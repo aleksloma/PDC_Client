@@ -1,0 +1,997 @@
+/* ============================================================
+   index_new.css — aesthetic re-skin of homepage at /new
+   Designer mockup: design/ჰოუმფეიჯები და ვიზუალი/ვები.png
+   Loaded AFTER main.css + dashboard.css so it can override.
+   Scope: body.index-new only.
+   ============================================================ */
+
+body.index-new {
+  --in-navy:        #001E44;
+  --in-navy-2:      #06102b;
+  --in-navy-3:      #0c1638;
+  --in-blue:        #1276C2;
+  --in-blue-soft:   #eef4ff;
+  --in-blue-light:  #f6faff;
+  --in-hero-from:   #c2dcfb;
+  --in-hero-to:     #f7f6fb;
+  --in-purple-glow: rgba(122, 90, 255, 0.55);
+  --in-text:        #0e1633;
+  --in-muted:       #5b6479;
+  --in-border:      #e6ecf5;
+  --in-border-soft: #eef2f9;
+  --in-card-bg:     #ffffff;
+  --in-shadow-sm:   0 2px 10px rgba(7, 20, 60, 0.06);
+  --in-shadow-md:   0 14px 36px rgba(7, 20, 60, 0.10);
+  --in-shadow-lg:   0 24px 60px rgba(7, 20, 60, 0.16);
+  --in-shadow-dark: 0 18px 48px rgba(0, 0, 0, 0.38);
+  --in-radius:      22px;
+  --in-radius-card: 18px;
+  --in-focus-ring:  0 0 0 3px rgba(18, 118, 194, 0.45);
+
+  font-family: 'Poppins', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  background: #ffffff;
+  margin: 0;
+  color: var(--in-text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+body.index-new.landing { margin: 0; }
+
+body.index-new main.container-new {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 0 24px 100px;
+}
+
+/* Global focus ring for keyboard users */
+body.index-new :focus-visible {
+  outline: none;
+  box-shadow: var(--in-focus-ring);
+  border-radius: 8px;
+}
+
+/* =====================================================================
+   NAV — fixed at the top of the viewport with a white background so it
+   stays visible during scroll across both light and dark sections.
+   Hero compensates for nav height via padding-top.
+   ===================================================================== */
+body.index-new .landing-navbar.nav-new {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 100;
+  padding: 18px clamp(28px, 3.4vw, 56px);
+  background: #ffffff;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border: none;
+  box-shadow: 0 1px 2px rgba(7, 20, 60, 0.06);
+}
+body.index-new .nav-new .navbar-logo {
+  height: 58px;
+  width: auto;
+}
+body.index-new .landing-navbar.nav-new::before,
+body.index-new .landing-navbar.nav-new::after {
+  content: none;
+  display: none;
+  border: 0;
+}
+
+body.index-new .navbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Center group: 3 nav text links, absolutely centered in the fixed navbar. */
+body.index-new .navbar-center {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+body.index-new .navbar-btn {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  color: var(--in-navy);
+  font-weight: 500;
+  font-size: 15px;
+  padding: 8px 14px;
+  text-decoration: none;
+  border-radius: 8px;
+  transition: background 160ms ease, color 160ms ease;
+}
+body.index-new .navbar-btn:hover {
+  background: rgba(0, 30, 68, 0.06) !important;
+  text-decoration: none;
+  color: var(--in-navy);
+}
+
+/* Language picker globe + profile button: flat, no pill, no box */
+body.index-new .lang-globe-btn,
+body.index-new .lang-dropdown-container {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+body.index-new .lang-globe-btn {
+  color: var(--in-navy);
+  padding: 8px 10px;
+  border-radius: 8px;
+  transition: background 160ms ease;
+}
+body.index-new .lang-globe-btn:hover {
+  background: rgba(0, 30, 68, 0.06) !important;
+}
+body.index-new .profile-button-wrapper,
+body.index-new .profile-btn-container,
+body.index-new .profile-btn {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+
+/* Mobile hamburger button — hidden on desktop, shown via the ≤768px block. */
+body.index-new .nav-mobile-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  gap: 5px;
+  border-radius: 8px;
+  transition: background 160ms ease;
+}
+body.index-new .nav-mobile-btn:hover { background: rgba(0, 30, 68, 0.06); }
+body.index-new .nav-mobile-btn-bar {
+  display: block;
+  width: 22px;
+  height: 2.5px;
+  background: var(--in-navy);
+  border-radius: 2px;
+  transition: transform 200ms ease, opacity 200ms ease;
+}
+body.index-new .nav-mobile-btn[aria-expanded="true"] .nav-mobile-btn-bar:nth-child(1) {
+  transform: translateY(7.5px) rotate(45deg);
+}
+body.index-new .nav-mobile-btn[aria-expanded="true"] .nav-mobile-btn-bar:nth-child(2) {
+  opacity: 0;
+}
+body.index-new .nav-mobile-btn[aria-expanded="true"] .nav-mobile-btn-bar:nth-child(3) {
+  transform: translateY(-7.5px) rotate(-45deg);
+}
+
+/* Mobile dropdown panel — hidden by default (display: none via .hidden) and
+   on desktop. Made visible only inside the ≤768px block. */
+body.index-new .nav-mobile-panel {
+  display: none;
+}
+body.index-new .nav-mobile-panel.hidden { display: none; }
+body.index-new .nav-mobile-link {
+  display: block;
+  width: 100%;
+  padding: 14px 22px;
+  font-family: inherit;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--in-navy);
+  text-decoration: none;
+  border-bottom: 1px solid var(--in-border-soft);
+  min-height: 48px;
+  box-sizing: border-box;
+  transition: background 140ms ease;
+}
+body.index-new .nav-mobile-link:last-child { border-bottom: none; }
+body.index-new .nav-mobile-link:hover,
+body.index-new .nav-mobile-link:focus-visible {
+  background: rgba(0, 30, 68, 0.04);
+}
+
+/* =====================================================================
+   HERO  (single column over a full-bleed CSS background-image)
+   The new background image `static/pdc_background.png` (2172×724, 3:1)
+   carries the illustration on its LEFT ~54% and a clean gradient on its
+   RIGHT ~46%. The HTML content (heading + CTAs + bullets) sits in the
+   right empty zone of the image.
+   ===================================================================== */
+body.index-new .hero-new {
+  position: relative;
+  /* margin-top clears the 94px fixed nav so the background image starts
+     directly below the nav line, fully visible, with no portion hidden. */
+  margin-top: 94px;
+  background-image: url('/static/pdc_background.png?v=v18');
+  background-color: #f0f4ff;  /* fallback — matches the image's right edge */
+  background-size: 100% 100%;
+  background-position: center center;
+  background-repeat: no-repeat;
+  aspect-ratio: 1873 / 840;
+  border-bottom: none;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+body.index-new .hero-new-inner {
+  margin: 0;
+  max-width: none;
+  height: 100%;
+  /* Symmetric top/bottom padding so the content block, vertically centered
+     via align-items: center, lands at the hero's midpoint with equal
+     breathing room above the H1 and below the bullets. */
+  padding: 32px clamp(28px, 3.4vw, 56px);
+  box-sizing: border-box;
+  display: grid;
+  /* Empty left column lets the image's illustrations show through; the
+     content sits in the right column shifted slightly LEFT vs. v13's
+     `1.25fr 1fr` so the text starts closer to the dashboard preview's
+     right edge while keeping comfortable clearance. `1fr 1.2fr` was tested
+     and overlapped the dashboard by ~45-63px at 1350-1920, so the modest
+     `1.15fr 1fr` shift is used. */
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  align-items: center;
+}
+body.index-new .hero-new-content {
+  min-width: 0;
+  grid-column: 2 / 3;
+  /* Wide enough for the longest H1 span at 34px in EN/KA/RU. */
+  max-width: 620px;
+  padding: 0;
+  text-align: right;
+  /* Anchor to the right edge of column 2 via grid layout — NOT translate.
+     Layout-based positioning respects the hero's right padding, so the
+     content cannot overflow the viewport at high zoom or narrow widths. */
+  justify-self: end;
+  /* Vertical lift kept from the previous translateY(-60px); margin-top
+     stays inside normal flow so it never escapes the hero bounds. */
+  margin-top: -60px;
+  /* Pull the block ~80px in from the grid column's right edge — reserves
+     real layout space (unlike transform), so high zoom never overflows. */
+  margin-right: 80px;
+}
+
+/* Mobile-only image — hidden by default at all widths; shown only inside the
+   `≤768px` block below. Desktop uses the CSS background-image instead. */
+body.index-new .hero-new-mobile-image {
+  display: none;
+}
+
+body.index-new .hero-new-title {
+  font-family: 'Poppins', system-ui, sans-serif;
+  font-weight: 700;
+  /* Sized to match the section H2 (`.sec-new-title`) ramp so the hero
+     headline reads as visually equal to "Why PowerDataChat?" below it. */
+  font-size: clamp(28px, 3.2vw, 46px);
+  line-height: 1.18;
+  letter-spacing: -0.02em;
+  color: var(--in-navy);
+  margin: 0 0 35px;
+}
+body.index-new .hero-new-tagline {
+  font-size: clamp(16px, 1.4vw, 18.5px);
+  line-height: 1.55;
+  color: var(--in-muted);
+  margin: 0 0 28px;
+}
+body.index-new .hero-new-highlights {
+  display: grid;
+  gap: 11px;
+  color: var(--in-text);
+  font-size: clamp(13px, 1.4vw, 18px);
+  line-height: 1.6;
+  margin: 42px 0 0;
+  text-align: right;
+}
+body.index-new .hero-new-highlights .hi { color: var(--in-text); }
+body.index-new .hi {
+  white-space: nowrap;
+}
+
+body.index-new .hero-new-cta-row {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: clamp(12px, 2.2vw, 28px);
+  align-items: stretch;
+  justify-content: flex-end;
+}
+
+body.index-new .cta-new {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 14px 26px;
+  font-family: inherit;
+  font-size: 15.5px;
+  font-weight: 600;
+  line-height: 1;
+  border-radius: 12px;
+  text-decoration: none;
+  cursor: pointer;
+  border: 2px solid var(--in-navy);
+  transition: transform 140ms ease, box-shadow 200ms ease, background 200ms ease, color 200ms ease;
+  min-width: clamp(110px, 11vw, 140px);
+  height: 54px;
+  box-sizing: border-box;
+  margin: 0;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+body.index-new .cta-new-primary {
+  background: var(--in-navy);
+  color: #ffffff;
+  box-shadow: 0 10px 26px rgba(0, 30, 68, 0.24);
+}
+body.index-new .cta-new-primary:hover {
+  transform: translateY(-2px);
+  background: #062758;
+  box-shadow: 0 16px 34px rgba(0, 30, 68, 0.34);
+  color: #ffffff;
+}
+body.index-new .cta-new-primary:active { transform: translateY(0); }
+body.index-new .cta-new-secondary {
+  background: transparent;
+  color: var(--in-navy);
+}
+body.index-new .cta-new-secondary:hover {
+  background: var(--in-navy);
+  color: #fff;
+  transform: translateY(-2px);
+  box-shadow: 0 10px 26px rgba(0, 30, 68, 0.22);
+}
+body.index-new .cta-new-secondary:active { transform: translateY(0); }
+body.index-new .cta-new-lg {
+  padding: 18px 44px;
+  font-size: 17.5px;
+  height: 60px;
+  min-width: 240px;
+  border-radius: 14px;
+}
+
+/* Slight size bump for HERO CTAs only — scoped to .hero-new so the
+   Try-It-Free section's primary CTA (which uses cta-new-lg) is unaffected
+   and other shared .cta-new buttons on the page keep their base size. */
+body.index-new .hero-new .cta-new-primary,
+body.index-new .hero-new .cta-new-secondary {
+  font-size: clamp(14px, 1.5vw, 20px);
+  padding: clamp(12px, 1.6vw, 19px) clamp(18px, 2.6vw, 35px);
+  height: 59px;
+  border-radius: 13px;
+}
+
+/* =====================================================================
+   SECTION SHELL — alternating light / dark with LARGE folder-tab notch
+   ===================================================================== */
+body.index-new .sec-new {
+  position: relative;
+  margin: 32px 0;
+  padding: 76px 40px 96px;
+  border-radius: var(--in-radius);
+  overflow: hidden;
+}
+body.index-new .sec-new-inner {
+  position: relative;
+  max-width: 1080px;
+  margin: 0 auto;
+  z-index: 2;
+}
+
+/* Light section */
+body.index-new .sec-new-light {
+  background: linear-gradient(180deg, #ffffff 0%, var(--in-blue-light) 100%);
+  border: 1px solid var(--in-border);
+  box-shadow: var(--in-shadow-sm);
+  color: var(--in-text);
+}
+
+/* Dark section — deep navy + LARGE soft purple radial glow top-left */
+body.index-new .sec-new-dark {
+  background:
+    radial-gradient(circle at 0% 0%, var(--in-purple-glow) 0%, rgba(122, 90, 255, 0.20) 18%, transparent 42%),
+    linear-gradient(180deg, var(--in-navy-3) 0%, var(--in-navy-2) 100%);
+  color: #ffffff;
+}
+body.index-new .sec-new-dark .sec-new-title { color: #ffffff; }
+body.index-new .sec-new-dark p,
+body.index-new .sec-new-dark li,
+body.index-new .sec-new-dark summary { color: #e7ecf7; }
+
+/* Folder-tab notch — designer's bottom-right cutout, on dark sections.
+   Cuts a clean rectangle from the bottom-right corner. */
+body.index-new .sec-new-notch {
+  clip-path: polygon(
+    0 0,
+    100% 0,
+    100% calc(100% - 96px),
+    calc(100% - 110px) calc(100% - 96px),
+    calc(100% - 170px) 100%,
+    0 100%
+  );
+}
+@media (max-width: 720px) {
+  body.index-new .sec-new-notch {
+    clip-path: polygon(
+      0 0,
+      100% 0,
+      100% calc(100% - 58px),
+      calc(100% - 70px) calc(100% - 58px),
+      calc(100% - 110px) 100%,
+      0 100%
+    );
+  }
+}
+
+/* Single, unified section title style */
+body.index-new .sec-new-title {
+  font-family: 'Poppins', system-ui, sans-serif;
+  font-weight: 800;
+  font-size: clamp(28px, 3.2vw, 42px);
+  text-align: center;
+  margin: 0 0 42px;
+  letter-spacing: -0.02em;
+  color: var(--in-navy);
+  line-height: 1.1;
+}
+
+/* =====================================================================
+   ICON CARD GRID  (Why / How It Works / What You Get)
+   ===================================================================== */
+body.index-new .icon-card-grid {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 24px;
+}
+body.index-new .icon-card-grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+body.index-new .icon-card-grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+body.index-new .icon-card {
+  background: #ffffff;
+  border: 1px solid var(--in-border-soft);
+  border-radius: var(--in-radius-card);
+  padding: 32px 22px 32px;
+  text-align: center;
+  box-shadow: 0 12px 32px rgba(7, 20, 60, 0.08);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  min-height: 300px;
+  justify-content: center;
+  transition: transform 200ms ease, box-shadow 200ms ease;
+}
+body.index-new .icon-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 20px 44px rgba(7, 20, 60, 0.14);
+}
+body.index-new .icon-card-img {
+  width: 100%;
+  max-width: 180px;
+  height: auto;
+  aspect-ratio: 1 / 1;
+  object-fit: contain;
+  display: block;
+  margin: 0 auto;
+}
+body.index-new .icon-card-text {
+  margin: 0;
+  font-size: 15.5px;
+  line-height: 1.5;
+  color: var(--in-text);
+}
+body.index-new .icon-card-text strong {
+  color: var(--in-navy);
+  font-weight: 700;
+}
+
+/* Per-section icon size targets */
+body.index-new .icon-card-grid-why     .icon-card-img { max-width: 190px; }
+body.index-new .icon-card-grid-hiw     .icon-card-img { max-width: 220px; }
+body.index-new .icon-card-grid-wyg     .icon-card-img { max-width: 175px; }
+
+/* How It Works + What You Get cards: bold navy title + colored blue subtitle.
+   Matches designer mockups 4.png and 5.png where the prefix word (before the
+   em-dash) is dark and the rest is blue. */
+body.index-new .icon-card-grid-hiw .icon-card-text,
+body.index-new .icon-card-grid-wyg .icon-card-text {
+  color: var(--in-blue);
+  font-weight: 500;
+}
+body.index-new .icon-card-grid-hiw .icon-card-text strong,
+body.index-new .icon-card-grid-wyg .icon-card-text strong {
+  color: var(--in-navy);
+  font-weight: 700;
+  display: block;
+  margin-bottom: 4px;
+  font-size: 17px;
+}
+
+/* Per-section card aspect ratios */
+body.index-new .icon-card-grid-why .icon-card { min-height: 310px; }
+body.index-new .icon-card-grid-hiw .icon-card { min-height: 350px; padding: 34px 22px 30px; }
+body.index-new .icon-card-grid-wyg .icon-card { min-height: 310px; }
+
+/* On dark sections: cards stay solid white, text stays dark */
+body.index-new .icon-card-grid-on-dark .icon-card {
+  background: #ffffff;
+  border: none;
+  box-shadow: var(--in-shadow-dark);
+}
+body.index-new .icon-card-grid-on-dark .icon-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 26px 56px rgba(0, 0, 0, 0.46);
+}
+body.index-new .icon-card-grid-on-dark .icon-card-text { color: var(--in-text); }
+body.index-new .icon-card-grid-on-dark .icon-card-text strong { color: var(--in-navy); }
+
+@media (max-width: 980px) {
+  body.index-new .icon-card-grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  body.index-new .icon-card-grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 640px) {
+  body.index-new .icon-card-grid-3,
+  body.index-new .icon-card-grid-4 { grid-template-columns: 1fr; }
+  body.index-new .icon-card-grid-why .icon-card-img,
+  body.index-new .icon-card-grid-hiw .icon-card-img,
+  body.index-new .icon-card-grid-wyg .icon-card-img { max-width: 170px; }
+  body.index-new .icon-card { min-height: 260px; }
+}
+
+/* =====================================================================
+   PILL CARDS (What You Can Do — dark section, solid white pills)
+   ===================================================================== */
+body.index-new .pill-grid {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+body.index-new .sec-new-dark .pill-card,
+body.index-new .pill-card {
+  background: #ffffff;
+  color: var(--in-navy);
+  font-weight: 600;
+  font-size: 15.5px;
+  padding: 22px 26px;
+  border-radius: 14px;
+  box-shadow: var(--in-shadow-dark);
+  text-align: center;
+  border: none;
+  opacity: 1;
+  transition: transform 200ms ease, box-shadow 200ms ease;
+}
+body.index-new .pill-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 22px 48px rgba(0, 0, 0, 0.45);
+}
+body.index-new .pill-card-wide {
+  grid-column: 1 / -1;
+  max-width: 420px;
+  margin: 0 auto;
+}
+@media (max-width: 720px) {
+  body.index-new .pill-grid { grid-template-columns: 1fr; }
+  body.index-new .pill-card-wide { max-width: 100%; }
+}
+
+/* =====================================================================
+   Details / collapsible blocks
+   ===================================================================== */
+body.index-new .details-new {
+  /* Left-aligned to the section's content edge (was margin: 32px auto 0). */
+  margin: 32px 0 0;
+  max-width: 820px;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid var(--in-border);
+  border-radius: 14px;
+  padding: 16px 22px;
+}
+body.index-new .details-new > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--in-navy);
+  list-style: none;
+  padding: 6px 0;
+  font-size: 15px;
+}
+body.index-new .details-new > summary::-webkit-details-marker { display: none; }
+body.index-new .details-new > summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 10px;
+  transition: transform 200ms ease;
+  color: var(--in-blue);
+}
+body.index-new .details-new[open] > summary::before { transform: rotate(90deg); }
+body.index-new .details-new .details-content { padding-top: 12px; color: var(--in-text); }
+body.index-new .details-new .details-content ul,
+body.index-new .details-new .details-content ol { padding-left: 20px; }
+body.index-new .details-new .details-content li { margin: 4px 0; line-height: 1.55; }
+
+body.index-new .details-on-dark {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+body.index-new .details-on-dark > summary { color: #ffffff; }
+body.index-new .details-on-dark > summary::before { color: #b9c7ff; }
+body.index-new .details-on-dark .details-content,
+body.index-new .details-on-dark .details-content li,
+body.index-new .details-on-dark .details-content p { color: #e7ecf7; }
+
+/* =====================================================================
+   Try It Free (light section, single CTA — no email field)
+   ===================================================================== */
+body.index-new .sec-new-cta { text-align: center; }
+body.index-new .sec-new-inner-cta {
+  max-width: 760px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+body.index-new .sec-new-illu-cta {
+  display: block;
+  max-width: 420px;
+  width: 100%;
+  height: auto;
+  margin: 16px 0 28px;
+  filter: drop-shadow(0 24px 44px rgba(15, 35, 90, 0.18));
+}
+body.index-new .sec-new-cta-desc {
+  font-size: 18px;
+  color: var(--in-muted);
+  margin: 0 0 4px;
+  line-height: 1.5;
+  max-width: 540px;
+}
+
+/* =====================================================================
+   FAQ — dark navy section, white pill cards with navy question + "+"
+   ===================================================================== */
+body.index-new .faq-grid-new {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+body.index-new .faq-card-new {
+  background: #ffffff;
+  color: var(--in-text);
+  padding: 22px 26px;
+  border-radius: 14px;
+  box-shadow: var(--in-shadow-dark);
+  transition: box-shadow 200ms ease, transform 200ms ease;
+  min-height: 80px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+body.index-new .faq-card-new[open] {
+  display: block;
+}
+body.index-new .faq-card-new:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 22px 48px rgba(0, 0, 0, 0.45);
+}
+body.index-new .faq-card-new > summary {
+  font-weight: 700;
+  color: var(--in-navy);
+  cursor: pointer;
+  list-style: none;
+  font-size: 15.5px;
+  line-height: 1.45;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+body.index-new .faq-card-new > summary::-webkit-details-marker { display: none; }
+body.index-new .faq-card-new > summary::after {
+  content: "+";
+  flex-shrink: 0;
+  font-weight: 700;
+  color: var(--in-blue);
+  font-size: 24px;
+  line-height: 1;
+  transition: transform 200ms ease;
+}
+body.index-new .faq-card-new[open] > summary::after { content: "−"; }
+body.index-new .faq-card-new p {
+  margin: 14px 0 0;
+  color: var(--in-muted);
+  font-size: 14.5px;
+  line-height: 1.6;
+}
+@media (max-width: 720px) {
+  body.index-new .faq-grid-new { grid-template-columns: 1fr; }
+}
+
+/* =====================================================================
+   Footer polish (uses base footer styles, but tighten margins on /new)
+   ===================================================================== */
+body.index-new .footer {
+  margin-top: 24px;
+  padding: 24px 24px 32px;
+  text-align: center;
+}
+
+/* =====================================================================
+   Hero mobile-stacked layout (≤1100px) — the hero alone switches to the
+   mobile stacked arrangement at this width because pdc_background.png
+   bakes the dashboard illustration into the LEFT ~47% of the image, and
+   below ~1024px the desktop right-column H1 visually overlaps it.
+   Everything else on the page (nav, sections, cards, FAQ) keeps its
+   600px breakpoint in the block below.
+   ===================================================================== */
+@media (max-width: 1100px) {
+  /* --- Hero (mobile) ---------------------------------------------------
+     Mobile uses a SEPARATE image (`pdc_background1.png`) rendered as an
+     `<img>` element placed BEFORE the text content. The desktop background
+     image is suppressed entirely. Reading order: nav → image → text. */
+  body.index-new .hero-new {
+    aspect-ratio: auto;
+    min-height: 0;
+    background-image: none;
+    background-color: #e1ecfc;  /* matches the top edge of pdc_background1.png */
+    /* Mobile nav is shorter than desktop — measured at 84px on phones. */
+    margin-top: 84px;
+  }
+  body.index-new .hero-new-inner {
+    grid-template-columns: 1fr;
+    /* No inner padding: image renders full-width; horizontal padding for the
+       text moves onto .hero-new-content itself. */
+    padding: 0;
+    gap: 20px;
+  }
+  body.index-new .hero-new-content {
+    grid-column: 1 / -1;
+    /* Horizontal padding lives here so the image above can span full width.
+       Symmetric 28px on both sides so right-aligned text isn't shifted off
+       the optical axis on real phones. Top 40 / bottom 70 makes the
+       light-blue area visibly taller. */
+    padding: 40px 28px 70px 28px;
+    text-align: right;
+    max-width: none;
+    margin-top: 0;
+    /* Reset desktop leaks — desktop has `justify-self: end` (which shrinks
+       the box to content width on a single-column grid) and `margin-right:
+       80px` (which pulls the box in from the right). Both make the heading
+       and buttons appear centered/left-shifted on mobile even with
+       text-align: right. Restore stretch + 0 margin so the box fills the
+       column and right-edge alignment actually works. */
+    justify-self: stretch;
+    margin-right: 0;
+  }
+  body.index-new .hero-new-mobile-image {
+    display: block;
+    grid-column: 1 / -1;
+    /* width: 110% was being clamped to 100% by main.css:2117
+       `img, svg, video { max-width: 100%; }` (a global cap), leaving the
+       -5% right margin uncompensated — visible as a blue strip on the
+       right. Reverting to 100% width / 0 margins makes the image fill the
+       full viewport exactly (no strip). The +10% size request applies to
+       the content/background area HEIGHT below, not the image's width. */
+    width: 100%;
+    height: auto;
+    margin: 0;
+  }
+  body.index-new .hero-new-title {
+    text-align: right;
+    font-size: 30px;
+    line-height: 1.2;
+    margin: 0 0 22px;
+    /* Reset desktop letter-spacing: -0.02em — on mobile it compresses the
+       heading by ~7-8px, making its visual right edge sit further LEFT
+       than the bullets' right edge. Reset so both align identically. */
+    letter-spacing: 0;
+  }
+  body.index-new .hero-new-tagline {
+    text-align: right;
+    font-size: 16px;
+    margin: 0 0 22px;
+  }
+  body.index-new .hero-new-cta-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    margin-bottom: 28px;
+  }
+  body.index-new .cta-new {
+    width: 100%;
+    min-width: 0;
+    height: 52px;
+    font-size: 17px;
+    padding: 12px 20px;
+    white-space: nowrap;
+  }
+  /* Mobile override for the hero CTAs: counteracts the desktop +10% leak
+     from the hero-scoped rule (specificity higher than `.cta-new`) and
+     applies tighter padding so the row fits side-by-side in the narrower
+     content column produced by the 40% left padding above. */
+  body.index-new .hero-new .cta-new-primary,
+  body.index-new .hero-new .cta-new-secondary {
+    font-size: 17px;
+    padding: 12px 20px;
+    height: 52px;
+    border-radius: 12px;
+    white-space: nowrap;
+  }
+  body.index-new .hero-new-highlights {
+    text-align: right;
+    margin-top: 22px;
+    font-size: clamp(11px, 3.2vw, 16px);
+    line-height: 1.45;
+    gap: 8px;
+  }
+  body.index-new .hi {
+    font-size: clamp(11px, 3.2vw, 16px);
+  }
+}
+
+/* =====================================================================
+   Mobile (≤600px) — designer-spec layouts per ./design/.../მობაილი/1x/1..7.png
+   ===================================================================== */
+@media (max-width: 600px) {
+  /* --- Logo and nav padding scale down for mobile ---------------------- */
+  body.index-new .landing-navbar.nav-new {
+    padding: 14px 18px;
+    /* On mobile the nav has many items - reduce horizontal space */
+  }
+  body.index-new .nav-new .navbar-logo { height: 40px; }
+  body.index-new .navbar-right { gap: 4px; }
+  /* Hide the inline desktop nav text links on mobile — they're surfaced
+     via the hamburger menu (`#mobileMenuBtn` + `#mobileMenuPanel`). */
+  body.index-new .navbar-center { display: none; }
+  /* Show the hamburger button only on mobile (hidden by default on desktop). */
+  body.index-new .nav-mobile-btn { display: inline-flex; }
+
+  /* Mobile dropdown panel — slides down below the nav when hamburger opens. */
+  body.index-new .nav-mobile-panel {
+    position: absolute;
+    top: 64px;
+    right: 12px;
+    width: min(280px, calc(100vw - 24px));
+    background: #ffffff;
+    border-radius: 14px;
+    box-shadow: 0 16px 40px rgba(7, 20, 60, 0.18);
+    border: 1px solid var(--in-border);
+    overflow: hidden;
+    z-index: 101;
+    transform-origin: top right;
+    transform: scale(0.96);
+    opacity: 0;
+    pointer-events: none;
+    transition: transform 200ms ease, opacity 200ms ease;
+  }
+  body.index-new .nav-mobile-panel.open {
+    display: block;
+    transform: scale(1);
+    opacity: 1;
+    pointer-events: auto;
+  }
+  body.index-new .nav-mobile-panel.hidden:not(.open) {
+    display: none;
+  }
+
+  /* --- Section shell --------------------------------------------------- */
+  body.index-new .sec-new {
+    padding: 56px 20px 78px;
+    margin: 28px 0;
+    border-radius: 18px;
+  }
+  body.index-new .sec-new-title {
+    margin-bottom: 32px;
+    font-size: clamp(26px, 7vw, 34px);
+  }
+
+  /* --- Why PowerDataChat? (mobile 2.png): 2x2 grid -------------------- */
+  body.index-new .icon-card-grid-why,
+  body.index-new .icon-card-grid-4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+  }
+  body.index-new .icon-card-grid-why .icon-card,
+  body.index-new .icon-card-grid-wyg .icon-card {
+    min-height: 250px;
+    padding: 20px 14px 20px;
+    gap: 12px;
+  }
+  body.index-new .icon-card-grid-why .icon-card-img,
+  body.index-new .icon-card-grid-wyg .icon-card-img { max-width: 130px; }
+  body.index-new .icon-card-text { font-size: 15px; line-height: 1.5; }
+  body.index-new .icon-card-grid-hiw .icon-card-text strong,
+  body.index-new .icon-card-grid-wyg .icon-card-text strong { font-size: 16px; }
+
+  /* --- What You Can Do (mobile 3.png): pills stacked ----------------- */
+  body.index-new .pill-grid {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+  body.index-new .pill-card-wide { max-width: 100%; }
+  body.index-new .pill-card { padding: 18px 22px; font-size: 15px; line-height: 1.45; }
+
+  /* --- How It Works (mobile 4.png): 2 on top row + 1 full-width below ---
+     The designer mockup shows the 3rd card centered + half-width; in practice
+     the long title/subtitle ("Ask questions in chat — get tables, charts...")
+     wraps to 6 lines in that narrow column and looks broken. Use full-width
+     for the 3rd card with horizontal icon+text layout so text reads well. */
+  body.index-new .icon-card-grid-hiw {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+  }
+  body.index-new .icon-card-grid-hiw .icon-card { min-height: 270px; padding: 22px 14px; }
+  body.index-new .icon-card-grid-hiw .icon-card-img { max-width: 150px; }
+  body.index-new .icon-card-grid-hiw > .icon-card:nth-child(3) {
+    grid-column: 1 / -1;
+    max-width: 100%;
+    margin: 0;
+    min-height: 0;
+    flex-direction: row;
+    align-items: center;
+    text-align: left;
+    padding: 20px 18px;
+    gap: 18px;
+  }
+  body.index-new .icon-card-grid-hiw > .icon-card:nth-child(3) .icon-card-img {
+    max-width: 90px;
+    flex-shrink: 0;
+  }
+  body.index-new .icon-card-grid-hiw > .icon-card:nth-child(3) .icon-card-text {
+    text-align: left;
+    margin: 0;
+  }
+  body.index-new .icon-card-grid-hiw > .icon-card:nth-child(3) .icon-card-text strong {
+    text-align: left;
+  }
+
+  /* --- Try It Free (mobile 6.png): full-width illu + CTA -------------- */
+  body.index-new .sec-new-inner-cta { max-width: 100%; }
+  body.index-new .sec-new-illu-cta { max-width: 80%; }
+  body.index-new .cta-new-lg { width: 100%; max-width: none; height: 52px; font-size: 17px; padding: 12px 20px; white-space: nowrap; }
+
+  /* --- FAQ (mobile 7.png): 2-column grid ------------------------------ */
+  body.index-new .faq-grid-new {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+  body.index-new .faq-card-new {
+    padding: 16px 14px;
+  }
+  body.index-new .faq-card-new > summary { font-size: 14px; gap: 8px; line-height: 1.4; }
+  body.index-new .faq-card-new > summary::after { font-size: 20px; }
+  body.index-new .faq-card-new p { font-size: 13.5px; line-height: 1.55; }
+
+  /* --- Notch position on mobile: bottom-LEFT for dark sections ------- */
+  body.index-new .sec-new-notch {
+    clip-path: polygon(
+      0 0,
+      100% 0,
+      100% 100%,
+      110px 100%,
+      70px calc(100% - 58px),
+      0 calc(100% - 58px)
+    );
+  }
+}
+
+/* Extra-narrow phones (≤380px): tighten even more */
+@media (max-width: 380px) {
+  body.index-new main.container-new { padding: 0 16px 80px; }
+  body.index-new .sec-new { padding: 48px 14px 66px; }
+  body.index-new .icon-card-grid-why .icon-card-img,
+  body.index-new .icon-card-grid-wyg .icon-card-img { max-width: 100px; }
+  body.index-new .icon-card { padding: 16px 10px 14px; min-height: 220px; }
+  body.index-new .icon-card-text { font-size: 13px; }
+}
+
+/* Hide any legacy decoration the parent CSS injects */
+body.index-new .hero-grid-overlay,
+body.index-new .hero-blob,
+body.index-new .hero-chart-line { display: none; }

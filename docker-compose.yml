@@ -1,0 +1,25 @@
+# PowerDataChat Client — customer Docker Compose (client only).
+#
+# This defines ONLY the client service. The brain is hosted by PowerDataChat
+# and is reached over HTTPS via BRAIN_URL in client.env — it is never run here.
+#
+# Usage:
+#   cp client.env.example client.env   # then fill BRAIN_TENANT_TOKEN + SECRET_KEY
+#   docker compose up -d
+#   curl http://localhost:8000/health
+#
+# See CUSTOMER_INSTALL.md for the full walkthrough.
+
+services:
+  client:
+    image: powerdatachat-client:enterprise   # change to your <registry>/...:<tag>
+    container_name: pdc-client
+    env_file: client.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - pdc_client_data:/data/client          # persistent — your raw data stays here
+    restart: unless-stopped
+
+volumes:
+  pdc_client_data:

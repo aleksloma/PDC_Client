@@ -1,0 +1,7 @@
+__pycache__
+*.pyc
+.venv
+client_data/
+logs/
+.git
+.env

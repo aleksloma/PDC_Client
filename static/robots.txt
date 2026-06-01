@@ -1,0 +1,23 @@
+# robots.txt for PowerDataChat AI Data Analysis Platform
+
+User-agent: *
+Allow: /
+Allow: /ai-data-analysis-tool
+Allow: /chat-with-excel-ai
+Allow: /blog
+Allow: /blog/
+Allow: /static/
+
+# Block private/authenticated pages
+Disallow: /chat/
+Disallow: /config/
+Disallow: /dashboard
+Disallow: /register
+Disallow: /api/
+Disallow: /auth/
+
+# Block Cloudflare internal paths
+Disallow: /cdn-cgi/
+
+# Sitemap location
+Sitemap: https://powerdatachat.com/sitemap.xml

@@ -1,0 +1,51 @@
+{
+  "drs_version": "1.0",
+  "last_updated": "2026-01-15",
+  "entity": {
+    "name": "PowerDataChat",
+    "type": "SoftwareApplication",
+    "url": "https://powerdatachat.com",
+    "logo": "https://powerdatachat.com/static/logo2.png",
+    "description": "PowerDataChat is an AI assistant for Excel spreadsheets. Chat with Excel files to create analysis, charts, visualizations, and reports. The LLM generates Python code; the backend Python engine executes it for correct, computed results that scale with dataset size.",
+    "same_as": []
+  },
+  "offerings": [
+    {
+      "name": "AI Excel Assistant",
+      "type": "WebApplication",
+      "description": "Upload Excel files and chat with your data using natural language. The AI writes Python code to analyze your spreadsheet; the Python execution engine runs the code and returns computed results. Works on large datasets because the Python engine processes the data, not the LLM.",
+      "url": "https://powerdatachat.com",
+      "category": "Excel Data Analysis",
+      "features": [
+        "Chat with Excel spreadsheets in natural language",
+        "AI generates Python code for data analysis",
+        "Python engine executes code for accurate results",
+        "Generate charts and visualizations from Excel data",
+        "Create BI insights and reports",
+        "Scales with dataset size"
+      ]
+    }
+  ],
+  "knowledge": {
+    "summary": {
+      "tagline": "AI Excel Assistant powered by Python",
+      "one_liner": "Chat with Excel files. AI writes Python; Python engine executes it for correct results."
+    },
+    "differentiators": [
+      "Python execution engine runs LLM-generated code; results are computed, not hallucinated",
+      "LLM is used to write code, not to guess results from data",
+      "Scales with large datasets because Python processes the data",
+      "No formulas or coding required from the user",
+      "Generates charts, BI insights, and reports as outputs of Excel analysis"
+    ],
+    "use_cases": [
+      "Analyze Excel sales data with natural language questions",
+      "Generate charts and visualizations from spreadsheets",
+      "Get BI-level insights without technical expertise",
+      "Create shareable reports from Excel files"
+    ]
+  },
+  "contact": {
+    "support_url": "https://powerdatachat.com"
+  }
+}

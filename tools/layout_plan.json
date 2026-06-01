@@ -1,0 +1,145 @@
+{
+  "version": 3,
+  "slide_size_in": {
+    "w": 13.33,
+    "h": 7.5
+  },
+  "palette": {
+    "bg": "FFFFFF",
+    "title": "44546A",
+    "accent": "4472C4",
+    "body": "000000",
+    "muted": "000000"
+  },
+  "fonts": {
+    "title": "Calibri Light",
+    "body": "Calibri"
+  },
+  "branding": [
+    {
+      "image_ref": "logo",
+      "shape_name": "Picture 8",
+      "x_in": 11.43,
+      "y_in": 0.3,
+      "w_in": 1.6,
+      "h_in": 0.55,
+      "roles": [
+        "cover",
+        "content",
+        "agenda",
+        "takeaways"
+      ]
+    }
+  ],
+  "slides": {
+    "cover": {
+      "title": {
+        "x": 0.3,
+        "y": 2.55,
+        "w": 12.73,
+        "h": 1.65,
+        "font": "Calibri Light",
+        "size_pt": 40.0,
+        "color": "44546A",
+        "align": "left",
+        "valign": "top"
+      },
+      "subtitle": {
+        "x": 0.3,
+        "y": 4.5,
+        "w": 12.73,
+        "h": 1.2,
+        "font": "Calibri",
+        "size_pt": 18.0,
+        "color": "000000",
+        "align": "left",
+        "valign": "top"
+      }
+    },
+    "agenda": {
+      "title": {
+        "x": 0.3,
+        "y": 0.4,
+        "w": 10.98,
+        "h": 0.9,
+        "font": "Calibri Light",
+        "size_pt": 30.0,
+        "color": "44546A",
+        "align": "left",
+        "valign": "top"
+      },
+      "list": {
+        "x": 0.3,
+        "y": 1.6,
+        "w": 12.73,
+        "h": 5.6,
+        "font": "Calibri",
+        "size_pt": 18.0,
+        "color": "000000",
+        "align": "left",
+        "valign": "top",
+        "line_spacing": 1.15,
+        "bullet": "number"
+      }
+    },
+    "content": {
+      "title": {
+        "x": 0.3,
+        "y": 0.4,
+        "w": 10.98,
+        "h": 0.85,
+        "font": "Calibri Light",
+        "size_pt": 26.0,
+        "color": "44546A",
+        "align": "left",
+        "valign": "top"
+      },
+      "body": {
+        "x": 0.3,
+        "y": 1.45,
+        "w": 5.35,
+        "h": 5.75,
+        "font": "Calibri",
+        "size_pt": 14.0,
+        "color": "000000",
+        "align": "left",
+        "valign": "top"
+      },
+      "chart": {
+        "x": 6.03,
+        "y": 1.45,
+        "w": 7.0,
+        "h": 5.75,
+        "fit": "contain"
+      }
+    },
+    "takeaways": {
+      "title": {
+        "x": 0.3,
+        "y": 0.4,
+        "w": 10.98,
+        "h": 0.85,
+        "font": "Calibri Light",
+        "size_pt": 28.0,
+        "color": "44546A",
+        "align": "left",
+        "valign": "top"
+      },
+      "list": {
+        "x": 0.3,
+        "y": 1.5,
+        "w": 12.73,
+        "h": 5.7,
+        "font": "Calibri",
+        "size_pt": 16.0,
+        "color": "000000",
+        "align": "left",
+        "valign": "top",
+        "line_spacing": 1.15,
+        "bullet": "number"
+      },
+      "chart": null
+    }
+  },
+  "notes": ""
+}

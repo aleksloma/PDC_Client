@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+        xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
+  
+  <!-- Landing Page - Highest Priority -->
+  <url>
+    <loc>https://powerdatachat.com/</loc>
+    <lastmod>2026-01-14</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+    <image:image>
+      <image:loc>https://powerdatachat.com/static/logo2.png</image:loc>
+      <image:title>PowerDataChat - AI Data Analysis Tool</image:title>
+    </image:image>
+  </url>
+  
+  <!-- Marketing Pages -->
+  <url>
+    <loc>https://powerdatachat.com/why-powerdatachat</loc>
+    <lastmod>2026-03-28</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.9</priority>
+  </url>
+
+  <!-- SEO Landing Pages - High Priority -->
+  <url>
+    <loc>https://powerdatachat.com/ai-data-analysis-tool</loc>
+    <lastmod>2026-01-14</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.95</priority>
+  </url>
+  
+  <url>
+    <loc>https://powerdatachat.com/chat-with-excel-ai</loc>
+    <lastmod>2026-01-14</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.95</priority>
+  </url>
+  
+  <!-- Blog Pages -->
+  <url>
+    <loc>https://powerdatachat.com/blog</loc>
+    <lastmod>2026-01-14</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  
+  <url>
+    <loc>https://powerdatachat.com/blog/chat-with-csv-ai</loc>
+    <lastmod>2026-01-14</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.7</priority>
+  </url>
+  
+  <url>
+    <loc>https://powerdatachat.com/blog/top-5-ai-tools-excel</loc>
+    <lastmod>2026-01-14</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.7</priority>
+  </url>
+  
+  <url>
+    <loc>https://powerdatachat.com/blog/ai-spreadsheet-analysis-faster</loc>
+    <lastmod>2026-01-14</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.7</priority>
+  </url>
+  
+  <!-- Public legal/pricing pages -->
+  <url>
+    <loc>https://powerdatachat.com/pricing</loc>
+    <lastmod>2026-03-01</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+
+  <url>
+    <loc>https://powerdatachat.com/terms</loc>
+    <lastmod>2026-03-01</lastmod>
+    <changefreq>yearly</changefreq>
+    <priority>0.3</priority>
+  </url>
+
+  <!--
+    Private pages (noindex, not included):
+    - /chat/ (authenticated)
+    - /config/ (authenticated)
+    - /dashboard/ (authenticated)
+    - /register (form page)
+    Redirect pages (not included):
+    - /privacy → /terms#privacy
+    - /refund → /terms#refund
+  -->
+</urlset>

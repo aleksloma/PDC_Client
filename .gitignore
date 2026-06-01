@@ -1,0 +1,123 @@
+# ============================================================================
+# Secrets — NEVER commit
+# ============================================================================
+.env
+.env.local
+.env.*.local
+*.env
+!.env.example
+!*.env.example
+
+# Credentials, keys, certificates
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+google-credentials.json
+
+# Bearer tokens, API keys, anything that looks secret-ish
+secrets/
+*.secret
+*.token
+
+# ============================================================================
+# Local runtime data — client side
+# ============================================================================
+# Customer raw data, uploads, chats, conversations, generated reports.
+# NEVER ends up in git — lives on the customer's host volume only.
+client_data/
+data/
+
+# Local users / auth store / per-chat data
+**/users.json
+**/users.jsonl
+**/profile.json
+**/active_chats.jsonl
+**/conversations.jsonl
+**/chatdata/
+**/sessions/
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# ============================================================================
+# Python
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.egg-info/
+*.egg
+.eggs/
+.Python
+build/
+dist/
+develop-eggs/
+downloads/
+sdist/
+wheels/
+share/python-wheels/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ============================================================================
+# Testing / coverage
+# ============================================================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ============================================================================
+# Node / front-end build artifacts (in case any are added)
+# ============================================================================
+node_modules/
+.npm/
+.yarn/
+.pnp.*
+*.tsbuildinfo
+
+# ============================================================================
+# IDE / editor
+# ============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# ============================================================================
+# OS
+# ============================================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# ============================================================================
+# Misc
+# ============================================================================
+*.pid
+*.lock
+.cache/
+tmp/
+temp/

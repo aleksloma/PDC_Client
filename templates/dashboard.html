@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DPQTG64LRY"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+  gtag('config', 'G-DPQTG64LRY');
+</script>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lab - PowerDataChat</title>
+  <meta name="description" content="Chat with your data using AI. Create visualizations and reports from Excel or CSV files." />
+  <meta name="robots" content="noindex, nofollow" />
+  <link rel="icon" type="image/png" href="/static/logo.png?v={{ ts }}" />
+  <link rel="shortcut icon" href="/static/logo.png?v={{ ts }}" />
+  <link rel="stylesheet" href="/static/main.css?v={{ ts }}" />
+  <link rel="stylesheet" href="/static/dashboard.css?v={{ ts }}" />
+</head>
+<body class="dashboard-page">
+  <div class="dashboard-container">
+    <!-- Left Sidebar -->
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-header">
+        <a href="/" class="logo-link">
+          <img src="/static/logo2.png?v={{ ts }}" alt="PowerDataChat" class="sidebar-logo" />
+        </a>
+        <button id="btnCloseSidebar" class="sidebar-close-btn" aria-label="Close menu">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="sidebar-content">
+        <!-- Create New Button -->
+        <button id="btnCreateNew" class="sidebar-btn primary">
+          <span class="btn-icon">+</span>
+          <span data-i18n="lab.create_new">Create New</span>
+        </button>
+
+        <!-- Unified Chats List -->
+        <div id="chatsList" class="chats-list">
+          <div class="list-loading" data-i18n="lab.loading">Loading...</div>
+        </div>
+      </div>
+
+    </aside>
+
+    <!-- Mobile Sidebar Backdrop -->
+    <div id="sidebarBackdrop" class="sidebar-backdrop hidden"></div>
+
+    <!-- Main Content Area -->
+    <main class="main-content">
+      <!-- Top Right Profile Button -->
+      <div class="top-bar">
+        <!-- Hamburger button for mobile -->
+        <button id="btnHamburger" class="hamburger-btn" aria-label="Open menu">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="3" y1="6" x2="21" y2="6"/>
+            <line x1="3" y1="12" x2="21" y2="12"/>
+            <line x1="3" y1="18" x2="21" y2="18"/>
+          </svg>
+        </button>
+        <div class="top-bar-spacer"></div>
+        <div class="top-bar-actions">
+          <button id="btnAutoAnalytics" class="ghost small top-action-btn report-download-btn hidden" type="button">
+            <span class="aa-btn-icon" aria-hidden="true">✨</span>
+            <span class="aa-btn-label">Run Auto Analytics</span>
+          </button>
+          <div id="downloadReportDropdown" class="dropdown-container hidden">
+            <button id="btnDownloadReport" class="ghost small top-action-btn report-download-btn" data-i18n="lab.download_report">📊 Download Analytics</button>
+            <div id="downloadReportMenu" class="dropdown-menu hidden">
+              <button class="dropdown-item" data-format="pdf" type="button">📄 PDF</button>
+              <button class="dropdown-item" data-format="pptx" type="button">📊 PowerPoint</button>
+            </div>
+          </div>
+          <button id="btnSchema" class="ghost small top-action-btn hidden" data-i18n="lab.view_schema">View / Edit Descriptions</button>
+          {% include 'partials/profile_button.html' %}
+          {# Enterprise: profile button is frozen, so expose a visible logout
+             link here. POSTs to /auth/logout, then redirects to /. #}
+          <form method="post" action="/auth/logout" style="display:inline; margin-left:8px;">
+            <button type="submit" class="ghost small top-action-btn" title="Log out">Logout</button>
+          </form>
+        </div>
+      </div>
+      <!-- Welcome State (shown when no chat selected) -->
+      <div id="welcomeState" class="welcome-state">
+        <div class="welcome-content">
+          <h1 class="welcome-title" data-i18n-html="lab.welcome_title">Drop your Excel / CSV Data files here<br>and start chatting to analyze it</h1>
+        </div>
+      </div>
+
+      <!-- Frictionless flow progress overlay (separate from generic loadingOverlay) -->
+      <div id="frictionlessOverlay" class="loading-overlay hidden">
+        <div class="loading-spinner frictionless-progress">
+          <div class="spinner"></div>
+          <p id="frictionlessStatus">Uploading file…</p>
+        </div>
+      </div>
+
+      <!-- Chat State (shown when chat is active) -->
+      <div id="chatState" class="chat-state hidden">
+        <div id="chatMessages" class="chat-messages">
+          <!-- Messages will be inserted here -->
+        </div>
+        <div class="chat-input-container">
+          <div class="chat-input-wrapper">
+            <textarea id="chatInput" placeholder="Ask anything about your data..." data-i18n-placeholder="lab.ask_placeholder" rows="1"></textarea>
+            <button id="btnSend" class="send-btn">
+              <span>➤</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Auto Analytics started popup (auto-dismisses after 5s) -->
+  <div id="autoAnalyticsPopup" class="modal hidden">
+    <div class="modal-content small-modal auto-analytics-popup">
+      <div class="auto-analytics-popup-icon" aria-hidden="true">✨</div>
+      <h3 class="auto-analytics-popup-title" data-i18n="lab.auto_analytics_popup_title">Auto Analysis Started</h3>
+      <p class="auto-analytics-popup-text" data-i18n="lab.auto_analytics_popup_body">Auto analysis is running in the background. It can take several minutes — you'll be notified when it finishes. You can safely close this window.</p>
+    </div>
+  </div>
+
+  <!-- Create New Modal (single-step) -->
+  <div id="createNewModal" class="modal hidden">
+    <div class="modal-content wizard-modal wizard-modal-single">
+      <div class="modal-header">
+        <h3 id="wizardTitle" data-i18n="wizard.title">Create New Chat</h3>
+        <button id="closeWizard" class="ghost">✕</button>
+      </div>
+
+      <!-- Upload screen (single step) -->
+      <div id="wizardStep1" class="wizard-step-content">
+        <p class="step-description" data-i18n="wizard.step1_desc">Upload Excel (.xlsx) or CSV/TSV files. AI will generate descriptions automatically — you can review or edit them later.</p>
+        <p class="step-hint" data-i18n="wizard.step1_hint">💡 You can drag & drop files anywhere in this window</p>
+        <p id="uploadLimitWarning" class="upload-warning hidden"></p>
+
+        <div class="upload-area">
+          <div class="upload-options">
+            <label for="fileInput" class="upload-btn">
+              <span data-i18n="wizard.choose_files">📁 Choose Files</span>
+            </label>
+            <input type="file" id="fileInput" multiple accept=".csv,.tsv,.xlsx,.xls" style="display: none;" />
+
+            <span class="upload-divider" data-i18n="wizard.or">or</span>
+
+            <button type="button" id="shareGoogleSheetBtn" class="google-btn" data-i18n="wizard.share_google_sheet">
+              📎 Share Google Sheet
+            </button>
+
+            <span class="upload-divider" data-i18n="wizard.or_drop">or drop here</span>
+          </div>
+
+          <!-- Google Sheet URL input -->
+          <div id="googleSheetInputBox" class="google-input-box hidden">
+            <p class="google-warning" data-i18n="wizard.google_warning">⚠️ Make sure the file is shared with "Anyone with the link can view"</p>
+            <div class="google-input-row">
+              <input type="text" id="googleUrlInput" placeholder="Paste Google Sheets or Drive link here..." data-i18n-placeholder="wizard.google_placeholder" />
+              <button type="button" id="importFromUrlBtn" class="import-btn" data-i18n="wizard.share_btn">Share</button>
+              <button type="button" id="cancelGoogleSheetBtn" class="cancel-btn" data-i18n="wizard.cancel_btn">Cancel</button>
+            </div>
+            <span id="urlImportStatus" class="import-status"></span>
+          </div>
+
+          <!-- Selected files list (filename + remove icon, no description input) -->
+          <div id="selectedFilesList" class="selected-files-list"></div>
+        </div>
+      </div>
+
+      <!-- Action bar -->
+      <div class="wizard-nav">
+        <div class="wizard-nav-spacer"></div>
+        <button id="btnWizardNext" class="primary" data-i18n="wizard.generate_chat">Generate Chat</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Profile Modal -->
+  <div id="profileModal" class="modal hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 data-i18n="profile.modal_title">Your Profile</h3>
+        <button id="closeProfile" class="ghost">✕</button>
+      </div>
+      <div class="profile-content">
+        <div class="subscription-section">
+          <h4 data-i18n="profile.subscription_title">Subscription Plan</h4>
+          <p><span data-i18n="profile.current_plan">Current plan:</span> <strong id="currentPlanName">Basic</strong> | <span data-i18n="profile.messages_today">Messages today:</span> <strong id="messagesToday">0</strong></p>
+          <div id="subscriptionStatus" style="display:none;margin:8px 0 12px;padding:10px 14px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;font-size:13px;line-height:1.5;"></div>
+          <div class="plan-cards">
+            <div id="planBasicCard" class="plan-card" data-plan="Basic">
+              <h5 data-i18n="plan.basic">Basic</h5>
+              <p class="plan-price" data-i18n="plan.basic_price">Free</p>
+              <p class="plan-desc" data-i18n="plan.basic_desc">Perfect for getting started</p>
+              <ul>
+                <li data-i18n="plan.basic_feat1">1 file per upload</li>
+                <li data-i18n="plan.basic_feat2">10 messages/day</li>
+                <li data-i18n="plan.basic_feat3">1 PDF report/month</li>
+              </ul>
+              <button class="ghost plan-select" data-plan="Basic" data-i18n="plan.select_btn">Select</button>
+            </div>
+            <div id="planStandardCard" class="plan-card" data-plan="Standard">
+              <div class="promo-label">50% OFF</div>
+              <h5 data-i18n="plan.standard">Standard</h5>
+              <p class="plan-price">$4.99/month <span class="plan-price-original">$9.99</span></p>
+              <p class="plan-desc" data-i18n="plan.standard_desc">Ideal for regular users</p>
+              <ul>
+                <li data-i18n="plan.standard_feat1">5 files per upload</li>
+                <li data-i18n="plan.standard_feat2">50 messages/day</li>
+                <li data-i18n="plan.standard_feat3">10 PDF reports/month</li>
+              </ul>
+              <button class="ghost plan-select" data-plan="Standard" data-i18n="plan.select_btn">Select</button>
+            </div>
+            <div id="planProCard" class="plan-card" data-plan="Pro">
+              <div class="promo-label">50% OFF</div>
+              <h5 data-i18n="plan.pro">Pro</h5>
+              <p class="plan-price">$9.99/month <span class="plan-price-original">$19.99</span></p>
+              <p class="plan-desc" data-i18n="plan.pro_desc">Best for power users</p>
+              <ul>
+                <li data-i18n="plan.pro_feat1">10 files per upload</li>
+                <li data-i18n="plan.pro_feat2">200 messages/day</li>
+                <li data-i18n="plan.pro_feat3">20 PDF reports/month</li>
+              </ul>
+              <button class="ghost plan-select" data-plan="Pro" data-i18n="plan.select_btn">Select</button>
+            </div>
+            <div id="planEnterpriseCard" class="plan-card enterprise-plan-card" data-plan="Enterprise">
+              <h5 data-i18n="plan.enterprise">Enterprise</h5>
+              <p class="plan-price" data-i18n="plan.enterprise_price">Custom Pricing</p>
+              <p class="plan-desc" data-i18n="plan.enterprise_desc">Tailored for your organization</p>
+              <ul>
+                <li data-i18n="plan.enterprise_feat1">Unlimited usage</li>
+                <li data-i18n="plan.enterprise_feat2">On-premise deployment</li>
+                <li data-i18n="plan.enterprise_feat3">Custom integrations</li>
+              </ul>
+              <button class="ghost plan-select" data-plan="Enterprise" data-i18n="plan.contact_btn">Contact Us</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="profile-info-section">
+          <h4 data-i18n="profile.info_title">Profile Information</h4>
+          <div class="form-group">
+            <label data-i18n="profile.username_label">Username</label>
+            <input id="profUsername" placeholder="Username" data-i18n-placeholder="profile.username_label" readonly />
+          </div>
+          <div class="form-group">
+            <label data-i18n="profile.fullname_label">Full Name</label>
+            <input id="profFullName" placeholder="Full name" data-i18n-placeholder="profile.fullname_label" />
+          </div>
+          <div class="form-group">
+            <label data-i18n="profile.email_label">Email</label>
+            <input id="profEmail" type="email" placeholder="Email" data-i18n-placeholder="profile.email_label" />
+          </div>
+        </div>
+
+        <div id="passwordSection" class="password-section">
+          <h4 data-i18n="profile.password_title">Change Password</h4>
+          <div id="passwordGoogleNotice" class="google-password-notice hidden" data-i18n="profile.google_notice">
+            Password change is not available for Google accounts
+          </div>
+          <div id="passwordFields">
+            <div class="form-group">
+              <input id="profCurrentPw" type="password" placeholder="Current password" data-i18n-placeholder="profile.current_pw" />
+            </div>
+            <div class="form-group">
+              <input id="profNewPw" type="password" placeholder="New password" data-i18n-placeholder="profile.new_pw" />
+            </div>
+            <div class="form-group">
+              <input id="profConfirmPw" type="password" placeholder="Confirm new password" data-i18n-placeholder="profile.confirm_pw" />
+            </div>
+            <div id="pwMatchError" class="pw-match-error hidden" data-i18n="profile.pw_mismatch">Passwords do not match</div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="btnSaveProfile" data-i18n="profile.save_btn">Save Profile</button>
+        <button id="btnChangePw" class="ghost" data-i18n="profile.change_pw_btn">Change Password</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Schema Viewer / Editor Modal -->
+  <div id="schemaViewerModal" class="modal hidden">
+    <div class="modal-content schema-editor-modal">
+      <div class="modal-header">
+        <h3 data-i18n="schema.title">View / Edit Descriptions</h3>
+        <button id="closeSchemaViewer" class="ghost">✕</button>
+      </div>
+      <p class="schema-editor-hint" data-i18n="schema.edit_hint">Click the pencil icon next to any description to edit it. Changes apply to this whole chat.</p>
+      <div id="schemaViewerContainer" class="schema-container schema-editor"></div>
+    </div>
+  </div>
+
+  <!-- Share Modal -->
+  <div id="shareModal" class="modal hidden">
+    <div class="modal-content small-modal">
+      <div class="modal-header">
+        <h3 id="shareModalTitle" data-i18n="share.title">Share Chat</h3>
+        <button id="closeShare" class="ghost">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label data-i18n="share.emails_label">Share with specific emails (comma-separated)</label>
+          <input id="shareEmails" type="text" placeholder="email1@example.com, email2@example.com" data-i18n-placeholder="share.emails_placeholder" />
+          <p style="font-size: 13px; color: #6b7280; margin-top: 8px;" data-i18n="share.emails_hint">The chat will appear in their "Shared with Me" list</p>
+        </div>
+        <div class="form-group" style="margin-top: 16px;">
+          <label data-i18n="share.comment_label">Add a comment (optional)</label>
+          <textarea id="shareComment" rows="3" placeholder="Add a note for the recipient..." data-i18n-placeholder="share.comment_placeholder" style="width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; resize: vertical;"></textarea>
+          <p style="font-size: 12px; color: #9ca3af; margin-top: 6px; font-style: italic;" data-i18n="share.comment_hint">This comment will be sent via email notification only</p>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="btnCancelShare" class="ghost" data-i18n="common.cancel">Cancel</button>
+        <button id="btnSaveShare" class="primary" data-i18n="common.share">Share</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Rename Modal -->
+  <div id="renameModal" class="modal hidden">
+    <div class="modal-content small-modal">
+      <div class="modal-header">
+        <h3 id="renameModalTitle" data-i18n="rename.title">Rename</h3>
+        <button id="closeRename" class="ghost">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label id="renameLabel" data-i18n="rename.label">New name</label>
+          <input id="renameInput" type="text" placeholder="Enter new name..." data-i18n-placeholder="rename.placeholder" />
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="btnCancelRename" class="ghost" data-i18n="common.cancel">Cancel</button>
+        <button id="btnConfirmRename" class="primary" data-i18n="common.rename">Rename</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete Confirmation Modal -->
+  <div id="deleteModal" class="modal hidden">
+    <div class="modal-content small-modal">
+      <div class="modal-header">
+        <h3 data-i18n="delete.title">Delete Confirmation</h3>
+        <button id="closeDelete" class="ghost">✕</button>
+      </div>
+      <div class="modal-body">
+        <p id="deleteMessage" data-i18n="delete.message">Are you sure you want to delete this item?</p>
+        <p class="warning-text" data-i18n="delete.warning">This action cannot be undone.</p>
+      </div>
+      <div class="modal-actions">
+        <button id="btnCancelDelete" class="ghost" data-i18n="common.cancel">Cancel</button>
+        <button id="btnConfirmDelete" class="primary danger" data-i18n="common.delete">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Loading Overlay -->
+  <div id="loadingOverlay" class="loading-overlay hidden">
+    <div class="loading-spinner">
+      <div class="spinner"></div>
+      <p id="loadingText">Processing...</p>
+    </div>
+  </div>
+
+  <script>
+    window.DEFAULT_DAYS = {{ default_days }};
+    window.MAX_DAYS = {{ max_days }};
+    window.OPEN_CONV_ID = "{{ open_conv_id | default('') }}";
+    window.OPEN_CHAT_ID = "{{ open_chat_id | default('') }}";
+  </script>
+  <!-- Paddle.js Checkout -->
+  <script src="https://cdn.paddle.com/paddle/v2/paddle.js"></script>
+  <script>
+  (function() {
+    window._paddleConfig = null;
+
+    fetch('/paddle/config').then(function(r){ return r.json(); }).then(function(cfg){
+      window._paddleConfig = cfg;
+      if (cfg.client_token) {
+        var opts = { token: cfg.client_token };
+        if (cfg.environment === 'sandbox') opts.environment = 'sandbox';
+        Paddle.Initialize(opts);
+        console.log('Paddle initialized with environment:', cfg.environment || '(default production)');
+      }
+    }).catch(function(){});
+
+    // Check for ?upgraded=true
+    var params = new URLSearchParams(window.location.search);
+    if (params.get('upgraded') === 'true') {
+      setTimeout(function() {
+        var t = document.createElement('div');
+        t.textContent = 'Payment successful! Your plan has been upgraded.';
+        t.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;color:#fff;font-size:14px;z-index:9999;box-shadow:0 4px 12px rgba(0,0,0,0.15);background:#10b981;';
+        document.body.appendChild(t);
+        setTimeout(function(){ t.style.opacity='0'; t.style.transition='opacity 0.3s'; setTimeout(function(){ t.remove(); }, 300); }, 4000);
+        // Clean URL
+        window.history.replaceState({}, '', window.location.pathname);
+      }, 500);
+    }
+  })();
+  </script>
+  <!-- Subscription Change Modal -->
+  <div id="subscriptionModal" class="modal hidden">
+    <div class="modal-content sub-modal-content">
+      <div class="modal-header">
+        <h3 id="subModalTitle" data-i18n="sub.title">Plan Change</h3>
+        <button id="closeSubModal" class="ghost" onclick="document.getElementById('subscriptionModal').classList.add('hidden')">&#10005;</button>
+      </div>
+      <div id="subModalBody" class="modal-body"></div>
+      <div id="subModalActions" class="modal-actions"></div>
+    </div>
+  </div>
+
+  <!-- About Us / Contact Modal -->
+  <div id="aboutModal" class="modal hidden">
+    <div class="modal-content" style="max-width: 900px; max-height: 85vh; display: flex; flex-direction: column;">
+      <div class="modal-header" style="flex-shrink: 0;">
+        <h3 data-i18n="about.title">About PowerDataChat</h3>
+        <button class="ghost" onclick="document.getElementById('aboutModal').classList.add('hidden')">&#10005;</button>
+      </div>
+      <div style="padding: 24px; line-height: 1.7; overflow-y: auto; flex: 1;">
+        <section style="margin-bottom: 32px; padding-bottom: 24px; border-bottom: 2px solid #e5e7eb;">
+          <h4 style="color: #667eea; margin-bottom: 16px; font-size: 20px; font-weight: 600;" data-i18n="about.section1_title">1. What is PowerDataChat?</h4>
+          <p style="color: #4b5563; margin-bottom: 14px; font-size: 15px;" data-i18n="about.section1_p1">PowerDataChat is your personal AI data analyst that turns Excel and CSV files into actionable insights through natural conversation. Upload your data, describe what you're looking for, and get instant charts, tables, and analysis in seconds.</p>
+          <p style="color: #4b5563; font-size: 15px;" data-i18n="about.section1_p2">Built for business users who need fast, accurate data analysis without writing code or learning complex tools.</p>
+        </section>
+        <section style="margin-bottom: 32px; padding: 20px; background: linear-gradient(135deg, #f9fafb 0%, #f3f4f6 100%); border-radius: 10px; border-left: 5px solid #667eea; padding-bottom: 24px; border-bottom: 2px solid #e5e7eb;">
+          <h4 style="color: #667eea; margin-bottom: 16px; font-size: 20px; font-weight: 600;" data-i18n="about.section2_title">2. Enterprise Solutions</h4>
+          <p style="color: #1f2937; margin-bottom: 14px; font-size: 16px; font-weight: 600;" data-i18n="about.section2_subtitle">On-Premise Integration Available</p>
+          <p style="color: #4b5563; margin-bottom: 12px; font-size: 15px;" data-i18n="about.section2_intro">We offer secure on-premise deployment for enterprise clients who need to:</p>
+          <ul style="color: #4b5563; margin-left: 24px; margin-bottom: 14px; font-size: 15px; line-height: 1.8;">
+            <li style="margin-bottom: 8px;" data-i18n="about.section2_item1">Connect directly to company data marts and databases</li>
+            <li style="margin-bottom: 8px;" data-i18n="about.section2_item2">Ensure raw data never leaves your environment</li>
+            <li style="margin-bottom: 8px;" data-i18n="about.section2_item3">Maintain full control over data security and compliance</li>
+            <li style="margin-bottom: 8px;" data-i18n="about.section2_item4">Integrate with existing data infrastructure</li>
+          </ul>
+        </section>
+        <section id="contact-us" style="padding-top: 8px;">
+          <h4 style="color: #667eea; margin-bottom: 16px; font-size: 20px; font-weight: 600;" data-i18n="about.section3_title">3. Contact Us</h4>
+          <div style="background: #f9fafb; padding: 20px; border-radius: 8px;">
+            <p style="margin-bottom: 12px; font-size: 15px; color: #4b5563;">
+              <strong style="color: #1f2937; display: inline-block; width: 100px;" data-i18n="about.contact_linkedin">LinkedIn:</strong>
+              <a href="https://www.linkedin.com/company/powerdatachat" target="_blank" rel="noopener noreferrer" style="color: #667eea; text-decoration: none; font-weight: 500; display: inline-flex; align-items: center; gap: 6px;">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="#0077B5"><path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/></svg>
+                PowerDataChat
+              </a>
+            </p>
+            <p style="margin-bottom: 12px; font-size: 15px; color: #4b5563;">
+              <strong style="color: #1f2937; display: inline-block; width: 100px;" data-i18n="about.contact_whatsapp">WhatsApp:</strong>
+              <a href="https://wa.me/12245510395" target="_blank" rel="noopener noreferrer" style="color: #667eea; text-decoration: none; font-weight: 500; display: inline-flex; align-items: center; gap: 6px;">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="#25D366"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+                +1 224 551 0395
+              </a>
+            </p>
+            <p style="margin-bottom: 16px; font-size: 15px; color: #4b5563;">
+              <strong style="color: #1f2937; display: inline-block; width: 100px;" data-i18n="about.contact_email">Email:</strong>
+              <a href="mailto:contact@powerdatachat.com" style="color: #667eea; text-decoration: none; font-weight: 500; display: inline-flex; align-items: center; gap: 6px;">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="#667eea"><path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/></svg>
+                contact@powerdatachat.com
+              </a>
+            </p>
+            <p style="margin-top: 16px; font-size: 14px; color: #6b7280; padding-top: 16px; border-top: 1px solid #e5e7eb; font-style: italic;" data-i18n="about.contact_note">
+              Interested in enterprise features or on-premise deployment? Reach out and we'll set up a demo tailored to your needs.
+            </p>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <script>window.__IS_ADMIN__ = {{ 'true' if is_admin else 'false' }};</script>
+  <script src="/static/i18n.js?v={{ ts }}"></script>
+  <script src="/static/dashboard.js?v={{ ts }}"></script>
+</body>
+</html>

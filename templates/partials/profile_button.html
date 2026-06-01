@@ -1,0 +1,51 @@
+{# Shared profile button + dropdown partial.
+   Used on both landing page (login.html) and dashboard.html.
+   Requires template context: logged_in, avatar_color, initials, display_name, subscription_plan, raw_username
+
+   ENTERPRISE FREEZE: the profile MODAL is temporarily disabled. The main
+   button still renders so the avatar + email show in the topbar, but clicking
+   it does nothing (no dropdown, no modal). Logout is still reachable via the
+   /auth/logout endpoint. This is intentionally a UI freeze only — the
+   underlying /auth/profile* endpoints stay live for any out-of-band tools.
+#}
+<div class="profile-dropdown-container">
+  {% if logged_in %}
+  <button id="btnProfileIcon" class="profile-btn" title="Profile (temporarily disabled)"
+          data-username="{{ raw_username }}"
+          data-frozen="1"
+          aria-disabled="true"
+          style="cursor: default; opacity: 0.9;">
+    <span id="profileAvatar" class="profile-avatar" style="background:{{ avatar_color }}">{{ initials }}</span>
+    <span class="profile-btn-info">
+      <span id="profileBtnName" class="profile-btn-name">{{ display_name }}</span>
+      <span id="profileBtnPlan" class="profile-btn-plan">{{ subscription_plan }}</span>
+    </span>
+  </button>
+  {% else %}
+  <button id="btnProfileIcon" class="profile-icon-btn" title="Profile (temporarily disabled)"
+          data-frozen="1" aria-disabled="true" style="cursor: default;">&#128100;</button>
+  {% endif %}
+  <div id="profileDropdown" class="profile-dropdown hidden">
+    {% if logged_in %}
+    <button class="dropdown-item" id="btnProfile" data-i18n="profile.profile">Profile</button>
+    <button class="dropdown-item" id="btnSubscriptions" data-i18n="profile.subscriptions">Subscriptions</button>
+    <div class="dropdown-divider"></div>
+    <button class="dropdown-item" id="btnLogout" data-i18n="profile.logout">Logout</button>
+    {% else %}
+    <button class="dropdown-item" id="btnLoginDropdown" data-i18n="profile.login">Login</button>
+    {% endif %}
+  </div>
+</div>
+<script>
+  // Enterprise: freeze the profile button. Swallow the click in the capture
+  // phase before any other handler can run so the dropdown / modal never
+  // appears. Logout still works via direct navigation to /auth/logout.
+  (function() {
+    const btn = document.getElementById('btnProfileIcon');
+    if (!btn || btn.getAttribute('data-frozen') !== '1') return;
+    btn.addEventListener('click', function(e) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }, true);
+  })();
+</script>
