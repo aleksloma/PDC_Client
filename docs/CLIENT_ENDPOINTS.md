@@ -112,7 +112,9 @@ The full enterprise split inside one turn:
 | `POST` | `/api/chat/{chat_id}/conversation/{conv_id}/download_pptx` | PPTX (python-pptx) |
 
 Both call `/v1/report` (no values) to get `report_structure` JSON, then merge
-the narrative into the client's own template locally.
+the narrative into the client's own template locally. Both authorize the caller
+as the chat owner OR a shared recipient, and a non-owner may export ONLY a
+`conv_id` in their own index — see **Per-user conversation isolation** below.
 
 **Per-tenant PowerPoint template (PPTX exports + Auto Analytics):**
 
@@ -193,9 +195,10 @@ values leave the client.
 
 | Endpoint | Behavior |
 |---|---|
-| `POST /api/chat/{id}/share` | adds recipients to `meta.json["sharing"]["shared_with"]`, asks brain `/v1/send_share_email` to SMTP-relay invites using this tenant's SMTP config |
+| `POST /api/chat/{id}/share` | **chat-level share (empty chat)** — adds recipients to `meta.json["sharing"]["shared_with"]` AND registers the chat in each recipient's sidebar via `AuthStore.record_shared_chat` (same uploaded data/files/schema, but NONE of the owner's conversations). The recipient opens an EMPTY chat and creates their own conversations (recorded under their own `conversations.jsonl` by the chat stream). No conversation is copied. Then asks brain `/v1/send_share_email` to SMTP-relay invites using this tenant's SMTP config |
 | `GET  /api/chat/{id}/share` | returns the current sharing record (`{shared_with, owner}`) |
-| `POST /auth/conversations/{conv_id}/share` | **conversation-level share** — for each recipient, snapshot the conversation history into a fresh `conv_id` via `ChatDataStore.copy_conv_to_new`, add them to the chat's `sharing.shared_with`, record the new conv in the recipient's `conversations.jsonl` with title prefix "(Shared) …" and `shared_by` field, then SMTP-relay an invite. Recipients access the chat through `_require_chat`'s shared-recipient check |
+| `POST /auth/conversations/{conv_id}/share` | **conversation-level share** — for each recipient, snapshot the conversation history into a fresh `conv_id` via `ChatDataStore.copy_conv_to_new`, add them to the chat's `sharing.shared_with`, record ONLY that new conv in the recipient's `conversations.jsonl` with title prefix "(Shared) …" and `shared_by` field, then SMTP-relay an invite. The recipient sees only that one snapshot conversation under the parent chat (not the owner's other conversations), can continue it, and can start new conversations under the chat. Recipients access the chat through `_require_chat`'s shared-recipient check |
+| **Per-user conversation isolation** | A shared chat (chat-level OR conversation-level) lets a non-owner into the chat via `_require_chat`, but every conversation-scoped endpoint additionally enforces that a non-owner may only read/continue/edit/export conversations recorded in THEIR OWN `conversations.jsonl` — never the owner's other conversations in the same chat. The chat owner keeps full access to all their own conversations. Enforced by `local_store.user_owns_conversation` + the `_require_conv` / `_conv_in_scope` helpers (in `routes/chat.py`) across: `GET /conversation/{conv_id}/history`, the legacy `GET /{chat_id}/history` (owner → newest conv in the chat; non-owner → newest of THEIR own, else empty), `POST /chat/stream` (an existing `conv_id` must be in scope; a new conv with no id is recorded under the caller), `POST /edit-regenerate`, and the report `download_report` (PDF) / `download_pptx` endpoints in `routes/report.py`. Out-of-scope conv access returns 404 (chat endpoints) / 403 (report endpoints) |
 | `GET  /api/chat/{id}/full_table/{key}` | returns the full result table cached under `key`. The chat stream sets `full_table_key` on responses that contain a tabular result. Backed by a bounded in-memory LRU (256 most recent results) |
 | Conversation title generation | After the 2nd human message, the chat stream fires a background `brain_client.title()` call and renames the conversation via `AuthStore.rename_conversation` |
 | Activity logging | `auth.py` (login), `upload.py` (file_uploaded), `chat.py` (plot_generated, per chart), `report.py` (report_exported), `auto_analytics.py` (auto_analytics_completed) all call `brain_client.post_activity` → brain `/v1/activity` |

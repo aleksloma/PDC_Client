@@ -107,6 +107,33 @@ def _require_chat(request: Request, chat_id: str):
     return None, JSONResponse({"error": "Access denied"}, status_code=403)
 
 
+def _conv_in_scope(email: str, chat_id: str, conv_id: str) -> bool:
+    """Is `conv_id` accessible to `email` within `chat_id`?
+
+    The chat OWNER has full access to every conversation in their chat. A shared
+    (non-owner) recipient may ONLY touch conversations recorded in their own
+    per-user index — never the owner's other conversations in the same shared
+    chat. Keeps conversation isolation consistent across every conv-scoped
+    endpoint (history, chat stream, edit-regenerate, report download)."""
+    if local_store.get_chat_meta_owner(chat_id) == email:
+        return True
+    return local_store.user_owns_conversation(email, chat_id, conv_id)
+
+
+def _require_conv(request: Request, chat_id: str, conv_id: str):
+    """Chat-level membership (`_require_chat`) + conversation-level scope.
+
+    Returns (email, None) on success, or (None, JSONResponse) on failure. A
+    non-owner asking for a conversation outside their own index gets a 404 (we
+    do not reveal that the owner's other conversations exist)."""
+    email, err = _require_chat(request, chat_id)
+    if err:
+        return None, err
+    if not _conv_in_scope(email, chat_id, conv_id):
+        return None, JSONResponse({"error": "Conversation not found"}, status_code=404)
+    return email, None
+
+
 # ---------------------------------------------------------------------------
 # Welcome + schema + history
 # ---------------------------------------------------------------------------
@@ -172,7 +199,7 @@ async def save_schema(request: Request, chat_id: str):
 
 @router.get("/{chat_id}/conversation/{conv_id}/history")
 async def history(request: Request, chat_id: str, conv_id: str):
-    email, err = _require_chat(request, chat_id)
+    email, err = _require_conv(request, chat_id, conv_id)
     if err:
         return err
     store = local_store.ChatDataStore(chat_id)
@@ -181,17 +208,31 @@ async def history(request: Request, chat_id: str, conv_id: str):
 
 @router.get("/{chat_id}/history")
 async def chat_history(request: Request, chat_id: str):
-    """Legacy single-conversation history — return the most recent conv."""
+    """Legacy single-conversation history — return the most recent conv.
+
+    The OWNER gets the newest conversation in the whole chat. A non-owner
+    (shared recipient) is scoped to THEIR OWN conversations in this chat (newest
+    first via the per-user index); it never exposes the owner's other convs.
+    """
     email, err = _require_chat(request, chat_id)
     if err:
         return err
     store = local_store.ChatDataStore(chat_id)
-    # Pick the newest conversation file
     try:
-        convs = sorted(store.conversations_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not convs:
+        if local_store.get_chat_meta_owner(chat_id) == email:
+            # Owner: newest conversation file in the chat directory.
+            convs = sorted(store.conversations_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if not convs:
+                return {"history": []}
+            conv_id = convs[0].stem
+            return {"history": store.get_history(conv_id), "conv_id": conv_id}
+        # Non-owner: only their own conversations in this chat. list_conversations
+        # is already sorted newest-first, so the first match is the most recent.
+        own = [c for c in local_store.AuthStore().list_conversations(email)
+               if c.get("chat_id") == chat_id and c.get("conv_id")]
+        if not own:
             return {"history": []}
-        conv_id = convs[0].stem
+        conv_id = own[0]["conv_id"]
         return {"history": store.get_history(conv_id), "conv_id": conv_id}
     except Exception:
         return {"history": []}
@@ -219,6 +260,11 @@ async def chat_stream(request: Request, chat_id: str):
     conv_id = body.get("conv_id")
     if not question:
         return JSONResponse({"error": "Question cannot be empty."}, status_code=400)
+    # Continuing an EXISTING conversation: a non-owner may only continue one in
+    # their own index (a fresh conv with no conv_id is created + recorded under
+    # the caller below, so it stays theirs).
+    if conv_id and not _conv_in_scope(email, chat_id, conv_id):
+        return JSONResponse({"error": "Conversation not found"}, status_code=404)
 
     store = local_store.ChatDataStore(chat_id)
     dfs = store.load_dataframes()
@@ -440,6 +486,9 @@ async def edit_regenerate(request: Request, chat_id: str):
         return JSONResponse({"error": "Question cannot be empty."}, status_code=400)
     if not conv_id:
         return JSONResponse({"error": "Conversation ID is required."}, status_code=400)
+    # A non-owner may only edit-regenerate a conversation in their own index.
+    if not _conv_in_scope(email, chat_id, conv_id):
+        return JSONResponse({"error": "Conversation not found"}, status_code=404)
 
     store = local_store.ChatDataStore(chat_id)
     if not store.root.exists():
@@ -679,6 +728,17 @@ async def share_post(request: Request, chat_id: str):
     store.write_meta(meta)
 
     chat_title = meta.get("title", "")
+    # Register the chat in each recipient's sidebar as an EMPTY chat: same
+    # uploaded data/files/schema, but NONE of the owner's conversations. The
+    # recipient starts fresh and creates their own conversations (recorded under
+    # their own conversations.jsonl by the chat-stream endpoint). We deliberately
+    # do NOT copy or record any conversation here — that is the conversation-share
+    # path (routes/auth.py). `record_shared_chat` is idempotent per chat_id.
+    files = [f.get("file_name") for f in meta.get("files", []) if f.get("file_name")]
+    for rec in recipients:
+        local_store.AuthStore().record_shared_chat(
+            rec, chat_id, chat_title or "Chat", files, shared_by=email)
+
     smtp_result = {"smtp_configured": False, "sent": [], "failed": []}
     if new_recipients:
         try:
