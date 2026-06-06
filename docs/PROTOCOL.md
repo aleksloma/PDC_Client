@@ -71,8 +71,23 @@ receives generated code to execute locally.
 
 ## `POST /v1/retry`
 
-Used when local execution of the planned code raises an error. The client sends
-the failed code + error text + schema and receives corrected code.
+Same shape as the B2C `_retry_code_with_error`. The brain rebuilds the
+"previous code failed with X — here is the schema — produce corrected
+code" prompt and calls the simple (or complex, on later attempts) model.
+
+**Same-type fidelity (do not regress).** In the global B2C edition the
+type-preservation is enforced by the orchestrator (`run_chat`), which re-checks
+the retry's `kind` against the *original* code's kind and rejects a mismatch.
+That orchestrator runs on the **client** in the enterprise split, so `/v1/retry`
+never receives the original kind — it infers it from `failed_code`. The brain's
+retry system instruction (`brain_agent._build_retry_system_instruction`)
+therefore detects chart code in `failed_code` (matplotlib / seaborn / plotly,
+via `_looks_like_plot_code`) and, when present, REQUIRES the corrected reply to
+be a fenced `python` code block that produces a **figure** — a prose-only or
+plain-text reply is forbidden. For plain-python failures no figure requirement
+is added. This guarantees a chart retry comes back as chart code, not prose.
+No raw data values are involved (Constitution Art. II): only the failed code,
+its error text, and column NAMES feed the prompt.
 
 ### Request
 
@@ -86,8 +101,8 @@ the failed code + error text + schema and receives corrected code.
   "history_rows": [ ... ],
   "error_msg": "KeyError: 'Department'",
   "failed_code": "df.groupby('Department')['salary'].mean()",
-  "use_pro": false,                       // hint: harder retry
-  "use_search": false,                    // hint: allow web grounding on last retry
+  "use_pro": false,                       // promotes to complex model on 2nd retry
+  "use_search": false,                    // enables Google Search grounding on last retry
   "user_email": "alice@acme.com"
 }
 ```
@@ -99,7 +114,8 @@ the failed code + error text + schema and receives corrected code.
   "raw_text": "...",
   "kind": "PYTHON",
   "code": "df.groupby('department')['salary'].mean()",
-  "usage": { ... }
+  "usage": { ... },
+  "model_used": "gemini-2.5-pro"
 }
 ```
 

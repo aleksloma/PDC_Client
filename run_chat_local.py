@@ -126,7 +126,7 @@ def run_chat(
     exec_out = executor(code, dfs, sid) if kind == "PLOT_CODE" else executor(code, dfs, sid)
 
     retry_count = 0
-    max_retries = 2  # 0=original, 1=retry, 2=pro
+    max_retries = 3  # up to 3 retry attempts; escalate to pro/search from the 2nd
     while exec_out.get("error") and retry_count < max_retries:
         error_msg = exec_out.get("error", "Unknown")
         log_with_sid(sid, "warning", f"EXEC_ERROR attempt {retry_count+1}: {error_msg[:200]}")
@@ -143,13 +143,15 @@ def run_chat(
         new_code = retry_out.get("code") or ""
         new_kind = retry_out.get("kind")
         usage = _sum_usage(usage, retry_out.get("usage") or {})
-        if not new_code or new_kind == "NO_CODE":
-            break
+        retry_count += 1
+        # A retry that returns prose (NO_CODE/CLARIFICATION) or no code is a
+        # FAILED attempt, not a reason to abort: keep retrying with escalation.
+        if not new_code or new_kind in ("NO_CODE", "CLARIFICATION"):
+            continue
         code = new_code
         kind = new_kind
         executor = render_plot_safe if kind == "PLOT_CODE" else safe_execute
         exec_out = executor(code, dfs, sid)
-        retry_count += 1
 
     if exec_out.get("error"):
         log_with_sid(sid, "error", f"EXEC_FINAL_ERROR after {retry_count+1} attempts")
@@ -306,7 +308,7 @@ def run_chat_multi_plot(
 
         plot_out = render_plot_safe(code, dfs, sid)
         retry_count = 0
-        max_retries = 2
+        max_retries = 3  # up to 3 retry attempts; escalate to pro/search from the 2nd
 
         while plot_out.get("error") and retry_count < max_retries:
             error_msg = plot_out.get("error", "Unknown")
@@ -325,18 +327,43 @@ def run_chat_multi_plot(
             new_code = retry_out.get("code") or ""
             new_kind = retry_out.get("kind")
             total_usage = _sum_usage(total_usage, retry_out.get("usage") or {})
-            if not new_code or new_kind != "PLOT_CODE":
-                break
-            code = new_code
-            plot_out = render_plot_safe(code, dfs, sid)
             retry_count += 1
+            # A retry returning prose (NO_CODE) or no code is a FAILED attempt,
+            # not a reason to abort the block: keep retrying with escalation.
+            if not new_code:
+                continue
+            if new_kind == "PLOT_CODE":
+                code = new_code
+                plot_out = render_plot_safe(code, dfs, sid)
+                continue
+            if new_kind == "PYTHON":
+                # The brain rewrote it as analysis code. Execute it; accept the
+                # chart ONLY if it produced an image, else treat as a failed
+                # attempt and keep retrying.
+                py_out = safe_execute(new_code, dfs, sid)
+                if py_out.get("image_base64"):
+                    code = new_code
+                    plot_out = py_out
+                    break
+                continue
+            # Any other kind (CLARIFICATION, …) → failed attempt; keep retrying.
+            continue
 
-        if plot_out.get("error"):
+        # Determine the renderable chart from either executor's output shape
+        # (render_plot_safe → image/plotly_html; safe_execute → image_base64).
+        img_b64 = None
+        if not plot_out.get("error"):
+            if plot_out.get("image_base64"):
+                img_b64 = plot_out.get("image_base64")
+            elif plot_out.get("is_plotly"):
+                img_b64 = plot_out.get("plotly_html")
+            else:
+                img_b64 = plot_out.get("image")
+
+        if not img_b64:
             log_with_sid(sid, "warning",
                          f"MULTI_PLOT_SKIP chart={chart_n} after {retry_count+1} attempts")
             continue
-
-        img_b64 = plot_out.get("plotly_html") if plot_out.get("is_plotly") else plot_out.get("image")
         # Describe from code (brain — no data leaves)
         d = brain_client.describe(sid=sid, question=question, code=code, user_email=user_email)
         text = d.get("text") or ""
@@ -354,7 +381,12 @@ def run_chat_multi_plot(
             "usage": dict(total_usage), "code": code,
         }
 
-    combined_text = "\n\n".join(combined_answers) if combined_answers else "Analysis complete."
+    # If every block failed all its retries we rendered ZERO charts — surface a
+    # clear failure rather than the misleading bare "Analysis complete.".
+    combined_text = (
+        "\n\n".join(combined_answers) if combined_answers
+        else "Something went wrong with this analysis. Please try again."
+    )
     log_with_sid(sid, "info",
                  f"MULTI_PLOT_DONE rendered={len(combined_answers)}/{total_charts}")
     yield {
@@ -385,29 +417,32 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
     exec_out = executor(code, dfs, sid)
 
     retry_count = 0
-    max_retries = 2
+    max_retries = 3  # up to 3 retry attempts; escalate to pro/search from the 2nd
     while exec_out.get("error") and retry_count < max_retries:
         error_msg = exec_out.get("error", "Unknown")
         log_with_sid(sid, "warning", f"EXEC_ERROR attempt {retry_count+1}: {error_msg[:200]}")
         use_pro = retry_count >= 1
+        use_search = retry_count >= 1
         retry_out = brain_client.retry(
             sid=sid, question=question, schema_text=schema_str,
             df_names=df_names, df_columns=df_columns,
             history_rows=history_rows,
             error_msg=error_msg, failed_code=code,
-            use_pro=use_pro, use_search=use_pro,
+            use_pro=use_pro, use_search=use_search,
             user_email=user_email,
         )
         new_code = retry_out.get("code") or ""
         new_kind = retry_out.get("kind")
         usage = _sum_usage(usage, retry_out.get("usage") or {})
-        if not new_code or new_kind == "NO_CODE":
-            break
+        retry_count += 1
+        # A retry that returns prose (NO_CODE/CLARIFICATION) or no code is a
+        # FAILED attempt, not a reason to abort: keep retrying with escalation.
+        if not new_code or new_kind in ("NO_CODE", "CLARIFICATION"):
+            continue
         code = new_code
         kind = new_kind
         executor = render_plot_safe if kind == "PLOT_CODE" else safe_execute
         exec_out = executor(code, dfs, sid)
-        retry_count += 1
 
     if exec_out.get("error"):
         return {

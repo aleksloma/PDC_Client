@@ -16,14 +16,16 @@ LLM work is done in a worker thread; results come back through an
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import re
 import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import local_store
 import run_chat_local
@@ -49,6 +51,38 @@ def _cache_full_table(table: dict) -> str:
         old = _FULL_TABLE_ORDER.pop(0)
         _FULL_TABLE_CACHE.pop(old, None)
     return key
+
+
+_XLSX_MEDIA_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+
+def _safe_xlsx_filename(filename: str) -> str:
+    """Sanitize the client-supplied filename stem (no extension, no path/header
+    injection). Mirrors the frontend's `table_<timestamp>` convention."""
+    stem = re.sub(r"[^A-Za-z0-9_-]", "_", (filename or "").strip())[:60]
+    return stem or "table"
+
+
+def _build_xlsx_response(columns: list, rows: list, filename: str) -> Response:
+    """Build an in-memory .xlsx from columns + row dicts and return it as a
+    download. 100% client-local — no brain call, raw data never leaves the
+    client (Constitution Art. II / Art. V)."""
+    import pandas as pd
+
+    cols = list(columns or [])
+    df = pd.DataFrame(rows or [], columns=cols or None)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Data")
+    buf.seek(0)
+    safe = _safe_xlsx_filename(filename)
+    return Response(
+        content=buf.getvalue(),
+        media_type=_XLSX_MEDIA_TYPE,
+        headers={"Content-Disposition": f'attachment; filename="{safe}.xlsx"'},
+    )
 
 
 router = APIRouter(prefix="/api/chat", tags=["client-chat"])
@@ -271,6 +305,10 @@ async def chat_stream(request: Request, chat_id: str):
     if not dfs:
         return JSONResponse({"error": "Chat dataset is empty."}, status_code=400)
     schema_docs = store.schema_docs()
+    # User-confirmed join columns (same source as GET /{chat_id}/schema): the
+    # planner needs them so build_schema_text includes the join relationships,
+    # exactly as Auto Analytics already does.
+    common_fields = store.read_meta().get("common_fields") or []
 
     sid = secrets.token_hex(8)
     if not conv_id:
@@ -304,7 +342,7 @@ async def chat_stream(request: Request, chat_id: str):
                 gen = run_chat_local.run_chat_multi_plot(
                     sid=sid, dfs=dfs, schema_docs=schema_docs,
                     question=question, history_rows=history_rows,
-                    user_email=email,
+                    user_email=email, common_fields=common_fields,
                 )
                 for event in gen:
                     loop.call_soon_threadsafe(queue.put_nowait, ("event", event))
@@ -519,6 +557,9 @@ async def edit_regenerate(request: Request, chat_id: str):
         if not dfs:
             return JSONResponse({"error": "Chat dataset is empty."}, status_code=400)
         schema_docs = store.schema_docs()
+        # User-confirmed join columns — pass to the planner so the regenerated
+        # schema text carries the join relationships (same as the chat stream).
+        common_fields = store.read_meta().get("common_fields") or []
 
         sid = secrets.token_hex(8)
         history_rows = store.get_history(conv_id)
@@ -533,7 +574,7 @@ async def edit_regenerate(request: Request, chat_id: str):
             return list(run_chat_local.run_chat_multi_plot(
                 sid=sid, dfs=dfs, schema_docs=schema_docs,
                 question=edited_question, history_rows=history_rows,
-                user_email=email,
+                user_email=email, common_fields=common_fields,
             ))
 
         events = await loop.run_in_executor(_EXEC, _run_blocking)
@@ -859,3 +900,53 @@ async def full_table_get(request: Request, chat_id: str, key: str):
     if not tbl:
         return JSONResponse({"error": "Full table not found or expired."}, status_code=404)
     return tbl
+
+
+# ---------------------------------------------------------------------------
+# Excel download — 100% client-local (no brain call). dashboard.js / chat.js
+# POST these from the "Download Excel" button under a result table:
+#   - export_excel: the preview table the frontend already holds (columns/rows).
+#   - download_excel/{full_key}: the full cached table minted by the chat stream.
+# Raw data never leaves the client (Constitution Art. II / Art. V).
+# ---------------------------------------------------------------------------
+@router.post("/{chat_id}/export_excel")
+async def export_excel(request: Request, chat_id: str):
+    """Body: {columns, rows, filename}. Returns an .xlsx of the posted table."""
+    email, err = _require_chat(request, chat_id)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    columns = body.get("columns") or []
+    rows = body.get("rows") or []
+    filename = body.get("filename") or "table"
+    try:
+        return _build_xlsx_response(columns, rows, filename)
+    except Exception as e:
+        log_with_sid(email, "error", f"EXPORT_EXCEL_ERROR chat_id={chat_id}: {type(e).__name__}: {e}")
+        return JSONResponse({"error": "Failed to build Excel file."}, status_code=500)
+
+
+@router.post("/{chat_id}/download_excel/{full_key}")
+async def download_excel(request: Request, chat_id: str, full_key: str):
+    """Serve the full table cached under `full_key` (minted by the chat stream)
+    as an .xlsx. Clean JSON 404 if the key has expired out of the LRU."""
+    email, err = _require_chat(request, chat_id)
+    if err:
+        return err
+    tbl = _FULL_TABLE_CACHE.get(full_key)
+    if not tbl:
+        return JSONResponse({"error": "Full table not found or expired."}, status_code=404)
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    filename = body.get("filename") or "table"
+    try:
+        return _build_xlsx_response(tbl.get("columns") or [], tbl.get("rows") or [], filename)
+    except Exception as e:
+        log_with_sid(email, "error", f"DOWNLOAD_EXCEL_ERROR chat_id={chat_id}: {type(e).__name__}: {e}")
+        return JSONResponse({"error": "Failed to build Excel file."}, status_code=500)

@@ -98,9 +98,41 @@ The full enterprise split inside one turn:
 1. Client loads dfs from local disk + builds schema text (`_schema_text` port).
 2. POST → `/v1/plan` → brain returns code.
 3. Client executes code locally with `safe_execute` / `render_plot_safe`.
-4. On execution error → POST `/v1/retry` (up to 2 retries), client retries.
+4. On execution error → POST `/v1/retry` → client re-executes. The orchestrator
+   (`run_chat_local`) retries each failing unit up to **3 attempts**, escalating
+   `use_pro` / `use_search` to `true` from the 2nd retry onward. A retry that
+   returns prose (`NO_CODE`/`CLARIFICATION`) or the wrong code kind counts as a
+   failed attempt — it never aborts the loop early, so the harder-model
+   escalation is always reached. In a multi-chart response a retry that returns
+   runnable `PYTHON` is executed and accepted only if it produces a chart image.
+   If a multi-chart turn ends with **zero** rendered charts, the persisted answer
+   is "Something went wrong with this analysis. Please try again." (never the
+   bare "Analysis complete.").
 5. POST → `/v1/describe` (or `/v1/summarize` for scalar results) → brain
    returns the natural-language intro. No row values cross the boundary.
+
+> The chat stream and edit-regenerate both load the chat's saved
+> `common_fields` from `meta.json` and pass them into the planner, so
+> `build_schema_text` carries the user-confirmed join relationships (matching
+> Auto Analytics).
+
+---
+
+## Table Excel download (client-local)
+
+The "📥 Download Excel" button under a result table (`static/chat.js`,
+`static/dashboard.js`) POSTs one of two endpoints. Both are **100% client-local**
+— no brain call — and build an in-memory `.xlsx` with `openpyxl` (already a
+dependency), so raw data never leaves the client (Constitution Art. II / Art. V).
+Both authorize via `_require_chat`.
+
+| Method | Path | Behavior |
+|---|---|---|
+| `POST` | `/api/chat/{chat_id}/export_excel` | Body `{columns, rows, filename}`. Builds a DataFrame from the posted preview table and streams it as `.xlsx` with `Content-Disposition: attachment; filename="{filename}.xlsx"` (filename sanitized). |
+| `POST` | `/api/chat/{chat_id}/download_excel/{full_key}` | Body `{filename}`. Serves the full table cached under `full_key` (minted by the chat stream and exposed via `full_table_key`) as `.xlsx`. Clean JSON **404** if the key has expired out of the bounded LRU. |
+
+The media type is
+`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`.
 
 ---
 
