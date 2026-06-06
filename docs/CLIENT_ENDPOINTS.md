@@ -214,12 +214,25 @@ gracefully handles them:
 | Endpoint | Returns | Reason |
 |---|---|---|
 | `POST /api/chat/{id}/publish`, `/unpublish` | 400 | no public pages on-prem (architecture: sharing is OPEN, public publish is out of scope) |
+| `POST /auth/conversations/{conv_id}/publish`, `/unpublish` | 400 | conversation-level public publish — same reason as chat-level |
+| `GET /paddle/config` | 200 `{enabled:false, client_token:null, environment:null}` | billing is off-prem; benign config so the page-load Paddle bootstrap is a no-op (no `client_token` → no `Paddle.Initialize`) and there is no 404 |
+| `POST /auth/subscription` | 400 | enterprise plan is constant ("Enterprise"); no plan changes (the `GET` returns the constant plan) |
+| `POST /api/paddle/subscription/{update-payment,reactivate,preview,cancel,update}` | 400 | Paddle billing is off-prem |
 | `POST /upload/init`, `/upload/finalize` | 400 | direct-to-GCS path only |
 | `POST /upload_from_url` | 400 | Google Drive/Sheets are off-prem |
+
+The billing/publish stubs live in [`routes/auth.py`](../routes/auth.py); the
+chat-level publish stub is in [`routes/chat.py`](../routes/chat.py). All require
+the same session auth as their sibling routes and expose no internals (Art. IV).
 
 > Auto Analytics (`*/auto_analysis/start|status|download`) is **implemented** on-prem
 > (brain-side planner + client-side execution + PPTX render). See the "Implemented
 > on-prem" table below for the full row.
+
+> **Active frontend assets.** `/lab` (`templates/dashboard.html`) loads only
+> `static/i18n.js` + `static/dashboard.js`. The legacy B2C bundles `chat.js`,
+> `config.js`, `login.js`, `register.js` were referenced by no template and were
+> removed (2026-06) to prevent phantom-endpoint confusion.
 
 ---
 
