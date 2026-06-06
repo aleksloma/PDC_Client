@@ -58,11 +58,11 @@ _XLSX_MEDIA_TYPE = (
 )
 
 
-def _safe_xlsx_filename(filename: str) -> str:
-    """Sanitize the client-supplied filename stem (no extension, no path/header
-    injection). Mirrors the frontend's `table_<timestamp>` convention."""
+def _safe_download_filename(filename: str, fallback: str = "download") -> str:
+    """Sanitize a client-supplied filename stem (no extension, no path/header
+    injection). Shared by the Excel and PNG download endpoints."""
     stem = re.sub(r"[^A-Za-z0-9_-]", "_", (filename or "").strip())[:60]
-    return stem or "table"
+    return stem or fallback
 
 
 def _build_xlsx_response(columns: list, rows: list, filename: str) -> Response:
@@ -77,7 +77,7 @@ def _build_xlsx_response(columns: list, rows: list, filename: str) -> Response:
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Data")
     buf.seek(0)
-    safe = _safe_xlsx_filename(filename)
+    safe = _safe_download_filename(filename, fallback="table")
     return Response(
         content=buf.getvalue(),
         media_type=_XLSX_MEDIA_TYPE,
@@ -950,3 +950,74 @@ async def download_excel(request: Request, chat_id: str, full_key: str):
     except Exception as e:
         log_with_sid(email, "error", f"DOWNLOAD_EXCEL_ERROR chat_id={chat_id}: {type(e).__name__}: {e}")
         return JSONResponse({"error": "Failed to build Excel file."}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Plotly chart PNG download — 100% client-local (no brain call). The chart
+# "Download high-resolution PNG" button (static/dashboard.js, static/chat.js)
+# POSTs the rendered interactive Plotly HTML; we rebuild the figure and render
+# a high-res PNG via kaleido (same mechanism as plot_utils._encode_plotly_figure).
+# Raw data never leaves the client (Constitution Art. II / Art. V).
+# ---------------------------------------------------------------------------
+_PLOTLY_NEWPLOT_MARKER = "Plotly.newPlot("
+
+
+def _plotly_png_from_html(html: str, scale: float) -> bytes:
+    """Rebuild the Plotly figure from the `Plotly.newPlot(...)` call embedded in
+    the rendered HTML (div_id, data, layout are positional JSON args) and render
+    a PNG via kaleido. Raises ValueError if the HTML has no parseable figure."""
+    import plotly.graph_objects as go
+
+    start = html.find(_PLOTLY_NEWPLOT_MARKER)
+    if start == -1:
+        raise ValueError("no Plotly.newPlot call in HTML")
+    decoder = json.JSONDecoder()
+    idx = start + len(_PLOTLY_NEWPLOT_MARKER)
+
+    def _next_json(s: str, i: int):
+        while i < len(s) and s[i] in " \t\r\n,":
+            i += 1
+        return decoder.raw_decode(s, i)
+
+    _div_id, idx = _next_json(html, idx)   # "plotly-chart"
+    data, idx = _next_json(html, idx)      # [ traces ... ]
+    layout, idx = _next_json(html, idx)    # { layout ... }
+    fig = go.Figure(data=data, layout=layout)
+    # High-res export at the requested scale; same base canvas as the inline
+    # render in plot_utils._encode_plotly_figure (1200x800).
+    return fig.to_image(format="png", width=1200, height=800, scale=scale)
+
+
+@router.post("/{chat_id}/export_plotly_png")
+async def export_plotly_png(request: Request, chat_id: str):
+    """Body: {html, filename, scale}. Render the interactive plotly chart to a
+    high-resolution PNG locally and return it as a download."""
+    email, err = _require_chat(request, chat_id)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    html = body.get("html") or ""
+    filename = body.get("filename") or "chart"
+    # Clamp scale to a sane range (default 2 — matches the inline render).
+    try:
+        scale = float(body.get("scale") or 2)
+    except (TypeError, ValueError):
+        scale = 2.0
+    scale = max(1.0, min(scale, 5.0))
+
+    if not isinstance(html, str) or _PLOTLY_NEWPLOT_MARKER not in html:
+        return JSONResponse({"error": "No renderable plotly chart in request."}, status_code=400)
+    try:
+        png = _plotly_png_from_html(html, scale)
+    except Exception as e:
+        log_with_sid(email, "error", f"EXPORT_PLOTLY_PNG_ERROR chat_id={chat_id}: {type(e).__name__}: {e}")
+        return JSONResponse({"error": "Could not render this chart to PNG."}, status_code=400)
+    safe = _safe_download_filename(filename, fallback="chart")
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Content-Disposition": f'attachment; filename="{safe}.png"'},
+    )

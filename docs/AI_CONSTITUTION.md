@@ -56,6 +56,23 @@ accidental row leakage in `/v1/summarize`: only `str | int | float | bool`
 pass through; dicts, lists, DataFrames are dropped to `None`. Do not weaken or
 bypass this.
 
+### Client-side logging
+The client logs metadata only — never full request/response payloads — by
+default (`log_with_sid`, truncated). Client logs stay on the local host.
+
+**Exception — `CLIENT_LLM_DEBUG` (default OFF).** When the operator sets the
+`CLIENT_LLM_DEBUG` env flag ON, `brain_client._post` emits the full brain
+request (`BRAIN_REQUEST` — question, df_names, schema_text, history size,
+error_msg, failed_code) and the full brain response (`BRAIN_RESPONSE` — kind,
+code, text, finish_reason, usage), each truncated to `CLIENT_LLM_DEBUG_MAX_CHARS`
+(default 20000). This stays inside the data boundary because the brain request
+carries no raw row values by design (question text, schema/column names,
+generated code, error text — see above); there are no row values to leak. It is
+a diagnostic switch, OFF by default, and must be turned back OFF once validation
+is done. Independently of the flag, the HTTP status + error body on any non-200
+or transport error is logged UNCONDITIONALLY (truncated to ~2000 chars) — a
+brain rejection must never be silently swallowed (Article IV).
+
 ---
 
 ## Article III: The Client Never Calls a Model

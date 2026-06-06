@@ -40,6 +40,11 @@ docker run --rm -p 8000:8000 \
 | `BRAIN_TENANT_TOKEN` | Per-tenant bearer token issued by the operator. **Never commit.** |
 | `SECRET_KEY`         | Local session-cookie signing secret. Generate once, keep stable.  |
 | `DATA_ROOT`          | Local-disk root for raw data + chats (default `/data/client`).    |
+| `CLIENT_LLM_DEBUG`   | Verbose brain-call debug logging to the LOCAL client log (default OFF; `1`/`true` to enable). Logs `BRAIN_REQUEST` / `BRAIN_RESPONSE` per call. Boundary-safe — brain payloads carry no row values (Art. II). Turn back OFF after diagnosing. |
+| `CLIENT_LLM_DEBUG_MAX_CHARS` | Per-field truncation for the debug logs (default `20000`). |
+
+A failed brain call always logs its HTTP status + body snippet (~2000 chars)
+regardless of `CLIENT_LLM_DEBUG` — an API rejection is never silently swallowed.
 
 The client listens on **port 8000**. Open `http://localhost:8000` → enter your
 work email → land in `/lab`.

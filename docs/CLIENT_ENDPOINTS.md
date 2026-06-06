@@ -136,6 +136,23 @@ The media type is
 
 ---
 
+## Chart PNG download (client-local)
+
+The chart "Download high-resolution PNG" button under an interactive Plotly
+chart (`static/dashboard.js`, `static/chat.js`) POSTs the rendered Plotly HTML.
+The endpoint is **100% client-local** — no brain call — and renders the PNG with
+kaleido (already a dependency), so raw data never leaves the client
+(Constitution Art. II / Art. V). Authorizes via `_require_chat`.
+
+| Method | Path | Behavior |
+|---|---|---|
+| `POST` | `/api/chat/{chat_id}/export_plotly_png` | Body `{html, filename, scale}`. Rebuilds the figure from the `Plotly.newPlot(...)` call embedded in the posted HTML and renders a high-res PNG (`fig.to_image`, same mechanism as `plot_utils._encode_plotly_figure`), honoring `scale` clamped to 1..5. Returns `image/png` with `Content-Disposition: attachment; filename="{filename}.png"` (filename sanitized). Clean JSON **400** if the HTML has no parseable plotly figure. |
+
+Matplotlib charts are delivered inline as base64 and downloaded client-side;
+only the interactive Plotly path needs this server-side render.
+
+---
+
 ## Reports (rendered locally, narrative from brain)
 
 | Method | Path | Purpose |
