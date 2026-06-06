@@ -63,7 +63,8 @@ receives generated code to execute locally.
   "kind": "PYTHON",                       // PYTHON | PLOT_CODE | NO_CODE | CLARIFICATION
   "code": "result = df.groupby('department')['salary'].mean()",
   "usage": { "input_tokens": 1234, "output_tokens": 56, "total_tokens": 1290 },
-  "context_decision": { "complexity": "simple", "complexity_score": 5, "skills_needed": ["analytics_libraries"], "is_greeting": false }
+  "context_decision": { "complexity": "simple", "complexity_score": 5, "skills_needed": ["analytics_libraries"], "is_greeting": false },
+  "model_used": "..."                     // the tenant-resolved model (informational)
 }
 ```
 
@@ -115,7 +116,7 @@ its error text, and column NAMES feed the prompt.
   "kind": "PYTHON",
   "code": "df.groupby('department')['salary'].mean()",
   "usage": { ... },
-  "model_used": "gemini-2.5-pro"
+  "model_used": "..."                     // the tenant-resolved model (informational)
 }
 ```
 
