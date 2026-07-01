@@ -825,6 +825,16 @@ button.danger:hover {
   cursor: not-allowed;
 }
 
+/* Stop state: the send button becomes a Stop button while generating. */
+.send-btn.is-stop,
+#btnSend.is-stop {
+  background: #dc2626;
+}
+.send-btn.is-stop:hover,
+#btnSend.is-stop:hover {
+  background: #b91c1c;
+}
+
 /* Modal Overrides for Dashboard */
 .wizard-modal {
   width: min(700px, 95vw);

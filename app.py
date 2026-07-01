@@ -138,6 +138,54 @@ async def lab(request: Request):
     )
 
 
+@app.get("/c/{conv_id}", response_class=HTMLResponse)
+async def open_conversation_deeplink(request: Request, conv_id: str):
+    """Deep-link / hard-refresh target for a single conversation.
+
+    The frontend auto-opens `window.OPEN_CONV_ID`/`OPEN_CHAT_ID` on load, but a
+    direct hit to `/c/{conv_id}` previously 404'd because no server route
+    existed. This mirrors the `/lab` handler and additionally seeds the open
+    conversation. Never 404s: unknown/foreign conv → `/lab`; no session → `/`.
+    """
+    email = request.session.get("email")
+    if not email:
+        return RedirectResponse(url="/", status_code=302)
+    # Resolve the conversation's chat_id from this user's own conversations
+    # index (local_store records {conv_id, chat_id} per conversation). A conv
+    # that isn't in the caller's index (unknown or another user's) → /lab.
+    chat_id = None
+    try:
+        from local_store import AuthStore
+        for row in AuthStore().list_conversations(email):
+            if row.get("conv_id") == conv_id:
+                chat_id = row.get("chat_id")
+                break
+    except Exception as e:
+        log_with_sid(email, "error", f"DEEPLINK_LOOKUP_FAILED: {e}", conv_id=conv_id)
+        return RedirectResponse(url="/lab", status_code=302)
+    if not chat_id:
+        log_with_sid(email, "info", "DEEPLINK_CONV_NOT_FOUND", conv_id=conv_id)
+        return RedirectResponse(url="/lab", status_code=302)
+    log_with_sid(email, "info", "OPEN_CONV_DEEPLINK", conv_id=conv_id, chat_id=chat_id)
+    ts = int(time.time())
+    prof = _profile_context(email)
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {
+            "request": request,
+            "ts": ts,
+            "default_days": settings.CHAT_ACTIVE_DEFAULT_DAYS,
+            "max_days": settings.CHAT_ACTIVE_MAX_DAYS,
+            "is_admin": False,
+            "username": email,
+            "subscription_plan": "Enterprise",
+            "open_conv_id": conv_id,
+            "open_chat_id": chat_id,
+            **prof,
+        },
+    )
+
+
 @app.get("/health")
 async def health():
     from brain_client import health as brain_health

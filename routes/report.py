@@ -239,25 +239,8 @@ def _build_payload(request: Request, chat_id: str, conv_id: str):
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
     if not local_store.chat_exists(chat_id):
         return JSONResponse({"error": "Chat not found"}, status_code=404)
-    # Authorize owner OR a shared recipient — mirror routes/chat.py `_require_chat`
-    # so report download (PPTX/PDF) is allowed for everyone who can view the chat
-    # (chat-level + conversation-level sharing both populate
-    # meta.json["sharing"]["shared_with"]). A non-owner may additionally export
-    # ONLY a conversation that exists in their OWN index — never the owner's
-    # other conversations in the same shared chat.
     if local_store.get_chat_meta_owner(chat_id) != email:
-        allowed = False
-        try:
-            store = local_store.ChatDataStore(chat_id)
-            sharing = (store.read_meta().get("sharing") or {}).get("shared_with") or []
-            if email in [s.lower() for s in sharing]:
-                allowed = True
-        except Exception:
-            allowed = False
-        if not allowed:
-            return JSONResponse({"error": "Access denied"}, status_code=403)
-        if not local_store.user_owns_conversation(email, chat_id, conv_id):
-            return JSONResponse({"error": "Access denied"}, status_code=403)
+        return JSONResponse({"error": "Access denied"}, status_code=403)
 
     sid = secrets.token_hex(8)
     store = local_store.ChatDataStore(chat_id)

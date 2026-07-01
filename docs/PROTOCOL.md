@@ -1,42 +1,50 @@
 # Client ↔ Brain protocol
 
-This file documents the **brain HTTP surface** (`/v1/*`) **as the client uses
-it** — the request the client sends and the response it consumes. For the
-client-side HTTP surface that `dashboard.js` calls, see
+This file documents the **brain HTTP surface** (`/v1/*`). For the client-side
+HTTP surface that `dashboard.js` calls, see
 [`CLIENT_ENDPOINTS.md`](CLIENT_ENDPOINTS.md).
-
-> Scope: this is the client-facing contract only. The brain's internal
-> implementation (how it generates code or narratives, model selection, prompt
-> engineering, storage) is out of scope and lives in the private brain repo.
-
-Transport: **HTTPS**. Every `/v1/*` call requires
-`Authorization: Bearer <tenant_token>`. The brain validates the token;
-revoked / suspended tenants get **HTTP 403** (the kill-switch).
 
 ---
 
-## Fields the client builds for these calls
 
-| Field          | Built by the client from |
-|----------------|--------------------------|
-| `schema_text`  | `schema_builder.schema_text` — column names, dtypes, sampled hints |
-| `df_names`     | `list(dfs.keys())` |
-| `df_columns`   | `{name: list(df.columns)}` — only sent on retry, for column self-correction |
-| `history_rows` | the local conversation history (text turns only) |
-| `common_fields`| user-confirmed join columns |
-| `error_msg`    | `exec_out["error"]` from `safe_execute` |
-| `failed_code`  | the failed code block |
-| `preview`      | the scalar-only `_safe_preview` value (summarize) |
-| `qa_pairs`     | the no-value findings list the client builds locally (report) |
+> **Important:** the prompt explicitly said *"DO NOT invent new request /
+> response JSON shapes — read how the existing app already passes this
+> same data internally and reuse those existing shapes across the new
+> client↔brain boundary."*
+>
+> Every endpoint below corresponds 1:1 to a function in the existing B2C
+> codebase, with the only change being that pandas DataFrames are
+> replaced by pre-built schema text + df names. The pure-LLM payloads
+> are identical to what the B2C agent already builds in-process.
 
-No DataFrame rows or cell values appear in any field above.
+Transport: **HTTPS**. Every `/v1/*` call requires
+`Authorization: Bearer <tenant_token>`. The brain validates the token by
+lookup; revoked / suspended tenants get **HTTP 403** (the kill-switch).
+
+---
+
+## Field-shape mapping back to the B2C code
+
+| Brain field          | Same field in B2C | Built by |
+|---------------------|-------------------|----------|
+| `schema_text`       | return value of `_schema_text(schema_docs, dfs, common_fields)` | client (`schema_builder.schema_text`) |
+| `df_names`          | `list(dfs.keys())` | client |
+| `df_columns`        | `{name: list(df.columns)}` (only sent on retry, for column self-correction) | client |
+| `history_rows`      | the `history_rows` arg to `generate_pandas_code` / `summarize_answer` | client (`local_store.get_conversation_history`) |
+| `common_fields`     | the `common_fields` arg to `generate_pandas_code` | client |
+| `error_msg`         | `exec_out["error"]` from `safe_execute` | client |
+| `failed_code`       | the failed code block | client |
+| `preview` (summarize) | the `safe_preview` value the B2C code already restricts to scalars | client |
+| `qa_pairs` (report) | the `findings_for_llm` list the B2C `_generate_report_structure` already builds | client |
 
 ---
 
 ## `POST /v1/plan`
 
-The brain's planner. The client sends the question + schema text + history and
-receives generated code to execute locally.
+The brain's planner — same prompt + multi-turn history + model-fallback
+chain as `agent.generate_pandas_code`. Returns the same `(raw_text,
+usage, context_decision)` tuple the B2C code returns internally, plus
+the convenience `kind` + `code` from `_extract_code_kind`.
 
 ### Request
 
@@ -63,8 +71,8 @@ receives generated code to execute locally.
   "kind": "PYTHON",                       // PYTHON | PLOT_CODE | NO_CODE | CLARIFICATION
   "code": "result = df.groupby('department')['salary'].mean()",
   "usage": { "input_tokens": 1234, "output_tokens": 56, "total_tokens": 1290 },
-  "context_decision": { "complexity": "simple", "complexity_score": 5, "skills_needed": ["analytics_libraries"], "is_greeting": false },
-  "model_used": "..."                     // the tenant-resolved model (informational)
+  "context_decision": { "complexity": "simple", "complexity_score": 5, "skills_needed": ["analytics_libraries"], "is_greeting": false, ... },
+  "model_used": "gemini-2.5-pro"
 }
 ```
 
@@ -75,20 +83,6 @@ receives generated code to execute locally.
 Same shape as the B2C `_retry_code_with_error`. The brain rebuilds the
 "previous code failed with X — here is the schema — produce corrected
 code" prompt and calls the simple (or complex, on later attempts) model.
-
-**Same-type fidelity (do not regress).** In the global B2C edition the
-type-preservation is enforced by the orchestrator (`run_chat`), which re-checks
-the retry's `kind` against the *original* code's kind and rejects a mismatch.
-That orchestrator runs on the **client** in the enterprise split, so `/v1/retry`
-never receives the original kind — it infers it from `failed_code`. The brain's
-retry system instruction (`brain_agent._build_retry_system_instruction`)
-therefore detects chart code in `failed_code` (matplotlib / seaborn / plotly,
-via `_looks_like_plot_code`) and, when present, REQUIRES the corrected reply to
-be a fenced `python` code block that produces a **figure** — a prose-only or
-plain-text reply is forbidden. For plain-python failures no figure requirement
-is added. This guarantees a chart retry comes back as chart code, not prose.
-No raw data values are involved (Constitution Art. II): only the failed code,
-its error text, and column NAMES feed the prompt.
 
 ### Request
 
@@ -116,7 +110,7 @@ its error text, and column NAMES feed the prompt.
   "kind": "PYTHON",
   "code": "df.groupby('department')['salary'].mean()",
   "usage": { ... },
-  "model_used": "..."                     // the tenant-resolved model (informational)
+  "model_used": "gemini-2.5-pro"
 }
 ```
 
@@ -124,8 +118,8 @@ its error text, and column NAMES feed the prompt.
 
 ## `POST /v1/describe`
 
-Generates a brief natural-language intro from **the code only**, never the
-result. No data values are sent.
+Mirror of `agent._describe_from_code` — generates a brief natural intro
+from **the code only**, never the result. No data values ever sent.
 
 ### Request
 
@@ -148,8 +142,8 @@ result. No data values are sent.
 
 ## `POST /v1/greeting`
 
-Only `df_names` is sent so the reply can mention the user's uploaded file
-names — no data.
+Mirror of `agent._respond_to_greeting`. Only `df_names` is sent so the
+LLM can mention the user's uploaded file names in the reply — no data.
 
 ### Request
 
@@ -167,8 +161,10 @@ names — no data.
 
 ## `POST /v1/summarize`
 
-Used only for **scalar** results (non-table, non-image). The client filters
-`preview` to scalar-safe values via the `_safe_preview` guard before sending.
+Mirror of `agent.summarize_answer`. Used only for **scalar** results
+(non-table, non-image). The client is responsible for filtering `preview`
+to scalar-safe values — the same `safe_preview` guard the B2C code
+already enforces.
 
 ### Request
 
@@ -194,8 +190,9 @@ Used only for **scalar** results (non-table, non-image). The client filters
 
 ## `POST /v1/chat_metadata`
 
-Generates the chat name + welcome message + suggested questions for a newly
-created chat. Only file names + descriptions + schema context are sent.
+Verbatim port of global `_generate_all_parallel` (3 parallel sub-calls:
+chat name + welcome message + suggested questions). Per-tenant API key +
+per-tier model overrides apply automatically.
 
 ### Request
 
@@ -211,6 +208,20 @@ created chat. Only file names + descriptions + schema context are sent.
 }
 ```
 
+`lang_instruction` is now only a **fallback hint** (the language the client
+detected from the file). The brain decides the welcome/questions language by
+this precedence:
+
+1. the tenant's `welcome_language` config override (`effective_settings()`),
+2. else the request's `lang_instruction` (the client-detected hint),
+3. else `"English"`.
+
+So a tenant with `welcome_language = "Georgian (ქართული)"` always gets a
+Georgian welcome + questions regardless of column-name language; a tenant that
+leaves it unset behaves exactly as before (client-detected → English). The same
+resolved language governs BOTH the welcome message and the suggested questions
+(one call).
+
 ### Response
 
 ```jsonc
@@ -225,12 +236,22 @@ created chat. Only file names + descriptions + schema context are sent.
 }
 ```
 
+The welcome message and questions are the same prompts and sanitizers
+global uses — output is byte-compatible.
+
 ---
 
 ## `POST /v1/auto_analytics_plan`
 
-Auto Analytics planner. The client sends schema text only and receives a set of
-natural-language analytical instructions to run locally.
+Auto Analytics planner (COMPLEX tier). Designs the set of analyses for the
+report. The **request shape is unchanged** (still schema-text only), but the
+planner now reasons over the tenant's DOMAIN CONTEXT in addition to the schema:
+it injects the tenant's enabled domain skill (terminology / KPIs / expected
+columns / analysis style via `skill_loader`), the free-text `domain_vocabulary`,
+and the operator's `prompt_tuning_planner` — all resolved server-side from
+`effective_settings()`. These are **shared brain assets, not client row data**,
+so the boundary is intact. If no domain skill is configured (or it fails to
+load) the planner degrades gracefully to schema-only planning.
 
 ```jsonc
 {
@@ -242,11 +263,19 @@ natural-language analytical instructions to run locally.
 }
 ```
 
-Returns `{"instructions": ["...", "...", ...]}` — each instruction a distinct
-analytical direction (intent + column names + chart hint), detailed enough for
-the client to turn into code. The client iterates each instruction through
-`run_chat_local.run_chat` (the same `/v1/plan` + `/v1/retry` path chat uses),
-builds synthetic Q&A pairs, then calls `/v1/report` for the narrative and
+Returns `{"instructions": ["...", "...", ...]}`. The planner is steered to
+produce a RICH, NON-REPETITIVE set — each instruction a DISTINCT finding on a
+different dimension/metric/relationship, detailed enough for the code-writer
+(intent + exact column names + chart hint). Server-side post-processing:
+near-duplicate instructions are dropped (Jaccard token overlap), and if the
+usable count is below the target (`_AUTO_ANALYTICS_TARGET` = 7) the brain does
+ONE targeted re-ask for additional distinct directions rather than padding with
+trivial charts. The list is then capped to `_AUTO_ANALYTICS_MAX` = **15 plots**
+(this is analyses/plots, NOT total slides). A soft `AUTO_ANALYTICS_PLAN_UNDER_TARGET`
+log line fires when the final count stays under target so chronic
+under-production stays visible. The client iterates each instruction through
+`run_chat_local.run_chat` (unchanged — same `/v1/plan` + `/v1/retry` path chat
+uses), builds synthetic Q&A pairs, then calls `/v1/report` for the narrative and
 renders the PPTX locally. NO raw row data ever crosses the boundary.
 
 ---
@@ -254,8 +283,9 @@ renders the PPTX locally. NO raw row data ever crosses the boundary.
 ## `POST /v1/activity`
 
 Centralized per-tenant activity log. The client posts events on
-login / file_uploaded / plot_generated / report_exported. No data values are
-sent.
+login / file_uploaded / plot_generated / report_exported. Stored as
+`tenants/{tenant_id}/activity.jsonl` (append-only JSONL). Powers the
+"Last login / Last activity" columns in the per-tenant admin Users tab.
 
 ```jsonc
 {
@@ -273,15 +303,16 @@ Returns `{ok: true}`.
 
 Streams the tenant's uploaded branded `.pptx` template file as
 `application/vnd.openxmlformats-officedocument.presentationml.presentation`.
-Returns **404** when no template is configured for this tenant (the client
-falls back to the built-in renderer). The companion spec endpoint is below.
+Returns **404** when the operator has not uploaded a template for this tenant
+(the client falls back to the built-in renderer in that case). The companion
+spec endpoint is below.
 
 ---
 
 ## `GET /v1/pptx_template_spec`
 
-Returns whether this tenant has a `.pptx` template, and the strict **v2 build
-plan** the client renderer consumes:
+Returns whether this tenant has a `.pptx` template uploaded, and the strict
+**v2 build plan** the brain produced (COMPLEX-tier analysis at upload time):
 
 ```jsonc
 {
@@ -332,24 +363,27 @@ plan** the client renderer consumes:
 }
 ```
 
-Client-side validation rules: missing shape entries default to `keep` (safer
-than silently dropping chrome). `replace:title` / `replace:body` /
-`replace:agenda` are capped at one each per slide. If the cover or content slide
-is missing / out of range, the client falls back to the built-in renderer. The
-renderer never invents shapes — it only touches shapes the plan references on
-the cloned slides, plus an `add_picture` in `chart_region` on content slides.
+Validation rules: missing shape entries default to `keep` (safer than
+silently dropping chrome). `replace:title` / `replace:body` /
+`replace:agenda` are capped at one each per slide. If the cover or
+content slide is missing / out of range, the client falls back to the
+built-in renderer. The renderer never invents shapes — it only touches
+shapes the plan references on the cloned slides, plus an `add_picture`
+in `chart_region` on content slides.
 
 When `has_template` is `false`, `spec` is `null`. The client caches both the
-file and the spec under `DATA_ROOT/templates_cache/` keyed by a schema marker
-(`*.v2.pptx`, `*.v2.json`) with a short TTL so a re-uploaded template is picked
-up without a client restart.
+file and the spec on `DATA_ROOT/templates_cache/` keyed by a schema marker
+(`*.v2.pptx`, `*.v2.json`) with a short TTL so an operator re-uploading a
+template is picked up without a client restart. Older v1 caches are purged
+on first refresh after a deploy.
 
 ---
 
 ## `GET /v1/app_settings`
 
-Returns the application settings the client should honor at upload time:
-`MAX_FILES`, `TITLE_MAX_LEN`, `TITLE_BREAK_MIN`.
+Returns the per-tenant application settings the client should honor at upload
+time: `MAX_FILES`, `TITLE_MAX_LEN`, `TITLE_BREAK_MIN`. Empty per-tenant values
+fall back to the brain-wide default (then to a hardcoded fallback).
 
 ```jsonc
 { "max_files": 10, "title_max_len": 80, "title_break_min": 30 }
@@ -360,7 +394,7 @@ Returns the application settings the client should honor at upload time:
 ## `POST /v1/title`
 
 Background conversation-title generation. The client fires this after the 2nd
-human message in a conversation.
+human message in a conversation (matches global's UX). Uses the Light model.
 
 ```jsonc
 { "sid": "...", "question": "...", "answer": "...", "lang": "English", "user_email": "..." }
@@ -372,8 +406,10 @@ Returns `{ "title": "Compensation Overview" }` (2-3 words, language-aware).
 
 ## `POST /v1/send_share_email`
 
-Brain-side SMTP relay for tenant-issued share invites. NO raw row data is
-forwarded — only the invitation prose.
+Brain-side SMTP relay for tenant-issued share invites. Uses the tenant's
+`smtp_host` / `smtp_port` / `smtp_username` / `smtp_password` / `smtp_from`
+config set on the per-tenant admin page. NO raw row data is forwarded — only
+the invitation prose.
 
 ```jsonc
 {
@@ -385,19 +421,24 @@ forwarded — only the invitation prose.
 }
 ```
 
-Returns `{ok, sent: [], failed: [], smtp_configured: bool}`. If the tenant has
-no SMTP configured, returns HTTP 503 with `smtp_configured: false` (the client
-surfaces "shared but no email sent — share credentials manually").
+Returns `{ok, sent: [], failed: [], smtp_configured: bool}`. If the tenant
+has no SMTP configured, returns HTTP 503 with `smtp_configured: false` (the
+client surfaces "shared but no email sent — share credentials manually").
 
 ---
 
 ## `POST /v1/schema_autofill`
 
-Combined autofill — file description + per-column descriptions in one call. The
-client builds the per-file context locally and sends **only** filename, dtypes,
-sampled / truncated unique values, a language hint, and user notes. No raw row
-data crosses the boundary beyond the sampled hints. One call per file; the
-client runs them in parallel and merges into `meta.json`.
+Combined autofill — file description + per-column descriptions in one LLM call,
+**verbatim port** of global's `_build_combined_autofill_prompt` +
+`_parse_combined_response` (`backend/routes/schema.py` L813-881). One call per
+file; the client runs them in parallel and merges the results into `meta.json`.
+
+The client builds the per-file context locally (same logic as global's
+`_prepare_file_context`) so the brain receives **only** the same inputs global
+itself feeds to the LLM: filename, dtypes, sampled / truncated unique values,
+language hint, user notes. No raw row data ever crosses the boundary beyond
+what global itself samples for this prompt.
 
 ### Request
 
@@ -432,15 +473,18 @@ client runs them in parallel and merges into `meta.json`.
 }
 ```
 
-On parse failure / error the brain returns `{file_description: "", columns: {}}`
-and the client falls back to a generic file description.
+Brain uses the **Light** tier model (`light_model` + per-tenant override),
+temperature 0.1, max 4096 tokens. On parse failure / LLM error the brain
+returns `{file_description: "", columns: {}}` and the client falls back to a
+generic file_description like global does.
 
 ---
 
 ## `POST /v1/file_description`
 
-Summarizes extracted header text (or any blurb) into a 2-3 sentence dataset
-description.
+Verbatim port of global upload.py's auto file-description LLM call (summarize
+text extracted from Excel headers, or any blurb, into a 2-3 sentence dataset
+description).
 
 ### Request
 
@@ -462,9 +506,11 @@ description.
 
 ## `POST /v1/report`
 
-The client first builds the no-value findings (`qa_pairs`) locally, then sends
-them. The brain returns the narrative JSON; the client renders the PPTX/PDF
-into its own template locally.
+Mirror of `chat.py._generate_report_structure`. The client first runs the
+same `_build_qa_pairs` logic locally (the B2C `_build_report_data`
+helper), then sends only the no-values findings payload. The brain
+returns the narrative JSON; the client renders the PPTX into its own
+template locally.
 
 ### Request
 
@@ -515,5 +561,5 @@ into its own template locally.
 | 4xx  | Brain rejected the request payload         | Surface clean message; log full details client-side. |
 | 5xx  | Brain internal error                       | Surface clean message; retry policy is per-endpoint. |
 
-The client implements all of these in [`brain_client.py`](../brain_client.py)
-as `BrainError` / `TenantRevokedError`.
+The client implements all of these in `brain_client.py` as
+`BrainError` / `TenantRevokedError`.

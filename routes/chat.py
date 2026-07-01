@@ -16,16 +16,14 @@ LLM work is done in a worker thread; results come back through an
 from __future__ import annotations
 
 import asyncio
-import io
 import json
-import re
 import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 import local_store
 import run_chat_local
@@ -53,36 +51,69 @@ def _cache_full_table(table: dict) -> str:
     return key
 
 
-_XLSX_MEDIA_TYPE = (
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
+# In-progress generation registry. A conv_id present here has a worker thread
+# generating right now. Used ONLY by the lightweight status endpoint so a page
+# reloaded/reopened mid-generation can show the working indicator and block new
+# questions until the AI turn is persisted. It NEVER affects persistence — the
+# worker remains the sole, exactly-once persister.
+_INPROGRESS_CONVS: set[str] = set()
+_INPROGRESS_LOCK = threading.Lock()
 
 
-def _safe_download_filename(filename: str, fallback: str = "download") -> str:
-    """Sanitize a client-supplied filename stem (no extension, no path/header
-    injection). Shared by the Excel and PNG download endpoints."""
-    stem = re.sub(r"[^A-Za-z0-9_-]", "_", (filename or "").strip())[:60]
-    return stem or fallback
+def _mark_generating(conv_id: str) -> None:
+    try:
+        with _INPROGRESS_LOCK:
+            _INPROGRESS_CONVS.add(conv_id)
+    except Exception:
+        pass
 
 
-def _build_xlsx_response(columns: list, rows: list, filename: str) -> Response:
-    """Build an in-memory .xlsx from columns + row dicts and return it as a
-    download. 100% client-local — no brain call, raw data never leaves the
-    client (Constitution Art. II / Art. V)."""
-    import pandas as pd
+def _unmark_generating(conv_id: str) -> None:
+    try:
+        with _INPROGRESS_LOCK:
+            _INPROGRESS_CONVS.discard(conv_id)
+    except Exception:
+        pass
 
-    cols = list(columns or [])
-    df = pd.DataFrame(rows or [], columns=cols or None)
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Data")
-    buf.seek(0)
-    safe = _safe_download_filename(filename, fallback="table")
-    return Response(
-        content=buf.getvalue(),
-        media_type=_XLSX_MEDIA_TYPE,
-        headers={"Content-Disposition": f'attachment; filename="{safe}.xlsx"'},
-    )
+
+def _is_generating(conv_id: str) -> bool:
+    try:
+        with _INPROGRESS_LOCK:
+            return conv_id in _INPROGRESS_CONVS
+    except Exception:
+        return False
+
+
+# Cooperative-cancel registry (STOP button). A conv_id here has had a stop
+# requested; the worker checks it between charts and halts at the next chart
+# boundary (the in-flight chart still finishes — cancellation is cooperative,
+# not instant). Shares the in-progress lock. Never affects exactly-once
+# persistence — the worker still persists whatever charts it produced.
+_CANCEL_CONVS: set[str] = set()
+
+
+def _request_cancel(conv_id: str) -> None:
+    try:
+        with _INPROGRESS_LOCK:
+            _CANCEL_CONVS.add(conv_id)
+    except Exception:
+        pass
+
+
+def _is_cancelled(conv_id: str) -> bool:
+    try:
+        with _INPROGRESS_LOCK:
+            return conv_id in _CANCEL_CONVS
+    except Exception:
+        return False
+
+
+def _clear_cancel(conv_id: str) -> None:
+    try:
+        with _INPROGRESS_LOCK:
+            _CANCEL_CONVS.discard(conv_id)
+    except Exception:
+        pass
 
 
 router = APIRouter(prefix="/api/chat", tags=["client-chat"])
@@ -120,6 +151,136 @@ def _json_safe(obj):
         return str(obj)
 
 
+# Max serialized size of a chart's source data we will PERSIST into history so
+# the "Show data" button survives reload. Oversize or missing data is omitted
+# (the button just won't appear for that chart) — we never bloat the on-disk
+# conversation or risk a serialization failure.
+_PERSIST_CHART_DATA_MAX_CHARS = 200_000
+
+
+def _persistable_chart_data(cd):
+    """Return JSON-safe chart_data if it is usable and within the size cap,
+    else None. Mirrors the live-cache guard (a dict with `rows` or `tables`)."""
+    try:
+        if not (isinstance(cd, dict) and (cd.get("rows") or cd.get("tables"))):
+            return None
+        safe = _json_safe(cd)
+        if len(json.dumps(safe, ensure_ascii=False)) > _PERSIST_CHART_DATA_MAX_CHARS:
+            return None
+        return safe
+    except Exception:
+        return None
+
+
+def _build_chart_entry(c: dict) -> dict:
+    """One persisted chart entry for a multi-chart turn: image + answer plus its
+    OWN code and (size-capped) chart_data, so reload restores Show code / Show
+    data per chart (PART B)."""
+    entry = {"image_base64": c.get("image_base64"), "answer": c.get("answer", "")}
+    if c.get("code"):
+        entry["code"] = c["code"]
+    cd = _persistable_chart_data(c.get("chart_data"))
+    if cd is not None:
+        entry["chart_data"] = cd
+    return entry
+
+
+def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
+                             usage, charts):
+    """Build the AI-turn history record persisted EXACTLY ONCE by the worker.
+
+    Returns None when there is nothing to persist (never writes an empty turn).
+    Enriches with PER-CHART code + chart_data (PART B). Backward-compatible
+    shape: 0 imgs → image_base64=None; 1 img → image_base64 + record-level
+    code/chart_data; 2+ imgs → images=[{image_base64, answer, code?, chart_data?}].
+    """
+    if err_msg:
+        return {"role": "ai", "content": err_msg, "ts": time.time()}
+    if single is not None:
+        rec = {
+            "role": "ai",
+            "content": single.get("text", ""),
+            "image_base64": single.get("image_base64"),
+            "table": single.get("table"),
+            "code": single.get("code"),
+            "usage": single.get("usage"),
+            "ts": time.time(),
+        }
+        cd = _persistable_chart_data(single.get("chart_data"))
+        if cd is not None:
+            rec["chart_data"] = cd
+        return rec
+    if combined_answer is not None:
+        imgs = [c for c in charts if c.get("image_base64")]
+        rec = {
+            "role": "ai",
+            "content": combined_answer,
+            "image_base64": None,
+            "table": None,
+            "code": "\n\n###NEXT_PLOT###\n\n".join(combined_codes or []),
+            "usage": usage or {},
+            "ts": time.time(),
+        }
+        if len(imgs) >= 2:
+            rec["images"] = [_build_chart_entry(c) for c in imgs]
+        elif len(imgs) == 1:
+            c = imgs[0]
+            rec["image_base64"] = c.get("image_base64")
+            if c.get("code"):
+                rec["code"] = c["code"]
+            cd = _persistable_chart_data(c.get("chart_data"))
+            if cd is not None:
+                rec["chart_data"] = cd
+        return rec
+    return None
+
+
+def _build_stopped_record(combined_answer, combined_codes, usage, charts):
+    """Persist a STOPPED AI turn (user clicked Stop) — never the planner
+    NO_CODE fallback or a late single-shot result.
+
+    ≥1 chart produced → the partial charts (same per-chart code/chart_data
+    shape as a normal multi-chart turn) with a stopped marker appended to the
+    content, plus a `stopped: True` flag. 0 charts → a short "Response stopped
+    by user." turn. Returns a record dict (never None — a stop always yields a
+    turn so reload shows it consistently). Reuses _build_chart_entry /
+    _persistable_chart_data so per-chart Show data/code survive reload.
+    """
+    note = "Response stopped by user."
+    imgs = [c for c in charts if c.get("image_base64")]
+    if imgs:
+        answers = [c.get("answer", "") for c in imgs if c.get("answer")]
+        base = "\n\n".join(a for a in answers if a)
+        content = (base + "\n\n⏹ " + note).strip() if base else ("⏹ " + note)
+        rec = {
+            "role": "ai",
+            "content": content,
+            "image_base64": None,
+            "table": None,
+            "code": "\n\n###NEXT_PLOT###\n\n".join(combined_codes or []),
+            "usage": usage or {},
+            "stopped": True,
+            "ts": time.time(),
+        }
+        if len(imgs) >= 2:
+            rec["images"] = [_build_chart_entry(c) for c in imgs]
+        elif len(imgs) == 1:
+            c = imgs[0]
+            rec["image_base64"] = c.get("image_base64")
+            if c.get("code"):
+                rec["code"] = c["code"]
+            cd = _persistable_chart_data(c.get("chart_data"))
+            if cd is not None:
+                rec["chart_data"] = cd
+        return rec
+    return {
+        "role": "ai",
+        "content": note,
+        "stopped": True,
+        "ts": time.time(),
+    }
+
+
 def _require_chat(request: Request, chat_id: str):
     email = request.session.get("email")
     if not email:
@@ -139,33 +300,6 @@ def _require_chat(request: Request, chat_id: str):
     except Exception:
         pass
     return None, JSONResponse({"error": "Access denied"}, status_code=403)
-
-
-def _conv_in_scope(email: str, chat_id: str, conv_id: str) -> bool:
-    """Is `conv_id` accessible to `email` within `chat_id`?
-
-    The chat OWNER has full access to every conversation in their chat. A shared
-    (non-owner) recipient may ONLY touch conversations recorded in their own
-    per-user index — never the owner's other conversations in the same shared
-    chat. Keeps conversation isolation consistent across every conv-scoped
-    endpoint (history, chat stream, edit-regenerate, report download)."""
-    if local_store.get_chat_meta_owner(chat_id) == email:
-        return True
-    return local_store.user_owns_conversation(email, chat_id, conv_id)
-
-
-def _require_conv(request: Request, chat_id: str, conv_id: str):
-    """Chat-level membership (`_require_chat`) + conversation-level scope.
-
-    Returns (email, None) on success, or (None, JSONResponse) on failure. A
-    non-owner asking for a conversation outside their own index gets a 404 (we
-    do not reveal that the owner's other conversations exist)."""
-    email, err = _require_chat(request, chat_id)
-    if err:
-        return None, err
-    if not _conv_in_scope(email, chat_id, conv_id):
-        return None, JSONResponse({"error": "Conversation not found"}, status_code=404)
-    return email, None
 
 
 # ---------------------------------------------------------------------------
@@ -233,40 +367,58 @@ async def save_schema(request: Request, chat_id: str):
 
 @router.get("/{chat_id}/conversation/{conv_id}/history")
 async def history(request: Request, chat_id: str, conv_id: str):
-    email, err = _require_conv(request, chat_id, conv_id)
+    email, err = _require_chat(request, chat_id)
     if err:
         return err
     store = local_store.ChatDataStore(chat_id)
     return {"history": store.get_history(conv_id)}
 
 
-@router.get("/{chat_id}/history")
-async def chat_history(request: Request, chat_id: str):
-    """Legacy single-conversation history — return the most recent conv.
+@router.get("/{chat_id}/conversation/{conv_id}/status")
+async def conversation_status(request: Request, chat_id: str, conv_id: str):
+    """Is a generation worker currently running for this conversation?
 
-    The OWNER gets the newest conversation in the whole chat. A non-owner
-    (shared recipient) is scoped to THEIR OWN conversations in this chat (newest
-    first via the per-user index); it never exposes the owner's other convs.
+    Registry lookup only (no I/O). Lets a page reloaded/reopened mid-generation
+    show the working indicator and block new questions until the worker has
+    persisted the AI turn. Mirrors the Auto Analytics status-poll pattern.
     """
     email, err = _require_chat(request, chat_id)
     if err:
         return err
+    return {"generating": _is_generating(conv_id)}
+
+
+@router.post("/{chat_id}/conversation/{conv_id}/stop")
+async def conversation_stop(request: Request, chat_id: str, conv_id: str):
+    """Request cancellation of an in-progress generation for this conversation.
+
+    Cooperative: the worker halts at the NEXT chart boundary (the in-flight
+    chart still finishes), persists the partial AI turn (the charts produced so
+    far, same shape as a normal turn), and emits a normal `done`. Idempotent —
+    setting the flag when nothing is running is a harmless no-op.
+    """
+    email, err = _require_chat(request, chat_id)
+    if err:
+        return err
+    _request_cancel(conv_id)
+    log_with_sid("stop", "info", "CHAT_STOP_REQUESTED", user=email,
+                 chat_id=chat_id, conv_id=conv_id)
+    return {"ok": True, "stopping": True}
+
+
+@router.get("/{chat_id}/history")
+async def chat_history(request: Request, chat_id: str):
+    """Legacy single-conversation history — return the most recent conv."""
+    email, err = _require_chat(request, chat_id)
+    if err:
+        return err
     store = local_store.ChatDataStore(chat_id)
+    # Pick the newest conversation file
     try:
-        if local_store.get_chat_meta_owner(chat_id) == email:
-            # Owner: newest conversation file in the chat directory.
-            convs = sorted(store.conversations_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if not convs:
-                return {"history": []}
-            conv_id = convs[0].stem
-            return {"history": store.get_history(conv_id), "conv_id": conv_id}
-        # Non-owner: only their own conversations in this chat. list_conversations
-        # is already sorted newest-first, so the first match is the most recent.
-        own = [c for c in local_store.AuthStore().list_conversations(email)
-               if c.get("chat_id") == chat_id and c.get("conv_id")]
-        if not own:
+        convs = sorted(store.conversations_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not convs:
             return {"history": []}
-        conv_id = own[0]["conv_id"]
+        conv_id = convs[0].stem
         return {"history": store.get_history(conv_id), "conv_id": conv_id}
     except Exception:
         return {"history": []}
@@ -294,21 +446,12 @@ async def chat_stream(request: Request, chat_id: str):
     conv_id = body.get("conv_id")
     if not question:
         return JSONResponse({"error": "Question cannot be empty."}, status_code=400)
-    # Continuing an EXISTING conversation: a non-owner may only continue one in
-    # their own index (a fresh conv with no conv_id is created + recorded under
-    # the caller below, so it stays theirs).
-    if conv_id and not _conv_in_scope(email, chat_id, conv_id):
-        return JSONResponse({"error": "Conversation not found"}, status_code=404)
 
     store = local_store.ChatDataStore(chat_id)
     dfs = store.load_dataframes()
     if not dfs:
         return JSONResponse({"error": "Chat dataset is empty."}, status_code=400)
     schema_docs = store.schema_docs()
-    # User-confirmed join columns (same source as GET /{chat_id}/schema): the
-    # planner needs them so build_schema_text includes the join relationships,
-    # exactly as Auto Analytics already does.
-    common_fields = store.read_meta().get("common_fields") or []
 
     sid = secrets.token_hex(8)
     if not conv_id:
@@ -327,14 +470,26 @@ async def chat_stream(request: Request, chat_id: str):
     async def _sse_generator():
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
-        # Multi-plot accumulator — partials are streamed live to the browser,
-        # but the chart images must also be persisted so they reappear after
-        # refresh/reopen. Matches global's `all_images` / `all_answers` pattern
-        # in backend/routes/chat.py (final append_conv_history with images=[...]).
-        all_images: list[str] = []
-        all_answers: list[str] = []
 
         def _worker():
+            # PART A: accumulate the AI turn and persist it EXACTLY ONCE here, in
+            # the worker thread, so a browser refresh/close (which cancels the SSE
+            # consumer below) can never discard the generated response. The
+            # consumer performs live UX only — it does NO persistence. The worker
+            # runs to completion regardless of the connection.
+            w_charts: list[dict] = []      # per-chart {image_base64, answer, code, chart_data}
+            w_combined_answer = None        # set by the multi-plot done event
+            w_combined_codes: list = []
+            w_usage: dict = {}
+            w_single = None                 # single-shot result dict
+            err_msg = None
+            cancelled = False               # STOP requested mid-generation
+            # Clear any stale cancel flag from a prior attempt, then mark this
+            # conv in-progress for the duration of the worker so a page reloaded
+            # mid-generation sees generating=true. Both flags are cleared in
+            # `finally` AFTER persistence — once unmarked, the AI turn is readable.
+            _clear_cancel(conv_id)
+            _mark_generating(conv_id)
             try:
                 # Use the multi-plot generator: it yields per-chart partials when
                 # the planner emitted ###NEXT_PLOT### blocks, and a single
@@ -342,18 +497,98 @@ async def chat_stream(request: Request, chat_id: str):
                 gen = run_chat_local.run_chat_multi_plot(
                     sid=sid, dfs=dfs, schema_docs=schema_docs,
                     question=question, history_rows=history_rows,
-                    user_email=email, common_fields=common_fields,
+                    user_email=email,
                 )
                 for event in gen:
+                    # Stream live first (UX identical to before), then accumulate.
                     loop.call_soon_threadsafe(queue.put_nowait, ("event", event))
-            except TenantRevokedError as e:
-                loop.call_soon_threadsafe(queue.put_nowait, ("error", "Service unavailable. Please contact your administrator."))
-            except BrainError as e:
-                loop.call_soon_threadsafe(queue.put_nowait, ("error", "Analysis service is temporarily unavailable."))
+                    try:
+                        if isinstance(event, dict):
+                            if event.get("partial"):
+                                w_usage = event.get("usage") or w_usage
+                                if event.get("image_base64"):
+                                    w_charts.append({
+                                        "image_base64": event.get("image_base64"),
+                                        "answer": event.get("answer", ""),
+                                        "code": event.get("code"),
+                                        "chart_data": event.get("chart_data"),
+                                    })
+                            elif event.get("done") and not event.get("single_response"):
+                                w_combined_answer = event.get("combined_answer", "")
+                                w_combined_codes = event.get("combined_codes") or []
+                                w_usage = event.get("total_usage") or {}
+                            elif event.get("single_response"):
+                                w_single = event.get("result") or {}
+                    except Exception:
+                        pass
+                    # Cooperative STOP: halt at this chart boundary (the chart just
+                    # streamed is kept). No further charts are pulled from the gen.
+                    if _is_cancelled(conv_id):
+                        cancelled = True
+                        log_with_sid(sid, "info", "CHAT_STOP_AT_BOUNDARY",
+                                     charts=len(w_charts))
+                        break
+                # If STOP broke us out before the generator's own done event,
+                # synthesize the combined result from the charts produced so far
+                # (so persistence + the client's done handler behave normally) and
+                # emit a done so the live stream finalizes and shows the partial.
+                if cancelled and w_single is None and w_combined_answer is None:
+                    if w_charts:
+                        answers = [c.get("answer", "") for c in w_charts if c.get("answer")]
+                        w_combined_answer = "\n\n".join(answers) if answers else "Analysis stopped."
+                        w_combined_codes = [c.get("code") for c in w_charts if c.get("code")]
+                    loop.call_soon_threadsafe(queue.put_nowait, ("event", {
+                        "partial": False, "done": True,
+                        "combined_answer": w_combined_answer or "",
+                        "combined_codes": w_combined_codes,
+                        "total_usage": w_usage,
+                    }))
+            except TenantRevokedError:
+                err_msg = "Service unavailable. Please contact your administrator."
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", err_msg))
+            except BrainError:
+                err_msg = "Analysis service is temporarily unavailable."
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", err_msg))
             except Exception as e:
                 log_with_sid(sid, "error", f"CHAT_THREAD_ERROR: {type(e).__name__}: {e}")
-                loop.call_soon_threadsafe(queue.put_nowait, ("error", "Something went wrong while processing your request."))
+                err_msg = "Something went wrong while processing your request."
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", err_msg))
+
+            # ── Exactly-once AI-turn persistence (Articles IV & V) ──
+            try:
+                if cancelled:
+                    # User clicked Stop. Persist a STOPPED turn — the partial
+                    # charts (if any) or a short "stopped by user" note — never
+                    # the planner NO_CODE error or a late single-shot result.
+                    record = _build_stopped_record(
+                        w_combined_answer, w_combined_codes, w_usage, w_charts)
+                else:
+                    record = _build_ai_history_record(
+                        err_msg, w_single, w_combined_answer, w_combined_codes,
+                        w_usage, w_charts)
+                if record is not None:
+                    store.append_history(conv_id, record)
+                    if not err_msg and not cancelled:
+                        answer_for_title = (
+                            (w_single or {}).get("text", "") if w_single is not None
+                            else (w_combined_answer or ""))
+                        try:
+                            human_count = sum(
+                                1 for m in store.get_history(conv_id)
+                                if m.get("role") == "human")
+                            if human_count == 2:
+                                _start_title_generation(
+                                    email, chat_id, conv_id, question, answer_for_title)
+                        except Exception:
+                            pass
+            except Exception as e:
+                log_with_sid(sid, "error", f"CHAT_PERSIST_ERROR: {type(e).__name__}: {e}")
             finally:
+                # Unmark only after persistence above has completed, so a status
+                # poll that now sees generating=false will find the AI turn saved.
+                # Clear the cancel flag too (paired with the start-of-worker clear).
+                _unmark_generating(conv_id)
+                _clear_cancel(conv_id)
                 loop.call_soon_threadsafe(queue.put_nowait, None)
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -361,6 +596,8 @@ async def chat_stream(request: Request, chat_id: str):
         # First event — empty progress + conv_id so the frontend can capture the conv_id
         yield f'data: {json.dumps({"progress": True, "message": "Working...", "conv_id": conv_id})}\n\n'
 
+        # The consumer streams events to the browser and caches live chart_data;
+        # it persists NOTHING (the worker owns persistence — exactly-once).
         while True:
             event = await queue.get()
             if event is None:
@@ -369,19 +606,21 @@ async def chat_stream(request: Request, chat_id: str):
             if tag == "error":
                 err_event = {"error": payload, "conv_id": conv_id, "done": True}
                 yield f"data: {json.dumps(err_event, ensure_ascii=False)}\n\n"
-                # Persist the error as the AI turn so history reflects the failure
-                store.append_history(conv_id, {"role": "ai", "content": payload, "ts": time.time()})
                 continue
             if tag == "event":
                 ev = payload
-                # ── Multi-plot: per-chart partial event ─────────────────
+                # ── Multi-plot: per-chart partial event (live UX only) ──
                 if ev.get("partial"):
                     img = ev.get("image_base64")
                     chart_answer = ev.get("answer", "")
-                    # Accumulate for persistence on the final done event.
-                    if img:
-                        all_images.append(img)
-                        all_answers.append(chart_answer)
+                    # Cache the chart's source data for the client-side
+                    # "Show data" button — reuses the full_table cache + endpoint.
+                    # Client-only display; nothing to brain. `chart_data` is a
+                    # single {rows} table or a multi-subplot {tables:[...]}.
+                    chart_data_key = None
+                    cd = ev.get("chart_data")
+                    if isinstance(cd, dict) and (cd.get("rows") or cd.get("tables")):
+                        chart_data_key = _cache_full_table(cd)
                     partial_payload = {
                         "partial": True,
                         "answer": chart_answer,
@@ -389,6 +628,8 @@ async def chat_stream(request: Request, chat_id: str):
                         "chart_n": ev.get("chart_n"),
                         "chart_total": ev.get("chart_total"),
                         "conv_id": conv_id,
+                        "code": ev.get("code"),
+                        "chart_data_key": chart_data_key,
                         "tokens": ev.get("usage") or {},
                     }
                     yield f"data: {json.dumps(_json_safe(partial_payload), ensure_ascii=False)}\n\n"
@@ -401,59 +642,24 @@ async def chat_stream(request: Request, chat_id: str):
                             pass
                     continue
 
-                # ── Multi-plot: final done event ───────────────────────
+                # ── Multi-plot: final done event (live UX only) ──
                 if ev.get("done") and not ev.get("single_response"):
                     answer = ev.get("combined_answer", "")
                     codes = ev.get("combined_codes") or []
                     usage = ev.get("total_usage") or {}
-                    # Persist the chart images alongside the combined answer so
-                    # the conversation re-renders after refresh / reopen. Matches
-                    # global's persist shape (backend/routes/chat.py L1088-1105):
-                    #   - 0 imgs  → image_base64=None, no images key
-                    #   - 1 img   → image_base64=<the image>, no images key
-                    #   - 2+ imgs → image_base64=None, images=[{image_base64, answer}, ...]
-                    history_obj: dict = {
-                        "role": "ai", "content": answer,
-                        "image_base64": None, "table": None,
-                        "code": "\n\n###NEXT_PLOT###\n\n".join(codes),
-                        "usage": usage, "ts": time.time(),
-                    }
-                    if len(all_images) >= 2:
-                        history_obj["images"] = [
-                            {"image_base64": img, "answer": ans}
-                            for img, ans in zip(all_images, all_answers) if img
-                        ]
-                    elif len(all_images) == 1:
-                        history_obj["image_base64"] = all_images[0]
-                    store.append_history(conv_id, history_obj)
                     out = {
                         "done": True, "partial": False,
                         "conv_id": conv_id,
                         "answer": answer,
                         "image_base64": None, "table": None,
+                        "code": "\n\n###NEXT_PLOT###\n\n".join(codes),
                         "tokens": usage,
                     }
                     yield f"data: {json.dumps(_json_safe(out), ensure_ascii=False)}\n\n"
-                    try:
-                        human_count = sum(1 for m in store.get_history(conv_id) if m.get("role") == "human")
-                        if human_count == 2:
-                            _start_title_generation(email, chat_id, conv_id, question, answer)
-                    except Exception:
-                        pass
                     continue
 
                 # ── Single-shot path: {single_response: True, result: ...} ─
                 result = ev.get("result") or {}
-                # Persist the AI turn (Article V)
-                store.append_history(conv_id, {
-                    "role": "ai",
-                    "content": result.get("text", ""),
-                    "image_base64": result.get("image_base64"),
-                    "table": result.get("table"),
-                    "code": result.get("code"),
-                    "usage": result.get("usage"),
-                    "ts": time.time(),
-                })
                 if result.get("image_base64"):
                     try:
                         brain_client.post_activity("plot_generated", email,
@@ -464,6 +670,13 @@ async def chat_stream(request: Request, chat_id: str):
                 tbl = result.get("table")
                 if isinstance(tbl, dict) and tbl.get("rows") and len(tbl.get("rows") or []) > 0:
                     full_table_key = _cache_full_table(tbl)
+                # Chart source data for the "Show data" button — reuses the
+                # full_table cache + endpoint. Client-only display. Single
+                # {rows} table or multi-subplot {tables:[...]}.
+                chart_data_key = None
+                cd = result.get("chart_data")
+                if isinstance(cd, dict) and (cd.get("rows") or cd.get("tables")):
+                    chart_data_key = _cache_full_table(cd)
                 out = {
                     "done": True,
                     "partial": False,
@@ -472,15 +685,11 @@ async def chat_stream(request: Request, chat_id: str):
                     "image_base64": result.get("image_base64"),
                     "table": result.get("table"),
                     "full_table_key": full_table_key,
+                    "chart_data_key": chart_data_key,
+                    "code": result.get("code"),
                     "tokens": result.get("usage") or {},
                 }
                 yield f"data: {json.dumps(_json_safe(out), ensure_ascii=False)}\n\n"
-                try:
-                    human_count = sum(1 for m in store.get_history(conv_id) if m.get("role") == "human")
-                    if human_count == 2:
-                        _start_title_generation(email, chat_id, conv_id, question, result.get("text", ""))
-                except Exception:
-                    pass
 
     return StreamingResponse(_sse_generator(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache",
@@ -524,9 +733,6 @@ async def edit_regenerate(request: Request, chat_id: str):
         return JSONResponse({"error": "Question cannot be empty."}, status_code=400)
     if not conv_id:
         return JSONResponse({"error": "Conversation ID is required."}, status_code=400)
-    # A non-owner may only edit-regenerate a conversation in their own index.
-    if not _conv_in_scope(email, chat_id, conv_id):
-        return JSONResponse({"error": "Conversation not found"}, status_code=404)
 
     store = local_store.ChatDataStore(chat_id)
     if not store.root.exists():
@@ -557,9 +763,6 @@ async def edit_regenerate(request: Request, chat_id: str):
         if not dfs:
             return JSONResponse({"error": "Chat dataset is empty."}, status_code=400)
         schema_docs = store.schema_docs()
-        # User-confirmed join columns — pass to the planner so the regenerated
-        # schema text carries the join relationships (same as the chat stream).
-        common_fields = store.read_meta().get("common_fields") or []
 
         sid = secrets.token_hex(8)
         history_rows = store.get_history(conv_id)
@@ -574,7 +777,7 @@ async def edit_regenerate(request: Request, chat_id: str):
             return list(run_chat_local.run_chat_multi_plot(
                 sid=sid, dfs=dfs, schema_docs=schema_docs,
                 question=edited_question, history_rows=history_rows,
-                user_email=email, common_fields=common_fields,
+                user_email=email,
             ))
 
         events = await loop.run_in_executor(_EXEC, _run_blocking)
@@ -631,6 +834,7 @@ async def edit_regenerate(request: Request, chat_id: str):
                 "ok": True, "done": True, "conv_id": conv_id,
                 "answer": combined_answer,
                 "image_base64": None, "table": None,
+                "code": "\n\n###NEXT_PLOT###\n\n".join(combined_codes),
                 "tokens": final_usage,
             }
             if "images" in history_obj:
@@ -655,12 +859,18 @@ async def edit_regenerate(request: Request, chat_id: str):
             tbl = single_result.get("table")
             if isinstance(tbl, dict) and tbl.get("rows"):
                 full_table_key = _cache_full_table(tbl)
+            chart_data_key = None
+            cd = single_result.get("chart_data")
+            if isinstance(cd, dict) and (cd.get("rows") or cd.get("tables")):
+                chart_data_key = _cache_full_table(cd)
             out = {
                 "ok": True, "done": True, "conv_id": conv_id,
                 "answer": single_result.get("text", ""),
                 "image_base64": single_result.get("image_base64"),
                 "table": single_result.get("table"),
                 "full_table_key": full_table_key,
+                "chart_data_key": chart_data_key,
+                "code": single_result.get("code"),
                 "tokens": single_result.get("usage") or {},
             }
             return JSONResponse(_json_safe(out))
@@ -769,17 +979,6 @@ async def share_post(request: Request, chat_id: str):
     store.write_meta(meta)
 
     chat_title = meta.get("title", "")
-    # Register the chat in each recipient's sidebar as an EMPTY chat: same
-    # uploaded data/files/schema, but NONE of the owner's conversations. The
-    # recipient starts fresh and creates their own conversations (recorded under
-    # their own conversations.jsonl by the chat-stream endpoint). We deliberately
-    # do NOT copy or record any conversation here — that is the conversation-share
-    # path (routes/auth.py). `record_shared_chat` is idempotent per chat_id.
-    files = [f.get("file_name") for f in meta.get("files", []) if f.get("file_name")]
-    for rec in recipients:
-        local_store.AuthStore().record_shared_chat(
-            rec, chat_id, chat_title or "Chat", files, shared_by=email)
-
     smtp_result = {"smtp_configured": False, "sent": [], "failed": []}
     if new_recipients:
         try:
@@ -900,124 +1099,3 @@ async def full_table_get(request: Request, chat_id: str, key: str):
     if not tbl:
         return JSONResponse({"error": "Full table not found or expired."}, status_code=404)
     return tbl
-
-
-# ---------------------------------------------------------------------------
-# Excel download — 100% client-local (no brain call). dashboard.js / chat.js
-# POST these from the "Download Excel" button under a result table:
-#   - export_excel: the preview table the frontend already holds (columns/rows).
-#   - download_excel/{full_key}: the full cached table minted by the chat stream.
-# Raw data never leaves the client (Constitution Art. II / Art. V).
-# ---------------------------------------------------------------------------
-@router.post("/{chat_id}/export_excel")
-async def export_excel(request: Request, chat_id: str):
-    """Body: {columns, rows, filename}. Returns an .xlsx of the posted table."""
-    email, err = _require_chat(request, chat_id)
-    if err:
-        return err
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    columns = body.get("columns") or []
-    rows = body.get("rows") or []
-    filename = body.get("filename") or "table"
-    try:
-        return _build_xlsx_response(columns, rows, filename)
-    except Exception as e:
-        log_with_sid(email, "error", f"EXPORT_EXCEL_ERROR chat_id={chat_id}: {type(e).__name__}: {e}")
-        return JSONResponse({"error": "Failed to build Excel file."}, status_code=500)
-
-
-@router.post("/{chat_id}/download_excel/{full_key}")
-async def download_excel(request: Request, chat_id: str, full_key: str):
-    """Serve the full table cached under `full_key` (minted by the chat stream)
-    as an .xlsx. Clean JSON 404 if the key has expired out of the LRU."""
-    email, err = _require_chat(request, chat_id)
-    if err:
-        return err
-    tbl = _FULL_TABLE_CACHE.get(full_key)
-    if not tbl:
-        return JSONResponse({"error": "Full table not found or expired."}, status_code=404)
-    body = {}
-    try:
-        body = await request.json()
-    except Exception:
-        pass
-    filename = body.get("filename") or "table"
-    try:
-        return _build_xlsx_response(tbl.get("columns") or [], tbl.get("rows") or [], filename)
-    except Exception as e:
-        log_with_sid(email, "error", f"DOWNLOAD_EXCEL_ERROR chat_id={chat_id}: {type(e).__name__}: {e}")
-        return JSONResponse({"error": "Failed to build Excel file."}, status_code=500)
-
-
-# ---------------------------------------------------------------------------
-# Plotly chart PNG download — 100% client-local (no brain call). The chart
-# "Download high-resolution PNG" button (static/dashboard.js, static/chat.js)
-# POSTs the rendered interactive Plotly HTML; we rebuild the figure and render
-# a high-res PNG via kaleido (same mechanism as plot_utils._encode_plotly_figure).
-# Raw data never leaves the client (Constitution Art. II / Art. V).
-# ---------------------------------------------------------------------------
-_PLOTLY_NEWPLOT_MARKER = "Plotly.newPlot("
-
-
-def _plotly_png_from_html(html: str, scale: float) -> bytes:
-    """Rebuild the Plotly figure from the `Plotly.newPlot(...)` call embedded in
-    the rendered HTML (div_id, data, layout are positional JSON args) and render
-    a PNG via kaleido. Raises ValueError if the HTML has no parseable figure."""
-    import plotly.graph_objects as go
-
-    start = html.find(_PLOTLY_NEWPLOT_MARKER)
-    if start == -1:
-        raise ValueError("no Plotly.newPlot call in HTML")
-    decoder = json.JSONDecoder()
-    idx = start + len(_PLOTLY_NEWPLOT_MARKER)
-
-    def _next_json(s: str, i: int):
-        while i < len(s) and s[i] in " \t\r\n,":
-            i += 1
-        return decoder.raw_decode(s, i)
-
-    _div_id, idx = _next_json(html, idx)   # "plotly-chart"
-    data, idx = _next_json(html, idx)      # [ traces ... ]
-    layout, idx = _next_json(html, idx)    # { layout ... }
-    fig = go.Figure(data=data, layout=layout)
-    # High-res export at the requested scale; same base canvas as the inline
-    # render in plot_utils._encode_plotly_figure (1200x800).
-    return fig.to_image(format="png", width=1200, height=800, scale=scale)
-
-
-@router.post("/{chat_id}/export_plotly_png")
-async def export_plotly_png(request: Request, chat_id: str):
-    """Body: {html, filename, scale}. Render the interactive plotly chart to a
-    high-resolution PNG locally and return it as a download."""
-    email, err = _require_chat(request, chat_id)
-    if err:
-        return err
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    html = body.get("html") or ""
-    filename = body.get("filename") or "chart"
-    # Clamp scale to a sane range (default 2 — matches the inline render).
-    try:
-        scale = float(body.get("scale") or 2)
-    except (TypeError, ValueError):
-        scale = 2.0
-    scale = max(1.0, min(scale, 5.0))
-
-    if not isinstance(html, str) or _PLOTLY_NEWPLOT_MARKER not in html:
-        return JSONResponse({"error": "No renderable plotly chart in request."}, status_code=400)
-    try:
-        png = _plotly_png_from_html(html, scale)
-    except Exception as e:
-        log_with_sid(email, "error", f"EXPORT_PLOTLY_PNG_ERROR chat_id={chat_id}: {type(e).__name__}: {e}")
-        return JSONResponse({"error": "Could not render this chart to PNG."}, status_code=400)
-    safe = _safe_download_filename(filename, fallback="chart")
-    return Response(
-        content=png,
-        media_type="image/png",
-        headers={"Content-Disposition": f'attachment; filename="{safe}.png"'},
-    )

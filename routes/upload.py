@@ -539,6 +539,10 @@ async def generate_chatdata(request: Request):
     file_descs = file_descriptions_dict(user_meta)
     context, lang_instruction = build_context_for_questions(user_meta)
     cth = columns_to_human_map(user_meta)
+    # The client only sends the DETECTED language as a hint. The welcome /
+    # suggested-questions language is decided on the brain: the per-tenant
+    # `welcome_language` override takes precedence over this hint (see
+    # /v1/chat_metadata in PROTOCOL.md).
 
     # Brain LLM step (3 parallel sub-calls under the hood — matches global)
     llm_name, welcome_message, suggested_questions = "", "", []

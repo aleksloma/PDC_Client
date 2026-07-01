@@ -37,10 +37,7 @@ Edit `client.env` and fill in:
 - **`SECRET_KEY`** — generate once with `openssl rand -hex 32`; keep it stable so
   logins persist.
 
-- **`BRAIN_URL`** — set to the brain endpoint PowerDataChat gave you (the
-  template ships a placeholder).
-
-`DATA_ROOT=/data/client` should stay as-is.
+`BRAIN_URL` is pre-filled and `DATA_ROOT=/data/client` should stay as-is.
 **Never commit or share the filled-in `client.env`.**
 
 ## 3. Run

@@ -69,85 +69,34 @@ def _headers() -> dict[str, str]:
     }
 
 
-# On a failed brain call we ALWAYS surface the HTTP status + body snippet so it
-# is never swallowed (this is independent of CLIENT_LLM_DEBUG).
-_ERROR_BODY_SNIPPET_CHARS = 2000
-
-
-def _trunc(value: Any, limit: int) -> str:
-    """Stringify and truncate a value for debug logging."""
-    try:
-        s = value if isinstance(value, str) else str(value)
-    except Exception:
-        return "<unprintable>"
-    return s if len(s) <= limit else s[:limit] + f"…(+{len(s) - limit} chars)"
-
-
-def _debug_log_request(path: str, payload: dict[str, Any], sid: str) -> None:
-    """Log the outgoing brain request (CLIENT_LLM_DEBUG only). Metadata only —
-    these payload fields carry no raw row values by design (Art. II)."""
-    n = settings.CLIENT_LLM_DEBUG_MAX_CHARS
-    log_with_sid(
-        sid, "info", "BRAIN_REQUEST",
-        endpoint=path,
-        question=_trunc(payload.get("question"), n) if payload.get("question") is not None else None,
-        df_names=_trunc(payload.get("df_names"), n) if payload.get("df_names") is not None else None,
-        schema_text=_trunc(payload.get("schema_text"), n) if payload.get("schema_text") is not None else None,
-        history_n=len(payload.get("history_rows") or []) if payload.get("history_rows") is not None else None,
-        error_msg=_trunc(payload.get("error_msg"), n) if payload.get("error_msg") is not None else None,
-        failed_code=_trunc(payload.get("failed_code"), n) if payload.get("failed_code") is not None else None,
-    )
-
-
-def _debug_log_response(path: str, data: dict, sid: str) -> None:
-    """Log the parsed brain response (CLIENT_LLM_DEBUG only)."""
-    n = settings.CLIENT_LLM_DEBUG_MAX_CHARS
-    usage = data.get("usage") or {}
-    log_with_sid(
-        sid, "info", "BRAIN_RESPONSE",
-        endpoint=path,
-        kind=data.get("kind"),
-        code=_trunc(data.get("code"), n) if data.get("code") is not None else None,
-        text=_trunc(data.get("text"), n) if data.get("text") is not None else None,
-        finish_reason=usage.get("finish_reason") if isinstance(usage, dict) else None,
-        usage=_trunc(usage, n) if usage else None,
-    )
-
-
 def _post(path: str, payload: dict[str, Any], sid: str) -> dict:
     """POST to the brain and return the parsed JSON body."""
     if not settings.BRAIN_TENANT_TOKEN:
         raise BrainError("BRAIN_TENANT_TOKEN is not configured")
     client = _get_client()
-    if settings.CLIENT_LLM_DEBUG:
-        _debug_log_request(path, payload, sid)
     t0 = time.monotonic()
     try:
         resp = client.post(path, json=payload, headers=_headers())
     except httpx.RequestError as e:
-        # Transport error — never swallowed.
         log_with_sid(sid, "error", f"BRAIN_NETWORK_ERROR {path}: {e}")
         raise BrainError(f"Cannot reach brain: {e}") from e
 
     elapsed = time.monotonic() - t0
     if resp.status_code in (401, 403):
-        log_with_sid(sid, "error", f"BRAIN_AUTH {resp.status_code} {path}: {resp.text[:_ERROR_BODY_SNIPPET_CHARS]}")
+        log_with_sid(sid, "error", f"BRAIN_AUTH {resp.status_code} {path}: {resp.text[:200]}")
         raise TenantRevokedError(f"Tenant {resp.status_code}: {resp.text[:200]}")
     if resp.status_code >= 500:
-        log_with_sid(sid, "error", f"BRAIN_5XX {resp.status_code} {path}: {resp.text[:_ERROR_BODY_SNIPPET_CHARS]}")
+        log_with_sid(sid, "error", f"BRAIN_5XX {resp.status_code} {path}: {resp.text[:200]}")
         raise BrainError(f"Brain error {resp.status_code}")
     if resp.status_code >= 400:
-        log_with_sid(sid, "warning", f"BRAIN_4XX {resp.status_code} {path}: {resp.text[:_ERROR_BODY_SNIPPET_CHARS]}")
+        log_with_sid(sid, "warning", f"BRAIN_4XX {resp.status_code} {path}: {resp.text[:200]}")
         raise BrainError(f"Brain rejected request {resp.status_code}: {resp.text[:200]}")
 
     log_with_sid(sid, "info", f"BRAIN_OK {path}", elapsed_s=f"{elapsed:.2f}")
     try:
-        data = resp.json()
+        return resp.json()
     except Exception:
         return {}
-    if settings.CLIENT_LLM_DEBUG:
-        _debug_log_response(path, data if isinstance(data, dict) else {}, sid)
-    return data
 
 
 # ---------------------------------------------------------------------------

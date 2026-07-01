@@ -529,22 +529,3 @@ def get_chat_meta_owner(chat_id: str) -> Optional[str]:
 
 def chat_exists(chat_id: str) -> bool:
     return (_data_root() / "chatdata" / chat_id / "meta.json").exists()
-
-
-def user_owns_conversation(email: str, chat_id: str, conv_id: str) -> bool:
-    """True when `conv_id` is recorded in THIS user's own conversations index
-    for `chat_id`.
-
-    Conversation snapshots for shared recipients live in the owner's
-    `ChatDataStore` conversations dir alongside the owner's own conversations,
-    so directory presence is NOT proof of access. The per-user
-    `conversations.jsonl` index is the source of truth for which conversations
-    a given user may read/continue/export. Used to scope shared (non-owner)
-    recipients to their own conversations within a shared chat."""
-    try:
-        for c in AuthStore().list_conversations(email):
-            if c.get("conv_id") == conv_id and c.get("chat_id") == chat_id:
-                return True
-    except Exception:
-        return False
-    return False

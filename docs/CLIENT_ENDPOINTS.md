@@ -12,6 +12,16 @@ file documents the enterprise client's implementation of each one.
 
 ---
 
+## Pages (HTML)
+
+| Method | Path | Behavior |
+|---|---|---|
+| `GET` | `/` | auth landing; redirects to `/lab` if already signed in |
+| `GET` | `/lab` | the dashboard page (no session → `/`) |
+| `GET` | `/c/{conv_id}` | deep-link / hard-refresh into one conversation. Resolves the conv's `chat_id` from the caller's conversations index and seeds `open_conv_id`/`open_chat_id` so `dashboard.js` auto-opens it. No session → `/`; unknown/foreign conv → `/lab` (never 404). |
+
+---
+
 ## Auth (email-only)
 
 | Method | Path | Behavior |
@@ -44,26 +54,31 @@ enterprise build keeps the same shape so the existing JS works unchanged:
    Returns `{ok, saved, dataframes}` (the same shape the B2C `/upload`
    returns). **Raw bytes never leave this server.**
 
-3. **`POST /schema_autofill_full`** — file-description + per-column autofill,
-   split for the brain/client boundary:
+3. **`POST /schema_autofill_full`** — verbatim port of global's
+   `/schema_autofill_full` (`backend/routes/schema.py` L884-1012), split for
+   the brain/client boundary:
      - Client builds per-file context locally: dtypes, sampled / truncated
        unique values, language hint (from column names), columns needing fill.
-       Runs against the local DataFrames so raw row data never leaves.
+       Identical to global's `_prepare_file_context` — runs against the local
+       DataFrames so raw row data never leaves.
      - Client POSTs `/v1/schema_autofill` to the brain (one call per file, run
        in parallel via `asyncio.gather` + bounded ThreadPool). Brain returns
        `{file_description, columns: {col: desc}}`.
      - Client merges results into `meta.json` and **also** generates a
        `technical_description` for every column from local pandas stats
-       (dtype, fill rate, categorical/sample values).
+       (dtype, fill rate, categorical/sample values) — verbatim port of
+       global's `_generate_technical_description`.
    Returns `{ok, filled: <total>, files: [...], updated: <total>}`. Failure of
-   any single file falls back to leaving descriptions blank
+   any single file falls back to leaving descriptions blank (just like global)
    and the technical_description step still runs.
 
 4. **`POST /generate_chatdata`** — clones the temp `UserStore` into a
    permanent `ChatDataStore` under `<DATA_ROOT>/chatdata/<chat_id>/`,
    records the chat in the user's `active_chats.jsonl`, and calls the
-   brain's `/v1/chat_metadata` endpoint (chat name + welcome message +
-   suggested questions). Returns
+   brain's `/v1/chat_metadata` endpoint. That endpoint is a verbatim port
+   of global `_generate_all_parallel` (3 parallel sub-calls: chat name,
+   welcome message, suggested questions) — same prompts, same sanitizers
+   — so the output is identical to the B2C app. Returns
    `{ok, chat_id, name, welcome_message, suggested_questions}`.
 
 Direct-to-GCS paths (`/upload/init`, `/upload/finalize`, `/upload_from_url`)
@@ -93,63 +108,42 @@ On kill-switch (tenant revoked / suspended), the stream emits a single
 `{error: "Service unavailable. Please contact your administrator.", done: true}`
 event and the chat UI surfaces it to the user.
 
+**`GET /api/chat/{chat_id}/conversation/{conv_id}/status`** → `{"generating": bool}`.
+Lightweight in-memory registry lookup (no I/O): `true` while a generation worker
+is still running for that conversation. The generation worker persists the AI
+turn regardless of the connection, so a page reloaded/reopened mid-generation
+uses this (polled, mirroring the Auto Analytics status pattern) to show the
+working indicator, block new questions, and auto-render the answer on completion
+without a second manual refresh. Unmarked only after the AI turn is persisted —
+so once it returns `false`, the turn is already readable from history.
+
+**`POST /api/chat/{chat_id}/conversation/{conv_id}/stop`** → `{"ok": true, "stopping": true}`.
+Requests cancellation of an in-progress generation (the send button becomes a
+Stop button while generating). **Instant for the user, cooperative on the
+server.** The client abandons the live stream the moment Stop is clicked —
+aborts the SSE reader (so NO further or late events render, killing both a late
+chart and the planner "couldn't generate…" fallback), finalizes the in-progress
+message (keeps any charts already rendered and appends a subtle "⏹ Response
+stopped by user" note), and re-enables the input immediately — all WITHOUT
+awaiting this endpoint (it is POSTed fire-and-forget). Server-side the worker
+checks the flag between charts and halts at the NEXT chart boundary (the
+in-flight chart finishes), then persists a **STOPPED** turn, which is
+authoritative on reload: ≥1 chart → the partial charts (same shape + per-chart
+code/chart_data) with the stopped marker; 0 charts → a short `"Response stopped
+by user."` turn. When cancelled it never persists the NO_CODE / "couldn't
+generate analysis code" fallback or a late single-shot result. Exactly-once
+persistence and the in-progress/cancel flags (cleared in `finally`) are
+preserved. Idempotent; setting the flag when nothing is running is a harmless
+no-op.
+
 The full enterprise split inside one turn:
 
 1. Client loads dfs from local disk + builds schema text (`_schema_text` port).
 2. POST → `/v1/plan` → brain returns code.
 3. Client executes code locally with `safe_execute` / `render_plot_safe`.
-4. On execution error → POST `/v1/retry` → client re-executes. The orchestrator
-   (`run_chat_local`) retries each failing unit up to **3 attempts**, escalating
-   `use_pro` / `use_search` to `true` from the 2nd retry onward. A retry that
-   returns prose (`NO_CODE`/`CLARIFICATION`) or the wrong code kind counts as a
-   failed attempt — it never aborts the loop early, so the harder-model
-   escalation is always reached. In a multi-chart response a retry that returns
-   runnable `PYTHON` is executed and accepted only if it produces a chart image.
-   If a multi-chart turn ends with **zero** rendered charts, the persisted answer
-   is "Something went wrong with this analysis. Please try again." (never the
-   bare "Analysis complete.").
+4. On execution error → POST `/v1/retry` (up to 2 retries), client retries.
 5. POST → `/v1/describe` (or `/v1/summarize` for scalar results) → brain
    returns the natural-language intro. No row values cross the boundary.
-
-> The chat stream and edit-regenerate both load the chat's saved
-> `common_fields` from `meta.json` and pass them into the planner, so
-> `build_schema_text` carries the user-confirmed join relationships (matching
-> Auto Analytics).
-
----
-
-## Table Excel download (client-local)
-
-The "📥 Download Excel" button under a result table (`static/chat.js`,
-`static/dashboard.js`) POSTs one of two endpoints. Both are **100% client-local**
-— no brain call — and build an in-memory `.xlsx` with `openpyxl` (already a
-dependency), so raw data never leaves the client (Constitution Art. II / Art. V).
-Both authorize via `_require_chat`.
-
-| Method | Path | Behavior |
-|---|---|---|
-| `POST` | `/api/chat/{chat_id}/export_excel` | Body `{columns, rows, filename}`. Builds a DataFrame from the posted preview table and streams it as `.xlsx` with `Content-Disposition: attachment; filename="{filename}.xlsx"` (filename sanitized). |
-| `POST` | `/api/chat/{chat_id}/download_excel/{full_key}` | Body `{filename}`. Serves the full table cached under `full_key` (minted by the chat stream and exposed via `full_table_key`) as `.xlsx`. Clean JSON **404** if the key has expired out of the bounded LRU. |
-
-The media type is
-`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`.
-
----
-
-## Chart PNG download (client-local)
-
-The chart "Download high-resolution PNG" button under an interactive Plotly
-chart (`static/dashboard.js`, `static/chat.js`) POSTs the rendered Plotly HTML.
-The endpoint is **100% client-local** — no brain call — and renders the PNG with
-kaleido (already a dependency), so raw data never leaves the client
-(Constitution Art. II / Art. V). Authorizes via `_require_chat`.
-
-| Method | Path | Behavior |
-|---|---|---|
-| `POST` | `/api/chat/{chat_id}/export_plotly_png` | Body `{html, filename, scale}`. Rebuilds the figure from the `Plotly.newPlot(...)` call embedded in the posted HTML and renders a high-res PNG (`fig.to_image`, same mechanism as `plot_utils._encode_plotly_figure`), honoring `scale` clamped to 1..5. Returns `image/png` with `Content-Disposition: attachment; filename="{filename}.png"` (filename sanitized). Clean JSON **400** if the HTML has no parseable plotly figure. |
-
-Matplotlib charts are delivered inline as base64 and downloaded client-side;
-only the interactive Plotly path needs this server-side render.
 
 ---
 
@@ -161,17 +155,16 @@ only the interactive Plotly path needs this server-side render.
 | `POST` | `/api/chat/{chat_id}/conversation/{conv_id}/download_pptx` | PPTX (python-pptx) |
 
 Both call `/v1/report` (no values) to get `report_structure` JSON, then merge
-the narrative into the client's own template locally. Both authorize the caller
-as the chat owner OR a shared recipient, and a non-owner may export ONLY a
-`conv_id` in their own index — see **Per-user conversation isolation** below.
+the narrative into the client's own template locally.
 
 **Per-tenant PowerPoint template (PPTX exports + Auto Analytics):**
 
-When a branded `.pptx` is configured for a tenant, the client renderer
-(`routes/report._render_pptx`) opens that file as the base presentation,
-inheriting the tenant's slide master, theme colors, and fonts natively through
-python-pptx. The brain's analyzer emits a strict **v2 build plan** that the
-renderer consumes verbatim:
+When the operator uploads a branded `.pptx` for a tenant in the brain admin
+panel, the client renderer (`client/routes/report._render_pptx`) opens that
+file as the base presentation, inheriting the tenant's slide master, theme
+colors, and fonts natively through python-pptx. The brain's COMPLEX-tier
+analyzer emits a strict **v2 build plan** that the renderer consumes
+verbatim:
 
 - The plan picks three template slides — `deck.cover_slide_index`,
   `deck.agenda_slide_index` (optional), `deck.content_slide_index` — and
@@ -214,25 +207,12 @@ gracefully handles them:
 | Endpoint | Returns | Reason |
 |---|---|---|
 | `POST /api/chat/{id}/publish`, `/unpublish` | 400 | no public pages on-prem (architecture: sharing is OPEN, public publish is out of scope) |
-| `POST /auth/conversations/{conv_id}/publish`, `/unpublish` | 400 | conversation-level public publish — same reason as chat-level |
-| `GET /paddle/config` | 200 `{enabled:false, client_token:null, environment:null}` | billing is off-prem; benign config so the page-load Paddle bootstrap is a no-op (no `client_token` → no `Paddle.Initialize`) and there is no 404 |
-| `POST /auth/subscription` | 400 | enterprise plan is constant ("Enterprise"); no plan changes (the `GET` returns the constant plan) |
-| `POST /api/paddle/subscription/{update-payment,reactivate,preview,cancel,update}` | 400 | Paddle billing is off-prem |
 | `POST /upload/init`, `/upload/finalize` | 400 | direct-to-GCS path only |
 | `POST /upload_from_url` | 400 | Google Drive/Sheets are off-prem |
-
-The billing/publish stubs live in [`routes/auth.py`](../routes/auth.py); the
-chat-level publish stub is in [`routes/chat.py`](../routes/chat.py). All require
-the same session auth as their sibling routes and expose no internals (Art. IV).
 
 > Auto Analytics (`*/auto_analysis/start|status|download`) is **implemented** on-prem
 > (brain-side planner + client-side execution + PPTX render). See the "Implemented
 > on-prem" table below for the full row.
-
-> **Active frontend assets.** `/lab` (`templates/dashboard.html`) loads only
-> `static/i18n.js` + `static/dashboard.js`. The legacy B2C bundles `chat.js`,
-> `config.js`, `login.js`, `register.js` were referenced by no template and were
-> removed (2026-06) to prevent phantom-endpoint confusion.
 
 ---
 
@@ -257,17 +237,16 @@ values leave the client.
 
 | Endpoint | Behavior |
 |---|---|
-| `POST /api/chat/{id}/share` | **chat-level share (empty chat)** — adds recipients to `meta.json["sharing"]["shared_with"]` AND registers the chat in each recipient's sidebar via `AuthStore.record_shared_chat` (same uploaded data/files/schema, but NONE of the owner's conversations). The recipient opens an EMPTY chat and creates their own conversations (recorded under their own `conversations.jsonl` by the chat stream). No conversation is copied. Then asks brain `/v1/send_share_email` to SMTP-relay invites using this tenant's SMTP config |
+| `POST /api/chat/{id}/share` | adds recipients to `meta.json["sharing"]["shared_with"]`, asks brain `/v1/send_share_email` to SMTP-relay invites using this tenant's SMTP config |
 | `GET  /api/chat/{id}/share` | returns the current sharing record (`{shared_with, owner}`) |
-| `POST /auth/conversations/{conv_id}/share` | **conversation-level share** — for each recipient, snapshot the conversation history into a fresh `conv_id` via `ChatDataStore.copy_conv_to_new`, add them to the chat's `sharing.shared_with`, record ONLY that new conv in the recipient's `conversations.jsonl` with title prefix "(Shared) …" and `shared_by` field, then SMTP-relay an invite. The recipient sees only that one snapshot conversation under the parent chat (not the owner's other conversations), can continue it, and can start new conversations under the chat. Recipients access the chat through `_require_chat`'s shared-recipient check |
-| **Per-user conversation isolation** | A shared chat (chat-level OR conversation-level) lets a non-owner into the chat via `_require_chat`, but every conversation-scoped endpoint additionally enforces that a non-owner may only read/continue/edit/export conversations recorded in THEIR OWN `conversations.jsonl` — never the owner's other conversations in the same chat. The chat owner keeps full access to all their own conversations. Enforced by `local_store.user_owns_conversation` + the `_require_conv` / `_conv_in_scope` helpers (in `routes/chat.py`) across: `GET /conversation/{conv_id}/history`, the legacy `GET /{chat_id}/history` (owner → newest conv in the chat; non-owner → newest of THEIR own, else empty), `POST /chat/stream` (an existing `conv_id` must be in scope; a new conv with no id is recorded under the caller), `POST /edit-regenerate`, and the report `download_report` (PDF) / `download_pptx` endpoints in `routes/report.py`. Out-of-scope conv access returns 404 (chat endpoints) / 403 (report endpoints) |
+| `POST /auth/conversations/{conv_id}/share` | **conversation-level share** — for each recipient, snapshot the conversation history into a fresh `conv_id` via `ChatDataStore.copy_conv_to_new`, add them to the chat's `sharing.shared_with`, record the new conv in the recipient's `conversations.jsonl` with title prefix "(Shared) …" and `shared_by` field, then SMTP-relay an invite. Recipients access the chat through `_require_chat`'s shared-recipient check |
 | `GET  /api/chat/{id}/full_table/{key}` | returns the full result table cached under `key`. The chat stream sets `full_table_key` on responses that contain a tabular result. Backed by a bounded in-memory LRU (256 most recent results) |
 | Conversation title generation | After the 2nd human message, the chat stream fires a background `brain_client.title()` call and renames the conversation via `AuthStore.rename_conversation` |
 | Activity logging | `auth.py` (login), `upload.py` (file_uploaded), `chat.py` (plot_generated, per chart), `report.py` (report_exported), `auto_analytics.py` (auto_analytics_completed) all call `brain_client.post_activity` → brain `/v1/activity` |
 | **Auto Analytics** | `POST /api/chat/{id}/auto_analysis/start` kicks a background job → brain `/v1/auto_analytics_plan` (planner returns 3-15 natural-language analytical instructions) → client executes each via `run_chat_local.run_chat` against the local dataframes (bounded 4-worker pool) → brain `/v1/report` for narrative → client renders PPTX via `routes/report._render_pptx` → persists to `chatdata/{id}/auto_analysis.pptx`. `GET /auto_analysis/status` reports `{status: idle|processing|done, progress, error, pptx_path}`. `GET /auto_analysis/download` streams the deck. Raw row data never leaves the client |
 | **Multi-chart streaming** | The chat SSE stream uses `run_chat_multi_plot` (a generator port of global's). The brain Agent classifier sets `suggested_approach` to "Decompose into multiple PLOT_CODE blocks ... separated by ###NEXT_PLOT###" for dashboard/overview-style queries; the planner emits the multi-block raw_text; the client splits it via `_extract_multi_plot_blocks` and executes each block locally with retry, yielding a `{partial: true, chart_n, chart_total, image_base64, answer}` SSE event per chart and a final `{done: true}` combined event. Capped at 6 charts per response. Single-chart queries fall through to the existing one-shot path |
-| **Edit-regenerate** | `POST /api/chat/{id}/edit-regenerate` — dashboard.js fires this from the pencil-edit affordance on a past user message. Server-side: find last `human` turn, `truncate_conv_history` to drop it (and everything after), append the edited human turn, run `run_chat_multi_plot` against the local dfs, persist the AI turn in the same shape the SSE stream uses (`image_base64` for 0/1 charts, `images: [...]` for 2+). Returns a single JSON (not SSE — a one-shot JSON response) |
-| **Chart persistence across refresh / reopen** | `routes/chat.py` accumulates each multi-plot partial's `(image_base64, answer)` while streaming. On the final `done` event the AI turn is appended to `conversations/{conv_id}.jsonl`: 0 images → no image fields, 1 image → top-level `image_base64`, 2+ images → `images: [{image_base64, answer}, ...]`. The single-chart path already stored `image_base64` directly. `dashboard.js` reopens the conversation via `GET /api/chat/{id}/conversation/{conv_id}/history`; lines 1551 and 2184 render `msg.images` as one assistant bubble per chart, otherwise render `msg.image_base64` — identical to global. **Bug fixed (May 2026):** multi-plot history previously persisted `image_base64: null` and no `images` field, so charts vanished on refresh |
+| **Edit-regenerate** | `POST /api/chat/{id}/edit-regenerate` — verbatim port of global's `edit_regenerate_api` (`backend/routes/chat.py` L1136-1296). dashboard.js fires this from the pencil-edit affordance on a past user message. Server-side: find last `human` turn, `truncate_conv_history` to drop it (and everything after), append the edited human turn, run `run_chat_multi_plot` against the local dfs, persist the AI turn in the same shape the SSE stream uses (`image_base64` for 0/1 charts, `images: [...]` for 2+). Returns a single JSON (NOT SSE — global's is also a one-shot JSON response) |
+| **Chart persistence across refresh / reopen** | `routes/chat.py` accumulates each multi-plot partial's `(image_base64, answer)` while streaming. On the final `done` event the AI turn is appended to `conversations/{conv_id}.jsonl` using global's shape (`backend/routes/chat.py` L1088–1105): 0 images → no image fields, 1 image → top-level `image_base64`, 2+ images → `images: [{image_base64, answer}, ...]`. The single-chart path already stored `image_base64` directly. `dashboard.js` reopens the conversation via `GET /api/chat/{id}/conversation/{conv_id}/history`; lines 1551 and 2184 render `msg.images` as one assistant bubble per chart, otherwise render `msg.image_base64` — identical to global. **Bug fixed (May 2026):** multi-plot history previously persisted `image_base64: null` and no `images` field, so charts vanished on refresh |
 
 ---
 

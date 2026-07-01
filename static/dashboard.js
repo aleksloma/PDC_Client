@@ -12,6 +12,12 @@ let paddleScheduledPlan = null;
 let isCurrentUserAdmin = !!(window.__IS_ADMIN__);
 let isRequestInProgress = false;
 let isFrictionlessFlowRunning = false;
+// Instant-Stop plumbing (Part A). The active live-stream sendMessage registers
+// a synchronous stop handler here (abort the reader + finalize the message); the
+// Stop button calls it WITHOUT awaiting the server. `currentSendToken` guards a
+// slow-unwinding old send from reverting a newer send's Stop button.
+let activeStopHandler = null;
+let currentSendToken = 0;
 
 const ALLOWED_UPLOAD_EXTENSIONS = ['xlsx', 'xls', 'csv', 'tsv'];
 
@@ -1071,7 +1077,11 @@ function setupEventListeners() {
       if (!isRequestInProgress) sendMessage();
     }
   });
-  document.getElementById('btnSend').addEventListener('click', sendMessage);
+  document.getElementById('btnSend').addEventListener('click', () => {
+    const btn = document.getElementById('btnSend');
+    if (btn && btn.dataset.mode === 'stop') { stopGeneration(); return; }
+    sendMessage();
+  });
   
   // Auto-resize textarea
   chatInput.addEventListener('input', () => {
@@ -1538,12 +1548,96 @@ function _highlightActiveChat(chatId) {
 }
 
 // Open existing conversation
+// ── Reload-time "generation in progress" resume ───────────────────────────
+// When a conversation is reloaded/reopened while its server-side worker is
+// still generating (the worker persists regardless of the connection), the
+// page must show the working state, block new questions, and auto-render the
+// answer when it completes — no second manual refresh. Mirrors the Auto
+// Analytics status-poll pattern.
+let _reloadGenPollTimer = null;
+let _reloadGenPollConv = null;
+
+function _stopReloadGenPoll() {
+  if (_reloadGenPollTimer) { clearInterval(_reloadGenPollTimer); _reloadGenPollTimer = null; }
+  _reloadGenPollConv = null;
+}
+
+// Show the same "Working…" indicator the live stream uses and lock input
+// (as a Stop button — matches the live path so the reload state can cancel too).
+function _enterReloadGeneratingUI() {
+  setGenerating(true);
+  if (!document.getElementById('loadingBubble')) {
+    const loadingDiv = document.createElement('div');
+    loadingDiv.className = 'message assistant thinking-msg';
+    loadingDiv.id = 'loadingBubble';
+    loadingDiv.innerHTML = '<div class="message-content"><div class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="loading-status-text">Working...</span></div></div>';
+    chatMessages.appendChild(loadingDiv);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+}
+
+// Remove the indicator and re-enable input. Called on every exit path
+// (completion, timeout, error) — input must never stay stuck disabled.
+function _exitReloadGeneratingUI() {
+  const lb = document.getElementById('loadingBubble');
+  if (lb) lb.remove();
+  setGenerating(false);
+}
+
+// If the server reports a worker still generating for this conv, enter the
+// working UI and poll until it finishes, then re-render the conversation from
+// history (simplest — picks up the completed AI turn with per-chart Show
+// data/Show code). Backward compatible: generating:false → no-op.
+async function _resumeIfGenerating(chatId, convId) {
+  let generating = false;
+  try {
+    const res = await fetch(`/api/chat/${chatId}/conversation/${convId}/status`);
+    if (res.ok) generating = !!(await res.json()).generating;
+  } catch (e) { /* treat as not generating */ }
+  if (!generating) return;
+  // Conversation may have been switched away during the await.
+  if (chatId !== currentChatId || convId !== currentConvId) return;
+
+  _enterReloadGeneratingUI();
+  _stopReloadGenPoll();
+  _reloadGenPollConv = convId;
+  const POLL_MS = 2500;
+  const MAX_MS = 240000;   // a few minutes — matches the live SSE abort timeout
+  const startedAt = Date.now();
+  _reloadGenPollTimer = setInterval(async () => {
+    // Stop if the user navigated to a different conversation.
+    if (_reloadGenPollConv !== currentConvId || chatId !== currentChatId) {
+      _stopReloadGenPoll();
+      return;
+    }
+    if (Date.now() - startedAt > MAX_MS) {
+      _stopReloadGenPoll();
+      _exitReloadGeneratingUI();   // graceful timeout — re-enable input
+      return;
+    }
+    let stillGenerating = true;
+    try {
+      const res = await fetch(`/api/chat/${chatId}/conversation/${convId}/status`);
+      if (res.ok) stillGenerating = !!(await res.json()).generating;
+    } catch (e) { return; /* transient — keep polling */ }
+    if (!stillGenerating) {
+      _stopReloadGenPoll();
+      _exitReloadGeneratingUI();
+      // Re-fetch + re-render history (now includes the completed AI turn).
+      if (chatId === currentChatId && convId === currentConvId) {
+        openConversation(chatId, convId);
+      }
+    }
+  }, POLL_MS);
+}
+
 async function openConversation(chatId, convId) {
   currentChatId = chatId;
   currentConvId = convId;
+  _stopReloadGenPoll();   // cancel any poll from a previously-open conversation
   _highlightActiveConv(convId);
   _highlightActiveChat(chatId);
-  
+
   showLoading('Loading conversation...');
   
   try {
@@ -1559,18 +1653,57 @@ async function openConversation(chatId, convId) {
     // Restore the Auto Analytics button state for this chat (idle / processing / done).
     AutoAnalytics.refresh(chatId);
 
+    // The seeded welcome message is stored in history with content ONLY (its
+    // starter questions live in chat meta, not the history record). On a fresh
+    // load openChat() renders them via /welcome; on a refresh we land here, so
+    // fetch the same metadata and re-render the questions under the welcome
+    // entry. Guarded — a failed fetch must never break history rendering.
+    let welcomeText = '';
+    let welcomeQuestions = [];
+    try {
+      const welcomeRes = await fetch(`/api/chat/${chatId}/welcome`);
+      if (welcomeRes.ok) {
+        const welcomeData = await welcomeRes.json();
+        welcomeText = (welcomeData.message || '').trim();
+        welcomeQuestions = welcomeData.suggested_questions || [];
+      }
+    } catch (e) {
+      console.warn('Welcome metadata fetch failed; starter questions hidden:', e);
+    }
+
     // Render messages
     chatMessages.classList.remove('empty');
     chatMessages.innerHTML = '';
-    
+
+    let welcomeRendered = false;
     history.forEach(msg => {
+      const isAi = msg.role !== 'human';
+      // Re-render the seeded welcome (first AI entry whose content matches the
+      // welcome text) with its starter questions, once — matching openChat().
+      // Only when there ARE questions; otherwise fall through to the plain path
+      // so the welcome renders exactly as before (no empty block).
+      if (isAi && !welcomeRendered && welcomeQuestions.length > 0 &&
+          welcomeText && (msg.content || '').trim() === welcomeText) {
+        appendWelcomeMessageWithQuestions(msg.content || '', welcomeQuestions);
+        welcomeRendered = true;
+        return;
+      }
       if (msg.images && Array.isArray(msg.images) && msg.images.length > 0) {
-        // Multi-chart history entry: render each chart as a separate assistant message
-        msg.images.forEach(img => {
-          appendMessage('assistant', img.answer || '', img.image_base64, null, null);
+        // Multi-chart history entry: render each chart as a separate assistant
+        // message. New records persist per-chart code + chart_data, so Show code
+        // / Show data appear on EVERY chart after reload. Backward compat: old
+        // records lack img.code/img.chart_data → fall back to the joined msg.code
+        // under the first chart (legacy behavior) and omit Show data.
+        msg.images.forEach((img, idx) => {
+          const code = img.code || (idx === 0 ? msg.code : null);
+          appendMessage('assistant', img.answer || '', img.image_base64, null, null,
+            { code: code, chartData: img.chart_data || null });
         });
       } else {
-        appendMessage(msg.role === 'human' ? 'user' : 'assistant', msg.content, msg.image_base64, msg.table, msg.full_table_key);
+        // Single-chart / table / text entry. New single-chart records persist
+        // chart_data on the record → Show data on reload; old records omit it.
+        appendMessage(msg.role === 'human' ? 'user' : 'assistant', msg.content, msg.image_base64, msg.table, msg.full_table_key,
+          msg.role === 'human' ? null : { code: msg.code, chartData: msg.chart_data || null });
       }
     });
 
@@ -1596,10 +1729,98 @@ async function openConversation(chatId, convId) {
   if (currentConvId === convId) {
     window.history.pushState({ convId: convId, chatId: chatId }, '', `/c/${convId}`);
   }
+
+  // If a generation worker is still running for this conv (page reloaded /
+  // reopened mid-generation), resume the working UI + poll and auto-render on
+  // completion. No-op when nothing is generating (normal load).
+  _resumeIfGenerating(chatId, convId);
 }
 
 // Append message to chat
-function appendMessage(role, content, imageBase64, table, fullTableKey) {
+// columns whose values must NOT be comma-grouped (years / identifiers).
+// Real date/datetime columns already arrive as strings, so the typeof===number
+// guard skips them; this only excludes numeric year/id-style columns by name.
+// We match the HEAD (last) word only — not any substring — so a MEASURE column
+// that merely mentions one of these words still groups ("Order Value",
+// "ID Count"), while "Order ID" / "Customer Code" / "Year" stay raw.
+// Mirrors plot_utils._is_identifier_label.
+const _IDENT_HEAD_WORDS = new Set(['year','yr','წელი','id','ids','code','codes','კოდი','იდ','zip','postal','phone','account','iban','invoice','order','ref']);
+
+function _isIdentifierLabel(name) {
+  if (name == null) return false;
+  const toks = String(name).match(/\p{L}+/gu);
+  if (!toks || !toks.length) return false;
+  return _IDENT_HEAD_WORDS.has(toks[toks.length - 1].toLowerCase());
+}
+
+function _fmtCellValue(colName, v) {
+  if (typeof v === 'number' && isFinite(v) && !_isIdentifierLabel(colName)) {
+    // Value-driven rounding: integers → 0 dp; non-integers → ≤2 dp (avoids raw
+    // floats like "15,018.369999999999"). No column-name literals.
+    return Number.isInteger(v)
+      ? v.toLocaleString('en-US')
+      : v.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  }
+  return (v === null || v === undefined) ? '' : String(v);
+}
+
+// Render the "Show data" (Plotly charts only) + "Show code" (any response)
+// buttons beneath an assistant message. Both open a self-contained, offline
+// new tab via the vendored PDCViewers — client-only display, nothing crosses
+// to the brain.
+function _appendResponseActions(contentDiv, extras) {
+  extras = extras || {};
+  if (!window.PDCViewers) return;
+  const hasCode = !!(extras.code && String(extras.code).trim());
+  const hasChartData = !!(extras.chartData || extras.chartDataKey);
+  if (!hasCode && !hasChartData) return;
+
+  // If this message already rendered an action bar (a chart's View Larger /
+  // Download row, or a table's Show full table / Download Excel row), drop the
+  // Show data / Show code buttons INTO that same flex row. For a plain text
+  // response (no existing bar) use a standalone bar.
+  const existingBar = contentDiv.querySelector('.pdc-action-bar');
+  const bar = existingBar || document.createElement('div');
+  if (!existingBar) {
+    bar.className = 'response-actions';
+    bar.style.cssText = 'display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;';
+  }
+
+  if (hasChartData) {
+    const dataBtn = document.createElement('button');
+    dataBtn.className = 'ghost';
+    dataBtn.textContent = '📊 Show data';
+    dataBtn.style.cssText = 'padding:6px 12px; font-size:13px;';
+    dataBtn.addEventListener('click', () => {
+      // Inline data → render immediately; keyed data → open tab now (popup-safe),
+      // then fetch the cached rows from the client's own full_table endpoint.
+      if (extras.chartData) {
+        window.PDCViewers.openData(extras.chartData);
+        return;
+      }
+      const win = window.PDCViewers.openBlankWindow('Chart data');
+      fetch(`/api/chat/${currentChatId}/full_table/${extras.chartDataKey}`)
+        .then(r => r.ok ? r.json() : Promise.reject(r.status))
+        .then(t => window.PDCViewers.renderData(win, t))
+        .catch(() => window.PDCViewers.renderData(win, null));
+    });
+    bar.appendChild(dataBtn);
+  }
+
+  if (hasCode) {
+    const codeBtn = document.createElement('button');
+    codeBtn.className = 'ghost';
+    codeBtn.textContent = '⟨⟩ Show code';
+    codeBtn.style.cssText = 'padding:6px 12px; font-size:13px;';
+    codeBtn.addEventListener('click', () => window.PDCViewers.openCode(extras.code));
+    bar.appendChild(codeBtn);
+  }
+
+  // Only append when we created a standalone bar — an existing bar is already in the DOM.
+  if (!existingBar) contentDiv.appendChild(bar);
+}
+
+function appendMessage(role, content, imageBase64, table, fullTableKey, extras) {
   const messageDiv = document.createElement('div');
   messageDiv.className = `message ${role}`;
 
@@ -1640,7 +1861,12 @@ function appendMessage(role, content, imageBase64, table, fullTableKey) {
   if (table && table.columns && table.rows) {
     appendTableTo(contentDiv, table, fullTableKey, content || '');
   }
-  
+
+  // "Show data" / "Show code" buttons (assistant responses only).
+  if (role === 'assistant') {
+    _appendResponseActions(contentDiv, extras);
+  }
+
   messageDiv.appendChild(contentDiv);
   chatMessages.appendChild(messageDiv);
 }
@@ -1687,10 +1913,11 @@ function createImageWithFullscreen(base64Data, messageContext = '') {
   const img = document.createElement('img');
   img.src = 'data:image/png;base64,' + base64Data;
   img.style.cssText = 'max-width: 100%; max-height: 700px; object-fit: contain; border: 1px solid #e7e8ea; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); display: block;';
-  
+
   const btnContainer = document.createElement('div');
-  btnContainer.style.cssText = 'display: flex; gap: 8px; margin-top: 8px;';
-  
+  btnContainer.className = 'pdc-action-bar';
+  btnContainer.style.cssText = 'display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap;';
+
   const viewBtn = document.createElement('button');
   viewBtn.className = 'ghost';
   viewBtn.innerHTML = '🔍 View Larger';
@@ -1786,7 +2013,8 @@ function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
   plotlyContainer.appendChild(iframe);
 
   const btnContainer = document.createElement('div');
-  btnContainer.style.cssText = 'display: flex; gap: 8px; margin-top: 8px;';
+  btnContainer.className = 'pdc-action-bar';
+  btnContainer.style.cssText = 'display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap;';
 
   const viewBtn = document.createElement('button');
   viewBtn.className = 'ghost';
@@ -1885,6 +2113,85 @@ function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
   return plotlyContainer;
 }
 
+// Make a rendered <table> sortable by clicking a column header (Part B).
+// Operates on the DOM rows (branch-agnostic — works for the plain table AND
+// the pandas-Styler `styled_html` table, preserving cell formatting/colors).
+// Numeric columns sort numerically (commas stripped), others locale-aware;
+// repeated clicks toggle asc/desc; a ▲/▼ indicator marks the active column.
+// Visibility is re-applied by position after each sort so the "top 10 / full"
+// preview still shows the top-N of the new order.
+function _makeSortableTable(tableEl) {
+  if (!tableEl) return;
+  const thead = tableEl.tHead || tableEl.querySelector('thead');
+  const tbody = tableEl.tBodies && tableEl.tBodies[0] ? tableEl.tBodies[0] : tableEl.querySelector('tbody');
+  if (!thead || !tbody) return;
+  const headerRow = thead.rows ? thead.rows[thead.rows.length - 1] : thead.querySelector('tr');
+  if (!headerRow) return;
+  const ths = Array.from(headerRow.cells || headerRow.children);
+  if (!ths.length) return;
+
+  const parseNum = (t) => {
+    if (t == null) return NaN;
+    const s = String(t).replace(/,/g, '').trim();
+    if (s === '') return NaN;
+    const cleaned = s.replace(/[^0-9.\-eE+]/g, '');
+    // Require at least one digit — else Number("") is 0, mis-tagging text as numeric.
+    if (!/[0-9]/.test(cleaned)) return NaN;
+    const n = Number(cleaned);
+    return isFinite(n) ? n : NaN;
+  };
+
+  let sortCol = -1, sortDir = 1;
+  ths.forEach((th, ci) => {
+    th.style.cursor = 'pointer';
+    th.style.userSelect = 'none';
+    if (!th.querySelector('.sort-ind')) {
+      const ind = document.createElement('span');
+      ind.className = 'sort-ind';
+      ind.style.cssText = 'margin-left:4px;font-size:11px;opacity:.7;';
+      th.appendChild(ind);
+    }
+    th.addEventListener('click', () => {
+      if (sortCol === ci) sortDir = -sortDir; else { sortCol = ci; sortDir = 1; }
+      const rows = Array.from(tbody.rows);
+      if (!rows.length) return;
+      // How many rows are currently visible (preserve the top-N preview window).
+      const visibleCount = rows.filter(r => r.style.display !== 'none').length || rows.length;
+      // Decide numeric-vs-string from the column's non-empty cells.
+      let numeric = 0, seen = 0;
+      rows.forEach(r => {
+        const cell = r.cells[ci];
+        if (!cell) return;
+        const t = (cell.textContent || '').trim();
+        if (t === '') return;
+        seen++;
+        if (!isNaN(parseNum(t))) numeric++;
+      });
+      const isNum = seen > 0 && numeric / seen >= 0.6;
+      rows.sort((a, b) => {
+        const ta = a.cells[ci] ? (a.cells[ci].textContent || '').trim() : '';
+        const tb = b.cells[ci] ? (b.cells[ci].textContent || '').trim() : '';
+        let cmp;
+        if (isNum) {
+          const na = parseNum(ta), nb = parseNum(tb);
+          cmp = (isNaN(na) ? Infinity : na) - (isNaN(nb) ? Infinity : nb);  // blanks last
+        } else {
+          cmp = ta.localeCompare(tb, undefined, { numeric: true, sensitivity: 'base' });
+        }
+        return cmp * sortDir;
+      });
+      rows.forEach((r, i) => {
+        r.style.display = (i < visibleCount) ? '' : 'none';
+        tbody.appendChild(r);  // reorder in place
+      });
+      ths.forEach((h, hi) => {
+        const ind = h.querySelector('.sort-ind');
+        if (ind) ind.textContent = (hi === ci) ? (sortDir === 1 ? '▲' : '▼') : '';
+      });
+    });
+  });
+}
+
 // Full-featured table renderer with Excel export and full table view
 function appendTableTo(div, table, fullKey, messageContext = '') {
   try {
@@ -1952,6 +2259,7 @@ function appendTableTo(div, table, fullKey, messageContext = '') {
           tr.style.display = 'none';
         }
       });
+      _makeSortableTable(styledTable);   // click-to-sort headers (Part B)
     }
     tableContainer = styledContainer;
     div.appendChild(styledContainer);
@@ -1980,7 +2288,7 @@ function appendTableTo(div, table, fullKey, messageContext = '') {
         const td = document.createElement('td');
         let v = row && Object.prototype.hasOwnProperty.call(row, c) ? row[c] : '';
         if (v === null || v === undefined) v = '';
-        td.textContent = String(v);
+        td.textContent = _fmtCellValue(c, v);
         td.style.cssText = 'border: 1px solid #e5e7eb; padding: 8px;';
         tr.appendChild(td);
       });
@@ -1989,18 +2297,25 @@ function appendTableTo(div, table, fullKey, messageContext = '') {
     tbl.appendChild(tbody);
     tableContainer = tbl;
     div.appendChild(tbl);
+    _makeSortableTable(tbl);   // click-to-sort headers (Part B)
   }
   
   // Initially showing top 10 rows (even for styled HTML, we hide rows beyond 10)
   let showingFull = false;
   let fullData = null;
   
+  // Table action bar — same flex row + shared class the response-action merge
+  // (_appendResponseActions) looks for, so Show code lands on this row too.
+  const actionBar = document.createElement('div');
+  actionBar.className = 'pdc-action-bar';
+  actionBar.style.cssText = 'display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap;';
+
   // Show full table button
   if (fullKey && (tot === null || (Array.isArray(previewRows) && tot > previewRows.length))) {
     const btn = document.createElement('button');
     btn.className = 'ghost';
     btn.textContent = showingFull ? 'Show top 10 rows' : 'Show full table';
-    btn.style.cssText = 'margin-top: 6px; padding: 6px 12px; font-size: 13px;';
+    btn.style.cssText = 'padding: 6px 12px; font-size: 13px;';
     
     const renderRows = (cols, rows) => {
       // For styled HTML tables, just show/hide rows instead of rebuilding
@@ -2042,7 +2357,7 @@ function appendTableTo(div, table, fullKey, messageContext = '') {
           const td = document.createElement('td');
           let v = row && Object.prototype.hasOwnProperty.call(row, c) ? row[c] : '';
           if (v === null || v === undefined) v = '';
-          td.textContent = String(v);
+          td.textContent = _fmtCellValue(c, v);
           td.style.cssText = 'border: 1px solid #e5e7eb; padding: 8px;';
           tr.appendChild(td);
         });
@@ -2104,14 +2419,14 @@ function appendTableTo(div, table, fullKey, messageContext = '') {
         showingFull = false;
       }
     });
-    div.appendChild(btn);
+    actionBar.appendChild(btn);
   }
-  
+
   // Excel download button
   const downloadBtn = document.createElement('button');
   downloadBtn.className = 'ghost';
   downloadBtn.innerHTML = '📥 Download Excel';
-  downloadBtn.style.cssText = 'margin-top: 6px; padding: 6px 12px; font-size: 13px; margin-left: 8px;';
+  downloadBtn.style.cssText = 'padding: 6px 12px; font-size: 13px;';
   
   downloadBtn.addEventListener('click', async () => {
     try {
@@ -2164,7 +2479,8 @@ function appendTableTo(div, table, fullKey, messageContext = '') {
     }
   });
   
-  div.appendChild(downloadBtn);
+  actionBar.appendChild(downloadBtn);
+  div.appendChild(actionBar);
   return true;
 }
 
@@ -2174,6 +2490,71 @@ function setInputLocked(locked) {
   isRequestInProgress = locked;
   const btn = document.getElementById('btnSend');
   if (btn) btn.disabled = locked;
+}
+
+// While a generation is active (live stream OR reload-poll), turn the send
+// button INTO a Stop button (ChatGPT/Claude style): new questions are blocked
+// (isRequestInProgress) but the user can cancel. Reverts to Send on every
+// terminal state (done, stopped, error, timeout) via setGenerating(false).
+function setGenerating(active) {
+  isRequestInProgress = active;
+  const btn = document.getElementById('btnSend');
+  if (!btn) return;
+  if (active) {
+    if (!btn.dataset.sendHtml) btn.dataset.sendHtml = btn.innerHTML;
+    btn.dataset.mode = 'stop';
+    btn.disabled = false;                 // clickable AS Stop
+    btn.classList.add('is-stop');
+    btn.title = 'Stop generating';
+    btn.setAttribute('aria-label', 'Stop generating');
+    btn.innerHTML = '<span style="font-size:14px;line-height:1;">■</span>';  // ■
+  } else {
+    btn.dataset.mode = 'send';
+    btn.disabled = false;
+    btn.classList.remove('is-stop');
+    btn.title = '';
+    btn.removeAttribute('aria-label');
+    if (btn.dataset.sendHtml) btn.innerHTML = btn.dataset.sendHtml;
+  }
+}
+
+// Subtle "stopped by user" note appended when the user cancels. Whether or not
+// charts already rendered, this reads as the natural end of the turn (matches
+// ChatGPT/Claude). No bubble chrome — a muted italic line.
+function _appendStoppedNote() {
+  const note = document.createElement('div');
+  note.className = 'message assistant stopped-note';
+  note.innerHTML = '<div class="message-content"><p style="color:#6b7280;font-size:13px;font-style:italic;margin:0;">⏹ Response stopped by user</p></div>';
+  chatMessages.appendChild(note);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+// Stop is INSTANT for the user (Part A): abort the live stream so no further /
+// late events render, finalize the in-progress message, and re-enable input —
+// all synchronously, WITHOUT awaiting the server. The server-side worker is
+// cancelled fire-and-forget in the background (it persists the partial / stopped
+// turn, which is authoritative on reload).
+function stopGeneration() {
+  const chatId = currentChatId, convId = currentConvId;
+  // Fire-and-forget server cancel — do NOT block the UI on it.
+  if (chatId && convId) {
+    try {
+      fetch(`/api/chat/${chatId}/conversation/${convId}/stop`, { method: 'POST' }).catch(() => {});
+    } catch (e) { /* ignore */ }
+  }
+  // Live-stream path: the active send registered a synchronous handler that
+  // aborts the reader + finalizes the message. Prefer it (instant, no await).
+  if (typeof activeStopHandler === 'function') {
+    try { activeStopHandler(); } catch (e) { /* fall through to the generic finalize */ }
+    return;
+  }
+  // Reload/poll path (no live stream in this tab): stop the poll, drop the
+  // working indicator, append the stopped note, and re-enable input now.
+  try { _stopReloadGenPoll(); } catch (e) {}
+  const lb = document.getElementById('loadingBubble');
+  if (lb) lb.remove();
+  _appendStoppedNote();
+  setGenerating(false);
 }
 
 // Try to recover a response from saved conversation history after a failed send.
@@ -2198,11 +2579,13 @@ async function _tryRecoverResponse(chatId, convId, loadingDiv) {
       // Recovery successful - display the saved response
       loadingDiv.remove();
       if (last.images && Array.isArray(last.images) && last.images.length > 0) {
-        last.images.forEach(img => {
-          appendMessage('assistant', img.answer || '', img.image_base64, null, null);
+        last.images.forEach((img, idx) => {
+          appendMessage('assistant', img.answer || '', img.image_base64, null, null,
+            idx === 0 ? { code: last.code } : null);
         });
       } else {
-        appendMessage('assistant', last.content || '', last.image_base64, last.table, last.full_table_key);
+        appendMessage('assistant', last.content || '', last.image_base64, last.table, last.full_table_key,
+          { code: last.code });
       }
       chatMessages.scrollTop = chatMessages.scrollHeight;
       console.log(`Response recovered from saved history (attempt ${attempt + 1})`);
@@ -2223,8 +2606,12 @@ async function sendMessage() {
   chatInput.value = '';
   chatInput.style.height = 'auto';
 
-  // Lock input immediately
-  setInputLocked(true);
+  // Lock input immediately and show the Stop button (cancellable generation).
+  setGenerating(true);
+  // Token identifying THIS send — the finally only reverts the button if a newer
+  // send hasn't started (so an instant Stop → immediate new question is clean).
+  const myToken = ++currentSendToken;
+  let userStopped = false;
 
   // Add user message
   appendMessage('user', question);
@@ -2242,6 +2629,30 @@ async function sendMessage() {
   // Abort controller with 240s timeout (Cloud Run has 300s, leave margin)
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 240000);
+
+  // Shared stream state (also read by the instant-Stop handler below).
+  let loadingBubbleVisible = true;
+  let streamLoadingDiv = null;
+  let chartCount = 0;
+
+  // Register the synchronous Stop handler: abort the reader so NO further/late
+  // events render (kills the late result AND the planner "couldn't generate…"
+  // fallback), drop the loading indicators, append the stopped note, and revert
+  // the button to Send — all instantly. The read loop then unwinds via the
+  // AbortError path, which is suppressed because userStopped is set.
+  activeStopHandler = () => {
+    userStopped = true;
+    try { controller.abort(); } catch (e) {}
+    clearTimeout(timeoutId);
+    if (loadingBubbleVisible) {
+      if (loadingDiv && loadingDiv.parentNode) loadingDiv.remove();
+      loadingBubbleVisible = false;
+    }
+    if (streamLoadingDiv) { streamLoadingDiv.remove(); streamLoadingDiv = null; }
+    _appendStoppedNote();
+    activeStopHandler = null;
+    setGenerating(false);   // re-enable input immediately for the next question
+  };
 
   try {
     // Use SSE streaming endpoint
@@ -2266,11 +2677,10 @@ async function sendMessage() {
     // Check if response is SSE stream
     const contentType = res.headers.get('content-type') || '';
     if (contentType.includes('text/event-stream')) {
-      // SSE streaming path — loadingDiv stays visible until first real content
-      let loadingBubbleVisible = true;
+      // SSE streaming path — loadingDiv stays visible until first real content.
+      // loadingBubbleVisible / streamLoadingDiv / chartCount are declared in the
+      // outer scope so the instant-Stop handler can finalize them.
       let convIdUpdated = false;
-      let chartCount = 0;
-      let streamLoadingDiv = null;
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -2294,6 +2704,25 @@ async function sendMessage() {
             continue;
           }
 
+          // Update conv_id as soon as it's known — the FIRST event is the
+          // "progress/Working…" one and already carries conv_id. Switching the
+          // URL to /c/{conv_id} immediately means an early refresh (before the
+          // first chart) reloads the in-progress conversation instead of /lab.
+          if (data.conv_id && !convIdUpdated) {
+            if (!currentConvId) {
+              currentConvId = data.conv_id;
+              console.log('New conversation created:', data.conv_id);
+              window.history.pushState({ convId: data.conv_id, chatId: currentChatId }, '', `/c/${data.conv_id}`);
+              const convDropdown = document.getElementById('conversationList');
+              const convToggle = document.querySelector('[data-target="conversationList"]');
+              if (convDropdown && convToggle) {
+                convDropdown.classList.remove('hidden');
+                convToggle.classList.add('open');
+              }
+            }
+            convIdUpdated = true;
+          }
+
           if (data.error) {
             if (loadingBubbleVisible) {
               loadingDiv.remove();
@@ -2313,22 +2742,6 @@ async function sendMessage() {
             continue;
           }
 
-          // Update conv_id on first event
-          if (data.conv_id && !convIdUpdated) {
-            if (!currentConvId) {
-              currentConvId = data.conv_id;
-              console.log('New conversation created:', data.conv_id);
-              window.history.pushState({ convId: data.conv_id, chatId: currentChatId }, '', `/c/${data.conv_id}`);
-              const convDropdown = document.getElementById('conversationList');
-              const convToggle = document.querySelector('[data-target="conversationList"]');
-              if (convDropdown && convToggle) {
-                convDropdown.classList.remove('hidden');
-                convToggle.classList.add('open');
-              }
-            }
-            convIdUpdated = true;
-          }
-
           if (data.partial) {
             // Remove main loading bubble on first real content
             if (loadingBubbleVisible) {
@@ -2344,7 +2757,8 @@ async function sendMessage() {
 
             // Append chart as a new assistant message
             chartCount++;
-            appendMessage('assistant', data.answer || '', data.image_base64);
+            appendMessage('assistant', data.answer || '', data.image_base64, null, null,
+              { code: data.code, chartDataKey: data.chart_data_key });
             chatMessages.scrollTop = chatMessages.scrollHeight;
 
             // Show "Rendering chart N of M..." if more charts expected
@@ -2375,7 +2789,8 @@ async function sendMessage() {
               if (!hasContent) {
                 appendMessage('assistant', 'I processed your request but could not generate a response. Please try rephrasing your question.');
               } else {
-                appendMessage('assistant', answer, data.image_base64, data.table, data.full_table_key);
+                appendMessage('assistant', answer, data.image_base64, data.table, data.full_table_key,
+          { code: data.code, chartDataKey: data.chart_data_key });
               }
               chatMessages.scrollTop = chatMessages.scrollHeight;
             }
@@ -2437,7 +2852,8 @@ async function sendMessage() {
       if (!hasContent) {
         appendMessage('assistant', 'I processed your request but could not generate a response. Please try rephrasing your question.');
       } else {
-        appendMessage('assistant', answer, data.image_base64, data.table, data.full_table_key);
+        appendMessage('assistant', answer, data.image_base64, data.table, data.full_table_key,
+          { code: data.code, chartDataKey: data.chart_data_key });
       }
       chatMessages.scrollTop = chatMessages.scrollHeight;
 
@@ -2455,6 +2871,11 @@ async function sendMessage() {
 
   } catch (e) {
     clearTimeout(timeoutId);
+    // User clicked Stop — the handler already aborted the stream and finalized
+    // the message. The AbortError landing here is expected; show nothing.
+    if (userStopped) {
+      return;
+    }
     console.error('Failed to send message:', e);
 
     // Try to recover: the server may have saved the response before the connection dropped
@@ -2475,8 +2896,13 @@ async function sendMessage() {
       loadingDiv.innerHTML = `<div class="message-content"><p style="color:#ef4444;">${escapeHtml(errorMsg)}</p></div>`;
     }
   } finally {
-    setInputLocked(false);
     clearTimeout(timeoutId);
+    // Only touch the button/handler if a NEWER send hasn't taken over (an
+    // instant Stop lets the user fire a new question while this one unwinds).
+    if (myToken === currentSendToken) {
+      activeStopHandler = null;
+      if (!userStopped) setGenerating(false);   // stop path already reverted it
+    }
   }
 }
 
@@ -2645,7 +3071,8 @@ async function editAndRegenerate(messageDiv, editedQuestion) {
       console.warn('Empty response from server:', data);
       appendMessage('assistant', 'I processed your request but could not generate a response. Please try rephrasing your question.');
     } else {
-      appendMessage('assistant', answer, data.image_base64, data.table, data.full_table_key);
+      appendMessage('assistant', answer, data.image_base64, data.table, data.full_table_key,
+        { code: data.code, chartDataKey: data.chart_data_key });
     }
     chatMessages.scrollTop = chatMessages.scrollHeight;
 
