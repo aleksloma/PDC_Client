@@ -29,7 +29,11 @@ secrets/
 # Customer raw data, uploads, chats, conversations, generated reports.
 # NEVER ends up in git — lives on the customer's host volume only.
 client_data/
+client_data*/
+client_data_local/
+brain_data_local/
 data/
+static/tmp/
 
 # Local users / auth store / per-chat data
 **/users.json

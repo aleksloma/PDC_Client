@@ -24,15 +24,6 @@ class Settings(BaseModel):
     BRAIN_TENANT_TOKEN: str = Field(default_factory=lambda: os.getenv("BRAIN_TENANT_TOKEN", ""))
     BRAIN_REQUEST_TIMEOUT: float = Field(default_factory=lambda: float(os.getenv("BRAIN_REQUEST_TIMEOUT", "180.0")))
 
-    # Verbose brain-call debug logging. OFF by default. When ON, every brain
-    # request/response is logged to the LOCAL client log (BRAIN_REQUEST /
-    # BRAIN_RESPONSE), each field truncated to CLIENT_LLM_DEBUG_MAX_CHARS. These
-    # payloads carry no raw row values by design (Art. II); the logs stay on the
-    # local host. A failed brain call always logs its HTTP status + body snippet
-    # regardless of this flag.
-    CLIENT_LLM_DEBUG: bool = Field(default_factory=lambda: os.getenv("CLIENT_LLM_DEBUG", "").strip().lower() in ("1", "true", "yes", "on"))
-    CLIENT_LLM_DEBUG_MAX_CHARS: int = Field(default_factory=lambda: int(os.getenv("CLIENT_LLM_DEBUG_MAX_CHARS", "20000")))
-
     # Same prompt-trim defaults as the B2C app (used by the client when it
     # builds schema text and history before posting to the brain).
     PROMPT_HISTORY_TRIM_CHARS: int = Field(default_factory=lambda: int(os.getenv("PROMPT_HISTORY_TRIM_CHARS", "800")))
