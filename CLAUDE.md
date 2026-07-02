@@ -81,7 +81,9 @@ PDC_Client/
 
 | File | Purpose |
 |---|---|
-| [`routes/chat.py`](routes/chat.py) | Chat SSE stream, multi-chart accumulation + persistence, edit-regenerate, sharing, full_table, conversation title generation, Auto Analytics endpoints |
+| [`routes/chat.py`](routes/chat.py) | Chat SSE stream, multi-chart accumulation + persistence, edit-regenerate, sharing, full_table, conversation title generation, Auto Analytics endpoints; chart-PNG + table-Excel download routes (`export_plotly_png`, `download_excel/{key}`, `export_excel`) |
+| [`plot_utils.py`](plot_utils.py) | `render_plot_safe` + `_plotly_to_html`; trims the non-functional Plotly modebar tools (`toImage`, `sendDataToCloud`, `select2d`, `lasso2d`) and widens the discrete color palette so >10-category charts never repeat a hue (`_widen_discrete_colors`; continuous/2nd-measure scales untouched) |
+| [`static/dashboard.js`](static/dashboard.js) | Served `/lab` UI; on the constant Enterprise plan it hides the B2C subscription plan-cards so the Paddle upsell (no billing backend on-prem) is unreachable |
 | [`routes/upload.py`](routes/upload.py) | `/new_session`, `/upload`, `/schema_autofill_full`, `/generate_chatdata`, GCS-path stubs (400) |
 | [`routes/auth.py`](routes/auth.py) | Email-only login/logout, profile (constant "Enterprise" plan), sidebar listings, rename/delete, conversation-level share |
 | [`routes/report.py`](routes/report.py) | PDF (ReportLab + DejaVu) and PPTX (python-pptx) report rendering — local only |

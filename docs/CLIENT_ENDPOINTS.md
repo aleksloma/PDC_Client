@@ -198,6 +198,25 @@ same `_render_pptx` path, so templates apply to it automatically.
 
 ---
 
+## Downloads (chart PNG + table Excel — rendered locally)
+
+The per-chart **Download** button and the per-table **Download Excel** button
+post to these three routes. Both the chart render and the `.xlsx` build happen
+on the client — **raw data never leaves this server** (Article II); nothing here
+calls the brain.
+
+| Method | Path | Behavior |
+|---|---|---|
+| `POST` | `/api/chat/{chat_id}/export_plotly_png` | Body `{html, filename, scale}`. Renders the interactive chart's raw Plotly HTML to a high-resolution PNG server-side (via `routes/report._plotly_html_to_png`, kaleido) and returns `image/png` as an attachment. `400` when `html` is missing; `502` if the chart cannot be rendered. |
+| `POST` | `/api/chat/{chat_id}/download_excel/{key}` | Body `{filename}`. Streams the full result table cached under `{key}` (the `full_table_key` / `chart_data_key` the chat stream emits — the same bounded LRU as `full_table`) as an `.xlsx` spreadsheet. Returns `404 {"error": "Table not found or expired."}` when the key is missing/expired; `502` on build failure. |
+| `POST` | `/api/chat/{chat_id}/export_excel` | Body `{columns, rows, filename}`. Builds an `.xlsx` directly from the posted preview table and returns the spreadsheet mime. `400` when no table data is posted. |
+
+All three require an authenticated session with access to `{chat_id}`. `.xlsx`
+files are built with pandas + openpyxl. Matplotlib/seaborn charts are already
+PNGs, so their Download is a pure client-side save (no route).
+
+---
+
 ## Endpoints that exist purely to keep the page non-broken
 
 The B2C dashboard.html references B2C-only features that don't exist on-prem.
