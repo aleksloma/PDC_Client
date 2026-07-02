@@ -245,6 +245,16 @@ async function loadUserProfile() {
     });
     updatePlanButtons();
 
+    // Enterprise (on-prem) has no self-serve billing: the plan is a constant
+    // "Enterprise" and there is no Paddle backend. Hide the upsell plan cards
+    // so their "Select" buttons (which POST /api/paddle/subscription/preview —
+    // a route this build never ports → 404) are not reachable. B2C divergence.
+    if ((profile.subscription_plan || '') === 'Enterprise') {
+      document.querySelectorAll('.plan-cards').forEach(function (el) {
+        el.style.display = 'none';
+      });
+    }
+
     // Show subscription status info
     var statusEl = document.getElementById('subscriptionStatus');
     if (statusEl) {

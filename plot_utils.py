@@ -376,6 +376,84 @@ def _encode_plotly_figure(fig) -> str:
         # Fallback: try to get matplotlib figure if available
         raise Exception(f"Plotly image export failed: {e}. Make sure 'kaleido' is installed.")
 
+def _wide_color_sequence(n: int) -> list:
+    """A palette of n visually-distinct colors. Dark24+Light24 (48 unique)
+    covers most cases; beyond that, generate n evenly-spaced HSL hues so no
+    two groups ever collide."""
+    wide = []
+    try:
+        import plotly.express as _px
+        seen = set()
+        for c in list(_px.colors.qualitative.Dark24) + list(_px.colors.qualitative.Light24):
+            if c not in seen:
+                seen.add(c)
+                wide.append(c)
+    except Exception:
+        wide = []
+    if n <= len(wide):
+        return wide[:n]
+    import colorsys
+    out = []
+    for i in range(n):
+        r, g, b = colorsys.hls_to_rgb((i / max(n, 1)), 0.5, 0.6)
+        out.append('#%02x%02x%02x' % (int(r * 255), int(g * 255), int(b * 255)))
+    return out
+
+
+def _widen_discrete_colors(fig) -> None:
+    """When a categorical (discrete-color) chart has more than ~10 color groups,
+    Plotly's default 10-color sequence repeats hues so distinct categories look
+    identical. Reassign each group a distinct color from a wide sequence.
+
+    Group-count-based and generic. GUARDS (never touched):
+      - continuous color scales / colorbars (a `coloraxis` with a colorscale),
+      - a 2nd-measure numeric color (marker/line color is an array, not a single
+        color string),
+      - charts with <= 10 color groups (Plotly's default is already fine).
+    """
+    try:
+        # A continuous color axis (e.g. a dual-measure colorbar) → leave alone.
+        try:
+            ca = fig.layout.coloraxis
+            if ca is not None and getattr(ca, 'colorscale', None):
+                return
+        except Exception:
+            pass
+
+        colored = []  # traces whose color is a single discrete color string
+        for tr in fig.data:
+            marker = getattr(tr, 'marker', None)
+            line = getattr(tr, 'line', None)
+            mcol = getattr(marker, 'color', None) if marker is not None else None
+            lcol = getattr(line, 'color', None) if line is not None else None
+            # A per-point / continuous color is array-like → bail entirely so we
+            # never disturb a numeric color measure or colorbar.
+            for col in (mcol, lcol):
+                if col is not None and not isinstance(col, str) and hasattr(col, '__len__'):
+                    return
+            colored.append(tr)
+
+        if len(colored) <= 10:
+            return
+
+        palette = _wide_color_sequence(len(colored))
+        for i, tr in enumerate(colored):
+            c = palette[i]
+            try:
+                if getattr(tr, 'marker', None) is not None:
+                    tr.marker.color = c
+            except Exception:
+                pass
+            try:
+                if getattr(tr, 'line', None) is not None and getattr(tr.line, 'color', None):
+                    tr.line.color = c
+            except Exception:
+                pass
+    except Exception:
+        # Cosmetic only — never block the render (Article IV).
+        pass
+
+
 def _plotly_to_html(fig) -> str:
     """Convert Plotly figure to interactive HTML string with full-height styling."""
     try:
@@ -412,13 +490,20 @@ def _plotly_to_html(fig) -> str:
         # internally; only fires for genuinely extreme, all-positive ranges.
         _maybe_log_plotly_axes(fig)
 
+        # Widen the discrete color palette for high-cardinality categorical
+        # charts so > ~10 groups never share a repeated hue. Guarded internally;
+        # continuous/2nd-measure color scales and <= 10-group charts untouched.
+        _widen_discrete_colors(fig)
+
         # Generate standalone HTML with responsive sizing
         html = fig.to_html(
             include_plotlyjs='cdn',
             config={
                 'displayModeBar': True,
                 'displaylogo': False,
-                'modeBarButtonsToRemove': ['toImage', 'sendDataToCloud'],
+                # Box/Lasso Select do nothing useful on these analytics charts;
+                # drop them. Zoom/pan/zoomin/zoomout/autoScale2d/resetScale2d stay.
+                'modeBarButtonsToRemove': ['toImage', 'sendDataToCloud', 'select2d', 'lasso2d'],
                 'responsive': True
             },
             div_id='plotly-chart'

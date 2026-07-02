@@ -16,14 +16,16 @@ LLM work is done in a worker thread; results come back through an
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import re
 import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import local_store
 import run_chat_local
@@ -1099,3 +1101,114 @@ async def full_table_get(request: Request, chat_id: str, key: str):
     if not tbl:
         return JSONResponse({"error": "Full table not found or expired."}, status_code=404)
     return tbl
+
+
+# --- Downloads (chart PNG + table Excel) -------------------------------------
+# The B2C dashboard calls these three routes; they were never ported, so every
+# "Download" button 404'd. Rendering + Excel build happen locally (Article II:
+# raw values stay on the client — nothing here touches the brain).
+
+def _safe_filename(name: str, default: str = "download") -> str:
+    """Strip anything that could break a Content-Disposition header or path."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (name or "").strip()).strip("._")
+    return cleaned[:120] or default
+
+
+def _table_to_xlsx_bytes(columns: list, rows: list) -> bytes:
+    """Build a .xlsx from the cached/posted table shape ({columns, rows})."""
+    import pandas as pd
+
+    cols = list(columns or [])
+    data = rows or []
+    df = pd.DataFrame(data, columns=cols) if cols else pd.DataFrame(data)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Data")
+    return buf.getvalue()
+
+
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+@router.post("/{chat_id}/export_plotly_png")
+async def export_plotly_png(request: Request, chat_id: str):
+    """Render a Plotly chart (raw HTML from the iframe) to a high-res PNG via
+    kaleido and stream it back. Body: {html, filename?, scale?}."""
+    email, err = _require_chat(request, chat_id)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    html = (body or {}).get("html") or ""
+    filename = _safe_filename((body or {}).get("filename") or "chart", "chart")
+    if not html:
+        return JSONResponse({"error": "No chart HTML provided."}, status_code=400)
+    try:
+        from routes.report import _plotly_html_to_png
+        png = _plotly_html_to_png(html, email)
+    except Exception as e:
+        log_with_sid(email, "error", f"EXPORT_PLOTLY_PNG_FAILED: {e}", chat_id=chat_id)
+        png = None
+    if not png:
+        return JSONResponse({"error": "Could not render chart image."}, status_code=502)
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Content-Disposition": f'attachment; filename="{filename}.png"'},
+    )
+
+
+@router.post("/{chat_id}/download_excel/{key}")
+async def download_excel(request: Request, chat_id: str, key: str):
+    """Build a .xlsx from the FULL table cached under `key`. Body: {filename?}."""
+    email, err = _require_chat(request, chat_id)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    filename = _safe_filename((body or {}).get("filename") or "table", "table")
+    tbl = _FULL_TABLE_CACHE.get(key)
+    if not tbl:
+        return JSONResponse({"error": "Table not found or expired."}, status_code=404)
+    try:
+        xlsx = _table_to_xlsx_bytes(tbl.get("columns"), tbl.get("rows"))
+    except Exception as e:
+        log_with_sid(email, "error", f"DOWNLOAD_EXCEL_FAILED: {e}", chat_id=chat_id)
+        return JSONResponse({"error": "Could not build Excel file."}, status_code=502)
+    return Response(
+        content=xlsx,
+        media_type=_XLSX_MIME,
+        headers={"Content-Disposition": f'attachment; filename="{filename}.xlsx"'},
+    )
+
+
+@router.post("/{chat_id}/export_excel")
+async def export_excel(request: Request, chat_id: str):
+    """Build a .xlsx from the preview table posted verbatim by the frontend.
+    Body: {columns, rows, filename?}."""
+    email, err = _require_chat(request, chat_id)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    filename = _safe_filename((body or {}).get("filename") or "table", "table")
+    columns = (body or {}).get("columns") or []
+    rows = (body or {}).get("rows") or []
+    if not columns and not rows:
+        return JSONResponse({"error": "No table data provided."}, status_code=400)
+    try:
+        xlsx = _table_to_xlsx_bytes(columns, rows)
+    except Exception as e:
+        log_with_sid(email, "error", f"EXPORT_EXCEL_FAILED: {e}", chat_id=chat_id)
+        return JSONResponse({"error": "Could not build Excel file."}, status_code=502)
+    return Response(
+        content=xlsx,
+        media_type=_XLSX_MIME,
+        headers={"Content-Disposition": f'attachment; filename="{filename}.xlsx"'},
+    )
