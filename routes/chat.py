@@ -53,6 +53,97 @@ def _cache_full_table(table: dict) -> str:
     return key
 
 
+# Durable full-table persistence (port of the B2C `download_full_excel`
+# mechanism). A tabular RESULT is written to disk as
+# `chatdata/{chat_id}/conversations/full/{key}.json` = {columns, rows, code,
+# total_rows}, so "Download Excel" / "Show full table" survive a container
+# restart AND can re-execute the stored code to return the COMPLETE (uncapped)
+# result — not the 50-row preview. The in-memory LRU is kept as a fast path and
+# as the fallback for chart-data ("Show data") records, which have no
+# re-executable DataFrame code. Article V: local disk under DATA_ROOT only.
+_FULL_KEY_RE = re.compile(r"[0-9a-fA-F]{16}")
+
+
+def _persist_full_table(store, table: dict, code: str | None) -> str | None:
+    """Persist {columns, rows, code, total_rows} to disk and mirror it into the
+    in-memory LRU. Returns the durable key, or None on failure (caller then
+    leaves `full_table_key` unset and the frontend exports the preview rows)."""
+    try:
+        key = secrets.token_hex(8)  # 16 hex chars — matches _FULL_KEY_RE
+        record = _json_safe({
+            "columns": table.get("columns", []),
+            "rows": table.get("rows", []),
+            "total_rows": table.get("total_rows"),
+        })
+        if code:
+            record["code"] = code
+        full_dir = store.conversations_dir / "full"
+        full_dir.mkdir(parents=True, exist_ok=True)
+        (full_dir / f"{key}.json").write_text(
+            json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        # Fast-path / fallback copy in the bounded LRU.
+        _FULL_TABLE_CACHE[key] = record
+        _FULL_TABLE_ORDER.append(key)
+        while len(_FULL_TABLE_ORDER) > _FULL_TABLE_MAX:
+            old = _FULL_TABLE_ORDER.pop(0)
+            _FULL_TABLE_CACHE.pop(old, None)
+        return key
+    except Exception as e:
+        log_with_sid(getattr(store, "chat_id", ""), "warning",
+                     f"PERSIST_FULL_TABLE_FAILED: {e}")
+        return None
+
+
+def _load_full_table_record(store, key: str) -> dict | None:
+    """Resolve a full-table / chart-data record by key: durable disk first
+    (survives restart, may carry re-executable `code`), then the in-memory LRU
+    (chart-data "Show data", no code). Returns None when the key is malformed or
+    unknown. The regex guard also blocks path traversal (Article VII)."""
+    if not (key and _FULL_KEY_RE.fullmatch(key)):
+        return None
+    try:
+        p = store.conversations_dir / "full" / f"{key}.json"
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        log_with_sid(getattr(store, "chat_id", ""), "warning",
+                     f"FULL_TABLE_READ_FAILED: {e}")
+    return _FULL_TABLE_CACHE.get(key)
+
+
+async def _reexecute_full_df(chat_id: str, code: str | None):
+    """Re-run stored code locally to produce the COMPLETE (uncapped) DataFrame.
+    Returns a DataFrame or None (caller falls back to the stored preview rows).
+
+    Article II: execution is local — nothing here touches the brain.
+    Article V: reads local DataFrames only. Article IV: never raises."""
+    if not code:
+        return None
+    try:
+        import pandas as pd
+        from code_exec import safe_execute
+        store = local_store.ChatDataStore(chat_id)
+        loop = asyncio.get_running_loop()
+        dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
+        if not dfs:
+            return None
+        exec_out = await loop.run_in_executor(
+            _EXEC, lambda: safe_execute(code, dfs, sid=chat_id))
+        if not isinstance(exec_out, dict) or exec_out.get("error"):
+            return None
+        obj = exec_out.get("result")
+        if isinstance(obj, pd.DataFrame):
+            return obj
+        if isinstance(obj, pd.Series):
+            return obj.reset_index()
+        if hasattr(obj, "data") and isinstance(obj.data, pd.DataFrame):
+            return obj.data
+        return None
+    except Exception as e:
+        log_with_sid(chat_id, "warning", f"DOWNLOAD_REEXEC_FAILED: {e}")
+        return None
+
+
 # In-progress generation registry. A conv_id present here has a worker thread
 # generating right now. Used ONLY by the lightweight status endpoint so a page
 # reloaded/reopened mid-generation can show the working indicator and block new
@@ -188,13 +279,15 @@ def _build_chart_entry(c: dict) -> dict:
 
 
 def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
-                             usage, charts):
+                             usage, charts, full_table_key=None):
     """Build the AI-turn history record persisted EXACTLY ONCE by the worker.
 
     Returns None when there is nothing to persist (never writes an empty turn).
     Enriches with PER-CHART code + chart_data (PART B). Backward-compatible
     shape: 0 imgs → image_base64=None; 1 img → image_base64 + record-level
     code/chart_data; 2+ imgs → images=[{image_base64, answer, code?, chart_data?}].
+    `full_table_key` (single-shot tabular result) is persisted so a reloaded
+    conversation can re-execute for the FULL Download Excel / Show full table.
     """
     if err_msg:
         return {"role": "ai", "content": err_msg, "ts": time.time()}
@@ -208,6 +301,8 @@ def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
             "usage": single.get("usage"),
             "ts": time.time(),
         }
+        if full_table_key:
+            rec["full_table_key"] = full_table_key
         cd = _persistable_chart_data(single.get("chart_data"))
         if cd is not None:
             rec["chart_data"] = cd
@@ -484,6 +579,7 @@ async def chat_stream(request: Request, chat_id: str):
             w_combined_codes: list = []
             w_usage: dict = {}
             w_single = None                 # single-shot result dict
+            w_full_table_key = None         # durable key for a tabular result
             err_msg = None
             cancelled = False               # STOP requested mid-generation
             # Clear any stale cancel flag from a prior attempt, then mark this
@@ -502,6 +598,20 @@ async def chat_stream(request: Request, chat_id: str):
                     user_email=email,
                 )
                 for event in gen:
+                    # Durable full-table persistence for a single-shot tabular
+                    # result: write {columns, rows, code, total_rows} to disk and
+                    # stash the key ON the shared event dict BEFORE the consumer
+                    # sees it — so the live download and the persisted history
+                    # record share ONE durable key that re-executes for the FULL
+                    # result (and survives a container restart / reload).
+                    if isinstance(event, dict) and event.get("single_response"):
+                        _res = event.get("result") or {}
+                        _tbl = _res.get("table")
+                        if isinstance(_tbl, dict) and _tbl.get("rows"):
+                            _k = _persist_full_table(store, _tbl, _res.get("code"))
+                            if _k:
+                                event["full_table_key"] = _k
+                                w_full_table_key = _k
                     # Stream live first (UX identical to before), then accumulate.
                     loop.call_soon_threadsafe(queue.put_nowait, ("event", event))
                     try:
@@ -567,7 +677,7 @@ async def chat_stream(request: Request, chat_id: str):
                 else:
                     record = _build_ai_history_record(
                         err_msg, w_single, w_combined_answer, w_combined_codes,
-                        w_usage, w_charts)
+                        w_usage, w_charts, full_table_key=w_full_table_key)
                 if record is not None:
                     store.append_history(conv_id, record)
                     if not err_msg and not cancelled:
@@ -668,10 +778,10 @@ async def chat_stream(request: Request, chat_id: str):
                                                    {"chat_id": chat_id, "conv_id": conv_id})
                     except Exception:
                         pass
-                full_table_key = None
-                tbl = result.get("table")
-                if isinstance(tbl, dict) and tbl.get("rows") and len(tbl.get("rows") or []) > 0:
-                    full_table_key = _cache_full_table(tbl)
+                # The worker already persisted the tabular result to disk and
+                # stashed its durable key on the event (re-executes for the FULL
+                # result + survives restart). Use it; do not re-cache the preview.
+                full_table_key = ev.get("full_table_key")
                 # Chart source data for the "Show data" button — reuses the
                 # full_table cache + endpoint. Client-only display. Single
                 # {rows} table or multi-subplot {tables:[...]}.
@@ -848,7 +958,15 @@ async def edit_regenerate(request: Request, chat_id: str):
         # Single-shot path
         if ev.get("single_response"):
             single_result = ev.get("result") or {}
-            store.append_history(conv_id, {
+            # Persist the tabular result durably (with code) BEFORE the history
+            # record, so the key can be embedded → a reloaded conversation
+            # re-executes for the FULL Download Excel / Show full table.
+            full_table_key = None
+            tbl = single_result.get("table")
+            if isinstance(tbl, dict) and tbl.get("rows"):
+                full_table_key = _persist_full_table(
+                    store, tbl, single_result.get("code"))
+            ai_record = {
                 "role": "ai",
                 "content": single_result.get("text", ""),
                 "image_base64": single_result.get("image_base64"),
@@ -856,11 +974,10 @@ async def edit_regenerate(request: Request, chat_id: str):
                 "code": single_result.get("code"),
                 "usage": single_result.get("usage"),
                 "ts": time.time(),
-            })
-            full_table_key = None
-            tbl = single_result.get("table")
-            if isinstance(tbl, dict) and tbl.get("rows"):
-                full_table_key = _cache_full_table(tbl)
+            }
+            if full_table_key:
+                ai_record["full_table_key"] = full_table_key
+            store.append_history(conv_id, ai_record)
             chart_data_key = None
             cd = single_result.get("chart_data")
             if isinstance(cd, dict) and (cd.get("rows") or cd.get("tables")):
@@ -1091,16 +1208,28 @@ async def suggested_questions_stub(request: Request, chat_id: str):
 
 @router.get("/{chat_id}/full_table/{key}")
 async def full_table_get(request: Request, chat_id: str, key: str):
-    """Return the full table that was cached for this key. The chat stream
+    """Return the FULL row set for this key ("Show full table"). The chat stream
     sets `full_table_key` on responses that contain a tabular result; the
-    frontend fetches the full rows via this endpoint."""
+    frontend fetches the full rows via this endpoint.
+
+    Re-executes the stored code locally to return the complete (uncapped)
+    result, falling back to the stored preview rows if re-execution yields
+    nothing (e.g. chart-data records, which carry no re-executable code)."""
     email, err = _require_chat(request, chat_id)
     if err:
         return err
-    tbl = _FULL_TABLE_CACHE.get(key)
-    if not tbl:
+    store = local_store.ChatDataStore(chat_id)
+    rec = _load_full_table_record(store, key)
+    if not rec:
         return JSONResponse({"error": "Full table not found or expired."}, status_code=404)
-    return tbl
+    df = await _reexecute_full_df(chat_id, rec.get("code"))
+    if df is not None and not df.empty:
+        return _json_safe({
+            "columns": list(df.columns),
+            "rows": df.to_dict(orient="records"),
+            "total_rows": int(len(df)),
+        })
+    return _json_safe(rec)
 
 
 # --- Downloads (chart PNG + table Excel) -------------------------------------
@@ -1121,6 +1250,16 @@ def _table_to_xlsx_bytes(columns: list, rows: list) -> bytes:
     cols = list(columns or [])
     data = rows or []
     df = pd.DataFrame(data, columns=cols) if cols else pd.DataFrame(data)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Data")
+    return buf.getvalue()
+
+
+def _df_to_xlsx_bytes(df) -> bytes:
+    """Build a .xlsx from a full (uncapped) DataFrame — every row."""
+    import pandas as pd
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Data")
@@ -1162,7 +1301,13 @@ async def export_plotly_png(request: Request, chat_id: str):
 
 @router.post("/{chat_id}/download_excel/{key}")
 async def download_excel(request: Request, chat_id: str, key: str):
-    """Build a .xlsx from the FULL table cached under `key`. Body: {filename?}."""
+    """Build a .xlsx with the FULL (uncapped) result for `key`. Body: {filename?}.
+
+    Re-executes the stored code against the chat's local DataFrames to produce
+    the complete result (no 50-row cap), then writes every row. Falls back to
+    the stored preview rows only if re-execution errors or yields nothing (e.g.
+    chart-data "Show data" records, which have no re-executable code).
+    Article II: execution is local; Article IV: guarded, safe fallback."""
     email, err = _require_chat(request, chat_id)
     if err:
         return err
@@ -1171,11 +1316,16 @@ async def download_excel(request: Request, chat_id: str, key: str):
     except Exception:
         body = {}
     filename = _safe_filename((body or {}).get("filename") or "table", "table")
-    tbl = _FULL_TABLE_CACHE.get(key)
-    if not tbl:
+    store = local_store.ChatDataStore(chat_id)
+    rec = _load_full_table_record(store, key)
+    if not rec:
         return JSONResponse({"error": "Table not found or expired."}, status_code=404)
     try:
-        xlsx = _table_to_xlsx_bytes(tbl.get("columns"), tbl.get("rows"))
+        df = await _reexecute_full_df(chat_id, rec.get("code"))
+        if df is not None and not df.empty:
+            xlsx = _df_to_xlsx_bytes(df)
+        else:
+            xlsx = _table_to_xlsx_bytes(rec.get("columns"), rec.get("rows"))
     except Exception as e:
         log_with_sid(email, "error", f"DOWNLOAD_EXCEL_FAILED: {e}", chat_id=chat_id)
         return JSONResponse({"error": "Could not build Excel file."}, status_code=502)
