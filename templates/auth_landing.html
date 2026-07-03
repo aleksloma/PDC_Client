@@ -55,12 +55,18 @@
       <input id="password" name="password" type="password"
              autocomplete="current-password" placeholder="Your password" required />
       {% if password_error %}
+      {% if legacy_reset %}
+      {# Pre-password (email-only era) account: password must be set through
+         the reset flow. data-i18n lets a stored language pref translate it. #}
+      <div class="pw-error" data-i18n="auth.legacy_reset_required">{{ password_error }}</div>
+      {% else %}
       <div class="pw-error">{{ password_error }}</div>
-      {% if password_error == 'Incorrect password' %}
+      {% endif %}
+      {% endif %}
+      {% if show_reset %}
       {# Reset posts the SAME form (uses the email field) to the reset endpoint #}
       <button type="submit" class="reset-btn" formaction="/auth/reset_password"
-              formnovalidate>Reset password</button>
-      {% endif %}
+              formnovalidate data-i18n="auth.reset_password">Reset password</button>
       {% endif %}
     </div>
     <label class="remember">
@@ -73,5 +79,11 @@
     <div class="footer">Enterprise · on-premise deployment<br>
       First time here? The password you enter becomes your password.</div>
   </form>
+  <script src="/static/i18n.js"></script>
+  <script>
+    // Apply the user's stored language preference (set on the /lab page) to
+    // the data-i18n-tagged strings; everything else stays server-rendered.
+    if (window.i18n) window.i18n.applyAll();
+  </script>
 </body>
 </html>

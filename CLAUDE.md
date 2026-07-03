@@ -87,7 +87,7 @@ PDC_Client/
 | [`plot_utils.py`](plot_utils.py) | `render_plot_safe` + `_plotly_to_html`; trims the non-functional Plotly modebar tools (`toImage`, `sendDataToCloud`, `select2d`, `lasso2d`) and widens the discrete color palette so >10-category charts never repeat a hue (`_widen_discrete_colors`; continuous/2nd-measure scales untouched) |
 | [`static/dashboard.js`](static/dashboard.js) | Served `/lab` UI; on the constant Enterprise plan it hides the B2C subscription plan-cards so the Paddle upsell (no billing backend on-prem) is unreachable. Profile dropdown carries exactly two items — Change Password (small modal → `POST /auth/password`) and Logout; the B2C Profile/Subscriptions dropdown items don't exist here (bindings are optional-chained) |
 | [`routes/upload.py`](routes/upload.py) | `/new_session`, `/upload`, `/schema_autofill_full`, `/generate_chatdata`, GCS-path stubs (400) |
-| [`routes/auth.py`](routes/auth.py) | Email+password login (first login sets the password + brain-relayed welcome mail; legacy email-only users migrate the same way), reset flow (client-generated temp password, hash + `must_change_password` stored locally, mailed via the brain), forced password change, `/auth/password` change endpoint, remember-me sessions, profile (constant "Enterprise" plan), sidebar listings, rename/delete, conversation-level share |
+| [`routes/auth.py`](routes/auth.py) | Email+password login (a genuinely NEW email sets the entered password + brain-relayed welcome mail; a LEGACY email-only account is refused with a "set your password via reset" notice — mailbox ownership is proven through the reset flow, never a silent adopt), reset flow (client-generated temp password, hash + `must_change_password` stored locally, mailed via the brain), forced password change, `/auth/password` change endpoint, remember-me sessions, profile (constant "Enterprise" plan), sidebar listings, rename/delete, conversation-level share |
 | [`password_utils.py`](password_utils.py) | `generate_password_hash` / `check_password_hash` — stdlib PBKDF2-HMAC-SHA256 in werkzeug's `pbkdf2:sha256:iter$salt$hex` format (werkzeug is not a dependency of this container). Only hashes are stored (`users/{email}/auth.json`) |
 | [`routes/report.py`](routes/report.py) | PDF (ReportLab + DejaVu) and PPTX (python-pptx) report rendering — local only |
 | [`auto_analytics.py`](auto_analytics.py) | Auto Analytics background job (planner via brain → execute locally → render PPTX) |
@@ -131,8 +131,9 @@ The two are NEVER deployed together. That would defeat the split.
 ## Differences from the B2C edition (intentional)
 
 - **Local email+password auth** — no Google OAuth, no B2C registration.
-  The password is set on first login (hash-only, local disk); the brain is
-  involved only as a Gmail relay for welcome / password-reset mails
+  The password is set on first login for NEW accounts (hash-only, local
+  disk); legacy email-only accounts must set theirs through the reset flow.
+  The brain is involved only as a Gmail relay for welcome / password-reset mails
   (`/v1/send_welcome_email`, `/v1/send_password_reset_email`).
 - **No subscriptions / quotas** — `/auth/subscription` returns
   constant `{"plan": "Enterprise"}`. No daily message caps. No Paddle.

@@ -29,14 +29,17 @@ Passwords never leave this container — only a HASH is stored, at
 `DATA_ROOT/users/{email}/auth.json` (`password_hash`, optional
 `temp_password_hash` + `must_change_password`). Hashing:
 `password_utils.py` (stdlib PBKDF2-HMAC-SHA256, werkzeug-compatible
-format). Migration rule: a user from the old email-only build has no
-hash — their next login is treated as a first visit (entered password
-becomes theirs; welcome mail sent). The brain is only involved as an
-email relay (`/v1/send_welcome_email`, `/v1/send_password_reset_email`).
+format). Migration rule: a LEGACY user from the old email-only build
+(user folder exists, no hash) must set their password through the RESET
+flow — login with any password is refused with a "set your password via
+reset" notice, because only the emailed temp password proves mailbox
+ownership. Only a genuinely NEW email (no user folder) gets the entered
+password adopted on first login. The brain is only involved as an email
+relay (`/v1/send_welcome_email`, `/v1/send_password_reset_email`).
 
 | Method | Path | Behavior |
 |---|---|---|
-| `POST` | `/auth/login` | form-encoded `email=`, `password=`, `remember?`. No stored hash → entered password becomes the password + welcome email (fire-and-forget). Wrong password → landing re-rendered with red "Incorrect password" + Reset action (401). Temp password → session flagged and redirected to `/auth/change_password`. `remember` → persistent ~30-day session cookie (RememberMeSessionMiddleware in app.py); otherwise browser-session cookie. |
+| `POST` | `/auth/login` | form-encoded `email=`, `password=`, `remember?`. Genuinely NEW email (no user folder) → entered password becomes the password + welcome email (fire-and-forget). LEGACY email-only account (folder, no hash) → 403 with the "set your password via Reset password" notice (never adopts the typed password). Wrong password → landing re-rendered with red "Incorrect password" + Reset action (401). Temp password → session flagged and redirected to `/auth/change_password`. `remember` → persistent ~30-day session cookie (RememberMeSessionMiddleware in app.py); otherwise browser-session cookie. |
 | `POST` | `/auth/reset_password` | form-encoded `email=`. Unknown email → "This account does not exist." Known → generates a temp password locally, stores its hash + `must_change_password`, brain-relays it by mail; on relay failure the temp credential is rolled back and an error shown. The user's own password stays valid until the temp one is used (a stranger's reset request can't lock the real user out). |
 | `POST` | `/auth/change_password` | form-encoded `new_password=`, `confirm_password=` — the forced-change submit (session required) |
 | `POST` | `/auth/logout` | clears session, redirects to `/`. |

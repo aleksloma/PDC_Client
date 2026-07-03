@@ -55,16 +55,20 @@ def _public_profile(email: str) -> dict:
 # --- Auth landing + login ----------------------------------------------------
 
 def _landing(request: Request, *, error: str = None, password_error: str = None,
-             info: str = None, email: str = "", status_code: int = 200):
+             info: str = None, email: str = "", status_code: int = 200,
+             show_reset: bool = False, legacy_reset: bool = False):
     """Render the landing page with optional messages.
 
-    `password_error` renders in red under the password field together with
-    the Reset-password action; `error` is the generic top-level message.
+    `password_error` renders in red under the password field; `show_reset`
+    additionally renders the Reset-password action next to it;
+    `legacy_reset` renders the i18n-wrapped "set your password via reset"
+    notice for pre-password accounts. `error` is the generic top message.
     """
     return _TEMPLATES.TemplateResponse(
         "auth_landing.html",
         {"request": request, "error": error, "password_error": password_error,
-         "info": info, "email": email},
+         "info": info, "email": email, "show_reset": show_reset,
+         "legacy_reset": legacy_reset},
         status_code=status_code,
     )
 
@@ -100,9 +104,11 @@ def _send_welcome_email_async(email: str) -> None:
 async def login(request: Request):
     """Email+password login (form-encoded: email, password, remember?).
 
-    A user with no stored hash (brand-new OR migrated from the email-only
-    build) gets the entered password set as theirs + the welcome mail. A
-    stored temp password logs in but forces a change before /lab opens.
+    A genuinely NEW email (no user folder) gets the entered password set as
+    theirs + the welcome mail. A LEGACY account (folder from the email-only
+    build, no hash) is refused with a "set your password via reset" notice —
+    the reset flow proves mailbox ownership. A stored temp password logs in
+    but forces a change before /lab opens.
     """
     form = await request.form()
     email = (form.get("email") or "").strip().lower()
@@ -118,10 +124,24 @@ async def login(request: Request):
     store = AuthStore()
     auth = store.get_auth(email)
     if not auth.get("password_hash") and not auth.get("temp_password_hash"):
-        # First visit (or legacy email-only user): the entered password
-        # becomes this user's password. Never lock anyone out (migration rule).
-        # An outstanding temp password counts as credentials — it must go
-        # through verify_password below so the forced change still triggers.
+        if store.user_exists(email):
+            # LEGACY account from the email-only build (folder exists, no
+            # hash): the typed password must NOT silently become theirs —
+            # ownership of the mailbox is proven through the reset flow
+            # (temp password emailed via the brain + forced change).
+            log_with_sid(email, "info", "USER_LOGIN_LEGACY_RESET_REQUIRED")
+            return _landing(
+                request, email=email, status_code=403,
+                password_error=("This account existed before passwords were "
+                                "introduced. Please click “Reset password” "
+                                "— we will email you a temporary password to "
+                                "sign in and set your own."),
+                show_reset=True, legacy_reset=True,
+            )
+        # Genuinely NEW email (no user folder): the entered password becomes
+        # this user's password. An outstanding temp password counts as
+        # credentials — it goes through verify_password below so the forced
+        # change still triggers.
         store.ensure_user(email)
         store.set_password(email, password)
         _start_session(request, email, remember=remember)
@@ -138,7 +158,7 @@ async def login(request: Request):
     if verdict is None:
         log_with_sid(email, "warning", "USER_LOGIN_BAD_PASSWORD")
         return _landing(request, password_error="Incorrect password",
-                        email=email, status_code=401)
+                        email=email, status_code=401, show_reset=True)
 
     must_change = (verdict == "temp") or bool(store.get_auth(email).get("must_change_password"))
     _start_session(request, email, remember=remember, must_change=must_change)
