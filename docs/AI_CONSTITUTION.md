@@ -212,7 +212,7 @@ docker compose up --build -d brain
 # 1) open http://localhost:8090/admin/login → create tenant → copy token
 # 2) put token in enterprise/.env as BRAIN_TENANT_TOKEN=<token>
 docker compose up -d client
-open http://localhost:8091           # email-only login → /lab
+open http://localhost:8091           # email + password login → /lab
 ```
 
 ### Required checks before release

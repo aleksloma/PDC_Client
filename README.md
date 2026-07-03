@@ -16,7 +16,7 @@ the chat UI surfaces a single "service unavailable" error.
 
 ## Architecture (at a glance)
 
-- **Client** (this repo, runs in customer LAN) — email-only auth, file
+- **Client** (this repo, runs in customer LAN) — email+password auth (local, hash-only), file
   upload + storage, schema autofill, data preprocessing, Python code
   execution, chart rendering, report (PDF/PPTX) generation, the
   `/lab` UI. All raw data + result tables + rendered files stay on
@@ -56,7 +56,7 @@ PDC_Client/
 ├── requirements.txt
 ├── Dockerfile
 ├── routes/
-│   ├── auth.py              # /auth/* — email-only login
+│   ├── auth.py              # /auth/* — email+password login, reset, change
 │   ├── upload.py            # /upload, /schema_autofill_full, /generate_chatdata
 │   ├── schema.py            # /schema_details, /schema_common_fields, /schema
 │   ├── chat.py              # /api/chat/* — SSE stream, edit-regenerate, sharing

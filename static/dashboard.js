@@ -921,21 +921,40 @@ function setupEventListeners() {
     profileDropdown.classList.add('hidden');
   });
   
-  // Profile button — opens profile modal at top
-  document.getElementById('btnProfile').addEventListener('click', () => {
+  // Profile button — opens profile modal at top.
+  // Enterprise: the dropdown has no Profile / Subscriptions items (replaced
+  // by Change Password + Logout), so these are optional bindings.
+  document.getElementById('btnProfile')?.addEventListener('click', () => {
     profileDropdown.classList.add('hidden');
     document.getElementById('profileModal').classList.remove('hidden');
   });
 
   // Subscriptions button — opens profile modal scrolled to subscription section
-  document.getElementById('btnSubscriptions').addEventListener('click', () => {
+  document.getElementById('btnSubscriptions')?.addEventListener('click', () => {
     profileDropdown.classList.add('hidden');
     document.getElementById('profileModal').classList.remove('hidden');
     setTimeout(() => {
       document.querySelector('.subscription-section')?.scrollIntoView({ behavior: 'smooth' });
     }, 100);
   });
-  
+
+  // Change Password (enterprise) — small dedicated modal
+  const changePwModal = document.getElementById('changePwModal');
+  document.getElementById('btnChangePassword')?.addEventListener('click', () => {
+    profileDropdown.classList.add('hidden');
+    if (!changePwModal) return;
+    ['cpCurrentPw', 'cpNewPw', 'cpConfirmPw'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.value = '';
+    });
+    document.getElementById('cpError')?.classList.add('hidden');
+    changePwModal.classList.remove('hidden');
+  });
+  document.getElementById('closeChangePw')?.addEventListener('click', () => {
+    changePwModal?.classList.add('hidden');
+  });
+  document.getElementById('btnSubmitChangePw')?.addEventListener('click', submitChangePassword);
+
   // Logout button
   document.getElementById('btnLogout').addEventListener('click', async () => {
     profileDropdown.classList.add('hidden');
@@ -3371,6 +3390,44 @@ async function changePassword() {
     showToast('Failed to change password', true);
   }
 
+  hideLoading();
+}
+
+// Enterprise change-password modal (opened from the profile dropdown).
+// Verifies the current password server-side via POST /auth/password.
+async function submitChangePassword() {
+  const t = (k) => (window.i18n ? window.i18n.t(k) : k);
+  const current = document.getElementById('cpCurrentPw').value;
+  const newPw = (document.getElementById('cpNewPw').value || '').trim();
+  const confirmPw = (document.getElementById('cpConfirmPw').value || '').trim();
+  const errEl = document.getElementById('cpError');
+
+  const showErr = (msg) => {
+    if (errEl) { errEl.textContent = msg; errEl.classList.remove('hidden'); }
+  };
+  errEl?.classList.add('hidden');
+
+  if (!newPw) { showErr(t('profile.pw_enter_new')); return; }
+  if (newPw !== confirmPw) { showErr(t('profile.pw_mismatch')); return; }
+
+  showLoading('Changing password...');
+  try {
+    const res = await fetch('/auth/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ current_password: current, new_password: newPw })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) {
+      showErr(res.status === 401 ? t('profile.pw_wrong_current')
+                                 : (data.error || t('profile.pw_change_failed')));
+    } else {
+      document.getElementById('changePwModal')?.classList.add('hidden');
+      showToast(t('profile.pw_changed'));
+    }
+  } catch (e) {
+    showErr(t('profile.pw_change_failed'));
+  }
   hideLoading();
 }
 

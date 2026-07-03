@@ -67,7 +67,7 @@ docker run --rm -p 8000:8000 \
   powerdatachat-client:enterprise
 ```
 
-Open `http://localhost:8000` → enter your work email → land in `/lab`.
+Open `http://localhost:8000` → sign in with your work email + password (first login sets the password) → land in `/lab`.
 
 ---
 
@@ -95,11 +95,11 @@ $env:BRAIN_URL = "http://127.0.0.1:8085"
 $env:BRAIN_TENANT_TOKEN = "<token-from-brain-admin>"
 python -m uvicorn app:app --host 127.0.0.1 --port 8001
 
-# Browser: http://127.0.0.1:8001 → enter email → /lab
+# Browser: http://127.0.0.1:8001 → email + password (first login sets it) → /lab
 ```
 
 Verification of this exact path was performed during development:
-landing → email login → upload `sample.csv` → schema endpoint → chat
+landing → email+password login → upload `sample.csv` → schema endpoint → chat
 endpoint → conversation history. The brain returned token-validated
 responses, and revoking the tenant returned `403` on every subsequent
 client call (the kill-switch).
@@ -325,13 +325,12 @@ API. They are reached by leaving every per-tenant model field empty.
 
 ## 6d. Client UI freezes / removals
 
-- The profile button in `/lab` is **temporarily frozen** — the partial
-  `templates/partials/profile_button.html` renders the avatar + email +
-  "Enterprise" plan badge but a capture-phase click handler swallows the
-  click so the dropdown / modal never opens. A separate visible Logout
-  button in the topbar POSTs to `/auth/logout` so users can still sign out.
-  The underlying `/auth/profile*` endpoints stay live for any out-of-band
-  tools.
+- The profile button in `/lab` is **live** — clicking it opens a dropdown
+  with exactly two items: **Change Password** (small modal: current + new
+  password, verified server-side via `POST /auth/password`) and **Logout**
+  (POSTs to `/auth/logout`). The former standalone topbar Logout button was
+  folded into this dropdown. The B2C Profile / Subscriptions dropdown items
+  do not exist on-prem.
 - Enterprise has **no message-count cap**. The dashboard profile modal's
   "Messages today" line, when it is visible at all (the modal is currently
   frozen), reads "unlimited". `run_chat_local` enforces no per-request quota,

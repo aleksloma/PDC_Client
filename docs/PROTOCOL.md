@@ -427,6 +427,50 @@ client surfaces "shared but no email sent — share credentials manually").
 
 ---
 
+## `POST /v1/send_welcome_email`
+
+Gmail relay for the client's password-auth lifecycle. Sends the fixed
+"Welcome to PowerDataChat" mail to a user who signed in (and set their
+password) for the first time on this tenant's client. Uses the brain-wide
+operator Gmail account (`GMAIL_SENDER` / `GMAIL_APP_PASSWORD` env vars,
+stdlib `smtplib`, smtp.gmail.com:587 STARTTLS) — NOT the per-tenant
+`smtp_*` config that `/v1/send_share_email` uses.
+
+```jsonc
+{ "sid": "8af3d2e1", "email": "alice@acme.com" }
+```
+
+Returns `{ok: true, email_configured: true}`. Errors:
+
+| HTTP | When |
+|------|------|
+| 400  | missing/invalid `email` |
+| 429  | rate limit — max 5 mails per (tenant, recipient) per hour |
+| 502  | SMTP send failed (`{ok: false, error, email_configured: true}`) |
+| 503  | Gmail relay not configured (`{email_configured: false}`) |
+
+The client treats this call as fire-and-forget: a failure is logged
+client-side and login proceeds regardless.
+
+---
+
+## `POST /v1/send_password_reset_email`
+
+Same relay + same rate limit / error shape as the welcome mail. Sends the
+user their temporary password and tells them they must change it after
+login. The temp password is generated ON THE CLIENT (which stores only its
+hash); it appears solely in the outgoing mail body — the brain never logs
+or stores it.
+
+```jsonc
+{ "sid": "8af3d2e1", "email": "alice@acme.com", "temp_password": "k3P…" }
+```
+
+Returns `{ok: true, email_configured: true}` (400 also when
+`temp_password` is missing).
+
+---
+
 ## `POST /v1/schema_autofill`
 
 Combined autofill — file description + per-column descriptions in one LLM call,

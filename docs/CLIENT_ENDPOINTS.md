@@ -16,22 +16,34 @@ file documents the enterprise client's implementation of each one.
 
 | Method | Path | Behavior |
 |---|---|---|
-| `GET` | `/` | auth landing; redirects to `/lab` if already signed in |
-| `GET` | `/lab` | the dashboard page (no session → `/`) |
-| `GET` | `/c/{conv_id}` | deep-link / hard-refresh into one conversation. Resolves the conv's `chat_id` from the caller's conversations index and seeds `open_conv_id`/`open_chat_id` so `dashboard.js` auto-opens it. No session → `/`; unknown/foreign conv → `/lab` (never 404). |
+| `GET` | `/` | auth landing (email + password + "Remember me"); redirects to `/lab` if already signed in (or to `/auth/change_password` when a forced change is pending) |
+| `GET` | `/lab` | the dashboard page (no session → `/`; `must_change_password` pending → `/auth/change_password`) |
+| `GET` | `/c/{conv_id}` | deep-link / hard-refresh into one conversation. Resolves the conv's `chat_id` from the caller's conversations index and seeds `open_conv_id`/`open_chat_id` so `dashboard.js` auto-opens it. No session → `/`; forced change pending → `/auth/change_password`; unknown/foreign conv → `/lab` (never 404). |
+| `GET` | `/auth/change_password` | forced set-a-new-password page shown after a temp-password login (no session → `/`; no pending flag → `/lab`) |
 
 ---
 
-## Auth (email-only)
+## Auth (email + password, all local)
+
+Passwords never leave this container — only a HASH is stored, at
+`DATA_ROOT/users/{email}/auth.json` (`password_hash`, optional
+`temp_password_hash` + `must_change_password`). Hashing:
+`password_utils.py` (stdlib PBKDF2-HMAC-SHA256, werkzeug-compatible
+format). Migration rule: a user from the old email-only build has no
+hash — their next login is treated as a first visit (entered password
+becomes theirs; welcome mail sent). The brain is only involved as an
+email relay (`/v1/send_welcome_email`, `/v1/send_password_reset_email`).
 
 | Method | Path | Behavior |
 |---|---|---|
-| `POST` | `/auth/login` | form-encoded `email=`. Creates profile, sets session, redirects to `/lab`. |
+| `POST` | `/auth/login` | form-encoded `email=`, `password=`, `remember?`. No stored hash → entered password becomes the password + welcome email (fire-and-forget). Wrong password → landing re-rendered with red "Incorrect password" + Reset action (401). Temp password → session flagged and redirected to `/auth/change_password`. `remember` → persistent ~30-day session cookie (RememberMeSessionMiddleware in app.py); otherwise browser-session cookie. |
+| `POST` | `/auth/reset_password` | form-encoded `email=`. Unknown email → "This account does not exist." Known → generates a temp password locally, stores its hash + `must_change_password`, brain-relays it by mail; on relay failure the temp credential is rolled back and an error shown. The user's own password stays valid until the temp one is used (a stranger's reset request can't lock the real user out). |
+| `POST` | `/auth/change_password` | form-encoded `new_password=`, `confirm_password=` — the forced-change submit (session required) |
 | `POST` | `/auth/logout` | clears session, redirects to `/`. |
 | `GET`  | `/auth/me` | `{authenticated, email}` |
 | `GET`  | `/auth/profile` | `{username: email, email, full_name: "", subscription_plan: "Enterprise"}` — shape that dashboard.js expects |
 | `POST` | `/auth/profile/update` | email is the identity; attempts to change it are silently ignored |
-| `POST` | `/auth/password` | no-op (`{ok: true}`) — enterprise has no password |
+| `POST` | `/auth/password` | JSON `{current_password, new_password}` — real change-password (verified server-side), used by the /lab profile-dropdown modal. 401 on wrong current password. |
 | `GET`  | `/auth/subscription` | constant `{plan: "Enterprise"}` |
 | `GET`  | `/auth/active_chats` | list of user's chats |
 | `GET`  | `/auth/conversations` | list of user's conversations |

@@ -39,6 +39,7 @@ static/tmp/
 **/users.json
 **/users.jsonl
 **/profile.json
+**/auth.json
 **/active_chats.jsonl
 **/conversations.jsonl
 **/chatdata/

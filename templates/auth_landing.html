@@ -14,15 +14,29 @@
   h1 { margin: 0 0 6px; font-size: 22px; color: #001E44; text-align: center; }
   p.sub { margin: 0 0 26px; color: #6b7280; font-size: 14px; text-align: center; }
   label { font-size: 12px; color: #4b5563; }
-  input { width: 100%; padding: 11px 13px; border: 1px solid #d1d5db;
+  .field { margin-top: 14px; }
+  .field:first-of-type { margin-top: 0; }
+  input[type=email], input[type=password] {
+          width: 100%; padding: 11px 13px; border: 1px solid #d1d5db;
           border-radius: 7px; margin-top: 5px; font-size: 15px;
           box-sizing: border-box; }
   input:focus { outline: 2px solid #1276C2; outline-offset: 0; }
+  .remember { display: flex; align-items: center; gap: 8px; margin-top: 14px;
+              font-size: 13px; color: #4b5563; }
+  .remember input { width: auto; margin: 0; }
   button { width: 100%; margin-top: 18px; padding: 12px; background: #1276C2;
            color: #fff; border: 0; border-radius: 7px; font-size: 15px;
            cursor: pointer; font-weight: 500; }
   button:hover { background: #0d5d99; }
+  .pw-error { color: #dc2626; font-size: 13px; margin-top: 8px; }
+  .reset-btn { width: auto; margin: 6px 0 0; padding: 0; background: none;
+               color: #1276C2; font-size: 13px; text-decoration: underline;
+               font-weight: 500; }
+  .reset-btn:hover { background: none; color: #0d5d99; }
   .error { color: #b91c1c; font-size: 13px; margin-top: 10px; text-align: center; }
+  .info { color: #047857; font-size: 13px; margin-top: 10px; text-align: center;
+          background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 7px;
+          padding: 9px 12px; }
   .footer { margin-top: 18px; font-size: 11px; color: #9ca3af; text-align: center; }
 </style>
 </head>
@@ -30,13 +44,34 @@
   <form class="card" method="post" action="/auth/login">
     <img src="/static/logo2.png" alt="PowerDataChat" class="logo" />
     <h1>PowerDataChat</h1>
-    <p class="sub">Enter your work email to continue</p>
-    <label for="email">Email</label>
-    <input id="email" name="email" type="email" autocomplete="email"
-           placeholder="you@company.com" required autofocus />
-    <button type="submit">Continue</button>
+    <p class="sub">Sign in with your work email</p>
+    <div class="field">
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" autocomplete="email"
+             placeholder="you@company.com" value="{{ email or '' }}" required autofocus />
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password"
+             autocomplete="current-password" placeholder="Your password" required />
+      {% if password_error %}
+      <div class="pw-error">{{ password_error }}</div>
+      {% if password_error == 'Incorrect password' %}
+      {# Reset posts the SAME form (uses the email field) to the reset endpoint #}
+      <button type="submit" class="reset-btn" formaction="/auth/reset_password"
+              formnovalidate>Reset password</button>
+      {% endif %}
+      {% endif %}
+    </div>
+    <label class="remember">
+      <input type="checkbox" name="remember" value="1" />
+      Remember me
+    </label>
+    <button type="submit">Sign in</button>
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
-    <div class="footer">Enterprise · on-premise deployment</div>
+    {% if info %}<div class="info">{{ info }}</div>{% endif %}
+    <div class="footer">Enterprise · on-premise deployment<br>
+      First time here? The password you enter becomes your password.</div>
   </form>
 </body>
 </html>

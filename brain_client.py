@@ -338,6 +338,25 @@ def send_share_email(to: list[str], subject: str, sender_email: str,
     }, sid=f"share-email:{len(to)}")
 
 
+def send_welcome_email(email: str) -> dict:
+    """Calls /v1/send_welcome_email — brain Gmail-relays the fixed welcome
+    mail to a first-time user. Callers treat this as fire-and-forget (a
+    failure must never block login); raises BrainError on non-2xx like every
+    other wrapper, so wrap in try/except at the call site."""
+    return _post("/v1/send_welcome_email", {
+        "sid": "welcome-email", "email": email,
+    }, sid="welcome-email")
+
+
+def send_password_reset_email(email: str, temp_password: str) -> dict:
+    """Calls /v1/send_password_reset_email — brain Gmail-relays the
+    client-generated temporary password to the user. The temp password is
+    never logged on either side; only its hash is stored (client-side)."""
+    return _post("/v1/send_password_reset_email", {
+        "sid": "reset-email", "email": email, "temp_password": temp_password,
+    }, sid="reset-email")
+
+
 def auto_analytics_plan(sid: str, schema_text: str, df_names: list[str],
                         common_fields: list, user_email: str | None = None) -> dict:
     """Auto Analytics planner. Returns {instructions: [...]}.

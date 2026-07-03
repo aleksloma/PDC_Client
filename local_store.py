@@ -96,6 +96,89 @@ class AuthStore:
         log_with_sid(email, "info", "USER_PROFILE_CREATED")
         return profile
 
+    # --- Password auth (hash-only storage under users/{email}/auth.json) ----
+    #
+    # Two hash slots:
+    #   password_hash       — the user's own password.
+    #   temp_password_hash  — a reset-issued temporary password (must_change).
+    # A login with the temp password forces a password change; a login with
+    # the primary password invalidates any outstanding temp password (so a
+    # third party requesting resets can never lock the real user out).
+    # Legacy users from the email-only build simply have no auth.json — their
+    # next login is treated like a first visit (entered password gets set).
+
+    def _auth_path(self, email: str) -> Path:
+        return _data_root() / "users" / _safe_email(email) / "auth.json"
+
+    def user_exists(self, email: str) -> bool:
+        """True when this email has a local profile (any prior login)."""
+        udir = _data_root() / "users" / _safe_email(email)
+        return (udir / "profile.json").exists() or (udir / "auth.json").exists()
+
+    def get_auth(self, email: str) -> dict:
+        p = self._auth_path(email)
+        if not p.exists():
+            return {}
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            log_with_sid(email, "error", f"AUTH_READ_FAILED: {e}")
+            return {}
+
+    def _write_auth(self, email: str, auth: dict) -> None:
+        p = self._auth_path(email)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        auth["updated_at"] = _now()
+        p.write_text(json.dumps(auth, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def has_password(self, email: str) -> bool:
+        return bool(self.get_auth(email).get("password_hash"))
+
+    def set_password(self, email: str, password: str) -> None:
+        """Set the user's own password. Clears any outstanding temp password."""
+        from password_utils import generate_password_hash
+        with _LOCK:
+            auth = self.get_auth(email)
+            auth["password_hash"] = generate_password_hash(password)
+            auth.pop("temp_password_hash", None)
+            auth["must_change_password"] = False
+            self._write_auth(email, auth)
+        log_with_sid(email, "info", "USER_PASSWORD_SET")
+
+    def set_temp_password(self, email: str, temp_password: str) -> None:
+        """Store a reset-issued temp password hash + must_change flag. The
+        user's own password (if any) stays valid until the temp one is used."""
+        from password_utils import generate_password_hash
+        with _LOCK:
+            auth = self.get_auth(email)
+            auth["temp_password_hash"] = generate_password_hash(temp_password)
+            auth["must_change_password"] = True
+            self._write_auth(email, auth)
+        log_with_sid(email, "info", "USER_TEMP_PASSWORD_SET")
+
+    def clear_temp_password(self, email: str) -> None:
+        with _LOCK:
+            auth = self.get_auth(email)
+            if auth.pop("temp_password_hash", None) is not None or auth.get("must_change_password"):
+                auth["must_change_password"] = False
+                self._write_auth(email, auth)
+
+    def verify_password(self, email: str, password: str) -> Optional[str]:
+        """Check a login attempt. Returns:
+          "ok"   — matched the user's own password (any temp is invalidated),
+          "temp" — matched an outstanding temporary password (force change),
+          None   — no match.
+        """
+        from password_utils import check_password_hash
+        auth = self.get_auth(email)
+        if auth.get("password_hash") and check_password_hash(auth["password_hash"], password):
+            if auth.get("temp_password_hash"):
+                self.clear_temp_password(email)
+            return "ok"
+        if auth.get("temp_password_hash") and check_password_hash(auth["temp_password_hash"], password):
+            return "temp"
+        return None
+
     def get_profile(self, email: str) -> Optional[dict]:
         email = _safe_email(email)
         p = _data_root() / "users" / email / "profile.json"

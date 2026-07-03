@@ -23,6 +23,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.datastructures import MutableHeaders
 
 from settings import settings
 from logger_utils import log_with_sid
@@ -56,8 +57,77 @@ async def lifespan(app: FastAPI):
     log_with_sid("shutdown", "info", "CLIENT_STOPPED")
 
 
+class RememberMeSessionMiddleware(SessionMiddleware):
+    """SessionMiddleware with a per-session cookie lifetime.
+
+    Sessions carrying `remember: True` (the "Remember me" checkbox at login)
+    get a persistent cookie with `Max-Age` = the configured `max_age`
+    (~30 days); all other sessions get a browser-session cookie (no Max-Age),
+    which dies when the browser closes. Only the Set-Cookie write differs
+    from the stock starlette middleware — reading/unsigning is inherited
+    behavior (max_age acts as the outer validity cap for both kinds).
+    """
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        import json as _json
+        from base64 import b64decode, b64encode
+        from itsdangerous.exc import BadSignature
+        from starlette.requests import HTTPConnection
+
+        connection = HTTPConnection(scope)
+        initial_session_was_empty = True
+
+        if self.session_cookie in connection.cookies:
+            data = connection.cookies[self.session_cookie].encode("utf-8")
+            try:
+                data = self.signer.unsign(data, max_age=self.max_age)
+                scope["session"] = _json.loads(b64decode(data))
+                initial_session_was_empty = False
+            except BadSignature:
+                scope["session"] = {}
+        else:
+            scope["session"] = {}
+
+        async def send_wrapper(message) -> None:
+            if message["type"] == "http.response.start":
+                if scope["session"]:
+                    data = b64encode(_json.dumps(scope["session"]).encode("utf-8"))
+                    data = self.signer.sign(data)
+                    headers = MutableHeaders(scope=message)
+                    # Persistent Max-Age only when the user asked to be remembered.
+                    persist = bool(scope["session"].get("remember"))
+                    header_value = "{session_cookie}={data}; path={path}; {max_age}{security_flags}".format(
+                        session_cookie=self.session_cookie,
+                        data=data.decode("utf-8"),
+                        path=self.path,
+                        max_age=f"Max-Age={self.max_age}; " if (persist and self.max_age) else "",
+                        security_flags=self.security_flags,
+                    )
+                    headers.append("Set-Cookie", header_value)
+                elif not initial_session_was_empty:
+                    headers = MutableHeaders(scope=message)
+                    header_value = "{session_cookie}={data}; path={path}; {expires}{security_flags}".format(
+                        session_cookie=self.session_cookie,
+                        data="null",
+                        path=self.path,
+                        expires="expires=Thu, 01 Jan 1970 00:00:00 GMT; ",
+                        security_flags=self.security_flags,
+                    )
+                    headers.append("Set-Cookie", header_value)
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+_REMEMBER_ME_MAX_AGE = 30 * 24 * 60 * 60   # ~30 days
+
 app = FastAPI(title="PowerDataChat Client (enterprise)", version="1.0", lifespan=lifespan)
-app.add_middleware(SessionMiddleware, secret_key=settings.SECRET_KEY, same_site="lax")
+app.add_middleware(RememberMeSessionMiddleware, secret_key=settings.SECRET_KEY,
+                   same_site="lax", max_age=_REMEMBER_ME_MAX_AGE)
 
 # Static assets (copied byte-for-byte from the B2C app)
 app.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static")
@@ -71,10 +141,16 @@ app.include_router(report_router)
 
 @app.get("/", response_class=HTMLResponse)
 async def landing(request: Request):
-    """Auth landing — email-only. The ONLY frontend difference vs the B2C app."""
+    """Auth landing — email + password (+ remember me)."""
     if request.session.get("email"):
+        if request.session.get("must_change_password"):
+            return RedirectResponse(url="/auth/change_password", status_code=302)
         return RedirectResponse(url="/lab", status_code=302)
-    return templates.TemplateResponse("auth_landing.html", {"request": request, "error": None})
+    return templates.TemplateResponse(
+        "auth_landing.html",
+        {"request": request, "error": None, "password_error": None,
+         "info": None, "email": ""},
+    )
 
 
 _AVATAR_COLORS = ["#0d9488", "#2563eb", "#7c3aed", "#db2777", "#ea580c", "#059669", "#4f46e5", "#0891b2"]
@@ -120,6 +196,8 @@ async def lab(request: Request):
     email = request.session.get("email")
     if not email:
         return RedirectResponse(url="/", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse(url="/auth/change_password", status_code=302)
     log_with_sid(email, "info", "OPEN_LAB_UI")
     ts = int(time.time())
     prof = _profile_context(email)
@@ -150,6 +228,8 @@ async def open_conversation_deeplink(request: Request, conv_id: str):
     email = request.session.get("email")
     if not email:
         return RedirectResponse(url="/", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse(url="/auth/change_password", status_code=302)
     # Resolve the conversation's chat_id from this user's own conversations
     # index (local_store records {conv_id, chat_id} per conversation). A conv
     # that isn't in the caller's index (unknown or another user's) → /lab.

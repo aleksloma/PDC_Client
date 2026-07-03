@@ -54,6 +54,7 @@ PDC_Client/
 ├── brain_client.py          # HTTP client to brain (bearer token)
 ├── run_chat_local.py        # local execution + _safe_preview guard
 ├── local_store.py           # users + chats + conversations on local disk
+├── password_utils.py        # stdlib PBKDF2 password hashing (werkzeug-compatible format)
 ├── schema_builder.py        # _schema_text builder
 ├── excel_table_detector.py  # 6-stage Excel table detection
 ├── auto_analytics.py        # background job (brain planner → local exec → PPTX)
@@ -63,14 +64,15 @@ PDC_Client/
 ├── models.py
 ├── logger_utils.py
 ├── routes/
-│   ├── auth.py              # /auth/* — email-only login
+│   ├── auth.py              # /auth/* — email+password login, reset, change
 │   ├── upload.py            # /upload, /schema_autofill_full, /generate_chatdata
 │   ├── schema.py            # /schema_details, /schema_common_fields, /schema
 │   ├── chat.py              # /api/chat/* — SSE stream, edit-regenerate, sharing
 │   └── report.py            # /download_report (PDF), /download_pptx
 ├── templates/
 │   ├── dashboard.html       # /lab page
-│   ├── auth_landing.html
+│   ├── auth_landing.html    # email + password + remember-me sign-in
+│   ├── change_password.html # forced new-password page (temp-password logins)
 │   └── partials/
 ├── static/                  # JS + CSS + images
 ├── Dockerfile
@@ -83,9 +85,10 @@ PDC_Client/
 |---|---|
 | [`routes/chat.py`](routes/chat.py) | Chat SSE stream, multi-chart accumulation + persistence, edit-regenerate, sharing, full_table, conversation title generation, Auto Analytics endpoints; chart-PNG + table-Excel download routes (`export_plotly_png`, `download_excel/{key}`, `export_excel`) |
 | [`plot_utils.py`](plot_utils.py) | `render_plot_safe` + `_plotly_to_html`; trims the non-functional Plotly modebar tools (`toImage`, `sendDataToCloud`, `select2d`, `lasso2d`) and widens the discrete color palette so >10-category charts never repeat a hue (`_widen_discrete_colors`; continuous/2nd-measure scales untouched) |
-| [`static/dashboard.js`](static/dashboard.js) | Served `/lab` UI; on the constant Enterprise plan it hides the B2C subscription plan-cards so the Paddle upsell (no billing backend on-prem) is unreachable |
+| [`static/dashboard.js`](static/dashboard.js) | Served `/lab` UI; on the constant Enterprise plan it hides the B2C subscription plan-cards so the Paddle upsell (no billing backend on-prem) is unreachable. Profile dropdown carries exactly two items — Change Password (small modal → `POST /auth/password`) and Logout; the B2C Profile/Subscriptions dropdown items don't exist here (bindings are optional-chained) |
 | [`routes/upload.py`](routes/upload.py) | `/new_session`, `/upload`, `/schema_autofill_full`, `/generate_chatdata`, GCS-path stubs (400) |
-| [`routes/auth.py`](routes/auth.py) | Email-only login/logout, profile (constant "Enterprise" plan), sidebar listings, rename/delete, conversation-level share |
+| [`routes/auth.py`](routes/auth.py) | Email+password login (first login sets the password + brain-relayed welcome mail; legacy email-only users migrate the same way), reset flow (client-generated temp password, hash + `must_change_password` stored locally, mailed via the brain), forced password change, `/auth/password` change endpoint, remember-me sessions, profile (constant "Enterprise" plan), sidebar listings, rename/delete, conversation-level share |
+| [`password_utils.py`](password_utils.py) | `generate_password_hash` / `check_password_hash` — stdlib PBKDF2-HMAC-SHA256 in werkzeug's `pbkdf2:sha256:iter$salt$hex` format (werkzeug is not a dependency of this container). Only hashes are stored (`users/{email}/auth.json`) |
 | [`routes/report.py`](routes/report.py) | PDF (ReportLab + DejaVu) and PPTX (python-pptx) report rendering — local only |
 | [`auto_analytics.py`](auto_analytics.py) | Auto Analytics background job (planner via brain → execute locally → render PPTX) |
 | [`run_chat_local.py`](run_chat_local.py) | `run_chat` / `run_chat_multi_plot`; `_safe_preview` data-boundary guard |
@@ -127,7 +130,10 @@ The two are NEVER deployed together. That would defeat the split.
 
 ## Differences from the B2C edition (intentional)
 
-- **Email-only auth** — no passwords, no Google OAuth.
+- **Local email+password auth** — no Google OAuth, no B2C registration.
+  The password is set on first login (hash-only, local disk); the brain is
+  involved only as a Gmail relay for welcome / password-reset mails
+  (`/v1/send_welcome_email`, `/v1/send_password_reset_email`).
 - **No subscriptions / quotas** — `/auth/subscription` returns
   constant `{"plan": "Enterprise"}`. No daily message caps. No Paddle.
 - **No public publishing** — `POST /publish`/`/unpublish` return 400.

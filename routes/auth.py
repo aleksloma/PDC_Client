@@ -1,19 +1,28 @@
-"""Client-side auth: email-only landing + the profile + sidebar endpoints.
+"""Client-side auth: email+password landing + the profile + sidebar endpoints.
 
-Per the prompt: "before reaching the lab page, show an authorization/landing
-page that asks ONLY for the user's email. ... No password, nothing else on
-that page."
+Password model (all local — the brain never sees a password):
+  - First-time email (no stored hash — includes every legacy user from the
+    email-only build): the entered password BECOMES the password (hash-only
+    storage via `AuthStore.set_password`), and the brain Gmail-relays a
+    welcome mail (fire-and-forget — login succeeds even if that fails).
+  - Wrong password → red "Incorrect password" + a Reset password action.
+  - Reset: the client generates a secure temp password, stores its hash with
+    `must_change_password`, and asks the brain to email it
+    (`/v1/send_password_reset_email`). Logging in with the temp password
+    forces a password change before the workspace opens.
+  - "Remember me" → persistent session cookie (~30 days) via the
+    RememberMeSessionMiddleware in app.py; unchecked → browser-session cookie.
 
 The dashboard.html template (copied verbatim from B2C) expects a profile JSON
 with `email`, `username`, `subscription_plan` keys. To keep that page working
 without re-skinning it, we return `username = email` and `subscription_plan =
-"Enterprise"` (constants). Profile updates only persist the email; password
-endpoints are no-ops.
+"Enterprise"` (constants). Profile updates only persist the email.
 """
 from __future__ import annotations
 
 import re
 import secrets
+import threading
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -45,29 +54,190 @@ def _public_profile(email: str) -> dict:
 
 # --- Auth landing + login ----------------------------------------------------
 
-@router.post("/auth/login")
-async def login(request: Request):
-    """Email-only login (form-encoded). Creates the local profile on first sight
-    and starts a session."""
-    form = await request.form()
-    email = (form.get("email") or "").strip().lower()
-    if not _EMAIL_RE.match(email):
-        return _TEMPLATES.TemplateResponse(
-            "auth_landing.html",
-            {"request": request, "error": "Please enter a valid email"},
-            status_code=400,
-        )
-    AuthStore().ensure_user(email)
+def _landing(request: Request, *, error: str = None, password_error: str = None,
+             info: str = None, email: str = "", status_code: int = 200):
+    """Render the landing page with optional messages.
+
+    `password_error` renders in red under the password field together with
+    the Reset-password action; `error` is the generic top-level message.
+    """
+    return _TEMPLATES.TemplateResponse(
+        "auth_landing.html",
+        {"request": request, "error": error, "password_error": password_error,
+         "info": info, "email": email},
+        status_code=status_code,
+    )
+
+
+def _start_session(request: Request, email: str, *, remember: bool,
+                   must_change: bool = False) -> None:
     request.session["email"] = email
+    if remember:
+        request.session["remember"] = True
+    else:
+        request.session.pop("remember", None)
+    if must_change:
+        request.session["must_change_password"] = True
+    else:
+        request.session.pop("must_change_password", None)
     # Issue a per-session SID for the temp UserStore (the upload flow keys off it)
     if not request.session.get("sid"):
         request.session["sid"] = "s_" + secrets.token_hex(8)
-    log_with_sid(email, "info", "USER_LOGIN", sid=request.session.get("sid"))
-    # Fire-and-forget activity ping to brain (centralized per-tenant activity log)
+
+
+def _send_welcome_email_async(email: str) -> None:
+    """Fire-and-forget welcome mail via the brain. Never blocks or fails login."""
+    def _fire():
+        try:
+            brain_client.send_welcome_email(email)
+            log_with_sid(email, "info", "WELCOME_EMAIL_REQUESTED")
+        except Exception as e:
+            log_with_sid(email, "warning", f"WELCOME_EMAIL_FAILED: {e}")
+    threading.Thread(target=_fire, daemon=True, name="welcome_email").start()
+
+
+@router.post("/auth/login")
+async def login(request: Request):
+    """Email+password login (form-encoded: email, password, remember?).
+
+    A user with no stored hash (brand-new OR migrated from the email-only
+    build) gets the entered password set as theirs + the welcome mail. A
+    stored temp password logs in but forces a change before /lab opens.
+    """
+    form = await request.form()
+    email = (form.get("email") or "").strip().lower()
+    password = form.get("password") or ""
+    remember = bool(form.get("remember"))
+    if not _EMAIL_RE.match(email):
+        return _landing(request, error="Please enter a valid email",
+                        email=email, status_code=400)
+    if not password:
+        return _landing(request, password_error="Please enter a password",
+                        email=email, status_code=400)
+
+    store = AuthStore()
+    auth = store.get_auth(email)
+    if not auth.get("password_hash") and not auth.get("temp_password_hash"):
+        # First visit (or legacy email-only user): the entered password
+        # becomes this user's password. Never lock anyone out (migration rule).
+        # An outstanding temp password counts as credentials — it must go
+        # through verify_password below so the forced change still triggers.
+        store.ensure_user(email)
+        store.set_password(email, password)
+        _start_session(request, email, remember=remember)
+        log_with_sid(email, "info", "USER_LOGIN_FIRST_PASSWORD_SET",
+                     sid=request.session.get("sid"))
+        _send_welcome_email_async(email)
+        try:
+            brain_client.post_activity("login", email)
+        except Exception:
+            pass
+        return RedirectResponse(url="/lab", status_code=302)
+
+    verdict = store.verify_password(email, password)
+    if verdict is None:
+        log_with_sid(email, "warning", "USER_LOGIN_BAD_PASSWORD")
+        return _landing(request, password_error="Incorrect password",
+                        email=email, status_code=401)
+
+    must_change = (verdict == "temp") or bool(store.get_auth(email).get("must_change_password"))
+    _start_session(request, email, remember=remember, must_change=must_change)
+    log_with_sid(email, "info", "USER_LOGIN", sid=request.session.get("sid"),
+                 must_change=must_change)
     try:
         brain_client.post_activity("login", email)
     except Exception:
         pass
+    target = "/auth/change_password" if must_change else "/lab"
+    return RedirectResponse(url=target, status_code=302)
+
+
+@router.post("/auth/reset_password")
+async def reset_password(request: Request):
+    """Password reset (form-encoded: email). Generates a temp password
+    locally, stores ONLY its hash (+ must_change flag), and asks the brain
+    to email it. The temp password never appears in any log."""
+    form = await request.form()
+    email = (form.get("email") or "").strip().lower()
+    if not _EMAIL_RE.match(email):
+        return _landing(request, error="Please enter a valid email",
+                        email=email, status_code=400)
+
+    store = AuthStore()
+    if not store.user_exists(email):
+        log_with_sid(email, "info", "PASSWORD_RESET_UNKNOWN_ACCOUNT")
+        return _landing(request, error="This account does not exist.",
+                        email=email, status_code=404)
+
+    temp_password = secrets.token_urlsafe(9)
+    store.set_temp_password(email, temp_password)
+    try:
+        brain_client.send_password_reset_email(email, temp_password)
+    except Exception as e:
+        # Roll the temp password back so the failed reset leaves no
+        # unusable credential behind; the user's own password still works.
+        store.clear_temp_password(email)
+        log_with_sid(email, "error", f"PASSWORD_RESET_EMAIL_FAILED: {e}")
+        return _landing(
+            request, email=email, status_code=502,
+            error="Could not send the reset email. Please try again later or contact your administrator.",
+        )
+    log_with_sid(email, "info", "PASSWORD_RESET_EMAIL_SENT")
+    return _landing(request, email=email,
+                    info="A temporary password has been sent to your email.")
+
+
+# --- Forced password change (temp-password logins) ----------------------------
+
+@router.get("/auth/change_password")
+async def change_password_page(request: Request):
+    """The set-a-new-password page a temp-password login lands on. Without a
+    session (or without the must_change flag) it just bounces to the start."""
+    email = request.session.get("email")
+    if not email:
+        return RedirectResponse(url="/", status_code=302)
+    if not request.session.get("must_change_password"):
+        return RedirectResponse(url="/lab", status_code=302)
+    return _TEMPLATES.TemplateResponse(
+        "change_password.html",
+        {"request": request, "email": email, "error": None},
+    )
+
+
+@router.post("/auth/change_password")
+async def change_password_submit(request: Request):
+    """Form-encoded {new_password, confirm_password} for the forced-change
+    page. The user already authenticated with the temp password."""
+    email = request.session.get("email")
+    if not email:
+        return RedirectResponse(url="/", status_code=302)
+    if not request.session.get("must_change_password"):
+        # Only the forced flow may set a password WITHOUT the current one —
+        # that user just authenticated with the temp password. Everyone else
+        # goes through /auth/password (current password verified).
+        return RedirectResponse(url="/lab", status_code=302)
+    form = await request.form()
+    new_password = form.get("new_password") or ""
+    confirm = form.get("confirm_password") or ""
+
+    def _page(err: str, code: int = 400):
+        return _TEMPLATES.TemplateResponse(
+            "change_password.html",
+            {"request": request, "email": email, "error": err},
+            status_code=code,
+        )
+
+    if len(new_password) < 4:
+        return _page("Password must be at least 4 characters")
+    if new_password != confirm:
+        return _page("Passwords do not match")
+    try:
+        AuthStore().set_password(email, new_password)
+    except Exception as e:
+        log_with_sid(email, "error", f"FORCED_PASSWORD_CHANGE_FAILED: {e}")
+        return _page("Could not save the new password. Please try again.", 500)
+    request.session.pop("must_change_password", None)
+    log_with_sid(email, "info", "USER_PASSWORD_CHANGED", forced=True)
     return RedirectResponse(url="/lab", status_code=302)
 
 
@@ -76,6 +246,8 @@ async def logout(request: Request):
     email = request.session.get("email")
     request.session.pop("email", None)
     request.session.pop("sid", None)
+    request.session.pop("remember", None)
+    request.session.pop("must_change_password", None)
     if email:
         log_with_sid(email, "info", "USER_LOGOUT")
     return RedirectResponse(url="/", status_code=302)
@@ -121,11 +293,34 @@ async def update_profile(request: Request):
 
 
 @router.post("/auth/password")
-async def password_noop(request: Request):
-    """No-op. Enterprise build has no password to change."""
-    if not request.session.get("email"):
+async def change_password(request: Request):
+    """Change password from the lab profile dropdown.
+    Body: {current_password, new_password}. Verified server-side."""
+    email = request.session.get("email")
+    if not email:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
-    return {"ok": True, "message": "Password management is disabled in the enterprise build."}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    current = body.get("current_password") or ""
+    new_password = (body.get("new_password") or "").strip()
+    if len(new_password) < 4:
+        return JSONResponse({"error": "Password must be at least 4 characters"}, status_code=400)
+
+    store = AuthStore()
+    if store.has_password(email) or store.get_auth(email).get("temp_password_hash"):
+        if store.verify_password(email, current) is None:
+            log_with_sid(email, "warning", "PASSWORD_CHANGE_BAD_CURRENT")
+            return JSONResponse({"error": "Incorrect current password"}, status_code=401)
+    try:
+        store.set_password(email, new_password)
+    except Exception as e:
+        log_with_sid(email, "error", f"PASSWORD_CHANGE_FAILED: {e}")
+        return JSONResponse({"error": "Could not save the new password"}, status_code=500)
+    request.session.pop("must_change_password", None)
+    log_with_sid(email, "info", "USER_PASSWORD_CHANGED", forced=False)
+    return {"ok": True}
 
 
 @router.get("/auth/subscription")

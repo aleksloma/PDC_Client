@@ -80,11 +80,6 @@
           </div>
           <button id="btnSchema" class="ghost small top-action-btn hidden" data-i18n="lab.view_schema">View / Edit Descriptions</button>
           {% include 'partials/profile_button.html' %}
-          {# Enterprise: profile button is frozen, so expose a visible logout
-             link here. POSTs to /auth/logout, then redirects to /. #}
-          <form method="post" action="/auth/logout" style="display:inline; margin-left:8px;">
-            <button type="submit" class="ghost small top-action-btn" title="Log out">Logout</button>
-          </form>
         </div>
       </div>
       <!-- Welcome State (shown when no chat selected) -->
@@ -282,6 +277,32 @@
       <div class="modal-actions">
         <button id="btnSaveProfile" data-i18n="profile.save_btn">Save Profile</button>
         <button id="btnChangePw" class="ghost" data-i18n="profile.change_pw_btn">Change Password</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Change Password Modal (enterprise — opened from the profile dropdown) -->
+  <div id="changePwModal" class="modal hidden">
+    <div class="modal-content" style="max-width: 420px;">
+      <div class="modal-header">
+        <h3 data-i18n="profile.password_title">Change Password</h3>
+        <button id="closeChangePw" class="ghost">✕</button>
+      </div>
+      <div class="form-group">
+        <input id="cpCurrentPw" type="password" autocomplete="current-password"
+               placeholder="Current password" data-i18n-placeholder="profile.current_pw" />
+      </div>
+      <div class="form-group">
+        <input id="cpNewPw" type="password" autocomplete="new-password"
+               placeholder="New password" data-i18n-placeholder="profile.new_pw" />
+      </div>
+      <div class="form-group">
+        <input id="cpConfirmPw" type="password" autocomplete="new-password"
+               placeholder="Confirm new password" data-i18n-placeholder="profile.confirm_pw" />
+      </div>
+      <div id="cpError" class="pw-match-error hidden"></div>
+      <div class="modal-actions">
+        <button id="btnSubmitChangePw" data-i18n="profile.change_pw_btn">Change Password</button>
       </div>
     </div>
   </div>

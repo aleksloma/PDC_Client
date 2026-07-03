@@ -190,6 +190,10 @@ window.I18N_TRANSLATIONS = {
     'profile.pw_mismatch': 'Passwords do not match',
     'profile.save_btn': 'Save Profile',
     'profile.change_pw_btn': 'Change Password',
+    'profile.pw_enter_new': 'Please enter a new password',
+    'profile.pw_changed': 'Password changed',
+    'profile.pw_change_failed': 'Failed to change password',
+    'profile.pw_wrong_current': 'Incorrect current password',
 
     // Plan cards
     'plan.basic': 'Basic',
@@ -480,6 +484,10 @@ window.I18N_TRANSLATIONS = {
     'profile.pw_mismatch': 'პაროლები არ ემთხვევა',
     'profile.save_btn': 'პროფილის შენახვა',
     'profile.change_pw_btn': 'პაროლის შეცვლა',
+    'profile.pw_enter_new': 'შეიყვანეთ ახალი პაროლი',
+    'profile.pw_changed': 'პაროლი შეიცვალა',
+    'profile.pw_change_failed': 'პაროლის შეცვლა ვერ მოხერხდა',
+    'profile.pw_wrong_current': 'მიმდინარე პაროლი არასწორია',
 
     // Plan cards
     'plan.basic': 'Basic',
@@ -770,6 +778,10 @@ window.I18N_TRANSLATIONS = {
     'profile.pw_mismatch': 'Пароли не совпадают',
     'profile.save_btn': 'Сохранить профиль',
     'profile.change_pw_btn': 'Изменить пароль',
+    'profile.pw_enter_new': 'Введите новый пароль',
+    'profile.pw_changed': 'Пароль изменён',
+    'profile.pw_change_failed': 'Не удалось изменить пароль',
+    'profile.pw_wrong_current': 'Неверный текущий пароль',
 
     // Plan cards
     'plan.basic': 'Basic',
