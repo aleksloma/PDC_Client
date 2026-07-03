@@ -76,6 +76,8 @@ PDC_Client/
 │   └── partials/
 ├── static/                  # JS + CSS + images
 ├── Dockerfile
+├── docker-compose.yml       # CUSTOMER install (image-only, client.env)
+├── docker-compose.local.yml # LOCAL testing stack (build ., persistent pdc_* volumes)
 └── docs/                    # constitution, protocol, endpoints, build & run
 ```
 
@@ -107,7 +109,13 @@ PDC_Client/
 
 ## Before committing
 
-1. **Smoke locally** — start the client and a brain you control, full
+1. **Smoke locally — ALWAYS via the Docker stack on the persistent data**
+   (`docker compose -f docker-compose.local.yml up -d --build` here :8091,
+   and the brain from the PDC_Brain repo :8090). The stack runs on the
+   external `pdc_*` volumes so real users / chats / history are exercised
+   like a production upgrade. Never ad-hoc native runs, never
+   `docker compose down -v`; back up the volumes before a rebuild. See
+   [`docs/BUILD_AND_RUN.md`](docs/BUILD_AND_RUN.md) §3. Then the full
    upload→chart→edit→report cycle in the browser.
 2. **`GET /health`** returns 200 (`brain_reachable: true`,
    `tenant_token_configured: true`).

@@ -1,0 +1,44 @@
+# LOCAL TESTING stack — client half.
+#
+# This file is for PowerDataChat's LOCAL testing only. Customers use the
+# plain docker-compose.yml (image-only, client.env) — that file is untouched
+# by local development. Here the image is BUILT from this repo, mirroring a
+# production client upgrade: new image, same data.
+#
+# STANDING RULE (see docs/BUILD_AND_RUN.md §3): local testing always runs
+# through this Docker stack against the PERSISTENT `pdc_client_*` volumes,
+# so real users, chats, and conversation history are exercised exactly like
+# a production redeploy. The volumes are declared EXTERNAL and must never be
+# removed — do NOT run `docker compose down -v` and back up the volume
+# contents before a rebuild.
+#
+# The local brain runs as its own compose project from the PDC_Brain repo on
+# port 8090; this client reaches it over a URL (host.docker.internal), the
+# same shape as a customer reaching the hosted brain.
+#
+# Usage:
+#   cp client.local.env.example client.local.env    # fill in once
+#   docker compose -f docker-compose.local.yml up -d --build
+
+services:
+  client:
+    build: .
+    image: powerdatachat-client:enterprise
+    container_name: pdc-client
+    env_file: client.local.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8091:8000"
+    volumes:
+      - pdc_client_data:/data/client
+      - pdc_client_logs:/app/logs
+    restart: unless-stopped
+
+volumes:
+  # EXTERNAL — pre-existing volumes holding all user data + history. Compose
+  # must never create or delete these.
+  pdc_client_data:
+    external: true
+  pdc_client_logs:
+    external: true

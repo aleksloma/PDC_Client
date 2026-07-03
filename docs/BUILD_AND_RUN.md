@@ -71,38 +71,55 @@ Open `http://localhost:8000` → sign in with your work email + password (first 
 
 ---
 
-## 3. End-to-end smoke test (native, no Docker)
+## 3. Local testing — ALWAYS the Docker stack, ALWAYS the persistent data
 
-Useful while iterating. From a clean checkout:
+**Standing rule: local testing is done through the local Docker stack running
+on the persistent `pdc_*` volumes — never via ad-hoc native `uvicorn` runs.**
+The stack exercises the real tenants, tenant tokens, domain skills, uploaded
+templates, users, chats, and conversation history, the same way a production
+redeploy (Cloud Run for the brain, a customer image upgrade for the client)
+meets existing state. A native run against a scratch directory proves nothing
+about migrations or data compatibility.
+
+Each split repo carries its own local compose file — the brain and the client
+are built and run as SEPARATE compose projects, mirroring production where
+they are never deployed together:
 
 ```powershell
-# Terminal A — brain
-cd enterprise\brain
-$env:GOOGLE_API_KEY = "<your-key>"
-$env:ADMIN_DEFAULT_PASSWORD = "test12345"
-$env:SECRET_KEY = "dev-secret"
-$env:BRAIN_STORAGE_ROOT = ".\brain_data"
-python -m uvicorn app:app --host 127.0.0.1 --port 8085
+# Brain — from the PDC_Brain repo (listens on http://localhost:8090)
+docker compose -f docker-compose.local.yml up -d --build
 
-# Browser: http://127.0.0.1:8085/admin/login
-#   user: admin, pass: test12345 → create tenant → copy token
-
-# Terminal B — client
-cd enterprise\client
-$env:DATA_ROOT = ".\client_data"
-$env:SECRET_KEY = "dev-secret-client"
-$env:BRAIN_URL = "http://127.0.0.1:8085"
-$env:BRAIN_TENANT_TOKEN = "<token-from-brain-admin>"
-python -m uvicorn app:app --host 127.0.0.1 --port 8001
-
-# Browser: http://127.0.0.1:8001 → email + password (first login sets it) → /lab
+# Client — from the PDC_Client repo (listens on http://localhost:8091)
+#   one-time: cp client.local.env.example client.local.env  (fill it in)
+docker compose -f docker-compose.local.yml up -d --build
 ```
 
-Verification of this exact path was performed during development:
-landing → email+password login → upload `sample.csv` → schema endpoint → chat
-endpoint → conversation history. The brain returned token-validated
-responses, and revoking the tenant returned `403` on every subsequent
-client call (the kill-switch).
+Configuration comes from gitignored env files at runtime — secrets are never
+baked into images: the brain reads `.env` (`GOOGLE_API_KEY`, `SECRET_KEY`,
+`GMAIL_SENDER` / `GMAIL_APP_PASSWORD`), the client reads `client.local.env`
+(`BRAIN_URL=http://host.docker.internal:8090`, `BRAIN_TENANT_TOKEN` of a
+tenant existing in the local brain volume, a STABLE `SECRET_KEY`).
+
+### Data preservation (hard rules)
+
+- The volumes `pdc_brain_data`, `pdc_brain_logs`, `pdc_client_data`,
+  `pdc_client_logs` are declared **`external: true`** — compose never
+  creates or deletes them. All tenants, tokens, templates, users, and
+  history live there and MUST survive every rebuild.
+- **NEVER run `docker compose down -v`** or otherwise remove/recreate these
+  volumes. `up -d --build` is the correct redeploy: it replaces the
+  container, the data stays — exactly like production.
+- **Back up the volume contents before a rebuild**:
+
+  ```powershell
+  # repeat for each of the four pdc_* volumes
+  docker run --rm -v pdc_brain_data:/src -v C:\tmp\pdc_backup\pdc_brain_data:/dest `
+      alpine cp -a /src/. /dest/
+  ```
+
+After `up`, verify `GET http://localhost:8090/health` and
+`GET http://localhost:8091/health` return 200 and that pre-existing tenants /
+users / chats are still visible before testing the change at hand.
 
 ---
 
