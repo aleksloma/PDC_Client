@@ -1786,9 +1786,9 @@ function _appendResponseActions(contentDiv, extras) {
   if (!hasCode && !hasChartData) return;
 
   // If this message already rendered an action bar (a chart's View Larger /
-  // Download row, or a table's Show full table / Download Excel row), drop the
-  // Show data / Show code buttons INTO that same flex row. For a plain text
-  // response (no existing bar) use a standalone bar.
+  // Download row, or a table's Download Excel row), drop the Show data / Show
+  // code buttons INTO that same flex row. For a plain text response (no
+  // existing bar) use a standalone bar.
   const existingBar = contentDiv.querySelector('.pdc-action-bar');
   const bar = existingBar || document.createElement('div');
   if (!existingBar) {
@@ -2310,126 +2310,29 @@ function appendTableTo(div, table, fullKey, messageContext = '') {
     _makeSortableTable(tbl);   // click-to-sort headers (Part B)
   }
   
-  // Initially showing top 10 rows (even for styled HTML, we hide rows beyond 10)
-  let showingFull = false;
-  let fullData = null;
-  
   // Table action bar — same flex row + shared class the response-action merge
   // (_appendResponseActions) looks for, so Show code lands on this row too.
   const actionBar = document.createElement('div');
   actionBar.className = 'pdc-action-bar';
   actionBar.style.cssText = 'display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap;';
 
-  // Show full table button
-  if (fullKey && (tot === null || (Array.isArray(previewRows) && tot > previewRows.length))) {
-    const btn = document.createElement('button');
-    btn.className = 'ghost';
-    btn.textContent = showingFull ? 'Show top 10 rows' : 'Show full table';
-    btn.style.cssText = 'padding: 6px 12px; font-size: 13px;';
-    
-    const renderRows = (cols, rows) => {
-      // For styled HTML tables, just show/hide rows instead of rebuilding
-      if (hasStyledHtml && tableContainer.className === 'styled-table-container') {
-        const styledTable = tableContainer.querySelector('table');
-        if (styledTable) {
-          const tableRows = styledTable.querySelectorAll('tbody tr');
-          const numRowsToShow = rows.length;
-          
-          tableRows.forEach((tr, idx) => {
-            if (idx < numRowsToShow) {
-              tr.style.display = '';
-            } else {
-              tr.style.display = 'none';
-            }
-          });
-        }
-        return;
-      }
-      
-      // For plain tables, rebuild rows
-      if (!tbody) return;
-      
-      tbody.innerHTML = '';
-      if (Array.isArray(cols) && cols.join('|') !== previewCols.join('|')) {
-        thead.innerHTML = '';
-        const trh2 = document.createElement('tr');
-        cols.forEach((c) => {
-          const th = document.createElement('th');
-          th.textContent = c;
-          th.style.cssText = 'border: 1px solid #e5e7eb; padding: 8px; background: #f9fafb; text-align: left; font-weight: 600;';
-          trh2.appendChild(th);
-        });
-        thead.appendChild(trh2);
-      }
-      rows.forEach((row) => {
-        const tr = document.createElement('tr');
-        (cols || []).forEach((c) => {
-          const td = document.createElement('td');
-          let v = row && Object.prototype.hasOwnProperty.call(row, c) ? row[c] : '';
-          if (v === null || v === undefined) v = '';
-          td.textContent = _fmtCellValue(c, v);
-          td.style.cssText = 'border: 1px solid #e5e7eb; padding: 8px;';
-          tr.appendChild(td);
-        });
-        tbody.appendChild(tr);
-      });
-    };
-    
-    btn.addEventListener('click', async () => {
-      if (!showingFull) {
-        try {
-          // For styled HTML, just show all rows; for plain tables, fetch and render full data
-          if (hasStyledHtml) {
-            const styledTable = tableContainer.querySelector('table');
-            if (styledTable) {
-              const tableRows = styledTable.querySelectorAll('tbody tr');
-              const totalRows = tableRows.length;
-              tableRows.forEach((tr) => {
-                tr.style.display = '';
-              });
-              meta.textContent = `Showing full ${totalRows} ${totalRows === 1 ? 'row' : 'rows'} (${what}).`;
-            }
-          } else {
-            if (!fullData) {
-              const res = await fetch(`/api/chat/${currentChatId}/full_table/${fullKey}`);
-              const js = await res.json();
-              if (!res.ok || !js || !Array.isArray(js.rows)) return;
-              fullData = js;
-            }
-            renderRows(fullData.columns || previewCols, fullData.rows || []);
-            const fullLen = Array.isArray(fullData.rows) ? fullData.rows.length : 0;
-            meta.textContent = `Showing full ${fullLen} ${fullLen === 1 ? 'row' : 'rows'} (${what}).`;
-          }
-          btn.textContent = 'Show top 10 rows';
-          showingFull = true;
-        } catch (e) {
-          console.error('Failed to load full table:', e);
-        }
-      } else {
-        // Hide rows beyond 10 for styled HTML, or render preview for plain tables
-        if (hasStyledHtml) {
-          const styledTable = tableContainer.querySelector('table');
-          if (styledTable) {
-            const tableRows = styledTable.querySelectorAll('tbody tr');
-            tableRows.forEach((tr, idx) => {
-              if (idx >= 10) {
-                tr.style.display = 'none';
-              }
-            });
-          }
-        } else {
-          renderRows(previewCols, previewRows.slice(0, 10));
-        }
-        if (tot !== null && tot <= 10) {
-          meta.textContent = `Showing ${tot} ${tot === 1 ? 'row' : 'rows'} (${what}).`;
-        } else {
-          meta.textContent = tot !== null ? `Showing top 10 of ${tot} ${tot === 1 ? 'row' : 'rows'} (${what}).` : `Showing top 10 (${what}).`;
-        }
-        btn.textContent = 'Show full table';
-        showingFull = false;
-      }
-    });
-    actionBar.appendChild(btn);
+  // Truncation cue (replaces the old "Show full table" / "Show top 10 rows"
+  // toggle): when the result has more rows than are shown inline (the top-10
+  // preview), state how many remain in a bold line. The complete data stays
+  // available via Download Excel (server-side re-execution). Correct for BOTH
+  // plain and styled_html (conditional-format) tables; shown only when rows are
+  // actually hidden (remaining > 0). total_rows is authoritative; the inline
+  // count is derived from the real preview (slice(0, 10)) — nothing hardcoded.
+  const INLINE_PREVIEW_ROWS = 10;
+  const shownInline = Math.min(previewRows.length, INLINE_PREVIEW_ROWS);
+  const remaining = (tot !== null) ? Math.max(0, tot - shownInline) : 0;
+  if (remaining > 0) {
+    const more = document.createElement('div');
+    more.style.cssText = 'font-weight: 700; margin: 6px 0 2px 0; color: #374151;';
+    more.textContent = remaining === 1
+      ? 'There is 1 more row in data.'
+      : `There are ${remaining} more rows in data.`;
+    div.appendChild(more);
   }
 
   // Excel download button
