@@ -1232,6 +1232,90 @@ async def full_table_get(request: Request, chat_id: str, key: str):
     return _json_safe(rec)
 
 
+# --- Per-chart / per-table refresh -------------------------------------------
+# Re-runs ONE item's stored code against the chat's CURRENT dataframes (after
+# an Add Data update) and returns the re-rendered chart/table. Purely local
+# code re-execution (Article II — nothing touches the brain), same execution
+# path _reexecute_full_df uses. Body: {code, kind: "chart"|"table"}.
+# Auth/permission/validation failures use HTTP status codes; EXECUTION failures
+# return 200 {ok: false, error} so the frontend keeps the previous render and
+# shows a small non-blocking note (Article IV: logged, safe fallback).
+
+@router.post("/{chat_id}/refresh_item")
+async def refresh_item(request: Request, chat_id: str):
+    email, err = _require_chat(request, chat_id)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    code = ((body or {}).get("code") or "").strip()
+    kind = ((body or {}).get("kind") or "chart").strip().lower()
+    if not code:
+        return JSONResponse({"error": "No code to re-run for this item."}, status_code=400)
+    if "###NEXT_PLOT###" in code:
+        # Legacy joined multi-chart record — not a single executable block.
+        return JSONResponse({"error": "This item cannot be refreshed."}, status_code=400)
+
+    sid = secrets.token_hex(8)
+    store = local_store.ChatDataStore(chat_id)
+    loop = asyncio.get_running_loop()
+    try:
+        dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
+        if not dfs:
+            return {"ok": False, "error": "Chat dataset is empty."}
+
+        if kind == "table":
+            from code_exec import safe_execute
+            from run_chat_local import _build_table_from_result
+            exec_out = await loop.run_in_executor(
+                _EXEC, lambda: safe_execute(code, dfs, sid=sid))
+            if not isinstance(exec_out, dict) or exec_out.get("error"):
+                emsg = (exec_out or {}).get("error", "unknown") if isinstance(exec_out, dict) else "unknown"
+                log_with_sid(sid, "warning", f"REFRESH_ITEM_TABLE_EXEC_ERROR: {str(emsg)[:200]}",
+                             chat_id=chat_id)
+                return {"ok": False, "error": "Could not re-run this table with the current data."}
+            table = _build_table_from_result(exec_out.get("result"))
+            if not table or not (table.get("rows") or []):
+                return {"ok": False, "error": "Re-execution did not produce a table."}
+            payload = {"ok": True, "kind": "table", "table": table}
+            full_table_key = _persist_full_table(store, table, code)
+            if full_table_key:
+                payload["full_table_key"] = full_table_key
+            log_with_sid(sid, "info", "REFRESH_ITEM_OK", kind="table",
+                         chat_id=chat_id, rows=table.get("total_rows"))
+            return _json_safe(payload)
+
+        # kind == "chart" (default)
+        from plot_utils import render_plot_safe
+        plot_out = await loop.run_in_executor(
+            _EXEC, lambda: render_plot_safe(code, dfs, sid))
+        if (not isinstance(plot_out, dict) or plot_out.get("error")
+                or plot_out.get("multi_axes")):
+            emsg = (plot_out or {}).get("error", "unknown") if isinstance(plot_out, dict) else "unknown"
+            log_with_sid(sid, "warning", f"REFRESH_ITEM_CHART_EXEC_ERROR: {str(emsg)[:200]}",
+                         chat_id=chat_id)
+            return {"ok": False, "error": "Could not re-run this chart with the current data."}
+        img = plot_out.get("plotly_html") if plot_out.get("is_plotly") else plot_out.get("image")
+        if not img:
+            return {"ok": False, "error": "Re-execution did not produce a chart."}
+        payload = {"ok": True, "kind": "chart", "image_base64": img,
+                   "is_plotly": bool(plot_out.get("is_plotly"))}
+        # Fresh chart source data so a subsequent "Show data" shows the
+        # refreshed values (same cache + endpoint the live stream uses).
+        cd = plot_out.get("chart_data")
+        if isinstance(cd, dict) and (cd.get("rows") or cd.get("tables")):
+            payload["chart_data_key"] = _cache_full_table(cd)
+        log_with_sid(sid, "info", "REFRESH_ITEM_OK", kind="chart",
+                     chat_id=chat_id, plotly=bool(plot_out.get("is_plotly")))
+        return _json_safe(payload)
+    except Exception as e:
+        log_with_sid(sid, "error", f"REFRESH_ITEM_ERROR: {type(e).__name__}: {e}",
+                     chat_id=chat_id)
+        return {"ok": False, "error": "Refresh failed."}
+
+
 # --- Downloads (chart PNG + table Excel) -------------------------------------
 # The B2C dashboard calls these three routes; they were never ported, so every
 # "Download" button 404'd. Rendering + Excel build happen locally (Article II:

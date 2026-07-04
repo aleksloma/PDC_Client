@@ -127,6 +127,11 @@ window.I18N_TRANSLATIONS = {
     'lab.ask_placeholder': 'Ask anything about your data...',
     'lab.download_report': '📊 Download Analytics',
     'lab.view_schema': 'View / Edit Descriptions',
+    'lab.add_data': '➕ Add Data',
+    'lab.flow_adding': 'Adding data to chat…',
+    'lab.data_added': 'Data added to chat',
+    'lab.refresh_item': 'Refresh with current data',
+    'lab.refresh_failed': 'Refresh failed — showing previous result',
     'lab.run_auto_analytics': 'Run Auto Analytics',
     'lab.processing': 'Processing…',
     'lab.download_presentation': 'Download Presentation',
@@ -147,6 +152,8 @@ window.I18N_TRANSLATIONS = {
     'wizard.share_btn': 'Share',
     'wizard.cancel_btn': 'Cancel',
     'wizard.generate_chat': 'Generate Chat',
+    'wizard.add_data_title': 'Add Data To',
+    'wizard.upload_btn': 'Upload',
 
     // Schema viewer / editor
     'schema.title': 'View / Edit Descriptions',
@@ -423,6 +430,11 @@ window.I18N_TRANSLATIONS = {
     'lab.ask_placeholder': 'დასვით კითხვა თქვენს მონაცემებზე...',
     'lab.download_report': '📊 ანალიტიკის ჩამოტვირთვა',
     'lab.view_schema': 'აღწერების ნახვა / რედაქტირება',
+    'lab.add_data': '➕ მონაცემების დამატება',
+    'lab.flow_adding': 'მონაცემები ემატება ჩატს…',
+    'lab.data_added': 'მონაცემები დაემატა ჩატს',
+    'lab.refresh_item': 'განახლება მიმდინარე მონაცემებით',
+    'lab.refresh_failed': 'განახლება ვერ მოხერხდა — ნაჩვენებია წინა შედეგი',
     'lab.run_auto_analytics': 'ავტომატური ანალიზის გაშვება',
     'lab.processing': 'მუშავდება…',
     'lab.download_presentation': 'პრეზენტაციის ჩამოტვირთვა',
@@ -443,6 +455,8 @@ window.I18N_TRANSLATIONS = {
     'wizard.share_btn': 'გაზიარება',
     'wizard.cancel_btn': 'გაუქმება',
     'wizard.generate_chat': 'ჩატის შექმნა',
+    'wizard.add_data_title': 'მონაცემების დამატება ჩატში',
+    'wizard.upload_btn': 'ატვირთვა',
 
     // Schema viewer / editor
     'schema.title': 'აღწერების ნახვა / რედაქტირება',
@@ -719,6 +733,11 @@ window.I18N_TRANSLATIONS = {
     'lab.ask_placeholder': 'Задайте вопрос о ваших данных...',
     'lab.download_report': '📊 Скачать аналитику',
     'lab.view_schema': 'Просмотр / редактирование описаний',
+    'lab.add_data': '➕ Добавить данные',
+    'lab.flow_adding': 'Добавление данных в чат…',
+    'lab.data_added': 'Данные добавлены в чат',
+    'lab.refresh_item': 'Обновить по текущим данным',
+    'lab.refresh_failed': 'Не удалось обновить — показан предыдущий результат',
     'lab.run_auto_analytics': 'Запустить авто-анализ',
     'lab.processing': 'Обработка…',
     'lab.download_presentation': 'Скачать презентацию',
@@ -739,6 +758,8 @@ window.I18N_TRANSLATIONS = {
     'wizard.share_btn': 'Поделиться',
     'wizard.cancel_btn': 'Отмена',
     'wizard.generate_chat': 'Создать чат',
+    'wizard.add_data_title': 'Добавить данные в',
+    'wizard.upload_btn': 'Загрузить',
 
     // Schema viewer / editor
     'schema.title': 'Просмотр / редактирование описаний',

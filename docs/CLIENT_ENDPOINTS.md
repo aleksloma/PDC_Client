@@ -99,6 +99,32 @@ enterprise build keeps the same shape so the existing JS works unchanged:
 Direct-to-GCS paths (`/upload/init`, `/upload/finalize`, `/upload_from_url`)
 return `400` — the on-prem build uses the standard path for all sizes.
 
+### Add Data to an existing chat
+
+**`POST /add_data_to_chat`** — body `{chat_id}`. Triggered by the **Add Data**
+button in the chat topbar (left of "View / Edit Descriptions"; the Create-New
+modal reopens in "add" mode: title `Add Data To "<chat name>"`, primary button
+**Upload**). The frontend runs the SAME preprocessing pipeline as chat
+creation — `/new_session` → `/upload` (table detection) →
+`/schema_autofill_full` (descriptions) — and then calls this endpoint instead
+of `/generate_chatdata`. It merges the temp session store into the existing
+`ChatDataStore`:
+
+- Raw files are copied into `chatdata/{chat_id}/files/`; a filename that
+  already exists in the chat is **silently overwritten** (intentional — acts
+  as a data update), and its existing meta/schema/description entry is kept
+  as-is. New filenames get their autofilled meta entries appended.
+- The user's `active_chats.jsonl` record gets its `files` list refreshed
+  (sidebar subtitle).
+- Nothing else changes: `schema_text` is rebuilt from all loaded dataframes on
+  every question, so added files are immediately visible to generated code and
+  to the View / Edit Descriptions modal (which re-fetches
+  `/api/chat/{id}/schema` on open).
+
+Requires an authenticated session with access to `{chat_id}` (owner or shared
+recipient). `400` when no files were uploaded in the session; raw data never
+leaves the client.
+
 ---
 
 ## Chat (SSE stream)
@@ -229,6 +255,39 @@ calls the brain.
 All three require an authenticated session with access to `{chat_id}`. `.xlsx`
 files are built with pandas + openpyxl. Matplotlib/seaborn charts are already
 PNGs, so their Download is a pure client-side save (no route).
+
+---
+
+## Per-chart / per-table refresh (local re-execution)
+
+**`POST /api/chat/{chat_id}/refresh_item`** — body `{code, kind: "chart"|"table"}`.
+
+Every chart and table that carries its own stored `code` (live events and
+persisted history records both do) gets a small refresh icon button (double
+curved arrows) in its action bar. Clicking it re-runs ONLY that item's stored
+code against the chat's **current** dataframes — purely local re-execution via
+`render_plot_safe` / `safe_execute` (the same path `_reexecute_full_df` uses);
+**no LLM/brain call** — and swaps the chart image / table content in place.
+Purpose: after updating a file via Add Data (overwrite), existing items can be
+refreshed to reflect the new data.
+
+- Charts return `{ok, image_base64, is_plotly, chart_data_key?}` — the fresh
+  `chart_data_key` re-points "Show data" at the refreshed values; Plotly
+  "View Larger" / "Download" follow the updated HTML automatically.
+- Tables return `{ok, table, full_table_key?}` — the block is re-rendered
+  (styled_html included when the code yields a pandas Styler) and "Download
+  Excel" is rebound to the new durable key.
+- Legacy history records (saved before per-chart code persistence) carry only
+  the joined `###NEXT_PLOT###` record-level code. The frontend SPLITS that code
+  on the marker when rendering history and assigns segment *i* to chart *i*, so
+  legacy charts are refreshable per segment (and Show code shows the clean
+  segment). Only items with NO code at all — or an ambiguous multi-segment
+  code that can't be matched to the item — show no button. The endpoint keeps
+  rejecting joined code with `400` as a guard; the frontend always sends a
+  single clean segment.
+- Auth/permission failures use HTTP codes; **execution** failures return
+  `200 {ok: false, error}` — the frontend keeps the previous render and shows
+  a small non-blocking note.
 
 ---
 

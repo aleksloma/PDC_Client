@@ -628,6 +628,94 @@ async def generate_chatdata(request: Request):
     }
 
 
+# ---------------------------------------------------------------------------
+# 5. /add_data_to_chat  — merge the temp UserStore into an EXISTING chat
+# ---------------------------------------------------------------------------
+@router.post("/add_data_to_chat")
+async def add_data_to_chat(request: Request):
+    """Add uploaded files to an EXISTING chat.
+
+    The frontend runs the SAME preprocessing pipeline as chat creation
+    (/new_session → /upload → /schema_autofill_full — table detection, schema
+    init, autofill all happen there, unchanged), then calls this instead of
+    /generate_chatdata. Body: {chat_id}.
+
+    Merge semantics (mirrors save_upload's silent-overwrite behavior):
+      - Every uploaded file is copied into the chat's files dir; a filename
+        that already exists in the chat is silently overwritten (data update).
+      - meta.json: entries for NEW filenames are appended (with their
+        autofilled schema/descriptions); entries for EXISTING filenames are
+        kept as-is (descriptions preserved).
+    schema_text is rebuilt from all loaded dataframes on every question, so
+    the added files are picked up with no further work.
+    """
+    from routes.chat import _require_chat
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    chat_id = ((body or {}).get("chat_id") or "").strip()
+    if not chat_id:
+        return JSONResponse({"error": "chat_id is required."}, status_code=400)
+
+    email, err = _require_chat(request, chat_id)
+    if err:
+        return err
+    sid = request.session.get("sid")
+    if not sid:
+        return JSONResponse({"error": "No upload session. Upload files first."}, status_code=400)
+
+    user_store = UserStore(sid)
+    dfs = user_store.load_dataframes()
+    if not dfs:
+        return JSONResponse({"error": "Upload at least one file before adding data."}, status_code=400)
+
+    try:
+        import shutil
+
+        chat_store = ChatDataStore(chat_id)
+        chat_meta = chat_store.read_meta()
+        existing_names = {f.get("file_name") for f in chat_meta.get("files", []) if f.get("file_name")}
+
+        # Copy the raw files (silent overwrite = intentional data update).
+        for fp in sorted(user_store.files_dir.iterdir()):
+            if fp.is_file() and not fp.name.startswith("."):
+                shutil.copy2(fp, chat_store.files_dir / fp.name)
+
+        # Merge meta: new df keys appended with their autofilled entries;
+        # existing keys keep the chat's entry (descriptions preserved).
+        added, updated = [], []
+        user_meta = user_store.read_meta()
+        for entry in user_meta.get("files", []):
+            name = entry.get("file_name")
+            if not name:
+                continue
+            if name in existing_names:
+                updated.append(name)
+                continue
+            chat_meta.setdefault("files", []).append(entry)
+            existing_names.add(name)
+            added.append(name)
+        chat_store.write_meta(chat_meta)
+
+        # Keep the sidebar's file list for this chat current (non-fatal).
+        all_names = [f.get("file_name") for f in chat_meta.get("files", []) if f.get("file_name")]
+        try:
+            AuthStore().update_active_chat_files(email, chat_id, all_names)
+        except Exception as e:
+            log_with_sid(email, "warning", f"ADD_DATA_FILELIST_UPDATE_FAILED: {e}", chat_id=chat_id)
+
+        log_with_sid(email, "info", "CHAT_DATA_ADDED", chat_id=chat_id,
+                     added=",".join(added), updated=",".join(updated))
+        return {"ok": True, "chat_id": chat_id, "added": added,
+                "updated": updated, "files": all_names}
+    except Exception as e:
+        log_with_sid(email, "error", f"ADD_DATA_ERROR: {type(e).__name__}: {e}", chat_id=chat_id)
+        return JSONResponse({"error": "Failed to add data to the chat."}, status_code=500)
+
+
 def _name_from_files(filenames: list[str]) -> str:
     if not filenames:
         return "Data Analysis"

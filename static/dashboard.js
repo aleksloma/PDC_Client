@@ -18,6 +18,10 @@ let isFrictionlessFlowRunning = false;
 // slow-unwinding old send from reverting a newer send's Stop button.
 let activeStopHandler = null;
 let currentSendToken = 0;
+// Create-New modal mode: 'create' (default — Generate Chat) or 'add' (Add Data
+// to the currently open chat — same modal/wizard, different final step).
+let wizardMode = 'create';
+let addDataTargetChatId = null;
 
 const ALLOWED_UPLOAD_EXTENSIONS = ['xlsx', 'xls', 'csv', 'tsv'];
 
@@ -673,6 +677,10 @@ function renderUnifiedChatList(chats, conversations) {
   const container = document.getElementById('chatsList');
   if (!container) return;
 
+  // The chat that is currently open must stay expanded across re-renders
+  // (list refresh, Add Data, …) so its — highlighted — conversation is visible.
+  if (currentChatId) expandedChats.add(currentChatId);
+
   if (chats.length === 0) {
     container.innerHTML = '<div class="chats-list-empty">No chats yet. Click "+ Create New" to get started.</div>';
     return;
@@ -723,7 +731,7 @@ function renderUnifiedChatList(chats, conversations) {
 
     return `
       <div class="${wrapperClass}" data-chat-id="${chatId}">
-        <div class="chat-item-row${chatId === currentChatId && !currentConvId ? ' active' : ''}" data-chat-id="${chatId}" data-slug="${chat.slug || ''}">
+        <div class="chat-item-row${chatId === currentChatId ? ' active' : ''}" data-chat-id="${chatId}" data-slug="${chat.slug || ''}">
           <button class="chat-expand-btn${isExpanded ? ' expanded' : ''}" data-chat-id="${chatId}" title="Show conversations">
             <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
               <path d="M4.5 2L8.5 6L4.5 10" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/>
@@ -1120,6 +1128,7 @@ function setupEventListeners() {
 
   // Chat actions
   document.getElementById('btnSchema')?.addEventListener('click', openSchemaViewer);
+  document.getElementById('btnAddData')?.addEventListener('click', openAddDataWizard);
 
   // Auto Analytics button (idle / processing / done state machine)
   AutoAnalytics.init();
@@ -1340,12 +1349,15 @@ const AutoAnalytics = (function () {
 // Show/hide top bar action buttons
 function showTopBarActions(show) {
   const btnSchema = document.getElementById('btnSchema');
+  const btnAddData = document.getElementById('btnAddData');
   const btnAuto = document.getElementById('btnAutoAnalytics');
   if (show) {
     btnSchema?.classList.remove('hidden');
+    btnAddData?.classList.remove('hidden');
     btnAuto?.classList.remove('hidden');
   } else {
     btnSchema?.classList.add('hidden');
+    btnAddData?.classList.add('hidden');
     btnAuto?.classList.add('hidden');
     AutoAnalytics.stopPolling();
     // Also hide report dropdown when top bar actions are hidden
@@ -1430,6 +1442,7 @@ async function openChat(chatId) {
   currentConvId = null;
   _highlightActiveConv(null);
   _highlightActiveChat(chatId);
+  _expandOpenChatInSidebar(chatId);
 
   showLoading('Loading chat...');
   
@@ -1576,6 +1589,21 @@ function _highlightActiveChat(chatId) {
   }
 }
 
+// Auto-expand the open chat in the sidebar (so the conversation list — and the
+// highlighted active conversation — is visible). Reuses toggleChatExpand, so
+// the single-open accordion behavior (collapse the others) stays as-is. If the
+// list isn't rendered yet, just record the state — renderUnifiedChatList
+// re-applies it on every render while the chat is open.
+function _expandOpenChatInSidebar(chatId) {
+  if (!chatId || expandedChats.has(chatId)) return;
+  const wrapper = document.querySelector(`.chat-item-wrapper[data-chat-id="${chatId}"]`);
+  if (wrapper) {
+    toggleChatExpand(chatId);
+  } else {
+    expandedChats.add(chatId);
+  }
+}
+
 // Open existing conversation
 // ── Reload-time "generation in progress" resume ───────────────────────────
 // When a conversation is reloaded/reopened while its server-side worker is
@@ -1666,6 +1694,7 @@ async function openConversation(chatId, convId) {
   _stopReloadGenPoll();   // cancel any poll from a previously-open conversation
   _highlightActiveConv(convId);
   _highlightActiveChat(chatId);
+  _expandOpenChatInSidebar(chatId);
 
   showLoading('Loading conversation...');
   
@@ -1721,10 +1750,13 @@ async function openConversation(chatId, convId) {
         // Multi-chart history entry: render each chart as a separate assistant
         // message. New records persist per-chart code + chart_data, so Show code
         // / Show data appear on EVERY chart after reload. Backward compat: old
-        // records lack img.code/img.chart_data → fall back to the joined msg.code
-        // under the first chart (legacy behavior) and omit Show data.
+        // records lack img.code/img.chart_data → split the legacy JOINED
+        // msg.code on ###NEXT_PLOT### and give chart idx its own clean segment
+        // (refresh + Show code work per chart); charts with no matching segment
+        // stay code-less. Show data stays omitted for legacy records.
+        const legacySegs = _splitJoinedCode(msg.code);
         msg.images.forEach((img, idx) => {
-          const code = img.code || (idx === 0 ? msg.code : null);
+          const code = img.code || legacySegs[idx] || null;
           appendMessage('assistant', img.answer || '', img.image_base64, null, null,
             { code: code, chartData: img.chart_data || null });
         });
@@ -1817,7 +1849,7 @@ function _appendResponseActions(contentDiv, extras) {
 
   if (hasChartData) {
     const dataBtn = document.createElement('button');
-    dataBtn.className = 'ghost';
+    dataBtn.className = 'ghost pdc-show-data-btn';
     dataBtn.textContent = '📊 Show data';
     dataBtn.style.cssText = 'padding:6px 12px; font-size:13px;';
     dataBtn.addEventListener('click', () => {
@@ -1838,7 +1870,7 @@ function _appendResponseActions(contentDiv, extras) {
 
   if (hasCode) {
     const codeBtn = document.createElement('button');
-    codeBtn.className = 'ghost';
+    codeBtn.className = 'ghost pdc-show-code-btn';
     codeBtn.textContent = '⟨⟩ Show code';
     codeBtn.style.cssText = 'padding:6px 12px; font-size:13px;';
     codeBtn.addEventListener('click', () => window.PDCViewers.openCode(extras.code));
@@ -1847,6 +1879,155 @@ function _appendResponseActions(contentDiv, extras) {
 
   // Only append when we created a standalone bar — an existing bar is already in the DOM.
   if (!existingBar) contentDiv.appendChild(bar);
+}
+
+// ── Per-chart / per-table Refresh (re-run stored code on current data) ─────
+// After the user updates a file via Add Data (silent overwrite), each chart /
+// table gets a small refresh button that POSTs its OWN stored code to
+// /api/chat/{id}/refresh_item (purely local re-execution — no LLM call) and
+// swaps the rendered item in place. Items without stored per-item code (old
+// history records with a joined multi-chart code) get no button. On failure a
+// small non-blocking note is shown and the previous render is kept.
+const _REFRESH_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/></svg>';
+
+// Legacy history records (saved before per-chart code persistence) carry ONE
+// joined record-level code — segments separated by ###NEXT_PLOT###. Split it
+// into clean single-block segments so each legacy chart gets its own code for
+// the refresh button AND Show code.
+function _splitJoinedCode(code) {
+  if (!code) return [];
+  return String(code).split('###NEXT_PLOT###').map(s => s.trim()).filter(Boolean);
+}
+
+function _makeRefreshButton(onRefresh) {
+  const btn = document.createElement('button');
+  btn.className = 'ghost pdc-refresh-btn';
+  btn.innerHTML = _REFRESH_SVG;
+  btn.title = _t('lab.refresh_item', 'Refresh with current data');
+  btn.style.cssText = 'padding:6px 10px; font-size:13px;';
+  btn.addEventListener('click', async () => {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.classList.add('pdc-refresh-spinning');   // rotate the arrows while in flight
+    try {
+      await onRefresh();
+    } catch (e) {
+      console.error('Refresh failed:', e);
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove('pdc-refresh-spinning');
+    }
+  });
+  return btn;
+}
+
+function _showRefreshError(anchorEl, msg) {
+  if (!anchorEl) return;
+  const note = document.createElement('span');
+  note.className = 'pdc-refresh-error';
+  note.textContent = msg || _t('lab.refresh_failed', 'Refresh failed — showing previous result');
+  note.style.cssText = 'color:#ef4444; font-size:12px; align-self:center;';
+  anchorEl.appendChild(note);
+  setTimeout(() => note.remove(), 5000);
+}
+
+async function _postRefreshItem(code, kind) {
+  // Returns the parsed payload on success, or {__error: msg} on any failure.
+  try {
+    const res = await fetch(`/api/chat/${currentChatId}/refresh_item`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code, kind }),
+    });
+    let data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (!res.ok || !data || data.error || data.ok === false) {
+      return { __error: (data && (data.error || null)) || undefined };
+    }
+    return data;
+  } catch (e) {
+    return { __error: undefined };
+  }
+}
+
+// Chart refresh: swap the visual in place. Plotly charts update through the
+// container's _setChartHtml hook (View Larger / Download follow); static
+// images update img.src (their buttons read the live src). Mutating `extras`
+// repoints the Show data button (its click handler reads extras at click time).
+async function _refreshChart(container, bar, code, extras) {
+  const data = await _postRefreshItem(code, 'chart');
+  if (data.__error !== undefined || !data.image_base64) {
+    _showRefreshError(bar, data.__error);
+    return;
+  }
+  const newContent = String(data.image_base64);
+  const isHtml = newContent.trim().startsWith('<');
+  const img = container.querySelector('img');
+  if (isHtml && typeof container._setChartHtml === 'function') {
+    container._setChartHtml(newContent);
+  } else if (!isHtml && img) {
+    img.src = 'data:image/png;base64,' + newContent;
+  } else {
+    // Re-execution changed the chart's render type — keep the previous chart.
+    _showRefreshError(bar);
+    return;
+  }
+  if (extras && data.chart_data_key) {
+    extras.chartData = null;
+    extras.chartDataKey = data.chart_data_key;
+  }
+}
+
+// Table refresh: rebuild the whole table block (meta line, table, truncation
+// cue, Download Excel bound to the NEW full_table_key), carry the Show data /
+// Show code buttons over to the new action bar, and re-arm the refresh button.
+function _wireTableRefresh(wrap, code, extras, messageContext) {
+  const bar = wrap.querySelector('.pdc-action-bar');
+  if (!bar) return;
+  bar.appendChild(_makeRefreshButton(async () => {
+    const data = await _postRefreshItem(code, 'table');
+    if (data.__error !== undefined || !data.table) {
+      _showRefreshError(bar, data.__error);
+      return;
+    }
+    const newWrap = document.createElement('div');
+    newWrap.className = 'pdc-table-block';
+    if (!appendTableTo(newWrap, data.table, data.full_table_key || null, messageContext)) {
+      _showRefreshError(bar);
+      return;
+    }
+    const newBar = newWrap.querySelector('.pdc-action-bar');
+    const oldBar = wrap.querySelector('.pdc-action-bar');
+    if (newBar && oldBar) {
+      Array.from(oldBar.querySelectorAll('.pdc-show-data-btn, .pdc-show-code-btn'))
+        .forEach(b => newBar.appendChild(b));
+    }
+    wrap.replaceWith(newWrap);
+    _wireTableRefresh(newWrap, code, extras, messageContext);
+  }));
+}
+
+// Attach refresh buttons to an assistant message's chart / table. Requires a
+// single clean code block: history rendering splits legacy joined records
+// per chart, and a joined code that reduces to ONE segment is normalized here.
+// Only a residual ambiguous multi-segment code (can't tell which segment this
+// item is) gets no button; records with no code at all can't be refreshed.
+function _wireRefreshButtons(chartContainer, tableWrap, extras, messageContext) {
+  let code = extras && extras.code ? String(extras.code) : '';
+  if (code.includes('###NEXT_PLOT###')) {
+    const segs = _splitJoinedCode(code);
+    code = segs.length === 1 ? segs[0] : '';
+  }
+  if (!code.trim()) return;
+  if (chartContainer) {
+    const bar = chartContainer.querySelector('.pdc-action-bar');
+    if (bar) {
+      bar.appendChild(_makeRefreshButton(() => _refreshChart(chartContainer, bar, code, extras)));
+    }
+  }
+  if (tableWrap) {
+    _wireTableRefresh(tableWrap, code, extras, messageContext);
+  }
 }
 
 function appendMessage(role, content, imageBase64, table, fullTableKey, extras) {
@@ -1875,25 +2056,32 @@ function appendMessage(role, content, imageBase64, table, fullTableKey, extras) 
     editBtn.addEventListener('click', () => startEditMessage(messageDiv));
     messageDiv.appendChild(editBtn);
   }
-  
+
+  let chartContainer = null;
   if (imageBase64) {
     // Check if it's interactive HTML (Plotly) or base64 image
     if (imageBase64.trim().startsWith('<') && imageBase64.includes('plotly')) {
-      contentDiv.appendChild(createPlotlyContainer(imageBase64, currentChatId, content || ''));
+      chartContainer = createPlotlyContainer(imageBase64, currentChatId, content || '');
     } else {
       // It's a base64 image (matplotlib/seaborn)
-      const imgContainer = createImageWithFullscreen(imageBase64, content || '');
-      contentDiv.appendChild(imgContainer);
+      chartContainer = createImageWithFullscreen(imageBase64, content || '');
     }
+    contentDiv.appendChild(chartContainer);
   }
-  
+
+  let tableWrap = null;
   if (table && table.columns && table.rows) {
-    appendTableTo(contentDiv, table, fullTableKey, content || '');
+    // Wrapped so the per-table Refresh can rebuild the block in place.
+    tableWrap = document.createElement('div');
+    tableWrap.className = 'pdc-table-block';
+    appendTableTo(tableWrap, table, fullTableKey, content || '');
+    contentDiv.appendChild(tableWrap);
   }
 
   // "Show data" / "Show code" buttons (assistant responses only).
   if (role === 'assistant') {
     _appendResponseActions(contentDiv, extras);
+    _wireRefreshButtons(chartContainer, tableWrap, extras, content || '');
   }
 
   messageDiv.appendChild(contentDiv);
@@ -2028,6 +2216,10 @@ function createImageWithFullscreen(base64Data, messageContext = '') {
 // NOTE: chat.js has a parallel copy of this function with the same signature.
 // Keep them in sync.
 function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
+  // Mutable holder so the per-chart Refresh button can swap the chart in place;
+  // View Larger and Download always use the CURRENT html.
+  let currentHtml = htmlString;
+
   const plotlyContainer = document.createElement('div');
   plotlyContainer.className = 'plotly-container';
   plotlyContainer.style.cssText = 'margin-top: 10px; width: 100%; max-width: 900px;';
@@ -2038,8 +2230,11 @@ function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
   // Sandbox: allow the chart's scripts to run but block top-level navigation /
   // new-tab popups from the blank-origin srcdoc document. (keep in sync: chat.js)
   iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
-  iframe.srcdoc = htmlString;
+  iframe.srcdoc = currentHtml;
   plotlyContainer.appendChild(iframe);
+
+  // Used by the per-chart Refresh button to update the chart in place.
+  plotlyContainer._setChartHtml = (h) => { currentHtml = h; iframe.srcdoc = h; };
 
   const btnContainer = document.createElement('div');
   btnContainer.className = 'pdc-action-bar';
@@ -2055,7 +2250,7 @@ function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
 
     const modalIframe = document.createElement('iframe');
     modalIframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
-    modalIframe.srcdoc = htmlString;
+    modalIframe.srcdoc = currentHtml;
     modalIframe.style.cssText = 'width: 100%; height: 100%; border: none; background: white; position: relative; z-index: 1;';
 
     const closeBtn = document.createElement('button');
@@ -2104,7 +2299,7 @@ function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
       const res = await fetch(`/api/chat/${chatIdRef}/export_plotly_png`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ html: htmlString, filename, scale: 3 })
+        body: JSON.stringify({ html: currentHtml, filename, scale: 3 })
       });
       if (!res.ok) {
         let serverMsg = `HTTP ${res.status}`;
@@ -2511,9 +2706,13 @@ async function _tryRecoverResponse(chatId, convId, loadingDiv) {
       // Recovery successful - display the saved response
       loadingDiv.remove();
       if (last.images && Array.isArray(last.images) && last.images.length > 0) {
+        // Same per-chart code resolution as the history renderer: prefer the
+        // persisted per-chart code, else the matching legacy joined segment.
+        const recSegs = _splitJoinedCode(last.code);
         last.images.forEach((img, idx) => {
+          const code = img.code || recSegs[idx] || null;
           appendMessage('assistant', img.answer || '', img.image_base64, null, null,
-            idx === 0 ? { code: last.code } : null);
+            { code: code, chartData: img.chart_data || null });
         });
       } else {
         appendMessage('assistant', last.content || '', last.image_base64, last.table, last.full_table_key,
@@ -3026,11 +3225,46 @@ async function editAndRegenerate(messageDiv, editedQuestion) {
 }
 
 // Create wizard functions (single-step modal — Generate Chat button is the only flow trigger)
+// The SAME modal serves two modes: 'create' (new chat) and 'add' (Add Data to
+// the open chat). Mode only changes the title, the primary button label, and
+// the final backend step — everything else (file picking, drop, validation)
+// is shared.
+function _setWizardMode(mode, chatName) {
+  wizardMode = mode;
+  const titleEl = document.getElementById('wizardTitle');
+  const nextBtn = document.getElementById('btnWizardNext');
+  if (mode === 'add') {
+    if (titleEl) titleEl.textContent = `${_t('wizard.add_data_title', 'Add Data To')} "${chatName || ''}"`;
+    if (nextBtn) nextBtn.textContent = _t('wizard.upload_btn', 'Upload');
+  } else {
+    if (titleEl) titleEl.textContent = _t('wizard.title', 'Create New Chat');
+    if (nextBtn) nextBtn.textContent = _t('wizard.generate_chat', 'Generate Chat');
+  }
+}
+
 function openCreateWizard() {
+  _setWizardMode('create');
+  addDataTargetChatId = null;
   selectedFiles = [];
   renderSelectedFilesList();
   _updateWizardGenerateBtn();
   // Reset session so the wizard always starts fresh
+  fetch('/new_session', { method: 'POST' });
+  document.getElementById('createNewModal').classList.remove('hidden');
+}
+
+// "Add Data" (chat topbar) — same modal in 'add' mode: files go through the
+// same upload+autofill pipeline and are merged into the CURRENT chat.
+function openAddDataWizard() {
+  if (!currentChatId) return;
+  addDataTargetChatId = currentChatId;
+  const chats = listCache.get('activeChats') || [];
+  const chat = chats.find(c => c.chat_id === currentChatId);
+  _setWizardMode('add', (chat && chat.name) || '');
+  selectedFiles = [];
+  renderSelectedFilesList();
+  _updateWizardGenerateBtn();
+  // Fresh temp session for this upload batch (same as Create New)
   fetch('/new_session', { method: 'POST' });
   document.getElementById('createNewModal').classList.remove('hidden');
 }
@@ -3047,16 +3281,29 @@ function closeCreateWizard() {
   document.getElementById('createNewModal').classList.add('hidden');
 }
 
-// Single-step wizard "Generate Chat" handler — uses the same frictionless flow as page drop
+// Single-step wizard "Generate Chat" / "Upload" handler — uses the same
+// frictionless flow as page drop; 'add' mode swaps only the final step.
 async function wizardNextStep() {
   if (selectedFiles.length === 0) {
     showToast('Please select at least one file', true);
     return;
   }
+  // Snapshot the mode BEFORE closing (closeCreateWizard is mode-agnostic but
+  // the flow below must dispatch on what the user actually opened).
+  const mode = wizardMode;
+  const targetChatId = addDataTargetChatId;
   // Close the modal first so the progress overlay is the only thing visible
   closeCreateWizard();
 
   const regularFiles = selectedFiles.filter(f => !f._isGoogleSheet);
+  if (mode === 'add' && targetChatId) {
+    if (regularFiles.length === 0) {
+      showToast('Please select at least one file', true);
+      return;
+    }
+    await runFrictionlessFlow(regularFiles, { resetSession: false, addToChatId: targetChatId });
+    return;
+  }
   // Google Sheets are already uploaded by /upload_from_url; if any are selected,
   // we MUST NOT call /new_session again (that would wipe them). The wizard already
   // reset the session in openCreateWizard().
@@ -3127,7 +3374,10 @@ function renderSelectedFilesList() {
  *
  * @param {File[]} files local files to upload (may be empty when only Google Sheets are present;
  *   in that case `opts.skipUploadIfEmpty` should be true so we still continue to autofill+generate).
- * @param {{skipUploadIfEmpty?: boolean, resetSession?: boolean}} opts
+ * @param {{skipUploadIfEmpty?: boolean, resetSession?: boolean, addToChatId?: string}} opts
+ *   `addToChatId` (Add Data mode): after the same upload+autofill steps, the
+ *   files are merged into that EXISTING chat via /add_data_to_chat instead of
+ *   creating a new chat.
  */
 async function runFrictionlessFlow(files, opts) {
   if (isFrictionlessFlowRunning) return;
@@ -3207,6 +3457,39 @@ async function runFrictionlessFlow(files, opts) {
     } catch (e) {
       console.warn('[FRICTIONLESS] schema_autofill_full failed:', e);
       showToast(_t('lab.ai_desc_unavailable', 'AI descriptions unavailable, you can edit them later'), true);
+    }
+
+    // Step 3 (Add Data mode): merge the uploaded files into the EXISTING chat
+    // instead of creating a new one. Same preprocessing already ran above.
+    if (opts.addToChatId) {
+      _updateFrictionlessStatus('lab.flow_adding');
+      let addData = null;
+      try {
+        const addRes = await fetch('/add_data_to_chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: opts.addToChatId }),
+        });
+        try { addData = await addRes.json(); } catch (e) { addData = null; }
+        if (!addRes.ok || !addData || addData.error) {
+          const msg = (addData && addData.error) || `Adding data failed (${addRes.status})`;
+          _hideFrictionlessOverlay();
+          showToast(msg, true);
+          return;
+        }
+      } catch (e) {
+        console.error('[ADD_DATA] add_data_to_chat failed:', e);
+        _hideFrictionlessOverlay();
+        showToast('Failed to add data — please try again', true);
+        return;
+      }
+      // Refresh the sidebar (file subtitles) — the View / Edit Descriptions
+      // modal re-fetches /api/chat/{id}/schema each time it opens, so it
+      // reflects the new files automatically. The open chat keeps working:
+      // schema_text is rebuilt from all loaded dataframes on every question.
+      try { await loadUnifiedChatList(true); } catch (e) { /* non-fatal */ }
+      showToast(_t('lab.data_added', 'Data added to chat'));
+      return;
     }
 
     // Step 3: Create the chat

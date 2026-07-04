@@ -314,6 +314,28 @@ class AuthStore:
             p.write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
             return found
 
+    def update_active_chat_files(self, email: str, chat_id: str, files: list[str]) -> bool:
+        """Refresh the `files` list on a chat's active_chats record (used after
+        Add Data so the sidebar subtitle reflects the current file set)."""
+        with _LOCK:
+            email = _safe_email(email)
+            p = _data_root() / "users" / email / "active_chats.jsonl"
+            if not p.exists():
+                return False
+            out_lines = []
+            found = False
+            for line in p.read_text(encoding="utf-8").splitlines():
+                try:
+                    rec = json.loads(line)
+                    if rec.get("chat_id") == chat_id:
+                        rec["files"] = files
+                        found = True
+                    out_lines.append(json.dumps(rec, ensure_ascii=False))
+                except Exception:
+                    out_lines.append(line)
+            p.write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
+            return found
+
     def rename_conversation(self, email: str, conv_id: str, new_title: str) -> bool:
         with _LOCK:
             email = _safe_email(email)

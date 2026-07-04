@@ -2162,3 +2162,16 @@ button.danger:hover {
 .wizard-modal-single .wizard-step-content {
   max-height: calc(85vh - 140px);
 }
+/* Per-chart / per-table refresh button (chat action bars).
+   While the refresh request is in flight the double-arrows icon rotates
+   continuously (class added on click, removed in the handler's finally). */
+@keyframes pdc-refresh-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+.pdc-refresh-btn svg {
+  transform-origin: 50% 50%;
+}
+.pdc-refresh-btn.pdc-refresh-spinning svg {
+  animation: pdc-refresh-spin 0.9s linear infinite;
+}
