@@ -96,7 +96,7 @@ PDC_Client/
 | [`run_chat_local.py`](run_chat_local.py) | `run_chat` / `run_chat_multi_plot`; `_safe_preview` data-boundary guard |
 | [`local_store.py`](local_store.py) | `AuthStore`, `UserStore`, `ChatDataStore` on local disk; `append_history` / `truncate_conv_history` |
 | [`brain_client.py`](brain_client.py) | HTTP wrappers for every `/v1/*` call (with `BRAIN_TENANT_TOKEN` bearer auth) |
-| [`excel_table_detector.py`](excel_table_detector.py) | 6-stage Excel table detection |
+| [`excel_table_detector.py`](excel_table_detector.py) | 6-stage Excel table detection; `load_excel_sheets` processes only VISIBLE sheets (hidden/veryHidden skipped in the probe step, before the single-vs-multi keying — the one choke point for every load path) |
 
 ## Documentation
 

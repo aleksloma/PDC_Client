@@ -519,10 +519,13 @@ def _is_valid_table(df: pd.DataFrame, min_rows: int = 1, min_cols: int = 1) -> b
 def load_excel_sheets(file_path: Path, filename: str) -> Dict[str, pd.DataFrame]:
     """Load every Excel sheet through the validated 6-stage detection pipeline.
 
-    Single-sheet workbooks return `{filename: df}`. Multi-sheet workbooks return
-    one key per valid sheet: `{f"{filename}::{sheet}": df, ...}`. Sheets the
-    pipeline cannot detect a table in are skipped. Total/aggregate rows are
-    DROPPED from each df and LOGGED.
+    Only VISIBLE sheets are processed — hidden and veryHidden sheets are
+    skipped up front, so the single-vs-multi keying below counts visible
+    sheets only. Single-visible-sheet workbooks return `{filename: df}`.
+    Multi-sheet workbooks return one key per valid sheet:
+    `{f"{filename}::{sheet}": df, ...}`. Sheets the pipeline cannot detect a
+    table in are skipped. Total/aggregate rows are DROPPED from each df and
+    LOGGED.
     """
     import time as _time
     import openpyxl
@@ -535,9 +538,21 @@ def load_excel_sheets(file_path: Path, filename: str) -> Dict[str, pd.DataFrame]
         file_size_mb = file_path.stat().st_size / 1024 / 1024
     except Exception:
         file_size_mb = 0.0
-    sheet_names = list(wb_probe.sheetnames)
+    sheet_names: List[str] = []
+    for sn in wb_probe.sheetnames:
+        try:
+            state = wb_probe[sn].sheet_state
+        except Exception as e:
+            from logger_utils import log_with_sid
+            log_with_sid(filename, "warning",
+                         f"EXCEL_SHEET_STATE_PROBE_FAILED sheet='{sn}': {e}")
+            state = "visible"  # fall back safely: never drop a sheet on probe failure
+        if state == "visible":
+            sheet_names.append(sn)
+        else:
+            print(f"[EXCEL]   {filename}::{sn}: SKIPPED (hidden sheet)", flush=True)
     wb_probe.close()
-    print(f"[EXCEL]   {filename}: {len(sheet_names)} sheet(s), {file_size_mb:.2f}MB", flush=True)
+    print(f"[EXCEL]   {filename}: {len(sheet_names)} visible sheet(s), {file_size_mb:.2f}MB", flush=True)
 
     valid_sheets: List[Tuple[str, pd.DataFrame]] = []
     for sn in sheet_names:

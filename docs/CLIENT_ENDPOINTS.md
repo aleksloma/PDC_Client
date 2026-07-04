@@ -67,7 +67,12 @@ enterprise build keeps the same shape so the existing JS works unchanged:
 2. **`POST /upload`** (multipart, field `files`) — saves uploads to the
    per-session temp area (under `<DATA_ROOT>/sessions/<sid>/files/`).
    Returns `{ok, saved, dataframes}` (the same shape the B2C `/upload`
-   returns). **Raw bytes never leave this server.**
+   returns). **Raw bytes never leave this server.** Excel workbooks load
+   only **visible** sheets — hidden and veryHidden sheets are skipped by
+   `load_excel_sheets` (the single choke point every load path shares:
+   chat creation, Add Data, and chat-time dataframe loading). A workbook
+   whose sheets are ALL hidden yields zero dataframes and flows through
+   the normal "no valid tables in file" handling.
 
 3. **`POST /schema_autofill_full`** — verbatim port of global's
    `/schema_autofill_full` (`backend/routes/schema.py` L884-1012), split for
