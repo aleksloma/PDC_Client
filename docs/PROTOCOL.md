@@ -30,7 +30,7 @@ lookup; revoked / suspended tenants get **HTTP 403** (the kill-switch).
 | `schema_text`       | return value of `_schema_text(schema_docs, dfs, common_fields)` | client (`schema_builder.schema_text`) |
 | `df_names`          | `list(dfs.keys())` | client |
 | `df_columns`        | `{name: list(df.columns)}` (only sent on retry, for column self-correction) | client |
-| `history_rows`      | the `history_rows` arg to `generate_pandas_code` / `summarize_answer` | client (`local_store.get_conversation_history`) |
+| `history_rows`      | the `history_rows` arg to `generate_pandas_code` / `summarize_answer`. Each row carries **only** `role`, `content`, and (when present) `code` — the client's `brain_client._sanitize_history_rows` strips every other persisted field (`image_base64`, `chart_data`, `table`, `usage`, `full_table_key`, `ts`, …) before the POST, so raw data values in locally persisted records never cross the boundary (Article II) | client (`local_store.get_history`, sanitized in `brain_client.plan/retry/summarize`) |
 | `common_fields`     | the `common_fields` arg to `generate_pandas_code` | client |
 | `error_msg`         | `exec_out["error"]` from `safe_execute` | client |
 | `failed_code`       | the failed code block | client |

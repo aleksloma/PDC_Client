@@ -11,6 +11,7 @@ column-description generation (the old global /schema_autofill_full) is in
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -23,6 +24,7 @@ from fastapi.responses import JSONResponse
 
 from local_store import UserStore
 from logger_utils import log_with_sid
+from routes.chat import _EXEC
 from settings import settings
 
 router = APIRouter(tags=["schema"])
@@ -113,7 +115,8 @@ async def schema_details(request: Request):
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
     store = UserStore(sid)
-    dfs = store.load_dataframes()
+    loop = asyncio.get_running_loop()
+    dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
     meta = store.read_meta()
 
     MAX_LIST = getattr(settings, "SCHEMA_MAX_UNIQUE_LIST", 50)
@@ -154,11 +157,15 @@ async def schema_details(request: Request):
         return {"file_name": fn, "columns": cols_out}
 
     file_entries = meta.get("files", [])
-    if len(file_entries) > 1:
-        with ThreadPoolExecutor(max_workers=min(len(file_entries), 4)) as ex:
-            files_out = list(ex.map(process_file, file_entries))
-    else:
-        files_out = [process_file(entry) for entry in file_entries]
+
+    # Column-stats computation is CPU-heavy — keep it off the event loop.
+    def _compute_files_out() -> list:
+        if len(file_entries) > 1:
+            with ThreadPoolExecutor(max_workers=min(len(file_entries), 4)) as ex:
+                return list(ex.map(process_file, file_entries))
+        return [process_file(entry) for entry in file_entries]
+
+    files_out = await loop.run_in_executor(_EXEC, _compute_files_out)
 
     log_with_sid(email, "info", f"SCHEMA_DETAILS time={time.time() - total_start:.2f}s files={len(files_out)}")
     return {"files": files_out}
@@ -182,66 +189,71 @@ async def get_common_fields(request: Request):
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
     store = UserStore(sid)
-    dfs = store.load_dataframes()
+    loop = asyncio.get_running_loop()
+    dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
     meta = store.read_meta()
     if len(dfs) < 2:
         return {"relationships": [], "user_defined": []}
 
     user_defined = meta.get("common_fields", []) or []
-    detected: list = []
     file_list = list(dfs.items())
 
-    for i, (file1, df1) in enumerate(file_list):
-        for file2, df2 in file_list[i + 1:]:
-            for col1 in df1.columns:
-                for col2 in df2.columns:
-                    score = 0
-                    reasons: list = []
-                    col1_str = str(col1)
-                    col2_str = str(col2)
-                    if col1_str == col2_str:
-                        score += 10
-                        reasons.append("Exact name match")
-                    else:
-                        n1 = _normalize_col_name(col1_str)
-                        n2 = _normalize_col_name(col2_str)
-                        if n1 == n2:
-                            score += 8
-                            reasons.append("Similar names")
-                        elif len(n1) > 3 and len(n2) > 3:
-                            if n1 in n2 or n2 in n1:
-                                score += 5
-                                reasons.append("Name similarity")
-                        for suffix in ("id", "code", "number", "num", "no", "key"):
-                            if n1.endswith(suffix) and n2.endswith(suffix):
-                                score += 3
-                                reasons.append(f"Both end with '{suffix}'")
-                                break
-                    try:
-                        if str(df1[col1].dtype) == str(df2[col2].dtype):
-                            score += 2
-                            reasons.append(f"Same type ({df1[col1].dtype})")
-                    except Exception:
-                        pass
-                    try:
-                        u1 = df1[col1].nunique()
-                        u2 = df2[col2].nunique()
-                        if u1 > 0 and u2 > 0:
-                            ratio = min(u1, u2) / max(u1, u2)
-                            if ratio > 0.8:
-                                score += 3
-                                reasons.append(f"Similar unique count ({u1} vs {u2})")
-                    except Exception:
-                        pass
-                    if score >= 5:
-                        detected.append({
-                            "file1": file1, "column1": col1_str,
-                            "file2": file2, "column2": col2_str,
-                            "confidence": min(100, int(score * 10)),
-                            "reasons": reasons,
-                            "auto_detected": True,
-                        })
+    # nunique() over every column pair is CPU-heavy — off the event loop.
+    def _detect_relationships() -> list:
+        detected: list = []
+        for i, (file1, df1) in enumerate(file_list):
+            for file2, df2 in file_list[i + 1:]:
+                for col1 in df1.columns:
+                    for col2 in df2.columns:
+                        score = 0
+                        reasons: list = []
+                        col1_str = str(col1)
+                        col2_str = str(col2)
+                        if col1_str == col2_str:
+                            score += 10
+                            reasons.append("Exact name match")
+                        else:
+                            n1 = _normalize_col_name(col1_str)
+                            n2 = _normalize_col_name(col2_str)
+                            if n1 == n2:
+                                score += 8
+                                reasons.append("Similar names")
+                            elif len(n1) > 3 and len(n2) > 3:
+                                if n1 in n2 or n2 in n1:
+                                    score += 5
+                                    reasons.append("Name similarity")
+                            for suffix in ("id", "code", "number", "num", "no", "key"):
+                                if n1.endswith(suffix) and n2.endswith(suffix):
+                                    score += 3
+                                    reasons.append(f"Both end with '{suffix}'")
+                                    break
+                        try:
+                            if str(df1[col1].dtype) == str(df2[col2].dtype):
+                                score += 2
+                                reasons.append(f"Same type ({df1[col1].dtype})")
+                        except Exception:
+                            pass
+                        try:
+                            u1 = df1[col1].nunique()
+                            u2 = df2[col2].nunique()
+                            if u1 > 0 and u2 > 0:
+                                ratio = min(u1, u2) / max(u1, u2)
+                                if ratio > 0.8:
+                                    score += 3
+                                    reasons.append(f"Similar unique count ({u1} vs {u2})")
+                        except Exception:
+                            pass
+                        if score >= 5:
+                            detected.append({
+                                "file1": file1, "column1": col1_str,
+                                "file2": file2, "column2": col2_str,
+                                "confidence": min(100, int(score * 10)),
+                                "reasons": reasons,
+                                "auto_detected": True,
+                            })
+        return detected
 
+    detected = await loop.run_in_executor(_EXEC, _detect_relationships)
     detected.sort(key=lambda x: x["confidence"], reverse=True)
     log_with_sid(email, "info", f"COMMON_FIELDS_DETECTED count={len(detected)}")
     return {"relationships": detected, "user_defined": user_defined}

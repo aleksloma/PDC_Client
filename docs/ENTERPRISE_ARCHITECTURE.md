@@ -155,9 +155,13 @@ returns `403 {"detail": "Tenant <status>"}` before any LLM call when
 
 1. User asks a question in the client frontend.
 2. Client sends `{question, schema_text, df_names, history_rows,
-   common_fields, user_email}` to the brain. Column names going to the
-   LLM is acceptable and is covered in the client agreement. **Raw data
-   VALUES are never sent.**
+   common_fields, user_email}` to the brain. `history_rows` are sanitized
+   in the `brain_client` wrappers (`_sanitize_history_rows`) down to
+   `role`/`content`(+`code`) — the extra fields persisted locally for
+   conversation reload (`image_base64`, `chart_data`, `table`, `usage`, …)
+   never leave the client. Column names going to the LLM is acceptable
+   and is covered in the client agreement. **Raw data VALUES are never
+   sent.**
 3. Brain selects the skill and model (4-tier hybrid) and loads that
    tenant's config.
 4. Brain generates Python code.

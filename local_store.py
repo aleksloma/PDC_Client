@@ -14,8 +14,11 @@ is JSONL with atomic appends.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import os
+import re
 import secrets
 import shutil
 import threading
@@ -71,6 +74,141 @@ def _load_one_file(path: Path) -> dict[str, pd.DataFrame]:
             out[path.name] = pd.read_parquet(path)
     except Exception as e:
         log_with_sid(path.name, "warning", f"FILE_LOAD_ERROR {path}: {e}")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Parquet cache for parsed tables
+# ---------------------------------------------------------------------------
+# Re-running the full detection pipeline (openpyxl + 6-stage table detection)
+# on every question is the dominant per-question cost. The POST-detection
+# dataframes are cached as parquet under `files_dir/.parquet_cache/` (a
+# dot-named entry, so the `load_dataframes` iteration skips it) next to a
+# per-source-file manifest keyed on the source's size + mtime_ns — Add Data
+# overwrites file bytes in place, so the stat change invalidates the cache
+# with no migration step. Self-healing per Article IV: any read/write failure
+# logs and falls back to the existing pipeline; a broken cache can never
+# break loading. Article V: lives on local disk under DATA_ROOT only.
+_PARQUET_CACHE_DIRNAME = ".parquet_cache"
+_PARQUET_CACHEABLE_EXTS = (".xls", ".xlsx", ".xlsm", ".csv", ".tsv", ".json")
+
+
+def _parquet_cache_safe_name(key: str) -> str:
+    """Filesystem-safe, collision-free name for a dataframe key (which may be
+    "file.xlsx::Sheet 1"): readable sanitized prefix + hash of the raw key."""
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", key)[:80]
+    return f"{stem}.{digest}"
+
+
+def _parquet_cache_paths(path: Path) -> tuple[Path, Path]:
+    cache_dir = path.parent / _PARQUET_CACHE_DIRNAME
+    manifest = cache_dir / (_parquet_cache_safe_name(path.name) + ".manifest.json")
+    return cache_dir, manifest
+
+
+def _parquet_cache_read(path: Path, src_size: int, src_mtime_ns: int) -> Optional[dict[str, pd.DataFrame]]:
+    """Fast path: return the cached dataframes when the manifest matches the
+    source file's current size + mtime_ns. None → caller runs the pipeline."""
+    try:
+        cache_dir, manifest_path = _parquet_cache_paths(path)
+        if not manifest_path.exists():
+            return None
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("src_size") != src_size or manifest.get("src_mtime_ns") != src_mtime_ns:
+            return None
+        out: dict[str, pd.DataFrame] = {}
+        for entry in manifest.get("entries", []):
+            key, fname = entry.get("key"), entry.get("parquet")
+            if not key or not fname:
+                return None
+            out[key] = pd.read_parquet(cache_dir / fname)
+        if not out:
+            return None
+        log_with_sid(path.name, "info", f"PARQUET_CACHE_HIT {path.name} dfs={len(out)}")
+        return out
+    except Exception as e:
+        log_with_sid(path.name, "warning", f"PARQUET_CACHE_READ_FAILED {path}: {e}")
+        return None
+
+
+def _parquet_cache_write(path: Path, dfs: dict[str, pd.DataFrame],
+                         src_size: int, src_mtime_ns: int) -> None:
+    """(Re)build this source file's cache. Writes are atomic (temp file +
+    os.replace) so concurrent rebuilds can't corrupt each other — the rebuild
+    is idempotent. Each dataframe is round-trip-verified; if any dataframe
+    can't be reproduced byte-identically from parquet, that dataframe is
+    logged and skipped and NO manifest is written for the source file (a
+    partial manifest would silently drop the uncacheable dataframe on read)."""
+    if not dfs:
+        return
+    try:
+        cache_dir, manifest_path = _parquet_cache_paths(path)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp_suffix = f".tmp-{os.getpid()}-{threading.get_ident()}"
+        entries: list[dict] = []
+        for key, df in dfs.items():
+            fname = _parquet_cache_safe_name(key) + ".parquet"
+            tmp = cache_dir / (fname + tmp_suffix)
+            try:
+                df.to_parquet(tmp, engine="pyarrow")
+                back = pd.read_parquet(tmp)
+                if list(back.columns) != list(df.columns) or not back.equals(df):
+                    raise ValueError("parquet round-trip altered the dataframe")
+                os.replace(tmp, cache_dir / fname)
+                entries.append({"key": key, "parquet": fname})
+            except Exception as e:
+                log_with_sid(path.name, "warning",
+                             f"PARQUET_CACHE_SKIP_DF file={path.name} key={key}: {e}")
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return
+        # Old manifest's parquet files that the new one no longer references
+        # (e.g. renamed sheets) are removed after the swap. Non-fatal.
+        stale: list[str] = []
+        try:
+            if manifest_path.exists():
+                old = json.loads(manifest_path.read_text(encoding="utf-8"))
+                new_names = {e["parquet"] for e in entries}
+                stale = [e.get("parquet") for e in old.get("entries", [])
+                         if e.get("parquet") and e.get("parquet") not in new_names]
+        except Exception:
+            stale = []
+        manifest = {"src_size": src_size, "src_mtime_ns": src_mtime_ns, "entries": entries}
+        m_tmp = cache_dir / (manifest_path.name + tmp_suffix)
+        m_tmp.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        os.replace(m_tmp, manifest_path)
+        for fname in stale:
+            try:
+                (cache_dir / fname).unlink(missing_ok=True)
+            except Exception:
+                pass
+        log_with_sid(path.name, "info", f"PARQUET_CACHE_REBUILT {path.name} dfs={len(entries)}")
+    except Exception as e:
+        log_with_sid(path.name, "warning", f"PARQUET_CACHE_WRITE_FAILED {path}: {e}")
+
+
+def _load_one_file_cached(path: Path) -> dict[str, pd.DataFrame]:
+    """Parquet-cache wrapper around `_load_one_file`. The source's size +
+    mtime_ns are captured BEFORE parsing, so a file overwritten mid-parse
+    stamps a stale manifest that self-heals on the next load. `.parquet`
+    sources are read directly — caching them would be a redundant copy."""
+    if path.suffix.lower() not in _PARQUET_CACHEABLE_EXTS:
+        return _load_one_file(path)
+    try:
+        st = path.stat()
+        src_size, src_mtime_ns = st.st_size, st.st_mtime_ns
+    except Exception as e:
+        log_with_sid(path.name, "warning", f"PARQUET_CACHE_STAT_FAILED {path}: {e}")
+        return _load_one_file(path)
+    cached = _parquet_cache_read(path, src_size, src_mtime_ns)
+    if cached is not None:
+        return cached
+    out = _load_one_file(path)
+    if out:
+        _parquet_cache_write(path, out, src_size, src_mtime_ns)
     return out
 
 
@@ -458,7 +596,7 @@ class UserStore:
         dfs: dict[str, pd.DataFrame] = {}
         for fp in sorted(self.files_dir.iterdir()):
             if fp.is_file() and not fp.name.startswith("."):
-                dfs.update(_load_one_file(fp))
+                dfs.update(_load_one_file_cached(fp))
         return dfs
 
 
@@ -532,7 +670,7 @@ class ChatDataStore:
         dfs: dict[str, pd.DataFrame] = {}
         for fp in sorted(self.files_dir.iterdir()):
             if fp.is_file() and not fp.name.startswith("."):
-                dfs.update(_load_one_file(fp))
+                dfs.update(_load_one_file_cached(fp))
         return dfs
 
     def schema_docs(self) -> dict:

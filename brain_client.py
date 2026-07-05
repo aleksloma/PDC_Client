@@ -103,6 +103,32 @@ def _post(path: str, payload: dict[str, Any], sid: str) -> dict:
 # Wrappers matching the brain's /v1/* endpoints.
 # Input shapes are the same as the brain's documented shapes.
 # ---------------------------------------------------------------------------
+def _sanitize_history_rows(history_rows: list | None) -> list[dict]:
+    """Strip conversation-history records down to role/content(+code) — the
+    only fields the brain reads. Persisted records also carry image_base64,
+    chart_data, table rows, usage, full_table_key, ts — raw data values that
+    must never cross the boundary (Article II). Rows lacking role or content
+    are skipped; order is preserved."""
+    out: list[dict] = []
+    for row in history_rows or []:
+        try:
+            if not isinstance(row, dict):
+                continue
+            role = row.get("role")
+            content = row.get("content")
+            if not role or content is None:
+                continue
+            slim = {"role": str(role), "content": str(content)}
+            code = row.get("code")
+            if code:
+                slim["code"] = str(code)
+            out.append(slim)
+        except Exception as e:
+            log_with_sid("history-sanitize", "warning", f"HISTORY_ROW_SKIPPED: {e}")
+            continue
+    return out
+
+
 def plan(sid: str, question: str, schema_text: str, df_names: list[str],
          history_rows: list, common_fields: list | None = None,
          user_email: str | None = None) -> dict:
@@ -111,7 +137,7 @@ def plan(sid: str, question: str, schema_text: str, df_names: list[str],
         "question": question,
         "schema_text": schema_text,
         "df_names": df_names,
-        "history_rows": history_rows,
+        "history_rows": _sanitize_history_rows(history_rows),
         "common_fields": common_fields or [],
         "user_email": user_email,
     }, sid)
@@ -128,7 +154,7 @@ def retry(sid: str, question: str, schema_text: str, df_names: list[str],
         "schema_text": schema_text,
         "df_names": df_names,
         "df_columns": df_columns,
-        "history_rows": history_rows,
+        "history_rows": _sanitize_history_rows(history_rows),
         "error_msg": error_msg,
         "failed_code": failed_code,
         "use_pro": use_pro,
@@ -156,7 +182,7 @@ def summarize(sid: str, question: str, schema_text: str, history_rows: list,
         "sid": sid,
         "question": question,
         "schema_text": schema_text,
-        "history_rows": history_rows,
+        "history_rows": _sanitize_history_rows(history_rows),
         "preview": preview,
         "context_decision": context_decision or {},
         "user_email": user_email,
