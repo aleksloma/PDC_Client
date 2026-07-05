@@ -22,6 +22,10 @@ let currentSendToken = 0;
 // to the currently open chat — same modal/wizard, different final step).
 let wizardMode = 'create';
 let addDataTargetChatId = null;
+// Add Data name-collision support: fingerprints ({filename: {size_bytes,
+// sha256}}) of the target chat's source files, fetched when the Add Data
+// wizard opens. Awaited in addFilesToSelection so a fast picker can't race it.
+let addDataFingerprintsPromise = null;
 
 const ALLOWED_UPLOAD_EXTENSIONS = ['xlsx', 'xls', 'csv', 'tsv'];
 
@@ -1445,8 +1449,11 @@ async function openChat(chatId) {
   _expandOpenChatInSidebar(chatId);
 
   showLoading('Loading chat...');
-  
+
   try {
+    // Df keys for the refresh pre-freeze — fire-and-forget: a fresh chat has
+    // no rendered items yet, live messages arrive long after this resolves.
+    _loadCurrentDfKeys(chatId);
     // Get welcome message with pre-generated questions (stored in metadata - fast)
     const welcomeRes = await fetch(`/api/chat/${chatId}/welcome`);
     const welcomeData = await welcomeRes.json();
@@ -1702,7 +1709,11 @@ async function openConversation(chatId, convId) {
     const res = await fetch(`/api/chat/${chatId}/conversation/${convId}/history`);
     const data = await res.json();
     const history = data.history || [];
-    
+
+    // Current df keys BEFORE rendering, so refresh buttons of items whose
+    // stored code references vanished keys render pre-frozen.
+    await _loadCurrentDfKeys(chatId);
+
     // Show chat state
     welcomeState.classList.add('hidden');
     chatState.classList.remove('hidden');
@@ -1899,12 +1910,71 @@ function _splitJoinedCode(code) {
   return String(code).split('###NEXT_PLOT###').map(s => s.trim()).filter(Boolean);
 }
 
-function _makeRefreshButton(onRefresh) {
+// ── Refresh freezing ────────────────────────────────────────────────────────
+// Pre-freeze by KEY check: stored code that subscripts a dataframe key which
+// no longer exists in the chat (structure changed via an Add Data overwrite)
+// can never re-execute — its refresh button renders disabled (greyed, not
+// hidden) with an explanatory tooltip. Keys only, per design — no column-level
+// static analysis of the code. Evaluated when buttons render (live + history
+// reload) and re-evaluated after an Add Data completes.
+let currentChatDfKeys = null;   // Set of df keys for the open chat; null = unknown → leave enabled
+
+async function _loadCurrentDfKeys(chatId) {
+  try {
+    const res = await fetch(`/api/chat/${chatId}/schema`);
+    if (!res.ok) { currentChatDfKeys = null; return; }
+    const data = await res.json();
+    currentChatDfKeys = new Set((data.files || []).map(f => f.file_name).filter(Boolean));
+  } catch (e) {
+    console.warn('df-keys fetch failed — refresh pre-freeze inactive:', e);
+    currentChatDfKeys = null;
+  }
+}
+
+function _extractDfKeysFromCode(code) {
+  // Matches dfs['…'] and dfs["…"] subscripts (exact keys, both quote styles).
+  const keys = [];
+  const re = /dfs\[\s*['"]([^'"]+)['"]\s*\]/g;
+  let m;
+  while ((m = re.exec(String(code || ''))) !== null) keys.push(m[1]);
+  return keys;
+}
+
+function _freezeRefreshButton(btn) {
+  btn.disabled = true;
+  btn.classList.add('pdc-refresh-frozen');
+  btn.classList.remove('pdc-refresh-spinning');
+  btn.title = _t('lab.refresh_frozen', "Data structure changed — this chart/table can't be refreshed.");
+}
+
+function _unfreezeRefreshButton(btn) {
+  btn.disabled = false;
+  btn.classList.remove('pdc-refresh-frozen');
+  btn.title = _t('lab.refresh_item', 'Refresh with current data');
+}
+
+// Apply the key check to one button. A fail-frozen button (its refresh
+// already failed at runtime this session) stays frozen regardless.
+function _applyKeyFreeze(btn) {
+  if (btn._pdcFailFrozen) { _freezeRefreshButton(btn); return; }
+  if (!currentChatDfKeys) return;   // keys unknown → leave as-is
+  const missing = _extractDfKeysFromCode(btn._pdcCode).some(k => !currentChatDfKeys.has(k));
+  if (missing) _freezeRefreshButton(btn); else _unfreezeRefreshButton(btn);
+}
+
+// Re-evaluate every rendered refresh button (called after Add Data completes —
+// an overwrite may have killed keys, a rename-upload can't affect old ones).
+function _reapplyRefreshFreezes() {
+  document.querySelectorAll('.pdc-refresh-btn').forEach(_applyKeyFreeze);
+}
+
+function _makeRefreshButton(code, onRefresh) {
   const btn = document.createElement('button');
   btn.className = 'ghost pdc-refresh-btn';
   btn.innerHTML = _REFRESH_SVG;
   btn.title = _t('lab.refresh_item', 'Refresh with current data');
   btn.style.cssText = 'padding:6px 10px; font-size:13px;';
+  btn._pdcCode = String(code || '');
   btn.addEventListener('click', async () => {
     if (btn.disabled) return;
     btn.disabled = true;
@@ -1914,10 +1984,11 @@ function _makeRefreshButton(onRefresh) {
     } catch (e) {
       console.error('Refresh failed:', e);
     } finally {
-      btn.disabled = false;
       btn.classList.remove('pdc-refresh-spinning');
+      if (!btn._pdcFailFrozen) btn.disabled = false;   // fail-freeze wins
     }
   });
+  _applyKeyFreeze(btn);   // pre-freeze on render when the chat's keys are known
   return btn;
 }
 
@@ -1929,6 +2000,13 @@ function _showRefreshError(anchorEl, msg) {
   note.style.cssText = 'color:#ef4444; font-size:12px; align-self:center;';
   anchorEl.appendChild(note);
   setTimeout(() => note.remove(), 5000);
+  // Fail-freeze: a refresh that failed at runtime stays disabled for the rest
+  // of the session (the key check re-evaluates it naturally on next reload;
+  // a column-level failure will fail-freeze again on retry — accepted).
+  try {
+    const btn = anchorEl.querySelector && anchorEl.querySelector('.pdc-refresh-btn');
+    if (btn) { btn._pdcFailFrozen = true; _freezeRefreshButton(btn); }
+  } catch (e) { /* non-fatal */ }
 }
 
 async function _postRefreshItem(code, kind) {
@@ -1984,7 +2062,7 @@ async function _refreshChart(container, bar, code, extras) {
 function _wireTableRefresh(wrap, code, extras, messageContext) {
   const bar = wrap.querySelector('.pdc-action-bar');
   if (!bar) return;
-  bar.appendChild(_makeRefreshButton(async () => {
+  bar.appendChild(_makeRefreshButton(code, async () => {
     const data = await _postRefreshItem(code, 'table');
     if (data.__error !== undefined || !data.table) {
       _showRefreshError(bar, data.__error);
@@ -2022,7 +2100,7 @@ function _wireRefreshButtons(chartContainer, tableWrap, extras, messageContext) 
   if (chartContainer) {
     const bar = chartContainer.querySelector('.pdc-action-bar');
     if (bar) {
-      bar.appendChild(_makeRefreshButton(() => _refreshChart(chartContainer, bar, code, extras)));
+      bar.appendChild(_makeRefreshButton(code, () => _refreshChart(chartContainer, bar, code, extras)));
     }
   }
   if (tableWrap) {
@@ -3245,6 +3323,7 @@ function _setWizardMode(mode, chatName) {
 function openCreateWizard() {
   _setWizardMode('create');
   addDataTargetChatId = null;
+  addDataFingerprintsPromise = null;
   selectedFiles = [];
   renderSelectedFilesList();
   _updateWizardGenerateBtn();
@@ -3258,6 +3337,9 @@ function openCreateWizard() {
 function openAddDataWizard() {
   if (!currentChatId) return;
   addDataTargetChatId = currentChatId;
+  // Existing-file fingerprints for the name-collision check — kicked off now,
+  // awaited when files are actually picked (addFilesToSelection).
+  addDataFingerprintsPromise = _fetchChatFingerprints(currentChatId);
   const chats = listCache.get('activeChats') || [];
   const chat = chats.find(c => c.chat_id === currentChatId);
   _setWizardMode('add', (chat && chat.name) || '');
@@ -3318,25 +3400,232 @@ function handleFileSelection(e) {
   }
 }
 
-function addFilesToSelection(newFiles) {
-  const unique = Array.from(newFiles).filter(f =>
-    !selectedFiles.some(existing => existing.name === f.name)
-  );
+// ── Name-collision handling (shared by Add Data and chat creation) ─────────
+// A selected File may carry `_pdcUploadName` — the name it will upload under.
+// The rename applies through the WHOLE pipeline via the FormData filename
+// override in runFrictionlessFlow, so /upload → /schema_autofill_full →
+// /add_data_to_chat / /generate_chatdata all see the new name.
+function _uploadNameOf(f) { return f._pdcUploadName || f.name; }
 
-  if (selectedFiles.length + unique.length > userMaxFiles) {
-    showToast(`Your plan allows only ${userMaxFiles} file(s). Remove some or upgrade.`, true);
-    return;
+function _splitNameExt(name) {
+  const idx = name.lastIndexOf('.');
+  return idx > 0 ? [name.slice(0, idx), name.slice(idx)] : [name, ''];
+}
+
+// First free "<base>_v2<ext>", "<base>_v3<ext>", … per `isTaken(candidate)`.
+function _suggestUniqueName(name, isTaken) {
+  const [base, ext] = _splitNameExt(name);
+  let n = 2;
+  let candidate = `${base}_v${n}${ext}`;
+  while (isTaken(candidate)) { n += 1; candidate = `${base}_v${n}${ext}`; }
+  return candidate;
+}
+
+// SHA-256 hex of a local File, or null when hashing is unavailable
+// (crypto.subtle needs a secure context) or fails. Callers must treat null as
+// "contents possibly different" — fall through to rename/dialog, NEVER treat
+// it as identical and NEVER silently overwrite.
+async function _fileSha256Hex(file) {
+  try {
+    if (!(window.crypto && window.crypto.subtle && file.arrayBuffer)) return null;
+    const digest = await window.crypto.subtle.digest('SHA-256', await file.arrayBuffer());
+    return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+  } catch (e) {
+    console.warn('SHA-256 hashing failed:', e);
+    return null;
   }
+}
 
-  // Reject unsupported types up-front
-  for (const f of unique) {
+// Content equality of two local Files (call only when sizes already match).
+// Unknown hash → false (treated as different → rename), never a silent drop.
+async function _sameLocalContent(a, b) {
+  const [ha, hb] = await Promise.all([_fileSha256Hex(a), _fileSha256Hex(b)]);
+  return !!(ha && hb && ha === hb);
+}
+
+// Fingerprints of the Add Data target chat's source files. Fallback: derive
+// name-only entries from the schema keys so name collisions are still caught
+// (contents unknown → dialog) even if the fingerprint endpoint fails.
+async function _fetchChatFingerprints(chatId) {
+  try {
+    const res = await fetch(`/api/chat/${chatId}/file_fingerprints`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.files) return data.files;
+    }
+  } catch (e) { console.warn('fingerprints fetch failed:', e); }
+  try {
+    const res = await fetch(`/api/chat/${chatId}/schema`);
+    if (res.ok) {
+      const data = await res.json();
+      const out = {};
+      (data.files || []).forEach(f => {
+        const key = f.file_name || '';
+        const src = key.includes('::') ? key.split('::')[0] : key;
+        if (src) out[src] = { size_bytes: null, sha256: null };
+      });
+      return out;
+    }
+  } catch (e) { console.warn('schema fallback for fingerprints failed:', e); }
+  return {};
+}
+
+// Best-effort header-level structure probe for the collision dialog: POSTs
+// the selected File to the client-container /probe_columns endpoint (nothing
+// reaches the brain) with a hard ~3s budget. Resolves the parsed body
+// ({ok, match, ...}) or null — callers keep the generic warning on null/!ok.
+async function _probeCollisionStructure(fileObj, fileName) {
+  try {
+    if (!fileObj || !addDataTargetChatId) return null;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 3000);
+    const fd = new FormData();
+    fd.append('file', fileObj, fileName);
+    const res = await fetch(`/api/chat/${addDataTargetChatId}/probe_columns`, {
+      method: 'POST', body: fd, signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) {
+    return null;   // timeout / network / abort — generic warning stays
+  }
+}
+
+// Guards a late probe response from writing into a dialog that has since been
+// answered or reopened for a different file.
+let _collisionDialogSeq = 0;
+
+// Name-collision dialog — exactly two choices (Overwrite carries the primary
+// style). Resolves 'rename' | 'overwrite' | 'drop' ('drop' = dismissed via ✕
+// → the file is not added at all; nothing ever overwrites without an explicit
+// choice). The dialog never blocks on the column probe: the generic warning
+// shows immediately and is replaced in place if the probe returns in time.
+function _showFileCollisionDialog(fileName, suggestedName, fileObj) {
+  return new Promise((resolve) => {
+    const modal = document.getElementById('fileCollisionModal');
+    if (!modal) { resolve('drop'); return; }
+    const seq = ++_collisionDialogSeq;
+    modal.querySelector('#collisionBody').textContent =
+      _t('collision.body', 'A file named "{name}" already exists in this chat with different content. How do you want to proceed?')
+        .replace('{name}', fileName);
+    const renameBtn = modal.querySelector('#collisionRenameBtn');
+    const overwriteBtn = modal.querySelector('#collisionOverwriteBtn');
+    const closeBtn = modal.querySelector('#collisionCloseBtn');
+    renameBtn.textContent = _t('collision.rename_btn', 'Upload as {name}').replace('{name}', suggestedName);
+    // Reset the structure note to the generic warning on every open.
+    const note = modal.querySelector('#collisionStructNote');
+    if (note) {
+      note.textContent = _t('collision.overwrite_warning',
+        'If the new file has different columns/sheets, some previous charts and tables may no longer be refreshable.');
+      note.classList.remove('collision-info');
+      note.classList.add('collision-warning');
+    }
+    const done = (choice) => {
+      _collisionDialogSeq++;   // invalidate any in-flight probe for this open
+      modal.classList.add('hidden');
+      renameBtn.onclick = overwriteBtn.onclick = closeBtn.onclick = null;
+      resolve(choice);
+    };
+    renameBtn.onclick = () => done('rename');
+    overwriteBtn.onclick = () => done('overwrite');
+    closeBtn.onclick = () => done('drop');
+    modal.classList.remove('hidden');
+    // Background probe — replaces the note only if THIS dialog is still open.
+    _probeCollisionStructure(fileObj, fileName).then((res) => {
+      if (seq !== _collisionDialogSeq || !note || !res || res.ok !== true) return;
+      if (res.match) {
+        note.textContent = _t('collision.same_columns',
+          'Both files appear to contain the same columns — existing charts should keep working after overwrite.');
+        note.classList.remove('collision-warning');
+        note.classList.add('collision-info');
+      } else {
+        note.textContent = _t('collision.diff_columns',
+          'Different columns/sheets detected — after overwrite some previous charts and tables may not be refreshable.');
+      }
+    }).catch(() => { /* non-fatal — generic warning stays */ });
+  });
+}
+
+// Adding files resolves name collisions BEFORE anything uploads:
+//  - within the current selection (chat creation AND Add Data): identical
+//    content → dropped with a notice; different content → auto-renamed to the
+//    first free _vN name;
+//  - against the Add Data target chat's existing files: identical content →
+//    "already in this chat" notice (dropped, no dialog); different content →
+//    the user chooses Upload-as-_vN (default) or Overwrite via the dialog.
+// Sizes are compared first; SHA-256 runs only on a size tie.
+async function addFilesToSelection(newFiles) {
+  const incoming = Array.from(newFiles);
+
+  // Reject unsupported types up-front (unchanged behavior)
+  for (const f of incoming) {
     if (!f._isGoogleSheet && !_hasValidUploadExtension(f.name)) {
       showToast(_t('lab.invalid_file_type', 'Unsupported file type. Use .xlsx, .xls, .csv, or .tsv.'), true);
       return;
     }
   }
 
-  selectedFiles.push(...unique);
+  const chatFps = (wizardMode === 'add' && addDataFingerprintsPromise)
+    ? await addDataFingerprintsPromise : {};
+
+  const accepted = [];
+  const isTaken = (name) =>
+    selectedFiles.some(f => _uploadNameOf(f) === name) ||
+    accepted.some(f => _uploadNameOf(f) === name) ||
+    Object.prototype.hasOwnProperty.call(chatFps, name);
+
+  for (const f of incoming) {
+    if (f._isGoogleSheet) {
+      // No local bytes to hash — keep the legacy name-level dedup.
+      if (!isTaken(f.name)) accepted.push(f);
+      continue;
+    }
+    delete f._pdcUploadName;   // a re-added File object starts clean
+
+    // Duplicate within the selection?
+    const dupe = selectedFiles.concat(accepted).find(o => _uploadNameOf(o) === f.name);
+    if (dupe) {
+      const identical = (!dupe._isGoogleSheet && dupe.size === f.size)
+        ? await _sameLocalContent(dupe, f) : false;
+      if (identical) {
+        showToast(`${_t('lab.duplicate_file_ignored', 'Duplicate file ignored')}: ${f.name}`);
+        continue;
+      }
+      f._pdcUploadName = _suggestUniqueName(f.name, isTaken);
+    }
+
+    // Collision with a file already in the Add Data target chat?
+    const name = _uploadNameOf(f);
+    const fp = chatFps[name];
+    if (fp) {
+      if (fp.size_bytes !== null && fp.size_bytes === f.size && fp.sha256) {
+        const localSha = await _fileSha256Hex(f);
+        if (localSha && localSha === fp.sha256) {
+          showToast(`${_t('lab.file_already_in_chat', 'This file is already in this chat — no changes needed')}: ${name}`);
+          continue;
+        }
+      }
+      const suggested = _suggestUniqueName(name, isTaken);
+      const choice = await _showFileCollisionDialog(name, suggested, f);
+      if (choice === 'rename') f._pdcUploadName = suggested;
+      else if (choice !== 'overwrite') continue;   // dismissed → not added
+    }
+    accepted.push(f);
+  }
+
+  if (accepted.length === 0) {
+    renderSelectedFilesList();
+    _updateWizardGenerateBtn();
+    return;
+  }
+
+  if (selectedFiles.length + accepted.length > userMaxFiles) {
+    showToast(`Your plan allows only ${userMaxFiles} file(s). Remove some or upgrade.`, true);
+    return;
+  }
+
+  selectedFiles.push(...accepted);
   renderSelectedFilesList();
   _updateWizardGenerateBtn();
 }
@@ -3358,7 +3647,7 @@ function renderSelectedFilesList() {
     row.className = 'selected-file-row' + (isGoogle ? ' google-sheet' : '');
     row.innerHTML = `
       <span class="selected-file-name">
-        ${index + 1}. ${escapeHtml(file.name)}
+        ${index + 1}. ${escapeHtml(_uploadNameOf(file))}
         ${isGoogle ? '<span class="selected-file-badge">📎 Google Sheet</span>' : ''}
       </span>
       <button type="button" class="file-remove-btn" onclick="removeFile(${index})">×</button>
@@ -3429,7 +3718,10 @@ async function runFrictionlessFlow(files, opts) {
         }
       } else {
         const formData = new FormData();
-        filesArr.forEach(f => formData.append('files', f));
+        // Third argument overrides the multipart filename — this is how a
+        // collision-renamed file (_pdcUploadName) flows through the WHOLE
+        // pipeline (/upload → autofill → add/generate) under its new name.
+        filesArr.forEach(f => formData.append('files', f, _uploadNameOf(f)));
         // No `file_descriptions` field — backend now accepts upload without descriptions and the
         // /schema_autofill_full step generates them.
 
@@ -3488,6 +3780,14 @@ async function runFrictionlessFlow(files, opts) {
       // reflects the new files automatically. The open chat keeps working:
       // schema_text is rebuilt from all loaded dataframes on every question.
       try { await loadUnifiedChatList(true); } catch (e) { /* non-fatal */ }
+      // Re-evaluate every rendered refresh button against the chat's NEW df
+      // keys — an overwrite may have removed keys old items reference.
+      if (opts.addToChatId === currentChatId) {
+        try {
+          await _loadCurrentDfKeys(currentChatId);
+          _reapplyRefreshFreezes();
+        } catch (e) { /* non-fatal */ }
+      }
       showToast(_t('lab.data_added', 'Data added to chat'));
       return;
     }

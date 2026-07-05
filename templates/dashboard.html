@@ -178,6 +178,27 @@
     </div>
   </div>
 
+  <!-- File name-collision dialog (Add Data) — rename (default) or overwrite.
+       Placed after createNewModal so it stacks on top of the open wizard. -->
+  <div id="fileCollisionModal" class="modal hidden">
+    <div class="modal-content small-modal">
+      <div class="modal-header">
+        <h3 data-i18n="collision.title">File name already exists</h3>
+        <button id="collisionCloseBtn" class="ghost">✕</button>
+      </div>
+      <div class="modal-body">
+        <p id="collisionBody"></p>
+        <!-- Generic warning shown immediately; the background column probe may
+             replace it with a specific match / mismatch line (dashboard.js). -->
+        <p id="collisionStructNote" class="collision-warning" data-i18n="collision.overwrite_warning">If the new file has different columns/sheets, some previous charts and tables may no longer be refreshable.</p>
+      </div>
+      <div class="modal-actions">
+        <button id="collisionOverwriteBtn" class="primary" data-i18n="collision.overwrite_btn">Overwrite existing file</button>
+        <button id="collisionRenameBtn" class="ghost"></button>
+      </div>
+    </div>
+  </div>
+
   <!-- Profile Modal -->
   <div id="profileModal" class="modal hidden">
     <div class="modal-content">

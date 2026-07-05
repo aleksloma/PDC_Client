@@ -74,6 +74,18 @@ enterprise build keeps the same shape so the existing JS works unchanged:
    whose sheets are ALL hidden yields zero dataframes and flows through
    the normal "no valid tables in file" handling.
 
+   **Parquet cache:** every `load_dataframes()` call goes through a
+   self-healing parquet cache (`local_store._load_one_file_cached`) under
+   `<files_dir>/.parquet_cache/` — one parquet per resulting dataframe key
+   plus a per-source-file manifest keyed on the source's size + `mtime_ns`.
+   A matching manifest skips the detection pipeline entirely (fast path);
+   a missing/mismatched/unreadable cache runs the existing pipeline and
+   atomically rewrites the cache. Overwriting a file's bytes (Add Data)
+   changes its stat and invalidates its cache automatically. Cached frames
+   are the POST-detection output (hidden sheets skipped, totals dropped)
+   and are round-trip-verified on write, so results are identical to a
+   fresh parse; any cache failure falls back to the old slow path.
+
 3. **`POST /schema_autofill_full`** — verbatim port of global's
    `/schema_autofill_full` (`backend/routes/schema.py` L884-1012), split for
    the brain/client boundary:
@@ -116,9 +128,22 @@ of `/generate_chatdata`. It merges the temp session store into the existing
 `ChatDataStore`:
 
 - Raw files are copied into `chatdata/{chat_id}/files/`; a filename that
-  already exists in the chat is **silently overwritten** (intentional — acts
-  as a data update), and its existing meta/schema/description entry is kept
-  as-is. New filenames get their autofilled meta entries appended.
+  already exists in the chat is **overwritten as a data update — never
+  silently**: the frontend's name-collision dialog (below) has already made
+  the user choose Overwrite vs upload-as-`_vN`.
+- meta.json merge: new keys get their autofilled entries appended. For an
+  **overwritten** source file the entries are **re-synced**
+  (`_resync_meta_after_add` in `routes/upload.py`): entries whose df key
+  vanished from the new upload are **deleted** (no stale entries in the
+  descriptions modal / schema_text); a surviving key takes the fresh
+  autofilled entry but keeps the old `file_description` and, per column that
+  existed before, the old (possibly user-edited) `description` + `values`
+  mappings; brand-new keys/columns keep their fresh autofill. Any resync
+  failure logs `ADD_DATA_RESYNC_FAILED` and falls back to the previous
+  append-only merge (meta is never corrupted). Response carries
+  `{added, updated, removed, files}`.
+- The overwritten bytes bump the file's size/mtime, so its parquet cache
+  invalidates on the next load (see the Parquet-cache note above).
 - The user's `active_chats.jsonl` record gets its `files` list refreshed
   (sidebar subtitle).
 - Nothing else changes: `schema_text` is rebuilt from all loaded dataframes on
@@ -129,6 +154,54 @@ of `/generate_chatdata`. It merges the temp session store into the existing
 Requires an authenticated session with access to `{chat_id}` (owner or shared
 recipient). `400` when no files were uploaded in the session; raw data never
 leaves the client.
+
+### Add Data name-collision dialog (frontend)
+
+**`GET /api/chat/{chat_id}/file_fingerprints`** →
+`{files: {source_filename: {size_bytes, sha256}}}` for the chat's current
+source files (owner/shared access via `_require_chat`; hashing runs in the
+executor; a per-file failure degrades to a name-only `{null, null}` entry).
+Served by the client container itself — fingerprints never reach the brain.
+
+When files are picked in the Add Data modal, `dashboard.js` compares each
+selected name against these fingerprints (sizes first; the browser computes
+the local file's SHA-256 via `crypto.subtle` only on a size tie):
+
+- **identical content** → small notice "This file is already in this chat —
+  no changes needed"; the file is dropped from the upload (no dialog).
+- **different content** → dialog with exactly two choices: **Overwrite
+  existing file** (primary/colored button) or **Upload as `<base>_vN.<ext>`**
+  (neutral; first free suffix, applied through the whole pipeline via the
+  FormData filename override). Dismissing the dialog drops the file.
+
+The dialog opens with the generic warning ("If the new file has different
+columns/sheets, some previous charts and tables may no longer be
+refreshable.") and immediately fires a background **column probe** with a
+~3s budget (`POST /api/chat/{chat_id}/probe_columns`, below). If the probe
+returns in time it replaces the line in place: structures match → green
+informational "Both files appear to contain the same columns — existing
+charts should keep working after overwrite."; structures differ → "Different
+columns/sheets detected — after overwrite some previous charts and tables may
+not be refreshable." On probe failure/timeout the generic warning stays. The
+dialog never blocks on the probe — the buttons are clickable immediately, and
+a choice made before the probe returns simply ignores its result.
+
+**`POST /api/chat/{chat_id}/probe_columns`** — multipart `file`. Returns a
+fast, header-level structure comparison of the uploaded file vs the chat's
+EXISTING same-named file WITHOUT running the detection pipeline:
+`{ok, match, uploaded, existing}` where the summaries map
+`sheet_name (or "" for csv/tsv) → [approximate column strings]`
+(.xlsx/.xlsm via openpyxl read_only — visible sheets, first non-empty row
+within the first 50 rows; .csv/.tsv — the header line). Behind
+`_require_chat`; parsing runs in the executor; any failure (unsupported
+format, no same-named file, parse error) returns `{ok: false}`. Served by the
+client container only — nothing reaches the brain; cell values are never
+logged (filename + match/mismatch only).
+
+Duplicate names **within one selection batch** (chat creation or Add Data)
+are resolved the same way without a dialog: identical → one kept + "Duplicate
+file ignored" notice; different → the second is auto-renamed to the first
+free `_vN` name (shown renamed in the wizard's file list).
 
 ---
 
@@ -293,6 +366,15 @@ refreshed to reflect the new data.
 - Auth/permission failures use HTTP codes; **execution** failures return
   `200 {ok: false, error}` — the frontend keeps the previous render and shows
   a small non-blocking note.
+- **Refresh freezing** (frontend): a button whose stored code subscripts a df
+  key (`dfs['…']` / `dfs["…"]` — exact keys only, no column analysis) that no
+  longer exists in `/api/chat/{id}/schema` renders **disabled** (greyed, not
+  hidden) with the tooltip "Data structure changed — this chart/table can't
+  be refreshed." — evaluated on live render, on history reload, and re-applied
+  after an Add Data completes. A refresh that **fails at runtime** (e.g. a
+  column vanished while the key survived) additionally disables that button
+  for the rest of the session after its transient red note (the key check
+  re-evaluates it on the next reload).
 
 ---
 

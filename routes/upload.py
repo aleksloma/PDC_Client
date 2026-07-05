@@ -12,6 +12,7 @@ names + schema descriptions, never row values.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 from typing import List, Optional
@@ -24,6 +25,7 @@ from brain_client import BrainError, TenantRevokedError
 from local_store import AuthStore, UserStore, ChatDataStore
 from excel_table_detector import _EXTRACTED_TEXT_ABOVE_TABLE
 from logger_utils import log_with_sid
+from routes.chat import _EXEC
 from settings import settings
 from schema_builder import (
     columns_to_human_map,
@@ -101,8 +103,10 @@ async def upload(request: Request, files: List[UploadFile] = File(...), file_des
         log_with_sid(email, "error", f"UPLOAD_ERROR: {e}")
         return JSONResponse({"error": f"Upload failed: {e}"}, status_code=500)
 
-    # Try loading them to detect parse failures and to populate the dataframe-key list
-    dfs = store.load_dataframes()
+    # Try loading them to detect parse failures and to populate the dataframe-key
+    # list — off the event loop, the detection pipeline blocks it otherwise.
+    loop = asyncio.get_running_loop()
+    dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
     df_names = list(dfs.keys())
 
     # Initialize empty schema entries (filled later by /schema_autofill_full)
@@ -366,7 +370,8 @@ async def schema_autofill_full(request: Request):
 
     store = UserStore(sid)
     meta = store.read_meta()
-    dfs = store.load_dataframes()
+    loop = asyncio.get_running_loop()
+    dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
     if not dfs:
         return JSONResponse({"error": "Upload files first"}, status_code=400)
 
@@ -381,30 +386,33 @@ async def schema_autofill_full(request: Request):
     if notes_text:
         notes_text = notes_text[: settings.SCHEMA_AUTOFILL_NOTES_MAX_CHARS]
 
-    # Step 1 — per-file context
+    # Step 1 — per-file context (sampling + value_counts are CPU-heavy — off
+    # the event loop)
     by_name = {f.get("file_name"): f for f in meta.get("files", [])}
-    file_contexts: list[dict] = []
-    for fname, df in dfs.items():
-        entry = by_name.get(fname)
-        if entry is None:
-            entry = {
-                "file_name": fname,
-                "schema": {"file_name": fname, "fields": {}},
-                "file_description": "",
-            }
-            meta.setdefault("files", []).append(entry)
-            by_name[fname] = entry
-        try:
-            ctx = _prepare_file_context(fname, df, entry, notes_text)
-            file_contexts.append(ctx)
-        except Exception as e:
-            log_with_sid(email, "warning", f"AUTOFILL_FULL_CTX_FAIL file={fname}: {e}")
+
+    def _build_contexts() -> list[dict]:
+        contexts: list[dict] = []
+        for fname, df in dfs.items():
+            entry = by_name.get(fname)
+            if entry is None:
+                entry = {
+                    "file_name": fname,
+                    "schema": {"file_name": fname, "fields": {}},
+                    "file_description": "",
+                }
+                meta.setdefault("files", []).append(entry)
+                by_name[fname] = entry
+            try:
+                ctx = _prepare_file_context(fname, df, entry, notes_text)
+                contexts.append(ctx)
+            except Exception as e:
+                log_with_sid(email, "warning", f"AUTOFILL_FULL_CTX_FAIL file={fname}: {e}")
+        return contexts
+
+    file_contexts: list[dict] = await loop.run_in_executor(_EXEC, _build_contexts)
 
     # Step 2 — brain calls (one per file, run in parallel)
-    import asyncio
     from concurrent.futures import ThreadPoolExecutor
-
-    loop = asyncio.get_running_loop()
 
     def _call_one(ctx: dict) -> dict:
         try:
@@ -478,24 +486,28 @@ async def schema_autofill_full(request: Request):
             "file_description": entry.get("file_description", ""),
         })
 
-    # Step 4 — auto-generate technical_description for every column (no LLM)
-    for fname, df in dfs.items():
-        entry = by_name.get(fname)
-        if entry is None or df is None:
-            continue
-        if not isinstance(entry.get("schema"), dict):
-            entry["schema"] = {"file_name": fname, "fields": {}}
-        fields = entry["schema"].setdefault("fields", {})
-        total = len(df)
-        for col in df.columns:
-            fields.setdefault(col, {})
-            if isinstance(fields[col], str):
-                fields[col] = {"description": fields[col]}
-            try:
-                fields[col]["technical_description"] = _generate_technical_description(df[col], total)
-            except Exception as e:
-                log_with_sid(email, "warning",
-                             f"AUTOFILL_TECH_DESC_FAIL file={fname} col={col}: {e}")
+    # Step 4 — auto-generate technical_description for every column (no LLM;
+    # per-column pandas stats are CPU-heavy — off the event loop)
+    def _fill_technical_descriptions() -> None:
+        for fname, df in dfs.items():
+            entry = by_name.get(fname)
+            if entry is None or df is None:
+                continue
+            if not isinstance(entry.get("schema"), dict):
+                entry["schema"] = {"file_name": fname, "fields": {}}
+            fields = entry["schema"].setdefault("fields", {})
+            total = len(df)
+            for col in df.columns:
+                fields.setdefault(col, {})
+                if isinstance(fields[col], str):
+                    fields[col] = {"description": fields[col]}
+                try:
+                    fields[col]["technical_description"] = _generate_technical_description(df[col], total)
+                except Exception as e:
+                    log_with_sid(email, "warning",
+                                 f"AUTOFILL_TECH_DESC_FAIL file={fname} col={col}: {e}")
+
+    await loop.run_in_executor(_EXEC, _fill_technical_descriptions)
 
     store.write_meta(meta)
     log_with_sid(email, "info",
@@ -531,7 +543,8 @@ async def generate_chatdata(request: Request):
     provided_name = (body.get("name") or "").strip()
 
     user_store = UserStore(sid)
-    dfs = user_store.load_dataframes()
+    loop = asyncio.get_running_loop()
+    dfs = await loop.run_in_executor(_EXEC, user_store.load_dataframes)
     if not dfs:
         return JSONResponse({"error": "Upload at least one file before generating chat data."}, status_code=400)
 
@@ -631,6 +644,76 @@ async def generate_chatdata(request: Request):
 # ---------------------------------------------------------------------------
 # 5. /add_data_to_chat  — merge the temp UserStore into an EXISTING chat
 # ---------------------------------------------------------------------------
+def _source_of_key(df_key: str) -> str:
+    """Bare source filename of a dataframe key ("file.xlsx::Sheet" → "file.xlsx")."""
+    return df_key.split("::", 1)[0] if "::" in df_key else df_key
+
+
+def _resync_meta_after_add(old_files: list, new_entries: dict,
+                           overwritten_sources: set,
+                           added: list, updated: list, removed: list) -> list:
+    """Merge the temp-session autofill entries into the chat's meta files.
+
+    Non-overwritten files keep the previous semantics: brand-new keys are
+    appended with their autofilled entries, untouched entries stay as-is.
+
+    For an OVERWRITTEN source file the new upload is authoritative:
+      - old entries whose key is NOT among the new upload's keys are DELETED
+        (the stale-entry bug: vanished sheets no longer pollute the
+        descriptions modal or schema_text);
+      - a surviving key takes the FRESH autofilled entry (new columns keep
+        fresh autofill, new technical_descriptions reflect the new data), but
+        the old file_description is kept and every column that also existed
+        before keeps its old description + value mappings (both are
+        user-editable in the descriptions modal — edits must survive);
+      - keys that are new in the upload are appended with fresh autofill.
+    """
+    import copy as _copy
+
+    merged: list = []
+    for entry in old_files:
+        key = entry.get("file_name")
+        if not key or _source_of_key(key) not in overwritten_sources:
+            merged.append(entry)
+            continue
+        if key not in new_entries:
+            removed.append(key)
+            continue
+        fresh = _copy.deepcopy(new_entries[key])
+        old_fd = (entry.get("file_description") or "").strip()
+        if old_fd:
+            fresh["file_description"] = old_fd
+        old_schema = entry.get("schema") if isinstance(entry.get("schema"), dict) else {}
+        old_fields = (old_schema.get("fields") or {}) if isinstance(old_schema.get("fields"), dict) else {}
+        if not isinstance(fresh.get("schema"), dict):
+            fresh["schema"] = {"file_name": key, "fields": {}}
+        new_fields = fresh["schema"].setdefault("fields", {})
+        for col, old_f in old_fields.items():
+            if col not in new_fields or not isinstance(old_f, dict):
+                continue
+            if not isinstance(new_fields[col], dict):
+                new_fields[col] = {}
+            old_desc = old_f.get("description")
+            if isinstance(old_desc, str) and old_desc.strip():
+                new_fields[col]["description"] = old_desc
+            old_vals = old_f.get("values")
+            if isinstance(old_vals, dict) and old_vals:
+                new_fields[col]["values"] = old_vals
+        merged.append(fresh)
+        updated.append(key)
+
+    existing_keys = {e.get("file_name") for e in merged if e.get("file_name")}
+    for key, entry in new_entries.items():
+        if key in existing_keys:
+            if key not in updated:
+                updated.append(key)
+            continue
+        merged.append(entry)
+        existing_keys.add(key)
+        added.append(key)
+    return merged
+
+
 @router.post("/add_data_to_chat")
 async def add_data_to_chat(request: Request):
     """Add uploaded files to an EXISTING chat.
@@ -640,12 +723,16 @@ async def add_data_to_chat(request: Request):
     init, autofill all happen there, unchanged), then calls this instead of
     /generate_chatdata. Body: {chat_id}.
 
-    Merge semantics (mirrors save_upload's silent-overwrite behavior):
+    Merge semantics:
       - Every uploaded file is copied into the chat's files dir; a filename
-        that already exists in the chat is silently overwritten (data update).
-      - meta.json: entries for NEW filenames are appended (with their
-        autofilled schema/descriptions); entries for EXISTING filenames are
-        kept as-is (descriptions preserved).
+        that already exists in the chat overwrites it (a data update — the
+        frontend's Add Data collision dialog has already made the user choose
+        Overwrite vs upload-as-_vN, so this is never silent).
+      - meta.json: entries for NEW keys are appended (with their autofilled
+        schema/descriptions). For an OVERWRITTEN source file the entries are
+        RE-SYNCED (`_resync_meta_after_add`): vanished keys deleted, surviving
+        keys rebuilt from the fresh autofill with old file/column descriptions
+        and value mappings carried over, new keys appended.
     schema_text is rebuilt from all loaded dataframes on every question, so
     the added files are picked up with no further work.
     """
@@ -668,7 +755,8 @@ async def add_data_to_chat(request: Request):
         return JSONResponse({"error": "No upload session. Upload files first."}, status_code=400)
 
     user_store = UserStore(sid)
-    dfs = user_store.load_dataframes()
+    loop = asyncio.get_running_loop()
+    dfs = await loop.run_in_executor(_EXEC, user_store.load_dataframes)
     if not dfs:
         return JSONResponse({"error": "Upload at least one file before adding data."}, status_code=400)
 
@@ -677,27 +765,49 @@ async def add_data_to_chat(request: Request):
 
         chat_store = ChatDataStore(chat_id)
         chat_meta = chat_store.read_meta()
-        existing_names = {f.get("file_name") for f in chat_meta.get("files", []) if f.get("file_name")}
 
-        # Copy the raw files (silent overwrite = intentional data update).
+        # Copy the raw files. An overwrite is always user-confirmed upstream
+        # (the Add Data collision dialog; rename is the default), so a name
+        # match here is an intentional data update. Track which SOURCE files
+        # were overwritten — their meta entries are re-synced below. The byte
+        # overwrite bumps the file's size/mtime_ns, so the parquet cache
+        # manifest mismatches and rebuilds on the next load (unchanged).
+        overwritten_sources: set = set()
         for fp in sorted(user_store.files_dir.iterdir()):
             if fp.is_file() and not fp.name.startswith("."):
+                if (chat_store.files_dir / fp.name).exists():
+                    overwritten_sources.add(fp.name)
                 shutil.copy2(fp, chat_store.files_dir / fp.name)
 
-        # Merge meta: new df keys appended with their autofilled entries;
-        # existing keys keep the chat's entry (descriptions preserved).
-        added, updated = [], []
         user_meta = user_store.read_meta()
+        new_entries: dict = {}
         for entry in user_meta.get("files", []):
             name = entry.get("file_name")
-            if not name:
-                continue
-            if name in existing_names:
-                updated.append(name)
-                continue
-            chat_meta.setdefault("files", []).append(entry)
-            existing_names.add(name)
-            added.append(name)
+            if name:
+                new_entries[name] = entry
+
+        # Merge meta. On any resync failure fall back to the previous
+        # append-behavior — never corrupt meta (Article IV).
+        added, updated, removed = [], [], []
+        try:
+            merged_files = _resync_meta_after_add(
+                chat_meta.get("files", []) or [], new_entries,
+                overwritten_sources, added, updated, removed)
+        except Exception as e:
+            log_with_sid(email, "error",
+                         f"ADD_DATA_RESYNC_FAILED (falling back to append-merge): {e}",
+                         chat_id=chat_id)
+            added, updated, removed = [], [], []
+            merged_files = list(chat_meta.get("files", []) or [])
+            existing_names = {f.get("file_name") for f in merged_files if f.get("file_name")}
+            for name, entry in new_entries.items():
+                if name in existing_names:
+                    updated.append(name)
+                    continue
+                merged_files.append(entry)
+                existing_names.add(name)
+                added.append(name)
+        chat_meta["files"] = merged_files
         chat_store.write_meta(chat_meta)
 
         # Keep the sidebar's file list for this chat current (non-fatal).
@@ -708,9 +818,10 @@ async def add_data_to_chat(request: Request):
             log_with_sid(email, "warning", f"ADD_DATA_FILELIST_UPDATE_FAILED: {e}", chat_id=chat_id)
 
         log_with_sid(email, "info", "CHAT_DATA_ADDED", chat_id=chat_id,
-                     added=",".join(added), updated=",".join(updated))
+                     added=",".join(added), updated=",".join(updated),
+                     removed=",".join(removed))
         return {"ok": True, "chat_id": chat_id, "added": added,
-                "updated": updated, "files": all_names}
+                "updated": updated, "removed": removed, "files": all_names}
     except Exception as e:
         log_with_sid(email, "error", f"ADD_DATA_ERROR: {type(e).__name__}: {e}", chat_id=chat_id)
         return JSONResponse({"error": "Failed to add data to the chat."}, status_code=500)

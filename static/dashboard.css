@@ -2175,3 +2175,23 @@ button.danger:hover {
 .pdc-refresh-btn.pdc-refresh-spinning svg {
   animation: pdc-refresh-spin 0.9s linear infinite;
 }
+/* Frozen refresh button: the item's stored code references a df key that no
+   longer exists (Add Data overwrite changed the structure) or its refresh
+   already failed this session — greyed, not hidden; tooltip explains why. */
+.pdc-refresh-btn.pdc-refresh-frozen {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+/* Overwrite warning inside the Add Data name-collision dialog */
+.collision-warning {
+  color: #b45309;
+  font-size: 12.5px;
+  margin-top: 8px;
+}
+/* Informational variant of the same note — the background column probe found
+   matching structures, so overwrite is safe for existing charts. */
+.collision-info {
+  color: #059669;
+  font-size: 12.5px;
+  margin-top: 8px;
+}

@@ -24,7 +24,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import local_store
@@ -440,6 +440,140 @@ async def get_schema(request: Request, chat_id: str):
     }
 
 
+@router.get("/{chat_id}/file_fingerprints")
+async def file_fingerprints(request: Request, chat_id: str):
+    """Identity of this chat's SOURCE files for the Add Data name-collision
+    dialog: {files: {source_filename: {size_bytes, sha256}}}. The browser
+    compares sizes first and hashes the selected File locally only on a size
+    tie — everything stays client↔client, nothing reaches the brain
+    (Article II). Hashing is disk work → executor (never on the event loop).
+    Article IV: any failure degrades to an empty/partial map — the frontend
+    then falls back to name-only collision handling."""
+    email, err = _require_chat(request, chat_id)
+    if err:
+        return err
+    import hashlib
+
+    store = local_store.ChatDataStore(chat_id)
+
+    def _compute() -> dict:
+        out: dict = {}
+        for fp in sorted(store.files_dir.iterdir()):
+            if not (fp.is_file() and not fp.name.startswith(".")):
+                continue
+            # The name is always reported — a hash/stat failure degrades to a
+            # name-only entry (nulls), which the frontend treats as "contents
+            # unknown → show the dialog", never as "no collision".
+            entry: dict = {"size_bytes": None, "sha256": None}
+            try:
+                entry["size_bytes"] = fp.stat().st_size
+                h = hashlib.sha256()
+                with fp.open("rb") as fh:
+                    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                        h.update(chunk)
+                entry["sha256"] = h.hexdigest()
+            except Exception as e:
+                log_with_sid(chat_id, "warning",
+                             f"FINGERPRINT_FAILED {fp.name}: {e}")
+            out[fp.name] = entry
+        return out
+
+    try:
+        loop = asyncio.get_running_loop()
+        files = await loop.run_in_executor(_EXEC, _compute)
+    except Exception as e:
+        log_with_sid(chat_id, "error", f"FINGERPRINTS_ERROR: {e}")
+        files = {}
+    return {"files": files}
+
+
+def _probe_structure(data: bytes, filename: str) -> dict | None:
+    """Fast, best-effort header-level structure of a tabular file WITHOUT the
+    full detection pipeline: {sheet_name_or_'': [column strings]}.
+
+    - .xlsx/.xlsm — openpyxl read_only: VISIBLE sheets, first non-empty row
+      within the first 50 rows per sheet as approximate columns.
+    - .csv/.tsv — first non-empty row within the first 50 lines (exact header).
+    Returns None for unsupported formats or any parse failure — callers must
+    then skip the comparison (Article IV: never raise)."""
+    import io as _io
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    try:
+        if ext in ("xlsx", "xlsm"):
+            from openpyxl import load_workbook
+            wb = load_workbook(_io.BytesIO(data), read_only=True, data_only=True)
+            out: dict = {}
+            try:
+                for ws in wb.worksheets:
+                    if getattr(ws, "sheet_state", "visible") != "visible":
+                        continue
+                    header: list = []
+                    for row in ws.iter_rows(min_row=1, max_row=50, values_only=True):
+                        cells = ["" if v is None else str(v).strip() for v in row]
+                        while cells and not cells[-1]:
+                            cells.pop()
+                        if any(cells):
+                            header = cells
+                            break
+                    out[ws.title] = header
+            finally:
+                wb.close()
+            return out
+        if ext in ("csv", "tsv"):
+            import csv as _csv
+            text = data.decode("utf-8-sig", errors="replace")
+            reader = _csv.reader(_io.StringIO(text),
+                                 delimiter="\t" if ext == "tsv" else ",")
+            for i, row in enumerate(reader):
+                if i >= 50:
+                    break
+                cells = [str(v).strip() for v in row]
+                while cells and not cells[-1]:
+                    cells.pop()
+                if any(cells):
+                    return {"": cells}
+            return {"": []}
+        return None
+    except Exception:
+        return None
+
+
+@router.post("/{chat_id}/probe_columns")
+async def probe_columns(request: Request, chat_id: str,
+                        file: UploadFile = File(...)):
+    """Header-level structure comparison for the Add Data collision dialog:
+    the uploaded file vs the chat's EXISTING same-named file, WITHOUT running
+    the detection pipeline (capped at the first 50 rows per sheet — fast).
+    Client-container only; nothing reaches the brain (Article II). Cell values
+    are returned to the browser but never logged (filename + match only).
+    Any failure → {ok: false} — the dialog keeps its generic warning."""
+    email, err = _require_chat(request, chat_id)
+    if err:
+        return err
+    try:
+        from pathlib import Path as _Path
+        fname = _Path(file.filename or "").name   # strip any path components
+        if not fname:
+            return {"ok": False}
+        store = local_store.ChatDataStore(chat_id)
+        existing_path = store.files_dir / fname
+        if not existing_path.exists():
+            return {"ok": False}
+        data = await file.read()
+        loop = asyncio.get_running_loop()
+        uploaded = await loop.run_in_executor(_EXEC, _probe_structure, data, fname)
+        existing_bytes = await loop.run_in_executor(_EXEC, existing_path.read_bytes)
+        existing = await loop.run_in_executor(_EXEC, _probe_structure, existing_bytes, fname)
+        if uploaded is None or existing is None:
+            return {"ok": False}
+        match = uploaded == existing
+        log_with_sid(chat_id, "info", f"PROBE_COLUMNS file={fname} match={match}")
+        return {"ok": True, "match": match, "uploaded": uploaded, "existing": existing}
+    except Exception as e:
+        log_with_sid(chat_id, "warning", f"PROBE_COLUMNS_FAILED: {e}")
+        return {"ok": False}
+
+
 @router.post("/{chat_id}/schema")
 async def save_schema(request: Request, chat_id: str):
     email, err = _require_chat(request, chat_id)
@@ -545,10 +679,13 @@ async def chat_stream(request: Request, chat_id: str):
         return JSONResponse({"error": "Question cannot be empty."}, status_code=400)
 
     store = local_store.ChatDataStore(chat_id)
-    dfs = store.load_dataframes()
+    # Off the event loop — parsing the source files blocks every other
+    # request otherwise (same pattern as _reexecute_full_df / refresh_item).
+    loop = asyncio.get_running_loop()
+    dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
     if not dfs:
         return JSONResponse({"error": "Chat dataset is empty."}, status_code=400)
-    schema_docs = store.schema_docs()
+    schema_docs = await loop.run_in_executor(_EXEC, store.schema_docs)
 
     sid = secrets.token_hex(8)
     if not conv_id:
@@ -871,10 +1008,11 @@ async def edit_regenerate(request: Request, chat_id: str):
                  f"EDIT_REGENERATE user={email} conv_id={conv_id} truncated_to={last_human_idx}")
 
     try:
-        dfs = store.load_dataframes()
+        loop = asyncio.get_running_loop()
+        dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
         if not dfs:
             return JSONResponse({"error": "Chat dataset is empty."}, status_code=400)
-        schema_docs = store.schema_docs()
+        schema_docs = await loop.run_in_executor(_EXEC, store.schema_docs)
 
         sid = secrets.token_hex(8)
         history_rows = store.get_history(conv_id)
@@ -882,8 +1020,6 @@ async def edit_regenerate(request: Request, chat_id: str):
         store.append_history(conv_id, {
             "role": "human", "content": edited_question, "ts": time.time(),
         })
-
-        loop = asyncio.get_running_loop()
 
         def _run_blocking():
             return list(run_chat_local.run_chat_multi_plot(

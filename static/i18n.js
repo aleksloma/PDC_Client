@@ -132,6 +132,9 @@ window.I18N_TRANSLATIONS = {
     'lab.data_added': 'Data added to chat',
     'lab.refresh_item': 'Refresh with current data',
     'lab.refresh_failed': 'Refresh failed — showing previous result',
+    'lab.refresh_frozen': "Data structure changed — this chart/table can't be refreshed.",
+    'lab.file_already_in_chat': 'This file is already in this chat — no changes needed',
+    'lab.duplicate_file_ignored': 'Duplicate file ignored',
     'lab.run_auto_analytics': 'Run Auto Analytics',
     'lab.processing': 'Processing…',
     'lab.download_presentation': 'Download Presentation',
@@ -154,6 +157,15 @@ window.I18N_TRANSLATIONS = {
     'wizard.generate_chat': 'Generate Chat',
     'wizard.add_data_title': 'Add Data To',
     'wizard.upload_btn': 'Upload',
+
+    // File name-collision dialog (Add Data)
+    'collision.title': 'File name already exists',
+    'collision.body': 'A file named "{name}" already exists in this chat with different content. How do you want to proceed?',
+    'collision.rename_btn': 'Upload as {name}',
+    'collision.overwrite_btn': 'Overwrite existing file',
+    'collision.overwrite_warning': 'If the new file has different columns/sheets, some previous charts and tables may no longer be refreshable.',
+    'collision.same_columns': 'Both files appear to contain the same columns — existing charts should keep working after overwrite.',
+    'collision.diff_columns': 'Different columns/sheets detected — after overwrite some previous charts and tables may not be refreshable.',
 
     // Schema viewer / editor
     'schema.title': 'View / Edit Descriptions',
@@ -435,6 +447,9 @@ window.I18N_TRANSLATIONS = {
     'lab.data_added': 'მონაცემები დაემატა ჩატს',
     'lab.refresh_item': 'განახლება მიმდინარე მონაცემებით',
     'lab.refresh_failed': 'განახლება ვერ მოხერხდა — ნაჩვენებია წინა შედეგი',
+    'lab.refresh_frozen': 'მონაცემთა სტრუქტურა შეიცვალა — ეს დიაგრამა/ცხრილი ვეღარ განახლდება.',
+    'lab.file_already_in_chat': 'ეს ფაილი უკვე ამ ჩატშია — ცვლილება არ არის საჭირო',
+    'lab.duplicate_file_ignored': 'დუბლიკატი ფაილი გამოტოვებულია',
     'lab.run_auto_analytics': 'ავტომატური ანალიზის გაშვება',
     'lab.processing': 'მუშავდება…',
     'lab.download_presentation': 'პრეზენტაციის ჩამოტვირთვა',
@@ -457,6 +472,15 @@ window.I18N_TRANSLATIONS = {
     'wizard.generate_chat': 'ჩატის შექმნა',
     'wizard.add_data_title': 'მონაცემების დამატება ჩატში',
     'wizard.upload_btn': 'ატვირთვა',
+
+    // File name-collision dialog (Add Data)
+    'collision.title': 'ფაილი ამ სახელით უკვე არსებობს',
+    'collision.body': 'ფაილი "{name}" უკვე არსებობს ამ ჩატში, მაგრამ შიგთავსი განსხვავდება. როგორ გავაგრძელოთ?',
+    'collision.rename_btn': 'ატვირთვა როგორც {name}',
+    'collision.overwrite_btn': 'არსებული ფაილის გადაწერა',
+    'collision.overwrite_warning': 'თუ ახალ ფაილს განსხვავებული სვეტები ან ფურცლები აქვს, ზოგიერთი ძველი დიაგრამა და ცხრილი შესაძლოა ვეღარ განახლდეს.',
+    'collision.same_columns': 'ორივე ფაილი, როგორც ჩანს, ერთსა და იმავე სვეტებს შეიცავს — გადაწერის შემდეგ არსებული დიაგრამები სავარაუდოდ გააგრძელებენ მუშაობას.',
+    'collision.diff_columns': 'აღმოჩენილია განსხვავებული სვეტები/ფურცლები — გადაწერის შემდეგ ზოგიერთი ძველი დიაგრამა და ცხრილი შესაძლოა ვეღარ განახლდეს.',
 
     // Schema viewer / editor
     'schema.title': 'აღწერების ნახვა / რედაქტირება',
@@ -738,6 +762,9 @@ window.I18N_TRANSLATIONS = {
     'lab.data_added': 'Данные добавлены в чат',
     'lab.refresh_item': 'Обновить по текущим данным',
     'lab.refresh_failed': 'Не удалось обновить — показан предыдущий результат',
+    'lab.refresh_frozen': 'Структура данных изменилась — этот график/таблицу нельзя обновить.',
+    'lab.file_already_in_chat': 'Этот файл уже есть в этом чате — изменения не требуются',
+    'lab.duplicate_file_ignored': 'Дубликат файла пропущен',
     'lab.run_auto_analytics': 'Запустить авто-анализ',
     'lab.processing': 'Обработка…',
     'lab.download_presentation': 'Скачать презентацию',
@@ -760,6 +787,15 @@ window.I18N_TRANSLATIONS = {
     'wizard.generate_chat': 'Создать чат',
     'wizard.add_data_title': 'Добавить данные в',
     'wizard.upload_btn': 'Загрузить',
+
+    // File name-collision dialog (Add Data)
+    'collision.title': 'Файл с таким именем уже существует',
+    'collision.body': 'Файл "{name}" уже есть в этом чате, но его содержимое отличается. Как поступить?',
+    'collision.rename_btn': 'Загрузить как {name}',
+    'collision.overwrite_btn': 'Перезаписать существующий файл',
+    'collision.overwrite_warning': 'Если в новом файле другие столбцы или листы, некоторые прежние графики и таблицы могут перестать обновляться.',
+    'collision.same_columns': 'Оба файла, похоже, содержат одинаковые столбцы — существующие графики должны продолжить работать после перезаписи.',
+    'collision.diff_columns': 'Обнаружены различия в столбцах/листах — после перезаписи некоторые прежние графики и таблицы могут не обновляться.',
 
     // Schema viewer / editor
     'schema.title': 'Просмотр / редактирование описаний',
