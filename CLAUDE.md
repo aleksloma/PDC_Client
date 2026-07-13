@@ -55,11 +55,12 @@ PDC_Client/
 ├── run_chat_local.py        # local execution + _safe_preview guard
 ├── local_store.py           # users + chats + conversations on local disk
 ├── password_utils.py        # stdlib PBKDF2 password hashing (werkzeug-compatible format)
-├── schema_builder.py        # _schema_text builder
+├── schema_builder.py        # _schema_text builder (memoized, 300s TTL)
 ├── excel_table_detector.py  # 6-stage Excel table detection
 ├── auto_analytics.py        # background job (brain planner → local exec → PPTX)
 ├── code_exec.py             # safe_execute
 ├── plot_utils.py            # render_plot_safe
+├── pptx_template_cache.py   # local cache of the brain-served tenant template/spec
 ├── settings.py
 ├── models.py
 ├── logger_utils.py
@@ -78,6 +79,8 @@ PDC_Client/
 ├── Dockerfile
 ├── docker-compose.yml       # CUSTOMER install (image-only, client.env)
 ├── docker-compose.local.yml # LOCAL testing stack (build ., persistent pdc_* volumes)
+├── tests/                   # pytest (offline — brain calls stubbed)
+├── tools/                   # dev tools + fixtures (sample_sales.csv, wide_data.csv)
 └── docs/                    # constitution, protocol, endpoints, build & run
 ```
 
@@ -94,9 +97,9 @@ PDC_Client/
 | [`routes/report.py`](routes/report.py) | PDF (ReportLab + DejaVu) and PPTX (python-pptx) report rendering — local only |
 | [`auto_analytics.py`](auto_analytics.py) | Auto Analytics background job (planner via brain → execute locally → render PPTX) |
 | [`run_chat_local.py`](run_chat_local.py) | `run_chat` / `run_chat_multi_plot`; `_safe_preview` data-boundary guard |
-| [`local_store.py`](local_store.py) | `AuthStore`, `UserStore`, `ChatDataStore` on local disk; `append_history` / `truncate_conv_history`; self-healing parquet cache for parsed tables (`_load_one_file_cached` → `<files_dir>/.parquet_cache/`, manifest keyed on source size+mtime_ns, atomic writes, round-trip-verified, falls back to the detection pipeline on any failure — Add Data's in-place overwrite invalidates via the stat change) |
+| [`local_store.py`](local_store.py) | `AuthStore`, `UserStore`, `ChatDataStore` on local disk; `append_history` / `truncate_conv_history`; TWO-LAYER dataframe caching: (1) in-memory `_DATAFRAME_CACHE` (`LRUTTLCache`: 300s TTL with active sweep + sweeper thread, `DF_CACHE_MAX_MB` byte budget with LRU eviction, oversized datasets served-not-cached; every hit signature-validated against source `(name, mtime_ns, size)` so overwrites/refreshes can never serve stale data); (2) self-healing on-disk parquet cache (`_load_one_file_cached` → `<files_dir>/.parquet_cache/`, manifest keyed on source size+mtime_ns, atomic writes, round-trip-verified, PICKLE fallback entry for dataframes parquet can't reproduce — e.g. mixed numeric/string object columns — so one bad column no longer aborts the whole file's cache; falls back to the detection pipeline on any failure; Add Data's in-place overwrite invalidates via the stat change); `clone_from_user_store` also copies `.parquet_cache` (mtime-preserving) so a new chat's first question skips the parse |
 | [`brain_client.py`](brain_client.py) | HTTP wrappers for every `/v1/*` call (with `BRAIN_TENANT_TOKEN` bearer auth); `_sanitize_history_rows` strips history to role/content(+code) inside `plan`/`retry`/`summarize` so persisted `image_base64`/`chart_data`/`table`/`usage` never reach the brain (Article II) |
-| [`excel_table_detector.py`](excel_table_detector.py) | 6-stage Excel table detection; `load_excel_sheets` processes only VISIBLE sheets (hidden/veryHidden skipped in the probe step, before the single-vs-multi keying — the one choke point for every load path) |
+| [`excel_table_detector.py`](excel_table_detector.py) | Streaming Excel table detection (port of global's calamine rewrite): header anchor/span detected on a 50-row read-only top slice (`HEADER_SCAN_ROWS`), body read ONCE via `pd.read_excel(engine="calamine")`, label_cols/totals run on the loaded df — no full openpyxl object-graph load (the old 3-pass path took ~250s on a 9MB workbook; this takes ~15s). ListObject precheck + merged-cell S1 span signal intentionally dropped (need non-read-only loads; validated unnecessary on global). `load_excel_sheets` processes only VISIBLE sheets (hidden/veryHidden skipped in the probe step, before the single-vs-multi keying — the one choke point for every load path) |
 
 ## Documentation
 
@@ -151,6 +154,69 @@ The two are NEVER deployed together. That would defeat the split.
   endpoints return 400.
 - **No Soro blog, Vlog, B2C marketing site, customer-analytics
   reporter** — those modules don't exist on-prem.
+
+## Data safety — no update may ever lose state
+
+Persistent state is strictly separated from deployable code. **Code is
+replaceable; state is not.**
+
+- Client state = everything under `DATA_ROOT` (`/data/client`): locally the
+  external `pdc_client_data` volume, in production the customer's own volume.
+  Users + auth hashes, uploaded raw files, chats, conversation history,
+  rendered decks, the parquet cache.
+- No script, test, migration, or deploy step may delete or overwrite it.
+  Tests run against `tmp_path` / a monkeypatched `DATA_ROOT` only — never
+  `./client_data`, never the volume.
+- Stored-format changes (`users/{email}/*`, `chatdata/{chat_id}/meta.json`,
+  `conversations/*.jsonl`, `.parquet_cache` manifests) must stay **backward
+  compatible** — data written by the previous release must still load after
+  an upgrade (customers upgrade the image against their existing volume).
+  Add a regression test with an old-shape fixture whenever a stored shape
+  changes.
+- Upgrades are image-only: `docker compose up -d` with a new image against the
+  same volume. See `/release-image`.
+- The local volume holds realistic test state — it survives rebuilds,
+  reinstalls, and test runs. Back it up before any rebuild (`/smoke-test`
+  step 1). **Never `docker compose down -v`.**
+
+## Agents & skills — when to use what
+
+Agents (`.claude/agents/`):
+
+- **explorer** (read-only, fast) — find code, map ALL call sites before
+  touching a shared helper, summarize a module.
+- **reviewer** — run on every non-trivial diff BEFORE commit; checks the
+  data boundary, constitution articles, protocol/doc mirroring, data safety.
+- **debugger** — stack won't boot, SSE/chart/report failures, brain 4xx;
+  reads `docker logs pdc-client` / `logs/datachat.log`, proposes a fix.
+- **test-runner** — runs pytest; may fix test-side bugs and env issues, never
+  weakens assertions, reports product bugs without fixing.
+- **ui-tester** — Playwright against `http://localhost:8091/lab` only, with
+  `tools/fixtures/` data and test accounts only; reports root cause with
+  file:line (dashboard.js / routes / templates), never fixes.
+
+Skills:
+
+- **/smoke-test** — before every commit and after every rebuild.
+- **/write-tests** — whenever adding or changing tests.
+- **/sync-docs** — after any route/module change; code is the source of truth.
+- **/release-image** — building/shipping a customer image (upgrade-safe).
+- **/add-brain-call** — checklist when adding a new client→brain `/v1` call.
+
+## Definition of done — regression protection
+
+1. **Grep all call sites** of any shared function/constant you change; update
+   every caller in the same change.
+2. **Full suite green** — `python -m pytest tests/ -q` passes entirely, not
+   just the new tests. Never weaken or delete an old test to get green.
+3. Routes or `/lab` UI touched → **/smoke-test** on the persistent-volume
+   stack, full upload→chart→edit→report cycle in the browser; ui-tester for
+   UI changes.
+4. **reviewer agent on the diff** before commit.
+5. **No silent behavior changes** — anything protocol- or user-visible is
+   named in the commit body and mirrored into the docs in the same commit.
+6. **No data loss on update** — see "Data safety" above; stored-shape changes
+   carry an old-shape regression test.
 
 ## Memory
 

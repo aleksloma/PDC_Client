@@ -126,3 +126,10 @@ $RECYCLE.BIN/
 .cache/
 tmp/
 temp/
+
+# ============================================================================
+# Claude Code
+# ============================================================================
+# .claude/ (settings, agents, skills) IS committed — shared project config.
+# Personal per-machine overrides are not.
+.claude/settings.local.json

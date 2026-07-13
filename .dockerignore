@@ -4,4 +4,6 @@ __pycache__
 client_data/
 logs/
 .git
-.env
+*.env
+!*.env.example
+.claude/
