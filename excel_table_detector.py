@@ -1,33 +1,32 @@
-"""Excel multi-row header + table detection — verbatim port of the global
-6-stage pipeline at `storage.py` lines 504-1099 of the B2C app.
+"""Excel multi-row header + table detection — port of the global streaming
+pipeline in the B2C app's `storage.py` (post-calamine rewrite).
 
-Pure Python (openpyxl + pandas only). NO LLM, NO model-based inference.
+Pure Python (openpyxl + calamine + pandas). NO LLM, NO model-based inference.
 
-Six-stage pipeline (runs on every Excel sheet):
-  1. ws.tables precheck — if a real Excel ListObject (Format-as-Table) is
-     defined, use its ref + headerRowCount + totalsRowCount directly.
-  2. Header anchor — run BOTH modal-column-width (A) and string-density (B)
-     detectors; pick the candidate with the cleaner header signature
-     (higher string fraction, numeric-name penalty, low-cell-count penalty).
-  3. Header span auto-decision (1 vs 2 header rows) via three signals:
-     S1 (merged-range overlap), S2 (gap-fill pattern), S3 (sub-header shape
-     + data-shaped row two below).
-  4. Read with pd.read_excel(header=[r] or [r, r+1]); flatten the MultiIndex,
-     dropping "Unnamed:" fragments and deduping consecutive equal parts.
-  5. label_cols auto-detection — count leading string-dominated columns over
-     a ~40-row data sample.
-  6. Totals detection via E ∪ F:
-       E = multilingual keyword match on the first non-empty string cell
-       F = structural outlier (sparse label cells + dense numerics)
-     Flagged total rows are DROPPED from the resulting df AND LOGGED.
+Pipeline per sheet (no full openpyxl object-graph load anywhere):
+  A. Header detection runs on a streamed top slice (`HEADER_SCAN_ROWS` rows,
+     openpyxl read_only): BOTH modal-column-width (2A) and string-density
+     (2B) anchors, then the 1-vs-2 header-span decision (S2 gap-fill + S3
+     sub-header shape; the merged-cell S1 signal and the ws.tables ListObject
+     precheck are intentionally NOT used — they need a non-read-only load and
+     were validated unnecessary on the global app).
+  B. The full data is read ONCE with pd.read_excel(engine="calamine")
+     (header=[r] or [r, r+1]); MultiIndex flattened, "Unnamed:" fragments
+     dropped, consecutive equal parts deduped.
+  C. label_cols auto-detection runs on the LOADED dataframe's head slice.
+  D. Totals detection (E = multilingual keyword ∪ F = structural outlier)
+     streams over the loaded dataframe with a one-row lookahead; flagged
+     total rows are DROPPED from the resulting df AND LOGGED.
 
 Text found above the header is published via `_EXTRACTED_TEXT_ABOVE_TABLE`
-so the upload flow can use it as a `file_description` fallback.
+so the upload flow can use it as a `file_description` fallback (the header
+anchor always sits within the streamed top slice, so the capture is complete).
 
-ENTERPRISE NOTE: This module is byte-for-byte the same algorithm as the global
-B2C app — only adapted to live next to the client's `local_store.py`. Any future
-fix to header / total detection should be ported back to global to keep the two
-in sync. Raw data values still never leave this server.
+ENTERPRISE NOTE: This module is the same algorithm as the global B2C app —
+only adapted to live next to the client's `local_store.py` (plus the
+client-only hidden-sheet skip in `load_excel_sheets`). Any future fix to
+header / total detection should be ported back to global to keep the two in
+sync. Raw data values still never leave this server.
 """
 from __future__ import annotations
 
@@ -44,6 +43,12 @@ import pandas as pd
 # Stores extracted text found above the table header, keyed by df_name.
 # Upload flow reads this to populate file_description in meta.json.
 _EXTRACTED_TEXT_ABOVE_TABLE: Dict[str, str] = {}
+
+# Header detection reads only this many top rows (streamed, read-only) instead
+# of materializing the whole sheet. The value matches the detectors' internal
+# sample window (sample=50) so anchor/span decisions are identical to a
+# full-sheet read for any file whose header sits in the first rows.
+HEADER_SCAN_ROWS = 50
 
 
 # --- Stage 6 keyword set (multilingual, NFKC-normalized + lowercased) ---
@@ -82,6 +87,31 @@ def _nonempty_cells(row: _Sequence) -> list:
 
 def _nonempty_count(row: _Sequence) -> int:
     return sum(1 for v in row if v is not None and not (isinstance(v, str) and v.strip() == ""))
+
+
+def _native_cell(v):
+    """Convert a loaded-dataframe cell back to the value contract openpyxl
+    produced, so the existing value-based detectors behave identically:
+      - NaN / NaT / pd.NA  -> None   (openpyxl yields None for empty cells; the
+        detectors test `v is None`, not pandas-NaN, so this MUST be normalized)
+      - numpy scalar       -> native Python int/float/bool (numpy.int64 is NOT
+        an `int` subclass, so `_is_num_cell` would otherwise miss integer cells)
+    Strings and Python natives pass through unchanged.
+    """
+    if v is None or isinstance(v, str):
+        return v
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    item = getattr(v, "item", None)
+    if callable(item):
+        try:
+            return v.item()
+        except Exception:
+            return v
+    return v
 
 
 # --- Stage 2A: modal-column-width header anchor ---
@@ -243,7 +273,7 @@ def _read_with_multiheader(
 ) -> Tuple[List[str], pd.DataFrame]:
     header_rows = list(range(header_row_0based, header_row_0based + header_span))
     df = pd.read_excel(file_input, sheet_name=sheet_name,
-                       header=header_rows, engine="openpyxl")
+                       header=header_rows, engine="calamine")
     flat: List[str] = []
     if isinstance(df.columns, pd.MultiIndex):
         for tup in df.columns:
@@ -382,51 +412,27 @@ def _build_text_above(rows: List[list], anchor_idx: int) -> str:
     return "\n".join(lines).strip()
 
 
-def _detect_and_extract_table(
-    file_input,
-    sheet_name: str,
-    df_key: str,
-    log_prefix: str = "[EXCEL_DETECT]",
-) -> Optional[pd.DataFrame]:
+def _read_top_rows(file_input, sheet_name: str, max_rows: int) -> Optional[List[list]]:
+    """Stream the first `max_rows` rows of VALUES from one sheet using a
+    read-only openpyxl load. read_only=True streams rows without building the
+    per-cell object graph (the source of the old full-load time/memory blow-up),
+    and the early break stops after `max_rows`. Empty cells come back as None,
+    matching the value contract the header detectors expect.
+    """
     import openpyxl
     wb = None
-    anchor_idx = None
-    span = 1
     try:
         wb_input = BytesIO(file_input) if isinstance(file_input, bytes) else str(file_input)
-        wb = openpyxl.load_workbook(wb_input, data_only=True)
+        wb = openpyxl.load_workbook(wb_input, read_only=True, data_only=True)
         if sheet_name not in wb.sheetnames:
             return None
         ws = wb[sheet_name]
-        raw_rows: List[list] = [list(r) for r in ws.iter_rows(values_only=True)]
-
-        # Stage 1: ws.tables precheck
-        for tname, tbl in ws.tables.items():
-            extracted = _read_listobject_table(ws, tbl, raw_rows)
-            if extracted is not None:
-                _col_names, df, hdr_count = extracted
-                print(f"{log_prefix} {df_key}: ws.tables FOUND table={tname!r} ref={tbl.ref} "
-                      f"header_rows={hdr_count} totals_rows={int(tbl.totalsRowCount or 0)} "
-                      f"data_rows={len(df)}", flush=True)
-                return df
-
-        # Stage 2: header anchor
-        anchor_idx, who = _pick_header_anchor(raw_rows)
-        if anchor_idx is None:
-            print(f"{log_prefix} {df_key}: header anchor NOT FOUND", flush=True)
-            return None
-
-        # Stage 3: header span
-        span = _detect_header_span(raw_rows, anchor_idx, ws=ws)
-        print(f"{log_prefix} {df_key}: anchor_row={anchor_idx + 1} (picked-by={who}) span={span}",
-              flush=True)
-
-        # Capture text above the header (used by upload flow for file_description)
-        text_above = _build_text_above(raw_rows, anchor_idx)
-        if text_above:
-            _EXTRACTED_TEXT_ABOVE_TABLE[df_key] = text_above
-            print(f"{log_prefix} {df_key}: captured {len(text_above)} chars of text above table",
-                  flush=True)
+        rows: List[list] = []
+        for r in ws.iter_rows(values_only=True):
+            rows.append(list(r))
+            if len(rows) >= max_rows:
+                break
+        return rows
     finally:
         if wb is not None:
             try:
@@ -434,10 +440,57 @@ def _detect_and_extract_table(
             except Exception:
                 pass
 
-    if anchor_idx is None:
+
+def _detect_and_extract_table(
+    file_input,           # bytes, str path, or Path
+    sheet_name: str,
+    df_key: str,
+    log_prefix: str = "[EXCEL_DETECT]",
+) -> Optional[pd.DataFrame]:
+    """Detect the table region on one Excel sheet and return the cleaned df.
+
+    Returns the cleaned dataframe (totals dropped) or None on failure. Side
+    effects: publishes any captured text above the header into
+    `_EXTRACTED_TEXT_ABOVE_TABLE[df_key]`; logs anchor / span / label_cols and
+    every dropped total row via `print(..., flush=True)`.
+
+    Pipeline (no longer loads the whole sheet with openpyxl):
+      A. Header detection runs on a streamed top-slice (`HEADER_SCAN_ROWS` rows,
+         read-only). `_pick_header_anchor` + `_detect_header_span` are reused
+         verbatim; `_detect_header_span` is called with ws=None (the merged-cell
+         S1 signal simply does not fire — S2/S3 still decide span from values).
+      B. The full data is read with the calamine engine via
+         `_read_with_multiheader` (header handoff unchanged).
+      C. `_detect_label_cols` runs on the LOADED dataframe rows.
+      D. `_detect_total_by_keyword` ∪ `_detect_total_by_structure` run over the
+         LOADED dataframe rows (same E ∪ F logic, same DROP + LOG behavior).
+
+    NOTE: the `ws.tables` (ListObject) precheck and the merged-cell S1 signal
+    are intentionally NOT used on this path — validated unnecessary for this
+    data and incompatible with a streaming read.
+    """
+    # Stage A: streamed header detection over the top slice (values only).
+    top_rows = _read_top_rows(file_input, sheet_name, HEADER_SCAN_ROWS)
+    if not top_rows:
         return None
 
-    # Stage 4: pandas read + flatten (openpyxl engine, multi-header when span=2)
+    anchor_idx, who = _pick_header_anchor(top_rows)
+    if anchor_idx is None:
+        print(f"{log_prefix} {df_key}: header anchor NOT FOUND", flush=True)
+        return None
+
+    span = _detect_header_span(top_rows, anchor_idx, ws=None)
+    print(f"{log_prefix} {df_key}: anchor_row={anchor_idx + 1} (picked-by={who}) span={span}",
+          flush=True)
+
+    # Capture text above the header (used by upload flow for file_description)
+    text_above = _build_text_above(top_rows, anchor_idx)
+    if text_above:
+        _EXTRACTED_TEXT_ABOVE_TABLE[df_key] = text_above
+        print(f"{log_prefix} {df_key}: captured {len(text_above)} chars of text above table",
+              flush=True)
+
+    # Stage B: full data read + flatten (calamine engine, multi-header when span=2)
     try:
         pd_input = BytesIO(file_input) if isinstance(file_input, bytes) else str(file_input)
         flat, df = _read_with_multiheader(pd_input, sheet_name, anchor_idx, span)
@@ -449,47 +502,59 @@ def _detect_and_extract_table(
     print(f"{log_prefix} {df_key}: cols={len(flat)} unnamed={unnamed} data_rows={len(df)}",
           flush=True)
 
-    # Stage 5: label_cols auto-detect — need raw rows again (wb was closed above)
-    try:
-        import openpyxl as _opx
-        wb2_input = BytesIO(file_input) if isinstance(file_input, bytes) else str(file_input)
-        wb2 = _opx.load_workbook(wb2_input, data_only=True)
-        ws2 = wb2[sheet_name]
-        raw_rows2: List[list] = [list(r) for r in ws2.iter_rows(values_only=True)]
-        wb2.close()
-    except Exception:
-        raw_rows2 = []
-
+    # Normalize loaded rows to openpyxl's value contract (NaN -> None, numpy
+    # scalar -> native) so the existing detectors behave identically. df row k
+    # corresponds to sheet row (data_start + k) — pandas discards the preamble
+    # and header rows, so the totals row numbering below matches the old path.
+    #
+    # Rows are normalized ONE AT A TIME (streamed) rather than materialized into
+    # a full second list-of-lists: on a large sheet that copy doubled peak
+    # memory. The values handed to the detectors — and therefore the resulting
+    # drop set — are identical to a full materialization.
     data_start = anchor_idx + span
-    label_cols = _detect_label_cols(raw_rows2, data_start_idx=data_start) if raw_rows2 else 0
+    n_rows = len(df)
+
+    # Stage C: label_cols auto-detect. `_detect_label_cols` only ever inspects
+    # the first `sample_rows * 3` (= 120) rows, so a head slice is equivalent to
+    # passing every row.
+    head_rows = [[_native_cell(v) for v in r]
+                 for r in df.head(40 * 3).itertuples(index=False, name=None)]
+    label_cols = _detect_label_cols(head_rows, data_start_idx=0)
     print(f"{log_prefix} {df_key}: label_cols={label_cols}", flush=True)
 
-    # Stage 6: totals via E ∪ F; DROP + LOG
+    # Stage D: totals via E ∪ F over the loaded rows (streamed with a one-row
+    # lookahead so `_detect_total_by_structure` still sees `next_row`); DROP + LOG
     flagged: List[Tuple[int, list, str]] = []
-    n_rows = len(raw_rows2)
-    for i in range(data_start, n_rows):
-        row = raw_rows2[i]
+
+    def _scan_total(i: int, row: list, next_row: Optional[list]) -> None:
         if all(v is None or (isinstance(v, str) and v.strip() == "") for v in row):
-            continue
+            return
         e = _detect_total_by_keyword(row)
         f = _detect_total_by_structure(
             row,
             label_cols=label_cols,
-            next_row=raw_rows2[i + 1] if i + 1 < n_rows else None,
+            next_row=next_row,
             is_last_row=(i == n_rows - 1),
         )
         if e or f:
-            tag = ("E" if e else "") + ("F" if f else "")
-            flagged.append((i, row, tag))
+            flagged.append((i, row, ("E" if e else "") + ("F" if f else "")))
+
+    prev: Optional[Tuple[int, list]] = None  # (index, row) awaiting its next_row
+    for i, raw in enumerate(df.itertuples(index=False, name=None)):
+        cur = [_native_cell(v) for v in raw]
+        if prev is not None:
+            _scan_total(prev[0], prev[1], cur)
+        prev = (i, cur)
+    if prev is not None:
+        _scan_total(prev[0], prev[1], None)
 
     if flagged:
         df_drop_indices: List[int] = []
-        for raw_i, row_values, tag in flagged:
-            df_i = raw_i - data_start
+        for df_i, row_values, tag in flagged:
             if 0 <= df_i < len(df):
                 df_drop_indices.append(df_i)
             preview = [str(v)[:30] for v in row_values][:8]
-            print(f"{log_prefix} {df_key}: DROPPED total row R{raw_i + 1} [{tag}] {preview}",
+            print(f"{log_prefix} {df_key}: DROPPED total row R{data_start + df_i + 1} [{tag}] {preview}",
                   flush=True)
         if df_drop_indices:
             df = df.drop(df.index[df_drop_indices]).reset_index(drop=True)
