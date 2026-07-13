@@ -23,9 +23,50 @@ from typing import Dict
 import pandas as pd
 
 from settings import settings
+from logger_utils import log_with_sid
+from local_store import LRUTTLCache
+
+# Memoizes the serialized schema string (mirrors the B2C `_schema_text_cache`).
+# The key covers schema_docs + the df name set + common_fields, NOT df values,
+# so categorical sample listings can lag a data update by at most the TTL —
+# 300s keeps that bound within the dataframe cache's own freshness horizon.
+_SCHEMA_TEXT_CACHE = LRUTTLCache(max_size=100, ttl_seconds=300)
+
+
+def _schema_text_cache_key(schema_docs, dfs, common_fields) -> str | None:
+    try:
+        payload = (
+            json.dumps(schema_docs, sort_keys=True, ensure_ascii=False, default=str)
+            + "|" + ",".join(sorted(dfs.keys()))
+            + "|" + json.dumps(common_fields or [], ensure_ascii=False, default=str)
+        )
+        return hashlib.md5(payload.encode("utf-8")).hexdigest()
+    except Exception as e:
+        log_with_sid("schema_text", "warning", f"SCHEMA_TEXT_CACHE_KEY_FAILED: {e}")
+        return None
 
 
 def schema_text(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFrame], common_fields: list | None = None) -> str:
+    cache_key = _schema_text_cache_key(schema_docs, dfs, common_fields)
+    if cache_key is not None:
+        try:
+            cached = _SCHEMA_TEXT_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+        except Exception as e:
+            log_with_sid("schema_text", "warning", f"SCHEMA_TEXT_CACHE_GET_FAILED: {e}")
+
+    result = _schema_text_uncached(schema_docs, dfs, common_fields)
+
+    if cache_key is not None:
+        try:
+            _SCHEMA_TEXT_CACHE.set(cache_key, result)
+        except Exception as e:
+            log_with_sid("schema_text", "warning", f"SCHEMA_TEXT_CACHE_SET_FAILED: {e}")
+    return result
+
+
+def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFrame], common_fields: list | None = None) -> str:
     parts: list[str] = []
     for fname, df in dfs.items():
         cols = list(df.columns)
