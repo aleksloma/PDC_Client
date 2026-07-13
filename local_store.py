@@ -22,6 +22,7 @@ import re
 import secrets
 import shutil
 import threading
+import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -210,6 +211,185 @@ def _load_one_file_cached(path: Path) -> dict[str, pd.DataFrame]:
     if out:
         _parquet_cache_write(path, out, src_size, src_mtime_ns)
     return out
+
+
+# ---------------------------------------------------------------------------
+# In-memory DataFrame cache
+# ---------------------------------------------------------------------------
+# Same idea as the B2C storage.py `_DATAFRAME_CACHE`: questions in an active
+# chat get the already-parsed dataframes from RAM instead of re-reading the
+# disk cache on every request. Client-side memory-safety upgrades over the
+# B2C version:
+#   - every hit is validated against the source files' (name, mtime_ns, size)
+#     signature, so a changed file can never serve stale data (no separate
+#     invalidation hooks needed — Add Data overwrite, reset, clone all change
+#     the signature or the key);
+#   - the cache is bounded by an approximate BYTE budget
+#     (settings.DF_CACHE_MAX_MB), not only an entry count; a dataset larger
+#     than half the budget is never cached (it just reloads from the parquet
+#     disk cache), so one huge upload can never pin the container's RAM;
+#   - strict TTL with an active sweep on every get/set plus a background
+#     sweeper thread, so an idle container releases the memory instead of
+#     holding it until the next request.
+# The app runs a single uvicorn worker, so one module-level cache is shared
+# by all requests. Self-healing per Article IV: any cache failure logs and
+# falls back to the uncached load path.
+
+class LRUTTLCache:
+    """Thread-safe LRU cache with TTL expiration and an approximate byte budget."""
+
+    def __init__(self, max_size: int = 8, ttl_seconds: float = 300,
+                 max_bytes: Optional[int] = None):
+        self._max_size = max_size
+        self._ttl_seconds = ttl_seconds
+        self._max_bytes = max_bytes
+        # {key: {"value": ..., "size": int, "timestamp": float, "access_time": float}}
+        self._cache: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: str):
+        """Return the value if present and not expired; sweeps ALL expired
+        entries first so idle data is freed on any cache traffic."""
+        with self._lock:
+            self._evict_expired_locked(_time.time())
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            entry["access_time"] = _time.time()
+            return entry["value"]
+
+    def set(self, key: str, value, size_bytes: int = 0) -> bool:
+        """Insert value. Returns False (not cached) when the entry alone would
+        occupy more than half the byte budget. Evicts expired entries, then
+        LRU entries until both the entry count and byte budget fit."""
+        with self._lock:
+            now = _time.time()
+            self._evict_expired_locked(now)
+            if self._max_bytes is not None and size_bytes > self._max_bytes // 2:
+                self._cache.pop(key, None)
+                return False
+            self._cache.pop(key, None)
+            while self._cache and (
+                len(self._cache) >= self._max_size
+                or (self._max_bytes is not None
+                    and self._total_bytes_locked() + size_bytes > self._max_bytes)
+            ):
+                self._evict_lru_locked()
+            self._cache[key] = {"value": value, "size": int(size_bytes),
+                                "timestamp": now, "access_time": now}
+            return True
+
+    def sweep(self):
+        """Drop every TTL-expired entry (called by the background sweeper)."""
+        with self._lock:
+            self._evict_expired_locked(_time.time())
+
+    def invalidate(self, key: str = None):
+        with self._lock:
+            if key is None:
+                self._cache.clear()
+            else:
+                self._cache.pop(key, None)
+
+    def _total_bytes_locked(self) -> int:
+        return sum(e["size"] for e in self._cache.values())
+
+    def _evict_expired_locked(self, now: float):
+        expired = [k for k, v in self._cache.items()
+                   if now - v["timestamp"] > self._ttl_seconds]
+        for k in expired:
+            del self._cache[k]
+
+    def _evict_lru_locked(self):
+        if not self._cache:
+            return
+        lru_key = min(self._cache.keys(), key=lambda k: self._cache[k]["access_time"])
+        del self._cache[lru_key]
+
+    def __len__(self):
+        with self._lock:
+            return len(self._cache)
+
+
+_DF_CACHE_TTL_SECONDS = 300
+_DF_CACHE_SWEEP_SECONDS = 60
+_DATAFRAME_CACHE = LRUTTLCache(
+    max_size=8,
+    ttl_seconds=_DF_CACHE_TTL_SECONDS,
+    max_bytes=max(1, int(settings.DF_CACHE_MAX_MB)) * 1024 * 1024,
+)
+
+
+def _df_cache_sweeper():
+    while True:
+        _time.sleep(_DF_CACHE_SWEEP_SECONDS)
+        try:
+            _DATAFRAME_CACHE.sweep()
+        except Exception as e:
+            log_with_sid("df_cache", "warning", f"DF_CACHE_SWEEP_FAILED: {e}")
+
+
+threading.Thread(target=_df_cache_sweeper, daemon=True, name="df_cache_sweeper").start()
+
+
+def _files_signature(files_dir: Path) -> Optional[tuple]:
+    """Sorted (name, mtime_ns, size) per source file — the freshness proof for
+    a memory-cache hit. None on any failure → caller treats it as a miss and
+    never caches."""
+    try:
+        sig = []
+        for fp in sorted(files_dir.iterdir()):
+            if fp.is_file() and not fp.name.startswith("."):
+                st = fp.stat()
+                sig.append((fp.name, st.st_mtime_ns, st.st_size))
+        return tuple(sig)
+    except Exception as e:
+        log_with_sid(str(files_dir), "warning", f"DF_CACHE_SIGNATURE_FAILED: {e}")
+        return None
+
+
+def _dfs_size_bytes(dfs: dict[str, pd.DataFrame]) -> Optional[int]:
+    """Approximate in-memory footprint of a dfs dict. None on failure → the
+    entry is simply not cached (safe fallback, Article IV)."""
+    try:
+        return int(sum(int(df.memory_usage(deep=True).sum()) for df in dfs.values()))
+    except Exception as e:
+        log_with_sid("df_cache", "warning", f"DF_CACHE_SIZE_FAILED: {e}")
+        return None
+
+
+def _load_dataframes_cached(files_dir: Path, owner: str) -> dict[str, pd.DataFrame]:
+    """Shared load path for UserStore/ChatDataStore: signature-validated
+    in-memory cache in front of the per-file parquet disk cache. Returns a
+    shallow copy on hit so callers mutating the dict can't poison the cache
+    (in-place DataFrame mutation by executed code remains possible — same
+    exposure as the B2C app)."""
+    key = str(files_dir)
+    sig = _files_signature(files_dir)
+    if sig is not None:
+        try:
+            entry = _DATAFRAME_CACHE.get(key)
+            if entry is not None and entry.get("sig") == sig:
+                log_with_sid(owner, "info", f"DF_MEMORY_CACHE_HIT dfs={len(entry['dfs'])}")
+                return dict(entry["dfs"])
+        except Exception as e:
+            log_with_sid(owner, "warning", f"DF_MEMORY_CACHE_GET_FAILED: {e}")
+    dfs: dict[str, pd.DataFrame] = {}
+    for fp in sorted(files_dir.iterdir()):
+        if fp.is_file() and not fp.name.startswith("."):
+            dfs.update(_load_one_file_cached(fp))
+    if sig is not None and dfs:
+        try:
+            size = _dfs_size_bytes(dfs)
+            if size is not None:
+                cached = _DATAFRAME_CACHE.set(key, {"sig": sig, "dfs": dict(dfs)},
+                                              size_bytes=size)
+                if not cached:
+                    log_with_sid(owner, "info",
+                                 f"DF_MEMORY_CACHE_TOO_LARGE size_mb={size // (1024 * 1024)}")
+        except Exception as e:
+            log_with_sid(owner, "warning", f"DF_MEMORY_CACHE_SET_FAILED: {e}")
+    return dfs
 
 
 # ---------------------------------------------------------------------------
@@ -593,11 +773,7 @@ class UserStore:
         self.meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def load_dataframes(self) -> dict[str, pd.DataFrame]:
-        dfs: dict[str, pd.DataFrame] = {}
-        for fp in sorted(self.files_dir.iterdir()):
-            if fp.is_file() and not fp.name.startswith("."):
-                dfs.update(_load_one_file_cached(fp))
-        return dfs
+        return _load_dataframes_cached(self.files_dir, self.sid)
 
 
 # ---------------------------------------------------------------------------
@@ -667,11 +843,7 @@ class ChatDataStore:
             return []
 
     def load_dataframes(self) -> dict[str, pd.DataFrame]:
-        dfs: dict[str, pd.DataFrame] = {}
-        for fp in sorted(self.files_dir.iterdir()):
-            if fp.is_file() and not fp.name.startswith("."):
-                dfs.update(_load_one_file_cached(fp))
-        return dfs
+        return _load_dataframes_cached(self.files_dir, self.chat_id)
 
     def schema_docs(self) -> dict:
         """Build {filename: {file_description, fields: {col: {...}}}} for the brain."""

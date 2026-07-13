@@ -49,6 +49,12 @@ class Settings(BaseModel):
     SCHEMA_AUTOFILL_HINTS_JSON_MAX_CHARS: int = Field(default_factory=lambda: int(os.getenv("SCHEMA_AUTOFILL_HINTS_JSON_MAX_CHARS", "3000")))
     SCHEMA_AUTOFILL_DESC_WORD_LIMIT: int = Field(default_factory=lambda: int(os.getenv("SCHEMA_AUTOFILL_DESC_WORD_LIMIT", "20")))
 
+    # In-memory DataFrame cache budget (MB). Parsed dataframes for recently
+    # active chats are kept in RAM to avoid re-reading the disk cache on every
+    # question; total residency is bounded by this budget and entries expire
+    # after a short TTL, so an idle container returns to baseline memory.
+    DF_CACHE_MAX_MB: int = Field(default_factory=lambda: int(os.getenv("DF_CACHE_MAX_MB", "500")))
+
     # Title display defaults (used by the dashboard sidebar)
     TITLE_MAX_LEN: int = Field(default_factory=lambda: int(os.getenv("TITLE_MAX_LEN", "80")))
     TITLE_BREAK_MIN: int = Field(default_factory=lambda: int(os.getenv("TITLE_BREAK_MIN", "40")))
