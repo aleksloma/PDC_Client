@@ -57,6 +57,27 @@ def test_different_df_name_set_distinct():
     assert "File: g.csv" in out2
 
 
+def test_same_names_different_data_distinct_entries():
+    # Two chats whose files share names/columns but hold DIFFERENT data must
+    # never be served each other's schema string (its CATEGORICAL listings
+    # embed actual values).
+    out1 = schema_builder.schema_text(_docs(), _dfs())
+    dfs_other = {"f.csv": pd.DataFrame({"cat": ["x", "y", "z", "x"], "num": [9, 8, 7, 6]})}
+    out2 = schema_builder.schema_text(_docs(), dfs_other)
+    assert out1 != out2
+    assert "x" in out2 and "'a'" not in out2.replace('"', "'").split("CATEGORICAL")[0]
+
+
+def test_changed_data_same_schema_docs_refreshes():
+    # Add Data overwrite that renames a column but leaves meta unchanged must
+    # not serve the stale column list.
+    out1 = schema_builder.schema_text(_docs(), _dfs())
+    dfs2 = {"f.csv": pd.DataFrame({"category_renamed": ["a", "b"], "num": [1, 2]})}
+    out2 = schema_builder.schema_text(_docs(), dfs2)
+    assert "category_renamed" in out2
+    assert out1 != out2
+
+
 def test_cache_key_failure_still_computes(monkeypatch):
     monkeypatch.setattr(schema_builder, "_schema_text_cache_key", lambda *a: None)
     out = schema_builder.schema_text(_docs(), _dfs())

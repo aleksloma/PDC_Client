@@ -137,6 +137,21 @@ def test_mixed_type_column_survives_as_object(tmp_path):
     assert any(isinstance(v, (int, float)) and v == 3 for v in col.tolist())
 
 
+def test_header_near_scan_boundary_keeps_followers(tmp_path):
+    # Anchor at row 48 (0-based 47): the density detector's follower rows and
+    # the data rows live past row 50 — the HEADER_SCAN_ROWS margin must keep
+    # them visible or the sheet silently fails detection.
+    rows = [[f"note {i}", None] for i in range(47)]
+    rows.append(["region", "amount"])
+    rows += [[f"r{i}", i] for i in range(8)]
+    path = _make_wb(tmp_path, "deep.xlsx", {"D": {"rows": rows}})
+    dfs = det.load_excel_sheets(path, "deep.xlsx")
+    assert "deep.xlsx" in dfs
+    df = dfs["deep.xlsx"]
+    assert list(df.columns) == ["region", "amount"]
+    assert len(df) == 8
+
+
 def test_listobject_region_still_parsed_heuristically(tmp_path):
     # The ws.tables precheck was dropped with the streaming port; a workbook
     # containing a real ListObject must still parse via the heuristics.

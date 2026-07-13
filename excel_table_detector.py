@@ -45,10 +45,15 @@ import pandas as pd
 _EXTRACTED_TEXT_ABOVE_TABLE: Dict[str, str] = {}
 
 # Header detection reads only this many top rows (streamed, read-only) instead
-# of materializing the whole sheet. The value matches the detectors' internal
-# sample window (sample=50) so anchor/span decisions are identical to a
-# full-sheet read for any file whose header sits in the first rows.
-HEADER_SCAN_ROWS = 50
+# of materializing the whole sheet. The detectors' own scan window is 50 rows
+# (sample=50); the +10 margin keeps the density detector's follower check
+# (rows[i+1:i+6]), the modal detector's stable_for rows, and the span
+# decision's anchor+2 lookahead available for anchors near the bottom of that
+# window — the old full-sheet read had those rows, and without the margin a
+# header around row ~47-50 would silently lose its span/follower evidence.
+# NOTE: global's storage.py uses a bare 50 — port this margin back (module
+# policy: keep the two detectors in sync).
+HEADER_SCAN_ROWS = 50 + 10
 
 
 # --- Stage 6 keyword set (multilingual, NFKC-normalized + lowercased) ---

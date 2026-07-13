@@ -376,10 +376,21 @@ def _files_signature(files_dir: Path) -> Optional[tuple]:
 
 
 def _dfs_size_bytes(dfs: dict[str, pd.DataFrame]) -> Optional[int]:
-    """Approximate in-memory footprint of a dfs dict. None on failure → the
-    entry is simply not cached (safe fallback, Article IV)."""
+    """Approximate in-memory footprint of a dfs dict. Large frames are
+    estimated from a head sample — memory_usage(deep=True) walks every Python
+    object in object-dtype columns, which would add real latency to the cache
+    fill on multi-million-cell frames just to feed an approximate budget.
+    None on failure → the entry is simply not cached (safe fallback, Art. IV)."""
     try:
-        return int(sum(int(df.memory_usage(deep=True).sum()) for df in dfs.values()))
+        total = 0
+        for df in dfs.values():
+            n = len(df)
+            if n > 100_000:
+                sample = df.head(10_000)
+                total += int(sample.memory_usage(deep=True).sum()) * n // max(1, len(sample))
+            else:
+                total += int(df.memory_usage(deep=True).sum())
+        return int(total)
     except Exception as e:
         log_with_sid("df_cache", "warning", f"DF_CACHE_SIZE_FAILED: {e}")
         return None
@@ -387,10 +398,14 @@ def _dfs_size_bytes(dfs: dict[str, pd.DataFrame]) -> Optional[int]:
 
 def _load_dataframes_cached(files_dir: Path, owner: str) -> dict[str, pd.DataFrame]:
     """Shared load path for UserStore/ChatDataStore: signature-validated
-    in-memory cache in front of the per-file parquet disk cache. Returns a
-    shallow copy on hit so callers mutating the dict can't poison the cache
-    (in-place DataFrame mutation by executed code remains possible — same
-    exposure as the B2C app)."""
+    in-memory cache in front of the per-file parquet disk cache.
+
+    ISOLATION INVARIANT: the cache never shares DataFrame objects with any
+    caller. Executed LLM code mutates dataframes in place (dropna(inplace=
+    True), column assignment, ...), and before this cache existed every
+    request got fresh objects from disk — so the cache stores its own copies
+    at set() and hands out copies at get(). A df.copy() is a memcpy-fast
+    operation, orders of magnitude cheaper than the disk reload it saves."""
     key = str(files_dir)
     sig = _files_signature(files_dir)
     if sig is not None:
@@ -398,7 +413,7 @@ def _load_dataframes_cached(files_dir: Path, owner: str) -> dict[str, pd.DataFra
             entry = _DATAFRAME_CACHE.get(key)
             if entry is not None and entry.get("sig") == sig:
                 log_with_sid(owner, "info", f"DF_MEMORY_CACHE_HIT dfs={len(entry['dfs'])}")
-                return dict(entry["dfs"])
+                return {k: df.copy() for k, df in entry["dfs"].items()}
         except Exception as e:
             log_with_sid(owner, "warning", f"DF_MEMORY_CACHE_GET_FAILED: {e}")
     dfs: dict[str, pd.DataFrame] = {}
@@ -409,8 +424,10 @@ def _load_dataframes_cached(files_dir: Path, owner: str) -> dict[str, pd.DataFra
         try:
             size = _dfs_size_bytes(dfs)
             if size is not None:
-                cached = _DATAFRAME_CACHE.set(key, {"sig": sig, "dfs": dict(dfs)},
-                                              size_bytes=size)
+                cached = _DATAFRAME_CACHE.set(
+                    key,
+                    {"sig": sig, "dfs": {k: df.copy() for k, df in dfs.items()}},
+                    size_bytes=size)
                 if not cached:
                     log_with_sid(owner, "info",
                                  f"DF_MEMORY_CACHE_TOO_LARGE size_mb={size // (1024 * 1024)}")

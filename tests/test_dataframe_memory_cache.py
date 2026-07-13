@@ -73,6 +73,19 @@ def test_hit_returns_shallow_copy_cache_not_poisoned(store):
     assert "data.csv" in store.load_dataframes()
 
 
+def test_inplace_df_mutation_cannot_poison_cache(store):
+    # Executed LLM code mutates dataframes in place; neither the request that
+    # FILLED the cache nor one that HIT it may corrupt later requests.
+    _write_csv(store)
+    d1 = store.load_dataframes()  # fills the cache
+    d1["data.csv"].drop(d1["data.csv"].index, inplace=True)
+    d2 = store.load_dataframes()  # cache hit
+    assert len(d2["data.csv"]) == 2  # unaffected by the fill-request mutation
+    d2["data.csv"]["a"] = 0
+    d3 = store.load_dataframes()
+    assert d3["data.csv"]["a"].tolist() == [1, 3]  # unaffected by the hit mutation
+
+
 def test_userstore_and_chatstore_have_distinct_keys(tmp_path, monkeypatch, load_counter):
     monkeypatch.setattr(local_store.settings, "DATA_ROOT", str(tmp_path))
     local_store._DATAFRAME_CACHE.invalidate()

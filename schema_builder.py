@@ -26,18 +26,32 @@ from settings import settings
 from logger_utils import log_with_sid
 from local_store import LRUTTLCache
 
-# Memoizes the serialized schema string (mirrors the B2C `_schema_text_cache`).
-# The key covers schema_docs + the df name set + common_fields, NOT df values,
-# so categorical sample listings can lag a data update by at most the TTL —
-# 300s keeps that bound within the dataframe cache's own freshness horizon.
+# Memoizes the serialized schema string (mirrors the B2C `_schema_text_cache`,
+# with a stronger key). The key covers schema_docs + common_fields + a per-df
+# identity (name, shape, columns, dtypes, and a hash of the first rows), so
+# neither a data update that keeps the file names nor a DIFFERENT chat whose
+# files merely share names/columns can be served another dataset's schema
+# string. Deep value changes past the hashed head can still lag by at most
+# the TTL.
 _SCHEMA_TEXT_CACHE = LRUTTLCache(max_size=100, ttl_seconds=300)
 
 
 def _schema_text_cache_key(schema_docs, dfs, common_fields) -> str | None:
     try:
+        df_idents = []
+        for name in sorted(dfs.keys()):
+            df = dfs[name]
+            head_hash = int(pd.util.hash_pandas_object(
+                df.head(50).astype(str), index=False).sum()) if len(df) else 0
+            df_idents.append([
+                name, list(df.shape),
+                [str(c) for c in df.columns],
+                [str(t) for t in df.dtypes],
+                head_hash,
+            ])
         payload = (
             json.dumps(schema_docs, sort_keys=True, ensure_ascii=False, default=str)
-            + "|" + ",".join(sorted(dfs.keys()))
+            + "|" + json.dumps(df_idents, ensure_ascii=False)
             + "|" + json.dumps(common_fields or [], ensure_ascii=False, default=str)
         )
         return hashlib.md5(payload.encode("utf-8")).hexdigest()
