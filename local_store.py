@@ -120,10 +120,14 @@ def _parquet_cache_read(path: Path, src_size: int, src_mtime_ns: int) -> Optiona
             return None
         out: dict[str, pd.DataFrame] = {}
         for entry in manifest.get("entries", []):
-            key, fname = entry.get("key"), entry.get("parquet")
-            if not key or not fname:
+            key = entry.get("key")
+            pq_name, pkl_name = entry.get("parquet"), entry.get("pickle")
+            if not key or not (pq_name or pkl_name):
                 return None
-            out[key] = pd.read_parquet(cache_dir / fname)
+            if pq_name:
+                out[key] = pd.read_parquet(cache_dir / pq_name)
+            else:
+                out[key] = pd.read_pickle(cache_dir / pkl_name)
         if not out:
             return None
         log_with_sid(path.name, "info", f"PARQUET_CACHE_HIT {path.name} dfs={len(out)}")
@@ -137,10 +141,13 @@ def _parquet_cache_write(path: Path, dfs: dict[str, pd.DataFrame],
                          src_size: int, src_mtime_ns: int) -> None:
     """(Re)build this source file's cache. Writes are atomic (temp file +
     os.replace) so concurrent rebuilds can't corrupt each other — the rebuild
-    is idempotent. Each dataframe is round-trip-verified; if any dataframe
-    can't be reproduced byte-identically from parquet, that dataframe is
-    logged and skipped and NO manifest is written for the source file (a
-    partial manifest would silently drop the uncacheable dataframe on read)."""
+    is idempotent. Each dataframe is round-trip-verified. A dataframe parquet
+    can't reproduce byte-identically (e.g. a mixed numeric/string object
+    column) falls back to a PICKLE entry — pickle preserves the exact dtypes,
+    so cached loads stay identical to the first load. Only when the pickle
+    round-trip fails too is the dataframe logged and skipped, and then NO
+    manifest is written for the source file (a partial manifest would
+    silently drop the uncacheable dataframe on read)."""
     if not dfs:
         return
     try:
@@ -158,23 +165,43 @@ def _parquet_cache_write(path: Path, dfs: dict[str, pd.DataFrame],
                     raise ValueError("parquet round-trip altered the dataframe")
                 os.replace(tmp, cache_dir / fname)
                 entries.append({"key": key, "parquet": fname})
-            except Exception as e:
-                log_with_sid(path.name, "warning",
-                             f"PARQUET_CACHE_SKIP_DF file={path.name} key={key}: {e}")
+                continue
+            except Exception as e_pq:
                 try:
                     tmp.unlink(missing_ok=True)
                 except Exception:
                     pass
-                return
-        # Old manifest's parquet files that the new one no longer references
-        # (e.g. renamed sheets) are removed after the swap. Non-fatal.
+                pkl_name = _parquet_cache_safe_name(key) + ".pkl"
+                pkl_tmp = cache_dir / (pkl_name + tmp_suffix)
+                try:
+                    df.to_pickle(pkl_tmp)
+                    back = pd.read_pickle(pkl_tmp)
+                    if list(back.columns) != list(df.columns) or not back.equals(df):
+                        raise ValueError("pickle round-trip altered the dataframe")
+                    os.replace(pkl_tmp, cache_dir / pkl_name)
+                    entries.append({"key": key, "pickle": pkl_name})
+                    log_with_sid(path.name, "info",
+                                 f"PARQUET_CACHE_PICKLE_FALLBACK file={path.name} key={key}: {e_pq}")
+                except Exception as e_pkl:
+                    log_with_sid(path.name, "warning",
+                                 f"PARQUET_CACHE_SKIP_DF file={path.name} key={key}: "
+                                 f"parquet: {e_pq}; pickle: {e_pkl}")
+                    try:
+                        pkl_tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    return
+        # Old manifest's cache files (parquet or pickle) that the new one no
+        # longer references (e.g. renamed sheets, or a df that switched
+        # formats) are removed after the swap. Non-fatal.
         stale: list[str] = []
         try:
             if manifest_path.exists():
                 old = json.loads(manifest_path.read_text(encoding="utf-8"))
-                new_names = {e["parquet"] for e in entries}
-                stale = [e.get("parquet") for e in old.get("entries", [])
-                         if e.get("parquet") and e.get("parquet") not in new_names]
+                new_names = {e.get("parquet") or e.get("pickle") for e in entries}
+                stale = [n for e in old.get("entries", [])
+                         for n in (e.get("parquet"), e.get("pickle"))
+                         if n and n not in new_names]
         except Exception:
             stale = []
         manifest = {"src_size": src_size, "src_mtime_ns": src_mtime_ns, "entries": entries}
@@ -801,6 +828,17 @@ class ChatDataStore:
         for fp in user_store.files_dir.iterdir():
             if fp.is_file() and not fp.name.startswith("."):
                 shutil.copy2(fp, self.files_dir / fp.name)
+        # Also carry over the parsed-table disk cache: copy2 preserves
+        # mtime_ns, so the manifests (keyed on source size+mtime_ns) stay
+        # valid in the new chat store and the first question skips the
+        # parse entirely. Best-effort — a failed copy just re-parses.
+        try:
+            src_cache = user_store.files_dir / _PARQUET_CACHE_DIRNAME
+            if src_cache.is_dir():
+                shutil.copytree(src_cache, self.files_dir / _PARQUET_CACHE_DIRNAME,
+                                dirs_exist_ok=True)
+        except Exception as e:
+            log_with_sid(self.chat_id, "warning", f"PARQUET_CACHE_CLONE_FAILED: {e}")
         # Copy meta wholesale (already contains schema entries)
         try:
             self.meta_path.write_text(user_store.meta_path.read_text(encoding="utf-8"), encoding="utf-8")
