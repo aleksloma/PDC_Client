@@ -1774,8 +1774,10 @@ async function openConversation(chatId, convId) {
       } else {
         // Single-chart / table / text entry. New single-chart records persist
         // chart_data on the record → Show data on reload; old records omit it.
+        // Multi-table records carry msg.tables (+ per-table full keys).
         appendMessage(msg.role === 'human' ? 'user' : 'assistant', msg.content, msg.image_base64, msg.table, msg.full_table_key,
-          msg.role === 'human' ? null : { code: msg.code, chartData: msg.chart_data || null });
+          msg.role === 'human' ? null : { code: msg.code, chartData: msg.chart_data || null,
+            tables: msg.tables || null, fullTableKeys: msg.full_table_keys || null });
       }
     });
 
@@ -1786,7 +1788,7 @@ async function openConversation(chatId, convId) {
       role: m.role === 'human' ? 'human' : 'ai',
       image_base64: m.image_base64,
       images: m.images,
-      table: m.table
+      table: m.table || (m.tables && m.tables[0]) || null
     })));
 
   } catch (e) {
@@ -2154,6 +2156,27 @@ function appendMessage(role, content, imageBase64, table, fullTableKey, extras) 
     tableWrap.className = 'pdc-table-block';
     appendTableTo(tableWrap, table, fullTableKey, content || '');
     contentDiv.appendChild(tableWrap);
+  }
+
+  // Multi-table answer (RESULT was a dict of DataFrames): one titled block
+  // per table, mirroring the multi-chart images[] pattern. Per-table durable
+  // keys (extras.fullTableKeys) align by index for Download Excel / Show full.
+  const multiTables = extras && Array.isArray(extras.tables) ? extras.tables : null;
+  if (multiTables && multiTables.length) {
+    const keys = (extras && Array.isArray(extras.fullTableKeys)) ? extras.fullTableKeys : [];
+    multiTables.forEach((t, i) => {
+      if (!(t && t.columns && t.rows)) return;
+      const wrap = document.createElement('div');
+      wrap.className = 'pdc-table-block';
+      if (t.title) {
+        const h = document.createElement('div');
+        h.style.cssText = 'font-weight:600;margin:10px 0 4px;';
+        h.textContent = t.title;
+        wrap.appendChild(h);
+      }
+      appendTableTo(wrap, t, keys[i] || null, t.title || content || '');
+      contentDiv.appendChild(wrap);
+    });
   }
 
   // "Show data" / "Show code" buttons (assistant responses only).
@@ -2994,12 +3017,14 @@ async function sendMessage() {
             // For single-response (non-multi-plot) that came via SSE
             if (chartCount === 0) {
               const answer = data.answer || '';
-              const hasContent = answer || data.image_base64 || (data.table && data.table.columns);
+              const hasContent = answer || data.image_base64 || (data.table && data.table.columns)
+                || (data.tables && data.tables.length);
               if (!hasContent) {
                 appendMessage('assistant', 'I processed your request but could not generate a response. Please try rephrasing your question.');
               } else {
                 appendMessage('assistant', answer, data.image_base64, data.table, data.full_table_key,
-          { code: data.code, chartDataKey: data.chart_data_key });
+          { code: data.code, chartDataKey: data.chart_data_key,
+            tables: data.tables || null, fullTableKeys: data.full_table_keys || null });
               }
               chatMessages.scrollTop = chatMessages.scrollHeight;
             }
@@ -3057,12 +3082,14 @@ async function sendMessage() {
       loadingDiv.remove();
 
       const answer = data.answer || '';
-      const hasContent = answer || data.image_base64 || (data.table && data.table.columns);
+      const hasContent = answer || data.image_base64 || (data.table && data.table.columns)
+        || (data.tables && data.tables.length);
       if (!hasContent) {
         appendMessage('assistant', 'I processed your request but could not generate a response. Please try rephrasing your question.');
       } else {
         appendMessage('assistant', answer, data.image_base64, data.table, data.full_table_key,
-          { code: data.code, chartDataKey: data.chart_data_key });
+          { code: data.code, chartDataKey: data.chart_data_key,
+            tables: data.tables || null, fullTableKeys: data.full_table_keys || null });
       }
       chatMessages.scrollTop = chatMessages.scrollHeight;
 
@@ -3274,14 +3301,16 @@ async function editAndRegenerate(messageDiv, editedQuestion) {
     loadingDiv.remove();
 
     const answer = data.answer || '';
-    const hasContent = answer || data.image_base64 || (data.table && data.table.columns);
+    const hasContent = answer || data.image_base64 || (data.table && data.table.columns)
+      || (data.tables && data.tables.length);
 
     if (!hasContent) {
       console.warn('Empty response from server:', data);
       appendMessage('assistant', 'I processed your request but could not generate a response. Please try rephrasing your question.');
     } else {
       appendMessage('assistant', answer, data.image_base64, data.table, data.full_table_key,
-        { code: data.code, chartDataKey: data.chart_data_key });
+        { code: data.code, chartDataKey: data.chart_data_key,
+          tables: data.tables || null, fullTableKeys: data.full_table_keys || null });
     }
     chatMessages.scrollTop = chatMessages.scrollHeight;
 

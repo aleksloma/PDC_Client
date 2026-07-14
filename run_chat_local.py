@@ -107,6 +107,46 @@ def _build_table_from_result(result_obj) -> Optional[dict]:
         return None
 
 
+def _build_tables_from_result(result_obj) -> Optional[list]:
+    """Handle a DICT of DataFrames/Series/Stylers as the executed RESULT
+    (e.g. RESULT = {'Sales first 10': df1, 'Stock first 10': df2} — a shape
+    models produce for "show each table" questions even though the planner
+    prompt asks for a single DataFrame; before this, such answers rendered as
+    prose garbage because no table event was built).
+
+    Maps each DataFrame-like value through `_build_table_from_result` and
+    carries the dict key as the table's `title`. Non-DF values are skipped.
+    Returns a non-empty list of {title, columns, rows, total_rows
+    [, styled_html]} dicts, or None."""
+    if not isinstance(result_obj, dict) or not result_obj:
+        return None
+    tables: list = []
+    for key, val in result_obj.items():
+        try:
+            t = _build_table_from_result(val)
+            if t and int(t.get("total_rows", 0)) > 0 and (t.get("rows") or []):
+                t["title"] = str(key)
+                tables.append(t)
+        except Exception as e:
+            log_with_sid(str(key), "warning", f"MULTI_TABLE_BUILD_FAILED: {e}")
+    return tables or None
+
+
+def _tables_from_python_result(result_obj, table):
+    """Shared post-processing for the PYTHON branches: when the single-table
+    builder found nothing and the result is a dict of DF-likes, build the
+    tables list; a single-entry dict unwraps back into the plain single-table
+    path (no UI change needed for that common shape). Returns (table, tables)."""
+    tables = None
+    if table is None:
+        tables = _build_tables_from_result(result_obj)
+        if tables and len(tables) == 1:
+            table = dict(tables[0])
+            table.pop("title", None)
+            tables = None
+    return table, tables
+
+
 def _safe_preview(preview) -> Any:
     """The hard data-boundary guard (Article II): only scalars — or dicts whose
     VALUES are all plain scalars/None — may be forwarded to the brain. NEVER
@@ -288,15 +328,16 @@ def run_chat(
     table = _build_table_from_result(result_obj)
     if table and (int(table.get("total_rows", 0)) <= 0 or not (table.get("rows") or [])):
         table = None
+    table, tables = _tables_from_python_result(result_obj, table)
     img_b64 = exec_out.get("image_base64")
 
     if img_b64:
         d = brain_client.describe(sid=sid, question=question, code=code, user_email=user_email)
-        return {"text": d.get("text", ""), "image_base64": img_b64, "table": table, "code": code, "usage": _sum_usage(usage, d.get("usage") or {})}
+        return {"text": d.get("text", ""), "image_base64": img_b64, "table": table, "tables": tables, "code": code, "usage": _sum_usage(usage, d.get("usage") or {})}
 
-    if table:
+    if table or tables:
         d = brain_client.describe(sid=sid, question=question, code=code, user_email=user_email)
-        return {"text": d.get("text", ""), "image_base64": None, "table": table, "code": code, "usage": _sum_usage(usage, d.get("usage") or {})}
+        return {"text": d.get("text", ""), "image_base64": None, "table": table, "tables": tables, "code": code, "usage": _sum_usage(usage, d.get("usage") or {})}
 
     # Scalar result — safe to forward to the summarizer
     safe_p = _safe_preview(preview)
@@ -1062,16 +1103,17 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
     table = _build_table_from_result(result_obj)
     if table and (int(table.get("total_rows", 0)) <= 0 or not (table.get("rows") or [])):
         table = None
+    table, tables = _tables_from_python_result(result_obj, table)
     img_b64 = exec_out.get("image_base64")
 
     if img_b64:
         d = brain_client.describe(sid=sid, question=question, code=code, user_email=user_email)
         return {"text": d.get("text", ""), "image_base64": img_b64, "table": table,
-                "code": code, "usage": _sum_usage(usage, d.get("usage") or {})}
-    if table:
+                "tables": tables, "code": code, "usage": _sum_usage(usage, d.get("usage") or {})}
+    if table or tables:
         d = brain_client.describe(sid=sid, question=question, code=code, user_email=user_email)
         return {"text": d.get("text", ""), "image_base64": None, "table": table,
-                "code": code, "usage": _sum_usage(usage, d.get("usage") or {})}
+                "tables": tables, "code": code, "usage": _sum_usage(usage, d.get("usage") or {})}
 
     preview = exec_out.get("preview")
     safe_p = _safe_preview(preview)

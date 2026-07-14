@@ -64,10 +64,15 @@ def _cache_full_table(table: dict) -> str:
 _FULL_KEY_RE = re.compile(r"[0-9a-fA-F]{16}")
 
 
-def _persist_full_table(store, table: dict, code: str | None) -> str | None:
+def _persist_full_table(store, table: dict, code: str | None,
+                        result_key: str | None = None) -> str | None:
     """Persist {columns, rows, code, total_rows} to disk and mirror it into the
     in-memory LRU. Returns the durable key, or None on failure (caller then
-    leaves `full_table_key` unset and the frontend exports the preview rows)."""
+    leaves `full_table_key` unset and the frontend exports the preview rows).
+
+    `result_key`: set for one table of a multi-table answer — names the dict
+    entry of the re-executed RESULT this table comes from (see
+    `_reexecute_full_df`)."""
     try:
         key = secrets.token_hex(8)  # 16 hex chars — matches _FULL_KEY_RE
         record = _json_safe({
@@ -77,6 +82,8 @@ def _persist_full_table(store, table: dict, code: str | None) -> str | None:
         })
         if code:
             record["code"] = code
+        if result_key is not None:
+            record["result_key"] = result_key
         full_dir = store.conversations_dir / "full"
         full_dir.mkdir(parents=True, exist_ok=True)
         (full_dir / f"{key}.json").write_text(
@@ -111,9 +118,13 @@ def _load_full_table_record(store, key: str) -> dict | None:
     return _FULL_TABLE_CACHE.get(key)
 
 
-async def _reexecute_full_df(chat_id: str, code: str | None):
+async def _reexecute_full_df(chat_id: str, code: str | None, result_key: str | None = None):
     """Re-run stored code locally to produce the COMPLETE (uncapped) DataFrame.
     Returns a DataFrame or None (caller falls back to the stored preview rows).
+
+    `result_key`: for multi-table answers (RESULT was a dict of DataFrames) the
+    durable record stores which dict entry this table came from — pick it out
+    of the re-executed dict before the normal normalization.
 
     Article II: execution is local — nothing here touches the brain.
     Article V: reads local DataFrames only. Article IV: never raises."""
@@ -132,6 +143,8 @@ async def _reexecute_full_df(chat_id: str, code: str | None):
         if not isinstance(exec_out, dict) or exec_out.get("error"):
             return None
         obj = exec_out.get("result")
+        if isinstance(obj, dict) and result_key is not None:
+            obj = obj.get(result_key)
         if isinstance(obj, pd.DataFrame):
             return obj
         if isinstance(obj, pd.Series):
@@ -259,7 +272,8 @@ def _build_chart_entry(c: dict) -> dict:
 
 
 def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
-                             usage, charts, full_table_key=None):
+                             usage, charts, full_table_key=None,
+                             full_table_keys=None):
     """Build the AI-turn history record persisted EXACTLY ONCE by the worker.
 
     Returns None when there is nothing to persist (never writes an empty turn).
@@ -283,6 +297,13 @@ def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
         }
         if full_table_key:
             rec["full_table_key"] = full_table_key
+        # Multi-table answer: persist the tables array (mirrors the multi-chart
+        # `images` array) + per-table durable keys aligned by index.
+        tables = single.get("tables")
+        if tables:
+            rec["tables"] = tables
+            if full_table_keys:
+                rec["full_table_keys"] = full_table_keys
         cd = _persistable_chart_data(single.get("chart_data"))
         if cd is not None:
             rec["chart_data"] = cd
@@ -697,6 +718,7 @@ async def chat_stream(request: Request, chat_id: str):
             w_usage: dict = {}
             w_single = None                 # single-shot result dict
             w_full_table_key = None         # durable key for a tabular result
+            w_full_table_keys = None        # per-table keys for a multi-table result
             err_msg = None
             cancelled = False               # STOP requested mid-generation
             # Clear any stale cancel flag from a prior attempt, then mark this
@@ -729,6 +751,19 @@ async def chat_stream(request: Request, chat_id: str):
                             if _k:
                                 event["full_table_key"] = _k
                                 w_full_table_key = _k
+                        # Multi-table answer (RESULT was a dict of DataFrames):
+                        # one durable key per table, each tagged with the dict
+                        # entry (`result_key`) it re-executes to.
+                        _tbls = _res.get("tables")
+                        if isinstance(_tbls, list) and _tbls:
+                            _keys = []
+                            for _t in _tbls:
+                                _k = _persist_full_table(
+                                    store, _t, _res.get("code"),
+                                    result_key=_t.get("title"))
+                                _keys.append(_k)
+                            event["full_table_keys"] = _keys
+                            w_full_table_keys = _keys
                     # Stream live first (UX identical to before), then accumulate.
                     loop.call_soon_threadsafe(queue.put_nowait, ("event", event))
                     try:
@@ -794,7 +829,8 @@ async def chat_stream(request: Request, chat_id: str):
                 else:
                     record = _build_ai_history_record(
                         err_msg, w_single, w_combined_answer, w_combined_codes,
-                        w_usage, w_charts, full_table_key=w_full_table_key)
+                        w_usage, w_charts, full_table_key=w_full_table_key,
+                        full_table_keys=w_full_table_keys)
                 if record is not None:
                     store.append_history(conv_id, record)
                     if not err_msg and not cancelled:
@@ -913,7 +949,9 @@ async def chat_stream(request: Request, chat_id: str):
                     "answer": result.get("text", ""),
                     "image_base64": result.get("image_base64"),
                     "table": result.get("table"),
+                    "tables": result.get("tables"),
                     "full_table_key": full_table_key,
+                    "full_table_keys": ev.get("full_table_keys"),
                     "chart_data_key": chart_data_key,
                     "code": result.get("code"),
                     "tokens": result.get("usage") or {},
@@ -1082,6 +1120,15 @@ async def edit_regenerate(request: Request, chat_id: str):
             if isinstance(tbl, dict) and tbl.get("rows"):
                 full_table_key = _persist_full_table(
                     store, tbl, single_result.get("code"))
+            # Multi-table answer: one durable key per table (see chat_stream).
+            full_table_keys = None
+            tbls = single_result.get("tables")
+            if isinstance(tbls, list) and tbls:
+                full_table_keys = [
+                    _persist_full_table(store, t, single_result.get("code"),
+                                        result_key=t.get("title"))
+                    for t in tbls
+                ]
             ai_record = {
                 "role": "ai",
                 "content": single_result.get("text", ""),
@@ -1093,6 +1140,10 @@ async def edit_regenerate(request: Request, chat_id: str):
             }
             if full_table_key:
                 ai_record["full_table_key"] = full_table_key
+            if tbls:
+                ai_record["tables"] = tbls
+                if full_table_keys:
+                    ai_record["full_table_keys"] = full_table_keys
             store.append_history(conv_id, ai_record)
             chart_data_key = None
             cd = single_result.get("chart_data")
@@ -1103,7 +1154,9 @@ async def edit_regenerate(request: Request, chat_id: str):
                 "answer": single_result.get("text", ""),
                 "image_base64": single_result.get("image_base64"),
                 "table": single_result.get("table"),
+                "tables": single_result.get("tables"),
                 "full_table_key": full_table_key,
+                "full_table_keys": full_table_keys,
                 "chart_data_key": chart_data_key,
                 "code": single_result.get("code"),
                 "tokens": single_result.get("usage") or {},
@@ -1338,7 +1391,7 @@ async def full_table_get(request: Request, chat_id: str, key: str):
     rec = _load_full_table_record(store, key)
     if not rec:
         return JSONResponse({"error": "Full table not found or expired."}, status_code=404)
-    df = await _reexecute_full_df(chat_id, rec.get("code"))
+    df = await _reexecute_full_df(chat_id, rec.get("code"), rec.get("result_key"))
     if df is not None and not df.empty:
         return _json_safe({
             "columns": list(df.columns),
@@ -1521,7 +1574,7 @@ async def download_excel(request: Request, chat_id: str, key: str):
     if not rec:
         return JSONResponse({"error": "Table not found or expired."}, status_code=404)
     try:
-        df = await _reexecute_full_df(chat_id, rec.get("code"))
+        df = await _reexecute_full_df(chat_id, rec.get("code"), rec.get("result_key"))
         if df is not None and not df.empty:
             xlsx = _df_to_xlsx_bytes(df)
         else:
