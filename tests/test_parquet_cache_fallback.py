@@ -78,10 +78,12 @@ def test_mixed_manifest_parquet_plus_pickle(tmp_path):
     pd.testing.assert_frame_equal(out["data.xlsx::Mixed"], _mixed_df())
 
 
-def test_old_shape_manifest_still_loads(tmp_path):
-    # Regression required by CLAUDE.md: a manifest exactly as the PREVIOUS
-    # release wrote it (all-'parquet' entries, no 'pickle' keys) must load
-    # unchanged after the upgrade.
+def test_old_shape_manifest_triggers_reparse_not_stale_serve(tmp_path):
+    # A manifest written by a PREVIOUS release (no parser_version) must be a
+    # cache MISS — the old parser could have cached Timestamp/duplicate column
+    # names, and serving them forever would keep pre-fix chats broken. The
+    # data still loads (upgrade-safe): the miss falls back to the detection
+    # pipeline and the cache is rewritten at the current version.
     src, size, mtime = _src(tmp_path)
     df = pd.DataFrame({"a": [1, 2, 3]})
     cache_dir, manifest_path = _parquet_cache_paths(src)
@@ -92,9 +94,15 @@ def test_old_shape_manifest_still_loads(tmp_path):
         "entries": [{"key": "data.xlsx", "parquet": "old_entry.parquet"}],
     }), encoding="utf-8")
 
+    assert _parquet_cache_read(src, size, mtime) is None  # versionless → miss
+
+    # A manifest at the CURRENT parser version loads normally.
+    _parquet_cache_write(src, {"data.xlsx": df}, size, mtime)
     out = _parquet_cache_read(src, size, mtime)
     assert out is not None
     pd.testing.assert_frame_equal(out["data.xlsx"], df)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["parser_version"] == local_store._PARQUET_CACHE_PARSER_VERSION
 
 
 def test_corrupted_pickle_self_heals_to_pipeline(tmp_path, monkeypatch):

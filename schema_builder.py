@@ -96,11 +96,14 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
                 for c in cols:
                     d = fields.get(c, {})
                     if isinstance(d, dict):
-                        descs[c] = d.get("description", "")
-                        tech_descs[c] = d.get("technical_description", "")
+                        # str(c): display keys must be JSON-safe even if a
+                        # legacy cached parse still carries non-str column
+                        # names (Timestamps, ints from read_json).
+                        descs[str(c)] = d.get("description", "")
+                        tech_descs[str(c)] = d.get("technical_description", "")
                         values = d.get("values", {}) or {}
                         if values and isinstance(values, dict):
-                            value_descs[c] = values
+                            value_descs[str(c)] = values
 
         dtype_info = {}
         for c in cols:
@@ -111,7 +114,7 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
                 # detector dedupes names at load, this is the safety net).
                 dt = str(df[c].dtype)
             except Exception:
-                dtype_info[c] = "object"
+                dtype_info[str(c)] = "object"
                 continue
             if df[c].dtype == object or df[c].dtype.kind == "O" or str(df[c].dtype) in ("str", "string", "object"):
                 try:
@@ -119,19 +122,19 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
                     n_unique = len(uniq)
                     if n_unique <= 20:
                         sample = uniq.tolist()
-                        dtype_info[c] = f"CATEGORICAL ({n_unique} unique values: {', '.join(str(v) for v in sample)})"
+                        dtype_info[str(c)] = f"CATEGORICAL ({n_unique} unique values: {', '.join(str(v) for v in sample)})"
                     else:
                         sample = uniq[:10].tolist()
-                        dtype_info[c] = f"object ({n_unique} unique, sample: {', '.join(str(v) for v in sample)})"
+                        dtype_info[str(c)] = f"object ({n_unique} unique, sample: {', '.join(str(v) for v in sample)})"
                 except Exception:
-                    dtype_info[c] = "object"
+                    dtype_info[str(c)] = "object"
             else:
-                dtype_info[c] = dt
+                dtype_info[str(c)] = dt
 
         file_info = f"File: {fname}"
         if file_desc and isinstance(file_desc, str) and file_desc.strip():
             file_info += f"\nFile Description: {file_desc.strip()}"
-        file_info += f"\nColumns: {', '.join(cols)}\nColumn Descriptions (business): {json.dumps(descs, ensure_ascii=False)}"
+        file_info += f"\nColumns: {', '.join(str(c) for c in cols)}\nColumn Descriptions (business): {json.dumps(descs, ensure_ascii=False)}"
         active_tech = {c: v for c, v in tech_descs.items() if v}
         if active_tech:
             file_info += f"\nColumn Technical Info: {json.dumps(active_tech, ensure_ascii=False)}"

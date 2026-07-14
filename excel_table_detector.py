@@ -293,12 +293,19 @@ def _read_with_multiheader(
         seen: dict = {}
         out: List[str] = []
         for n in names:
-            if n in seen:
-                seen[n] += 1
-                out.append(f"{n}.{seen[n]}")
-            else:
+            if n not in seen:
                 seen[n] = 0
                 out.append(n)
+                continue
+            seen[n] += 1
+            candidate = f"{n}.{seen[n]}"
+            # A generated name can collide with a REAL column ('a','a','a.1')
+            # — keep counting until the candidate is genuinely unused.
+            while candidate in seen:
+                seen[n] += 1
+                candidate = f"{n}.{seen[n]}"
+            seen[candidate] = 0
+            out.append(candidate)
         return out
     flat: List[str] = []
     if isinstance(df.columns, pd.MultiIndex):

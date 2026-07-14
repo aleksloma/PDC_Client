@@ -209,15 +209,20 @@ def test_duplicate_header_names_are_deduped(tmp_path):
     # come back unique (pandas-style .1 suffix) so every downstream df[c] is
     # a Series.
     rows = [
-        ["Brand", "Qty", "Qty", "Amount"],
-        ["TOUS", 1, 2, 30],
-        ["Casio", 3, 4, 50],
-        ["Pandora", 5, 6, 70],
+        ["Brand", "Qty", "Qty", "Qty.1", "Amount"],
+        ["TOUS", 1, 2, 9, 30],
+        ["Casio", 3, 4, 9, 50],
+        ["Pandora", 5, 6, 9, 70],
     ]
     path = _make_wb(tmp_path, "dup.xlsx", {"D": {"rows": rows}})
     dfs = det.load_excel_sheets(path, "dup.xlsx")
     df = dfs["dup.xlsx"]
-    assert list(df.columns) == ["Brand", "Qty", "Qty.1", "Amount"]
+    # pandas may pre-mangle single-row duplicate headers itself; our _dedupe
+    # is the backstop (and the only guard on the MultiIndex-flatten branch,
+    # where the Casio duplicates actually came from). The exact mangled names
+    # depend on the pandas version — the CONTRACT is uniqueness.
+    assert len(set(df.columns)) == len(df.columns)
+    assert {"Brand", "Qty", "Amount"} <= set(df.columns)
     import pandas as pd
     assert all(isinstance(df[c], pd.Series) for c in df.columns)
     # And schema_text over it must not raise.

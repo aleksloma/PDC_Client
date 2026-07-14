@@ -170,6 +170,12 @@ def _load_one_file(path: Path) -> dict[str, pd.DataFrame]:
 # break loading. Article V: lives on local disk under DATA_ROOT only.
 _PARQUET_CACHE_DIRNAME = ".parquet_cache"
 _PARQUET_CACHEABLE_EXTS = (".xls", ".xlsx", ".xlsm", ".csv", ".tsv", ".json")
+# Bump when the PARSE pipeline changes what a cached dataframe looks like
+# (column naming, detection semantics). A manifest with a different/absent
+# version is a MISS, so caches written by an older parser self-heal by
+# re-parsing instead of serving stale shapes forever.
+# v2: column names str()-normalized + duplicate names deduped ("name.1").
+_PARQUET_CACHE_PARSER_VERSION = 2
 
 
 def _parquet_cache_safe_name(key: str) -> str:
@@ -196,6 +202,8 @@ def _parquet_cache_read(path: Path, src_size: int, src_mtime_ns: int) -> Optiona
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if manifest.get("src_size") != src_size or manifest.get("src_mtime_ns") != src_mtime_ns:
             return None
+        if manifest.get("parser_version") != _PARQUET_CACHE_PARSER_VERSION:
+            return None  # written by an older parser — re-parse and rewrite
         out: dict[str, pd.DataFrame] = {}
         for entry in manifest.get("entries", []):
             key = entry.get("key")
@@ -282,7 +290,8 @@ def _parquet_cache_write(path: Path, dfs: dict[str, pd.DataFrame],
                          if n and n not in new_names]
         except Exception:
             stale = []
-        manifest = {"src_size": src_size, "src_mtime_ns": src_mtime_ns, "entries": entries}
+        manifest = {"src_size": src_size, "src_mtime_ns": src_mtime_ns,
+                    "parser_version": _PARQUET_CACHE_PARSER_VERSION, "entries": entries}
         m_tmp = cache_dir / (manifest_path.name + tmp_suffix)
         m_tmp.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
         os.replace(m_tmp, manifest_path)
