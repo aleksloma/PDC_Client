@@ -152,6 +152,56 @@ def test_header_near_scan_boundary_keeps_followers(tmp_path):
     assert len(df) == 8
 
 
+def test_datetime_headers_become_string_columns(tmp_path):
+    # The 12MB customer file's sheet has datetime cells in the HEADER row —
+    # raw pd.Timestamp column names crashed the upload's meta write
+    # ("keys must be str..., not Timestamp"). Columns must come back as str.
+    import datetime as dt
+    import json
+    rows = [
+        ["Brand", dt.datetime(2022, 9, 1), dt.datetime(2022, 10, 1)],
+        ["TOUS", 5, 7],
+        ["Casio", 3, 4],
+        ["Pandora", 1, 2],
+    ]
+    path = _make_wb(tmp_path, "dt_headers.xlsx", {"B": {"rows": rows}})
+    dfs = det.load_excel_sheets(path, "dt_headers.xlsx")
+    df = dfs["dt_headers.xlsx"]
+    assert all(isinstance(c, str) for c in df.columns)
+    # The exact upload shape must be JSON-serializable now.
+    json.dumps({c: {"description": "", "values": None} for c in df.columns})
+
+
+def test_upload_meta_with_hidden_sheets_and_odd_keys(tmp_path, monkeypatch):
+    # write_meta must survive non-string schema keys (safety net) AND hidden
+    # sheets must never appear in the meta built from detected dataframes.
+    import json
+    import pandas as pd
+    import local_store
+    monkeypatch.setattr(local_store.settings, "DATA_ROOT", str(tmp_path))
+    local_store._DATAFRAME_CACHE.invalidate()
+    path = _make_wb(tmp_path, "mix2.xlsx", {
+        "Visible": {"rows": _SIMPLE_ROWS},
+        "HiddenData": {"rows": _SIMPLE_ROWS, "state": "hidden"},
+    })
+    dfs = det.load_excel_sheets(path, "mix2.xlsx")
+    store = local_store.UserStore("s_hiddenmeta")
+    meta = {"files": [
+        {"file_name": k,
+         "schema": {"fields": {c: {"description": ""} for c in df.columns}}}
+        for k, df in dfs.items()
+    ]}
+    # Simulate the pre-fix hazard too: a Timestamp key must not crash the write.
+    meta["files"][0]["schema"]["fields"][pd.Timestamp("2022-09-01")] = {"description": ""}
+    store.write_meta(meta)  # must NOT raise
+    saved = json.loads(store.meta_path.read_text(encoding="utf-8"))
+    names = [f["file_name"] for f in saved["files"]]
+    assert names == ["mix2.xlsx"]  # single visible sheet, no hidden entries
+    assert "HiddenData" not in json.dumps(saved)
+    assert "2022-09-01" in json.dumps(saved["files"][0]["schema"]["fields"])
+    local_store._DATAFRAME_CACHE.invalidate()
+
+
 def test_listobject_region_still_parsed_heuristically(tmp_path):
     # The ws.tables precheck was dropped with the streaming port; a workbook
     # containing a real ListObject must still parse via the heuristics.

@@ -277,8 +277,12 @@ def _read_with_multiheader(
     header_span: int,
 ) -> Tuple[List[str], pd.DataFrame]:
     header_rows = list(range(header_row_0based, header_row_0based + header_span))
-    df = pd.read_excel(file_input, sheet_name=sheet_name,
-                       header=header_rows, engine="calamine")
+    if isinstance(file_input, pd.ExcelFile):
+        # Reused pre-parsed workbook (engine chosen at ExcelFile construction).
+        df = file_input.parse(sheet_name=sheet_name, header=header_rows)
+    else:
+        df = pd.read_excel(file_input, sheet_name=sheet_name,
+                           header=header_rows, engine="calamine")
     flat: List[str] = []
     if isinstance(df.columns, pd.MultiIndex):
         for tup in df.columns:
@@ -296,6 +300,12 @@ def _read_with_multiheader(
         df.columns = flat
     else:
         flat = [str(c) for c in df.columns]
+        # Assign in this branch too: a sheet whose header row holds datetime
+        # cells otherwise keeps raw pd.Timestamp COLUMN NAMES, which crash
+        # every json.dumps that uses columns as dict keys (meta write on
+        # upload → 500). Global's copy computes `flat` here without assigning
+        # — same latent bug; port this back.
+        df.columns = flat
     return flat, df
 
 
@@ -417,18 +427,25 @@ def _build_text_above(rows: List[list], anchor_idx: int) -> str:
     return "\n".join(lines).strip()
 
 
-def _read_top_rows(file_input, sheet_name: str, max_rows: int) -> Optional[List[list]]:
+def _read_top_rows(file_input, sheet_name: str, max_rows: int,
+                   wb=None) -> Optional[List[list]]:
     """Stream the first `max_rows` rows of VALUES from one sheet using a
     read-only openpyxl load. read_only=True streams rows without building the
     per-cell object graph (the source of the old full-load time/memory blow-up),
     and the early break stops after `max_rows`. Empty cells come back as None,
     matching the value contract the header detectors expect.
+
+    `wb`: an already-open read-only workbook to REUSE (multi-sheet files —
+    re-opening per sheet re-parses sharedStrings every time, which dominated
+    load time on large workbooks). A caller-provided wb is NOT closed here.
     """
     import openpyxl
-    wb = None
+    own_wb = None
     try:
-        wb_input = BytesIO(file_input) if isinstance(file_input, bytes) else str(file_input)
-        wb = openpyxl.load_workbook(wb_input, read_only=True, data_only=True)
+        if wb is None:
+            wb_input = BytesIO(file_input) if isinstance(file_input, bytes) else str(file_input)
+            own_wb = openpyxl.load_workbook(wb_input, read_only=True, data_only=True)
+            wb = own_wb
         if sheet_name not in wb.sheetnames:
             return None
         ws = wb[sheet_name]
@@ -439,9 +456,9 @@ def _read_top_rows(file_input, sheet_name: str, max_rows: int) -> Optional[List[
                 break
         return rows
     finally:
-        if wb is not None:
+        if own_wb is not None:
             try:
-                wb.close()
+                own_wb.close()
             except Exception:
                 pass
 
@@ -451,6 +468,8 @@ def _detect_and_extract_table(
     sheet_name: str,
     df_key: str,
     log_prefix: str = "[EXCEL_DETECT]",
+    probe_wb=None,        # open read-only openpyxl wb to reuse for the top slice
+    excel_file=None,      # open pd.ExcelFile (calamine) to reuse for the body read
 ) -> Optional[pd.DataFrame]:
     """Detect the table region on one Excel sheet and return the cleaned df.
 
@@ -475,7 +494,7 @@ def _detect_and_extract_table(
     data and incompatible with a streaming read.
     """
     # Stage A: streamed header detection over the top slice (values only).
-    top_rows = _read_top_rows(file_input, sheet_name, HEADER_SCAN_ROWS)
+    top_rows = _read_top_rows(file_input, sheet_name, HEADER_SCAN_ROWS, wb=probe_wb)
     if not top_rows:
         return None
 
@@ -495,9 +514,15 @@ def _detect_and_extract_table(
         print(f"{log_prefix} {df_key}: captured {len(text_above)} chars of text above table",
               flush=True)
 
-    # Stage B: full data read + flatten (calamine engine, multi-header when span=2)
+    # Stage B: full data read + flatten (calamine engine, multi-header when
+    # span=2). A caller-provided ExcelFile reuses ONE parsed workbook across
+    # sheets — pd.read_excel(engine="calamine") on a path re-parses the whole
+    # file per call, which dominated load time on multi-sheet workbooks.
     try:
-        pd_input = BytesIO(file_input) if isinstance(file_input, bytes) else str(file_input)
+        if excel_file is not None:
+            pd_input = excel_file
+        else:
+            pd_input = BytesIO(file_input) if isinstance(file_input, bytes) else str(file_input)
         flat, df = _read_with_multiheader(pd_input, sheet_name, anchor_idx, span)
     except Exception as e_read:
         print(f"{log_prefix} {df_key}: pandas multi-header read failed "
@@ -603,39 +628,63 @@ def load_excel_sheets(file_path: Path, filename: str) -> Dict[str, pd.DataFrame]
     total_start = _time.time()
     print(f"[EXCEL] Loading {filename} via validated detection pipeline...", flush=True)
 
+    # ONE read-only openpyxl workbook serves the visibility probe AND every
+    # sheet's 50-row top slice; ONE calamine ExcelFile serves every sheet's
+    # body read. Re-opening per sheet re-parsed the whole workbook each time
+    # (sharedStrings + all sheet XML), which multiplied load time by the
+    # sheet count on multi-sheet files.
     wb_probe = openpyxl.load_workbook(str(file_path), read_only=True, data_only=True)
+    xl = None
     try:
-        file_size_mb = file_path.stat().st_size / 1024 / 1024
-    except Exception:
-        file_size_mb = 0.0
-    sheet_names: List[str] = []
-    for sn in wb_probe.sheetnames:
         try:
-            state = wb_probe[sn].sheet_state
+            file_size_mb = file_path.stat().st_size / 1024 / 1024
+        except Exception:
+            file_size_mb = 0.0
+        sheet_names: List[str] = []
+        for sn in wb_probe.sheetnames:
+            try:
+                state = wb_probe[sn].sheet_state
+            except Exception as e:
+                from logger_utils import log_with_sid
+                log_with_sid(filename, "warning",
+                             f"EXCEL_SHEET_STATE_PROBE_FAILED sheet='{sn}': {e}")
+                state = "visible"  # fall back safely: never drop a sheet on probe failure
+            if state == "visible":
+                sheet_names.append(sn)
+            else:
+                print(f"[EXCEL]   {filename}::{sn}: SKIPPED (hidden sheet)", flush=True)
+        print(f"[EXCEL]   {filename}: {len(sheet_names)} visible sheet(s), {file_size_mb:.2f}MB", flush=True)
+
+        try:
+            xl = pd.ExcelFile(str(file_path), engine="calamine")
         except Exception as e:
             from logger_utils import log_with_sid
-            log_with_sid(filename, "warning",
-                         f"EXCEL_SHEET_STATE_PROBE_FAILED sheet='{sn}': {e}")
-            state = "visible"  # fall back safely: never drop a sheet on probe failure
-        if state == "visible":
-            sheet_names.append(sn)
-        else:
-            print(f"[EXCEL]   {filename}::{sn}: SKIPPED (hidden sheet)", flush=True)
-    wb_probe.close()
-    print(f"[EXCEL]   {filename}: {len(sheet_names)} visible sheet(s), {file_size_mb:.2f}MB", flush=True)
+            log_with_sid(filename, "warning", f"EXCEL_SHARED_HANDLE_FAILED: {e}")
+            xl = None  # per-sheet reads fall back to self-opening (slower, same result)
 
-    valid_sheets: List[Tuple[str, pd.DataFrame]] = []
-    for sn in sheet_names:
-        sheet_start = _time.time()
-        df_key = filename if len(sheet_names) == 1 else f"{filename}::{sn}"
-        df = _detect_and_extract_table(str(file_path), sn, df_key)
-        if _is_valid_table(df):
-            valid_sheets.append((sn, df))
-            print(f"[EXCEL]   {filename}::{sn}: OK {len(df)} rows in "
-                  f"{_time.time() - sheet_start:.3f}s", flush=True)
-        else:
-            print(f"[EXCEL]   {filename}::{sn}: SKIPPED (pipeline returned no valid table) "
-                  f"in {_time.time() - sheet_start:.3f}s", flush=True)
+        valid_sheets: List[Tuple[str, pd.DataFrame]] = []
+        for sn in sheet_names:
+            sheet_start = _time.time()
+            df_key = filename if len(sheet_names) == 1 else f"{filename}::{sn}"
+            df = _detect_and_extract_table(str(file_path), sn, df_key,
+                                           probe_wb=wb_probe, excel_file=xl)
+            if _is_valid_table(df):
+                valid_sheets.append((sn, df))
+                print(f"[EXCEL]   {filename}::{sn}: OK {len(df)} rows in "
+                      f"{_time.time() - sheet_start:.3f}s", flush=True)
+            else:
+                print(f"[EXCEL]   {filename}::{sn}: SKIPPED (pipeline returned no valid table) "
+                      f"in {_time.time() - sheet_start:.3f}s", flush=True)
+    finally:
+        try:
+            wb_probe.close()
+        except Exception:
+            pass
+        if xl is not None:
+            try:
+                xl.close()
+            except Exception:
+                pass
 
     dfs: Dict[str, pd.DataFrame] = {}
     if len(valid_sheets) == 1:

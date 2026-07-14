@@ -892,7 +892,10 @@ class UserStore:
             return {"files": []}
 
     def write_meta(self, meta: dict):
-        self.meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        # _json_safe: schema fields are keyed by COLUMN NAMES, which can be
+        # non-string objects on messy sheets — normalize keys+values or the
+        # write raises and the upload 500s (same net as the history writers).
+        self.meta_path.write_text(json.dumps(_json_safe(meta), ensure_ascii=False, indent=2), encoding="utf-8")
 
     def load_dataframes(self) -> dict[str, pd.DataFrame]:
         return _load_dataframes_cached(self.files_dir, self.sid)
@@ -947,7 +950,8 @@ class ChatDataStore:
             return {"files": []}
 
     def write_meta(self, meta: dict):
-        self.meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Same _json_safe net as UserStore.write_meta (non-string schema keys).
+        self.meta_path.write_text(json.dumps(_json_safe(meta), ensure_ascii=False, indent=2), encoding="utf-8")
 
     def set_welcome(self, msg: str):
         (self.root / "welcome.txt").write_text(msg or "", encoding="utf-8")
