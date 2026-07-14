@@ -94,6 +94,31 @@ def test_mixed_dict_takes_only_df_values(monkeypatch, dfs):
     assert [t["title"] for t in result["tables"]] == ["Sales", "Stock"]
 
 
+def test_mixed_table_and_chart_blocks(monkeypatch, dfs):
+    # Dashboard/KPI pattern: a python RESULT block + a plot block separated by
+    # ###NEXT_PLOT###. The table block previously died in the chart renderer
+    # and vanished; it must now ride on the done event as `tables`.
+    raw = ("```python\nRESULT = dfs['sales.csv'].head(2)\n```\n###NEXT_PLOT###\n"
+           "```plot_code\nplot_block_0\n```\n###NEXT_PLOT###\n")
+    monkeypatch.setattr(run_chat_local.brain_client, "plan", lambda **k: {
+        "raw_text": raw, "kind": "PLOT_CODE", "code": "", "usage": {}})
+    monkeypatch.setattr(run_chat_local, "render_plot_safe",
+                        lambda code, dfs, sid, **kw: {"error": None, "image": "IMG",
+                                                      "is_plotly": False, "chart_data": None})
+    monkeypatch.setattr(run_chat_local.brain_client, "describe",
+                        lambda **k: {"text": "d", "usage": {}})
+    events = list(run_chat_local.run_chat_multi_plot(
+        sid="t", dfs=dfs, schema_docs={}, question="dashboard",
+        history_rows=[], user_email="alice@acme.com"))
+    partials = [e for e in events if e.get("partial")]
+    assert len(partials) == 1  # the chart still streams
+    done = [e for e in events if e.get("done")][0]
+    assert len(done["tables"]) == 1
+    assert done["tables"][0]["columns"] == ["store", "amount"]
+    assert "RESULT" in done["table_codes"][0]
+    assert done["table_result_keys"] == [None]  # plain df, not a dict entry
+
+
 def test_history_record_with_tables_round_trips(tmp_path, monkeypatch, dfs):
     monkeypatch.setattr(local_store.settings, "DATA_ROOT", str(tmp_path))
     store = local_store.ChatDataStore("c_multitbl")

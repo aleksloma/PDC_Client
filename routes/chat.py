@@ -273,7 +273,7 @@ def _build_chart_entry(c: dict) -> dict:
 
 def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
                              usage, charts, full_table_key=None,
-                             full_table_keys=None):
+                             full_table_keys=None, combined_tables=None):
     """Build the AI-turn history record persisted EXACTLY ONCE by the worker.
 
     Returns None when there is nothing to persist (never writes an empty turn).
@@ -329,6 +329,12 @@ def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
             cd = _persistable_chart_data(c.get("chart_data"))
             if cd is not None:
                 rec["chart_data"] = cd
+        # Mixed dashboard answer: the KPI/table blocks' tables ride alongside
+        # the charts (per-table durable keys aligned by index).
+        if combined_tables:
+            rec["tables"] = combined_tables
+            if full_table_keys:
+                rec["full_table_keys"] = full_table_keys
         return rec
     return None
 
@@ -719,6 +725,7 @@ async def chat_stream(request: Request, chat_id: str):
             w_single = None                 # single-shot result dict
             w_full_table_key = None         # durable key for a tabular result
             w_full_table_keys = None        # per-table keys for a multi-table result
+            w_combined_tables = None        # tables of a mixed charts+tables answer
             err_msg = None
             cancelled = False               # STOP requested mid-generation
             # Clear any stale cancel flag from a prior attempt, then mark this
@@ -764,6 +771,20 @@ async def chat_stream(request: Request, chat_id: str):
                                 _keys.append(_k)
                             event["full_table_keys"] = _keys
                             w_full_table_keys = _keys
+                    # Mixed dashboard done event (charts + KPI/table blocks):
+                    # persist each table with its OWN block code + dict entry.
+                    if (isinstance(event, dict) and event.get("done")
+                            and not event.get("single_response") and event.get("tables")):
+                        _tbls = event.get("tables") or []
+                        _codes = event.get("table_codes") or []
+                        _rkeys = event.get("table_result_keys") or []
+                        _keys = []
+                        for _i, _t in enumerate(_tbls):
+                            _keys.append(_persist_full_table(
+                                store, _t,
+                                _codes[_i] if _i < len(_codes) else None,
+                                result_key=_rkeys[_i] if _i < len(_rkeys) else None))
+                        event["full_table_keys"] = _keys
                     # Stream live first (UX identical to before), then accumulate.
                     loop.call_soon_threadsafe(queue.put_nowait, ("event", event))
                     try:
@@ -781,6 +802,9 @@ async def chat_stream(request: Request, chat_id: str):
                                 w_combined_answer = event.get("combined_answer", "")
                                 w_combined_codes = event.get("combined_codes") or []
                                 w_usage = event.get("total_usage") or {}
+                                if event.get("tables"):
+                                    w_combined_tables = event.get("tables")
+                                    w_full_table_keys = event.get("full_table_keys") or w_full_table_keys
                             elif event.get("single_response"):
                                 w_single = event.get("result") or {}
                     except Exception:
@@ -830,7 +854,8 @@ async def chat_stream(request: Request, chat_id: str):
                     record = _build_ai_history_record(
                         err_msg, w_single, w_combined_answer, w_combined_codes,
                         w_usage, w_charts, full_table_key=w_full_table_key,
-                        full_table_keys=w_full_table_keys)
+                        full_table_keys=w_full_table_keys,
+                        combined_tables=w_combined_tables)
                 if record is not None:
                     store.append_history(conv_id, record)
                     if not err_msg and not cancelled:
@@ -917,6 +942,10 @@ async def chat_stream(request: Request, chat_id: str):
                         "conv_id": conv_id,
                         "answer": answer,
                         "image_base64": None, "table": None,
+                        # Mixed dashboard answers carry the KPI/table blocks'
+                        # results; the worker already stamped per-table keys.
+                        "tables": ev.get("tables"),
+                        "full_table_keys": ev.get("full_table_keys"),
                         "code": "\n\n###NEXT_PLOT###\n\n".join(codes),
                         "tokens": usage,
                     }
@@ -1095,6 +1124,20 @@ async def edit_regenerate(request: Request, chat_id: str):
                 ]
             elif len(all_images) == 1:
                 history_obj["image_base64"] = all_images[0]
+            # Mixed dashboard answer: persist the KPI/table blocks' tables with
+            # per-table durable keys (same as chat_stream's worker).
+            tbls = ev.get("tables") or []
+            if tbls:
+                codes_per = ev.get("table_codes") or []
+                rkeys = ev.get("table_result_keys") or []
+                keys = [
+                    _persist_full_table(store, t,
+                                        codes_per[i] if i < len(codes_per) else None,
+                                        result_key=rkeys[i] if i < len(rkeys) else None)
+                    for i, t in enumerate(tbls)
+                ]
+                history_obj["tables"] = tbls
+                history_obj["full_table_keys"] = keys
             store.append_history(conv_id, history_obj)
             out: dict = {
                 "ok": True, "done": True, "conv_id": conv_id,
@@ -1107,6 +1150,9 @@ async def edit_regenerate(request: Request, chat_id: str):
                 out["images"] = history_obj["images"]
             elif history_obj.get("image_base64"):
                 out["image_base64"] = history_obj["image_base64"]
+            if tbls:
+                out["tables"] = tbls
+                out["full_table_keys"] = history_obj.get("full_table_keys")
             return JSONResponse(_json_safe(out))
 
         # Single-shot path

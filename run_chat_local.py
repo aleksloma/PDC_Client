@@ -781,6 +781,24 @@ def _extract_multi_plot_blocks(raw_text: str) -> list[str]:
     return blocks
 
 
+_CHART_MARKERS = ("plt.", "px.", "go.", "sns.", "plotly", "matplotlib", "seaborn",
+                  "fig =", "fig=", ".figure(")
+
+
+def _looks_like_table_block(code: str) -> bool:
+    """A ###NEXT_PLOT### segment that assigns RESULT and never touches a
+    charting API is a TABLE block (the planner's dashboard/KPI pattern mixes a
+    RESULT block with plot blocks). Previously such blocks were fed to the
+    chart renderer, always failed, and the table silently vanished from the
+    answer."""
+    if "RESULT" not in code:
+        return False
+    return not any(m in code for m in _CHART_MARKERS)
+
+
+_MAX_MIXED_TABLE_BLOCKS = 4
+
+
 def run_chat_multi_plot(
     sid: str,
     dfs: dict[str, pd.DataFrame],
@@ -792,7 +810,8 @@ def run_chat_multi_plot(
 ):
     """Generator port of global `agent.run_chat_multi_plot`. Yields:
       - {"partial": True,  "answer", "image_base64", "chart_n", "chart_total", "usage", "code"}
-      - {"partial": False, "done": True, "combined_answer", "combined_codes", "total_usage"}
+      - {"partial": False, "done": True, "combined_answer", "combined_codes", "total_usage"
+         [, "tables", "table_codes", "table_result_keys"]}
     For non-multi-plot responses, yields a single {"single_response": True, "result": {...}} item.
     """
     df_names = list(dfs.keys())
@@ -832,6 +851,17 @@ def run_chat_multi_plot(
             )
             yield {"single_response": True, "result": result}
             return
+
+    # Mixed dashboard answers (KPI table + charts): pull TABLE blocks out of
+    # the worklist — they execute via safe_execute and land on the done event
+    # as `tables` instead of dying in the chart renderer (which silently
+    # dropped the table part of every mixed answer before).
+    table_blocks = [b for b in plot_blocks if _looks_like_table_block(b)]
+    if table_blocks:
+        plot_blocks = [b for b in plot_blocks if not _looks_like_table_block(b)]
+        table_blocks = table_blocks[:_MAX_MIXED_TABLE_BLOCKS]
+        log_with_sid(sid, "info",
+                     f"MIXED_TABLE_BLOCKS extracted={len(table_blocks)} charts={len(plot_blocks)}")
 
     # Cap CANDIDATE blocks to bound render cost; the final EMITTED count is
     # capped at _MAX_MULTI_PLOTS *after* dedup (see the produced>=cap breaks
@@ -1031,14 +1061,55 @@ def run_chat_multi_plot(
             "chart_data": plot_out.get("chart_data"),
         }
 
+    # Execute the extracted TABLE blocks (mixed dashboard answers). Each block
+    # yields one table (or several, when its RESULT was a dict of DataFrames);
+    # they ride on the done event with their block code + dict entry so the
+    # per-table Download Excel / Show full table re-execute correctly.
+    combined_tables: list = []
+    table_codes: list = []
+    table_result_keys: list = []
+    for tb in table_blocks if table_blocks else []:
+        try:
+            exec_out = safe_execute(tb, dfs, sid)
+            if exec_out.get("error"):
+                log_with_sid(sid, "warning",
+                             f"MIXED_TABLE_BLOCK_ERROR: {str(exec_out['error'])[:200]}")
+                continue
+            result_obj = exec_out.get("result")
+            t = _build_table_from_result(result_obj)
+            if t and (int(t.get("total_rows", 0)) <= 0 or not (t.get("rows") or [])):
+                t = None
+            ts = None
+            if t is None:
+                ts = _build_tables_from_result(result_obj)
+            emitted = ([t] if t else []) + (ts or [])
+            if not emitted:
+                continue
+            d = brain_client.describe(sid=sid, question=question, code=tb, user_email=user_email)
+            total_usage = _sum_usage(total_usage, d.get("usage") or {})
+            if d.get("text"):
+                combined_answers.append(d["text"])
+            for entry in emitted:
+                combined_tables.append(entry)
+                table_codes.append(tb)
+                table_result_keys.append(entry.get("title") if ts else None)
+            log_with_sid(sid, "info", f"MIXED_TABLE_EMIT tables={len(emitted)}")
+        except Exception as e:
+            log_with_sid(sid, "warning", f"MIXED_TABLE_BLOCK_FAILED: {e}")
+
     combined_text = "\n\n".join([a for a in combined_answers if a]) if combined_answers else "Analysis complete."
     log_with_sid(sid, "info", f"MULTI_PLOT_DONE rendered={produced}")
-    yield {
+    done_event = {
         "partial": False, "done": True,
         "combined_answer": combined_text,
         "combined_codes": combined_codes,
         "total_usage": total_usage,
     }
+    if combined_tables:
+        done_event["tables"] = combined_tables
+        done_event["table_codes"] = table_codes
+        done_event["table_result_keys"] = table_result_keys
+    yield done_event
 
 
 def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,

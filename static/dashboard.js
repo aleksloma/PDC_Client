@@ -1771,6 +1771,11 @@ async function openConversation(chatId, convId) {
           appendMessage('assistant', img.answer || '', img.image_base64, null, null,
             { code: code, chartData: img.chart_data || null });
         });
+        // Mixed dashboard record: the tables ride after the charts.
+        if (msg.tables && msg.tables.length) {
+          appendMessage('assistant', '', null, null, null,
+            { tables: msg.tables, fullTableKeys: msg.full_table_keys || null });
+        }
       } else {
         // Single-chart / table / text entry. New single-chart records persist
         // chart_data on the record → Show data on reload; old records omit it.
@@ -3026,6 +3031,12 @@ async function sendMessage() {
           { code: data.code, chartDataKey: data.chart_data_key,
             tables: data.tables || null, fullTableKeys: data.full_table_keys || null });
               }
+              chatMessages.scrollTop = chatMessages.scrollHeight;
+            } else if (data.tables && data.tables.length) {
+              // Mixed dashboard answer: charts already streamed as partials —
+              // append the KPI/table blocks' tables as a final message.
+              appendMessage('assistant', '', null, null, null,
+                { tables: data.tables, fullTableKeys: data.full_table_keys || null });
               chatMessages.scrollTop = chatMessages.scrollHeight;
             }
 
