@@ -218,30 +218,10 @@ import atexit
 atexit.register(lambda: _EXEC.shutdown(wait=False, cancel_futures=True))
 
 
-def _json_safe(obj):
-    """Best-effort safe JSON serialization for the SSE payload."""
-    try:
-        json.dumps(obj, ensure_ascii=False)
-        return obj
-    except Exception:
-        # Fall back to str() for anything pandas/numpy that snuck through
-        import pandas as pd
-        import numpy as np
-        if isinstance(obj, dict):
-            return {k: _json_safe(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_json_safe(v) for v in obj]
-        if isinstance(obj, (np.integer,)):
-            return int(obj)
-        if isinstance(obj, (np.floating,)):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        if isinstance(obj, pd.Series):
-            return obj.to_list()
-        if isinstance(obj, pd.DataFrame):
-            return obj.to_dict(orient="records")
-        return str(obj)
+# One implementation for SSE payloads AND persistence — the full pandas/numpy
+# normalizer (Timestamp→ISO, NaT→None, catch-all str()) lives in local_store
+# next to the history writers that depend on it.
+_json_safe = local_store._json_safe
 
 
 # Max serialized size of a chart's source data we will PERSIST into history so

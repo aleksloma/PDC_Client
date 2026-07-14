@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -49,6 +50,83 @@ def _now() -> str:
 
 def _safe_email(email: str) -> str:
     return email.strip().lower().replace("/", "_").replace("\\", "_")
+
+
+def _json_safe(value):
+    """Recursively make a value JSON-compliant before persistence (verbatim
+    port of the B2C `storage._json_safe`): Timestamp/datetime → ISO strings,
+    NaT/NaN/Inf → None, numpy scalars → native, DataFrame/Series/ndarray →
+    lists, tuple dict-keys → strings, and a final str() catch-all so an
+    unexpected object (e.g. a pandas Styler) degrades to text instead of
+    killing the write. Every history json.dumps MUST go through this."""
+    import datetime as _dt
+    try:
+        import numpy as _np
+    except Exception:
+        _np = None
+
+    if value is pd.NaT:
+        return None
+    if isinstance(value, pd.Timestamp):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    if _np is not None and isinstance(value, _np.datetime64):
+        try:
+            if _np.isnat(value):
+                return None
+            return pd.Timestamp(value).isoformat()
+        except Exception:
+            return str(value)
+    if isinstance(value, (_dt.datetime, _dt.date)):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    if _np is not None and isinstance(value, _np.integer):
+        return int(value)
+    if _np is not None and isinstance(value, _np.floating):
+        if _np.isnan(value) or _np.isinf(value):
+            return None
+        return float(value)
+    if _np is not None and isinstance(value, _np.bool_):
+        return bool(value)
+    if isinstance(value, pd.DataFrame):
+        try:
+            return [_json_safe(row) for row in value.where(pd.notnull(value), None).to_dict(orient="records")]
+        except Exception:
+            return [_json_safe(row) for row in value.to_dict(orient="records")]
+    if isinstance(value, pd.Series):
+        return [_json_safe(v) for v in value.tolist()]
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    if isinstance(value, dict):
+        safe_dict = {}
+        for k, v in value.items():
+            if isinstance(k, tuple):
+                safe_key = "_".join(map(str, k))
+            else:
+                safe_key = str(k) if not isinstance(k, (str, int, float, bool, type(None))) else k
+            safe_dict[safe_key] = _json_safe(v)
+        return safe_dict
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if _np is not None and isinstance(value, _np.ndarray):
+        return [_json_safe(v) for v in value.tolist()]
+    if isinstance(value, pd.Index):
+        return [_json_safe(v) for v in value.tolist()]
+    if hasattr(pd, "Categorical") and isinstance(value, pd.Categorical):
+        return [_json_safe(v) for v in value.tolist()]
+    # Fallback: stringify anything unrecognized (Styler, Interval, ...)
+    if not isinstance(value, (str, int, float, bool, type(None))):
+        try:
+            return str(value)
+        except Exception:
+            return None
+    return value
 
 
 def _load_one_file(path: Path) -> dict[str, pd.DataFrame]:
@@ -933,7 +1011,7 @@ class ChatDataStore:
             new_path = self.conversations_dir / f"{new_conv_id}.jsonl"
             with new_path.open("w", encoding="utf-8") as f:
                 for msg in source_history:
-                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                    f.write(json.dumps(_json_safe(msg), ensure_ascii=False) + "\n")
         return new_conv_id
 
     def add_share_recipients(self, recipients: list[str]) -> list[str]:
@@ -954,7 +1032,10 @@ class ChatDataStore:
         p = self.conversations_dir / f"{conv_id}.jsonl"
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(message, ensure_ascii=False) + "\n")
+            # _json_safe: result tables carry raw pd.Timestamp cells (and any
+            # stray pandas object) — normalize the WHOLE record or the write
+            # raises and the AI turn is lost (mirrors B2C append_conv_history).
+            fh.write(json.dumps(_json_safe(message), ensure_ascii=False) + "\n")
 
     def get_history(self, conv_id: str) -> list[dict]:
         p = self.conversations_dir / f"{conv_id}.jsonl"
@@ -982,7 +1063,7 @@ class ChatDataStore:
         p = self.conversations_dir / f"{conv_id}.jsonl"
         with p.open("w", encoding="utf-8") as fh:
             for msg in truncated:
-                fh.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                fh.write(json.dumps(_json_safe(msg), ensure_ascii=False) + "\n")
         return truncated
 
 

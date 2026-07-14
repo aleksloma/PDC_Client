@@ -108,14 +108,35 @@ def _build_table_from_result(result_obj) -> Optional[dict]:
 
 
 def _safe_preview(preview) -> Any:
-    """Mirror the B2C 'safe_preview' guard: only scalars / simple dicts may
-    be forwarded to the LLM. NEVER send DataFrame rows."""
+    """The hard data-boundary guard (Article II): only scalars — or dicts whose
+    VALUES are all plain scalars/None — may be forwarded to the brain. NEVER
+    send DataFrame rows.
+
+    The value check must be a scalar allow-list, not a list/dict deny-list: a
+    dict of DataFrames/Stylers/Timestamps (e.g. RESULT = {"sales": df1.head(10),
+    "stock": df2.head(10)}) previously slipped through and crashed the brain
+    call's JSON encoding mid-turn ("Object of type Styler is not JSON
+    serializable"). numpy scalars are coerced to native first so a
+    {"mean": np.float64(...)} summary still passes."""
     if preview is None:
         return None
     if isinstance(preview, (str, int, float, bool)):
         return preview
-    if isinstance(preview, dict) and not any(isinstance(v, (list, dict)) for v in preview.values()):
-        return preview
+    if isinstance(preview, dict):
+        safe: dict = {}
+        for k, v in preview.items():
+            if not isinstance(k, (str, int, float, bool)):
+                return None
+            item = getattr(v, "item", None)
+            if callable(item) and not isinstance(v, (str, int, float, bool)):
+                try:
+                    v = v.item()
+                except Exception:
+                    return None
+            if v is not None and not isinstance(v, (str, int, float, bool)):
+                return None
+            safe[k] = v
+        return safe
     return None
 
 
