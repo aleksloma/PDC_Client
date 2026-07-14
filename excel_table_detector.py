@@ -283,6 +283,23 @@ def _read_with_multiheader(
     else:
         df = pd.read_excel(file_input, sheet_name=sheet_name,
                            header=header_rows, engine="calamine")
+
+    def _dedupe(names: List[str]) -> List[str]:
+        # Sheets with REPEATED header names (e.g. the same month label twice)
+        # otherwise yield duplicate df columns: df[c] then returns a DataFrame
+        # (not a Series) and every downstream .dtype/.unique() crashes, and
+        # schema dicts keyed by column silently collapse. Pandas' classic
+        # mangling convention: second occurrence -> "name.1", third -> ".2".
+        seen: dict = {}
+        out: List[str] = []
+        for n in names:
+            if n in seen:
+                seen[n] += 1
+                out.append(f"{n}.{seen[n]}")
+            else:
+                seen[n] = 0
+                out.append(n)
+        return out
     flat: List[str] = []
     if isinstance(df.columns, pd.MultiIndex):
         for tup in df.columns:
@@ -297,6 +314,7 @@ def _read_with_multiheader(
                 if not deduped or deduped[-1] != p:
                     deduped.append(p)
             flat.append("_".join(deduped) if deduped else "col")
+        flat = _dedupe(flat)
         df.columns = flat
     else:
         flat = [str(c) for c in df.columns]
@@ -305,6 +323,7 @@ def _read_with_multiheader(
         # every json.dumps that uses columns as dict keys (meta write on
         # upload → 500). Global's copy computes `flat` here without assigning
         # — same latent bug; port this back.
+        flat = _dedupe(flat)
         df.columns = flat
     return flat, df
 

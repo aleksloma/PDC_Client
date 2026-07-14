@@ -202,6 +202,32 @@ def test_upload_meta_with_hidden_sheets_and_odd_keys(tmp_path, monkeypatch):
     local_store._DATAFRAME_CACHE.invalidate()
 
 
+def test_duplicate_header_names_are_deduped(tmp_path):
+    # A sheet with REPEATED header names (the Casio 'Analyze' case) made
+    # df[c] return a DataFrame → schema_text crashed with "'DataFrame' object
+    # has no attribute 'dtype'" and the whole question errored. Names must
+    # come back unique (pandas-style .1 suffix) so every downstream df[c] is
+    # a Series.
+    rows = [
+        ["Brand", "Qty", "Qty", "Amount"],
+        ["TOUS", 1, 2, 30],
+        ["Casio", 3, 4, 50],
+        ["Pandora", 5, 6, 70],
+    ]
+    path = _make_wb(tmp_path, "dup.xlsx", {"D": {"rows": rows}})
+    dfs = det.load_excel_sheets(path, "dup.xlsx")
+    df = dfs["dup.xlsx"]
+    assert list(df.columns) == ["Brand", "Qty", "Qty.1", "Amount"]
+    import pandas as pd
+    assert all(isinstance(df[c], pd.Series) for c in df.columns)
+    # And schema_text over it must not raise.
+    import schema_builder
+    schema_builder._SCHEMA_TEXT_CACHE.invalidate()
+    out = schema_builder.schema_text({}, {"dup.xlsx": df})
+    assert "Qty.1" in out
+    schema_builder._SCHEMA_TEXT_CACHE.invalidate()
+
+
 def test_listobject_region_still_parsed_heuristically(tmp_path):
     # The ws.tables precheck was dropped with the streaming port; a workbook
     # containing a real ListObject must still parse via the heuristics.

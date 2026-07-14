@@ -104,7 +104,15 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
 
         dtype_info = {}
         for c in cols:
-            dt = str(df[c].dtype)
+            try:
+                # df[c] can be a DataFrame (not a Series) if a sheet slipped
+                # through with duplicate column names — treat it as opaque
+                # rather than crashing the whole question (Article IV; the
+                # detector dedupes names at load, this is the safety net).
+                dt = str(df[c].dtype)
+            except Exception:
+                dtype_info[c] = "object"
+                continue
             if df[c].dtype == object or df[c].dtype.kind == "O" or str(df[c].dtype) in ("str", "string", "object"):
                 try:
                     uniq = df[c].dropna().unique()
