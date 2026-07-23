@@ -21,6 +21,7 @@
 | Tenant | a dedicated **demo tenant** created in the brain admin panel |
 | Secrets | `CLIENT_DEMO_TENANT_TOKEN` → `BRAIN_TENANT_TOKEN`, `CLIENT_DEMO_SECRET_KEY` → `SECRET_KEY` (Secret Manager) |
 | Service URL | `https://pdcclient-demo-873133613631.europe-west1.run.app` |
+| Custom domain | `https://client.powerdatachat.com` (Cloud Run domain mapping; the brain's admin panel is `admin.powerdatachat.com`) |
 
 Do **not** confuse this service with `pdcbrain`; the brain deploy runbook
 (`PDC_Brain/docs/DEPLOY.md` + its `deploy` skill) is unchanged and never
@@ -142,9 +143,19 @@ holds the demo accounts, uploaded demo datasets, chats, and rendered decks.
   `gcloud secrets versions add CLIENT_DEMO_TENANT_TOKEN --data-file=<file>`
   then a no-op redeploy (secrets pinned to `:latest` are resolved at instance start).
 
-## Follow-up (not done yet)
+## Custom domain
 
-Public linking from powerdatachat.com: prefer a Cloud Run **domain mapping**
-(e.g. `demo.powerdatachat.com`) with a "Launch live demo" link. Avoid iframe
-embedding — the session cookie is `SameSite=lax`, so login inside a cross-site
-iframe silently fails.
+Created 2026-07-24:
+
+```bash
+gcloud beta run domain-mappings create --service pdcclient-demo \
+  --domain client.powerdatachat.com --region europe-west1 --project pdc-enterprise
+```
+
+- DNS at the domain provider: `CNAME client → ghs.googlehosted.com.` The
+  Google-managed certificate provisions only after the CNAME resolves; until
+  then `CertificateProvisioned` stays `Unknown/False` and only the `*.run.app`
+  URL works.
+- A domain mapping is routing-only — no new revision, no service changes.
+- Status check:
+  `gcloud beta run domain-mappings describe --domain client.powerdatachat.com --region europe-west1`
