@@ -44,6 +44,15 @@ enterprise design.
 - Per-tenant configuration (see §5).
 - Operator admin panel (see §6).
 
+### Internal demo instance (exception, not a customer topology)
+
+PowerDataChat additionally hosts ONE demo/showcase client instance on Cloud
+Run in its own GCP project (`pdcclient-demo`), used for business meetings. It
+runs the standard, unmodified client image under a dedicated demo tenant and
+holds only PowerDataChat's own demo data, so the customer data-boundary model
+above is unaffected — no customer's raw data is ever on that instance.
+Runbook: `PDC_Client/docs/DEMO_CLOUD_RUN.md`.
+
 ---
 
 ## 3. Separation from the existing B2C instance

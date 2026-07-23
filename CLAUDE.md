@@ -139,6 +139,11 @@ PDC_Client/
 
 The two are NEVER deployed together. That would defeat the split.
 
+One intentional exception exists: PowerDataChat hosts a single internal
+demo/showcase instance of this client on Cloud Run (`pdcclient-demo`, demo
+tenant, demo data only — no customer data). See `docs/DEMO_CLOUD_RUN.md`.
+It is NOT a customer topology.
+
 ## Differences from the B2C edition (intentional)
 
 - **Local email+password auth** — no Google OAuth, no B2C registration.
