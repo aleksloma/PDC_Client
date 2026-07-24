@@ -186,7 +186,7 @@ window.I18N_TRANSLATIONS = {
     'share.need_email': 'Please enter at least one email address',
 
     // Dashboards
-    'dash.dashboards': '▦ Dashboards',
+    'dash.dashboards': 'Dashboards',
     'dash.add_new': 'Add new',
     'dash.new_title': 'New dashboard',
     'dash.name_label': 'Dashboard name',
@@ -550,7 +550,7 @@ window.I18N_TRANSLATIONS = {
     'share.need_email': 'გთხოვთ, შეიყვანოთ მინიმუმ ერთი ელ.ფოსტა',
 
     // Dashboards
-    'dash.dashboards': '▦ დაფები',
+    'dash.dashboards': 'დაფები',
     'dash.add_new': 'ახლის დამატება',
     'dash.new_title': 'ახალი დაფა',
     'dash.name_label': 'დაფის სახელი',
@@ -914,7 +914,7 @@ window.I18N_TRANSLATIONS = {
     'share.need_email': 'Пожалуйста, введите хотя бы один email',
 
     // Dashboards
-    'dash.dashboards': '▦ Дашборды',
+    'dash.dashboards': 'Дашборды',
     'dash.add_new': 'Добавить новый',
     'dash.new_title': 'Новый дашборд',
     'dash.name_label': 'Название дашборда',

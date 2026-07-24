@@ -2200,6 +2200,9 @@ button.danger:hover {
 /* Entry point to the whole Dashboards feature — a filled brand-navy box so it
    stands out from the ghost chat-action buttons (id beats button.ghost). */
 #btnDashboards {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   background: #001E44;
   color: #fff;
   font-weight: 600;

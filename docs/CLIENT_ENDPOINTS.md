@@ -418,7 +418,8 @@ chars, regex-guarded (path-traversal safe). Old-shape docs load with defaults
 | `POST` | `/api/dashboards/{id}/share` | `{emails: [...]\|"a@x, b@y", message?}` — owner only, mirrors the chat share contract (`{ok, shared_with, added, email_sent, smtp_configured, failed}`). Adds recipients to the doc's `shared_with`, writes a pointer row into each recipient's dashboard index, **and grants them access to every tile's source chat** (`add_share_recipients`, same grant conversation-sharing performs) so their Show-data/refresh work. Brain SMTP relay gets only the dashboard name + comment (Article II — never tile content). No revoke exists (parity with chat sharing). |
 
 **Frontend**: the `/lab` top bar has a Dashboards dropdown at the LEFT corner
-(filled navy `#001E44` bold button; left-anchored menu; always visible when
+(filled navy `#001E44` bold button with an inline-SVG list icon — rows of
+square-bullet + bar; left-anchored menu; always visible when
 signed in; "＋ Add new" first, then MRU; shared dashboards green with "Shared
 by …"). "＋ Add new" only CREATES the dashboard (toast, no navigation) — the
 user pins items to it later. Dashboard entries in the menu are real `<a>`
