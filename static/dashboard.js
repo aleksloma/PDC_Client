@@ -836,6 +836,17 @@ function attachUnifiedListeners() {
         closeSidebar();
       }
     });
+    // Middle-click → open the conversation's deep-link in a new tab (the
+    // mousedown preventDefault suppresses the browser's autoscroll cursor).
+    item.addEventListener('mousedown', (e) => {
+      if (e.button === 1) e.preventDefault();
+    });
+    item.addEventListener('auxclick', (e) => {
+      if (e.button !== 1) return;
+      if (e.target.closest('.conversation-menu-btn')) return;
+      const convId = item.dataset.convId;
+      if (convId) window.open('/c/' + convId, '_blank');
+    });
   });
 
   // Conversation menu buttons
@@ -2077,6 +2088,11 @@ function _wireTableRefresh(wrap, code, extras, messageContext) {
     }
     const newWrap = document.createElement('div');
     newWrap.className = 'pdc-table-block';
+    // Carry the pin-to-dashboard payload forward with the REFRESHED data so a
+    // pin after refresh captures the current table (handler reads the block).
+    newWrap._pdcTable = data.table;
+    newWrap._pdcFullKey = data.full_table_key || null;
+    newWrap._pdcTitle = wrap._pdcTitle || '';
     if (!appendTableTo(newWrap, data.table, data.full_table_key || null, messageContext)) {
       _showRefreshError(bar);
       return;
@@ -2084,7 +2100,7 @@ function _wireTableRefresh(wrap, code, extras, messageContext) {
     const newBar = newWrap.querySelector('.pdc-action-bar');
     const oldBar = wrap.querySelector('.pdc-action-bar');
     if (newBar && oldBar) {
-      Array.from(oldBar.querySelectorAll('.pdc-show-data-btn, .pdc-show-code-btn'))
+      Array.from(oldBar.querySelectorAll('.pdc-show-data-btn, .pdc-show-code-btn, .pdc-pin-btn'))
         .forEach(b => newBar.appendChild(b));
     }
     wrap.replaceWith(newWrap);
@@ -2159,6 +2175,8 @@ function appendMessage(role, content, imageBase64, table, fullTableKey, extras) 
     // Wrapped so the per-table Refresh can rebuild the block in place.
     tableWrap = document.createElement('div');
     tableWrap.className = 'pdc-table-block';
+    tableWrap._pdcTable = table;                    // pin-to-dashboard payload
+    tableWrap._pdcFullKey = fullTableKey || null;
     appendTableTo(tableWrap, table, fullTableKey, content || '');
     contentDiv.appendChild(tableWrap);
   }
@@ -2173,6 +2191,9 @@ function appendMessage(role, content, imageBase64, table, fullTableKey, extras) 
       if (!(t && t.columns && t.rows)) return;
       const wrap = document.createElement('div');
       wrap.className = 'pdc-table-block';
+      wrap._pdcTable = t;                        // pin-to-dashboard payload
+      wrap._pdcFullKey = keys[i] || null;
+      wrap._pdcTitle = t.title || '';
       if (t.title) {
         const h = document.createElement('div');
         h.style.cssText = 'font-weight:600;margin:10px 0 4px;';
@@ -2188,6 +2209,8 @@ function appendMessage(role, content, imageBase64, table, fullTableKey, extras) 
   if (role === 'assistant') {
     _appendResponseActions(contentDiv, extras);
     _wireRefreshButtons(chartContainer, tableWrap, extras, content || '');
+    // Pin-to-dashboard buttons — guarded so they can never break rendering.
+    try { _wireAddToDash(contentDiv, chartContainer, extras, content || ''); } catch (e) { console.warn('pin wiring failed:', e); }
   }
 
   messageDiv.appendChild(contentDiv);
@@ -5038,3 +5061,386 @@ async function handleDelete(type, chatId, convId, title) {
 
 // Make removeFile global
 window.removeFile = removeFile;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Dashboards — top-bar dropdown, add-to-dashboard pin buttons, picker modal.
+// Everything below is ADDITIVE: wired from its own DOMContentLoaded listener
+// and one guarded _wireAddToDash call in appendMessage. Nothing above changes.
+// ═══════════════════════════════════════════════════════════════════════════
+
+let _dashListCache = { rows: null, ts: 0 };
+const _DASH_LIST_TTL_MS = 15000;
+
+async function _dashList(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && _dashListCache.rows && (now - _dashListCache.ts) < _DASH_LIST_TTL_MS) {
+    return _dashListCache.rows;
+  }
+  try {
+    const res = await fetch('/api/dashboards');
+    if (!res.ok) {
+      console.warn('Dashboard list fetch failed: HTTP', res.status);
+      _dashListCache.error = true;
+      return _dashListCache.rows || [];
+    }
+    const data = await res.json();
+    _dashListCache = { rows: data.dashboards || [], ts: now, error: false };
+    return _dashListCache.rows;
+  } catch (e) {
+    console.warn('Dashboard list fetch failed:', e);
+    _dashListCache.error = true;
+    return _dashListCache.rows || [];
+  }
+}
+
+async function _createDashboard(name) {
+  const res = await fetch('/api/dashboards', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !data || !data.dash_id) {
+    throw new Error((data && data.error) || 'Could not create dashboard');
+  }
+  _dashListCache = { rows: null, ts: 0 };
+  return data;
+}
+
+// ── Top-bar Dashboards dropdown (always visible when logged in) ────────────
+function initDashboardsDropdown() {
+  const container = document.getElementById('dashboardsDropdown');
+  const btn = document.getElementById('btnDashboards');
+  const menu = document.getElementById('dashboardsMenu');
+  if (!container || !btn || !menu) return;
+
+  function renderMenu(rows) {
+    menu.innerHTML = '';
+    const addNew = document.createElement('button');
+    addNew.className = 'dropdown-item';
+    addNew.type = 'button';
+    addNew.textContent = '＋ ' + _t('dash.add_new', 'Add new');
+    addNew.addEventListener('click', () => {
+      menu.classList.add('hidden');
+      // Create only — the user stays in /lab and pins items when ready; the
+      // new dashboard shows in the list on the next dropdown open.
+      _openNewDashboardModal(async (row) => {
+        showToast(_t('dash.created', 'Dashboard "{name}" created').replace('{name}', row.name || ''));
+      });
+    });
+    menu.appendChild(addNew);
+    (rows || []).forEach((row) => {
+      // Real anchor → middle-click / Ctrl+click open a new tab natively.
+      const item = document.createElement('a');
+      item.className = 'dropdown-item dash-dd-item' + (row.shared_by ? ' shared' : '');
+      item.href = '/dashboards/' + row.dash_id;
+      const name = document.createElement('span');
+      name.className = 'dash-dd-name';
+      name.textContent = row.name || '(unnamed)';
+      item.appendChild(name);
+      if (row.shared_by) {
+        const sub = document.createElement('span');
+        sub.className = 'dash-dd-sub';
+        sub.textContent = _t('dash.shared_by', 'Shared by') + ' ' + row.shared_by;
+        item.appendChild(sub);
+      }
+      menu.appendChild(item);
+    });
+    if (!rows || !rows.length) {
+      const empty = document.createElement('div');
+      empty.className = 'dash-dd-empty';
+      empty.textContent = _t('dash.no_dashboards', 'No dashboards yet');
+      menu.appendChild(empty);
+    }
+  }
+
+  btn.addEventListener('click', async () => {
+    const isHidden = menu.classList.contains('hidden');
+    if (isHidden) {
+      renderMenu(_dashListCache.rows || []);   // instant paint from cache
+      menu.classList.remove('hidden');
+      renderMenu(await _dashList(true));       // then fresh MRU order
+    } else {
+      menu.classList.add('hidden');
+    }
+  });
+  // Close on outside click (same pattern as the report-download dropdown).
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#dashboardsDropdown')) menu.classList.add('hidden');
+  });
+}
+
+// ── New-dashboard name modal ───────────────────────────────────────────────
+function _openNewDashboardModal(onCreated) {
+  const modal = document.getElementById('newDashboardModal');
+  const input = document.getElementById('newDashboardName');
+  const btnCreate = document.getElementById('btnCreateDashboard');
+  const btnCancel = document.getElementById('btnCancelNewDashboard');
+  const btnClose = document.getElementById('closeNewDashboard');
+  if (!modal || !input || !btnCreate) return;
+  input.value = '';
+  modal.classList.remove('hidden');
+  setTimeout(() => input.focus(), 50);
+
+  const close = () => {
+    modal.classList.add('hidden');
+    btnCreate.onclick = null;
+    if (btnCancel) btnCancel.onclick = null;
+    if (btnClose) btnClose.onclick = null;
+    input.onkeydown = null;
+  };
+  const create = async () => {
+    const name = input.value.trim();
+    if (!name) { input.focus(); return; }
+    btnCreate.disabled = true;
+    try {
+      const row = await _createDashboard(name);
+      close();
+      if (onCreated) await onCreated(row);
+    } catch (e) {
+      showToast(String(e.message || e), true);
+    } finally {
+      btnCreate.disabled = false;
+    }
+  };
+  btnCreate.onclick = create;
+  if (btnCancel) btnCancel.onclick = close;
+  if (btnClose) btnClose.onclick = close;
+  input.onkeydown = (e) => { if (e.key === 'Enter') create(); };
+}
+
+// ── Add-to-dashboard picker ────────────────────────────────────────────────
+// payloadBuilder() is called at CHOOSE time so the payload reflects the item's
+// current state (a chart refreshed in-chat pins its refreshed render).
+// The picker is an ANCHORED COMBOBOX POPOVER at the 📌 button (not a centered
+// modal): a search input with the suggestion list attached directly beneath
+// it, all own dashboards visible immediately, live filtering, Enter picks the
+// first match, "＋ Add new" pinned at the bottom.
+let _dashPickerCleanup = null;
+
+function _closeDashPicker() {
+  if (_dashPickerCleanup) {
+    try { _dashPickerCleanup(); } catch (e) { /* non-fatal */ }
+    _dashPickerCleanup = null;
+  }
+}
+
+function _openDashPicker(anchorEl, payloadBuilder, onAdded) {
+  _closeDashPicker();
+  if (!anchorEl || !document.body.contains(anchorEl)) return;
+
+  const pop = document.createElement('div');
+  pop.className = 'pdc-dash-pop';
+
+  const search = document.createElement('input');
+  search.type = 'text';
+  search.className = 'pdc-dash-pop-search';
+  search.placeholder = _t('dash.search_placeholder', 'Search dashboards…');
+  search.setAttribute('autocomplete', 'off');
+
+  const listEl = document.createElement('div');
+  listEl.className = 'pdc-dash-pop-list';
+
+  const createRow = document.createElement('button');
+  createRow.type = 'button';
+  createRow.className = 'pdc-dash-pop-create';
+  createRow.textContent = '＋ ' + _t('dash.add_new', 'Add new');
+
+  pop.appendChild(search);
+  pop.appendChild(listEl);
+  pop.appendChild(createRow);
+  document.body.appendChild(pop);
+
+  // Anchor below the pin button; flip above when there is no room below.
+  const rect = anchorEl.getBoundingClientRect();
+  const W = 300;
+  pop.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - W - 8)) + 'px';
+  const roomBelow = window.innerHeight - rect.bottom;
+  if (roomBelow >= 260 || roomBelow >= rect.top) {
+    pop.style.top = (rect.bottom + 6) + 'px';
+  } else {
+    pop.style.bottom = (window.innerHeight - rect.top + 6) + 'px';
+  }
+
+  const onDocDown = (e) => {
+    if (!e.target.closest('.pdc-dash-pop') && e.target !== anchorEl) _closeDashPicker();
+  };
+  const onKey = (e) => {
+    if (e.key === 'Escape') _closeDashPicker();
+  };
+  document.addEventListener('mousedown', onDocDown, true);
+  document.addEventListener('keydown', onKey, true);
+  _dashPickerCleanup = () => {
+    document.removeEventListener('mousedown', onDocDown, true);
+    document.removeEventListener('keydown', onKey, true);
+    pop.remove();
+  };
+
+  let rows = [];
+
+  async function pick(dashId, dashName) {
+    let payload = null;
+    try { payload = payloadBuilder(); } catch (e) { payload = null; }
+    if (!payload) {
+      showToast(_t('dash.pin_failed', 'Could not add to dashboard'), true);
+      return;
+    }
+    try {
+      const res = await fetch(`/api/dashboards/${dashId}/tiles`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data || !data.ok) {
+        throw new Error((data && data.error) || 'add failed');
+      }
+      _closeDashPicker();
+      showToast(_t('dash.added', 'Added to') + ' "' + dashName + '"');
+      if (onAdded) onAdded();
+    } catch (e) {
+      showToast(String(e.message || e), true);
+    }
+  }
+
+  createRow.addEventListener('click', () => {
+    _closeDashPicker();
+    _openNewDashboardModal(async (row) => { await pick(row.dash_id, row.name); });
+  });
+
+  function statusRow(text) {
+    listEl.innerHTML = '';
+    const div = document.createElement('div');
+    div.className = 'pdc-dash-pop-status';
+    div.textContent = text;
+    listEl.appendChild(div);
+  }
+
+  function render(filter) {
+    const q = (filter || '').trim().toLowerCase();
+    listEl.innerHTML = '';
+    // Only OWN dashboards are pinnable (the server rejects pins to shared ones).
+    const own = rows.filter(r => !r.shared_by);
+    const matches = own.filter(r => !q || (r.name || '').toLowerCase().includes(q));
+    if (!own.length) {
+      statusRow(_dashListCache.error
+        ? _t('dash.list_failed', 'Could not load dashboards — try again')
+        : _t('dash.no_dashboards', 'No dashboards yet'));
+      return;
+    }
+    if (!matches.length) {
+      statusRow(_t('dash.no_matches', 'No matches — create a new dashboard below'));
+      return;
+    }
+    matches.forEach((row) => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'pdc-dash-pop-item';
+      item.textContent = row.name || '(unnamed)';
+      item.title = row.name || '';
+      item.addEventListener('click', () => pick(row.dash_id, row.name));
+      listEl.appendChild(item);
+    });
+  }
+
+  search.addEventListener('input', () => render(search.value));
+  search.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    const first = listEl.querySelector('.pdc-dash-pop-item');
+    if (first) first.click(); else createRow.click();
+  });
+
+  statusRow('…');
+  setTimeout(() => search.focus(), 30);
+  _dashList(true).then((r) => { rows = r || []; render(search.value); });
+}
+
+// ── Pin buttons on charts + table blocks ───────────────────────────────────
+function _makePinButton(payloadBuilder) {
+  const btn = document.createElement('button');
+  btn.className = 'ghost pdc-pin-btn';
+  btn.textContent = '📌';
+  btn.title = _t('dash.pin', 'Add to dashboard');
+  btn.style.cssText = 'padding:6px 10px; font-size:13px;';
+  btn.addEventListener('click', () => {
+    _openDashPicker(btn, payloadBuilder, () => {
+      const original = btn.textContent;
+      btn.textContent = '✓';
+      setTimeout(() => { btn.textContent = original; }, 1500);
+    });
+  });
+  return btn;
+}
+
+// Normalize a possibly-joined legacy code into ONE clean block (same rule as
+// _wireRefreshButtons) — multi-segment residues pin without code (no refresh).
+function _pinnableCode(rawCode) {
+  let code = rawCode ? String(rawCode) : '';
+  if (code.includes('###NEXT_PLOT###')) {
+    const segs = _splitJoinedCode(code);
+    code = segs.length === 1 ? segs[0] : '';
+  }
+  return code.trim() || null;
+}
+
+function _wireAddToDash(contentDiv, chartContainer, extras, content) {
+  extras = extras || {};
+  // Chart pin — payload is read at CLICK time: the iframe's srcdoc / img src
+  // reflect any in-chat refresh, extras.chartDataKey is mutated by refresh.
+  if (chartContainer) {
+    const bar = chartContainer.querySelector('.pdc-action-bar');
+    if (bar && !bar.querySelector('.pdc-pin-btn')) {
+      bar.appendChild(_makePinButton(() => {
+        const chatId = currentChatId;
+        if (!chatId) return null;
+        const iframe = chartContainer.querySelector('iframe');
+        const img = chartContainer.querySelector('img');
+        let image = null, isPlotly = false;
+        if (iframe) {
+          image = iframe.srcdoc || '';
+          isPlotly = true;
+        } else if (img && img.src.startsWith('data:image/png;base64,')) {
+          image = img.src.slice('data:image/png;base64,'.length);
+        }
+        if (!image) return null;
+        return {
+          chat_id: chatId,
+          kind: 'chart',
+          description: content || '',
+          code: _pinnableCode(extras.code),
+          image_base64: image,
+          is_plotly: isPlotly,
+          chart_data: extras.chartData || null,
+          chart_data_key: extras.chartDataKey || null,
+        };
+      }));
+    }
+  }
+  // Table pins — one per block; the handler reads the block's CURRENT stash
+  // (_pdcTable/_pdcFullKey are refreshed by the per-table refresh rebuild).
+  // In a MIXED chart+table message, extras.code belongs to the CHART — send no
+  // code for the table; the server resolves the authoritative table code from
+  // the durable full-table record (the one Download Excel re-executes).
+  const tableCode = chartContainer ? null : _pinnableCode(extras.code);
+  contentDiv.querySelectorAll('.pdc-table-block').forEach((wrap) => {
+    const bar = wrap.querySelector('.pdc-action-bar');
+    if (!bar || bar.querySelector('.pdc-pin-btn')) return;
+    bar.appendChild(_makePinButton(() => {
+      const chatId = currentChatId;
+      const t = wrap._pdcTable;
+      if (!chatId || !t) return null;
+      const title = wrap._pdcTitle || '';
+      return {
+        chat_id: chatId,
+        kind: 'table',
+        description: title ? (title + '\n\n' + (content || '')) : (content || ''),
+        code: tableCode,
+        table: t,
+        full_table_key: wrap._pdcFullKey || null,
+      };
+    }));
+  });
+}
+
+// Own listener — deliberately NOT touching setupEventListeners.
+document.addEventListener('DOMContentLoaded', initDashboardsDropdown);

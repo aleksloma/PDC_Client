@@ -1456,24 +1456,13 @@ async def full_table_get(request: Request, chat_id: str, key: str):
 # return 200 {ok: false, error} so the frontend keeps the previous render and
 # shows a small non-blocking note (Article IV: logged, safe fallback).
 
-@router.post("/{chat_id}/refresh_item")
-async def refresh_item(request: Request, chat_id: str):
-    email, err = _require_chat(request, chat_id)
-    if err:
-        return err
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    code = ((body or {}).get("code") or "").strip()
-    kind = ((body or {}).get("kind") or "chart").strip().lower()
-    if not code:
-        return JSONResponse({"error": "No code to re-run for this item."}, status_code=400)
-    if "###NEXT_PLOT###" in code:
-        # Legacy joined multi-chart record — not a single executable block.
-        return JSONResponse({"error": "This item cannot be refreshed."}, status_code=400)
-
-    sid = secrets.token_hex(8)
+async def run_item_refresh(chat_id: str, code: str, kind: str, sid: str) -> dict:
+    """Re-run ONE item's stored code against the chat's current dataframes and
+    return the re-rendered item. Shared by `refresh_item` (per-message refresh
+    in /lab) and the dashboard tile refresh (routes/dashboards.py). Purely
+    local (Article II). Returns `{ok: True, ...}` payloads identical to the
+    historical refresh_item contract, or `{ok: False, error}` on any execution
+    failure (Article IV: logged, safe fallback — never raises)."""
     store = local_store.ChatDataStore(chat_id)
     loop = asyncio.get_running_loop()
     try:
@@ -1529,6 +1518,25 @@ async def refresh_item(request: Request, chat_id: str):
         log_with_sid(sid, "error", f"REFRESH_ITEM_ERROR: {type(e).__name__}: {e}",
                      chat_id=chat_id)
         return {"ok": False, "error": "Refresh failed."}
+
+
+@router.post("/{chat_id}/refresh_item")
+async def refresh_item(request: Request, chat_id: str):
+    email, err = _require_chat(request, chat_id)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    code = ((body or {}).get("code") or "").strip()
+    kind = ((body or {}).get("kind") or "chart").strip().lower()
+    if not code:
+        return JSONResponse({"error": "No code to re-run for this item."}, status_code=400)
+    if "###NEXT_PLOT###" in code:
+        # Legacy joined multi-chart record — not a single executable block.
+        return JSONResponse({"error": "This item cannot be refreshed."}, status_code=400)
+    return await run_item_refresh(chat_id, code, kind, secrets.token_hex(8))
 
 
 # --- Downloads (chart PNG + table Excel) -------------------------------------

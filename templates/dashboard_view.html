@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dashboard - PowerDataChat</title>
+  <meta name="robots" content="noindex, nofollow" />
+  <link rel="icon" type="image/png" href="/static/logo.png?v={{ ts }}" />
+  <link rel="shortcut icon" href="/static/logo.png?v={{ ts }}" />
+  <link rel="stylesheet" href="/static/main.css?v={{ ts }}" />
+  <link rel="stylesheet" href="/static/dashboard.css?v={{ ts }}" />
+  <link rel="stylesheet" href="/static/vendor/gridstack/gridstack.min.css?v={{ ts }}" />
+  <link rel="stylesheet" href="/static/vendor/gridstack/gridstack-extra.min.css?v={{ ts }}" />
+  <link rel="stylesheet" href="/static/dashboard_view.css?v={{ ts }}" />
+</head>
+<body class="dashboard-page dash-view-page">
+  <main class="dash-main">
+    <div class="top-bar dash-top-bar">
+      <a href="/lab" class="dash-back-btn" id="btnBackToLab" data-i18n-title="dash.back" title="Back to Lab">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+      </a>
+      <h1 id="dashTitle" class="dash-title"></h1>
+      <button id="btnRenameDash" class="ghost small dash-title-edit hidden" data-i18n-title="dash.rename" title="Rename">✎</button>
+      <span id="dashSharedBadge" class="dash-shared-badge hidden"></span>
+      <div class="top-bar-spacer"></div>
+      <div class="top-bar-actions">
+        <button id="btnRefreshAll" class="ghost small top-action-btn" data-i18n="dash.refresh_all">⟳ Refresh all</button>
+        <button id="btnShareDash" class="ghost small top-action-btn hidden" data-i18n="dash.share">🔗 Share</button>
+        <button id="btnDeleteDash" class="ghost small top-action-btn" data-i18n="dash.delete">🗑 Delete</button>
+        {% include 'partials/profile_button.html' %}
+      </div>
+    </div>
+
+    <div id="dashEmptyState" class="dash-empty hidden">
+      <h2 data-i18n="dash.empty_title">This dashboard is empty</h2>
+      <p data-i18n="dash.empty_hint">Open a conversation in the Lab and click 📌 on any chart or table to add it here.</p>
+      <a href="/lab" class="dash-empty-cta" data-i18n="dash.go_lab">Go to Lab</a>
+    </div>
+
+    <div class="dash-grid-scroll">
+      <div id="dashGrid" class="grid-stack"></div>
+    </div>
+  </main>
+
+  <!-- Rename modal -->
+  <div id="renameDashModal" class="modal hidden">
+    <div class="modal-content small-modal">
+      <div class="modal-header">
+        <h3 data-i18n="dash.rename">Rename</h3>
+        <button id="closeRenameDash" class="ghost">✕</button>
+      </div>
+      <div class="modal-body">
+        <input type="text" id="renameDashInput" maxlength="100" data-i18n-placeholder="dash.name_placeholder" placeholder="Dashboard name" />
+      </div>
+      <div class="modal-actions">
+        <button class="ghost" id="btnCancelRenameDash" data-i18n="dash.cancel">Cancel</button>
+        <button class="primary" id="btnSaveRenameDash" data-i18n="dash.rename">Rename</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete confirm modal -->
+  <div id="deleteDashModal" class="modal hidden">
+    <div class="modal-content small-modal">
+      <div class="modal-header">
+        <h3 id="deleteDashTitle" data-i18n="dash.delete">Delete</h3>
+        <button id="closeDeleteDash" class="ghost">✕</button>
+      </div>
+      <div class="modal-body">
+        <p id="deleteDashText" data-i18n="dash.delete_confirm">Delete this dashboard? Its tiles are removed; your chats and data are not affected.</p>
+      </div>
+      <div class="modal-actions">
+        <button class="ghost" id="btnCancelDeleteDash" data-i18n="dash.cancel">Cancel</button>
+        <button class="primary danger" id="btnConfirmDeleteDash" data-i18n="dash.delete">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Share modal — exact mirror of the /lab conversation-share modal
+       (templates/dashboard.html #shareModal); only the title differs. -->
+  <div id="shareDashModal" class="modal hidden">
+    <div class="modal-content small-modal">
+      <div class="modal-header">
+        <h3 data-i18n="dash.share_title">Share Dashboard</h3>
+        <button id="closeShareDash" class="ghost">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label data-i18n="share.emails_label">Share with specific emails (comma-separated)</label>
+          <input id="shareDashEmails" type="text" placeholder="email1@example.com, email2@example.com" data-i18n-placeholder="share.emails_placeholder" />
+          <p style="font-size: 13px; color: #6b7280; margin-top: 8px;" data-i18n="share.emails_hint">The chat will appear in their "Shared with Me" list</p>
+        </div>
+        <div class="form-group" style="margin-top: 16px;">
+          <label data-i18n="share.comment_label">Add a comment (optional)</label>
+          <textarea id="shareDashComment" rows="3" placeholder="Add a note for the recipient..." data-i18n-placeholder="share.comment_placeholder" style="width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; resize: vertical;"></textarea>
+          <p style="font-size: 12px; color: #9ca3af; margin-top: 6px; font-style: italic;" data-i18n="share.comment_hint">This comment will be sent via email notification only</p>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="btnCancelShareDash" class="ghost" data-i18n="common.cancel">Cancel</button>
+        <button id="btnSaveShareDash" class="primary" data-i18n="common.share">Share</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    window.DASH_ID = "{{ dash_id }}";
+  </script>
+  <script src="/static/i18n.js?v={{ ts }}"></script>
+  <script src="/static/vendor/viewers.js?v={{ ts }}"></script>
+  <script src="/static/vendor/gridstack/gridstack-all.js?v={{ ts }}"></script>
+  <script src="/static/dashboard_view.js?v={{ ts }}"></script>
+</body>
+</html>

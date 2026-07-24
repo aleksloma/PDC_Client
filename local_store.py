@@ -1093,3 +1093,372 @@ def get_chat_meta_owner(chat_id: str) -> Optional[str]:
 
 def chat_exists(chat_id: str) -> bool:
     return (_data_root() / "chatdata" / chat_id / "meta.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# DashboardStore — per-user dashboards (pinned charts/tables + grid layout)
+# ---------------------------------------------------------------------------
+
+_DASH_ID_RE = re.compile(r"^[0-9a-fA-F]{16}$")
+
+# Default grid cell for a newly pinned tile (12-column grid).
+_DASH_DEFAULT_W = 6
+_DASH_DEFAULT_H = 5
+
+
+def _write_json_atomic(path: Path, payload) -> None:
+    """Whole-file JSON replace: tmp + os.replace (same pattern as the parquet
+    cache manifests) so a crash mid-write can never corrupt a dashboard doc."""
+    tmp = path.with_name(path.name + f".tmp-{os.getpid()}-{threading.get_ident()}")
+    tmp.write_text(json.dumps(_json_safe(payload), ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+class DashboardStore:
+    """Per-user dashboards under users/{email}/dashboards/.
+
+    Layout:
+      index.json       — light listing rows for the dropdown:
+                           own:    {dash_id, name, created_at, last_used_at, tile_count}
+                           shared: {dash_id, name, owner, shared_by, created_at, last_used_at}
+                         A row with `shared_by` is a POINTER — the doc lives in
+                         the owner's folder (single source of truth, live share).
+      {dash_id}.json   — full doc incl. tile snapshots (can be MBs):
+                           {dash_id, name, owner, version, created_at, updated_at,
+                            last_used_at, sharing: {shared_with: [emails]},
+                            tiles: [{tile_id, chat_id, kind, title, description,
+                                     code, snapshot, chart_data, full_table_key,
+                                     frozen, frozen_reason, layout, added_at}]}
+
+    Readers .get() every field with defaults (stored-shape backward compat).
+    All mutations run under _LOCK with atomic whole-file replaces.
+    """
+
+    @staticmethod
+    def valid_id(value) -> bool:
+        return bool(isinstance(value, str) and _DASH_ID_RE.match(value))
+
+    def _dir(self, email: str) -> Path:
+        d = _data_root() / "users" / _safe_email(email) / "dashboards"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _index_path(self, email: str) -> Path:
+        return self._dir(email) / "index.json"
+
+    def _doc_path(self, email: str, dash_id: str) -> Path:
+        return self._dir(email) / f"{dash_id}.json"
+
+    # ---- index -------------------------------------------------------------
+    def _read_index(self, email: str) -> list[dict]:
+        p = self._index_path(email)
+        if not p.exists():
+            return []
+        try:
+            rows = json.loads(p.read_text(encoding="utf-8"))
+            return rows if isinstance(rows, list) else []
+        except Exception as e:
+            log_with_sid(email, "error", f"DASH_INDEX_READ_FAILED: {e}")
+            return []
+
+    def _write_index(self, email: str, rows: list[dict]) -> None:
+        _write_json_atomic(self._index_path(email), rows)
+
+    # ---- docs --------------------------------------------------------------
+    def _read_doc(self, owner_email: str, dash_id: str) -> Optional[dict]:
+        if not self.valid_id(dash_id):
+            return None
+        p = self._doc_path(owner_email, dash_id)
+        if not p.exists():
+            return None
+        try:
+            doc = json.loads(p.read_text(encoding="utf-8"))
+            return doc if isinstance(doc, dict) else None
+        except Exception as e:
+            log_with_sid(owner_email, "error", f"DASH_DOC_READ_FAILED dash={dash_id}: {e}")
+            return None
+
+    def _write_doc(self, owner_email: str, doc: dict) -> None:
+        doc["updated_at"] = _now()
+        _write_json_atomic(self._doc_path(owner_email, doc["dash_id"]), doc)
+
+    # ---- public API --------------------------------------------------------
+    def list_dashboards(self, email: str) -> list[dict]:
+        """Own + shared rows, MRU-sorted (last_used_at, then created_at, desc).
+        Shared pointers whose owner doc vanished (owner deleted the dashboard)
+        are lazily dropped here."""
+        with _LOCK:
+            rows = self._read_index(email)
+            keep: list[dict] = []
+            dropped = False
+            for row in rows:
+                dash_id = row.get("dash_id")
+                if not self.valid_id(dash_id):
+                    dropped = True
+                    continue
+                if row.get("shared_by"):
+                    if not self._doc_path(row.get("owner") or "", dash_id).exists():
+                        dropped = True
+                        continue
+                keep.append(row)
+            if dropped:
+                try:
+                    self._write_index(email, keep)
+                except Exception as e:
+                    log_with_sid(email, "warning", f"DASH_INDEX_PRUNE_FAILED: {e}")
+        keep.sort(key=lambda r: (r.get("last_used_at") or r.get("created_at") or ""),
+                  reverse=True)
+        return keep
+
+    def create_dashboard(self, email: str, name: str) -> dict:
+        email = _safe_email(email)
+        dash_id = secrets.token_hex(8)
+        now = _now()
+        doc = {
+            "dash_id": dash_id, "name": name, "owner": email, "version": 1,
+            "created_at": now, "updated_at": now, "last_used_at": now,
+            "sharing": {"shared_with": []}, "tiles": [],
+        }
+        row = {"dash_id": dash_id, "name": name, "created_at": now,
+               "last_used_at": now, "tile_count": 0}
+        with _LOCK:
+            _write_json_atomic(self._doc_path(email, dash_id), doc)
+            rows = self._read_index(email)
+            rows.append(row)
+            self._write_index(email, rows)
+        log_with_sid(email, "info", f"DASHBOARD_CREATED dash={dash_id}")
+        return row
+
+    def get_dashboard(self, email: str, dash_id: str) -> Optional[dict]:
+        """Own doc only (owner path)."""
+        return self._read_doc(email, dash_id)
+
+    def resolve_dashboard(self, email: str, dash_id: str):
+        """Resolve a dashboard the caller may access: own doc, else a shared
+        pointer whose owner doc still lists the caller. Returns (doc, is_owner)
+        or (None, False)."""
+        email = _safe_email(email)
+        doc = self._read_doc(email, dash_id)
+        if doc is not None:
+            return doc, True
+        for row in self._read_index(email):
+            if row.get("dash_id") == dash_id and row.get("shared_by"):
+                owner = row.get("owner") or ""
+                doc = self._read_doc(owner, dash_id)
+                if doc is None:
+                    return None, False
+                shared = [s.lower() for s in
+                          ((doc.get("sharing") or {}).get("shared_with") or [])]
+                if email in shared:
+                    return doc, False
+                return None, False
+        return None, False
+
+    def touch_last_used(self, email: str, dash_id: str) -> None:
+        """Bump the caller's MRU row (and the doc when the caller owns it).
+        For shared pointers this also re-syncs the name from the live doc."""
+        email = _safe_email(email)
+        now = _now()
+        try:
+            with _LOCK:
+                rows = self._read_index(email)
+                changed = False
+                for row in rows:
+                    if row.get("dash_id") != dash_id:
+                        continue
+                    row["last_used_at"] = now
+                    if row.get("shared_by"):
+                        live = self._read_doc(row.get("owner") or "", dash_id)
+                        if live and live.get("name"):
+                            row["name"] = live["name"]
+                    changed = True
+                if changed:
+                    self._write_index(email, rows)
+                doc = self._read_doc(email, dash_id)
+                if doc is not None:
+                    doc["last_used_at"] = now
+                    self._write_doc(email, doc)
+        except Exception as e:
+            log_with_sid(email, "warning", f"DASH_TOUCH_FAILED dash={dash_id}: {e}")
+
+    def rename_dashboard(self, owner_email: str, dash_id: str, name: str) -> bool:
+        owner_email = _safe_email(owner_email)
+        with _LOCK:
+            doc = self._read_doc(owner_email, dash_id)
+            if doc is None:
+                return False
+            doc["name"] = name
+            self._write_doc(owner_email, doc)
+            rows = self._read_index(owner_email)
+            for row in rows:
+                if row.get("dash_id") == dash_id:
+                    row["name"] = name
+            self._write_index(owner_email, rows)
+        log_with_sid(owner_email, "info", f"DASHBOARD_RENAMED dash={dash_id}")
+        return True
+
+    def delete_dashboard(self, owner_email: str, dash_id: str) -> bool:
+        """Owner delete: remove doc + own index row. Recipients' pointer rows
+        go stale and are pruned by their next list_dashboards. Idempotent."""
+        owner_email = _safe_email(owner_email)
+        if not self.valid_id(dash_id):
+            return False
+        with _LOCK:
+            p = self._doc_path(owner_email, dash_id)
+            existed = p.exists()
+            try:
+                p.unlink(missing_ok=True)
+            except Exception as e:
+                log_with_sid(owner_email, "error", f"DASH_DELETE_FAILED dash={dash_id}: {e}")
+                return False
+            rows = [r for r in self._read_index(owner_email) if r.get("dash_id") != dash_id]
+            self._write_index(owner_email, rows)
+        if existed:
+            log_with_sid(owner_email, "info", f"DASHBOARD_DELETED dash={dash_id}")
+        return True
+
+    def remove_from_index(self, email: str, dash_id: str) -> bool:
+        """Recipient 'delete': drop only the caller's index row (pointer or
+        stale row) — the owner's doc is untouched (deactivate_chat semantics)."""
+        email = _safe_email(email)
+        with _LOCK:
+            rows = self._read_index(email)
+            keep = [r for r in rows if r.get("dash_id") != dash_id]
+            if len(keep) == len(rows):
+                return False
+            self._write_index(email, keep)
+        return True
+
+    # ---- tiles -------------------------------------------------------------
+    def _sync_tile_count(self, owner_email: str, doc: dict) -> None:
+        rows = self._read_index(owner_email)
+        for row in rows:
+            if row.get("dash_id") == doc.get("dash_id"):
+                row["tile_count"] = len(doc.get("tiles") or [])
+        self._write_index(owner_email, rows)
+
+    def add_tile(self, owner_email: str, dash_id: str, tile: dict) -> Optional[dict]:
+        """Assign a tile_id, auto-place at the bottom of the layout, append."""
+        owner_email = _safe_email(owner_email)
+        with _LOCK:
+            doc = self._read_doc(owner_email, dash_id)
+            if doc is None:
+                return None
+            tiles = doc.get("tiles") or []
+            bottom = 0
+            for t in tiles:
+                lay = t.get("layout") or {}
+                try:
+                    bottom = max(bottom, int(lay.get("y", 0)) + int(lay.get("h", _DASH_DEFAULT_H)))
+                except Exception:
+                    continue
+            tile = dict(tile)
+            tile["tile_id"] = secrets.token_hex(8)
+            tile["added_at"] = _now()
+            tile.setdefault("frozen", False)
+            tile.setdefault("frozen_reason", None)
+            tile["layout"] = {"x": 0, "y": bottom,
+                              "w": _DASH_DEFAULT_W, "h": _DASH_DEFAULT_H}
+            tiles.append(tile)
+            doc["tiles"] = tiles
+            self._write_doc(owner_email, doc)
+            self._sync_tile_count(owner_email, doc)
+        log_with_sid(owner_email, "info",
+                     f"DASH_TILE_ADDED dash={dash_id} tile={tile['tile_id']} kind={tile.get('kind')}")
+        return tile
+
+    def remove_tile(self, owner_email: str, dash_id: str, tile_id: str) -> bool:
+        owner_email = _safe_email(owner_email)
+        with _LOCK:
+            doc = self._read_doc(owner_email, dash_id)
+            if doc is None:
+                return False
+            tiles = doc.get("tiles") or []
+            keep = [t for t in tiles if t.get("tile_id") != tile_id]
+            if len(keep) == len(tiles):
+                return False
+            doc["tiles"] = keep
+            self._write_doc(owner_email, doc)
+            self._sync_tile_count(owner_email, doc)
+        log_with_sid(owner_email, "info", f"DASH_TILE_REMOVED dash={dash_id} tile={tile_id}")
+        return True
+
+    def update_layout(self, owner_email: str, dash_id: str, layouts: list[dict]) -> bool:
+        """Bulk layout save: [{tile_id, x, y, w, h}]. Unknown tile_ids are
+        ignored (stale client); non-int values are clamped/skipped."""
+        owner_email = _safe_email(owner_email)
+        by_id = {}
+        for lay in layouts or []:
+            tid = lay.get("tile_id")
+            try:
+                x = max(0, int(lay.get("x", 0)))
+                y = max(0, int(lay.get("y", 0)))
+                w = min(12, max(1, int(lay.get("w", _DASH_DEFAULT_W))))
+                h = min(50, max(1, int(lay.get("h", _DASH_DEFAULT_H))))
+            except Exception:
+                continue
+            if tid:
+                by_id[tid] = {"x": x, "y": y, "w": w, "h": h}
+        with _LOCK:
+            doc = self._read_doc(owner_email, dash_id)
+            if doc is None:
+                return False
+            for t in doc.get("tiles") or []:
+                lay = by_id.get(t.get("tile_id"))
+                if lay:
+                    t["layout"] = lay
+            self._write_doc(owner_email, doc)
+        return True
+
+    def update_tile(self, owner_email: str, dash_id: str, tile_id: str, patch: dict) -> bool:
+        """Merge a patch into one tile (snapshot swap / frozen flags). The doc
+        always lives in the OWNER's folder — recipients refresh through here
+        with the owner email resolved from the doc."""
+        owner_email = _safe_email(owner_email)
+        with _LOCK:
+            doc = self._read_doc(owner_email, dash_id)
+            if doc is None:
+                return False
+            for t in doc.get("tiles") or []:
+                if t.get("tile_id") == tile_id:
+                    t.update(patch)
+                    self._write_doc(owner_email, doc)
+                    return True
+        return False
+
+    # ---- sharing -----------------------------------------------------------
+    def add_dashboard_share(self, owner_email: str, dash_id: str,
+                            recipients: list[str]) -> list[str]:
+        """Append distinct emails to the doc's shared_with (same shape as chat
+        meta sharing) + write a pointer row into each NEW recipient's index.
+        Returns the previously-absent recipients only."""
+        owner_email = _safe_email(owner_email)
+        with _LOCK:
+            doc = self._read_doc(owner_email, dash_id)
+            if doc is None:
+                return []
+            sharing = doc.get("sharing") or {"shared_with": []}
+            existing = set(sharing.get("shared_with") or [])
+            new = [r for r in (_safe_email(r) for r in recipients if r)
+                   if r and r != owner_email and r not in existing]
+            existing.update(new)
+            sharing["shared_with"] = sorted(existing)
+            doc["sharing"] = sharing
+            self._write_doc(owner_email, doc)
+            now = _now()
+            for rcpt in new:
+                try:
+                    rows = self._read_index(rcpt)
+                    if any(r.get("dash_id") == dash_id for r in rows):
+                        continue
+                    rows.append({"dash_id": dash_id, "name": doc.get("name") or "",
+                                 "owner": owner_email, "shared_by": owner_email,
+                                 "created_at": now, "last_used_at": None})
+                    self._write_index(rcpt, rows)
+                except Exception as e:
+                    log_with_sid(owner_email, "error",
+                                 f"DASH_SHARE_POINTER_FAILED dash={dash_id} rcpt={rcpt}: {e}")
+        if new:
+            log_with_sid(owner_email, "info",
+                         f"DASHBOARD_SHARED dash={dash_id} added={len(new)}")
+        return new

@@ -33,6 +33,7 @@ from routes.upload import router as upload_router
 from routes.chat import router as chat_router
 from routes.report import router as report_router
 from routes.schema import router as schema_router
+from routes.dashboards import router as dashboards_router
 
 
 _HERE = Path(__file__).resolve().parent
@@ -137,6 +138,7 @@ app.include_router(upload_router)
 app.include_router(schema_router)
 app.include_router(chat_router)
 app.include_router(report_router)
+app.include_router(dashboards_router)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -261,6 +263,41 @@ async def open_conversation_deeplink(request: Request, conv_id: str):
             "subscription_plan": "Enterprise",
             "open_conv_id": conv_id,
             "open_chat_id": chat_id,
+            **prof,
+        },
+    )
+
+
+@app.get("/dashboards/{dash_id}", response_class=HTMLResponse)
+async def dashboard_view_page(request: Request, dash_id: str):
+    """The dashboard page (grid of pinned tiles). Mirrors the /lab handler's
+    session guards; unknown/unshared dashboard → /lab (never 404s, same
+    philosophy as the /c/{conv_id} deep-link)."""
+    email = request.session.get("email")
+    if not email:
+        return RedirectResponse(url="/", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse(url="/auth/change_password", status_code=302)
+    try:
+        from local_store import DashboardStore
+        doc, is_owner = DashboardStore().resolve_dashboard(email, dash_id)
+    except Exception as e:
+        log_with_sid(email, "error", f"DASH_PAGE_LOOKUP_FAILED: {e}", dash_id=dash_id)
+        return RedirectResponse(url="/lab", status_code=302)
+    if doc is None:
+        log_with_sid(email, "info", "DASH_PAGE_NOT_FOUND", dash_id=dash_id)
+        return RedirectResponse(url="/lab", status_code=302)
+    log_with_sid(email, "info", "OPEN_DASHBOARD_UI", dash_id=dash_id)
+    ts = int(time.time())
+    prof = _profile_context(email)
+    return templates.TemplateResponse(
+        "dashboard_view.html",
+        {
+            "request": request,
+            "ts": ts,
+            "dash_id": dash_id,
+            "username": email,
+            "subscription_plan": "Enterprise",
             **prof,
         },
     )

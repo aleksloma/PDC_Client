@@ -20,6 +20,7 @@ file documents the enterprise client's implementation of each one.
 | `GET` | `/lab` | the dashboard page (no session → `/`; `must_change_password` pending → `/auth/change_password`) |
 | `GET` | `/c/{conv_id}` | deep-link / hard-refresh into one conversation. Resolves the conv's `chat_id` from the caller's conversations index and seeds `open_conv_id`/`open_chat_id` so `dashboard.js` auto-opens it. No session → `/`; forced change pending → `/auth/change_password`; unknown/foreign conv → `/lab` (never 404). |
 | `GET` | `/auth/change_password` | forced set-a-new-password page shown after a temp-password login (no session → `/`; no pending flag → `/lab`) |
+| `GET` | `/dashboards/{dash_id}` | the dashboard page (grid of pinned tiles, `dashboard_view.html` + `dashboard_view.js`). Resolves the dashboard via own-doc-or-shared-pointer; no session → `/`; forced change pending → `/auth/change_password`; unknown/unshared → `/lab` (never 404). |
 
 ---
 
@@ -340,6 +341,12 @@ PNGs, so their Download is a pure client-side save (no route).
 
 **`POST /api/chat/{chat_id}/refresh_item`** — body `{code, kind: "chart"|"table"}`.
 
+The execution body lives in the module-level coroutine
+`routes.chat.run_item_refresh(chat_id, code, kind, sid)`; `refresh_item` is a
+thin auth/validation wrapper around it and the dashboard tile refresh
+(`routes/dashboards.py`) reuses the same helper — one source of truth for
+local re-execution.
+
 Every chart and table that carries its own stored `code` (live events and
 persisted history records both do) gets a small refresh icon button (double
 curved arrows) in its action bar. Clicking it re-runs ONLY that item's stored
@@ -375,6 +382,65 @@ refreshed to reflect the new data.
   column vanished while the key survived) additionally disables that button
   for the rest of the session after its transient red note (the key check
   re-evaluates it on the next reload).
+
+---
+
+## Dashboards (curated grids of pinned charts/tables)
+
+A dashboard is a named grid of TILES pinned from conversation responses. Each
+tile stores a **snapshot** (chart base64-PNG / Plotly HTML, or a ≤50-row table
+preview) plus the item's stored `code`, description, inline `chart_data`
+(≤200k chars) and `full_table_key`. Opening a dashboard renders snapshots
+instantly — zero execution; per-tile refresh re-runs the code locally via the
+shared `run_item_refresh` helper (the `refresh_item` execution path — **no
+brain call**) and persists the fresh snapshot.
+
+**Storage** (Article V, all under `DATA_ROOT`):
+`users/{email}/dashboards/index.json` — light listing rows (own rows +
+`shared_by` pointer rows for dashboards shared with this user) — and
+`users/{email}/dashboards/{dash_id}.json` — the full doc
+`{dash_id, name, owner, version, sharing: {shared_with}, tiles: [...]}` with
+atomic tmp+`os.replace` writes (`local_store.DashboardStore`). IDs are 16 hex
+chars, regex-guarded (path-traversal safe). Old-shape docs load with defaults
+(backward compatible).
+
+| Method | Path | Behavior |
+|---|---|---|
+| `GET` | `/api/dashboards` | own + shared rows merged, MRU-sorted (`last_used_at` desc); shared rows carry `shared_by`/`owner` (rendered green in the UI). Stale pointers to owner-deleted dashboards are lazily pruned here. |
+| `POST` | `/api/dashboards` | `{name}` (1–100 chars) → creates an empty dashboard, returns the index row |
+| `GET` | `/api/dashboards/{id}` | full doc + `is_owner`; **bumps `last_used_at`** (opened == used) |
+| `POST` | `/api/dashboards/{id}/rename` | `{name}` — owner only (shared recipients → 403) |
+| `POST` | `/api/dashboards/{id}/delete` | owner → deletes the doc (+ own index row); shared recipient → drops only their pointer row (`{ok, deleted: bool}`); idempotent |
+| `POST` | `/api/dashboards/{id}/tiles` | pin one item. Body `{chat_id, kind: "chart"\|"table", description?, code?, image_base64?, is_plotly?, table?, full_table_key?, chart_data?\|chart_data_key?}`. Owner only + `_require_chat(chat_id)` (can only pin from accessible chats). Volatile `chart_data_key` is resolved to durable inline data AT PIN TIME; table rows capped at 50 (honest `total_rows`) with `styled_html`/`dtype`/`title` preserved (styled_html dropped only over 2M chars — plain rows remain) so conditional formatting survives on the tile; chart snapshots >5M chars → 400; `###NEXT_PLOT###` code is nulled (tile renders, can't refresh). **Table code is authoritative-from-record**: when `full_table_key` resolves to a durable record with clean `code`, that code (+ its `result_key`) is stored on the tile — the client-sent code can be the CHART's code in mixed chart+table answers, and the frontend sends no code for a table pinned from such a message. Auto-placed at the layout bottom (w6×h5 on a 12-col grid). |
+| `POST` | `/api/dashboards/{id}/tiles/{tile_id}/remove` | owner only |
+| `POST` | `/api/dashboards/{id}/layout` | `{tiles: [{tile_id, x, y, w, h}]}` bulk save — owner only; ints validated/clamped, unknown tile_ids ignored (stale client) |
+| `POST` | `/api/dashboards/{id}/tiles/{tile_id}/refresh` | allowed for owner AND shared recipients. Table tiles first **re-resolve + self-heal** their code from the durable full-table record (tiles pinned with a wrong/chart code get the corrected code persisted); tiles with a `result_key` (one table of a multi-table RESULT) re-execute via `_reexecute_full_df` and persist a fresh durable key, others via `run_item_refresh` (Styler results keep `styled_html`). Deleted source chat → persists `frozen/frozen_reason="source_deleted"` on the tile, returns `200 {ok:false, frozen:true, reason}`; a caller without source-chat access gets the same shape with `reason:"access_revoked"` but nothing is persisted (caller-specific). Execution failures → `200 {ok:false, error}`, stored snapshot untouched. Success updates the snapshot (+ re-inlined `chart_data` / new `full_table_key`), clears `frozen`, returns `{ok, kind, image_base64\|table, is_plotly?, tile}`. |
+| `POST` | `/api/dashboards/{id}/share` | `{emails: [...]\|"a@x, b@y", message?}` — owner only, mirrors the chat share contract (`{ok, shared_with, added, email_sent, smtp_configured, failed}`). Adds recipients to the doc's `shared_with`, writes a pointer row into each recipient's dashboard index, **and grants them access to every tile's source chat** (`add_share_recipients`, same grant conversation-sharing performs) so their Show-data/refresh work. Brain SMTP relay gets only the dashboard name + comment (Article II — never tile content). No revoke exists (parity with chat sharing). |
+
+**Frontend**: the `/lab` top bar has a Dashboards dropdown at the LEFT corner
+(filled navy `#001E44` bold button; left-anchored menu; always visible when
+signed in; "＋ Add new" first, then MRU; shared dashboards green with "Shared
+by …"). "＋ Add new" only CREATES the dashboard (toast, no navigation) — the
+user pins items to it later. Dashboard entries in the menu are real `<a>`
+anchors (middle-click / Ctrl+click open a new tab), and sidebar conversation
+items support middle-click via their `/c/{conv_id}` deep link. The
+add-to-dashboard picker is an ANCHORED COMBOBOX POPOVER at the 📌 button
+(`_openDashPicker`): search input with the suggestion list attached beneath,
+all own dashboards shown immediately, live filter, Enter picks the first
+match, "＋ Add new" pinned at the bottom, explicit loading/empty/error rows. Every chart and table block in a response carries a 📌 pin button in
+its `.pdc-action-bar` (live stream, history reload, multi-chart, multi-table)
+that opens the anchored combobox popover; the payload is read at CLICK time so a
+prior in-chat refresh pins the refreshed render. The dashboard page uses
+vendored GridStack 10.3.1 (`static/vendor/gridstack/`, MIT, offline) — drag by
+the tile grab strip, resize by edges, non-overlapping gravity packing, 1-column
+read-only mode under 768px (narrow layout is presentational and never saved).
+Tile toolbar: description popover (backdrop-dismissed — clicks inside Plotly
+iframes don't bubble), Show data / Show code (PDCViewers), Download
+(`export_plotly_png` / client-side PNG / `download_excel`), View larger,
+Refresh, Remove; plus a top-bar "Refresh all" (client-side concurrency-2 queue,
+per-tile failure isolation). Shared recipients see a read-only grid (no
+drag/resize/rename/share/remove-tile) with Delete becoming "Remove from my
+list".
 
 ---
 

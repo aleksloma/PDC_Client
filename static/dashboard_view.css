@@ -1,0 +1,317 @@
+/* Dashboard page (grid of pinned tiles) — loaded ONLY on /dashboards/{id}. */
+
+.dash-view-page {
+  background: var(--muted, #f6f7f9);
+  overflow: hidden;
+}
+
+.dash-main {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.dash-top-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: var(--bg, #fff);
+  border-bottom: 1px solid var(--line, #e7e8ea);
+  flex: 0 0 auto;
+}
+
+.dash-back-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  border: 1px solid var(--line, #e7e8ea);
+  color: var(--text, #222);
+  text-decoration: none;
+  background: var(--bg, #fff);
+  flex: 0 0 auto;
+}
+.dash-back-btn:hover { background: var(--muted, #f6f7f9); }
+
+.dash-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text, #222);
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 40vw;
+}
+
+.dash-title-edit { flex: 0 0 auto; }
+
+.dash-shared-badge {
+  font-size: 12px;
+  color: #166534;
+  background: #f0fdf4;
+  border: 1px solid #86efac;
+  border-radius: 999px;
+  padding: 3px 10px;
+  white-space: nowrap;
+}
+
+.dash-top-bar .top-bar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Grid area */
+.dash-grid-scroll {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+/* Empty state */
+.dash-empty {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 8px;
+  padding: 40px 20px;
+  color: var(--sub, #666);
+}
+.dash-empty h2 { color: var(--text, #222); margin: 0; }
+.dash-empty p { margin: 0 0 12px; max-width: 460px; }
+.dash-empty-cta {
+  display: inline-block;
+  background: var(--primary, #1f6feb);
+  color: #fff;
+  border-radius: 8px;
+  padding: 10px 20px;
+  text-decoration: none;
+  font-weight: 600;
+}
+.dash-empty.hidden { display: none; }
+
+/* Tile card */
+.pdc-tile {
+  background: var(--bg, #fff);
+  border: 1px solid var(--line, #e7e8ea);
+  border-radius: 10px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+  height: 100%;
+}
+
+/* Grab strip — the ONLY drag handle (keeps Plotly hover/zoom usable at rest) */
+.pdc-tile-drag {
+  flex: 0 0 auto;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  cursor: grab;
+  background: transparent;
+  border-bottom: 1px solid transparent;
+  color: var(--sub, #666);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: none;
+}
+.pdc-tile:hover .pdc-tile-drag {
+  background: var(--muted, #f6f7f9);
+  border-bottom-color: var(--line, #e7e8ea);
+}
+.pdc-tile-drag:active { cursor: grabbing; }
+.dash-readonly .pdc-tile-drag { cursor: default; }
+
+.pdc-tile-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Hover toolbar */
+.pdc-tile-toolbar {
+  position: absolute;
+  top: 30px;
+  right: 8px;
+  display: flex;
+  gap: 4px;
+  background: rgba(255, 255, 255, 0.95);
+  border: 1px solid var(--line, #e7e8ea);
+  border-radius: 8px;
+  padding: 3px;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 15;
+}
+.pdc-tile:hover .pdc-tile-toolbar,
+.pdc-tile-toolbar:focus-within { opacity: 1; }
+.pdc-tile-toolbar button {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 5px 6px;
+  border-radius: 6px;
+  color: var(--text, #222);
+}
+.pdc-tile-toolbar button:hover { background: var(--muted, #f6f7f9); }
+.pdc-tile-toolbar button:disabled { opacity: 0.4; cursor: not-allowed; }
+.pdc-tile-toolbar .t-refresh.spinning svg { animation: pdcspin 1s linear infinite; }
+@keyframes pdcspin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+/* Tile body */
+.pdc-tile-body {
+  flex: 1 1 auto;
+  overflow: hidden;
+  position: relative;
+  padding: 4px;
+}
+.pdc-tile-body iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  display: block;
+  background: #fff;
+}
+.pdc-tile-body img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.pdc-tile-body .pdc-tile-tablewrap {
+  height: 100%;
+  overflow: auto;
+  font-size: 13px;
+}
+.pdc-tile-body table { width: 100%; border-collapse: collapse; }
+.pdc-tile-body th, .pdc-tile-body td {
+  border: 1px solid #e5e7eb;
+  padding: 6px 8px;
+  text-align: left;
+}
+.pdc-tile-body th {
+  background: #f9fafb;
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+}
+
+/* Frozen / stale marker */
+.pdc-tile-badge {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  font-size: 11px;
+  color: #92400e;
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+  border-radius: 6px;
+  padding: 2px 8px;
+  z-index: 14;
+  max-width: calc(100% - 16px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pdc-tile-badge.hidden { display: none; }
+
+/* Description popover */
+.pdc-tile-pop-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  background: transparent;
+}
+.pdc-tile-pop {
+  position: absolute;
+  top: 34px;
+  right: 8px;
+  max-width: min(380px, calc(100% - 16px));
+  max-height: 65%;
+  overflow: auto;
+  background: var(--bg, #fff);
+  border: 1px solid var(--line, #e7e8ea);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+  padding: 12px 14px;
+  font-size: 13px;
+  color: var(--text, #222);
+  z-index: 901;
+  white-space: pre-wrap;
+}
+
+/* While dragging/resizing, Plotly iframes must not swallow mouse events */
+body.pdc-grid-moving .pdc-tile-body iframe { pointer-events: none; }
+body.pdc-grid-moving { user-select: none; }
+
+/* GridStack cosmetics */
+.grid-stack-item-content { inset: 5px; }
+.grid-stack > .grid-stack-item > .ui-resizable-se { z-index: 16; }
+
+/* View-larger overlay (chart/table) */
+.dash-larger-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.92);
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.dash-larger-modal iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: #fff;
+}
+.dash-larger-modal img {
+  max-width: 95%;
+  max-height: 95%;
+  object-fit: contain;
+}
+.dash-larger-modal .dash-larger-tablebox {
+  background: #fff;
+  border-radius: 10px;
+  max-width: 92%;
+  max-height: 90%;
+  overflow: auto;
+  padding: 20px;
+}
+.dash-larger-close {
+  position: fixed;
+  top: 18px;
+  right: 26px;
+  background: rgba(255, 255, 255, 0.9);
+  border: 2px solid #fff;
+  color: #333;
+  font-size: 36px;
+  font-weight: bold;
+  cursor: pointer;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  z-index: 10001;
+  line-height: 1;
+}
+
+.modal-actions .danger { background: #ef4444; border-color: #ef4444; }
+
+@media (max-width: 768px) {
+  .dash-title { max-width: 30vw; }
+  .dash-top-bar { flex-wrap: wrap; }
+  .dash-grid-scroll { padding: 8px; }
+}

@@ -65,6 +65,10 @@
             <line x1="3" y1="18" x2="21" y2="18"/>
           </svg>
         </button>
+        <div id="dashboardsDropdown" class="dropdown-container">
+          <button id="btnDashboards" class="ghost small top-action-btn" data-i18n="dash.dashboards">▦ Dashboards</button>
+          <div id="dashboardsMenu" class="dropdown-menu hidden"></div>
+        </div>
         <div class="top-bar-spacer"></div>
         <div class="top-bar-actions">
           <button id="btnAutoAnalytics" class="ghost small top-action-btn report-download-btn hidden" type="button">
@@ -366,6 +370,29 @@
       </div>
     </div>
   </div>
+
+  <!-- New Dashboard Modal (name prompt) -->
+  <div id="newDashboardModal" class="modal hidden">
+    <div class="modal-content small-modal">
+      <div class="modal-header">
+        <h3 data-i18n="dash.new_title">New dashboard</h3>
+        <button id="closeNewDashboard" class="ghost">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label data-i18n="dash.name_label">Dashboard name</label>
+          <input id="newDashboardName" type="text" maxlength="100" placeholder="Dashboard name" data-i18n-placeholder="dash.name_placeholder" />
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="btnCancelNewDashboard" class="ghost" data-i18n="common.cancel">Cancel</button>
+        <button id="btnCreateDashboard" class="primary" data-i18n="dash.create">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- (Add-to-Dashboard picker is a JS-built anchored popover — see
+       _openDashPicker in dashboard.js; no modal markup needed.) -->
 
   <!-- Rename Modal -->
   <div id="renameModal" class="modal hidden">
