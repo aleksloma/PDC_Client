@@ -3467,10 +3467,12 @@ function _wireDbPanel() {
   if (_dbPanelWired) return;
   _dbPanelWired = true;
   // Outside click / Escape close. The closest() guard keeps checkbox clicks
-  // inside the panel from closing it (the download-dropdown pattern).
+  // inside the panel from closing it. CAPTURE phase: several modal handlers
+  // call stopPropagation(), which would swallow a bubbling document listener
+  // and leave the panel stuck open.
   document.addEventListener('click', (e) => {
     if (!e.target.closest('#dbSelectWrap')) _closeDbPanel();
-  });
+  }, true);
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') _closeDbPanel();
   });
@@ -3483,20 +3485,27 @@ function _wireDbPanel() {
   window.addEventListener('resize', () => _closeDbPanel());
 }
 
-function _openDbPanel() {
+function _positionDbPanel() {
   const panel = document.getElementById('dbSelectPanel');
   const btn = document.getElementById('dbSelectBtn');
-  if (!panel || !btn) return;
-  _renderDbTableList();
+  if (!panel || !btn || panel.classList.contains('hidden')) return;
   const r = btn.getBoundingClientRect();
   panel.style.top = `${Math.round(r.bottom + 6)}px`;
   panel.style.left = `${Math.round(r.left)}px`;
-  panel.classList.remove('hidden');
   // Keep the panel on-screen when the button sits near the right edge.
   const pr = panel.getBoundingClientRect();
   if (pr.right > window.innerWidth - 8) {
     panel.style.left = `${Math.max(8, Math.round(window.innerWidth - 8 - pr.width))}px`;
   }
+}
+
+function _openDbPanel() {
+  const panel = document.getElementById('dbSelectPanel');
+  const btn = document.getElementById('dbSelectBtn');
+  if (!panel || !btn) return;
+  _renderDbTableList();
+  panel.classList.remove('hidden');
+  _positionDbPanel();
   const search = document.getElementById('dbTableSearch');
   if (search) search.focus();
 }
@@ -3536,7 +3545,9 @@ function _updateDbSelectCount() {
   const el = document.getElementById('dbSelectCount');
   if (!el) return;
   const n = selectedFiles.filter(f => f._isDbTable).length;
-  el.textContent = n ? ` (${n})` : '';
+  // Overlay badge (number only) — never widens the button, so the row
+  // layout and the anchored panel stay put.
+  el.textContent = n ? String(n) : '';
   el.classList.toggle('hidden', !n);
 }
 
@@ -3550,6 +3561,7 @@ function _toggleDbTable(t, checked) {
   renderSelectedFilesList();
   _updateWizardGenerateBtn();
   _updateDbSelectCount();
+  _positionDbPanel();   // chip render may nudge layout; keep the panel anchored
 }
 
 // "Add Data" (chat topbar) — same modal in 'add' mode: files go through the

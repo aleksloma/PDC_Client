@@ -2329,8 +2329,12 @@ button.danger:hover {
 /* ── Database tables (Data sources feature) ─────────────────────────────── */
 /* Wizard "Select from DB" checkbox dropdown (Excel-column-filter style).
    The panel is position:fixed — the wizard modal is overflow:hidden, so an
-   absolute child would be clipped; dashboard.js anchors it to the button. */
-.db-select-wrap { display: inline-block; }
+   absolute child would be clipped; dashboard.js anchors it to the button.
+   NOTE: this stylesheet has NO generic `.hidden` rule (all hidden rules are
+   element-specific) — these elements need their own, or `hidden` is a no-op. */
+.db-select-wrap.hidden, .db-select-panel.hidden,
+.db-select-count.hidden, #dbSelectDivider.hidden { display: none; }
+.db-select-wrap { display: inline-block; position: relative; }
 .db-select-btn {
   display: inline-flex;
   align-items: center;
@@ -2346,7 +2350,26 @@ button.danger:hover {
   font-family: inherit;
 }
 .db-select-btn:hover { background: #f8fafc; border-color: #9ca3af; }
-.db-select-count { font-weight: 700; color: #1276C2; }
+/* Selection count: an overlay badge pinned to the button's corner so the
+   button width NEVER changes (an inline " (1)" widened it and wrapped the
+   flex-wrap upload-options row, detaching the fixed-position panel). */
+.db-select-count {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 9px;
+  background: #1276C2;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+  padding: 0 4px;
+  box-sizing: border-box;
+  pointer-events: none;
+}
 .db-select-caret { font-size: 11px; color: #6b7280; margin-left: 2px; }
 .db-select-panel {
   position: fixed;

@@ -18,10 +18,8 @@ body.admin-ds-page {
   width: 248px; flex: 0 0 248px; background: #001E44; color: #cbd5e1;
   display: flex; flex-direction: column; padding: 18px 12px 14px;
 }
-.adm-brand { display: flex; align-items: center; gap: 10px; padding: 2px 8px 16px; }
-.adm-brand-logo { width: 34px; height: 34px; }
-.adm-brand-text { display: flex; flex-direction: column; line-height: 1.2; }
-.adm-brand-name { color: #fff; font-weight: 700; font-size: 15px; }
+.adm-brand { display: flex; flex-direction: column; gap: 6px; padding: 4px 8px 16px; }
+.adm-brand-logo { width: 172px; max-width: 100%; height: auto; display: block; }
 .adm-brand-sub { font-size: 11px; color: #7d95b5; text-transform: uppercase; letter-spacing: .06em; }
 
 .adm-nav { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; flex: 1; }
