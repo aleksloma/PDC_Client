@@ -3439,13 +3439,14 @@ async function _loadDbTablesList() {
   list.innerHTML = '';
   try {
     const res = await fetch('/api/db_tables');
-    if (!res.ok) return;                       // no tables / no feature → button stays hidden
+    if (!res.ok) return;                       // endpoint error → button stays hidden
     const data = await res.json();
     _dbTablesCache = data.tables || [];
   } catch (e) {
-    _dbTablesCache = [];
+    return;                                    // fetch failure → button stays hidden
   }
-  if (!_dbTablesCache.length) return;
+  // Zero registered tables still shows the button — the panel renders an
+  // "ask your administrator" empty state so the feature is discoverable.
   wrap.classList.remove('hidden');
   document.getElementById('dbSelectDivider')?.classList.remove('hidden');
   _renderDbTableList();
@@ -3536,7 +3537,10 @@ function _renderDbTableList() {
     list.appendChild(row);
   });
   if (!list.children.length) {
-    list.innerHTML = `<div class="db-table-empty">${escapeHtml(_t('wizard.db_no_match', 'No matching tables'))}</div>`;
+    const key = (_dbTablesCache || []).length ? 'wizard.db_no_match' : 'wizard.db_empty';
+    const fallback = (_dbTablesCache || []).length ? 'No matching tables'
+      : 'No database tables yet — an administrator can register them under Data sources.';
+    list.innerHTML = `<div class="db-table-empty">${escapeHtml(_t(key, fallback))}</div>`;
   }
   _updateDbSelectCount();
 }
