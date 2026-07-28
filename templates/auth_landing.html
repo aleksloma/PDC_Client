@@ -16,7 +16,10 @@
   label { font-size: 12px; color: #4b5563; }
   .field { margin-top: 14px; }
   .field:first-of-type { margin-top: 0; }
-  input[type=email], input[type=password] {
+  /* type=text included: the email field is type="text" so the non-email
+     admin username "ladmin" can be submitted (browser email validation
+     would refuse it) — it must keep the same styling. */
+  input[type=text], input[type=email], input[type=password] {
           width: 100%; padding: 11px 13px; border: 1px solid #d1d5db;
           border-radius: 7px; margin-top: 5px; font-size: 15px;
           box-sizing: border-box; }
