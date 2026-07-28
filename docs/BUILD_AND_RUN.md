@@ -249,6 +249,51 @@ picked up within ~60 s without restarting the client.
 
 ---
 
+## 4c. Registering database tables (client-admin runbook, "Data sources")
+
+The CLIENT-side local admin (`ladmin`) can register tables from the
+customer's own databases (PostgreSQL, MySQL/MariaDB, MSSQL, Oracle) so users
+analyze them in chats like uploaded files. Snapshot mode: each registered
+table is copied to `DATA_ROOT/db_snapshots/{table_id}.parquet` and refreshed
+nightly. This runs entirely on the client — the brain is untouched.
+
+Prerequisites (client env, see `client.env.example`):
+
+- `CLIENT_ENCRYPTION_KEY` — Fernet key for DB passwords at rest (generate with
+  `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`).
+  Without it the feature refuses to save connections (503, no plaintext fallback).
+- `LOCAL_ADMIN_PASSWORD` — one-time ladmin bootstrap (hash-only; forced change
+  on first login; ignored once ladmin has a password; recovery = delete
+  `users/ladmin/auth.json` on the volume and restart).
+- The customer's DBA provides a **dedicated SELECT-only database login**
+  (ideally on a read replica) — that grant is the real security guarantee.
+
+Runbook:
+
+1. Sign in as `ladmin` → forced password change → topbar **🗄️ Data sources**
+   (`/admin/data_sources`; non-admins are redirected to `/lab`).
+2. **Add connection** → fill host/port/database/user/password (SSL toggle;
+   MSSQL also has Trust-server-certificate for self-signed certs) → **Test
+   connection** (works on the unsaved draft) → Save.
+3. **Register table** → pick schema + table → *Load structure* (columns,
+   PK/FK, indexed flags, catalog row-count/size estimates, first-rows
+   preview) → **✨ Draft descriptions with AI** (English; via the existing
+   schema-autofill brain call) → review/edit the display name (`CL_INFO` →
+   "clients information"), table description, per-column descriptions,
+   indexed flags, `is_connector` toggle, relations (join keys; pre-seeded
+   from FKs) → tick **"I have reviewed…"** (Save stays disabled until then;
+   the server independently enforces the confirm) → **Save & snapshot**.
+4. Connector tables (dictionaries/link tables) are hidden from users and
+   auto-included in chats through the relations graph.
+5. **Nightly refresh** — set the time (container-local; `TZ` env var) and
+   enabled flag; per-table/-connection **⟳ Refresh now** any time. Failed
+   refreshes keep the last good snapshot; schema drift re-syncs chat metas
+   automatically (user-edited descriptions survive).
+6. The **Audit trail** section tails `DATA_ROOT/admin_audit.jsonl` (every
+   admin action, secrets scrubbed).
+
+---
+
 ## 5. Revoking a tenant (kill-switch)
 
 In the admin panel, click **Revoke** on the tenant's row. The brain

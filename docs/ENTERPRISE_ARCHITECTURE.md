@@ -563,6 +563,65 @@ The same boundary applies to the background "Auto Analytics" feature:
 
 ---
 
+## 10a. Database tables — snapshot mode (Phase 1, client-side only)
+
+A local admin (`ladmin`, the fixed role=admin account bootstrapped from
+`LOCAL_ADMIN_PASSWORD`) registers external database tables (PostgreSQL,
+MySQL/MariaDB, MSSQL, Oracle — a dialect REGISTRY in `client/db_connector.py`;
+adding a type = one registry entry + one driver package) so users can analyze
+them in chats exactly like uploaded files. Spec: `docs/DB_TABLES_PLAN.md`.
+
+**Why this fits the split.** Everything downstream of `load_dataframes()`
+(schema_text, planning, safe_execute, charts, reports, Auto Analytics)
+consumes a `dict[str, pd.DataFrame]` and is source-agnostic. A registered
+table enters as a parquet-backed named DataFrame (ONE central snapshot per
+table at `DATA_ROOT/db_snapshots/{table_id}.parquet`; chats reference it
+meta-only by `table_id`, df key = display name), so **the brain, the protocol
+and the LLM layer are unchanged** in Phase 1.
+
+**What crosses the boundary — Article II unchanged.** Only names, dtypes,
+ladmin-confirmed descriptions, declared relations (rendered into schema_text
+as a `Database Relations` block), and — during registration's AI draft — the
+same truncated sampled `unique_hints` uploaded files already send to
+`/v1/schema_autofill`. Raw DB values reach only the admin's browser preview
+and the local parquet. DB credentials never cross (Fernet-encrypted at rest,
+masked in APIs, never logged).
+
+**Registration** (admin "Data sources" page): add connection → Test →
+introspect (Inspector + catalog-estimate row count/size; never `COUNT(*)` on
+a customer table) → preview → AI-draft English descriptions → **mandatory
+ladmin review/confirm** (server-enforced: `confirm:true`, session-stamped
+confirmation, re-introspection drift check; the draft endpoint has no write
+path) → save + chunked snapshot (per-query statement timeout, dtype
+optimization, atomic replace). Row count/size are stored as metadata only —
+**nothing routes on them** (no size thresholds in Phase 1).
+
+**Connector tables** (`is_connector` — dictionaries/link tables) are hidden
+from the user picker and auto-included transitively through the relations
+graph when a related table is selected (closure frozen into the chat meta at
+selection time; undirected; only connectors are pulled in; capped).
+
+**Refresh.** A lifespan-scoped scheduler thread re-snapshots all tables at an
+admin-configured container-local time (default midnight) + per-table/-connection
+"Refresh now". The atomic snapshot replace flips the dataframe memory-cache
+signature, so every chat serves fresh data with the existing invalidation. A
+failed refresh keeps the previous snapshot and `refreshed_at` (chats keep the
+last good data). Schema drift re-syncs every referencing chat meta with the
+same carry-over rules as Add Data's `_resync_meta_after_add` (user edits
+survive, vanished columns deleted). Chats using DB tables show "data as of
+<refreshed_at>" (min across tables) via `GET /api/chat/{id}/schema`.
+
+**Security** — see AI_CONSTITUTION Article VII (rules 8–9): SELECT-only
+connector, sandbox import denylist (defense in depth — the customer's
+dedicated SELECT-only DB login is the real guarantee), encrypted credentials,
+append-only admin audit JSONL.
+
+**Phase 2 (later, client + brain in parallel — NOT built):** live SQL mode
+for large tables (brain writes dialect-aware aggregation SELECTs; client
+validates + executes). Per `docs/DB_TABLES_PLAN.md`.
+
+---
+
 ## 11. Sharing restriction
 
 The enterprise/company version restricts sharing to within the company's

@@ -36,9 +36,31 @@ Edit `client.env` and fill in:
   once at tenant creation).
 - **`SECRET_KEY`** — generate once with `openssl rand -hex 32`; keep it stable so
   logins persist.
+- **`CLIENT_ENCRYPTION_KEY`** — only needed if you will connect your own
+  databases ("Data sources"). Generate once with
+  `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
+  and keep it stable — changing it makes stored database passwords unreadable
+  (they must be re-entered in the admin UI).
+- **`LOCAL_ADMIN_PASSWORD`** — one-time bootstrap password for the local admin
+  account `ladmin` (manages database sources). Only a hash is stored and the
+  admin must change it on first login; once set, this variable is ignored.
 
 `BRAIN_URL` is pre-filled and `DATA_ROOT=/data/client` should stay as-is.
 **Never commit or share the filled-in `client.env`.**
+
+### Connecting your own databases (optional)
+
+The `ladmin` account can register tables from your PostgreSQL, MySQL/MariaDB,
+SQL Server, or Oracle databases so your users analyze them in chats. Table
+data is snapshotted **inside your own `/data/client` volume** — like all raw
+data, it never leaves your network; only column names, types, and the
+descriptions your admin confirms are shared with the AI.
+
+**Ask your DBA to create a dedicated read-only database login for
+PowerDataChat with SELECT-only grants** (ideally on a read replica). The
+client only ever issues SELECT/introspection statements, and that grant is
+your hard guarantee. Set the nightly snapshot-refresh time in the admin UI
+(container-local time — set `TZ` in `client.env` if your server isn't UTC).
 
 ## 3. Run
 

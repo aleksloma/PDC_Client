@@ -483,9 +483,160 @@ def _dfs_size_bytes(dfs: dict[str, pd.DataFrame]) -> Optional[int]:
         return None
 
 
-def _load_dataframes_cached(files_dir: Path, owner: str) -> dict[str, pd.DataFrame]:
+# ---------------------------------------------------------------------------
+# Database-table snapshots (admin-registered "Data sources")
+# ---------------------------------------------------------------------------
+# A chat that uses registered database tables carries meta entries with
+# source == "database". The dataframe bytes live in ONE central snapshot per
+# table at DATA_ROOT/db_snapshots/{table_id}.parquet (written atomically by
+# db_connector.snapshot_table; refreshed nightly by db_scheduler). Chat meta
+# references only the table_id — never a path — so a volume remount or a
+# refresh can never break a chat. The df key visible to users and generated
+# code is the DISPLAY NAME (entry["file_name"]), same indirection the
+# "file.xlsx::Sheet" keys already use.
+_DB_SNAPSHOT_DIRNAME = "db_snapshots"
+_DB_TABLE_ID_RE = re.compile(r"^[0-9a-fA-F]{16}$")
+
+
+def db_snapshot_path(table_id: str) -> Path:
+    """Canonical snapshot location for a registered table (id regex-guarded —
+    the filename derives from it, so this is path-traversal safety)."""
+    if not (isinstance(table_id, str) and _DB_TABLE_ID_RE.match(table_id)):
+        raise ValueError("invalid table id")
+    d = _data_root() / _DB_SNAPSHOT_DIRNAME
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{table_id}.parquet"
+
+
+def db_entries_from_meta(meta) -> list[dict]:
+    """The meta entries backed by a database snapshot. Absent `source` ⇒ file
+    (every pre-feature meta.json keeps loading unchanged)."""
+    if not isinstance(meta, dict):
+        return []
+    return [e for e in (meta.get("files") or [])
+            if isinstance(e, dict) and e.get("source") == "database"]
+
+
+def _db_signature(db_entries) -> tuple:
+    """(df_key, table_id, mtime_ns, size) per snapshot — the DB half of the
+    memory-cache freshness proof. A missing snapshot contributes (None, None)
+    so its appearance/disappearance also flips the signature."""
+    sig = []
+    for entry in sorted(db_entries or [], key=lambda e: e.get("file_name") or ""):
+        key = entry.get("file_name")
+        tid = (entry.get("db") or {}).get("table_id")
+        try:
+            st = db_snapshot_path(tid).stat()
+            sig.append((key, tid, st.st_mtime_ns, st.st_size))
+        except Exception:
+            sig.append((key, tid, None, None))
+    return tuple(sig)
+
+
+def _db_dtype_plans() -> dict:
+    """{table_id: dtype_plan} from the registry — the loader-side half of the
+    snapshot dtype optimization (category strings are re-applied after
+    read_parquet; writing them per-chunk would destabilize the Arrow schema).
+    Lazy import: db_sources imports this module at module level."""
+    try:
+        from db_sources import DataSourceStore
+        return {t.get("id"): t.get("dtype_plan") for t in DataSourceStore().list_tables()}
+    except Exception:
+        return {}
+
+
+def _load_db_snapshots(db_entries: list, owner: str) -> dict[str, pd.DataFrame]:
+    """Read each entry's central snapshot parquet, keyed by display name.
+    A missing/unreadable snapshot is SKIPPED (logged) — the chat still answers
+    on its remaining frames (Article IV); the frontend's key-freeze machinery
+    disables items that referenced the vanished key."""
+    out: dict[str, pd.DataFrame] = {}
+    plans = None
+    for entry in db_entries or []:
+        key = entry.get("file_name")
+        tid = (entry.get("db") or {}).get("table_id")
+        if not key or not tid:
+            continue
+        try:
+            path = db_snapshot_path(tid)
+        except ValueError:
+            log_with_sid(owner, "warning", f"DB_SNAPSHOT_BAD_ID key={key}")
+            continue
+        if not path.exists():
+            log_with_sid(owner, "warning", f"DB_SNAPSHOT_MISSING table={tid} key={key}")
+            continue
+        try:
+            df = pd.read_parquet(path)
+            if plans is None:
+                plans = _db_dtype_plans()
+            try:
+                from db_connector import apply_category_plan
+                df = apply_category_plan(df, plans.get(tid))
+            except Exception:
+                pass
+            out[key] = df
+        except Exception as e:
+            log_with_sid(owner, "warning", f"DB_SNAPSHOT_LOAD_FAILED table={tid}: {e}")
+    return out
+
+
+def unique_df_key(existing_keys, display_name: str) -> str:
+    """Collision-free df key for a DB table's display name against the keys
+    already present in a meta (uploaded files or other tables). Resolved at
+    META-WRITE time, never at load time — file_name IS the df key."""
+    base = (display_name or "table").strip() or "table"
+    existing = set(existing_keys or ())
+    if base not in existing:
+        return base
+    n = 2
+    while f"{base} ({n})" in existing:
+        n += 1
+    return f"{base} ({n})"
+
+
+def merge_schema_entry(old_entry: dict, fresh_entry: dict) -> dict:
+    """Carry user-editable content from an old meta entry onto a fresh one:
+    non-empty old file_description wins; per column present in BOTH, the old
+    description + values map win; everything else (new columns, dtypes,
+    technical_description) comes from the fresh entry. Shared by the Add Data
+    overwrite resync, the DB drift resync, and the Add Data DB re-merge —
+    one source of truth for 'edits must survive'."""
+    import copy as _copy
+
+    fresh = _copy.deepcopy(fresh_entry)
+    key = fresh.get("file_name") or old_entry.get("file_name")
+    old_fd = (old_entry.get("file_description") or "").strip()
+    if old_fd:
+        fresh["file_description"] = old_fd
+    old_schema = old_entry.get("schema") if isinstance(old_entry.get("schema"), dict) else {}
+    old_fields = (old_schema.get("fields") or {}) if isinstance(old_schema.get("fields"), dict) else {}
+    if not isinstance(fresh.get("schema"), dict):
+        fresh["schema"] = {"file_name": key, "fields": {}}
+    new_fields = fresh["schema"].setdefault("fields", {})
+    for col, old_f in old_fields.items():
+        if col not in new_fields or not isinstance(old_f, dict):
+            continue
+        if not isinstance(new_fields[col], dict):
+            new_fields[col] = {}
+        old_desc = old_f.get("description")
+        if isinstance(old_desc, str) and old_desc.strip():
+            new_fields[col]["description"] = old_desc
+        old_vals = old_f.get("values")
+        if isinstance(old_vals, dict) and old_vals:
+            new_fields[col]["values"] = old_vals
+    return fresh
+
+
+def _load_dataframes_cached(files_dir: Path, owner: str,
+                            db_entries: Optional[list] = None) -> dict[str, pd.DataFrame]:
     """Shared load path for UserStore/ChatDataStore: signature-validated
     in-memory cache in front of the per-file parquet disk cache.
+
+    `db_entries` are the meta entries with source == "database" — their
+    central snapshot parquets (DATA_ROOT/db_snapshots/) are merged into the
+    result keyed by DISPLAY NAME, and their (mtime_ns, size) join the cache
+    signature so a re-snapshot invalidates the memory cache exactly like an
+    overwritten upload. Empty/None → behavior is byte-identical to before.
 
     ISOLATION INVARIANT: the cache never shares DataFrame objects with any
     caller. Executed LLM code mutates dataframes in place (dropna(inplace=
@@ -494,7 +645,8 @@ def _load_dataframes_cached(files_dir: Path, owner: str) -> dict[str, pd.DataFra
     at set() and hands out copies at get(). A df.copy() is a memcpy-fast
     operation, orders of magnitude cheaper than the disk reload it saves."""
     key = str(files_dir)
-    sig = _files_signature(files_dir)
+    files_sig = _files_signature(files_dir)
+    sig = None if files_sig is None else (files_sig, _db_signature(db_entries))
     if sig is not None:
         try:
             entry = _DATAFRAME_CACHE.get(key)
@@ -507,6 +659,8 @@ def _load_dataframes_cached(files_dir: Path, owner: str) -> dict[str, pd.DataFra
     for fp in sorted(files_dir.iterdir()):
         if fp.is_file() and not fp.name.startswith("."):
             dfs.update(_load_one_file_cached(fp))
+    if db_entries:
+        dfs.update(_load_db_snapshots(db_entries, owner))
     if sig is not None and dfs:
         try:
             size = _dfs_size_bytes(dfs)
@@ -583,16 +737,71 @@ class AuthStore:
     def has_password(self, email: str) -> bool:
         return bool(self.get_auth(email).get("password_hash"))
 
-    def set_password(self, email: str, password: str) -> None:
-        """Set the user's own password. Clears any outstanding temp password."""
+    def set_password(self, email: str, password: str, *, force_change: bool = False) -> None:
+        """Set the user's own password. Clears any outstanding temp password.
+        force_change=True (used only by the ladmin bootstrap) keeps the
+        must_change_password flag ON so the first login forces a change."""
         from password_utils import generate_password_hash
         with _LOCK:
             auth = self.get_auth(email)
             auth["password_hash"] = generate_password_hash(password)
             auth.pop("temp_password_hash", None)
-            auth["must_change_password"] = False
+            auth["must_change_password"] = bool(force_change)
             self._write_auth(email, auth)
         log_with_sid(email, "info", "USER_PASSWORD_SET")
+
+    # --- Roles (stored on profile.json — the identity record; auth.json is
+    # credentials-only and is rewritten wholesale on password churn) ---------
+    #
+    # Default "user"; the fixed local admin is "admin". The field lives on the
+    # local user record so roles can later be assigned from the brain side
+    # without a storage migration. Legacy profiles without the key read as
+    # "user" (stored-shape backward compatibility).
+
+    def get_role(self, email: str) -> str:
+        return (self.get_profile(email) or {}).get("role") or "user"
+
+    def set_role(self, email: str, role: str) -> None:
+        email = _safe_email(email)
+        with _LOCK:
+            prof = self.get_profile(email) or {"email": email, "created_at": _now()}
+            if prof.get("role") == role:
+                return
+            prof["role"] = role
+            p = _data_root() / "users" / email / "profile.json"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(prof, indent=2, ensure_ascii=False), encoding="utf-8")
+        log_with_sid(email, "info", f"USER_ROLE_SET role={role}")
+
+    def is_admin(self, email: str) -> bool:
+        return self.get_role(email) == "admin"
+
+    def ensure_local_admin(self) -> None:
+        """Idempotent boot-time bootstrap of the fixed local admin account
+        (settings.LOCAL_ADMIN_USERNAME, default "ladmin"). Only a HASH is ever
+        stored; the bootstrap password forces a change on first login. An
+        EXISTING password hash is never overwritten — a LOCAL_ADMIN_PASSWORD
+        left in the env must not re-assert itself (that would be a permanent
+        backdoor). Recovery: delete users/ladmin/auth.json and restart."""
+        try:
+            uname = (settings.LOCAL_ADMIN_USERNAME or "").strip().lower()
+            if not uname:
+                log_with_sid("startup", "info", "LADMIN_DISABLED")
+                return
+            self.ensure_user(uname)
+            self.set_role(uname, "admin")
+            auth = self.get_auth(uname)
+            if auth.get("password_hash") or auth.get("temp_password_hash"):
+                log_with_sid("startup", "info", "LADMIN_PRESENT")
+                return
+            boot_pw = settings.LOCAL_ADMIN_PASSWORD or ""
+            if not boot_pw:
+                log_with_sid("startup", "warning", "LADMIN_BOOTSTRAP_SKIPPED_NO_PASSWORD")
+                return
+            self.set_password(uname, boot_pw, force_change=True)
+            log_with_sid("startup", "info", "LADMIN_BOOTSTRAP_CREATED")
+        except Exception as e:
+            log_with_sid("startup", "error", f"LADMIN_BOOTSTRAP_FAILED: {e}")
 
     def set_temp_password(self, email: str, temp_password: str) -> None:
         """Store a reset-issued temp password hash + must_change flag. The
@@ -906,8 +1115,12 @@ class UserStore:
         # write raises and the upload 500s (same net as the history writers).
         self.meta_path.write_text(json.dumps(_json_safe(meta), ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def load_dataframes(self) -> dict[str, pd.DataFrame]:
-        return _load_dataframes_cached(self.files_dir, self.sid)
+    def load_dataframes(self, include_db: bool = True) -> dict[str, pd.DataFrame]:
+        """include_db=False is the session-stage fast path (upload/autofill/
+        schema endpoints must not read multi-million-row snapshots just to
+        list keys)."""
+        db = db_entries_from_meta(self.read_meta()) if include_db else None
+        return _load_dataframes_cached(self.files_dir, self.sid, db)
 
 
 # ---------------------------------------------------------------------------
@@ -932,6 +1145,9 @@ class ChatDataStore:
             self.meta_path.write_text(json.dumps({"files": []}, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def clone_from_user_store(self, user_store: UserStore) -> None:
+        # Database-table entries (source == "database") are meta-only — they
+        # reference the central DATA_ROOT/db_snapshots/ parquet by table_id,
+        # so the verbatim meta copy below carries them with zero extra work.
         for fp in user_store.files_dir.iterdir():
             if fp.is_file() and not fp.name.startswith("."):
                 shutil.copy2(fp, self.files_dir / fp.name)
@@ -960,7 +1176,13 @@ class ChatDataStore:
 
     def write_meta(self, meta: dict):
         # Same _json_safe net as UserStore.write_meta (non-string schema keys).
-        self.meta_path.write_text(json.dumps(_json_safe(meta), ensure_ascii=False, indent=2), encoding="utf-8")
+        # ATOMIC (tmp + os.replace) under _LOCK: since the nightly DB-snapshot
+        # resync (db_scheduler) rewrites chat metas OUTSIDE request context, a
+        # plain write_text could leave a truncated meta.json on a crash and
+        # race a concurrent request-path write. Chat meta is customer state —
+        # it must never be torn (CLAUDE.md data safety).
+        with _LOCK:
+            _write_json_atomic(self.meta_path, meta)
 
     def set_welcome(self, msg: str):
         (self.root / "welcome.txt").write_text(msg or "", encoding="utf-8")
@@ -988,11 +1210,18 @@ class ChatDataStore:
         except Exception:
             return []
 
-    def load_dataframes(self) -> dict[str, pd.DataFrame]:
-        return _load_dataframes_cached(self.files_dir, self.chat_id)
+    def load_dataframes(self, include_db: bool = True) -> dict[str, pd.DataFrame]:
+        db = db_entries_from_meta(self.read_meta()) if include_db else None
+        return _load_dataframes_cached(self.files_dir, self.chat_id, db)
 
     def schema_docs(self) -> dict:
-        """Build {filename: {file_description, fields: {col: {...}}}} for the brain."""
+        """Build {filename: {file_description, fields: {col: {...}}}} for the brain.
+
+        Entries with source == "database" additionally carry source/db_table/
+        refreshed_at/relations so schema_builder can render the DB source line
+        and the declared-join-keys block. File entries emit EXACTLY the two
+        keys they always did — schema_text stays byte-identical for any chat
+        with no database tables."""
         out = {}
         for file_entry in self.read_meta().get("files", []) or []:
             name = file_entry.get("file_name")
@@ -1003,6 +1232,12 @@ class ChatDataStore:
                 "file_description": file_entry.get("file_description", ""),
                 "fields": (schema.get("fields") if isinstance(schema, dict) else {}) or {},
             }
+            if file_entry.get("source") == "database":
+                db = file_entry.get("db") or {}
+                out[name]["source"] = "database"
+                out[name]["db_table"] = f"{db.get('schema') or ''}.{db.get('table_name') or ''}".strip(".")
+                out[name]["refreshed_at"] = db.get("refreshed_at")
+                out[name]["relations"] = db.get("relations") or []
         return out
 
     def new_conversation(self, title: str = "New conversation") -> str:

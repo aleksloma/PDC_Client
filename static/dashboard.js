@@ -1374,6 +1374,7 @@ function showTopBarActions(show) {
     btnSchema?.classList.add('hidden');
     btnAddData?.classList.add('hidden');
     btnAuto?.classList.add('hidden');
+    document.getElementById('dataAsOfBadge')?.classList.add('hidden');
     AutoAnalytics.stopPolling();
     // Also hide report dropdown when top bar actions are hidden
     document.getElementById('downloadReportDropdown')?.classList.add('hidden');
@@ -1940,13 +1941,35 @@ let currentChatDfKeys = null;   // Set of df keys for the open chat; null = unkn
 async function _loadCurrentDfKeys(chatId) {
   try {
     const res = await fetch(`/api/chat/${chatId}/schema`);
-    if (!res.ok) { currentChatDfKeys = null; return; }
+    if (!res.ok) { currentChatDfKeys = null; _updateDataAsOfBadge(null); return; }
     const data = await res.json();
     currentChatDfKeys = new Set((data.files || []).map(f => f.file_name).filter(Boolean));
+    _updateDataAsOfBadge(data);
   } catch (e) {
     console.warn('df-keys fetch failed — refresh pre-freeze inactive:', e);
     currentChatDfKeys = null;
+    _updateDataAsOfBadge(null);
   }
+}
+
+// "Data as of <refreshed_at>" for chats that use database tables. Rides the
+// /schema fetch every chat open already performs; file-only chats get
+// data_as_of=null and the badge stays hidden (unchanged behavior).
+function _updateDataAsOfBadge(schemaData) {
+  const badge = document.getElementById('dataAsOfBadge');
+  if (!badge) return;
+  const asOf = schemaData && schemaData.data_as_of;
+  if (!asOf) { badge.classList.add('hidden'); badge.textContent = ''; return; }
+  let label = asOf;
+  try {
+    const d = new Date(asOf);
+    if (!isNaN(d)) label = d.toLocaleString();
+  } catch (e) { /* keep raw */ }
+  badge.textContent = `${_t('lab.data_as_of', 'Data as of')} ${label}`;
+  const rows = (schemaData.db_tables || [])
+    .map(t => `${t.display_name}${t.missing ? ' (missing)' : ''}: ${t.refreshed_at || '—'}`);
+  badge.title = rows.join('\n');
+  badge.classList.remove('hidden');
 }
 
 function _extractDfKeysFromCode(code) {
@@ -3390,9 +3413,75 @@ function openCreateWizard() {
   selectedFiles = [];
   renderSelectedFilesList();
   _updateWizardGenerateBtn();
+  _loadDbTablesList();
   // Reset session so the wizard always starts fresh
   fetch('/new_session', { method: 'POST' });
   document.getElementById('createNewModal').classList.remove('hidden');
+}
+
+// ── Database tables in the wizard ──────────────────────────────────────────
+// Registered NON-connector tables (GET /api/db_tables) render as a checkbox
+// list under the file picker. A checked table joins `selectedFiles` as
+// {name, _isDbTable: true, _tableId} (the Google-Sheet no-File precedent), so
+// the shared render/validation/removal paths need almost no changes and DB
+// tables + uploaded files mix freely in one chat.
+let _dbTablesCache = null;   // last fetched /api/db_tables list (this wizard open)
+
+async function _loadDbTablesList() {
+  const section = document.getElementById('dbTablesSection');
+  const list = document.getElementById('dbTableList');
+  if (!section || !list) return;
+  section.classList.add('hidden');
+  list.innerHTML = '';
+  try {
+    const res = await fetch('/api/db_tables');
+    if (!res.ok) return;                       // no tables / no feature → section stays hidden
+    const data = await res.json();
+    _dbTablesCache = data.tables || [];
+  } catch (e) {
+    _dbTablesCache = [];
+  }
+  if (!_dbTablesCache.length) return;
+  section.classList.remove('hidden');
+  _renderDbTableList();
+  const search = document.getElementById('dbTableSearch');
+  if (search) { search.value = ''; search.oninput = () => _renderDbTableList(); }
+}
+
+function _renderDbTableList() {
+  const list = document.getElementById('dbTableList');
+  if (!list) return;
+  const q = (document.getElementById('dbTableSearch')?.value || '').trim().toLowerCase();
+  const selected = new Set(selectedFiles.filter(f => f._isDbTable).map(f => f._tableId));
+  list.innerHTML = '';
+  (_dbTablesCache || []).forEach(t => {
+    const name = t.display_name || '';
+    const desc = t.description || '';
+    if (q && !(name.toLowerCase().includes(q) || desc.toLowerCase().includes(q))) return;
+    const row = document.createElement('label');
+    row.className = 'db-table-row';
+    row.innerHTML = `
+      <input type="checkbox" class="db-table-check" ${selected.has(t.table_id) ? 'checked' : ''} />
+      <span class="db-table-badge">DB</span>
+      <span class="db-table-name">${escapeHtml(name)}</span>
+      <span class="db-table-desc">${escapeHtml(desc)}</span>
+    `;
+    row.querySelector('.db-table-check').addEventListener('change', (e) => {
+      _toggleDbTable(t, e.target.checked);
+    });
+    list.appendChild(row);
+  });
+}
+
+function _toggleDbTable(t, checked) {
+  const idx = selectedFiles.findIndex(f => f._isDbTable && f._tableId === t.table_id);
+  if (checked && idx === -1) {
+    selectedFiles.push({ name: t.display_name, _isDbTable: true, _tableId: t.table_id });
+  } else if (!checked && idx !== -1) {
+    selectedFiles.splice(idx, 1);
+  }
+  renderSelectedFilesList();
+  _updateWizardGenerateBtn();
 }
 
 // "Add Data" (chat topbar) — same modal in 'add' mode: files go through the
@@ -3409,6 +3498,7 @@ function openAddDataWizard() {
   selectedFiles = [];
   renderSelectedFilesList();
   _updateWizardGenerateBtn();
+  _loadDbTablesList();
   // Fresh temp session for this upload batch (same as Create New)
   fetch('/new_session', { method: 'POST' });
   document.getElementById('createNewModal').classList.remove('hidden');
@@ -3440,19 +3530,25 @@ async function wizardNextStep() {
   // Close the modal first so the progress overlay is the only thing visible
   closeCreateWizard();
 
-  const regularFiles = selectedFiles.filter(f => !f._isGoogleSheet);
+  const regularFiles = selectedFiles.filter(f => !f._isGoogleSheet && !f._isDbTable);
+  const dbTableIds = selectedFiles.filter(f => f._isDbTable).map(f => f._tableId);
   if (mode === 'add' && targetChatId) {
-    if (regularFiles.length === 0) {
+    if (regularFiles.length === 0 && dbTableIds.length === 0) {
       showToast('Please select at least one file', true);
       return;
     }
-    await runFrictionlessFlow(regularFiles, { resetSession: false, addToChatId: targetChatId });
+    await runFrictionlessFlow(regularFiles, {
+      resetSession: false, addToChatId: targetChatId, dbTableIds,
+    });
     return;
   }
   // Google Sheets are already uploaded by /upload_from_url; if any are selected,
   // we MUST NOT call /new_session again (that would wipe them). The wizard already
-  // reset the session in openCreateWizard().
-  await runFrictionlessFlow(regularFiles, { skipUploadIfEmpty: true, resetSession: false });
+  // reset the session in openCreateWizard(). DB tables need no upload at all —
+  // /session/db_tables records the selection server-side.
+  await runFrictionlessFlow(regularFiles, {
+    skipUploadIfEmpty: true, resetSession: false, dbTableIds,
+  });
 }
 
 // File handling — used by wizard <input>, page drop, welcome pick-button drop
@@ -3697,6 +3793,7 @@ function removeFile(index) {
   selectedFiles.splice(index, 1);
   renderSelectedFilesList();
   _updateWizardGenerateBtn();
+  _renderDbTableList();   // keep the DB checkbox list in sync with removals
 }
 
 // Single-step wizard now shows just the filename + remove button (no description input)
@@ -3706,12 +3803,14 @@ function renderSelectedFilesList() {
   container.innerHTML = '';
   selectedFiles.forEach((file, index) => {
     const isGoogle = !!file._isGoogleSheet;
+    const isDb = !!file._isDbTable;
     const row = document.createElement('div');
-    row.className = 'selected-file-row' + (isGoogle ? ' google-sheet' : '');
+    row.className = 'selected-file-row' + (isGoogle ? ' google-sheet' : '') + (isDb ? ' db-table' : '');
     row.innerHTML = `
       <span class="selected-file-name">
         ${index + 1}. ${escapeHtml(_uploadNameOf(file))}
         ${isGoogle ? '<span class="selected-file-badge">📎 Google Sheet</span>' : ''}
+        ${isDb ? '<span class="selected-file-badge db">🗄️ DB table</span>' : ''}
       </span>
       <button type="button" class="file-remove-btn" onclick="removeFile(${index})">×</button>
     `;
@@ -3750,7 +3849,8 @@ async function runFrictionlessFlow(files, opts) {
     return;
   }
 
-  if (filesArr.length === 0 && !opts.skipUploadIfEmpty) {
+  const dbTableIds = opts.dbTableIds || [];
+  if (filesArr.length === 0 && dbTableIds.length === 0 && !opts.skipUploadIfEmpty) {
     showToast('Please select at least one file', true);
     return;
   }
@@ -3797,6 +3897,31 @@ async function runFrictionlessFlow(files, opts) {
           showToast(msg, true);
           return;
         }
+      }
+    }
+
+    // Step 1b: record the database-table selection (AFTER /upload — its
+    // reset preserves DB entries defensively, but the canonical order keeps
+    // the selection authoritative). Server-side this freezes the connector
+    // closure into the session meta; no snapshot is read here.
+    if (dbTableIds.length > 0) {
+      try {
+        const dbRes = await fetch('/session/db_tables', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ table_ids: dbTableIds }),
+        });
+        let dbData = {};
+        try { dbData = await dbRes.json(); } catch (e) { dbData = {}; }
+        if (!dbRes.ok || dbData.error) {
+          _hideFrictionlessOverlay();
+          showToast(dbData.error || `Adding database tables failed (${dbRes.status})`, true);
+          return;
+        }
+      } catch (e) {
+        _hideFrictionlessOverlay();
+        showToast('Adding database tables failed — please try again', true);
+        return;
       }
     }
 

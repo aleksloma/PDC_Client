@@ -1454,6 +1454,11 @@ def render_plot_safe(code: str, dfs: dict, sid_or_id: str, split_multi_axes: boo
     logging.info(f"[PLOT_RENDER] Starting plot execution, go={go is not None}, px={px is not None}")
     env = dict(GLOBAL_PLOT_SCOPE)
     env["dfs"] = dfs
+    # Same guarded builtins as code_exec.safe_execute — chart code must not be
+    # able to import DB drivers / credential modules either (Article VII).
+    # dict(): per-call copy so one execution can't mutate the shared guard.
+    from sandbox_guard import SANDBOX_BUILTINS
+    env["__builtins__"] = dict(SANDBOX_BUILTINS)
 
     # Strip direct upsetplot imports — the library's UpSet class has rendering
     # bugs (NaN RGBA errors). Use upset_plot_from_sets() from scope instead.

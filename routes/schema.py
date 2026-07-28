@@ -116,7 +116,9 @@ async def schema_details(request: Request):
 
     store = UserStore(sid)
     loop = asyncio.get_running_loop()
-    dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
+    # include_db=False: session-stage endpoints operate on uploaded files
+    # only (DB descriptions are ladmin-confirmed; snapshots can be huge).
+    dfs = await loop.run_in_executor(_EXEC, lambda: store.load_dataframes(include_db=False))
     meta = store.read_meta()
 
     MAX_LIST = getattr(settings, "SCHEMA_MAX_UNIQUE_LIST", 50)
@@ -190,7 +192,9 @@ async def get_common_fields(request: Request):
 
     store = UserStore(sid)
     loop = asyncio.get_running_loop()
-    dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
+    # include_db=False: session-stage endpoints operate on uploaded files
+    # only (DB descriptions are ladmin-confirmed; snapshots can be huge).
+    dfs = await loop.run_in_executor(_EXEC, lambda: store.load_dataframes(include_db=False))
     meta = store.read_meta()
     if len(dfs) < 2:
         return {"relationships": [], "user_defined": []}

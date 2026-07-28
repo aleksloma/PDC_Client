@@ -154,6 +154,9 @@ def append_line(path: Path, data: dict) -> None:
 | client | Active chats          | `users/{email}/active_chats.jsonl`                  |
 | client | Chat metadata         | `chatdata/{chat_id}/meta.json`                      |
 | client | Conversation history  | `chatdata/{chat_id}/conversations/{conv_id}.jsonl`  |
+| client | DB sources registry   | `data_sources.json` (connections Fernet-encrypted + registered tables) |
+| client | DB table snapshots    | `db_snapshots/{table_id}.parquet` (ONE central copy per table) |
+| client | Admin audit trail     | `admin_audit.jsonl` (append-only, secrets scrubbed) |
 | brain  | Tenant registry       | `tenants/{tenant_id}/meta.json`                     |
 | brain  | Per-tenant config     | `tenants/{tenant_id}/config.json`                   |
 | brain  | Per-tenant usage      | `tenants/{tenant_id}/usage.jsonl`                   |
@@ -197,6 +200,26 @@ client must be closed on FastAPI lifespan shutdown.
 6. Never commit `.env` files. Commit `.env.example` templates only.
 7. SMTP credentials live on the brain (per-tenant config). The client relays
    share emails through `POST /v1/send_share_email`.
+8. **Database credentials (client "Data sources")** are Fernet-encrypted at
+   rest (`CLIENT_ENCRYPTION_KEY` env var; no key → the feature refuses to
+   save, NEVER a plaintext fallback), masked in every API response, never
+   logged, never included in any `brain_client` payload, and only ever
+   decrypted into function-locals at the moment of use — never held in
+   cleartext at importable module scope.
+9. **The code-exec sandbox never gets DB access.** Both exec sites
+   (`code_exec.safe_execute`, `plot_utils.render_plot_safe`) install
+   `sandbox_guard.SANDBOX_BUILTINS`, whose `__import__` DENIES SQLAlchemy,
+   every DB driver (psycopg2, pymysql, pyodbc, oracledb, sqlite3, …) and this
+   client's credential modules (`db_connector`, `db_sources`, `db_scheduler`,
+   `local_store`, `settings`, `brain_client`, `password_utils`). A denylist,
+   deliberately not an allowlist — plotting stacks lazy-import transitively at
+   call time, and an allowlist miss would fail-freeze historical stored code.
+   **Honest limit:** this is defense in depth, NOT a security boundary
+   (`open`/`eval` remain; already-imported modules stay reachable). The
+   load-bearing controls are the dedicated SELECT-only database login the
+   customer provisions (the grant is the real guarantee), plus rules 8 above
+   and the connector's SELECT-only statement gate
+   (`db_connector._assert_single_select`; no route accepts free SQL).
 
 ---
 

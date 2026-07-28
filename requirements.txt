@@ -31,3 +31,14 @@ adjustText==1.2.0
 # Reports
 python-pptx==1.0.2
 reportlab==4.2.5
+
+# Database sources (admin-registered tables → parquet snapshots).
+# Connector is SELECT/introspection-only; drivers are DENIED inside the
+# code-exec sandbox (sandbox_guard.py). oracledb runs in thin mode (no
+# Instant Client); pyodbc needs unixodbc + msodbcsql18 from the Dockerfile.
+SQLAlchemy==2.0.36
+cryptography==43.0.3
+psycopg2-binary==2.9.10
+PyMySQL==1.1.1
+pyodbc==5.2.0
+oracledb==2.5.1

@@ -42,13 +42,29 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _FIXED_PLAN = "Enterprise"
 
 
+def _local_admin_username() -> str:
+    from settings import settings
+    return (settings.LOCAL_ADMIN_USERNAME or "").strip().lower()
+
+
+def _valid_login_id(value: str) -> bool:
+    """A real email, or the fixed local-admin username (the ONLY non-email
+    identity; every other id still requires a valid email)."""
+    return bool(_EMAIL_RE.match(value)) or (value and value == _local_admin_username())
+
+
 def _public_profile(email: str) -> dict:
-    """Shape the profile in the way dashboard.js expects."""
+    """Shape the profile in the way dashboard.js expects.
+
+    NOTE: the admin flag is `is_local_admin`, deliberately NOT `is_admin` —
+    dashboard.js feeds `profile.is_admin` into the B2C Publish context-menu
+    items, whose routes return 400 by design on-prem."""
     return {
         "username": email,
         "email": email,
         "full_name": "",
         "subscription_plan": _FIXED_PLAN,
+        "is_local_admin": AuthStore().is_admin(email),
     }
 
 
@@ -114,7 +130,7 @@ async def login(request: Request):
     email = (form.get("email") or "").strip().lower()
     password = form.get("password") or ""
     remember = bool(form.get("remember"))
-    if not _EMAIL_RE.match(email):
+    if not _valid_login_id(email):
         return _landing(request, error="Please enter a valid email",
                         email=email, status_code=400)
     if not password:
@@ -124,6 +140,16 @@ async def login(request: Request):
     store = AuthStore()
     auth = store.get_auth(email)
     if not auth.get("password_hash") and not auth.get("temp_password_hash"):
+        if email == _local_admin_username():
+            # Bootstrapped account without a password (LOCAL_ADMIN_PASSWORD
+            # unset at boot). The reset flow is refused for ladmin (no
+            # mailbox), so point at the server-side fix instead.
+            log_with_sid(email, "warning", "LADMIN_LOGIN_NO_BOOTSTRAP")
+            return _landing(
+                request, email=email, status_code=403,
+                password_error=("The administrator account has no password yet. "
+                                "Set LOCAL_ADMIN_PASSWORD in the server "
+                                "environment and restart the container."))
         if store.user_exists(email):
             # LEGACY account from the email-only build (folder exists, no
             # hash): the typed password must NOT silently become theirs —
@@ -179,6 +205,15 @@ async def reset_password(request: Request):
     to email it. The temp password never appears in any log."""
     form = await request.form()
     email = (form.get("email") or "").strip().lower()
+    if email and email == _local_admin_username():
+        # ladmin has no mailbox — an email reset would store a temp hash
+        # nobody can ever receive AND lock the admin behind must_change.
+        # Server-side recovery: delete users/ladmin/auth.json and restart.
+        log_with_sid(email, "warning", "LADMIN_RESET_REFUSED")
+        return _landing(
+            request, email=email, status_code=403,
+            error=("The local administrator password cannot be reset by email. "
+                   "Ask whoever installed PowerDataChat to reset it on the server."))
     if not _EMAIL_RE.match(email):
         return _landing(request, error="Please enter a valid email",
                         email=email, status_code=400)

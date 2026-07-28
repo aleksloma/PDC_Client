@@ -27,6 +27,7 @@ from starlette.datastructures import MutableHeaders
 
 from settings import settings
 from logger_utils import log_with_sid
+from local_store import AuthStore
 
 from routes.auth import router as auth_router
 from routes.upload import router as upload_router
@@ -34,6 +35,7 @@ from routes.chat import router as chat_router
 from routes.report import router as report_router
 from routes.schema import router as schema_router
 from routes.dashboards import router as dashboards_router
+from routes.admin_data import router as admin_data_router
 
 
 _HERE = Path(__file__).resolve().parent
@@ -53,8 +55,16 @@ async def lifespan(app: FastAPI):
     # Build marker — lets an operator confirm from the logs that the running
     # image actually carries the clone renderer (a stale image is the classic
     # "decks still look un-branded" cause: the new code never got deployed).
-    log_with_sid("startup", "info", "CLIENT_BUILD", marker="pptx-clone-iter6")
+    log_with_sid("startup", "info", "CLIENT_BUILD", marker="db-tables-phase1")
+    # Fixed local admin bootstrap (idempotent; never overwrites an existing
+    # password) + the nightly database-snapshot refresh scheduler. Both are
+    # lifespan-scoped on purpose: an import-time thread would leak into every
+    # pytest session (the local_store sweeper lesson).
+    AuthStore().ensure_local_admin()
+    import db_scheduler
+    db_scheduler.start()
     yield
+    db_scheduler.stop()
     log_with_sid("shutdown", "info", "CLIENT_STOPPED")
 
 
@@ -139,6 +149,7 @@ app.include_router(schema_router)
 app.include_router(chat_router)
 app.include_router(report_router)
 app.include_router(dashboards_router)
+app.include_router(admin_data_router)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -210,7 +221,11 @@ async def lab(request: Request):
             "ts": ts,
             "default_days": settings.CHAT_ACTIVE_DEFAULT_DAYS,
             "max_days": settings.CHAT_ACTIVE_MAX_DAYS,
+            # is_admin stays False — it feeds the B2C Publish menu (400 by
+            # design on-prem). The local-admin "Data sources" link renders
+            # from is_local_admin instead.
             "is_admin": False,
+            "is_local_admin": AuthStore().is_admin(email),
             "username": email,
             "subscription_plan": "Enterprise",
             **prof,
@@ -259,6 +274,7 @@ async def open_conversation_deeplink(request: Request, conv_id: str):
             "default_days": settings.CHAT_ACTIVE_DEFAULT_DAYS,
             "max_days": settings.CHAT_ACTIVE_MAX_DAYS,
             "is_admin": False,
+            "is_local_admin": AuthStore().is_admin(email),
             "username": email,
             "subscription_plan": "Enterprise",
             "open_conv_id": conv_id,
@@ -300,6 +316,28 @@ async def dashboard_view_page(request: Request, dash_id: str):
             "subscription_plan": "Enterprise",
             **prof,
         },
+    )
+
+
+@app.get("/admin/data_sources", response_class=HTMLResponse)
+async def admin_data_sources_page(request: Request):
+    """The ladmin "Data sources" page (connections + registered tables +
+    refresh schedule). Same guard philosophy as every page route — redirects,
+    never an error page: no session → /, forced change → change_password,
+    non-admin → /lab."""
+    email = request.session.get("email")
+    if not email:
+        return RedirectResponse(url="/", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse(url="/auth/change_password", status_code=302)
+    if not AuthStore().is_admin(email):
+        log_with_sid(email, "warning", "ADMIN_PAGE_DENIED")
+        return RedirectResponse(url="/lab", status_code=302)
+    log_with_sid(email, "info", "OPEN_ADMIN_DATA_SOURCES")
+    return templates.TemplateResponse(
+        "admin_data_sources.html",
+        {"request": request, "ts": int(time.time()), "username": email,
+         "subscription_plan": "Enterprise", **_profile_context(email)},
     )
 
 

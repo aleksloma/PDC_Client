@@ -21,6 +21,7 @@ file documents the enterprise client's implementation of each one.
 | `GET` | `/c/{conv_id}` | deep-link / hard-refresh into one conversation. Resolves the conv's `chat_id` from the caller's conversations index and seeds `open_conv_id`/`open_chat_id` so `dashboard.js` auto-opens it. No session → `/`; forced change pending → `/auth/change_password`; unknown/foreign conv → `/lab` (never 404). |
 | `GET` | `/auth/change_password` | forced set-a-new-password page shown after a temp-password login (no session → `/`; no pending flag → `/lab`) |
 | `GET` | `/dashboards/{dash_id}` | the dashboard page (grid of pinned tiles, `dashboard_view.html` + `dashboard_view.js`). Resolves the dashboard via own-doc-or-shared-pointer; no session → `/`; forced change pending → `/auth/change_password`; unknown/unshared → `/lab` (never 404). |
+| `GET` | `/admin/data_sources` | the ladmin **Data sources** page (`admin_data_sources.html` + `admin_data_sources.js`): DB connections, registered tables, nightly refresh schedule, audit trail. Same redirect philosophy: no session → `/`; forced change → `/auth/change_password`; non-admin → `/lab` (never an error page). |
 
 ---
 
@@ -203,6 +204,86 @@ Duplicate names **within one selection batch** (chat creation or Add Data)
 are resolved the same way without a dialog: identical → one kept + "Duplicate
 file ignored" notice; different → the second is auto-renamed to the first
 free `_vN` name (shown renamed in the wizard's file list).
+
+---
+
+## Database tables (admin-registered "Data sources", snapshot mode)
+
+An ladmin-registered database table enters a chat exactly like an uploaded
+file: its snapshot parquet (ONE central copy at
+`DATA_ROOT/db_snapshots/{table_id}.parquet`) is merged into the chat's
+dataframes by `load_dataframes()`, keyed by the table's **display name**. The
+chat meta carries a meta-only entry (`source: "database"`, `db: {table_id,…}`,
+no path) — see `docs/ENTERPRISE_ARCHITECTURE.md` §"Database tables". Raw DB
+values never reach the brain (Article II unchanged): only names, dtypes,
+ladmin-confirmed descriptions and the same truncated sampled hints uploaded
+files already send cross via `schema_text` / `schema_autofill`.
+
+### Client-facing routes (any signed-in user)
+
+| Method | Path | Behavior |
+|---|---|---|
+| `GET` | `/api/db_tables` | Registered NON-connector tables for the Create-New / Add Data picker: `{tables: [{table_id, display_name, description, row_count, refreshed_at}]}`. Connector (helper/join) tables are never listed — they are auto-included through the relations graph. |
+| `POST` | `/session/db_tables` | Body `{table_ids: [...]}`. Sets the temp session's DB-table selection: validates ids, **rejects a directly-selected connector (400)**, expands through the connector relations graph (transitive, undirected, capped — frozen into the session meta so later admin edits never silently change an existing chat), REPLACES any previous selection, and writes meta-only entries built from the registry (no brain call, no snapshot read). The wizard calls it between `/upload` and `/schema_autofill_full`; `/upload` defensively preserves DB entries across its session reset. |
+
+`/schema_autofill_full`, `/generate_chatdata` and `/add_data_to_chat` accept a
+DB-only session (their "no dataframes → 400" guards also count DB selections);
+autofill **skips** database entries (descriptions are ladmin-confirmed — never
+overwritten). `/add_data_to_chat` merges DB selections by `table_id`: an
+already-present table keeps the chat's (possibly user-edited) descriptions via
+the shared `merge_schema_entry` carry-over; new tables append with a df key
+deduped against the chat's existing keys.
+
+`GET /api/chat/{chat_id}/schema` additionally returns (additive — file-only
+chats get `db_tables: []`, `data_as_of: null`):
+
+```jsonc
+{
+  "db_tables": [{"df_key", "table_id", "display_name", "is_connector",
+                  "auto_included", "row_count", "refreshed_at", "missing"}],
+  "data_as_of": "2026-07-27T00:00:12+00:00"   // MIN refreshed_at — oldest data in the chat
+}
+```
+
+The `/lab` topbar shows "Data as of <refreshed_at>" from this. A `missing`
+table (unregistered / snapshot gone) is skipped by `load_dataframes` and the
+existing refresh key-freeze disables items that referenced its key.
+
+### Admin routes — `/api/admin/*` (role == "admin" only)
+
+Guarded by `_require_admin` (401 unauthenticated; 403 while
+`must_change_password` is pending; 403 + `admin.denied` audit row for
+non-admins). Connectivity/introspection failures return `200 {ok:false,
+error}` (the dashboards idiom). Every response masks credentials
+(`password_set`/`password_readable`/`password_masked` — never `password_enc`
+or `url_override`). Every admin action appends to the append-only audit JSONL
+`DATA_ROOT/admin_audit.jsonl` (secrets scrubbed).
+
+| Method | Path | Behavior |
+|---|---|---|
+| `GET` | `/api/admin/dialects` | dialect registry for the UI (`postgresql`, `mysql`, `mariadb`, `mssql`, `oracle`) with per-dialect `{available, unavailable_reason}` (e.g. msodbcsql18 not installed) |
+| `GET/POST` | `/api/admin/connections` | list (masked) / create. Create requires `CLIENT_ENCRYPTION_KEY` (else 503 — passwords are Fernet-encrypted at rest, never plaintext) |
+| `POST` | `/api/admin/connections/test` | SELECT-1 probe with a short connect timeout. Accepts `{connection_id}` OR a full unsaved draft incl. `password` (Test-before-Save). `{ok, error?, server_version?, elapsed_ms}` |
+| `POST` | `/api/admin/connections/{cid}` | edit; omitted/empty `password` keeps the stored credential |
+| `POST` | `/api/admin/connections/{cid}/delete` | `409 {tables:[…]}` while registered tables reference it; `{cascade:true}` deletes those tables + snapshots too |
+| `GET` | `/api/admin/connections/{cid}/schemas`, `…/tables?schema=` | live introspection listings (tables marked `registered`) |
+| `POST` | `/api/admin/connections/{cid}/refresh` | Refresh-now for every table on the connection (sequential) |
+| `POST` | `/api/admin/tables/introspect` | columns+dtypes / PK / FK / indexes / comment via SQLAlchemy Inspector + catalog-estimate row count & size (degraded gracefully on missing catalog privileges — never `COUNT(*)` on a customer table) + first-rows preview (admin's browser only) |
+| `POST` | `/api/admin/tables/draft_descriptions` | AI-drafted ENGLISH table+column descriptions via the existing `brain_client.schema_autofill` (same truncated sampled hints files send; payload carries no host/user/password/connection id). **Persists nothing** — one of the four mandatory-confirm locks |
+| `GET/POST` | `/api/admin/tables`, `POST /api/admin/tables/{tid}` | list / register / edit + snapshot. **Mandatory confirm**: `confirm:true` required (`400 CONFIRM_REQUIRED`); `descriptions_confirmed_by/at` stamped from the session + server clock, never the body; a fresh introspection must match the posted column set (`409 SCHEMA_DRIFT`). Snapshot failure keeps the registration saved with `last_refresh_error` (Refresh retries); success = chunked SELECT → parquet, atomic `os.replace` |
+| `POST` | `/api/admin/tables/{tid}/refresh` | Refresh-now (same `db_scheduler.refresh_one_table` the nightly run uses). Returns `{ok, rows, bytes, refreshed_at, drift:{added,removed}}`; on schema drift every chat meta referencing the table is re-synced with the `_resync_meta_after_add` carry-over rules (user edits survive, vanished columns deleted). A failed refresh keeps the previous snapshot AND `refreshed_at` — chats serve the last good data |
+| `POST` | `/api/admin/tables/{tid}/delete` | unregister (+ delete the snapshot by default) |
+| `GET/POST` | `/api/admin/refresh_settings` | nightly schedule `{refresh_enabled, refresh_time "HH:MM" container-local, next_run_at, last_run_at, last_run_summary}`; 400 on a bad time |
+| `GET` | `/api/admin/audit?limit=` | newest-first tail of `admin_audit.jsonl` |
+
+**Security invariants** (stated in code — `db_connector.py`, `sandbox_guard.py`):
+the connector only ever issues SELECT/introspection statements
+(`_assert_single_select` guards the one assembled statement + the optional
+WHERE; no route accepts free SQL); DB drivers and the client's credential
+modules are **denied inside the code-exec sandbox** (`sandbox_guard.SANDBOX_BUILTINS`
+installed at both exec sites — defense in depth; the SELECT-only DB grant is
+the real guarantee); credentials are never logged, never in any brain payload,
+never at importable module scope in cleartext.
 
 ---
 

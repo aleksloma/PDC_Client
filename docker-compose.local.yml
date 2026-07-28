@@ -25,7 +25,14 @@ services:
     build: .
     image: powerdatachat-client:enterprise
     container_name: pdc-client
-    env_file: client.local.env
+    env_file:
+      - client.local.env
+      # Optional overlay: `.env` is dockerignored (never baked into the
+      # image), so vars kept there (CLIENT_ENCRYPTION_KEY,
+      # LOCAL_ADMIN_PASSWORD, ...) reach the container this way. Later files
+      # override earlier ones.
+      - path: .env
+        required: false
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

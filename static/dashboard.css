@@ -2325,3 +2325,69 @@ button.danger:hover {
   cursor: pointer;
 }
 .pdc-dash-pop-create:hover { background: #eff6ff; }
+
+/* ── Database tables (Data sources feature) ─────────────────────────────── */
+/* Wizard "Add database tables" section */
+.db-tables-section {
+  margin-top: 14px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 12px;
+  background: #f8fafc;
+  text-align: left;
+}
+.db-tables-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.db-tables-title { font-weight: 600; font-size: 14px; color: #0f172a; }
+.db-table-search {
+  flex: 1;
+  min-width: 120px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+.db-table-list { max-height: 180px; overflow-y: auto; }
+.db-table-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.db-table-row:hover { background: #eef2f7; }
+.db-table-badge {
+  background: #001E44;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 5px;
+  padding: 2px 6px;
+  letter-spacing: 0.5px;
+}
+.db-table-name { font-weight: 600; color: #111827; white-space: nowrap; }
+.db-table-desc {
+  color: #6b7280;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.selected-file-row .selected-file-badge.db { background: #001E44; color: #fff; }
+
+/* Top-bar "Data as of" badge (chats using database tables) */
+.data-as-of-badge {
+  font-size: 12px;
+  color: #6b7280;
+  background: #f3f4f6;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  padding: 4px 10px;
+  white-space: nowrap;
+}

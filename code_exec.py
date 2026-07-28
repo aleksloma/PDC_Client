@@ -11,6 +11,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from logger_utils import log_with_sid
 from settings import settings
+from sandbox_guard import SANDBOX_BUILTINS
 
 # --- Extended visualization libraries (safe imports) ---
 try:
@@ -203,7 +204,15 @@ def safe_execute(code: str, dfs: dict, sid: str | None = None, timeout: float = 
         "roc_curve": roc_curve,
         "auc": sklearn_auc,
         "silhouette_score": silhouette_score,
-        "dfs": dfs, "RESULT": None
+        "dfs": dfs, "RESULT": None,
+        # Guarded builtins: without this key, exec() injects the FULL builtins
+        # (incl. __import__) — generated code must never be able to import a
+        # DB driver or this client's credential modules (Article VII; see
+        # sandbox_guard.py for the honest limits of this guard).
+        # PER-CALL COPY: generated code can assign into its __builtins__;
+        # sharing one dict would let one execution poison the guard for every
+        # later execution container-wide.
+        "__builtins__": dict(SANDBOX_BUILTINS),
     }
     # Convenience alias: expose the first dataframe as `df` if available
     try:

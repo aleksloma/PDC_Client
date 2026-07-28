@@ -55,6 +55,35 @@ class Settings(BaseModel):
     # after a short TTL, so an idle container returns to baseline memory.
     DF_CACHE_MAX_MB: int = Field(default_factory=lambda: int(os.getenv("DF_CACHE_MAX_MB", "500")))
 
+    # --- Database sources (admin-registered tables → parquet snapshots) -----
+    # Fernet key for encrypting DB connection passwords at rest in
+    # data_sources.json. Generate once per install:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Never logged, never sent to the brain. When rotating, put the previous
+    # key in CLIENT_ENCRYPTION_KEY_OLD so stored passwords stay readable.
+    CLIENT_ENCRYPTION_KEY: str = Field(default_factory=lambda: os.getenv("CLIENT_ENCRYPTION_KEY", ""))
+    CLIENT_ENCRYPTION_KEY_OLD: str = Field(default_factory=lambda: os.getenv("CLIENT_ENCRYPTION_KEY_OLD", ""))
+
+    # Fixed local admin account (the only role=admin user in Phase 1).
+    # LOCAL_ADMIN_PASSWORD bootstraps the account ONCE (hash-only on disk,
+    # forced change on first login); an existing hash is never overwritten.
+    LOCAL_ADMIN_USERNAME: str = Field(default_factory=lambda: os.getenv("LOCAL_ADMIN_USERNAME", "ladmin"))
+    LOCAL_ADMIN_PASSWORD: str = Field(default_factory=lambda: os.getenv("LOCAL_ADMIN_PASSWORD", ""))
+
+    # Connector tuning. The connector only ever issues SELECT/introspection
+    # statements; timeouts bound each connection attempt / snapshot query.
+    DB_CONNECT_TIMEOUT: int = Field(default_factory=lambda: int(os.getenv("DB_CONNECT_TIMEOUT", "8")))
+    DB_STATEMENT_TIMEOUT: int = Field(default_factory=lambda: int(os.getenv("DB_STATEMENT_TIMEOUT", "300")))
+    DB_SNAPSHOT_CHUNK_ROWS: int = Field(default_factory=lambda: int(os.getenv("DB_SNAPSHOT_CHUNK_ROWS", "100000")))
+    DB_PREVIEW_ROWS: int = Field(default_factory=lambda: int(os.getenv("DB_PREVIEW_ROWS", "20")))
+    DB_MAX_AUTO_CONNECTORS: int = Field(default_factory=lambda: int(os.getenv("DB_MAX_AUTO_CONNECTORS", "25")))
+
+    # Nightly snapshot refresh (container-local time; the admin UI value in
+    # data_sources.json wins once set — these are first-boot defaults only).
+    DB_REFRESH_TIME: str = Field(default_factory=lambda: os.getenv("DB_REFRESH_TIME", "00:00"))
+    DB_REFRESH_ENABLED: bool = Field(default_factory=lambda: os.getenv("DB_REFRESH_ENABLED", "1") not in ("0", "false", "False", ""))
+    DB_REFRESH_LOCK_STALE_S: int = Field(default_factory=lambda: int(os.getenv("DB_REFRESH_LOCK_STALE_S", "21600")))
+
     # Title display defaults (used by the dashboard sidebar)
     TITLE_MAX_LEN: int = Field(default_factory=lambda: int(os.getenv("TITLE_MAX_LEN", "80")))
     TITLE_BREAK_MIN: int = Field(default_factory=lambda: int(os.getenv("TITLE_BREAK_MIN", "40")))

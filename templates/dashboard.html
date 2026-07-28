@@ -81,6 +81,9 @@
         </div>
         <div class="top-bar-spacer"></div>
         <div class="top-bar-actions">
+          <!-- "Data as of" — shown only for chats that use database tables
+               (min refreshed_at across the chat's snapshots). -->
+          <span id="dataAsOfBadge" class="data-as-of-badge hidden" title=""></span>
           <button id="btnAutoAnalytics" class="ghost small top-action-btn report-download-btn hidden" type="button">
             <span class="aa-btn-icon" aria-hidden="true">✨</span>
             <span class="aa-btn-label">Run Auto Analytics</span>
@@ -94,6 +97,9 @@
           </div>
           <button id="btnAddData" class="ghost small top-action-btn hidden" data-i18n="lab.add_data">➕ Add Data</button>
           <button id="btnSchema" class="ghost small top-action-btn hidden" data-i18n="lab.view_schema">View / Edit Descriptions</button>
+          {% if is_local_admin %}
+          <a id="btnDataSources" href="/admin/data_sources" class="ghost small top-action-btn" data-i18n="lab.data_sources">🗄️ Data sources</a>
+          {% endif %}
           {% include 'partials/profile_button.html' %}
         </div>
       </div>
@@ -181,6 +187,19 @@
 
           <!-- Selected files list (filename + remove icon, no description input) -->
           <div id="selectedFilesList" class="selected-files-list"></div>
+
+          <!-- Database tables (admin-registered; non-connector only). Hidden
+               unless the server has registered tables. Selected tables join
+               selectedFiles as {_isDbTable} items — files and DB tables mix
+               freely in one chat. -->
+          <div id="dbTablesSection" class="db-tables-section hidden">
+            <div class="db-tables-header">
+              <span class="db-tables-title" data-i18n="wizard.db_tables_title">🗄️ Add database tables</span>
+              <input type="text" id="dbTableSearch" class="db-table-search"
+                     placeholder="Search tables…" data-i18n-placeholder="wizard.db_tables_search" />
+            </div>
+            <div id="dbTableList" class="db-table-list"></div>
+          </div>
         </div>
       </div>
 

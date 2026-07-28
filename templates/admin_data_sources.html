@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data sources - PowerDataChat</title>
+  <meta name="robots" content="noindex, nofollow" />
+  <link rel="icon" type="image/png" href="/static/logo.png?v={{ ts }}" />
+  <link rel="shortcut icon" href="/static/logo.png?v={{ ts }}" />
+  <link rel="stylesheet" href="/static/main.css?v={{ ts }}" />
+  <link rel="stylesheet" href="/static/dashboard.css?v={{ ts }}" />
+  <link rel="stylesheet" href="/static/admin_data_sources.css?v={{ ts }}" />
+</head>
+<body class="dashboard-page admin-ds-page">
+  <main class="dash-main">
+    <div class="top-bar dash-top-bar">
+      <a href="/lab" class="dash-back-btn" title="Back to Lab">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+      </a>
+      <h1 class="dash-title">🗄️ Data sources</h1>
+      <div class="top-bar-spacer"></div>
+      <div class="top-bar-actions">
+        {% include 'partials/profile_button.html' %}
+      </div>
+    </div>
+
+    <div class="ads-body">
+      <!-- Encryption-key warning (shown when CLIENT_ENCRYPTION_KEY is unset) -->
+      <div id="adsKeyWarning" class="ads-warning hidden">
+        ⚠️ CLIENT_ENCRYPTION_KEY is not configured on this server — database
+        connections cannot be saved. Set it in the environment and restart the
+        container.
+      </div>
+
+      <!-- Connections -->
+      <section class="ads-section">
+        <div class="ads-section-header">
+          <h2>Connections</h2>
+          <button id="btnAddConnection" class="primary small">＋ Add connection</button>
+        </div>
+        <div id="connectionsList" class="ads-cards"></div>
+      </section>
+
+      <!-- Registered tables -->
+      <section class="ads-section">
+        <div class="ads-section-header">
+          <h2>Registered tables</h2>
+        </div>
+        <div id="tablesList" class="ads-table-wrap"></div>
+      </section>
+
+      <!-- Refresh schedule -->
+      <section class="ads-section">
+        <div class="ads-section-header">
+          <h2>Nightly refresh</h2>
+        </div>
+        <div class="ads-schedule-row">
+          <label class="ads-check"><input type="checkbox" id="refreshEnabled" /> Enabled</label>
+          <label>Time (container-local): <input type="time" id="refreshTime" value="00:00" /></label>
+          <button id="btnSaveSchedule" class="primary small">Save</button>
+          <span id="scheduleInfo" class="ads-muted"></span>
+        </div>
+      </section>
+
+      <!-- Audit trail -->
+      <section class="ads-section">
+        <div class="ads-section-header">
+          <h2>Audit trail</h2>
+          <button id="btnToggleAudit" class="ghost small">Show</button>
+        </div>
+        <div id="auditList" class="ads-audit hidden"></div>
+      </section>
+    </div>
+  </main>
+
+  <!-- Connection form modal (create + edit; Test works on the unsaved draft) -->
+  <div id="connModal" class="modal hidden">
+    <div class="modal-content ads-modal">
+      <div class="modal-header">
+        <h3 id="connModalTitle">Add connection</h3>
+        <button id="closeConnModal" class="ghost">✕</button>
+      </div>
+      <div class="modal-body ads-form">
+        <label>Name <input type="text" id="connName" placeholder="Core DWH" /></label>
+        <label>Type
+          <select id="connType"></select>
+        </label>
+        <div class="ads-form-row">
+          <label class="grow">Host <input type="text" id="connHost" placeholder="db.corp.local" /></label>
+          <label>Port <input type="number" id="connPort" /></label>
+        </div>
+        <label id="connDatabaseWrap">Database <input type="text" id="connDatabase" /></label>
+        <label id="connServiceWrap" class="hidden">Service name <input type="text" id="connService" /></label>
+        <label>User <input type="text" id="connUser" autocomplete="off" /></label>
+        <label>Password <input type="password" id="connPassword" autocomplete="new-password" placeholder="" /></label>
+        <div class="ads-form-row">
+          <label class="ads-check"><input type="checkbox" id="connSsl" /> SSL / Encrypt</label>
+          <label class="ads-check"><input type="checkbox" id="connTrustCert" /> Trust server certificate</label>
+        </div>
+        <div id="connTestResult" class="ads-test-result hidden"></div>
+      </div>
+      <div class="modal-actions">
+        <button id="btnTestConn" class="ghost">🔌 Test connection</button>
+        <div class="wizard-nav-spacer"></div>
+        <button id="btnCancelConn" class="ghost">Cancel</button>
+        <button id="btnSaveConn" class="primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Table registration wizard modal -->
+  <div id="tableModal" class="modal hidden">
+    <div class="modal-content ads-modal ads-table-modal">
+      <div class="modal-header">
+        <h3 id="tableModalTitle">Register table</h3>
+        <button id="closeTableModal" class="ghost">✕</button>
+      </div>
+      <div class="modal-body">
+        <!-- Step A: pick schema + table -->
+        <div id="twPick" class="ads-step">
+          <div class="ads-form-row">
+            <label>Schema
+              <select id="twSchema"></select>
+            </label>
+            <label class="grow">Table
+              <select id="twTable"></select>
+            </label>
+            <button id="btnIntrospect" class="primary small">Load structure</button>
+          </div>
+          <div id="twPickStatus" class="ads-muted"></div>
+        </div>
+
+        <!-- Step B: structure + preview + descriptions + settings -->
+        <div id="twDetail" class="hidden">
+          <div class="ads-form-row">
+            <label class="grow">Display name
+              <input type="text" id="twDisplayName" placeholder="clients information" />
+            </label>
+            <label class="ads-check"><input type="checkbox" id="twIsConnector" />
+              Connector (helper/join table — hidden from users, auto-included with related tables)</label>
+          </div>
+          <div id="twStats" class="ads-muted"></div>
+
+          <label class="ads-label">Table description (contents + how it joins to other tables)
+            <textarea id="twDescription" rows="2"></textarea>
+          </label>
+
+          <div class="ads-section-header">
+            <h4>Columns</h4>
+            <button id="btnDraftAI" class="ghost small">✨ Draft descriptions with AI</button>
+          </div>
+          <div id="twDraftBanner" class="ads-warning hidden">
+            AI-drafted — review and confirm before saving.
+          </div>
+          <div class="ads-cols-wrap">
+            <table class="ads-cols-table">
+              <thead><tr><th>Column</th><th>Type</th><th>PK</th><th>Indexed</th><th>Description</th></tr></thead>
+              <tbody id="twColsBody"></tbody>
+            </table>
+          </div>
+
+          <div class="ads-section-header"><h4>Preview (first rows)</h4></div>
+          <div id="twPreview" class="ads-preview-wrap"></div>
+
+          <div class="ads-section-header"><h4>Relations (join keys to other registered tables)</h4></div>
+          <div id="twRelations"></div>
+          <button id="btnAddRelation" class="ghost small">＋ Add relation</button>
+
+          <label class="ads-check ads-confirm">
+            <input type="checkbox" id="twConfirm" />
+            I have reviewed the table and column descriptions
+          </label>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="btnCancelTable" class="ghost">Cancel</button>
+        <button id="btnSaveTable" class="primary" disabled>Save &amp; snapshot</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    window.ADMIN_USER = "{{ username }}";
+  </script>
+  <script src="/static/i18n.js?v={{ ts }}"></script>
+  <script src="/static/admin_data_sources.js?v={{ ts }}"></script>
+</body>
+</html>

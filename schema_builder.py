@@ -132,6 +132,16 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
                 dtype_info[str(c)] = dt
 
         file_info = f"File: {fname}"
+        # Database-table entries (admin-registered "Data sources") carry a
+        # source marker in schema_docs; file entries never have it, so any
+        # chat without DB tables renders byte-identically to before.
+        if isinstance(schema_docs.get(fname), dict) and schema_docs[fname].get("source") == "database":
+            db_table = schema_docs[fname].get("db_table") or ""
+            refreshed = schema_docs[fname].get("refreshed_at") or ""
+            src_line = f"\nSource: database table {db_table}" if db_table else "\nSource: database table"
+            if refreshed:
+                src_line += f" (snapshot as of {refreshed})"
+            file_info += src_line
         if file_desc and isinstance(file_desc, str) and file_desc.strip():
             file_info += f"\nFile Description: {file_desc.strip()}"
         file_info += f"\nColumns: {', '.join(str(c) for c in cols)}\nColumn Descriptions (business): {json.dumps(descs, ensure_ascii=False)}"
@@ -155,6 +165,33 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
                 cf_lines.append(f"  - {f1}[{c1}] ⟷ {f2}[{c2}] (confidence: {conf}%)")
         if cf_lines:
             parts.append("\nCommon Fields (potential join columns):\n" + "\n".join(cf_lines))
+
+    # Declared join keys between database tables (admin-defined relations).
+    # A relation renders only when BOTH endpoints are loaded in this chat —
+    # the planner must never be pointed at a frame that isn't in dfs.
+    db_rel_lines: list[str] = []
+    seen_rels: set = set()
+    for fname, f in (schema_docs or {}).items():
+        if not (isinstance(f, dict) and f.get("source") == "database" and fname in dfs):
+            continue
+        for rel in f.get("relations") or []:
+            if not isinstance(rel, dict):
+                continue
+            other = rel.get("related_df_key")
+            if not other or other not in dfs:
+                continue
+            for pair in rel.get("join_keys") or []:
+                try:
+                    c1, c2 = pair[0], pair[1]
+                except Exception:
+                    continue
+                ident = tuple(sorted([(fname, str(c1)), (str(other), str(c2))]))
+                if ident in seen_rels:
+                    continue
+                seen_rels.add(ident)
+                db_rel_lines.append(f"  - {fname}[{c1}] ⟷ {other}[{c2}]")
+    if db_rel_lines:
+        parts.append("\nDatabase Relations (declared join keys):\n" + "\n".join(db_rel_lines))
 
     return "\n\n".join(parts)
 

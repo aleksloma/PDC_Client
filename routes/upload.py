@@ -22,7 +22,8 @@ from fastapi.responses import JSONResponse
 
 import brain_client
 from brain_client import BrainError, TenantRevokedError
-from local_store import AuthStore, UserStore, ChatDataStore
+from local_store import (AuthStore, UserStore, ChatDataStore,
+                         db_entries_from_meta, merge_schema_entry, unique_df_key)
 from excel_table_detector import _EXTRACTED_TEXT_ABOVE_TABLE
 from logger_utils import log_with_sid
 from routes.chat import _EXEC
@@ -84,6 +85,12 @@ async def upload(request: Request, files: List[UploadFile] = File(...), file_des
             return JSONResponse({"error": "Invalid file descriptions format."}, status_code=400)
 
     store = UserStore(sid)
+    # Preserve database-table selections across the reset: the wizard may run
+    # /session/db_tables before /upload (or the user adds files after picking
+    # tables), and reset_all() would silently drop those meta-only entries.
+    prior_meta = store.read_meta()
+    preserved_db = db_entries_from_meta(prior_meta)
+    preserved_db_ids = prior_meta.get("db_table_ids") or []
     store.reset_all()  # Fresh temp area for this upload batch (matches B2C)
 
     saved = []
@@ -105,8 +112,9 @@ async def upload(request: Request, files: List[UploadFile] = File(...), file_des
 
     # Try loading them to detect parse failures and to populate the dataframe-key
     # list — off the event loop, the detection pipeline blocks it otherwise.
+    # include_db=False: never read snapshot parquets just to list upload keys.
     loop = asyncio.get_running_loop()
-    dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
+    dfs = await loop.run_in_executor(_EXEC, lambda: store.load_dataframes(include_db=False))
     df_names = list(dfs.keys())
 
     # Initialize empty schema entries (filled later by /schema_autofill_full)
@@ -168,6 +176,24 @@ async def upload(request: Request, files: List[UploadFile] = File(...), file_des
             log_with_sid(email, "warning", f"UPLOAD_AUTO_DESC_ERROR file={fn_key}: {e}")
             entry["file_description"] = extracted[:500]
 
+    # Re-append the preserved database-table entries (deduping their df keys
+    # against the fresh upload keys — display-name collisions re-key here, at
+    # meta-write time, never at load time).
+    if preserved_db:
+        existing = {f.get("file_name") for f in meta.get("files", []) if f.get("file_name")}
+        for entry in preserved_db:
+            key = entry.get("file_name")
+            if key in existing:
+                entry = dict(entry)
+                display = (entry.get("db") or {}).get("display_name") or key
+                key = unique_df_key(existing, display)
+                entry["file_name"] = key
+                if isinstance(entry.get("schema"), dict):
+                    entry["schema"] = {**entry["schema"], "file_name": key}
+            meta.setdefault("files", []).append(entry)
+            existing.add(key)
+    if preserved_db_ids:
+        meta["db_table_ids"] = preserved_db_ids
     store.write_meta(meta)
 
     log_with_sid(email, "info", "UPLOAD_OK", saved=",".join(saved), dataframes=",".join(df_names))
@@ -371,8 +397,14 @@ async def schema_autofill_full(request: Request):
     store = UserStore(sid)
     meta = store.read_meta()
     loop = asyncio.get_running_loop()
-    dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
+    # include_db=False: autofill operates on uploaded files only. Database
+    # entries carry ladmin-CONFIRMED descriptions from the registry — autofill
+    # must never overwrite them, and listing keys must not read snapshots.
+    dfs = await loop.run_in_executor(_EXEC, lambda: store.load_dataframes(include_db=False))
     if not dfs:
+        if db_entries_from_meta(meta):
+            # DB-tables-only session: nothing to autofill, not an error.
+            return {"ok": True, "filled": 0, "files": [], "updated": 0}
         return JSONResponse({"error": "Upload files first"}, status_code=400)
 
     # User notes (same source as global: `text_path`)
@@ -544,11 +576,14 @@ async def generate_chatdata(request: Request):
 
     user_store = UserStore(sid)
     loop = asyncio.get_running_loop()
-    dfs = await loop.run_in_executor(_EXEC, user_store.load_dataframes)
-    if not dfs:
-        return JSONResponse({"error": "Upload at least one file before generating chat data."}, status_code=400)
-
+    # include_db=False: never read a multi-million-row snapshot just to list
+    # keys; DB display names join via db_keys below.
+    dfs = await loop.run_in_executor(_EXEC, lambda: user_store.load_dataframes(include_db=False))
     user_meta = user_store.read_meta()
+    db_keys = [e.get("file_name") for e in db_entries_from_meta(user_meta) if e.get("file_name")]
+    if not dfs and not db_keys:
+        return JSONResponse({"error": "Upload a file or select a database table before generating chat data."}, status_code=400)
+    all_keys = list(dfs.keys()) + db_keys
     file_descs = file_descriptions_dict(user_meta)
     context, lang_instruction = build_context_for_questions(user_meta)
     cth = columns_to_human_map(user_meta)
@@ -563,7 +598,7 @@ async def generate_chatdata(request: Request):
         try:
             rsp = brain_client.chat_metadata(
                 sid=f"chatmeta:{sid}",
-                files_info=list(dfs.keys()),
+                files_info=all_keys,
                 file_descriptions=file_descs,
                 context=context,
                 lang_instruction=lang_instruction,
@@ -582,7 +617,7 @@ async def generate_chatdata(request: Request):
         try:
             rsp = brain_client.chat_metadata(
                 sid=f"chatmeta:{sid}",
-                files_info=list(dfs.keys()),
+                files_info=all_keys,
                 file_descriptions=file_descs,
                 context=context,
                 lang_instruction=lang_instruction,
@@ -596,7 +631,7 @@ async def generate_chatdata(request: Request):
         except Exception as e:
             log_with_sid(email, "warning", f"CHAT_METADATA_ERROR: {e}")
 
-    name = provided_name or llm_name or _name_from_files(list(dfs.keys()))
+    name = provided_name or llm_name or _name_from_files(all_keys)
 
     existing = AuthStore().get_active_chat_names(email)
     title = name
@@ -624,10 +659,10 @@ async def generate_chatdata(request: Request):
     chat_store.set_welcome(welcome_message or "")
     chat_store.set_suggested_questions(suggested_questions or [])
 
-    AuthStore().record_active_chat(email, chat_id, title, list(dfs.keys()))
+    AuthStore().record_active_chat(email, chat_id, title, all_keys)
     log_with_sid(
         email, "info", "CHAT_CREATED",
-        chat_id=chat_id, title=title, files=len(dfs),
+        chat_id=chat_id, title=title, files=len(all_keys),
         questions=len(suggested_questions),
         welcome_chars=len(welcome_message),
     )
@@ -639,6 +674,163 @@ async def generate_chatdata(request: Request):
         "welcome_message": welcome_message,
         "suggested_questions": suggested_questions,
     }
+
+
+# ---------------------------------------------------------------------------
+# 4b. Database tables — client picker + session selection
+# ---------------------------------------------------------------------------
+# Registered database tables enter a chat as META-ONLY entries (source ==
+# "database") referencing the central DATA_ROOT/db_snapshots/{table_id}.parquet
+# by table_id. Descriptions come from ladmin's CONFIRMED registration — no
+# brain call, no snapshot read happens here.
+
+@router.get("/api/db_tables")
+async def api_db_tables(request: Request):
+    """Non-connector registered tables for the Create-New / Add Data picker.
+    Connector (helper/join) tables are never listed to users — they are
+    auto-included through the relations graph."""
+    email = request.session.get("email")
+    if not email:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    try:
+        from db_sources import DataSourceStore
+        rows = DataSourceStore().list_tables(include_connector=False)
+    except Exception as e:
+        log_with_sid(email, "warning", f"DB_TABLES_LIST_FAILED: {e}")
+        rows = []
+    return {"tables": [{
+        "table_id": r.get("id"),
+        "display_name": r.get("display_name") or r.get("table_name"),
+        "description": (r.get("description") or "")[:300],
+        "row_count": r.get("row_count"),
+        "refreshed_at": r.get("refreshed_at"),
+    } for r in rows if r.get("id")]}
+
+
+def _db_meta_entry(row: dict, df_key: str, auto_included: bool,
+                   name_of: dict) -> dict:
+    """Chat-meta entry for a registered table, built from its registry row.
+    `name_of` maps table_id → df key (chat-local, deduped) or registry display
+    name, so relations always carry a resolvable `related_df_key`."""
+    fields = {}
+    for col in row.get("columns") or []:
+        cname = col.get("name")
+        if not cname:
+            continue
+        fields[str(cname)] = {
+            "description": col.get("description") or "",
+            "technical_description": col.get("technical_description") or "",
+            "values": None,
+            "indexed": bool(col.get("indexed")),
+        }
+    relations = []
+    for rel in row.get("relations") or []:
+        if not isinstance(rel, dict):
+            continue
+        rid = rel.get("related_table_id") or rel.get("related_table")
+        related_key = (name_of.get(rid) or name_of.get(str(rid).lower())
+                       or rel.get("related_df_key"))
+        relations.append({
+            "related_table_id": rid,
+            "related_df_key": related_key,
+            "join_keys": rel.get("join_keys") or [],
+        })
+    return {
+        "file_name": df_key,
+        "file_description": row.get("description") or "",
+        "source": "database",
+        "db": {
+            "table_id": row.get("id"),
+            "connection_id": row.get("connection_id"),
+            "schema": row.get("schema"),
+            "table_name": row.get("table_name"),
+            "display_name": row.get("display_name") or row.get("table_name"),
+            "is_connector": bool(row.get("is_connector")),
+            "auto_included": bool(auto_included),
+            "row_count": row.get("row_count"),
+            "refreshed_at": row.get("refreshed_at"),
+            "relations": relations,
+        },
+        "schema": {"file_name": df_key, "fields": fields},
+    }
+
+
+@router.post("/session/db_tables")
+async def session_db_tables(request: Request):
+    """Set the session's database-table selection. Body {table_ids: [...]}.
+
+    Validates the ids, REJECTS a directly-selected connector table (400 —
+    connectors are auto-only), expands the selection through the connector
+    relations graph (frozen into the meta here — a later admin edit never
+    silently changes an existing chat), and REPLACES any previous DB
+    selection in the session meta."""
+    email, sid = _require_session(request)
+    if not email:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    if not sid:
+        sid = "s_" + secrets.token_hex(8)
+        request.session["sid"] = sid
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    raw_ids = (body or {}).get("table_ids") or []
+    ids = [t for t in raw_ids if isinstance(t, str)]
+
+    from db_sources import DataSourceStore, expand_with_connectors
+    reg = DataSourceStore()
+    tables = {t.get("id"): t for t in reg.list_tables() if t.get("id")}
+    unknown = [t for t in ids if t not in tables]
+    if unknown:
+        return JSONResponse({"error": "Unknown table selection."}, status_code=400)
+    if any(tables[t].get("is_connector") for t in ids):
+        return JSONResponse(
+            {"error": "Connector tables are included automatically and cannot be selected directly."},
+            status_code=400)
+
+    closure = expand_with_connectors(ids, reg) if ids else []
+
+    user_store = UserStore(sid)
+    meta = user_store.read_meta()
+    meta["files"] = [f for f in (meta.get("files") or [])
+                     if not (isinstance(f, dict) and f.get("source") == "database")]
+    existing = {f.get("file_name") for f in meta["files"] if f.get("file_name")}
+
+    keymap: dict = {}
+    for tid in closure:
+        row = tables[tid]
+        key = unique_df_key(existing, row.get("display_name") or row.get("table_name") or "table")
+        keymap[tid] = key
+        existing.add(key)
+    # Relations may reference the related table by id OR by name (the same
+    # forms expand_with_connectors resolves). Map every form to the df key
+    # (chat-local, deduped) or, for non-included tables, the registry display
+    # name (schema_builder drops relations whose endpoint isn't loaded).
+    name_of: dict = {}
+    for tid, t in tables.items():
+        label = keymap.get(tid) or t.get("display_name") or t.get("table_name")
+        name_of[tid] = label
+        name_of[(t.get("table_name") or "").lower()] = label
+        name_of[f"{t.get('schema') or ''}.{t.get('table_name') or ''}".lower()] = label
+
+    out_rows = []
+    for tid in closure:
+        row = tables[tid]
+        auto = tid not in ids
+        meta["files"].append(_db_meta_entry(row, keymap[tid], auto, name_of))
+        out_rows.append({"table_id": tid, "df_key": keymap[tid],
+                         "display_name": row.get("display_name") or row.get("table_name"),
+                         "is_connector": bool(row.get("is_connector")),
+                         "auto_included": auto,
+                         "row_count": row.get("row_count"),
+                         "refreshed_at": row.get("refreshed_at")})
+    meta["db_table_ids"] = ids
+    user_store.write_meta(meta)
+    log_with_sid(email, "info", "SESSION_DB_TABLES_SET", sid=sid,
+                 selected=len(ids), included=len(closure))
+    return {"ok": True, "tables": out_rows}
 
 
 # ---------------------------------------------------------------------------
@@ -668,38 +860,24 @@ def _resync_meta_after_add(old_files: list, new_entries: dict,
         user-editable in the descriptions modal — edits must survive);
       - keys that are new in the upload are appended with fresh autofill.
     """
-    import copy as _copy
-
     merged: list = []
     for entry in old_files:
         key = entry.get("file_name")
+        if isinstance(entry, dict) and entry.get("source") == "database":
+            # DB entries are merged upstream by table_id — the filename-keyed
+            # overwrite logic below must never touch (or drop) them.
+            merged.append(entry)
+            continue
         if not key or _source_of_key(key) not in overwritten_sources:
             merged.append(entry)
             continue
         if key not in new_entries:
             removed.append(key)
             continue
-        fresh = _copy.deepcopy(new_entries[key])
-        old_fd = (entry.get("file_description") or "").strip()
-        if old_fd:
-            fresh["file_description"] = old_fd
-        old_schema = entry.get("schema") if isinstance(entry.get("schema"), dict) else {}
-        old_fields = (old_schema.get("fields") or {}) if isinstance(old_schema.get("fields"), dict) else {}
-        if not isinstance(fresh.get("schema"), dict):
-            fresh["schema"] = {"file_name": key, "fields": {}}
-        new_fields = fresh["schema"].setdefault("fields", {})
-        for col, old_f in old_fields.items():
-            if col not in new_fields or not isinstance(old_f, dict):
-                continue
-            if not isinstance(new_fields[col], dict):
-                new_fields[col] = {}
-            old_desc = old_f.get("description")
-            if isinstance(old_desc, str) and old_desc.strip():
-                new_fields[col]["description"] = old_desc
-            old_vals = old_f.get("values")
-            if isinstance(old_vals, dict) and old_vals:
-                new_fields[col]["values"] = old_vals
-        merged.append(fresh)
+        # Shared carry-over (also used by the DB drift resync): old
+        # file_description + per-column description/values survive; new
+        # columns / technical_descriptions come from the fresh autofill.
+        merged.append(merge_schema_entry(entry, new_entries[key]))
         updated.append(key)
 
     existing_keys = {e.get("file_name") for e in merged if e.get("file_name")}
@@ -756,9 +934,11 @@ async def add_data_to_chat(request: Request):
 
     user_store = UserStore(sid)
     loop = asyncio.get_running_loop()
-    dfs = await loop.run_in_executor(_EXEC, user_store.load_dataframes)
-    if not dfs:
-        return JSONResponse({"error": "Upload at least one file before adding data."}, status_code=400)
+    dfs = await loop.run_in_executor(
+        _EXEC, lambda: user_store.load_dataframes(include_db=False))
+    session_db_entries = db_entries_from_meta(user_store.read_meta())
+    if not dfs and not session_db_entries:
+        return JSONResponse({"error": "Upload a file or select a database table before adding data."}, status_code=400)
 
     try:
         import shutil
@@ -783,12 +963,49 @@ async def add_data_to_chat(request: Request):
         new_entries: dict = {}
         for entry in user_meta.get("files", []):
             name = entry.get("file_name")
-            if name:
+            # DB entries are merged separately below — keep them out of the
+            # filename-keyed resync (its _source_of_key logic is file-shaped).
+            if name and entry.get("source") != "database":
                 new_entries[name] = entry
+
+        # Merge the session's DATABASE selections first: same table already in
+        # the chat → refresh its db block but keep the user's edited
+        # descriptions (merge_schema_entry); new table → append with a df key
+        # deduped against the chat's existing keys.
+        added, updated, removed = [], [], []
+        if session_db_entries:
+            chat_files = chat_meta.get("files", []) or []
+            by_tid = {(e.get("db") or {}).get("table_id"): i
+                      for i, e in enumerate(chat_files)
+                      if isinstance(e, dict) and e.get("source") == "database"}
+            existing_keys = {e.get("file_name") for e in chat_files if e.get("file_name")}
+            for entry in session_db_entries:
+                tid = (entry.get("db") or {}).get("table_id")
+                if tid in by_tid:
+                    idx = by_tid[tid]
+                    old = chat_files[idx]
+                    fresh = dict(entry)
+                    fresh["file_name"] = old.get("file_name")  # keep the chat's key
+                    if isinstance(fresh.get("schema"), dict):
+                        fresh["schema"] = {**fresh["schema"], "file_name": old.get("file_name")}
+                    chat_files[idx] = merge_schema_entry(old, fresh)
+                    updated.append(old.get("file_name"))
+                else:
+                    ent = dict(entry)
+                    key = ent.get("file_name")
+                    if key in existing_keys:
+                        display = (ent.get("db") or {}).get("display_name") or key
+                        key = unique_df_key(existing_keys, display)
+                        ent["file_name"] = key
+                        if isinstance(ent.get("schema"), dict):
+                            ent["schema"] = {**ent["schema"], "file_name": key}
+                    chat_files.append(ent)
+                    existing_keys.add(key)
+                    added.append(key)
+            chat_meta["files"] = chat_files
 
         # Merge meta. On any resync failure fall back to the previous
         # append-behavior — never corrupt meta (Article IV).
-        added, updated, removed = [], [], []
         try:
             merged_files = _resync_meta_after_add(
                 chat_meta.get("files", []) or [], new_entries,

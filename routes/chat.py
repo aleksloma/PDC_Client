@@ -440,10 +440,51 @@ async def get_schema(request: Request, chat_id: str):
         return err
     store = local_store.ChatDataStore(chat_id)
     meta = store.read_meta()
+    # "Data as of" for chats that use registered database tables. Additive:
+    # file-only chats get db_tables=[] and data_as_of=None (UI renders
+    # nothing). refreshed_at prefers the REGISTRY (authoritative) over the
+    # chat meta's display cache; a table gone from the registry or whose
+    # snapshot file vanished reports missing=true (load_dataframes skips that
+    # key, and the frontend key-freeze already disables items referencing it).
+    db_tables = []
+    data_as_of = None
+    db_entries = local_store.db_entries_from_meta(meta)
+    if db_entries:
+        try:
+            from db_sources import DataSourceStore
+            registry = {t.get("id"): t for t in DataSourceStore().list_tables()}
+        except Exception:
+            registry = {}
+        for entry in db_entries:
+            db = entry.get("db") or {}
+            tid = db.get("table_id")
+            reg = registry.get(tid)
+            refreshed = (reg or {}).get("refreshed_at") or db.get("refreshed_at")
+            missing = True
+            try:
+                missing = reg is None or not local_store.db_snapshot_path(tid).exists()
+            except Exception as e:
+                log_with_sid(email, "warning",
+                             f"DB_TABLE_MISSING_PROBE_FAILED table={tid}: {e}",
+                             chat_id=chat_id)
+            db_tables.append({
+                "df_key": entry.get("file_name"),
+                "table_id": tid,
+                "display_name": db.get("display_name") or entry.get("file_name"),
+                "is_connector": bool(db.get("is_connector")),
+                "auto_included": bool(db.get("auto_included")),
+                "row_count": (reg or {}).get("row_count") or db.get("row_count"),
+                "refreshed_at": refreshed,
+                "missing": missing,
+            })
+        stamps = [t["refreshed_at"] for t in db_tables if t.get("refreshed_at")]
+        data_as_of = min(stamps) if stamps else None  # oldest data in the chat
     return {
         "chat_id": chat_id,
         "files": meta.get("files", []),
         "common_fields": meta.get("common_fields", []),
+        "db_tables": db_tables,
+        "data_as_of": data_as_of,
     }
 
 
