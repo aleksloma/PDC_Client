@@ -103,6 +103,10 @@ Create-New modal and the Add Data flow get an "Add database tables" section:
 registered non-connector tables listed by display name + short description with a
 DB badge, multi-select.
 
+*(Revised after Phase-1 ship: the section became a compact "🗄️ Select from DB"
+checkbox dropdown — names only, search on top, scrolls past ~8 tables; the
+description now shows as a hover tooltip. Selection semantics unchanged.)*
+
 ## Refresh
 
 Background scheduler (same pattern as auto_analytics): re-snapshot all registered

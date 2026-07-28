@@ -3420,32 +3420,89 @@ function openCreateWizard() {
 }
 
 // ── Database tables in the wizard ──────────────────────────────────────────
-// Registered NON-connector tables (GET /api/db_tables) render as a checkbox
-// list under the file picker. A checked table joins `selectedFiles` as
-// {name, _isDbTable: true, _tableId} (the Google-Sheet no-File precedent), so
-// the shared render/validation/removal paths need almost no changes and DB
+// Registered NON-connector tables (GET /api/db_tables) render inside a compact
+// "Select from DB" checkbox dropdown (Excel-column-filter style: names only,
+// search on top, scrolls past ~8 rows). A checked table joins `selectedFiles`
+// as {name, _isDbTable: true, _tableId} (the Google-Sheet no-File precedent),
+// so the shared render/validation/removal paths need almost no changes and DB
 // tables + uploaded files mix freely in one chat.
 let _dbTablesCache = null;   // last fetched /api/db_tables list (this wizard open)
+let _dbPanelWired = false;   // one-time document-level open/close wiring
 
 async function _loadDbTablesList() {
-  const section = document.getElementById('dbTablesSection');
+  const wrap = document.getElementById('dbSelectWrap');
   const list = document.getElementById('dbTableList');
-  if (!section || !list) return;
-  section.classList.add('hidden');
+  if (!wrap || !list) return;
+  wrap.classList.add('hidden');
+  document.getElementById('dbSelectDivider')?.classList.add('hidden');
+  _closeDbPanel();
   list.innerHTML = '';
   try {
     const res = await fetch('/api/db_tables');
-    if (!res.ok) return;                       // no tables / no feature → section stays hidden
+    if (!res.ok) return;                       // no tables / no feature → button stays hidden
     const data = await res.json();
     _dbTablesCache = data.tables || [];
   } catch (e) {
     _dbTablesCache = [];
   }
   if (!_dbTablesCache.length) return;
-  section.classList.remove('hidden');
+  wrap.classList.remove('hidden');
+  document.getElementById('dbSelectDivider')?.classList.remove('hidden');
   _renderDbTableList();
   const search = document.getElementById('dbTableSearch');
   if (search) { search.value = ''; search.oninput = () => _renderDbTableList(); }
+  _wireDbPanel();
+}
+
+function _wireDbPanel() {
+  const btn = document.getElementById('dbSelectBtn');
+  if (btn) {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const panel = document.getElementById('dbSelectPanel');
+      if (panel && panel.classList.contains('hidden')) _openDbPanel();
+      else _closeDbPanel();
+    };
+  }
+  if (_dbPanelWired) return;
+  _dbPanelWired = true;
+  // Outside click / Escape close. The closest() guard keeps checkbox clicks
+  // inside the panel from closing it (the download-dropdown pattern).
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#dbSelectWrap')) _closeDbPanel();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') _closeDbPanel();
+  });
+  // The panel is position:fixed (the wizard modal clips absolute children),
+  // so any scroll would leave it floating detached — just close it.
+  document.addEventListener('scroll', (e) => {
+    if (e.target.closest && e.target.closest('#dbSelectPanel')) return;
+    _closeDbPanel();
+  }, true);
+  window.addEventListener('resize', () => _closeDbPanel());
+}
+
+function _openDbPanel() {
+  const panel = document.getElementById('dbSelectPanel');
+  const btn = document.getElementById('dbSelectBtn');
+  if (!panel || !btn) return;
+  _renderDbTableList();
+  const r = btn.getBoundingClientRect();
+  panel.style.top = `${Math.round(r.bottom + 6)}px`;
+  panel.style.left = `${Math.round(r.left)}px`;
+  panel.classList.remove('hidden');
+  // Keep the panel on-screen when the button sits near the right edge.
+  const pr = panel.getBoundingClientRect();
+  if (pr.right > window.innerWidth - 8) {
+    panel.style.left = `${Math.max(8, Math.round(window.innerWidth - 8 - pr.width))}px`;
+  }
+  const search = document.getElementById('dbTableSearch');
+  if (search) search.focus();
+}
+
+function _closeDbPanel() {
+  document.getElementById('dbSelectPanel')?.classList.add('hidden');
 }
 
 function _renderDbTableList() {
@@ -3456,21 +3513,31 @@ function _renderDbTableList() {
   list.innerHTML = '';
   (_dbTablesCache || []).forEach(t => {
     const name = t.display_name || '';
-    const desc = t.description || '';
-    if (q && !(name.toLowerCase().includes(q) || desc.toLowerCase().includes(q))) return;
+    if (q && !name.toLowerCase().includes(q)) return;
     const row = document.createElement('label');
     row.className = 'db-table-row';
+    row.title = t.description || '';
     row.innerHTML = `
       <input type="checkbox" class="db-table-check" ${selected.has(t.table_id) ? 'checked' : ''} />
-      <span class="db-table-badge">DB</span>
       <span class="db-table-name">${escapeHtml(name)}</span>
-      <span class="db-table-desc">${escapeHtml(desc)}</span>
     `;
     row.querySelector('.db-table-check').addEventListener('change', (e) => {
       _toggleDbTable(t, e.target.checked);
     });
     list.appendChild(row);
   });
+  if (!list.children.length) {
+    list.innerHTML = `<div class="db-table-empty">${escapeHtml(_t('wizard.db_no_match', 'No matching tables'))}</div>`;
+  }
+  _updateDbSelectCount();
+}
+
+function _updateDbSelectCount() {
+  const el = document.getElementById('dbSelectCount');
+  if (!el) return;
+  const n = selectedFiles.filter(f => f._isDbTable).length;
+  el.textContent = n ? ` (${n})` : '';
+  el.classList.toggle('hidden', !n);
 }
 
 function _toggleDbTable(t, checked) {
@@ -3482,6 +3549,7 @@ function _toggleDbTable(t, checked) {
   }
   renderSelectedFilesList();
   _updateWizardGenerateBtn();
+  _updateDbSelectCount();
 }
 
 // "Add Data" (chat topbar) — same modal in 'add' mode: files go through the

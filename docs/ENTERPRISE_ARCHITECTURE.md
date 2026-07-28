@@ -570,6 +570,10 @@ A local admin (`ladmin`, the fixed role=admin account bootstrapped from
 MySQL/MariaDB, MSSQL, Oracle — a dialect REGISTRY in `client/db_connector.py`;
 adding a type = one registry entry + one driver package) so users can analyze
 them in chats exactly like uploaded files. Spec: `docs/DB_TABLES_PLAN.md`.
+ladmin is **config-only**: login lands directly on the `/admin/data_sources`
+panel and `/lab` redirects it back there — the admin account has no chat UI.
+Users pick registered tables via a compact "Select from DB" checkbox dropdown
+in the Create-New / Add-Data wizard.
 
 **Why this fits the split.** Everything downstream of `load_dataframes()`
 (schema_text, planning, safe_execute, charts, reports, Auto Analytics)

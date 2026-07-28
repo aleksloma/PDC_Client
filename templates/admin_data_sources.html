@@ -3,186 +3,327 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Data sources - PowerDataChat</title>
+  <title>Admin · Data sources - PowerDataChat</title>
   <meta name="robots" content="noindex, nofollow" />
   <link rel="icon" type="image/png" href="/static/logo.png?v={{ ts }}" />
   <link rel="shortcut icon" href="/static/logo.png?v={{ ts }}" />
-  <link rel="stylesheet" href="/static/main.css?v={{ ts }}" />
-  <link rel="stylesheet" href="/static/dashboard.css?v={{ ts }}" />
   <link rel="stylesheet" href="/static/admin_data_sources.css?v={{ ts }}" />
 </head>
-<body class="dashboard-page admin-ds-page">
-  <main class="dash-main">
-    <div class="top-bar dash-top-bar">
-      <a href="/lab" class="dash-back-btn" title="Back to Lab">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
-      </a>
-      <h1 class="dash-title">🗄️ Data sources</h1>
-      <div class="top-bar-spacer"></div>
-      <div class="top-bar-actions">
-        {% include 'partials/profile_button.html' %}
-      </div>
-    </div>
+<body class="admin-ds-page">
+  <div class="adm-shell">
 
-    <div class="ads-body">
-      <!-- Encryption-key warning (shown when CLIENT_ENCRYPTION_KEY is unset) -->
-      <div id="adsKeyWarning" class="ads-warning hidden">
-        ⚠️ CLIENT_ENCRYPTION_KEY is not configured on this server — database
-        connections cannot be saved. Set it in the environment and restart the
-        container.
+    <!-- ── Sidebar ─────────────────────────────────────────────────────── -->
+    <aside class="adm-sidebar">
+      <div class="adm-brand">
+        <img src="/static/logo2.png" alt="" class="adm-brand-logo" />
+        <div class="adm-brand-text">
+          <span class="adm-brand-name">PowerDataChat</span>
+          <span class="adm-brand-sub">Administration</span>
+        </div>
       </div>
+
+      <nav class="adm-nav">
+        <button class="adm-nav-item active" data-section="connections">
+          <span class="adm-nav-ico">🔌</span> Connections
+          <span class="adm-nav-count" id="navConnCount"></span>
+        </button>
+        <button class="adm-nav-item" data-section="tables">
+          <span class="adm-nav-ico">📋</span> Registered tables
+          <span class="adm-nav-count" id="navTableCount"></span>
+        </button>
+        <button class="adm-nav-item" data-section="schedule">
+          <span class="adm-nav-ico">⏱️</span> Refresh schedule
+        </button>
+        <button class="adm-nav-item" data-section="audit">
+          <span class="adm-nav-ico">📜</span> Audit log
+        </button>
+      </nav>
+
+      <div class="adm-sidebar-footer">
+        <div class="adm-user">
+          <span class="adm-user-avatar">{{ (username or 'A')[0]|upper }}</span>
+          <span class="adm-user-name" title="{{ username }}">{{ username }}</span>
+        </div>
+        <button id="btnAdmChangePw" class="adm-footer-btn">Change password</button>
+        <button id="btnAdmLogout" class="adm-footer-btn">Sign out</button>
+      </div>
+    </aside>
+
+    <!-- ── Main content ─────────────────────────────────────────────────── -->
+    <main class="adm-main">
 
       <!-- Connections -->
-      <section class="ads-section">
-        <div class="ads-section-header">
-          <h2>Connections</h2>
-          <button id="btnAddConnection" class="primary small">＋ Add connection</button>
+      <section id="secConnections" class="adm-section">
+        <header class="adm-page-head">
+          <div>
+            <h1>Database connections</h1>
+            <p class="adm-page-sub">Read-only credentials to your databases. Users never see these —
+               they only pick from the tables you register.</p>
+          </div>
+          <button id="btnAddConnection" class="adm-btn primary">＋ Add connection</button>
+        </header>
+
+        <!-- Encryption-key warning (shown when CLIENT_ENCRYPTION_KEY is unset/invalid) -->
+        <div id="adsKeyWarning" class="adm-alert warn hidden">
+          <strong>CLIENT_ENCRYPTION_KEY is not configured on this server.</strong>
+          Database connections cannot be saved until it is set in the environment and
+          the container is restarted.
         </div>
-        <div id="connectionsList" class="ads-cards"></div>
+
+        <!-- Onboarding hero: rendered by JS when there are zero connections -->
+        <div id="connOnboarding" class="adm-hero hidden">
+          <h2>Give your users live database tables in three steps</h2>
+          <ol class="adm-hero-steps">
+            <li><span class="adm-hero-num">1</span>
+              <div><strong>Add a connection</strong><br>Point PowerDataChat at a database with a
+              read-only account. Credentials are encrypted and stay on this server.</div></li>
+            <li><span class="adm-hero-num">2</span>
+              <div><strong>Register tables</strong><br>Pick tables, review the AI-drafted
+              descriptions, and confirm. A local snapshot is taken — user questions never
+              query your database directly.</div></li>
+            <li><span class="adm-hero-num">3</span>
+              <div><strong>Users select them in chats</strong><br>Registered tables appear in the
+              “Select from DB” list when users create a chat, refreshed nightly.</div></li>
+          </ol>
+          <button id="btnAddConnectionHero" class="adm-btn primary big">＋ Add your first connection</button>
+        </div>
+
+        <div id="connectionsList"></div>
       </section>
 
       <!-- Registered tables -->
-      <section class="ads-section">
-        <div class="ads-section-header">
-          <h2>Registered tables</h2>
-        </div>
-        <div id="tablesList" class="ads-table-wrap"></div>
+      <section id="secTables" class="adm-section" hidden>
+        <header class="adm-page-head">
+          <div>
+            <h1>Registered tables</h1>
+            <p class="adm-page-sub">Tables users can add to chats. <em>Connector</em> tables are
+               hidden from users and auto-included through their relations.</p>
+          </div>
+          <button id="btnRegisterTable" class="adm-btn primary">＋ Register table</button>
+        </header>
+        <div id="tablesList"></div>
       </section>
 
       <!-- Refresh schedule -->
-      <section class="ads-section">
-        <div class="ads-section-header">
-          <h2>Nightly refresh</h2>
-        </div>
-        <div class="ads-schedule-row">
-          <label class="ads-check"><input type="checkbox" id="refreshEnabled" /> Enabled</label>
-          <label>Time (container-local): <input type="time" id="refreshTime" value="00:00" /></label>
-          <button id="btnSaveSchedule" class="primary small">Save</button>
-          <span id="scheduleInfo" class="ads-muted"></span>
+      <section id="secSchedule" class="adm-section" hidden>
+        <header class="adm-page-head">
+          <div>
+            <h1>Refresh schedule</h1>
+            <p class="adm-page-sub">Snapshots refresh automatically every night. A failed refresh
+               keeps the previous snapshot — chats never break.</p>
+          </div>
+        </header>
+        <div class="adm-card adm-schedule-card">
+          <label class="adm-switch-row">
+            <input type="checkbox" id="refreshEnabled" />
+            <span>Nightly refresh enabled</span>
+          </label>
+          <label class="adm-time-row">
+            <span>Run at (container-local time)</span>
+            <input type="time" id="refreshTime" value="00:00" />
+          </label>
+          <div id="scheduleInfo" class="adm-muted"></div>
+          <div class="adm-card-actions">
+            <button id="btnSaveSchedule" class="adm-btn primary">Save schedule</button>
+          </div>
         </div>
       </section>
 
-      <!-- Audit trail -->
-      <section class="ads-section">
-        <div class="ads-section-header">
-          <h2>Audit trail</h2>
-          <button id="btnToggleAudit" class="ghost small">Show</button>
-        </div>
-        <div id="auditList" class="ads-audit hidden"></div>
+      <!-- Audit log -->
+      <section id="secAudit" class="adm-section" hidden>
+        <header class="adm-page-head">
+          <div>
+            <h1>Audit log</h1>
+            <p class="adm-page-sub">Every administrative action, newest first. Credentials are
+               never written here.</p>
+          </div>
+          <button id="btnReloadAudit" class="adm-btn ghost">⟳ Reload</button>
+        </header>
+        <div id="auditList" class="adm-card"></div>
       </section>
-    </div>
-  </main>
 
-  <!-- Connection form modal (create + edit; Test works on the unsaved draft) -->
-  <div id="connModal" class="modal hidden">
-    <div class="modal-content ads-modal">
-      <div class="modal-header">
+    </main>
+  </div>
+
+  <!-- ── Connection form modal (create + edit; Test works on the unsaved draft) ── -->
+  <div id="connModal" class="adm-modal-backdrop hidden">
+    <div class="adm-modal">
+      <div class="adm-modal-head">
         <h3 id="connModalTitle">Add connection</h3>
-        <button id="closeConnModal" class="ghost">✕</button>
+        <button id="closeConnModal" class="adm-x">✕</button>
       </div>
-      <div class="modal-body ads-form">
-        <label>Name <input type="text" id="connName" placeholder="Core DWH" /></label>
-        <label>Type
-          <select id="connType"></select>
-        </label>
-        <div class="ads-form-row">
-          <label class="grow">Host <input type="text" id="connHost" placeholder="db.corp.local" /></label>
-          <label>Port <input type="number" id="connPort" /></label>
+      <div class="adm-modal-body">
+        <div class="adm-form-grid">
+          <label class="span2">Connection name
+            <input type="text" id="connName" placeholder="e.g. Core DWH" />
+          </label>
+          <label class="span2">Database type
+            <select id="connType"></select>
+          </label>
+          <label>Host
+            <input type="text" id="connHost" placeholder="db.corp.local" />
+          </label>
+          <label>Port
+            <input type="number" id="connPort" />
+          </label>
+          <label class="span2" id="connDatabaseWrap">Database
+            <input type="text" id="connDatabase" />
+          </label>
+          <label class="span2 hidden" id="connServiceWrap">Service name
+            <input type="text" id="connService" />
+          </label>
+          <label>User
+            <input type="text" id="connUser" autocomplete="off" />
+          </label>
+          <label>Password
+            <input type="password" id="connPassword" autocomplete="new-password" />
+          </label>
+          <label class="adm-check"><input type="checkbox" id="connSsl" /> SSL / Encrypt</label>
+          <label class="adm-check"><input type="checkbox" id="connTrustCert" /> Trust server certificate</label>
         </div>
-        <label id="connDatabaseWrap">Database <input type="text" id="connDatabase" /></label>
-        <label id="connServiceWrap" class="hidden">Service name <input type="text" id="connService" /></label>
-        <label>User <input type="text" id="connUser" autocomplete="off" /></label>
-        <label>Password <input type="password" id="connPassword" autocomplete="new-password" placeholder="" /></label>
-        <div class="ads-form-row">
-          <label class="ads-check"><input type="checkbox" id="connSsl" /> SSL / Encrypt</label>
-          <label class="ads-check"><input type="checkbox" id="connTrustCert" /> Trust server certificate</label>
-        </div>
-        <div id="connTestResult" class="ads-test-result hidden"></div>
+        <div id="connTestResult" class="adm-test-result hidden"></div>
       </div>
-      <div class="modal-actions">
-        <button id="btnTestConn" class="ghost">🔌 Test connection</button>
-        <div class="wizard-nav-spacer"></div>
-        <button id="btnCancelConn" class="ghost">Cancel</button>
-        <button id="btnSaveConn" class="primary">Save</button>
+      <div class="adm-modal-foot">
+        <button id="btnTestConn" class="adm-btn ghost">🔌 Test connection</button>
+        <span class="adm-spacer"></span>
+        <button id="btnCancelConn" class="adm-btn ghost">Cancel</button>
+        <button id="btnSaveConn" class="adm-btn primary">Save</button>
       </div>
     </div>
   </div>
 
-  <!-- Table registration wizard modal -->
-  <div id="tableModal" class="modal hidden">
-    <div class="modal-content ads-modal ads-table-modal">
-      <div class="modal-header">
+  <!-- ── Register / edit table: 3-step wizard ──────────────────────────── -->
+  <div id="tableModal" class="adm-modal-backdrop hidden">
+    <div class="adm-modal adm-modal-wide">
+      <div class="adm-modal-head">
         <h3 id="tableModalTitle">Register table</h3>
-        <button id="closeTableModal" class="ghost">✕</button>
+        <button id="closeTableModal" class="adm-x">✕</button>
       </div>
-      <div class="modal-body">
-        <!-- Step A: pick schema + table -->
-        <div id="twPick" class="ads-step">
-          <div class="ads-form-row">
+
+      <div class="adm-stepper">
+        <div class="adm-step-dot active" data-step="1"><span>1</span> Source</div>
+        <div class="adm-step-line"></div>
+        <div class="adm-step-dot" data-step="2"><span>2</span> Describe</div>
+        <div class="adm-step-line"></div>
+        <div class="adm-step-dot" data-step="3"><span>3</span> Confirm &amp; snapshot</div>
+      </div>
+
+      <div class="adm-modal-body">
+        <!-- Step 1: pick source table -->
+        <div id="twStep1" class="adm-wstep">
+          <p class="adm-step-hint">Choose the table (or view) to make available. Its structure and a
+             few preview rows load next — nothing is saved yet.</p>
+          <div class="adm-form-grid">
+            <label class="span2">Connection
+              <input type="text" id="twConnName" disabled />
+            </label>
             <label>Schema
               <select id="twSchema"></select>
             </label>
-            <label class="grow">Table
+            <label>Table
               <select id="twTable"></select>
             </label>
-            <button id="btnIntrospect" class="primary small">Load structure</button>
           </div>
-          <div id="twPickStatus" class="ads-muted"></div>
+          <div id="twPickStatus" class="adm-muted"></div>
         </div>
 
-        <!-- Step B: structure + preview + descriptions + settings -->
-        <div id="twDetail" class="hidden">
-          <div class="ads-form-row">
-            <label class="grow">Display name
-              <input type="text" id="twDisplayName" placeholder="clients information" />
+        <!-- Step 2: describe -->
+        <div id="twStep2" class="adm-wstep" hidden>
+          <p class="adm-step-hint">These names and descriptions are what the AI uses to understand
+             the table — write them for a colleague who has never seen this database.</p>
+          <div class="adm-form-grid">
+            <label class="span2">Display name <span class="adm-label-note">(what users see, e.g. “clients information”)</span>
+              <input type="text" id="twDisplayName" />
             </label>
-            <label class="ads-check"><input type="checkbox" id="twIsConnector" />
-              Connector (helper/join table — hidden from users, auto-included with related tables)</label>
+            <label class="span2">Table description <span class="adm-label-note">(contents + how it joins other tables)</span>
+              <textarea id="twDescription" rows="2"></textarea>
+            </label>
           </div>
-          <div id="twStats" class="ads-muted"></div>
+          <div id="twStats" class="adm-muted"></div>
 
-          <label class="ads-label">Table description (contents + how it joins to other tables)
-            <textarea id="twDescription" rows="2"></textarea>
-          </label>
-
-          <div class="ads-section-header">
-            <h4>Columns</h4>
-            <button id="btnDraftAI" class="ghost small">✨ Draft descriptions with AI</button>
+          <div class="adm-subhead">
+            <h4>Column descriptions</h4>
+            <button id="btnDraftAI" class="adm-btn ghost small">✨ Draft descriptions with AI</button>
           </div>
-          <div id="twDraftBanner" class="ads-warning hidden">
-            AI-drafted — review and confirm before saving.
+          <div id="twDraftBanner" class="adm-alert warn hidden">
+            AI-drafted — review every description before confirming. Only column
+            <em>names and types</em> were shared with the AI, never row values.
           </div>
-          <div class="ads-cols-wrap">
-            <table class="ads-cols-table">
-              <thead><tr><th>Column</th><th>Type</th><th>PK</th><th>Indexed</th><th>Description</th></tr></thead>
+          <div class="adm-table-scroll adm-cols-scroll">
+            <table class="adm-table">
+              <thead><tr><th>Column</th><th>Type</th><th>PK</th><th>Indexed</th><th style="width:50%">Description</th></tr></thead>
               <tbody id="twColsBody"></tbody>
             </table>
           </div>
 
-          <div class="ads-section-header"><h4>Preview (first rows)</h4></div>
-          <div id="twPreview" class="ads-preview-wrap"></div>
+          <details class="adm-preview-details">
+            <summary>Preview first rows</summary>
+            <div id="twPreview" class="adm-table-scroll"></div>
+          </details>
+        </div>
 
-          <div class="ads-section-header"><h4>Relations (join keys to other registered tables)</h4></div>
+        <!-- Step 3: confirm -->
+        <div id="twStep3" class="adm-wstep" hidden>
+          <div class="adm-summary" id="twSummary"></div>
+
+          <label class="adm-check adm-connector-check">
+            <input type="checkbox" id="twIsConnector" />
+            <span><strong>Connector table</strong> — a helper/dictionary table users should not pick
+            directly; it is auto-included whenever a related table is used.</span>
+          </label>
+
+          <div class="adm-subhead">
+            <h4>Relations <span class="adm-label-note">(join keys to other registered tables — lets the AI join correctly)</span></h4>
+            <button id="btnAddRelation" class="adm-btn ghost small">＋ Add relation</button>
+          </div>
           <div id="twRelations"></div>
-          <button id="btnAddRelation" class="ghost small">＋ Add relation</button>
 
-          <label class="ads-check ads-confirm">
+          <label class="adm-check adm-confirm">
             <input type="checkbox" id="twConfirm" />
-            I have reviewed the table and column descriptions
+            <span>I have reviewed the table and column descriptions</span>
           </label>
         </div>
       </div>
-      <div class="modal-actions">
-        <button id="btnCancelTable" class="ghost">Cancel</button>
-        <button id="btnSaveTable" class="primary" disabled>Save &amp; snapshot</button>
+
+      <div class="adm-modal-foot">
+        <button id="btnTwBack" class="adm-btn ghost" hidden>← Back</button>
+        <span class="adm-spacer"></span>
+        <button id="btnCancelTable" class="adm-btn ghost">Cancel</button>
+        <button id="btnTwNext" class="adm-btn primary">Next →</button>
+        <button id="btnSaveTable" class="adm-btn primary" disabled hidden>💾 Save &amp; snapshot</button>
       </div>
     </div>
   </div>
 
-  <script>
-    window.ADMIN_USER = "{{ username }}";
-  </script>
-  <script src="/static/i18n.js?v={{ ts }}"></script>
+  <!-- ── Change-password modal ─────────────────────────────────────────── -->
+  <div id="pwModal" class="adm-modal-backdrop hidden">
+    <div class="adm-modal adm-modal-narrow">
+      <div class="adm-modal-head">
+        <h3>Change password</h3>
+        <button id="closePwModal" class="adm-x">✕</button>
+      </div>
+      <div class="adm-modal-body">
+        <div class="adm-form-grid">
+          <label class="span2">Current password
+            <input type="password" id="pwCurrent" autocomplete="current-password" />
+          </label>
+          <label class="span2">New password
+            <input type="password" id="pwNew" autocomplete="new-password" />
+          </label>
+          <label class="span2">Repeat new password
+            <input type="password" id="pwNew2" autocomplete="new-password" />
+          </label>
+        </div>
+        <div id="pwError" class="adm-test-result bad hidden"></div>
+      </div>
+      <div class="adm-modal-foot">
+        <span class="adm-spacer"></span>
+        <button id="btnCancelPw" class="adm-btn ghost">Cancel</button>
+        <button id="btnSavePw" class="adm-btn primary">Change password</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/static/admin_data_sources.js?v={{ ts }}"></script>
 </body>
 </html>

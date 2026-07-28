@@ -211,6 +211,10 @@ async def lab(request: Request):
         return RedirectResponse(url="/", status_code=302)
     if request.session.get("must_change_password"):
         return RedirectResponse(url="/auth/change_password", status_code=302)
+    if AuthStore().is_admin(email):
+        # The local admin is config-only: no chats, no /lab. Mirror of the
+        # non-admin guard on /admin/data_sources.
+        return RedirectResponse(url="/admin/data_sources", status_code=302)
     log_with_sid(email, "info", "OPEN_LAB_UI")
     ts = int(time.time())
     prof = _profile_context(email)
@@ -222,10 +226,9 @@ async def lab(request: Request):
             "default_days": settings.CHAT_ACTIVE_DEFAULT_DAYS,
             "max_days": settings.CHAT_ACTIVE_MAX_DAYS,
             # is_admin stays False — it feeds the B2C Publish menu (400 by
-            # design on-prem). The local-admin "Data sources" link renders
-            # from is_local_admin instead.
+            # design on-prem). The local admin never reaches this page (the
+            # guard above sends it to /admin/data_sources).
             "is_admin": False,
-            "is_local_admin": AuthStore().is_admin(email),
             "username": email,
             "subscription_plan": "Enterprise",
             **prof,
@@ -274,7 +277,6 @@ async def open_conversation_deeplink(request: Request, conv_id: str):
             "default_days": settings.CHAT_ACTIVE_DEFAULT_DAYS,
             "max_days": settings.CHAT_ACTIVE_MAX_DAYS,
             "is_admin": False,
-            "is_local_admin": AuthStore().is_admin(email),
             "username": email,
             "subscription_plan": "Enterprise",
             "open_conv_id": conv_id,

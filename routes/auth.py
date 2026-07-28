@@ -68,6 +68,13 @@ def _public_profile(email: str) -> dict:
     }
 
 
+def _post_login_target(email: str) -> str:
+    """Where a signed-in user lands. The local admin is config-only — it goes
+    straight to the Data-sources page, never the /lab chat UI (app.py's /lab
+    route mirrors this with a redirect guard)."""
+    return "/admin/data_sources" if AuthStore().is_admin(email) else "/lab"
+
+
 # --- Auth landing + login ----------------------------------------------------
 
 def _landing(request: Request, *, error: str = None, password_error: str = None,
@@ -194,7 +201,7 @@ async def login(request: Request):
         brain_client.post_activity("login", email)
     except Exception:
         pass
-    target = "/auth/change_password" if must_change else "/lab"
+    target = "/auth/change_password" if must_change else _post_login_target(email)
     return RedirectResponse(url=target, status_code=302)
 
 
@@ -252,7 +259,7 @@ async def change_password_page(request: Request):
     if not email:
         return RedirectResponse(url="/", status_code=302)
     if not request.session.get("must_change_password"):
-        return RedirectResponse(url="/lab", status_code=302)
+        return RedirectResponse(url=_post_login_target(email), status_code=302)
     return _TEMPLATES.TemplateResponse(
         "change_password.html",
         {"request": request, "email": email, "error": None},
@@ -270,7 +277,7 @@ async def change_password_submit(request: Request):
         # Only the forced flow may set a password WITHOUT the current one —
         # that user just authenticated with the temp password. Everyone else
         # goes through /auth/password (current password verified).
-        return RedirectResponse(url="/lab", status_code=302)
+        return RedirectResponse(url=_post_login_target(email), status_code=302)
     form = await request.form()
     new_password = form.get("new_password") or ""
     confirm = form.get("confirm_password") or ""
@@ -293,7 +300,7 @@ async def change_password_submit(request: Request):
         return _page("Could not save the new password. Please try again.", 500)
     request.session.pop("must_change_password", None)
     log_with_sid(email, "info", "USER_PASSWORD_CHANGED", forced=True)
-    return RedirectResponse(url="/lab", status_code=302)
+    return RedirectResponse(url=_post_login_target(email), status_code=302)
 
 
 @router.post("/auth/logout")

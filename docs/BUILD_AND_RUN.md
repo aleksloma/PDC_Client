@@ -270,27 +270,39 @@ Prerequisites (client env, see `client.env.example`):
 
 Runbook:
 
-1. Sign in as `ladmin` → forced password change → topbar **🗄️ Data sources**
-   (`/admin/data_sources`; non-admins are redirected to `/lab`).
-2. **Add connection** → fill host/port/database/user/password (SSL toggle;
-   MSSQL also has Trust-server-certificate for self-signed certs) → **Test
-   connection** (works on the unsaved draft) → Save.
-3. **Register table** → pick schema + table → *Load structure* (columns,
-   PK/FK, indexed flags, catalog row-count/size estimates, first-rows
-   preview) → **✨ Draft descriptions with AI** (English; via the existing
-   schema-autofill brain call) → review/edit the display name (`CL_INFO` →
-   "clients information"), table description, per-column descriptions,
-   indexed flags, `is_connector` toggle, relations (join keys; pre-seeded
-   from FKs) → tick **"I have reviewed…"** (Save stays disabled until then;
-   the server independently enforces the confirm) → **Save & snapshot**.
+1. Sign in as `ladmin` → forced password change → you land directly on the
+   **Data sources** admin panel (`/admin/data_sources`). ladmin is
+   config-only: it never sees the `/lab` chat UI (`/lab` redirects admins
+   here; non-admins are redirected the other way, to `/lab`). Account
+   controls (change password / sign out) live at the bottom of the panel's
+   sidebar.
+2. **Connections** section → **＋ Add connection** → fill
+   host/port/database/user/password (SSL toggle; MSSQL also has
+   Trust-server-certificate for self-signed certs) → **Test connection**
+   (works on the unsaved draft) → Save. With zero connections the section
+   shows a 3-step getting-started hero instead of an empty table.
+3. **＋ Register table** (from a connection row or the Registered-tables
+   section) → 3-step wizard: **Source** (schema + table; *Next* loads
+   columns, PK/FK, indexed flags, catalog row-count/size estimates,
+   first-rows preview) → **Describe** (display name — `CL_INFO` → "clients
+   information" — table + per-column descriptions, **✨ Draft descriptions
+   with AI**: English, via the existing schema-autofill brain call) →
+   **Confirm & snapshot** (summary, `is_connector` toggle, relations —
+   join keys, pre-seeded from FKs — and the **"I have reviewed…"** tick;
+   Save stays disabled until then, and the server independently enforces
+   the confirm) → **Save & snapshot**.
 4. Connector tables (dictionaries/link tables) are hidden from users and
    auto-included in chats through the relations graph.
-5. **Nightly refresh** — set the time (container-local; `TZ` env var) and
-   enabled flag; per-table/-connection **⟳ Refresh now** any time. Failed
-   refreshes keep the last good snapshot; schema drift re-syncs chat metas
-   automatically (user-edited descriptions survive).
-6. The **Audit trail** section tails `DATA_ROOT/admin_audit.jsonl` (every
-   admin action, secrets scrubbed).
+5. **Refresh schedule** section — set the time (container-local; `TZ` env
+   var) and enabled flag; per-table/-connection **⟳ Refresh now** any time.
+   Failed refreshes keep the last good snapshot; schema drift re-syncs chat
+   metas automatically (user-edited descriptions survive).
+6. The **Audit log** section tails `DATA_ROOT/admin_audit.jsonl` (every
+   admin action, secrets scrubbed), newest first.
+
+Users then pick registered tables in the Create-New / Add-Data wizard via
+the compact **🗄️ Select from DB** dropdown (names only, searchable,
+scrolls past ~8 tables; connector tables never listed).
 
 ---
 

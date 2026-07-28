@@ -117,6 +117,39 @@ def test_ladmin_login_without_bootstrap_password_gets_server_hint(client, monkey
     assert b"LOCAL_ADMIN_PASSWORD" in r.content
 
 
+def test_ladmin_login_lands_on_admin_page(client):
+    """The local admin is config-only: after the password is set, login goes
+    straight to /admin/data_sources, never the /lab chat UI."""
+    local_store.AuthStore().ensure_local_admin()
+    local_store.AuthStore().set_password("ladmin", "final-pw")
+    r = client.post("/auth/login", data={"email": "ladmin", "password": "final-pw"},
+                    follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/admin/data_sources"
+
+
+def test_ladmin_forced_change_lands_on_admin_page(client):
+    """Completing the forced bootstrap change also targets the admin page."""
+    local_store.AuthStore().ensure_local_admin()
+    client.post("/auth/login", data={"email": "ladmin", "password": "boot-pw-123"},
+                follow_redirects=False)
+    r = client.post("/auth/change_password",
+                    data={"new_password": "final-pw", "confirm_password": "final-pw"},
+                    follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/admin/data_sources"
+
+
+def test_normal_user_login_still_lands_on_lab(client):
+    store = local_store.AuthStore()
+    store.ensure_user("u@x.com")
+    store.set_password("u@x.com", "user-pw")
+    r = client.post("/auth/login", data={"email": "u@x.com", "password": "user-pw"},
+                    follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/lab"
+
+
 def test_profile_exposes_is_local_admin_not_is_admin(client):
     local_store.AuthStore().ensure_local_admin()
     local_store.AuthStore().set_password("ladmin", "final-pw")

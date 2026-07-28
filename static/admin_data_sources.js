@@ -1,13 +1,16 @@
 /* Admin "Data sources" page (ladmin only).
  *
- * Deliberately independent from dashboard.js (the dashboard_view.js pattern):
- * a single IIFE, fetch + small render helpers, no framework. Talks only to
- * /api/admin/*. Credentials never render — the API returns masked rows.
+ * Standalone admin panel: single IIFE, fetch + small render helpers, no
+ * framework, no dashboard.js. Talks only to /api/admin/* and /auth/*.
+ * Credentials never render — the API returns masked rows.
  *
- * Mandatory-confirm (client side): the "Save & snapshot" button stays
- * disabled until the review checkbox is ticked, and the tick is force-cleared
- * whenever a new AI draft lands or another table is loaded. The server
- * enforces the same gate independently (confirm:true, CONFIRM_REQUIRED).
+ * Layout: sidebar nav switches four sections (connections / tables /
+ * schedule / audit); state is a full refetch after every mutation.
+ *
+ * Mandatory-confirm (client side): "Save & snapshot" stays disabled until
+ * the review checkbox is ticked, and the tick is force-cleared whenever a
+ * new AI draft lands or another table is loaded. The server enforces the
+ * same gate independently (confirm:true, CONFIRM_REQUIRED).
  */
 (function () {
   'use strict';
@@ -15,12 +18,9 @@
   const $ = (id) => document.getElementById(id);
 
   function toast(msg, isErr) {
-    // Minimal inline toast (dashboard.js's showToast lives on the /lab page).
     const t = document.createElement('div');
+    t.className = 'adm-toast' + (isErr ? ' bad' : '');
     t.textContent = msg;
-    t.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);' +
-      'background:' + (isErr ? '#991b1b' : '#0f172a') + ';color:#fff;padding:10px 18px;' +
-      'border-radius:8px;font-size:14px;z-index:9999;box-shadow:0 4px 14px rgba(0,0,0,.25)';
     document.body.appendChild(t);
     setTimeout(() => t.remove(), 4000);
   }
@@ -42,12 +42,30 @@
   let DIALECTS = [];
   let CONNECTIONS = [];
   let TABLES = [];
+  let ENCRYPTION_READY = true;
   let editingConnId = null;     // null = creating
   let editingTableId = null;    // null = registering new
   let currentIntro = null;      // last introspection result (register wizard)
   let wizardConnId = null;
+  let wizardStep = 1;
 
-  // ── Bootstrap ────────────────────────────────────────────────────────────
+  // ── Sidebar navigation ─────────────────────────────────────────────────
+  const SECTIONS = ['connections', 'tables', 'schedule', 'audit'];
+
+  function showSection(name) {
+    if (!SECTIONS.includes(name)) name = 'connections';
+    SECTIONS.forEach((s) => {
+      const sec = $('sec' + s.charAt(0).toUpperCase() + s.slice(1));
+      if (sec) sec.hidden = (s !== name);
+    });
+    document.querySelectorAll('.adm-nav-item').forEach((b) => {
+      b.classList.toggle('active', b.dataset.section === name);
+    });
+    if (name === 'audit') loadAudit();
+    if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
+  }
+
+  // ── Bootstrap ──────────────────────────────────────────────────────────
   async function loadAll() {
     const [d, c, t, s] = await Promise.all([
       api('/api/admin/dialects'), api('/api/admin/connections'),
@@ -56,48 +74,73 @@
     DIALECTS = d.data.dialects || [];
     CONNECTIONS = c.data.connections || [];
     TABLES = t.data.tables || [];
-    $('adsKeyWarning').classList.toggle('hidden', c.data.encryption_ready !== false);
+    ENCRYPTION_READY = c.data.encryption_ready !== false;
+    $('adsKeyWarning').classList.toggle('hidden', ENCRYPTION_READY);
+    ['btnAddConnection', 'btnAddConnectionHero'].forEach((id) => {
+      const b = $(id);
+      b.disabled = !ENCRYPTION_READY;
+      b.title = ENCRYPTION_READY ? '' : 'Set CLIENT_ENCRYPTION_KEY first';
+    });
+    $('navConnCount').textContent = CONNECTIONS.length || '';
+    $('navTableCount').textContent = TABLES.length || '';
     renderConnections();
     renderTables();
     renderSchedule(s.data);
   }
 
-  // ── Connections ──────────────────────────────────────────────────────────
+  // ── Connections ────────────────────────────────────────────────────────
+  function connStatusChips(c) {
+    const chips = [];
+    if (!c.password_set) chips.push('<span class="adm-chip bad">no password</span>');
+    else if (!c.password_readable) chips.push('<span class="adm-chip bad">re-enter password</span>');
+    if (c.last_test_ok === true) chips.push('<span class="adm-chip ok">test ok</span>');
+    else if (c.last_test_ok === false) chips.push('<span class="adm-chip bad">test failed</span>');
+    return chips.join(' ') || '<span class="adm-chip">not tested</span>';
+  }
+
   function renderConnections() {
     const box = $('connectionsList');
-    box.innerHTML = '';
+    const hero = $('connOnboarding');
     if (!CONNECTIONS.length) {
-      box.innerHTML = '<div class="ads-muted">No connections yet. Add one to register database tables.</div>';
+      hero.classList.remove('hidden');
+      box.innerHTML = '';
       return;
     }
-    CONNECTIONS.forEach((c) => {
-      const card = document.createElement('div');
-      card.className = 'ads-card';
+    hero.classList.add('hidden');
+    const rows = CONNECTIONS.map((c) => {
       const where = c.db_type === 'sqlite' ? '(local file)' :
-        `${esc(c.user)}@${esc(c.host)}:${esc(c.port ?? '')}/${esc(c.database || c.service_name || '')}`;
-      const pwChip = !c.password_set ? '<span class="ads-chip bad">no password</span>'
-        : (c.password_readable ? '' : '<span class="ads-chip bad">re-enter password</span>');
-      const testChip = c.last_test_ok == null ? ''
-        : (c.last_test_ok ? '<span class="ads-chip ok">test ok</span>' : '<span class="ads-chip bad">test failed</span>');
-      card.innerHTML = `
-        <div class="ads-card-title">${esc(c.name)} <span class="ads-chip">${esc(c.db_type)}</span> ${pwChip} ${testChip}</div>
-        <div class="ads-card-sub">${where} · ${c.table_count || 0} table(s)</div>
-        <div class="ads-card-actions">
-          <button class="ghost small" data-act="test">🔌 Test</button>
-          <button class="ghost small" data-act="browse">📋 Register table</button>
-          <button class="ghost small" data-act="refresh">⟳ Refresh all</button>
-          <button class="ghost small" data-act="edit">✎ Edit</button>
-          <button class="ghost small" data-act="delete">🗑 Delete</button>
-        </div>`;
-      card.querySelectorAll('button').forEach((b) => {
-        b.addEventListener('click', () => connAction(b.dataset.act, c));
-      });
-      box.appendChild(card);
+        `${esc(c.host)}:${esc(c.port ?? '')} / ${esc(c.database || c.service_name || '')}`;
+      return `
+      <tr data-cid="${esc(c.id)}">
+        <td><strong>${esc(c.name)}</strong><div class="adm-cell-sub">${esc(c.user)}</div></td>
+        <td><span class="adm-chip">${esc(c.db_type)}</span></td>
+        <td class="adm-cell-mono">${where}</td>
+        <td>${c.table_count || 0}</td>
+        <td>${connStatusChips(c)}</td>
+        <td class="adm-actions-cell">
+          <button class="adm-btn ghost small" data-act="browse">＋ Register table</button>
+          <button class="adm-icon-btn" data-act="test" title="Test connection">🔌</button>
+          <button class="adm-icon-btn" data-act="refresh" title="Refresh all snapshots on this connection">⟳</button>
+          <button class="adm-icon-btn" data-act="edit" title="Edit connection">✎</button>
+          <button class="adm-icon-btn" data-act="delete" title="Delete connection">🗑</button>
+        </td>
+      </tr>`;
+    }).join('');
+    box.innerHTML = `<div class="adm-card adm-table-scroll"><table class="adm-table">
+      <thead><tr><th>Name</th><th>Type</th><th>Server / database</th>
+      <th>Tables</th><th>Status</th><th class="adm-th-actions"></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
+    box.querySelectorAll('button').forEach((b) => {
+      const cid = b.closest('tr').dataset.cid;
+      b.addEventListener('click', () =>
+        connAction(b.dataset.act, CONNECTIONS.find((c) => c.id === cid)));
     });
   }
 
   async function connAction(act, c) {
+    if (!c) return;
     if (act === 'test') {
+      toast(`Testing "${c.name}"…`);
       const r = await api('/api/admin/connections/test', {
         method: 'POST', body: JSON.stringify({ connection_id: c.id }) });
       if (r.data.ok) toast(`Connection OK (${r.data.server_version || 'server'} · ${r.data.elapsed_ms}ms)`);
@@ -154,6 +197,7 @@
     $('connTestResult').classList.add('hidden');
     onDialectChange();
     $('connModal').classList.remove('hidden');
+    $('connName').focus();
   }
 
   function onDialectChange() {
@@ -206,31 +250,38 @@
     }
   }
 
-  // ── Registered tables ────────────────────────────────────────────────────
+  // ── Registered tables ──────────────────────────────────────────────────
   function renderTables() {
     const box = $('tablesList');
     if (!TABLES.length) {
-      box.innerHTML = '<div class="ads-muted">No tables registered yet. Use "Register table" on a connection.</div>';
+      box.innerHTML = `<div class="adm-empty">
+        <div class="adm-empty-ico">📋</div>
+        <p>No tables registered yet.</p>
+        <p class="adm-muted">${CONNECTIONS.length
+          ? 'Use “＋ Register table” to pick a table from one of your connections.'
+          : 'Add a database connection first, then register tables from it.'}</p>
+      </div>`;
       return;
     }
     const connName = (cid) => (CONNECTIONS.find((c) => c.id === cid) || {}).name || '?';
     const rows = TABLES.map((t) => `
       <tr data-tid="${esc(t.id)}">
-        <td><strong>${esc(t.display_name)}</strong>${t.is_connector ? ' <span class="ads-chip">connector</span>' : ''}</td>
-        <td>${esc(connName(t.connection_id))}</td>
-        <td>${esc([t.schema, t.table_name].filter(Boolean).join('.'))}</td>
+        <td><strong>${esc(t.display_name)}</strong>${t.is_connector
+          ? ' <span class="adm-chip conn" title="Hidden from users; auto-included via relations">connector</span>' : ''}</td>
+        <td class="adm-cell-mono">${esc(connName(t.connection_id))} · ${esc([t.schema, t.table_name].filter(Boolean).join('.'))}</td>
         <td>${t.row_count != null ? Number(t.row_count).toLocaleString() : '—'}</td>
-        <td title="${esc(t.last_refresh_error || '')}">${t.refreshed_at ? esc(t.refreshed_at) : (t.last_refresh_error ? '<span class="ads-chip bad">failed</span>' : '—')}</td>
-        <td>
-          <button class="ghost small" data-act="refresh">⟳</button>
-          <button class="ghost small" data-act="edit">✎</button>
-          <button class="ghost small" data-act="delete">🗑</button>
+        <td title="${esc(t.last_refresh_error || '')}">${t.refreshed_at ? esc(t.refreshed_at)
+          : (t.last_refresh_error ? '<span class="adm-chip bad">failed</span>' : '—')}</td>
+        <td class="adm-actions-cell">
+          <button class="adm-icon-btn" data-act="refresh" title="Refresh snapshot now">⟳</button>
+          <button class="adm-icon-btn" data-act="edit" title="Edit descriptions / relations">✎</button>
+          <button class="adm-icon-btn" data-act="delete" title="Delete registered table">🗑</button>
         </td>
       </tr>`).join('');
-    box.innerHTML = `<table class="ads-table">
-      <thead><tr><th>Display name</th><th>Connection</th><th>Source table</th>
-      <th>Rows</th><th>Data as of</th><th></th></tr></thead>
-      <tbody>${rows}</tbody></table>`;
+    box.innerHTML = `<div class="adm-card adm-table-scroll"><table class="adm-table">
+      <thead><tr><th>Display name</th><th>Source</th>
+      <th>Rows</th><th>Data as of</th><th class="adm-th-actions"></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
     box.querySelectorAll('button').forEach((b) => {
       const tid = b.closest('tr').dataset.tid;
       b.addEventListener('click', () => tableAction(b.dataset.act, tid));
@@ -262,21 +313,81 @@
     }
   }
 
-  // ── Register / edit wizard ───────────────────────────────────────────────
-  async function openTableWizard(connId, existing) {
+  // "+ Register table" from the Tables section: one connection → straight in;
+  // several → quick pick via prompt-free chooser (first connection preselected
+  // in a tiny select is overkill — use a confirm-style chooser list).
+  function registerTableEntry() {
+    if (!CONNECTIONS.length) {
+      showSection('connections');
+      toast('Add a database connection first', true);
+      return;
+    }
+    if (CONNECTIONS.length === 1) { openTableWizard(CONNECTIONS[0].id); return; }
+    // lightweight chooser: reuse the wizard's step-1 connection field as a select
+    openTableWizard(CONNECTIONS[0].id, null, true);
+  }
+
+  // ── Register / edit wizard (3 steps) ───────────────────────────────────
+  function setWizardStep(n) {
+    wizardStep = n;
+    [1, 2, 3].forEach((i) => {
+      $('twStep' + i).hidden = (i !== n);
+      const dot = document.querySelector(`.adm-step-dot[data-step="${i}"]`);
+      dot.classList.toggle('active', i === n);
+      dot.classList.toggle('done', i < n);
+    });
+    $('btnTwBack').hidden = (n === 1);
+    $('btnTwNext').hidden = (n === 3);
+    $('btnSaveTable').hidden = (n !== 3);
+    if (n === 3) renderSummary();
+  }
+
+  async function openTableWizard(connId, existing, chooseConn) {
     wizardConnId = connId;
     editingTableId = existing ? existing.id : null;
     currentIntro = null;
     $('tableModalTitle').textContent = existing
       ? `Edit table — ${existing.display_name}` : 'Register table';
-    $('twDetail').classList.add('hidden');
     $('twConfirm').checked = false;
     $('twDraftBanner').classList.add('hidden');
     updateSaveEnabled();
-    $('twPickStatus').textContent = 'Loading schemas…';
+    setWizardStep(1);
     $('tableModal').classList.remove('hidden');
 
-    const r = await api(`/api/admin/connections/${connId}/schemas`);
+    // Connection field: fixed label normally; a select when the entry point
+    // didn't come from a specific connection row.
+    const connField = $('twConnName');
+    if (chooseConn) {
+      const sel = document.createElement('select');
+      sel.id = 'twConnName';
+      CONNECTIONS.forEach((c) => {
+        const o = document.createElement('option');
+        o.value = c.id; o.textContent = c.name;
+        sel.appendChild(o);
+      });
+      sel.value = connId;
+      sel.onchange = async () => { wizardConnId = sel.value; await loadSchemas(null); };
+      connField.replaceWith(sel);
+    } else if (connField.tagName === 'SELECT') {
+      const inp = document.createElement('input');
+      inp.type = 'text'; inp.id = 'twConnName'; inp.disabled = true;
+      connField.replaceWith(inp);
+    }
+    const cf = $('twConnName');
+    if (cf.tagName === 'INPUT') {
+      cf.value = (CONNECTIONS.find((c) => c.id === connId) || {}).name || '';
+    }
+
+    await loadSchemas(existing);
+    if (existing) {
+      $('twTable').value = existing.table_name;
+      await introspectNow(existing, { advance: false });
+    }
+  }
+
+  async function loadSchemas(existing) {
+    $('twPickStatus').textContent = 'Loading schemas…';
+    const r = await api(`/api/admin/connections/${wizardConnId}/schemas`);
     const schemas = r.data.schemas || [];
     const sel = $('twSchema');
     sel.innerHTML = '';
@@ -289,10 +400,6 @@
     else if (r.data.default_schema) sel.value = r.data.default_schema;
     sel.onchange = loadTableNames;
     await loadTableNames();
-    if (existing) {
-      $('twTable').value = existing.table_name;
-      await introspectNow(existing);
-    }
     $('twPickStatus').textContent = r.data.ok === false ? (r.data.error || 'Failed to list schemas') : '';
   }
 
@@ -308,23 +415,25 @@
     });
   }
 
-  async function introspectNow(existing) {
-    $('twPickStatus').textContent = 'Introspecting…';
+  async function introspectNow(existing, opts) {
+    const advance = !opts || opts.advance !== false;
+    $('twPickStatus').textContent = 'Loading table structure…';
+    $('btnTwNext').disabled = true;
     const r = await api('/api/admin/tables/introspect', {
       method: 'POST',
       body: JSON.stringify({ connection_id: wizardConnId,
         schema: $('twSchema').value, table: $('twTable').value }),
     });
+    $('btnTwNext').disabled = false;
     if (!r.data.ok) {
       $('twPickStatus').textContent = r.data.error || 'Introspection failed';
-      return;
+      return false;
     }
     $('twPickStatus').textContent = '';
     currentIntro = r.data.introspection;
     const prevByName = {};
     (existing && existing.columns || []).forEach((c) => { prevByName[c.name] = c; });
 
-    $('twDetail').classList.remove('hidden');
     $('twDisplayName').value = existing ? existing.display_name
       : $('twTable').value.toLowerCase().replace(/_/g, ' ');
     $('twIsConnector').checked = existing ? !!existing.is_connector : false;
@@ -346,7 +455,7 @@
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td>${esc(c.name)}</td>
-        <td class="ads-muted">${esc(c.dtype)}</td>
+        <td class="adm-muted">${esc(c.dtype)}</td>
         <td>${c.pk ? '🔑' : ''}</td>
         <td><input type="checkbox" class="tw-col-indexed" ${ (prev.indexed != null ? prev.indexed : c.indexed) ? 'checked' : ''}></td>
         <td><input type="text" class="tw-col-desc" value="${esc(prev.description || '')}"></td>`;
@@ -359,17 +468,47 @@
     const prevW = $('twPreview');
     const p = r.data.preview || {};
     if (p.ok && (p.rows || []).length) {
-      prevW.innerHTML = `<table class="ads-preview-table"><thead><tr>${
+      prevW.innerHTML = `<table class="adm-table"><thead><tr>${
         (p.columns || []).map((c) => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${
         p.rows.map((row) => `<tr>${row.map((v) => `<td>${esc(v)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
     } else {
-      prevW.innerHTML = `<div class="ads-muted">${esc(p.error || 'No preview rows.')}</div>`;
+      prevW.innerHTML = `<div class="adm-muted">${esc(p.error || 'No preview rows.')}</div>`;
     }
 
     renderRelations(existing ? (existing.relations || []) : seedRelationsFromFks());
     $('twConfirm').checked = false;
     $('twDraftBanner').classList.add('hidden');
     updateSaveEnabled();
+    if (advance) setWizardStep(2);
+    return true;
+  }
+
+  function wizardNext() {
+    if (wizardStep === 1) {
+      introspectNow(editingTableId ? TABLES.find((t) => t.id === editingTableId) : null);
+    } else if (wizardStep === 2) {
+      if (!$('twDisplayName').value.trim()) {
+        toast('Give the table a display name', true);
+        $('twDisplayName').focus();
+        return;
+      }
+      setWizardStep(3);
+    }
+  }
+
+  function renderSummary() {
+    if (!currentIntro) { $('twSummary').innerHTML = ''; return; }
+    const rc = currentIntro.row_count_estimate;
+    const connName = (CONNECTIONS.find((c) => c.id === wizardConnId) || {}).name || '';
+    const described = document.querySelectorAll('#twColsBody .tw-col-desc');
+    const filled = Array.from(described).filter((i) => i.value.trim()).length;
+    $('twSummary').innerHTML = `
+      <div class="adm-summary-row"><span>Display name</span><strong>${esc($('twDisplayName').value)}</strong></div>
+      <div class="adm-summary-row"><span>Source</span><strong>${esc(connName)} · ${esc($('twSchema').value)}.${esc($('twTable').value)}</strong></div>
+      <div class="adm-summary-row"><span>Rows (estimate)</span><strong>${rc != null ? Number(rc).toLocaleString() : 'n/a'}</strong></div>
+      <div class="adm-summary-row"><span>Column descriptions</span><strong>${filled} of ${described.length} filled</strong></div>
+      <div class="adm-summary-note">Saving takes a local snapshot now — user questions run against
+        the snapshot, never against your database.</div>`;
   }
 
   // Pre-seed the relations editor from the introspected FKs when the referred
@@ -397,7 +536,7 @@
   function addRelationRow(rel) {
     const box = $('twRelations');
     const row = document.createElement('div');
-    row.className = 'ads-rel-row';
+    row.className = 'adm-rel-row';
     const options = TABLES
       .filter((t) => t.id !== editingTableId)
       .map((t) => `<option value="${esc(t.id)}" ${rel && rel.related_table_id === t.id ? 'selected' : ''}>${esc(t.display_name)}</option>`)
@@ -409,14 +548,14 @@
       <select class="tw-rel-target"><option value="">— pick table —</option>${options}</select>
       <span>on</span>
       <input type="text" class="tw-rel-keys" placeholder="my_col=their_col, …" value="${esc(pairs)}">
-      <button type="button" class="ghost small tw-rel-remove">×</button>`;
+      <button type="button" class="adm-icon-btn tw-rel-remove" title="Remove relation">×</button>`;
     row.querySelector('.tw-rel-remove').addEventListener('click', () => row.remove());
     box.appendChild(row);
   }
 
   function collectRelations() {
     const rels = [];
-    document.querySelectorAll('#twRelations .ads-rel-row').forEach((row) => {
+    document.querySelectorAll('#twRelations .adm-rel-row').forEach((row) => {
       const target = row.querySelector('.tw-rel-target').value;
       if (!target) return;
       const pairs = row.querySelector('.tw-rel-keys').value.split(',')
@@ -486,10 +625,10 @@
     $('btnSaveTable').textContent = 'Snapshotting…';
     const path = editingTableId ? `/api/admin/tables/${editingTableId}` : '/api/admin/tables';
     const r = await api(path, { method: 'POST', body: JSON.stringify(body) });
-    $('btnSaveTable').textContent = 'Save & snapshot';
+    $('btnSaveTable').textContent = '💾 Save & snapshot';
     updateSaveEnabled();
     if (r.status === 409) {
-      toast(r.data.error || 'Table structure changed — re-run introspect.', true);
+      toast(r.data.error || 'Table structure changed — go back and reload the structure.', true);
       return;
     }
     if (!(r.status === 200 || r.status === 201)) {
@@ -506,13 +645,13 @@
     loadAll();
   }
 
-  // ── Schedule + audit ─────────────────────────────────────────────────────
+  // ── Schedule ───────────────────────────────────────────────────────────
   function renderSchedule(s) {
     $('refreshEnabled').checked = !!s.refresh_enabled;
     $('refreshTime').value = s.refresh_time || '00:00';
     const bits = [];
-    if (s.next_run_at) bits.push(`next run: ${s.next_run_at}`);
-    if (s.last_run_at) bits.push(`last run: ${s.last_run_at}`);
+    if (s.next_run_at) bits.push(`Next run: ${s.next_run_at}`);
+    if (s.last_run_at) bits.push(`Last run: ${s.last_run_at}`);
     $('scheduleInfo').textContent = bits.join(' · ');
   }
 
@@ -526,38 +665,101 @@
     else toast(r.data.error || 'Save failed', true);
   }
 
-  async function toggleAudit() {
+  // ── Audit ──────────────────────────────────────────────────────────────
+  async function loadAudit() {
     const box = $('auditList');
-    const showing = !box.classList.contains('hidden');
-    if (showing) { box.classList.add('hidden'); $('btnToggleAudit').textContent = 'Show'; return; }
+    box.innerHTML = '<div class="adm-muted" style="padding:14px">Loading…</div>';
     const r = await api('/api/admin/audit?limit=200');
-    box.innerHTML = (r.data.rows || []).map((row) =>
-      `<div class="row ${row.ok === false ? 'bad' : ''}">${esc(row.ts)} · ${esc(row.actor)} · ${esc(row.action)}${row.target ? ' · ' + esc(row.target) : ''}</div>`
-    ).join('') || '<div class="row">No audit entries yet.</div>';
-    box.classList.remove('hidden');
-    $('btnToggleAudit').textContent = 'Hide';
+    const rows = (r.data.rows || []).slice().reverse();
+    if (!rows.length) {
+      box.innerHTML = '<div class="adm-muted" style="padding:14px">No audit entries yet.</div>';
+      return;
+    }
+    box.innerHTML = `<div class="adm-table-scroll"><table class="adm-table adm-audit-table">
+      <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th></th></tr></thead>
+      <tbody>${rows.map((row) => `
+        <tr class="${row.ok === false ? 'adm-row-bad' : ''}">
+          <td class="adm-cell-mono">${esc(row.ts)}</td>
+          <td>${esc(row.actor)}</td>
+          <td>${esc(row.action)}</td>
+          <td class="adm-cell-mono">${esc(row.target || '')}</td>
+          <td>${row.ok === false ? '<span class="adm-chip bad">failed</span>' : ''}</td>
+        </tr>`).join('')}</tbody></table></div>`;
   }
 
-  // ── Wire-up ──────────────────────────────────────────────────────────────
+  // ── Account (sidebar footer) ───────────────────────────────────────────
+  async function logout() {
+    try { await fetch('/auth/logout', { method: 'POST' }); } catch (e) { /* ignore */ }
+    window.location.href = '/';
+  }
+
+  function openPwModal() {
+    ['pwCurrent', 'pwNew', 'pwNew2'].forEach((id) => { $(id).value = ''; });
+    $('pwError').classList.add('hidden');
+    $('pwModal').classList.remove('hidden');
+    $('pwCurrent').focus();
+  }
+
+  async function savePassword() {
+    const err = $('pwError');
+    err.classList.add('hidden');
+    if ($('pwNew').value.length < 4) {
+      err.textContent = 'Password must be at least 4 characters';
+      err.classList.remove('hidden');
+      return;
+    }
+    if ($('pwNew').value !== $('pwNew2').value) {
+      err.textContent = 'Passwords do not match';
+      err.classList.remove('hidden');
+      return;
+    }
+    const r = await api('/auth/password', {
+      method: 'POST',
+      body: JSON.stringify({ current_password: $('pwCurrent').value,
+        new_password: $('pwNew').value }),
+    });
+    if (r.ok) {
+      $('pwModal').classList.add('hidden');
+      toast('Password changed');
+    } else {
+      err.textContent = r.data.error || 'Could not change the password';
+      err.classList.remove('hidden');
+    }
+  }
+
+  // ── Wire-up ────────────────────────────────────────────────────────────
   document.addEventListener('DOMContentLoaded', () => {
-    if (window.i18n && window.i18n.init) { try { window.i18n.init(); } catch (e) {} }
+    document.querySelectorAll('.adm-nav-item').forEach((b) => {
+      b.addEventListener('click', () => showSection(b.dataset.section));
+    });
+    showSection((location.hash || '').replace('#', ''));
+
     $('btnAddConnection').addEventListener('click', () => openConnModal(null));
+    $('btnAddConnectionHero').addEventListener('click', () => openConnModal(null));
     $('closeConnModal').addEventListener('click', () => $('connModal').classList.add('hidden'));
     $('btnCancelConn').addEventListener('click', () => $('connModal').classList.add('hidden'));
     $('btnTestConn').addEventListener('click', testConnDraft);
     $('btnSaveConn').addEventListener('click', saveConn);
     $('connType').addEventListener('change', onDialectChange);
 
+    $('btnRegisterTable').addEventListener('click', registerTableEntry);
     $('closeTableModal').addEventListener('click', () => $('tableModal').classList.add('hidden'));
     $('btnCancelTable').addEventListener('click', () => $('tableModal').classList.add('hidden'));
-    $('btnIntrospect').addEventListener('click', () => introspectNow(null));
+    $('btnTwBack').addEventListener('click', () => setWizardStep(wizardStep - 1));
+    $('btnTwNext').addEventListener('click', wizardNext);
     $('btnDraftAI').addEventListener('click', draftWithAI);
     $('btnAddRelation').addEventListener('click', () => addRelationRow(null));
     $('twConfirm').addEventListener('change', updateSaveEnabled);
     $('btnSaveTable').addEventListener('click', saveTable);
 
     $('btnSaveSchedule').addEventListener('click', saveSchedule);
-    $('btnToggleAudit').addEventListener('click', toggleAudit);
+    $('btnReloadAudit').addEventListener('click', loadAudit);
+
+    $('btnAdmLogout').addEventListener('click', logout);
+    $('btnAdmChangePw').addEventListener('click', openPwModal);
+    $('closePwModal').addEventListener('click', () => $('pwModal').classList.add('hidden'));
+    $('btnCancelPw').addEventListener('click', () => $('pwModal').classList.add('hidden'));
+    $('btnSavePw').addEventListener('click', savePassword);
 
     loadAll();
   });

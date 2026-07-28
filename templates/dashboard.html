@@ -97,9 +97,6 @@
           </div>
           <button id="btnAddData" class="ghost small top-action-btn hidden" data-i18n="lab.add_data">➕ Add Data</button>
           <button id="btnSchema" class="ghost small top-action-btn hidden" data-i18n="lab.view_schema">View / Edit Descriptions</button>
-          {% if is_local_admin %}
-          <a id="btnDataSources" href="/admin/data_sources" class="ghost small top-action-btn" data-i18n="lab.data_sources">🗄️ Data sources</a>
-          {% endif %}
           {% include 'partials/profile_button.html' %}
         </div>
       </div>
@@ -171,6 +168,24 @@
               📎 Share Google Sheet
             </button>
 
+            <!-- Database tables (admin-registered; non-connector only). Hidden
+                 unless the server has registered tables. A compact checkbox
+                 dropdown (Excel-filter style): names only, scrolls past ~8
+                 rows. Checked tables join selectedFiles as {_isDbTable}
+                 items — files and DB tables mix freely in one chat. -->
+            <span id="dbSelectDivider" class="upload-divider hidden" data-i18n="wizard.or">or</span>
+            <div id="dbSelectWrap" class="db-select-wrap hidden">
+              <button type="button" id="dbSelectBtn" class="db-select-btn">
+                🗄️ <span id="dbSelectLabel" data-i18n="wizard.db_select">Select from DB</span><span id="dbSelectCount" class="db-select-count hidden"></span>
+                <span class="db-select-caret">▾</span>
+              </button>
+              <div id="dbSelectPanel" class="db-select-panel hidden">
+                <input type="text" id="dbTableSearch" class="db-table-search"
+                       placeholder="Search tables…" data-i18n-placeholder="wizard.db_tables_search" />
+                <div id="dbTableList" class="db-table-list"></div>
+              </div>
+            </div>
+
             <span class="upload-divider" data-i18n="wizard.or_drop">or drop here</span>
           </div>
 
@@ -187,19 +202,6 @@
 
           <!-- Selected files list (filename + remove icon, no description input) -->
           <div id="selectedFilesList" class="selected-files-list"></div>
-
-          <!-- Database tables (admin-registered; non-connector only). Hidden
-               unless the server has registered tables. Selected tables join
-               selectedFiles as {_isDbTable} items — files and DB tables mix
-               freely in one chat. -->
-          <div id="dbTablesSection" class="db-tables-section hidden">
-            <div class="db-tables-header">
-              <span class="db-tables-title" data-i18n="wizard.db_tables_title">🗄️ Add database tables</span>
-              <input type="text" id="dbTableSearch" class="db-table-search"
-                     placeholder="Search tables…" data-i18n-placeholder="wizard.db_tables_search" />
-            </div>
-            <div id="dbTableList" class="db-table-list"></div>
-          </div>
         </div>
       </div>
 
