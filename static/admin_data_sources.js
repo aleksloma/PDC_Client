@@ -30,6 +30,16 @@
       (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
   }
 
+  // Busy overlay for DB round-trips (snapshot / refresh / test) — large
+  // tables can take a while and the page must never look dead meanwhile.
+  function _busy(msg) {
+    $('admBusyMsg').textContent = msg || 'Working…';
+    $('admBusy').classList.remove('hidden');
+  }
+  function _busyDone() {
+    $('admBusy').classList.add('hidden');
+  }
+
   async function api(path, opts) {
     const res = await fetch(path, Object.assign({
       headers: { 'Content-Type': 'application/json' },
@@ -140,17 +150,23 @@
   async function connAction(act, c) {
     if (!c) return;
     if (act === 'test') {
-      toast(`Testing "${c.name}"…`);
-      const r = await api('/api/admin/connections/test', {
-        method: 'POST', body: JSON.stringify({ connection_id: c.id }) });
+      _busy(`Testing connection "${c.name}"…`);
+      let r;
+      try {
+        r = await api('/api/admin/connections/test', {
+          method: 'POST', body: JSON.stringify({ connection_id: c.id }) });
+      } finally { _busyDone(); }
       if (r.data.ok) toast(`Connection OK (${r.data.server_version || 'server'} · ${r.data.elapsed_ms}ms)`);
       else toast(r.data.error || 'Connection failed', true);
       loadAll();
     } else if (act === 'browse') {
       openTableWizard(c.id);
     } else if (act === 'refresh') {
-      toast('Refreshing all tables on this connection…');
-      const r = await api(`/api/admin/connections/${c.id}/refresh`, { method: 'POST', body: '{}' });
+      _busy(`Refreshing all tables on "${c.name}"… large tables can take a while.`);
+      let r;
+      try {
+        r = await api(`/api/admin/connections/${c.id}/refresh`, { method: 'POST', body: '{}' });
+      } finally { _busyDone(); }
       const results = r.data.results || [];
       const bad = results.filter((x) => !x.ok);
       toast(bad.length ? `Refreshed with ${bad.length} failure(s)` : `Refreshed ${results.length} table(s)`, !!bad.length);
@@ -292,8 +308,11 @@
     const t = TABLES.find((x) => x.id === tid);
     if (!t) return;
     if (act === 'refresh') {
-      toast(`Refreshing "${t.display_name}"…`);
-      const r = await api(`/api/admin/tables/${tid}/refresh`, { method: 'POST', body: '{}' });
+      _busy(`Refreshing "${t.display_name}"… large tables can take a while.`);
+      let r;
+      try {
+        r = await api(`/api/admin/tables/${tid}/refresh`, { method: 'POST', body: '{}' });
+      } finally { _busyDone(); }
       if (r.data.ok) {
         const d = r.data.drift || {};
         const driftNote = (d.added || []).length || (d.removed || []).length
@@ -623,8 +642,12 @@
     };
     $('btnSaveTable').disabled = true;
     $('btnSaveTable').textContent = 'Snapshotting…';
+    _busy(`Saving "${body.display_name}" and taking a snapshot… large tables can take a while.`);
     const path = editingTableId ? `/api/admin/tables/${editingTableId}` : '/api/admin/tables';
-    const r = await api(path, { method: 'POST', body: JSON.stringify(body) });
+    let r;
+    try {
+      r = await api(path, { method: 'POST', body: JSON.stringify(body) });
+    } finally { _busyDone(); }
     $('btnSaveTable').textContent = '💾 Save & snapshot';
     updateSaveEnabled();
     if (r.status === 409) {

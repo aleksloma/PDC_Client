@@ -323,6 +323,16 @@
     </div>
   </div>
 
+  <!-- Busy overlay for operations that hit the customer DB (snapshot /
+       refresh / test) — large tables can take a while; the page must never
+       look dead during them. -->
+  <div id="admBusy" class="adm-busy-backdrop hidden">
+    <div class="adm-busy-card">
+      <div class="adm-spinner"></div>
+      <div id="admBusyMsg">Working…</div>
+    </div>
+  </div>
+
   <script src="/static/admin_data_sources.js?v={{ ts }}"></script>
 </body>
 </html>

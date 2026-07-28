@@ -11,8 +11,10 @@ of a stack trace.
 """
 from __future__ import annotations
 
+import atexit
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 import httpx
@@ -265,10 +267,18 @@ def health() -> bool:
         return False
 
 
-def post_activity(event: str, user_email: str, metadata: dict | None = None) -> dict:
-    """Centralized activity log. Brain stores in tenants/{id}/activity.jsonl."""
+# Activity posts run on a single background worker: several call sites sit in
+# async handlers (login, chat SSE, report, upload), and a synchronous brain
+# call there blocks uvicorn's whole event loop — a slow /v1/activity response
+# froze the entire platform for its duration. One worker keeps events ordered;
+# telemetry may lag, requests never do.
+_ACTIVITY_EXEC = ThreadPoolExecutor(max_workers=1, thread_name_prefix="activity")
+atexit.register(lambda: _ACTIVITY_EXEC.shutdown(wait=False, cancel_futures=True))
+
+
+def _post_activity_sync(event: str, user_email: str, metadata: dict | None) -> None:
     try:
-        return _post("/v1/activity", {
+        _post("/v1/activity", {
             "event": event,
             "user_email": user_email,
             "metadata": metadata or {},
@@ -276,7 +286,17 @@ def post_activity(event: str, user_email: str, metadata: dict | None = None) -> 
     except Exception as e:
         # Activity logging must never break the user flow
         log_with_sid(user_email or "—", "warning", f"ACTIVITY_POST_FAILED event={event}: {e}")
+
+
+def post_activity(event: str, user_email: str, metadata: dict | None = None) -> dict:
+    """Centralized activity log (fire-and-forget — see _ACTIVITY_EXEC above).
+    Brain stores in tenants/{id}/activity.jsonl."""
+    try:
+        _ACTIVITY_EXEC.submit(_post_activity_sync, event, user_email, metadata)
+    except Exception as e:   # interpreter shutdown — nothing to do
+        log_with_sid(user_email or "—", "warning", f"ACTIVITY_QUEUE_FAILED event={event}: {e}")
         return {"ok": False}
+    return {"ok": True, "queued": True}
 
 
 def get_app_settings() -> dict:
