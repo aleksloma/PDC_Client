@@ -929,6 +929,10 @@ function setupEventListeners() {
 
   // Create New button
   document.getElementById('btnCreateNew').addEventListener('click', openCreateWizard);
+
+  // Warm the Select-from-DB cache so the wizard button renders instantly on
+  // first open (on slow storage the round trip takes seconds).
+  _fetchDbTables();
   
   // Profile icon dropdown
   const profileIconBtn = document.getElementById('btnProfileIcon');
@@ -3426,33 +3430,58 @@ function openCreateWizard() {
 // as {name, _isDbTable: true, _tableId} (the Google-Sheet no-File precedent),
 // so the shared render/validation/removal paths need almost no changes and DB
 // tables + uploaded files mix freely in one chat.
-let _dbTablesCache = null;   // last fetched /api/db_tables list (this wizard open)
+// CACHE-FIRST: the list is prefetched once at page load; every wizard open
+// renders the button instantly from the last successful fetch and refreshes in
+// the background. Waiting for the round trip made the button pop in seconds
+// late on slow storage (the GCS-fuse-backed Cloud Run demo). Only when no
+// fetch has ever succeeded does the button stay hidden until a 200 arrives.
+let _dbTablesCache = null;   // last successful /api/db_tables list (null = never fetched OK)
 let _dbPanelWired = false;   // one-time document-level open/close wiring
 
-async function _loadDbTablesList() {
-  const wrap = document.getElementById('dbSelectWrap');
-  const list = document.getElementById('dbTableList');
-  if (!wrap || !list) return;
-  wrap.classList.add('hidden');
-  document.getElementById('dbSelectDivider')?.classList.add('hidden');
-  _closeDbPanel();
-  list.innerHTML = '';
+async function _fetchDbTables() {
+  // → true on a 200 (cache updated), false otherwise (cache untouched).
   try {
     const res = await fetch('/api/db_tables');
-    if (!res.ok) return;                       // endpoint error → button stays hidden
+    if (!res.ok) return false;
     const data = await res.json();
     _dbTablesCache = data.tables || [];
+    return true;
   } catch (e) {
-    return;                                    // fetch failure → button stays hidden
+    return false;
   }
+}
+
+function _showDbSelect() {
   // Zero registered tables still shows the button — the panel renders an
   // "ask your administrator" empty state so the feature is discoverable.
-  wrap.classList.remove('hidden');
+  document.getElementById('dbSelectWrap')?.classList.remove('hidden');
   document.getElementById('dbSelectDivider')?.classList.remove('hidden');
   _renderDbTableList();
   const search = document.getElementById('dbTableSearch');
   if (search) { search.value = ''; search.oninput = () => _renderDbTableList(); }
   _wireDbPanel();
+}
+
+async function _loadDbTablesList() {
+  const wrap = document.getElementById('dbSelectWrap');
+  const list = document.getElementById('dbTableList');
+  if (!wrap || !list) return;
+  _closeDbPanel();
+  if (_dbTablesCache !== null) {
+    // Cache-first: show instantly, refresh behind it. A failed refresh keeps
+    // the cached render — /session/db_tables re-validates ids server-side, so
+    // a stale name is benign; a vanishing button is not.
+    _showDbSelect();
+    _fetchDbTables().then((ok) => { if (ok) _renderDbTableList(); });
+    return;
+  }
+  // Never fetched successfully yet (first open racing the page-load prefetch,
+  // or the endpoint is down): hidden until a 200 arrives — endpoint failure
+  // keeps the button hidden by design.
+  wrap.classList.add('hidden');
+  document.getElementById('dbSelectDivider')?.classList.add('hidden');
+  list.innerHTML = '';
+  if (await _fetchDbTables()) _showDbSelect();
 }
 
 function _wireDbPanel() {

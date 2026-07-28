@@ -53,8 +53,12 @@ async def new_session(request: Request):
     # Rotate sid → cleanest reset
     new_sid = "s_" + secrets.token_hex(8)
     request.session["sid"] = new_sid
-    # Also wipe any stale UserStore folder at the previous sid
-    UserStore(new_sid).reset_all()
+    # Also wipe any stale UserStore folder at the previous sid — off the event
+    # loop, INCLUDING the constructor (its _ensure_layout does mkdirs + a
+    # write): these syscalls block every concurrent request on slow storage
+    # (each one is a network RPC on the GCS-fuse-mounted demo volume).
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(_EXEC, lambda: UserStore(new_sid).reset_all())
     log_with_sid(email, "info", "NEW_SESSION_RESET", sid=new_sid)
     return {"ok": True}
 
@@ -694,7 +698,11 @@ async def api_db_tables(request: Request):
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
     try:
         from db_sources import DataSourceStore
-        rows = DataSourceStore().list_tables(include_connector=False)
+        # Off the event loop: the registry read is disk I/O (a network round
+        # trip per syscall on the GCS-fuse-mounted demo volume).
+        loop = asyncio.get_running_loop()
+        rows = await loop.run_in_executor(
+            _EXEC, lambda: DataSourceStore().list_tables(include_connector=False))
     except Exception as e:
         log_with_sid(email, "warning", f"DB_TABLES_LIST_FAILED: {e}")
         rows = []
