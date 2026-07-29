@@ -570,8 +570,11 @@ _CATEGORY_MAX_RATIO = 0.5
 def _compute_dtype_plan(chunk: pd.DataFrame) -> dict:
     """From the FIRST chunk, decide per-column optimization: numeric downcast
     (applied on write — pins the Arrow schema across chunks) and 'category'
-    for low-cardinality strings (applied by the LOADER after read_parquet —
-    writing per-chunk categoricals would produce unstable Arrow schemas)."""
+    for low-cardinality strings. Category entries are RECORDED ONLY — neither
+    baked into the file (per-chunk categoricals destabilize the Arrow schema)
+    nor applied by the loader: categorical frames make generated groupby code
+    (pandas < 3.0 observed=False default) emit the full cartesian product of
+    ALL categories, which once put every city/product on a chart axis."""
     plan: dict[str, str] = {}
     n = max(1, len(chunk))
     for col in chunk.columns:
@@ -609,20 +612,6 @@ def _apply_numeric_plan(chunk: pd.DataFrame, plan: dict) -> pd.DataFrame:
             log_with_sid("db_snapshot", "warning", f"DB_SNAPSHOT_DTYPE_RELAXED col={col}")
             plan.pop(col, None)
     return chunk
-
-
-def apply_category_plan(df: pd.DataFrame, plan: Optional[dict]) -> pd.DataFrame:
-    """Loader-side half of the dtype optimization: re-apply 'category' entries
-    after pd.read_parquet. Never raises."""
-    if not plan:
-        return df
-    for col, dtype in plan.items():
-        if dtype == "category" and col in df.columns:
-            try:
-                df[col] = df[col].astype("category")
-            except Exception:
-                pass
-    return df
 
 
 def snapshot_table(cfg: dict, password: str, *, schema: Optional[str], table: str,

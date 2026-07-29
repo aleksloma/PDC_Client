@@ -134,14 +134,13 @@ def test_snapshot_dtype_plan_stable_across_chunks(sqlite_cfg, tmp_path):
                                       dest=dest, sid="t", chunk_rows=2)
     assert res["ok"] is True
     plan = res["dtype_plan"]
-    # Low-cardinality string column planned as category (loader-side);
+    # Low-cardinality string column recorded as category (metadata only —
+    # never baked into the file, never applied by the loader);
     # numerics downcast (writer-side).
     assert plan.get("segment") == "category"
     assert plan.get("order_id", "").startswith("int")
     df = pd.read_parquet(dest)
     assert str(df["segment"].dtype) != "category"  # not baked into the file
-    df2 = db_connector.apply_category_plan(df, plan)
-    assert str(df2["segment"].dtype) == "category"
     # A refresh reusing the stored plan stays stable.
     res2 = db_connector.snapshot_table(sqlite_cfg, "", schema=None, table="orders",
                                        dest=dest, sid="t", chunk_rows=2,

@@ -76,7 +76,10 @@ action.
    (related table + join keys), per-column indexed flag (pre-filled from
    introspection, overridable). Row count + size auto-captured and shown.
 5. On save, snapshot the table to parquet (chunked `pd.read_sql`, statement
-   timeout, dtype optimization: category strings, downcast numerics).
+   timeout, dtype optimization: downcast numerics on write; low-cardinality
+   string columns are recorded in the plan as `category` but served as plain
+   `object` — categorical frames break generated `groupby` code, which
+   defaults to `observed=False` on pandas < 3.0).
 
 ## Connector tables and relations
 

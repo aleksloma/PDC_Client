@@ -533,25 +533,19 @@ def _db_signature(db_entries) -> tuple:
     return tuple(sig)
 
 
-def _db_dtype_plans() -> dict:
-    """{table_id: dtype_plan} from the registry — the loader-side half of the
-    snapshot dtype optimization (category strings are re-applied after
-    read_parquet; writing them per-chunk would destabilize the Arrow schema).
-    Lazy import: db_sources imports this module at module level."""
-    try:
-        from db_sources import DataSourceStore
-        return {t.get("id"): t.get("dtype_plan") for t in DataSourceStore().list_tables()}
-    except Exception:
-        return {}
-
-
 def _load_db_snapshots(db_entries: list, owner: str) -> dict[str, pd.DataFrame]:
     """Read each entry's central snapshot parquet, keyed by display name.
     A missing/unreadable snapshot is SKIPPED (logged) — the chat still answers
     on its remaining frames (Article IV); the frontend's key-freeze machinery
-    disables items that referenced the vanished key."""
+    disables items that referenced the vanished key.
+
+    String columns are served as plain object dtype — the registry's
+    dtype_plan 'category' entries are deliberately NOT applied here: pandas
+    (< 3.0) groupby on categoricals defaults to observed=False, so generated
+    code grouping by a dimension column would emit the full cartesian product
+    of ALL categories (every city × every product, mostly NaN) and plotly
+    would put every category on the axis."""
     out: dict[str, pd.DataFrame] = {}
-    plans = None
     for entry in db_entries or []:
         key = entry.get("file_name")
         tid = (entry.get("db") or {}).get("table_id")
@@ -566,15 +560,7 @@ def _load_db_snapshots(db_entries: list, owner: str) -> dict[str, pd.DataFrame]:
             log_with_sid(owner, "warning", f"DB_SNAPSHOT_MISSING table={tid} key={key}")
             continue
         try:
-            df = pd.read_parquet(path)
-            if plans is None:
-                plans = _db_dtype_plans()
-            try:
-                from db_connector import apply_category_plan
-                df = apply_category_plan(df, plans.get(tid))
-            except Exception:
-                pass
-            out[key] = df
+            out[key] = pd.read_parquet(path)
         except Exception as e:
             log_with_sid(owner, "warning", f"DB_SNAPSHOT_LOAD_FAILED table={tid}: {e}")
     return out

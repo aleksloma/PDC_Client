@@ -4,6 +4,7 @@ snapshot degradation, and zero regression for file-only chats."""
 import json
 import os
 import time
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -123,13 +124,25 @@ def test_snapshot_never_enters_parquet_cache():
     assert not (local_store.db_snapshot_path(TID).parent / ".parquet_cache").exists()
 
 
-def test_category_dtype_plan_applied_on_load(monkeypatch):
-    _write_snapshot(TID, pd.DataFrame({"seg": ["a", "b", "a"]}))
-    monkeypatch.setattr(local_store, "_db_dtype_plans",
-                        lambda: {TID: {"seg": "category"}})
+def test_db_snapshot_strings_stay_object_never_category():
+    """Regression (demo 3D-chart wrong-axis bug): snapshot string columns
+    served as pandas categoricals made generated groupby code — pandas < 3.0
+    defaults to observed=False — emit the full cartesian product of ALL
+    categories (every city × every product, mostly NaN), so plotly put every
+    category on the chart axes. The loader must serve plain object dtype even
+    when the registry's dtype_plan requests 'category'."""
+    _write_snapshot(TID, pd.DataFrame({"seg": ["a", "b", "a"],
+                                       "qty": [1, 2, 3]}))
+    reg = {"connections": [],
+           "tables": [{"id": TID, "dtype_plan": {"seg": "category"}}]}
+    (Path(local_store.settings.DATA_ROOT) / "data_sources.json").write_text(
+        json.dumps(reg), encoding="utf-8")
     store = _chat_with([_db_entry("t", TID)])
     dfs = store.load_dataframes()
-    assert str(dfs["t"]["seg"].dtype) == "category"
+    assert str(dfs["t"]["seg"].dtype) != "category"
+    # Observed groups only — a categorical would also surface unused categories.
+    grouped = dfs["t"].groupby("seg")["qty"].sum()
+    assert set(grouped.index) == {"a", "b"}
 
 
 def test_unique_df_key():
