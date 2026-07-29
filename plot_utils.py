@@ -1453,6 +1453,10 @@ def render_plot_safe(code: str, dfs: dict, sid_or_id: str, split_multi_axes: boo
     import re as _re
     logging.info(f"[PLOT_RENDER] Starting plot execution, go={go is not None}, px={px is not None}")
     env = dict(GLOBAL_PLOT_SCOPE)
+    # Article XIII gate: chart code must only ever see standard dtypes (same
+    # per-exec-site install pattern as SANDBOX_BUILTINS below).
+    from exec_sanitizer import sanitize_for_execution
+    dfs = sanitize_for_execution(dfs, sid_or_id)
     env["dfs"] = dfs
     # Same guarded builtins as code_exec.safe_execute — chart code must not be
     # able to import DB drivers / credential modules either (Article VII).

@@ -1,0 +1,47 @@
+{
+  "C3_revenue_by_product": {
+    "Widget A": 450.75,
+    "Widget B": 151.0,
+    "Widget C": 220.0
+  },
+  "C4_product_counts": {
+    "Widget A": 3,
+    "Widget B": 2,
+    "Widget C": 1
+  },
+  "C5_month_split": {
+    "1": 3,
+    "2": 3
+  },
+  "C6_two_key_observed": [
+    [
+      "East",
+      "Widget C",
+      220.0
+    ],
+    [
+      "North",
+      "Widget A",
+      300.5
+    ],
+    [
+      "South",
+      "Widget B",
+      151.0
+    ],
+    [
+      "West",
+      "Widget A",
+      150.25
+    ]
+  ],
+  "C7_merge_then_group": {
+    "EW": 370.25,
+    "NS": 451.5
+  },
+  "C8_filter_then_group": {
+    "East": 220.0,
+    "North": 300.5,
+    "West": 150.25
+  }
+}

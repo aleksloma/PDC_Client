@@ -4,8 +4,8 @@
 > enterprise (on-prem) edition. Adapted from the original B2C constitution
 > for the brain/client split.
 
-**Version:** 1.0 (enterprise)
-**Last Updated:** 2026-05-25
+**Version:** 1.1 (enterprise)
+**Last Updated:** 2026-07-29
 
 ---
 
@@ -327,6 +327,36 @@ EOF
 
 ---
 
+## Article XIII: Standard Dtypes at the Execution Boundary
+
+**Dataframes handed to the execution sandbox must behave like plain,
+standard pandas: strings as object, dates as datetime64, ordinary
+numerics.**
+
+- No category, sparse, or extension dtypes (tz-aware `datetime64` is the
+  one allowed extension dtype — it behaves like plain datetime and
+  stripping it would drop the timezone) — no optimization that is
+  observable by generated code in any way. Generated code cannot be
+  trusted to handle them (a categorical dimension column once made
+  `groupby` — pandas < 3.0 defaults to `observed=False` — emit the full
+  cartesian product of ALL categories, putting every category on a chart
+  axis).
+- Performance optimizations are permitted only in storage/caching layers
+  where generated code can never observe them (e.g. numeric downcasts
+  baked into snapshot parquet files are fine; serving a categorical to
+  the sandbox is not).
+- Enforcement is in code, not in memory: the pre-execution sanitize gate
+  (`exec_sanitizer.sanitize_for_execution` on the client) runs inside
+  BOTH exec sites — `code_exec.safe_execute` and
+  `plot_utils.render_plot_safe`, the same pair that installs
+  `sandbox_guard.SANDBOX_BUILTINS` — so every execution path passes
+  through it. Do not add a third exec site without installing the gate.
+- The gate never mutates the caller's frames (they are shared across
+  worklists and threads) and never raises (Article IV): a column that
+  cannot be converted is logged and passed through unchanged.
+
+---
+
 ## Amendment process
 
 To modify this constitution:
@@ -349,3 +379,4 @@ To modify this constitution:
 | Security     | Secrets in env only. Never commit `.env`. Brain holds the Gemini key.     |
 | Deploy       | Brain → enterprise GCP. Client → customer LAN. Two independent images.    |
 | Docs         | Five required docs under `docs/`. Fix contradictions in the same PR.      |
+| Exec dtypes  | Sandbox sees standard dtypes only. `sanitize_for_execution` is the gate.  |

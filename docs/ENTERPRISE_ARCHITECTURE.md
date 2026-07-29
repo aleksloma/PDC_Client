@@ -176,7 +176,16 @@ returns `403 {"detail": "Tenant <status>"}` before any LLM call when
 4. Brain generates Python code.
 5. Brain returns the code only to the client.
 6. Client executes the code against the raw data locally via
-   `code_exec.safe_execute`. The result stays local.
+   `code_exec.safe_execute`. The result stays local. Before EVERY
+   execution (both exec sites: `code_exec.safe_execute` and
+   `plot_utils.render_plot_safe`) the Article XIII sanitize gate
+   (`exec_sanitizer.sanitize_for_execution`) normalizes the dataframes to
+   plain standard dtypes — generated code must never observe category /
+   sparse / extension dtypes (a categorical dimension column once made a
+   two-key groupby emit the cartesian product of all categories and put
+   every category on a chart axis). Storage-layer optimizations (numeric
+   downcasts in snapshot parquet) remain allowed because generated code
+   cannot observe them.
 7. On execution error: client POSTs `{error, code, schema_text, ...}` to
    `/v1/retry`, brain returns corrected code, client retries (up to 2
    attempts).

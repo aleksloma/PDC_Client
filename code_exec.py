@@ -12,6 +12,7 @@ import plotly.graph_objects as go
 from logger_utils import log_with_sid
 from settings import settings
 from sandbox_guard import SANDBOX_BUILTINS
+from exec_sanitizer import sanitize_for_execution
 
 # --- Extended visualization libraries (safe imports) ---
 try:
@@ -178,6 +179,10 @@ def safe_execute(code: str, dfs: dict, sid: str | None = None, timeout: float = 
     """
     if timeout is None:
         timeout = CODE_EXEC_TIMEOUT_SECONDS
+
+    # Article XIII gate: generated code must only ever see standard dtypes.
+    # Rebinding the local `dfs` covers both env["dfs"] and the `df` alias.
+    dfs = sanitize_for_execution(dfs, sid or "exec")
 
     env = {
         "pd": pd, "np": np, "plt": plt,
