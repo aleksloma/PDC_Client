@@ -658,6 +658,31 @@ table doc (single-admin exposure, same class as save), and a source-DB
 column rename leaves a dangling join key that surfaces as `unverified` on
 the next scan.
 
+**Relations overview + wizard auto-suggest** (UX layer over discovery). The
+admin section is named "Relations": Zone A lists EVERY confirmed relation
+across all registered tables (legacy pre-discovery entries render with
+origin "manual" and blank cardinality) with per-row Edit — the same inline
+editor as candidates, saved through `accept`'s additive `replaces` field
+(swap-in-one-write; an edit that would duplicate a DIFFERENT entry is
+skipped with the old entry preserved, never a silent delete) — and Delete
+(`/relations/delete`, exact-match by related ref + ordered join keys,
+removes every identical duplicate). Zone B keeps the scan/SQL discovery
+unchanged; a zero-candidate scan is explained with the confirmed-relations
+count instead of an empty list. The register wizard's relations step
+auto-suggests relations for the table being registered
+(`/relations/wizard_suggest`): declared FKs from the introspection the
+wizard already performed render PRE-CHECKED (direction is ground truth,
+default N:1; referred tables resolve across ALL connections — broader than
+the old same-connection seeding, which was removed in favor of the
+suggestion block), name/description similarity renders unchecked; the
+parent side is verified against its snapshot, the child side is ESTIMATED
+from the wizard's preview sample (labeled as such; a candidate whose
+measured direction had to be flipped drops its numbers rather than show a
+misleading percentage; date-typed join keys may under-estimate — preview
+datetimes serialize with a time-of-day the parquet string form lacks).
+Checked suggestions ride the wizard's NORMAL confirm+snapshot save.
+Suggestions are computed only when the step opens; no background scanning.
+
 **Security** — see AI_CONSTITUTION Article VII (rules 8–9): SELECT-only
 connector, sandbox import denylist (defense in depth — the customer's
 dedicated SELECT-only DB login is the real guarantee), encrypted credentials,
