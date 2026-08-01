@@ -624,10 +624,48 @@ same carry-over rules as Add Data's `_resync_meta_after_add` (user edits
 survive, vanished columns deleted). Chats using DB tables show "data as of
 <refreshed_at>" (min across tables) via `GET /api/chat/{id}/schema`.
 
+**Relation discovery** (ladmin "Discover relations" section; proposals only —
+nothing is applied without an explicit accept). Candidates come from three
+deterministic sources, merged and deduped on the (table, columns) pair:
+declared FKs (fetched by LIVE introspection at scan time — FKs are not
+persisted in the registry; an unreachable connection degrades only the FK
+source), normalized column-name / confirmed-description similarity (inverse-
+frequency down-weighting for ubiquitous names, hard share cap, no LLM), and
+optionally admin-pasted SELECT statements parsed locally with sqlglot
+(aliases/CTEs/subqueries resolved via scope traversal; composite ON
+predicates become one multi-column candidate; literal predicates dropped;
+frequency counted across distinct statements). Every candidate is then
+verified against the local snapshot parquets — cardinality derived from
+key-side uniqueness (one-to-many inputs are flipped so the stored direction
+is always many-to-one with the correct parent; a declared FK's direction is
+never overridden by data), overlap % of child keys present in the
+de-duplicated parent keys, orphan count; a missing snapshot renders the
+candidate `unverified` instead of hiding it — and banded CONFIRMED /
+SUGGESTED / NEEDS ATTENTION (thresholds in one constants block in
+`relation_discovery.py`). Accepting writes the relation onto the CHILD
+table's `relations` with two additive fields — `cardinality`
+("N:1"|"1:1"|"1:N"|"N:M") and `origin` ("fk"|"sql"|"name"|"description";
+manual rows simply lack the keys) — through a relations-only write path with
+no confirm gate / drift check / re-snapshot (those locks protect the
+column+description shape, which the accept endpoint cannot touch). Old-shape
+relation entries load and render byte-identically; schema_text appends a
+"(many-to-one)"-style suffix only when `cardinality` is present, and the
+cardinality is carried into NEW chats' meta at selection time (existing
+chats keep their frozen meta, as with every relation edit). Dismissals are
+audited but deliberately not persisted. Known limits: the accept
+read-modify-write is not atomic vs a concurrent nightly refresh of the same
+table doc (single-admin exposure, same class as save), and a source-DB
+column rename leaves a dangling join key that surfaces as `unverified` on
+the next scan.
+
 **Security** — see AI_CONSTITUTION Article VII (rules 8–9): SELECT-only
 connector, sandbox import denylist (defense in depth — the customer's
 dedicated SELECT-only DB login is the real guarantee), encrypted credentials,
-append-only admin audit JSONL.
+append-only admin audit JSONL. Relation discovery adds one more invariant:
+**admin-pasted SQL is parsed in memory on this client only** — never
+persisted, logged, audited, or sent to the brain; sqlglot error messages
+(they embed the SQL text) never leave the parser (exception types only), and
+snapshot verification emits aggregates only (counts/percentages, no values).
 
 **Phase 2 (later, client + brain in parallel — NOT built):** live SQL mode
 for large tables (brain writes dialect-aware aggregation SELECTs; client

@@ -219,7 +219,17 @@ client must be closed on FastAPI lifespan shutdown.
    load-bearing controls are the dedicated SELECT-only database login the
    customer provisions (the grant is the real guarantee), plus rules 8 above
    and the connector's SELECT-only statement gate
-   (`db_connector._assert_single_select`; no route accepts free SQL).
+   (`db_connector._assert_single_select`; no route accepts free SQL —
+   relation discovery's "Analyze SQL" box PARSES pasted SQL, it never
+   executes it).
+10. **Admin-pasted SQL never leaves this client.** The relation-discovery
+   "Analyze SQL" box (`relation_discovery.py`) parses pasted SELECT
+   statements in memory only: the SQL text is never persisted, logged,
+   audited, or included in any `brain_client` payload, and sqlglot error
+   messages — which embed the offending SQL — never leave the parser
+   (exception TYPES only may be logged). Audit rows carry counts only.
+   Snapshot verification emits aggregates only (uniqueness, overlap %,
+   orphan counts) — never cell values.
 
 ---
 
