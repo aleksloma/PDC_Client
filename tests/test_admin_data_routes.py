@@ -200,6 +200,89 @@ def test_save_snapshots_and_stamps_server_side_identity(client, sqlite_conn):
     assert pd.read_parquet(local_store.db_snapshot_path(t["id"])).shape == (2, 2)
 
 
+def test_duplicate_registration_rejected_edit_still_allowed(client, sqlite_conn):
+    """A physical table (connection + schema + table) registers only ONCE:
+    a second registration is 400 DUPLICATE_TABLE naming the existing one;
+    re-saving the SAME registration (edit) stays allowed."""
+    _, cid = sqlite_conn
+    first = client.post("/api/admin/tables", json=_table_body(cid))
+    assert first.status_code == 201
+    tid = first.json()["table"]["id"]
+
+    dup = client.post("/api/admin/tables", json=_table_body(cid))
+    assert dup.status_code == 400
+    body = dup.json()
+    assert body["code"] == "DUPLICATE_TABLE"
+    assert "test table" in body["error"]                 # names the registration
+    # nothing was written
+    assert len(db_sources.DataSourceStore().list_tables()) == 1
+
+    edit = client.post(f"/api/admin/tables/{tid}", json=_table_body(cid))
+    assert edit.status_code == 200                       # same id = edit, allowed
+
+
+def test_editing_legacy_duplicate_registration_still_allowed(client, sqlite_conn):
+    """BLOCKER regression pin: with two LEGACY duplicates of one physical
+    table stored, editing either copy (same id, unchanged physical key) must
+    pass — otherwise every mutation on a duplicated table would 400 and the
+    error's own remediation ('edit that registration') would be impossible.
+    Only a save that CREATES a new physical mapping is blocked."""
+    from sqlalchemy import create_engine, text
+    db, cid = sqlite_conn
+    tid = client.post("/api/admin/tables", json=_table_body(cid)).json()["table"]["id"]
+    # legacy duplicate, created at store level (the API blocks new ones)
+    db_sources.DataSourceStore().upsert_table({
+        "connection_id": cid, "schema": "", "table_name": "t",
+        "display_name": "t duplicate", "description": "",
+        "columns": [{"name": "a"}, {"name": "b"}],
+        "is_connector": True, "relations": []}, actor=ADMIN)
+
+    edit = client.post(f"/api/admin/tables/{tid}", json=_table_body(cid))
+    assert edit.status_code == 200               # same physical key kept -> OK
+
+    # retargeting the SAME registration onto another registered physical
+    # table is still blocked
+    eng = create_engine(f"sqlite+pysqlite:///{db}")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE u (a INTEGER PRIMARY KEY, b TEXT)"))
+    eng.dispose()
+    db_sources.DataSourceStore().upsert_table({
+        "connection_id": cid, "schema": "", "table_name": "u",
+        "display_name": "u table", "description": "", "columns": [],
+        "is_connector": False, "relations": []}, actor=ADMIN)
+    body = _table_body(cid)
+    body["table_name"] = "u"
+    r = client.post(f"/api/admin/tables/{tid}", json=body)
+    assert r.status_code == 400 and r.json()["code"] == "DUPLICATE_TABLE"
+
+
+def test_connector_flag_toggles_both_directions(client, sqlite_conn):
+    """Pin for the duplicate-registration block: connector-vs-normal was the
+    one reason to register a table twice — the edit flow must toggle it."""
+    _, cid = sqlite_conn
+    body = _table_body(cid)
+    body["is_connector"] = True
+    tid = client.post("/api/admin/tables", json=body).json()["table"]["id"]
+    assert db_sources.DataSourceStore().get_table(tid)["is_connector"] is True
+
+    body["is_connector"] = False                         # connector -> normal
+    assert client.post(f"/api/admin/tables/{tid}", json=body).status_code == 200
+    assert db_sources.DataSourceStore().get_table(tid)["is_connector"] is False
+
+    body["is_connector"] = True                          # normal -> connector
+    assert client.post(f"/api/admin/tables/{tid}", json=body).status_code == 200
+    assert db_sources.DataSourceStore().get_table(tid)["is_connector"] is True
+
+
+def test_connection_tables_carries_registered_as(client, sqlite_conn):
+    _, cid = sqlite_conn
+    client.post("/api/admin/tables", json=_table_body(cid))
+    rows = client.get(f"/api/admin/connections/{cid}/tables").json()["tables"]
+    row = next(r for r in rows if r["name"] == "t")
+    assert row["registered"] is True
+    assert row["registered_as"] == "test table"
+
+
 def test_refresh_now_unknown_table(client, sqlite_conn):
     r = client.post("/api/admin/tables/aa11bb22cc33dd44/refresh")
     assert r.status_code == 200

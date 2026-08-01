@@ -422,6 +422,87 @@ def test_wizard_suggest_requires_table_name(client, fk_setup):
                        json={"table_name": " "}).status_code == 400
 
 
+# ── duplicate registrations (legacy state) ─────────────────────────────────
+
+@pytest.fixture
+def dup_customers(client, fk_setup):
+    """A LEGACY duplicate registration of shop-less `customers` (store-level —
+    the API blocks new duplicates, stored ones must keep working). The
+    duplicate is flagged connector so the preference rule is observable."""
+    store = db_sources.DataSourceStore()
+    doc = store.upsert_table({
+        "connection_id": fk_setup["cid"], "schema": "", "table_name": "customers",
+        "display_name": "customers connector", "description": "",
+        "columns": [{"name": "id", "pk": True}, {"name": "city"}],
+        "is_connector": True, "relations": [],
+        "descriptions_confirmed_by": ADMIN,
+        "descriptions_confirmed_at": "2026-08-01T00:00:00+00:00",
+    }, actor=ADMIN)
+    pd.DataFrame({"id": [1, 2, 3], "city": list("ABC")}).to_parquet(
+        local_store.db_snapshot_path(doc["id"]))
+    return doc["id"]
+
+
+def test_scan_never_proposes_same_physical_and_dedupes_fanout(client, fk_setup,
+                                                              dup_customers):
+    data = client.post("/api/admin/relations/scan", json={}).json()
+    assert data["ok"] is True
+    both = {fk_setup["customers"], dup_customers}
+    # no candidate joins the two registrations of shop-less `customers`
+    assert all({c["table_id"], c["related_table_id"]} != both
+               for c in data["candidates"]), data["candidates"]
+    # the orders FK fans out to ONE candidate, targeting the connector
+    fk_cands = [c for c in data["candidates"] if "fk" in c["sources"]
+                and c["table_id"] == fk_setup["orders"]]
+    assert len(fk_cands) == 1
+    kept = fk_cands[0]
+    assert kept["related_table_id"] == dup_customers        # connector preferred
+    assert kept["alternate_targets"] == [
+        {"id": fk_setup["customers"], "label": "Customers"}]
+
+
+def test_wizard_suggest_dedupes_duplicate_registrations(client, fk_setup,
+                                                        dup_customers):
+    body = _wizard_body(fk_setup, connection_id=fk_setup["cid"])
+    data = client.post("/api/admin/relations/wizard_suggest", json=body).json()
+    fk = [c for c in data["candidates"] if "fk" in c["sources"]]
+    assert len(fk) == 1                                     # one, not one per copy
+    assert fk[0]["related_table_id"] == dup_customers       # connector preferred
+    assert fk[0]["alternate_targets"] == [
+        {"id": fk_setup["customers"], "label": "Customers"}]
+
+
+def test_wizard_suggest_excludes_same_physical_in_edit_mode(client, fk_setup,
+                                                            dup_customers):
+    """Editing one registration of a duplicated physical table must not
+    suggest joining it to its own copy."""
+    body = _wizard_body(
+        fk_setup, editing_tid=fk_setup["customers"],
+        connection_id=fk_setup["cid"],
+        table_name="customers", display_name="Customers",
+        columns=[{"name": "id", "pk": True}, {"name": "city"}],
+        foreign_keys=[],
+        sample={"columns": ["id", "city"], "rows": [[1, "A"], [2, "B"]]})
+    data = client.post("/api/admin/relations/wizard_suggest", json=body).json()
+    assert all(c["related_table_id"] != dup_customers
+               for c in data["candidates"]), data["candidates"]
+
+
+def test_analyze_sql_reports_unknown_tables(client, fk_setup):
+    r = client.post("/api/admin/relations/analyze_sql", json={
+        "sql": "SELECT 1 FROM orders o JOIN warehouses w ON o.customer_id = w.id",
+        "db_type": "sqlite"})
+    data = r.json()
+    assert data["ok"] is True and data["candidates"] == []
+    assert data["stats"]["unknown_tables"] == ["warehouses"]
+
+
+def test_legacy_duplicate_registrations_still_load(client, fk_setup, dup_customers):
+    listing = client.get("/api/admin/tables").json()["tables"]
+    names = [(t["schema"], t["table_name"]) for t in listing]
+    assert names.count(("", "customers")) == 2              # both copies list fine
+
+
 # ── delete ─────────────────────────────────────────────────────────────────
 
 def test_delete_removes_matching_entries_neighbors_untouched(client, fk_setup):

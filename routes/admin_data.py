@@ -246,13 +246,16 @@ async def connection_tables(request: Request, cid: str, schema: str = ""):
     res = await _run(db_connector.list_tables, cfg, password, schema or None,
                      sid=f"admin:{email}")
     if res.get("ok"):
-        registered = {(t.get("connection_id"), t.get("schema") or "", t.get("table_name")): t.get("id")
+        registered = {(t.get("connection_id"), t.get("schema") or "", t.get("table_name")): t
                       for t in store.list_tables()}
         for row in res["tables"]:
-            tid = registered.get((cid, schema or "", row["name"]))
-            row["registered"] = tid is not None
-            if tid:
-                row["table_id"] = tid
+            t = registered.get((cid, schema or "", row["name"]))
+            row["registered"] = t is not None
+            if t:
+                row["table_id"] = t.get("id")
+                # Lets the wizard label + disable the option ("already
+                # registered as 'X'") — duplicates are blocked on save too.
+                row["registered_as"] = t.get("display_name")
     return res
 
 
@@ -397,7 +400,9 @@ async def analyze_sql(request: Request):
     tables = store.list_tables()
     cands, stats = await _run(relation_discovery.extract_sql_joins,
                               sql_text, tables, dialect)
-    cands = relation_discovery.filter_existing(cands, tables)
+    cands = relation_discovery.filter_same_physical(cands, tables)
+    cands = relation_discovery.filter_existing_physical(cands, tables)
+    cands = relation_discovery.dedupe_physical_targets(cands, tables)
     cands = await _run(_verify_and_band, cands)
     db_sources.audit(email, "relations.analyze_sql",
                      detail={"statements": stats.get("statements"),
@@ -445,6 +450,7 @@ def _wizard_suggest_candidates(body: dict, registered: list) -> list:
                 else _WIZARD_CHILD_ID)
     child = {
         "id": child_id,
+        "connection_id": (body.get("connection_id") or "").strip(),
         "schema": (body.get("schema") or "").strip(),
         "table_name": (body.get("table_name") or "").strip(),
         "display_name": ((body.get("display_name") or "").strip()
@@ -470,7 +476,9 @@ def _wizard_suggest_candidates(body: dict, registered: list) -> list:
         relation_discovery.name_candidates(tables),
         relation_discovery.description_candidates(tables))
     cands = [c for c in cands if child_id in (c["table_id"], c["related_table_id"])]
-    cands = relation_discovery.filter_existing(cands, tables)
+    cands = relation_discovery.filter_same_physical(cands, tables)
+    cands = relation_discovery.filter_existing_physical(cands, tables)
+    cands = relation_discovery.dedupe_physical_targets(cands, tables)
 
     def _swap_orientation(c):
         c["table_id"], c["related_table_id"] = c["related_table_id"], c["table_id"]
@@ -912,6 +920,30 @@ async def save_table(request: Request, tid: str = ""):
         return resp
     schema = (body.get("schema") or "").strip() or None
     table = (body.get("table_name") or "").strip()
+
+    # A physical table (connection + schema + table) may be registered only
+    # ONCE — duplicate registrations are how meaningless self-relations were
+    # born. Editing the existing registration (same id) stays allowed; legacy
+    # duplicates in stored data keep loading, only NEW saves are blocked.
+    own_id = tid if db_sources.DataSourceStore.valid_id(tid) else None
+    own = store.get_table(own_id) if own_id else None
+    own_key = relation_discovery.physical_key(own) if own else None
+    new_key = relation_discovery.physical_key(
+        {"connection_id": body.get("connection_id"),
+         "schema": schema or "", "table_name": table})
+    # Check only when the save CREATES a physical mapping (new registration,
+    # or an edit retargeting to a different source table). An edit that keeps
+    # its stored physical key passes even when a LEGACY duplicate of it
+    # exists — otherwise every mutation on a duplicated table would 400.
+    if own_key != new_key:
+        for t in store.list_tables():
+            if t.get("id") != own_id and \
+                    relation_discovery.physical_key(t) == new_key:
+                return JSONResponse(
+                    {"error": f"This table is already registered as "
+                              f"'{t.get('display_name')}'. Edit that registration "
+                              "instead (the Connector flag can be changed there).",
+                     "code": "DUPLICATE_TABLE"}, status_code=400)
 
     posted_cols = [c.get("name") for c in (body.get("columns") or []) if c.get("name")]
     intro = await _run(db_connector.introspect, cfg, password, schema, table,

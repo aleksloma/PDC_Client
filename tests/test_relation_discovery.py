@@ -394,6 +394,136 @@ def test_filter_existing_drops_declared_including_flipped_and_legacy_name():
     assert rd.filter_existing([cand], [t4, CUSTOMERS]) == [cand]
 
 
+# ── physical identity (duplicate registrations) ────────────────────────────
+
+def _phys_table(tid, name, cols, *, conn="conn-1", schema="shop",
+                connector=False, created="2026-01-01", **kw):
+    t = _table(tid, name, cols, schema=schema, **kw)
+    t["connection_id"] = conn
+    t["is_connector"] = connector
+    t["created_at"] = created
+    return t
+
+
+def test_physical_key_and_same_physical_filter():
+    a = _phys_table(TID_A, "city_dict", ["city_code"], connector=True)
+    b = _phys_table(TID_B, "CITY_DICT", ["city_code"])       # case-insensitive
+    other_conn = _phys_table(TID_C, "city_dict", ["city_code"], conn="conn-2")
+    assert rd.physical_key(a) == rd.physical_key(b)
+    assert rd.physical_key(a) != rd.physical_key(other_conn)
+
+    same = rd._make_candidate(a, b, [("city_code", "city_code")], "name", {})
+    cross = rd._make_candidate(a, other_conn, [("city_code", "city_code")], "name", {})
+    out = rd.filter_same_physical([same, cross], [a, b, other_conn])
+    assert out == [cross]        # same physical dropped; cross-connection kept
+
+
+def test_same_physical_never_matches_incomplete_keys():
+    """A wizard draft without connection_id must never false-positive."""
+    a = _table(TID_A, "orders", ["x"])           # no connection_id
+    b = _table(TID_B, "orders", ["x"])
+    cand = rd._make_candidate(a, b, [("x", "x")], "name", {})
+    assert rd.filter_same_physical([cand], [a, b]) == [cand]
+
+
+def test_dedupe_physical_targets_prefers_connector_and_notes_alternates():
+    child = _phys_table(TID_A, "orders", ["city_code"])
+    dict_a = _phys_table(TID_B, "city_dict", ["city_code"], connector=True,
+                         created="2026-02-01", display="cities dictionary")
+    dict_b = _phys_table(TID_C, "city_dict", ["city_code"],
+                         created="2026-01-01", display="city dictionary")
+    c1 = rd._make_candidate(child, dict_a, [("city_code", "city_code")], "fk", True)
+    c2 = rd._make_candidate(child, dict_b, [("city_code", "city_code")], "fk", True)
+    out = rd.dedupe_physical_targets([c2, c1], [child, dict_a, dict_b])
+    assert len(out) == 1
+    kept = out[0]
+    assert kept["related_table_id"] == TID_B             # connector wins
+    assert kept["alternate_targets"] == [{"id": TID_C, "label": "city dictionary"}]
+
+    # tie (neither connector) -> earliest created_at wins
+    dict_a2 = dict(dict_a, is_connector=False)
+    out = rd.dedupe_physical_targets([c1, c2], [child, dict_a2, dict_b])
+    assert out[0]["related_table_id"] == TID_C           # created 2026-01-01
+
+
+def test_dedupe_physical_collapses_child_side_too():
+    dup1 = _phys_table(TID_A, "city_dict", ["region"], connector=True)
+    dup2 = _phys_table(TID_B, "city_dict", ["region"])
+    other = _phys_table(TID_C, "regions", ["region"])
+    c1 = rd._make_candidate(dup1, other, [("region", "region")], "name", {})
+    c2 = rd._make_candidate(dup2, other, [("region", "region")], "name", {})
+    out = rd.dedupe_physical_targets([c2, c1], [dup1, dup2, other])
+    assert len(out) == 1 and out[0]["table_id"] == TID_A  # connector side kept
+
+
+def test_filter_existing_physical_blocks_duplicate_registration_reproposal():
+    child = _phys_table(TID_A, "orders", ["city_code"])
+    dict_a = _phys_table(TID_B, "city_dict", ["city_code"], connector=True)
+    dict_b = _phys_table(TID_C, "city_dict", ["city_code"])
+    # declared to registration A only
+    child_declared = dict(child, relations=[{
+        "related_table_id": TID_B, "join_keys": [["city_code", "city_code"]]}])
+    to_b = rd._make_candidate(child, dict_b, [("city_code", "city_code")], "name", {})
+    assert rd.filter_existing_physical([to_b], [child_declared, dict_a, dict_b]) == []
+    # flipped orientation also blocked
+    flipped = rd._make_candidate(dict_b, child, [("city_code", "city_code")], "name", {})
+    assert rd.filter_existing_physical([flipped], [child_declared, dict_a, dict_b]) == []
+    # different columns still proposed
+    other_cols = rd._make_candidate(child, dict_b, [("city_code", "city_name")], "name", {})
+    assert rd.filter_existing_physical([other_cols],
+                                       [child_declared, dict_a, dict_b]) == [other_cols]
+
+
+def test_sql_duplicate_registration_resolves_to_preferred_and_unknown_reported():
+    orders = _phys_table(TID_A, "orders", ["city_code", "amount"])
+    dict_a = _phys_table(TID_B, "city_dict", ["city_code"], connector=True,
+                         display="cities dictionary")
+    dict_b = _phys_table(TID_C, "city_dict", ["city_code"])
+    sql = ("SELECT 1 FROM shop.orders o JOIN shop.city_dict d ON o.city_code = d.city_code;"
+           "SELECT 1 FROM shop.orders o JOIN shop.warehouses w ON o.city_code = w.id")
+    cands, stats = rd.extract_sql_joins(sql, [orders, dict_a, dict_b], None)
+    assert len(cands) == 1
+    ids = {cands[0]["table_id"], cands[0]["related_table_id"]}
+    assert ids == {TID_A, TID_B}                 # preferred (connector) registration
+    assert stats["unknown_tables"] == ["shop.warehouses"]
+
+
+def test_prefer_registration_cross_connection_stays_ambiguous():
+    """Reviewer regression pin: preference applies ONLY to duplicate
+    registrations of one physical table — same-named tables on different
+    connections stay genuinely ambiguous."""
+    a = _phys_table(TID_A, "orders", ["x"], conn="conn-1")
+    b = _phys_table(TID_B, "orders", ["x"], conn="conn-2")
+    assert rd.prefer_registration([a, b]) is None
+    dup = _phys_table(TID_C, "orders", ["x"], conn="conn-1", connector=True)
+    assert rd.prefer_registration([a, dup])["id"] == TID_C
+    assert rd.prefer_registration([]) is None
+
+
+def test_sql_unqualified_duplicate_name_resolves_to_preferred():
+    """Reviewer regression pin: an unqualified SQL name matching TWO
+    registrations of one physical table resolves (it is a duplicate, not an
+    unknown) — the admin must not be told to 'register' a blocked table."""
+    orders = _phys_table(TID_A, "orders", ["city_code", "amount"])
+    dict_a = _phys_table(TID_B, "city_dict", ["city_code"], connector=True)
+    dict_b = _phys_table(TID_C, "city_dict", ["city_code"])
+    sql = "SELECT 1 FROM orders o JOIN city_dict d ON o.city_code = d.city_code"
+    cands, stats = rd.extract_sql_joins(sql, [orders, dict_a, dict_b], None)
+    assert len(cands) == 1
+    assert {cands[0]["table_id"], cands[0]["related_table_id"]} == {TID_A, TID_B}
+    assert stats["unknown_tables"] == []
+
+
+def test_sql_same_name_two_connections_dropped_not_unknown():
+    orders = _phys_table(TID_A, "orders", ["x"])
+    t1 = _phys_table(TID_B, "dims", ["x"], conn="conn-1")
+    t2 = _phys_table(TID_C, "dims", ["x"], conn="conn-2")
+    sql = "SELECT 1 FROM shop.orders o JOIN shop.dims d ON o.x = d.x"
+    cands, stats = rd.extract_sql_joins(sql, [orders, t1, t2], None)
+    assert cands == []                           # ambiguous -> dropped...
+    assert stats["unknown_tables"] == []         # ...but NOT "not registered"
+
+
 def test_discover_end_to_end_excludes_declared():
     fk_map = {TID_A: _fk_intro([{
         "constrained_columns": ["customer_id"], "referred_schema": None,

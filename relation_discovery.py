@@ -148,7 +148,169 @@ def _resolve_physical(registered: dict, schema: str, table: str) -> list:
     if hit:
         return hit
     rows = registered["by_name"].get(tn) or []
-    return rows if len(rows) == 1 else []
+    if len(rows) == 1:
+        return rows
+    # Several rows that are all registrations of ONE physical table are not
+    # ambiguous — they are duplicates (legacy state) and resolve fine.
+    if rows and len({physical_key(t) for t in rows}) == 1:
+        return rows
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Physical identity (duplicate registrations of one source table)
+# ---------------------------------------------------------------------------
+
+def physical_key(t: dict) -> tuple:
+    """Identity of the underlying SOURCE table: (connection_id, schema,
+    table_name), case-insensitive on the name parts. Two registrations with
+    the same key are copies of one physical table."""
+    return (str(t.get("connection_id") or ""),
+            str(t.get("schema") or "").lower(),
+            str(t.get("table_name") or "").lower())
+
+
+def _keys_match(a: tuple, b: tuple) -> bool:
+    """Physical keys match only when complete on both sides — a doc without a
+    connection_id or table_name (e.g. a wizard draft that didn't send one)
+    must never false-positive against a real registration."""
+    return a == b and bool(a[0]) and bool(a[2])
+
+
+def registration_rank(t: dict) -> tuple:
+    """Preference order among registrations of ONE physical table: connector
+    first (connectors exist to be auto-included via relations), then the
+    earliest-registered, then id — fully deterministic."""
+    return (0 if t.get("is_connector") else 1,
+            str(t.get("created_at") or "~"), str(t.get("id") or ""))
+
+
+def prefer_registration(hits: list) -> Optional[dict]:
+    """The preferred registration among resolution hits — but ONLY when they
+    all share one physical key (duplicate registrations). Hits spanning
+    DIFFERENT physical tables (a same-named table on two connections) stay
+    genuinely ambiguous -> None."""
+    if not hits:
+        return None
+    if len({physical_key(t) for t in hits}) > 1:
+        return None
+    return min(hits, key=registration_rank)
+
+
+def filter_same_physical(candidates: list, tables: list) -> list:
+    """Drop candidates whose two endpoints are registrations of the SAME
+    physical table — a join of a table to its own copy is never a relation.
+    Generation-side only; confirmed relations are never touched here."""
+    by_id = {t.get("id"): t for t in tables or []}
+    out = []
+    for c in candidates or []:
+        child = by_id.get(c.get("table_id"))
+        parent = by_id.get(c.get("related_table_id"))
+        if child is not None and parent is not None and \
+                _keys_match(physical_key(child), physical_key(parent)):
+            continue
+        out.append(c)
+    return out
+
+
+def filter_existing_physical(candidates: list, tables: list) -> list:
+    """Like filter_existing, but declared relations suppress candidates at the
+    PHYSICAL level: a relation confirmed to ANY registration of a physical
+    table also blocks re-proposals to its duplicate registrations (same
+    columns, either orientation). For single registrations this is identical
+    to the id-level filter."""
+    registered = build_registered_map(tables)
+    by_id = {t.get("id"): t for t in tables or []}
+
+    def _phys_id(t1, cols1, t2, cols2):
+        pairs = sorted(
+            tuple(sorted([(physical_key(t1), str(c1)), (physical_key(t2), str(c2))]))
+            for c1, c2 in zip(cols1, cols2))
+        return repr(pairs)
+
+    existing: set = set()
+    for t in tables or []:
+        for rel in t.get("relations") or []:
+            if not isinstance(rel, dict):
+                continue
+            other = by_id.get(rel.get("related_table_id"))
+            if other is None and rel.get("related_table"):
+                name = str(rel.get("related_table"))
+                sc, _, tn = name.rpartition(".")
+                hits = _resolve_physical(registered, sc, tn)
+                other = hits[0] if hits else None
+            if other is None:
+                continue
+            try:
+                jk = [(str(p[0]), str(p[1])) for p in (rel.get("join_keys") or [])]
+            except Exception as e:
+                log_with_sid("relation_discovery", "warning",
+                             f"REL_EXISTING_MALFORMED table={t.get('id')}: {type(e).__name__}")
+                continue
+            if jk:
+                existing.add(_phys_id(t, [p[0] for p in jk],
+                                      other, [p[1] for p in jk]))
+    out = []
+    for c in candidates or []:
+        child = by_id.get(c.get("table_id"))
+        parent = by_id.get(c.get("related_table_id"))
+        if child is not None and parent is not None and _phys_id(
+                child, [p[0] for p in c["join_keys"]],
+                parent, [p[1] for p in c["join_keys"]]) in existing:
+            continue
+        out.append(c)
+    return out
+
+
+def dedupe_physical_targets(candidates: list, tables: list) -> list:
+    """While duplicate registrations exist (legacy state), collapse candidates
+    that differ only in WHICH registration of a physical table they point at
+    into ONE — the member whose endpoints are the preferred registrations
+    (registration_rank, applied to both sides). The kept candidate carries
+    `alternate_targets` [{id, label}] for the other parent registrations so
+    the UI can offer a retarget."""
+    by_id = {t.get("id"): t for t in tables or []}
+
+    def _group_key(c):
+        child, parent = by_id.get(c.get("table_id")), by_id.get(c.get("related_table_id"))
+        if child is None or parent is None:
+            return ("solo", c.get("candidate_id"))
+        pairs = sorted(
+            tuple(sorted([(physical_key(child), str(a)), (physical_key(parent), str(b))]))
+            for a, b in c["join_keys"])
+        return ("phys", repr(pairs))
+
+    def _rank(c):
+        child, parent = by_id.get(c.get("table_id")), by_id.get(c.get("related_table_id"))
+        return (registration_rank(child) if child else (9,),
+                registration_rank(parent) if parent else (9,))
+
+    groups: dict = {}
+    order: list = []
+    for c in candidates or []:
+        k = _group_key(c)
+        if k not in groups:
+            order.append(k)
+        groups.setdefault(k, []).append(c)
+
+    out = []
+    for k in order:
+        members = sorted(groups[k], key=_rank)
+        chosen = members[0]
+        if len(members) > 1:
+            seen_alt = {chosen.get("related_table_id")}
+            alts = []
+            for m in members[1:]:
+                rid = m.get("related_table_id")
+                if rid in seen_alt:
+                    continue
+                seen_alt.add(rid)
+                alts.append({"id": rid, "label": m.get("related_label")})
+            if alts:
+                chosen = dict(chosen)
+                chosen["alternate_targets"] = alts
+        out.append(chosen)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +554,9 @@ def extract_sql_joins(sql_text: str, tables: list,
     registered tables. Composite predicates between one table pair inside one
     ON clause collapse to one multi-column candidate; WHERE-style implicit
     joins group per statement. Frequency counts DISTINCT statements."""
-    stats = {"statements": 0, "parsed": 0, "failed": 0, "non_select": 0}
+    stats = {"statements": 0, "parsed": 0, "failed": 0, "non_select": 0,
+             "unknown_tables": []}
+    unknown: set = set()
     registered = build_registered_map(tables)
     schema_map = build_schema_map(tables)
     try:
@@ -451,19 +615,31 @@ def extract_sql_joins(sql_text: str, tables: list,
                         continue
                     ta = _resolve_physical(registered, a[0], a[1])
                     tb = _resolve_physical(registered, b[0], b[1])
-                    if len(ta) != 1 or len(tb) != 1 or ta[0]["id"] == tb[0]["id"]:
+                    if not ta:
+                        unknown.add(f"{a[0]}.{a[1]}" if a[0] else a[1])
+                    if not tb:
+                        unknown.add(f"{b[0]}.{b[1]}" if b[0] else b[1])
+                    if not ta or not tb:
+                        continue
+                    # Duplicate registrations of one physical table resolve to
+                    # the PREFERRED registration (connector first); hits that
+                    # span DIFFERENT physical tables (same name on two
+                    # connections) stay ambiguous and are dropped as before.
+                    ta0 = prefer_registration(ta)
+                    tb0 = prefer_registration(tb)
+                    if ta0 is None or tb0 is None or ta0["id"] == tb0["id"]:
                         continue
                     # Canonical endpoint order inside the group so composite
                     # pairs line up regardless of predicate orientation.
-                    if ta[0]["id"] <= tb[0]["id"]:
-                        key = (ta[0]["id"], tb[0]["id"])
+                    if ta0["id"] <= tb0["id"]:
+                        key = (ta0["id"], tb0["id"])
                         pair = (a[2], b[2])
                     else:
-                        key = (tb[0]["id"], ta[0]["id"])
+                        key = (tb0["id"], ta0["id"])
                         pair = (b[2], a[2])
                     pair_groups.setdefault((gkey,) + key,
-                                           {"child": min(ta[0], tb[0], key=lambda t: t["id"]),
-                                            "parent": max(ta[0], tb[0], key=lambda t: t["id"]),
+                                           {"child": min(ta0, tb0, key=lambda t: t["id"]),
+                                            "parent": max(ta0, tb0, key=lambda t: t["id"]),
                                             "pairs": set()})["pairs"].add(pair)
                 for grp in pair_groups.values():
                     pairs = sorted(grp["pairs"])
@@ -480,6 +656,9 @@ def extract_sql_joins(sql_text: str, tables: list,
         cand["sql_frequency"] = int(freq[cid])
         cand["evidence"]["sql"] = {"frequency": int(freq[cid])}
         out.append(cand)
+    # Join endpoints that are not registered tables — names come from the
+    # admin's own pasted SQL and go only back to the admin's browser.
+    stats["unknown_tables"] = sorted(unknown)[:10]
     return out, stats
 
 
@@ -710,9 +889,15 @@ def band_all(candidates: list) -> list:
 # ---------------------------------------------------------------------------
 
 def discover(tables: list, fk_map: dict) -> list:
-    """Generate + merge + drop already-declared. Verification and banding are
-    invoked separately by the caller so analyze_sql reuses them."""
+    """Generate + merge, then drop same-physical pairs, drop candidates
+    already declared to ANY registration of the physical target, and collapse
+    duplicate-registration fan-out to one candidate per physical pair.
+    Verification and banding are invoked separately by the caller so
+    analyze_sql reuses them. Single-registration registries behave exactly as
+    before (the physical filters degenerate to the id-level ones)."""
     merged = merge_candidates(fk_candidates(tables, fk_map),
                               name_candidates(tables),
                               description_candidates(tables))
-    return filter_existing(merged, tables)
+    merged = filter_same_physical(merged, tables)
+    merged = filter_existing_physical(merged, tables)
+    return dedupe_physical_targets(merged, tables)

@@ -245,9 +245,27 @@ body.admin-ds-page {
 
 /* ── Relations (confirmed overview + discovery) ────────────────────────── */
 .adm-rel-confirmed-card { margin-bottom: 16px; }
+.adm-rel-candidates-card { margin-bottom: 16px; }
 .adm-rel-nonew { padding: 10px 2px; font-size: 13.5px; }
 .adm-rel-suggestion { background: #f8fafc; }
 .adm-rel-sql-card { margin-bottom: 16px; }
+.adm-rel-group {
+  border: 1px solid #e2e8f0; border-radius: 10px;
+  padding: 10px 14px; margin-bottom: 10px;
+}
+.adm-rel-group .adm-rel-cand { border: 0; border-top: 1px solid #f1f5f9;
+  border-radius: 0; padding: 8px 0 6px; margin-bottom: 0; }
+.adm-rel-group-head { display: flex; align-items: baseline; gap: 10px;
+  flex-wrap: wrap; font-size: 13.5px; color: #0f172a; padding-bottom: 4px; }
+.adm-rel-group-head .adm-cell-sub { margin-left: 4px; }
+.adm-rel-arrow { color: #94a3b8; }
+.adm-rel-alt { font-size: 12px; }
+.adm-suggest-panel {
+  border: 1px solid #93c5fd; border-left: 4px solid #1276C2;
+  background: #f0f7ff; border-radius: 10px;
+  padding: 4px 14px 10px; margin-bottom: 14px;
+}
+.adm-suggest-panel .adm-rel-cand { background: #fff; }
 .adm-rel-sql-card textarea {
   width: 100%; box-sizing: border-box; resize: vertical;
   border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 10px;

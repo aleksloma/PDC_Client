@@ -121,18 +121,54 @@
 
         <!-- Zone A: every confirmed relation across all registered tables -->
         <div id="relConfirmedCard" class="adm-card adm-rel-confirmed-card">
-          <div class="adm-subhead"><h4>Confirmed relations</h4></div>
-          <div id="relConfirmedEmpty" class="adm-muted adm-rel-band-empty hidden">
-            No relations confirmed yet — scan below for proposals, or add them manually in each
-            table's settings (Registered tables → ✎).
+          <div class="adm-subhead">
+            <h4>Confirmed relations</h4>
+            <button id="btnRelDeleteFlagged" class="adm-btn ghost small hidden"
+              title="Delete every relation flagged as joining a table to its own duplicate registration">
+              🗑 Delete all flagged</button>
           </div>
-          <div id="relConfirmedList" class="adm-table-scroll"></div>
+          <div id="relConfirmedEmpty" class="adm-muted adm-rel-band-empty hidden">
+            No relations confirmed yet — scan for proposals in the candidates panel, or add them
+            manually in each table's settings (Registered tables → ✎).
+          </div>
+          <div id="relConfirmedList"></div>
+        </div>
+
+        <!-- Zone B: discovery output, directly under the confirmed list so a
+             scan's result lands where the eye already is -->
+        <div class="adm-card adm-rel-candidates-card">
+          <div class="adm-subhead"><h4>Proposed candidates <span class="adm-label-note">(from
+            “Scan for relations” above and “Analyze SQL” below — nothing is applied until you
+            accept)</span></h4></div>
+          <div id="relDegraded" class="adm-alert warn hidden"></div>
+          <div id="relNoNew" class="adm-muted adm-rel-nonew hidden"></div>
+          <div id="relEmpty" class="adm-empty">
+            <div class="adm-empty-ico">🔗</div>
+            <p>No candidates yet.</p>
+            <p class="adm-muted">Run “Scan for relations” to propose joins from foreign keys and
+              column-name similarity, or paste SQL below.</p>
+          </div>
+          <div id="relBands" class="hidden">
+            <div class="adm-rel-bulkbar">
+              <button id="btnRelAcceptChecked" class="adm-btn primary">✔ Accept all checked</button>
+              <span id="relCheckedCount" class="adm-muted"></span>
+            </div>
+            <div class="adm-subhead"><h4>Confirmed <span class="adm-label-note">(strong evidence —
+              pre-checked)</span></h4></div>
+            <div id="relBandConfirmed"></div>
+            <div class="adm-subhead"><h4>Suggested <span class="adm-label-note">(good evidence —
+              review and tick to accept)</span></h4></div>
+            <div id="relBandSuggested"></div>
+            <div class="adm-subhead"><h4>Needs attention <span class="adm-label-note">(weak overlap,
+              many-to-many, or unverified)</span></h4></div>
+            <div id="relBandAttention"></div>
+          </div>
         </div>
 
         <div class="adm-card adm-rel-sql-card">
           <div class="adm-subhead">
             <h4>Analyze SQL <span class="adm-label-note">(optional — paste SELECT queries your team
-              already runs; their joins become candidates)</span></h4>
+              already runs; their joins become candidates above)</span></h4>
           </div>
           <textarea id="relSqlInput" rows="5"
             placeholder="Paste one or more SELECT statements…"></textarea>
@@ -144,31 +180,6 @@
             <span class="adm-muted">SQL is parsed in memory on this server only — it is never
               stored, logged, or sent anywhere.</span>
           </div>
-        </div>
-
-        <div id="relDegraded" class="adm-alert warn hidden"></div>
-        <div id="relNoNew" class="adm-muted adm-rel-nonew hidden"></div>
-        <div id="relEmpty" class="adm-empty">
-          <div class="adm-empty-ico">🔗</div>
-          <p>No candidates yet.</p>
-          <p class="adm-muted">Run “Scan for relations” to propose joins from foreign keys and
-            column-name similarity, or paste SQL above.</p>
-        </div>
-
-        <div id="relBands" class="hidden">
-          <div class="adm-rel-bulkbar">
-            <button id="btnRelAcceptChecked" class="adm-btn primary">✔ Accept all checked</button>
-            <span id="relCheckedCount" class="adm-muted"></span>
-          </div>
-          <div class="adm-subhead"><h4>Confirmed <span class="adm-label-note">(strong evidence —
-            pre-checked)</span></h4></div>
-          <div id="relBandConfirmed"></div>
-          <div class="adm-subhead"><h4>Suggested <span class="adm-label-note">(good evidence —
-            review and tick to accept)</span></h4></div>
-          <div id="relBandSuggested"></div>
-          <div class="adm-subhead"><h4>Needs attention <span class="adm-label-note">(weak overlap,
-            many-to-many, or unverified)</span></h4></div>
-          <div id="relBandAttention"></div>
         </div>
       </section>
 
@@ -298,7 +309,9 @@
         <!-- Step 2: describe -->
         <div id="twStep2" class="adm-wstep" hidden>
           <p class="adm-step-hint">These names and descriptions are what the AI uses to understand
-             the table — write them for a colleague who has never seen this database.</p>
+             the table — write them for a colleague who has never seen this database.
+             <span class="adm-muted">Relation suggestions (foreign keys, matching column names)
+             appear at the Confirm step.</span></p>
           <div class="adm-form-grid">
             <label class="span2">Display name <span class="adm-label-note">(what users see, e.g. “clients information”)</span>
               <input type="text" id="twDisplayName" />
@@ -340,11 +353,13 @@
             directly; it is auto-included whenever a related table is used.</span>
           </label>
 
-          <div class="adm-subhead">
-            <h4>Suggested relations <span class="adm-label-note">(from this table's foreign keys and
-              column-name similarity — checked rows are saved with the table)</span></h4>
+          <div class="adm-suggest-panel">
+            <div class="adm-subhead">
+              <h4>💡 Suggested relations <span class="adm-label-note">(from this table's foreign keys
+                and column-name similarity — checked rows are saved with the table)</span></h4>
+            </div>
+            <div id="twSuggestions" class="adm-muted adm-rel-band-empty">Loading suggestions…</div>
           </div>
-          <div id="twSuggestions" class="adm-muted adm-rel-band-empty">Loading suggestions…</div>
 
           <div class="adm-subhead">
             <h4>Relations <span class="adm-label-note">(join keys to other registered tables — lets the AI join correctly)</span></h4>

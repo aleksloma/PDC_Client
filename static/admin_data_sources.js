@@ -63,6 +63,7 @@
   let wizardStep = 1;
   let WIZ_SUGGESTIONS = [];     // wizard relation suggestions (step 3)
   let _wizSuggestToken = 0;     // supersedes stale in-flight suggestion loads
+  let _wizSuggestLoading = false; // blocks Save mid-load (pre-checked rows!)
 
   let RELCANDIDATES = [];       // discover-relations proposals (session-local)
   const REL_DISMISSED = new Set(); // dismissed candidate ids (session-local by design)
@@ -443,12 +444,34 @@
     const r = await api(`/api/admin/connections/${wizardConnId}/tables?schema=${encodeURIComponent($('twSchema').value)}`);
     const sel = $('twTable');
     sel.innerHTML = '';
+    // A physical table can be registered only once (the server enforces it
+    // too — 400 DUPLICATE_TABLE): registered tables stay visible but
+    // disabled, labeled with the registration they belong to. In edit mode
+    // the edited table's own row stays selectable.
+    const own = editingTableId ? TABLES.find((x) => x.id === editingTableId) : null;
     (r.data.tables || []).forEach((t) => {
       const o = document.createElement('option');
       o.value = t.name;
-      o.textContent = t.name + (t.registered ? ' (registered)' : '') + (t.kind === 'view' ? ' [view]' : '');
+      const view = t.kind === 'view' ? ' [view]' : '';
+      // case-insensitive: the server's physical identity lowercases too
+      const isOwn = !!(own && String(own.table_name).toLowerCase() === String(t.name).toLowerCase()
+        && String(own.schema || '').toLowerCase() === $('twSchema').value.toLowerCase());
+      if (t.registered && !isOwn) {
+        o.disabled = true;
+        o.textContent = `${t.name}${view} — already registered as '${t.registered_as || '?'}'`;
+      } else {
+        o.textContent = t.name + view + (isOwn ? ' (this registration)' : '');
+      }
       sel.appendChild(o);
     });
+    if (sel.selectedIndex >= 0 && sel.options[sel.selectedIndex].disabled) {
+      const firstEnabled = Array.from(sel.options).findIndex((o) => !o.disabled);
+      sel.selectedIndex = firstEnabled;
+      if (firstEnabled === -1) {
+        $('twPickStatus').textContent =
+          'Every table in this schema is already registered.';
+      }
+    }
   }
 
   async function introspectNow(existing, opts) {
@@ -614,11 +637,12 @@
     WIZ_SUGGESTIONS = [];
     if (!currentIntro) {
       _wizSuggestToken++;            // invalidate any in-flight load
-      box.className = 'adm-muted adm-rel-band-empty';
-      box.textContent = 'No suggested relations found.';
+      _wizSuggestLoading = false;    // (its completion no longer clears this)
+      renderWizardSuggestions();
       return;
     }
     const token = ++_wizSuggestToken;
+    _wizSuggestLoading = true;
     box.className = 'adm-muted adm-rel-band-empty';
     box.textContent = 'Loading suggestions…';
     const columns = [];
@@ -627,10 +651,13 @@
         description: tr.querySelector('.tw-col-desc').value.trim() });
     });
     const p = currentPreview;
-    const r = await api('/api/admin/relations/wizard_suggest', {
-      method: 'POST',
-      body: JSON.stringify({
+    let r;
+    try {
+      r = await api('/api/admin/relations/wizard_suggest', {
+        method: 'POST',
+        body: JSON.stringify({
         editing_tid: editingTableId || '',
+        connection_id: wizardConnId || '',
         schema: $('twSchema').value,
         table_name: $('twTable').value,
         display_name: $('twDisplayName').value.trim(),
@@ -638,11 +665,23 @@
         foreign_keys: currentIntro.foreign_keys || [],
         relations: collectRelations(),
         sample: p && p.ok ? { columns: p.columns, rows: p.rows } : null,
-      }),
-    });
+        }),
+      });
+    } catch (e) {
+      // A thrown fetch must not leave the loading flag stuck (Save would
+      // refuse forever) nor misreport an error as "no matches".
+      if (token === _wizSuggestToken) {
+        _wizSuggestLoading = false;
+        box.className = 'adm-muted adm-rel-band-empty';
+        box.textContent = 'Could not load suggestions — you can still add relations manually below.';
+      }
+      return;
+    }
     if (token !== _wizSuggestToken) return;   // superseded by a newer open
+    _wizSuggestLoading = false;
     if (!r.data.ok) {
-      box.textContent = 'No suggested relations found.';
+      box.className = 'adm-muted adm-rel-band-empty';
+      box.textContent = 'Could not load suggestions — you can still add relations manually below.';
       return;
     }
     WIZ_SUGGESTIONS = r.data.candidates || [];
@@ -652,22 +691,27 @@
   function renderWizardSuggestions() {
     const box = $('twSuggestions');
     if (!WIZ_SUGGESTIONS.length) {
+      // Panel stays visible with the WHY — a collapsed line reads as "the
+      // feature doesn't exist" (live-testing finding).
       box.className = 'adm-muted adm-rel-band-empty';
-      box.textContent = 'No suggested relations found.';
+      box.textContent = 'No suggested relations found — suggestions appear when '
+        + "this table's foreign keys or column names match another registered table.";
       return;
     }
     box.className = '';
     box.innerHTML = WIZ_SUGGESTIONS.map((c, i) => {
       const pairs = (c.join_keys || []).map((pair) =>
-        `${esc(pair[0])} → <strong>${esc(c.related_label)}</strong>.${esc(pair[1])}`).join('<br>');
+        `<strong>${esc(c.table_label)}</strong>.${esc(pair[0])} → ` +
+        `<strong>${esc(c.related_label)}</strong>.${esc(pair[1])}`).join('<br>');
       const chips = [];
-      if (c.cardinality) chips.push(`<span class="adm-chip">${esc(REL_CARD_LABEL[c.cardinality] || c.cardinality)}</span>`);
+      chips.push(cardChip(c.cardinality));
       if (c.verified && c.overlap_pct != null) {
         chips.push(`<span class="adm-chip">≈${esc(c.overlap_pct)}% key match (estimated from sample) · ${esc(Number(c.orphans).toLocaleString())} orphan(s)</span>`);
       } else if (!c.verified) {
         chips.push(`<span class="adm-chip bad" title="${esc(c.unverified_reason || '')}">unverified</span>`);
       }
-      (c.sources || []).forEach((s) => chips.push(`<span class="adm-chip conn">${esc(s)}</span>`));
+      (c.sources || []).forEach((s) => chips.push(originChip(s)));
+      if (altNote(c)) chips.push(altNote(c));
       return `
         <div class="adm-rel-cand adm-rel-suggestion" data-idx="${i}">
           <input type="checkbox" class="tw-sugg-check" ${c.precheck ? 'checked' : ''}>
@@ -697,6 +741,42 @@
   const REL_CARD_LABEL = { 'N:1': 'many-to-one', '1:1': 'one-to-one',
                            '1:N': 'one-to-many', 'N:M': 'many-to-many' };
   const REL_ORIGINS = ['fk', 'sql', 'name', 'description'];
+  const REL_ORIGIN_TIP = {
+    fk: 'Declared foreign key in the source database',
+    sql: 'Seen in analyzed SQL joins',
+    name: 'Matched by column-name similarity',
+    description: 'Matched by column-description similarity',
+    manual: 'Added manually',
+  };
+  const REL_CARD_TIP = {
+    'N:1': 'Many-to-one: many rows on the left match one row on the right',
+    '1:1': 'One-to-one: rows match pairwise',
+    '1:N': 'One-to-many: one row on the left matches many rows on the right',
+    'N:M': 'Many-to-many: neither side is unique — usually not a real join key',
+  };
+
+  function originChip(origin) {
+    return `<span class="adm-chip conn" title="${esc(REL_ORIGIN_TIP[origin] || '')}">${esc(origin)}</span>`;
+  }
+  function cardChip(card) {
+    if (!card) return '';
+    return `<span class="adm-chip" title="${esc(REL_CARD_TIP[card] || '')}">${esc(REL_CARD_LABEL[card] || card)}</span>`;
+  }
+  function altNote(c) {
+    const alts = c.alternate_targets || [];
+    if (!alts.length) return '';
+    return `<span class="adm-muted adm-rel-alt" title="This physical table has duplicate registrations; the preferred one was chosen — use Edit to retarget.">also registered as: ${esc(alts.map((a) => a.label).join(', '))}</span>`;
+  }
+
+  function _physLabel(t) {
+    return t ? `${t.schema ? t.schema + '.' : ''}${t.table_name}` : '';
+  }
+  function _samePhysicalDocs(a, b) {
+    return !!(a && b && a.connection_id && b.connection_id
+      && a.connection_id === b.connection_id
+      && String(a.schema || '').toLowerCase() === String(b.schema || '').toLowerCase()
+      && String(a.table_name || '').toLowerCase() === String(b.table_name || '').toLowerCase());
+  }
 
   function confirmedRelCount() {
     let n = 0;
@@ -707,22 +787,32 @@
   }
 
   function relOverviewEntries() {
-    const nameOf = (tid) => (TABLES.find((t) => t.id === tid) || {}).display_name;
+    const byId = (tid) => TABLES.find((t) => t.id === tid) || null;
     const entries = [];
     TABLES.forEach((t) => (t.relations || []).forEach((rel) => {
       if (!rel || typeof rel !== 'object') return;
       const rid = rel.related_table_id || rel.related_table || '';
+      const parentDoc = byId(rel.related_table_id);
+      // Suspicious = both sides are registrations of ONE physical table (the
+      // duplicate-registration noise). Legacy name refs flag when the name
+      // equals the child's own physical name.
+      const suspicious = parentDoc
+        ? _samePhysicalDocs(t, parentDoc)
+        : (!rel.related_table_id && String(rid).toLowerCase() === _physLabel(t).toLowerCase());
       entries.push({
         table_id: t.id,
         child_label: t.display_name,
+        child_phys: _physLabel(t),
         related_ref: String(rid),
         related_is_id: !!rel.related_table_id,
-        related_label: nameOf(rel.related_table_id) || String(rid) || '?',
+        related_label: (parentDoc || {}).display_name || String(rid) || '?',
+        parent_phys: parentDoc ? _physLabel(parentDoc) : String(rid),
         join_keys: (rel.join_keys || [])
           .filter((p) => Array.isArray(p) && p.length === 2)
           .map((p) => [String(p[0]), String(p[1])]),
         cardinality: rel.cardinality || null,
         origin: rel.origin || 'manual',       // pre-discovery entries had no origin
+        suspicious,
       });
     }));
     return entries;
@@ -733,24 +823,46 @@
     if (!list) return;
     const entries = relOverviewEntries();
     $('relConfirmedEmpty').classList.toggle('hidden', !!entries.length);
-    list.innerHTML = entries.map((e, i) => {
-      const pairs = e.join_keys.map((p) =>
-        `<strong>${esc(e.child_label)}</strong>.${esc(p[0])} → ` +
-        `<strong>${esc(e.related_label)}</strong>.${esc(p[1])}`).join('<br>');
-      const chips = [];
-      if (e.cardinality) chips.push(`<span class="adm-chip">${esc(REL_CARD_LABEL[e.cardinality] || e.cardinality)}</span>`);
-      chips.push(`<span class="adm-chip conn">${esc(e.origin)}</span>`);
-      return `
-        <div class="adm-rel-cand" data-idx="${i}">
-          <div class="adm-rel-cand-main">
-            <div class="adm-rel-cand-title">${pairs || esc(e.child_label) + ' → ' + esc(e.related_label)}</div>
-            <div class="adm-rel-cand-meta">${chips.join(' ')}</div>
-          </div>
-          <div class="adm-rel-cand-actions">
-            <button class="adm-icon-btn" data-act="edit" title="Edit relation">✎</button>
-            <button class="adm-icon-btn" data-act="delete" title="Delete relation">🗑</button>
-          </div>
+    $('btnRelDeleteFlagged').classList.toggle('hidden',
+      !entries.some((e) => e.suspicious));
+    // Grouped by table pair: one group card per child→parent, each key-set
+    // variant (exact duplicates, subsets, composites) as a sub-row inside it.
+    const groups = new Map();
+    entries.forEach((e, i) => {
+      const k = e.table_id + '|' + e.related_ref;
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(i);
+    });
+    list.innerHTML = Array.from(groups.values()).map((idxs) => {
+      const first = entries[idxs[0]];
+      const head = `
+        <div class="adm-rel-group-head">
+          <span><strong>${esc(first.child_label)}</strong>
+            <span class="adm-cell-sub">${esc(first.child_phys)}</span></span>
+          <span class="adm-rel-arrow">→</span>
+          <span><strong>${esc(first.related_label)}</strong>
+            <span class="adm-cell-sub">${esc(first.parent_phys)}</span></span>
         </div>`;
+      const rows = idxs.map((i) => {
+        const e = entries[i];
+        const keys = e.join_keys.map((p) => `${esc(p[0])} = ${esc(p[1])}`).join(', ');
+        const chips = [];
+        if (e.suspicious) chips.push('<span class="adm-chip bad" title="Both sides are registrations of the same physical source table — this relation joins a table to its own copy and is almost certainly noise. Delete it.">⚠ same physical table</span>');
+        chips.push(cardChip(e.cardinality));
+        chips.push(originChip(e.origin));
+        return `
+          <div class="adm-rel-cand" data-idx="${i}">
+            <div class="adm-rel-cand-main">
+              <div class="adm-rel-cand-title">${keys || '—'}</div>
+              <div class="adm-rel-cand-meta">${chips.filter(Boolean).join(' ')}</div>
+            </div>
+            <div class="adm-rel-cand-actions">
+              <button class="adm-icon-btn" data-act="edit" title="Edit relation">✎</button>
+              <button class="adm-icon-btn" data-act="delete" title="Delete relation">🗑</button>
+            </div>
+          </div>`;
+      }).join('');
+      return `<div class="adm-rel-group">${head}${rows}</div>`;
     }).join('');
     list.querySelectorAll('.adm-rel-cand').forEach((row) => {
       const entry = entries[parseInt(row.dataset.idx, 10)];
@@ -759,6 +871,31 @@
           ? relOverviewEdit(entry, row) : relOverviewDelete(entry)));
       });
     });
+  }
+
+  async function deleteFlaggedRelations() {
+    const flagged = relOverviewEntries().filter((e) => e.suspicious);
+    if (!flagged.length) return;
+    if (!window.confirm(`Delete ${flagged.length} flagged relation(s)? Each joins a table to its own duplicate registration and carries no information.`)) return;
+    _busy('Deleting flagged relations…');
+    let failed = 0;
+    try {
+      for (const e of flagged) {
+        const body = { table_id: e.table_id, join_keys: e.join_keys };
+        if (e.related_is_id) body.related_table_id = e.related_ref;
+        else body.related_table = e.related_ref;
+        try {
+          const r = await api('/api/admin/relations/delete', {
+            method: 'POST', body: JSON.stringify(body) });
+          // delete removes ALL exact matches, so an identical duplicate may
+          // 404 on the second call — that one is expected, not a failure.
+          if (!(r.ok || r.status === 404)) failed++;
+        } catch (err) { failed++; }
+      }
+    } finally { _busyDone(); }
+    if (failed) toast(`Deleted with ${failed} failure(s) — check the audit log`, true);
+    else toast(`Deleted ${flagged.length} flagged relation(s)`);
+    loadAll();
   }
 
   async function relOverviewDelete(e) {
@@ -861,14 +998,15 @@
       `<strong>${esc(c.table_label)}</strong>.${esc(p[0])} → ` +
       `<strong>${esc(c.related_label)}</strong>.${esc(p[1])}`).join('<br>');
     const chips = [];
-    if (c.cardinality) chips.push(`<span class="adm-chip">${esc(REL_CARD_LABEL[c.cardinality] || c.cardinality)}</span>`);
+    chips.push(cardChip(c.cardinality));
     if (c.verified) {
       chips.push(`<span class="adm-chip ${c.overlap_pct >= 95 ? 'ok' : ''}">${esc(c.overlap_pct)}% match · ${esc(Number(c.orphans).toLocaleString())} orphan(s)</span>`);
     } else {
       chips.push(`<span class="adm-chip bad" title="${esc(c.unverified_reason || '')}">unverified</span>`);
     }
-    (c.sources || []).forEach((s) => chips.push(`<span class="adm-chip conn">${esc(s)}</span>`));
+    (c.sources || []).forEach((s) => chips.push(originChip(s)));
     if (c.sql_frequency > 0) chips.push(`<span class="adm-chip">×${esc(c.sql_frequency)} statement(s)</span>`);
+    if (altNote(c)) chips.push(altNote(c));
     return `
       <div class="adm-rel-cand" data-cid="${esc(c.candidate_id)}">
         <input type="checkbox" class="rel-check" ${c.band === 'confirmed' ? 'checked' : ''}>
@@ -960,9 +1098,18 @@
     } finally { _busyDone(); }
     if (!r.data.ok) { toast(r.data.error || 'SQL analysis failed', true); return; }
     mergeRelCandidates(r.data.candidates || []);
-    _renderNoNew((r.data.candidates || []).length, r.data.confirmed_count || 0);
-    renderRelCandidates();
     const st = r.data.stats || {};
+    const unknown = st.unknown_tables || [];
+    if (!(r.data.candidates || []).length && unknown.length) {
+      // The honest reason beats "already confirmed": the SQL joins tables
+      // that are not registered, so they can never become candidates.
+      const box = $('relNoNew');
+      box.textContent = `No candidates — these tables in the SQL are not registered: ${unknown.join(', ')}. Register them first, then analyze again.`;
+      box.classList.remove('hidden');
+    } else {
+      _renderNoNew((r.data.candidates || []).length, r.data.confirmed_count || 0);
+    }
+    renderRelCandidates();
     const failNote = st.failed ? ` (${st.failed} statement(s) could not be parsed)` : '';
     toast(`Analyzed ${st.statements || 0} statement(s) — ${(r.data.candidates || []).length} candidate(s)${failNote}`, !!st.failed);
   }
@@ -1091,6 +1238,12 @@
 
   async function saveTable() {
     if (!currentIntro) return;
+    if (_wizSuggestLoading) {
+      // Pre-checked suggestion rows would silently NOT be committed if the
+      // save raced the (sub-second) suggestions load.
+      toast('Relation suggestions are still loading — one moment…', true);
+      return;
+    }
     const columns = [];
     document.querySelectorAll('#twColsBody tr').forEach((tr) => {
       columns.push({
@@ -1258,6 +1411,7 @@
     $('btnRelScan').addEventListener('click', scanRelations);
     $('btnRelAnalyzeSql').addEventListener('click', analyzeRelSql);
     $('btnRelAcceptChecked').addEventListener('click', acceptCheckedRelCandidates);
+    $('btnRelDeleteFlagged').addEventListener('click', deleteFlaggedRelations);
 
     $('btnSaveSchedule').addEventListener('click', saveSchedule);
     $('btnReloadAudit').addEventListener('click', loadAudit);
