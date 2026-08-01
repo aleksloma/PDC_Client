@@ -683,6 +683,31 @@ datetimes serialize with a time-of-day the parquet string form lacks).
 Checked suggestions ride the wizard's NORMAL confirm+snapshot save.
 Suggestions are computed only when the step opens; no background scanning.
 
+**Physical identity + the one-registration rule.** A registration's physical
+identity is `(connection_id, lower(schema), lower(table_name))`. Live
+testing showed that a table registered TWICE turned discovery into a noise
+generator (self-relations between the copies, FK fan-out to every copy), so:
+(1) candidate generation never proposes a relation whose two sides are
+registrations of one physical table; (2) a relation confirmed to ANY
+registration of a physical target suppresses re-proposals to its
+duplicates; (3) duplicate-registration fan-out collapses to ONE candidate
+targeting the preferred registration — connector first (connectors exist to
+be auto-included via relations), then earliest-registered, deterministic —
+with `alternate_targets` noted for retargeting; (4) a physical table can be
+REGISTERED only once — the save rejects a new physical mapping another
+registration covers (`400 DUPLICATE_TABLE`), the wizard dropdown disables
+registered tables ("already registered as 'X'"), and connector-vs-normal is
+toggled on the existing registration instead of registering a second copy.
+Preference never crosses physical tables: a same-named table on two
+connections stays ambiguous. LEGACY duplicates in stored data keep loading
+and working (an edit keeping its stored physical key always saves; nothing
+is auto-deleted) — the overview flags their self-relations with a
+"same physical table" badge and offers per-row and bulk delete, so the
+admin cleans them deliberately. The overview groups relations by table pair
+and shows the physical `schema.table` under the display names, so duplicate
+registrations are visible instead of looking like inexplicable twins.
+Findings + plan: `docs/RELATIONS_UX_PLAN.md`.
+
 **Security** — see AI_CONSTITUTION Article VII (rules 8–9): SELECT-only
 connector, sandbox import denylist (defense in depth — the customer's
 dedicated SELECT-only DB login is the real guarantee), encrypted credentials,
