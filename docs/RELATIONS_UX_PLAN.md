@@ -120,3 +120,85 @@ Additions from Phase-1 research (marked as such):
 No changes to scan scoring thresholds, sqlglot parsing, accept/dismiss/delete
 semantics beyond the plan items, snapshots, scheduler, schema_text, or user
 pages. No brain calls. Single-registration behavior byte-identical.
+
+---
+
+# v3 — structured editor, missing-table hints, relations graph
+
+## Baseline findings (research pass on the verified-fresh stack)
+
+1. **(Critical) Wizard save persists join-key typos silently** — the free-text
+   editor accepts `client_idd=client_id` and `save_table` stores relations
+   verbatim while `/relations/accept` validates columns: the same typo is a
+   400 in the inline editor and silent corruption via the wizard.
+2. **(High) Column names must be typed from memory** — neither side's column
+   list is on screen at the relations step; no pickers, no dtype hints;
+   malformed text (`a b` without `=`) silently drops the whole row.
+3. **(Critical) The scan says nothing about unregistered FK targets** —
+   `tr_data`'s live FK to unregistered `prod_dict` appears nowhere; a
+   forgotten dictionary table is invisible.
+4. **(High) Dangling relations render as raw 16-hex ids** — deleting a
+   registration leaves its inbound relations "confirmed", labeled with the
+   dead id, counted in the badge, never flagged.
+5. **(Med) SQL unknown-table message is honest but a dead end** — no way to
+   act on "register them first".
+6. **(High) No structure is readable from the flat list** — hubs, isolated
+   tables, and clusters are invisible; at 20 tables it would be unreadable.
+7. Inline-editor validation errors are transient API-speak toasts; a failed
+   accept leaves no audit row; suggestion rows for structurally-verified
+   (numbers-dropped) candidates show no evidence chip.
+
+## v3 items
+
+- [x] **(A) Structured pair editor** `createPairEditor` (paired column
+  dropdowns with dtypes shown, per-row remove, "+ add column pair",
+  non-blocking dtype-family warning mirroring the verification rule, missing
+  registry columns rendered "<name> (missing)" in invalid style — never
+  dropped) replacing free text at ALL manual surfaces: wizard step-3 rows,
+  overview inline edit, candidate inline edit, and the NEW overview
+  "+ Add relation" (child+target pickers, saved via accept, renders as
+  manual). Accept-backed editors disable Save while a missing pair remains
+  (accept 400s on unknown columns); the wizard path stays non-blocking.
+  `parseJoinKeys` deleted. Storage format and API payloads unchanged.
+- [x] **(B) Missing-table hints**: scan response gains `unregistered_refs`
+  (pure `unregistered_fk_refs` — connection-scoped, schema falls back to the
+  child's) rendered as "Referenced but not registered" rows; analyze_sql
+  gains `unknown_table_hints` (pure `resolve_unknown_tables` — hint only on
+  an unambiguous connection, never for already-registered names) rendered
+  with the same shortcut. **Register as connector** opens the wizard
+  prefilled (connection/schema/table via the loadSchemas path,
+  case-insensitive table match, connector ticked inside introspectNow);
+  nothing auto-registers. Just-registered ghosts drop from the list at
+  render without a re-scan.
+- [x] **(C) Graph view** (List | Graph toggle in the Relations head, List
+  default): vendored **Cytoscape.js 3.34.0 (MIT)** at
+  `static/vendor/cytoscape/` (license sidecar; lazy-loaded on first
+  toggle). Pure `build_graph` (components via BFS, isolated flags, connector
+  + relation-count styling data, suspicious same-physical edges, legacy name
+  refs resolved to the preferred registration, dashed ghost nodes/edges)
+  behind `POST /api/admin/relations/graph` — the one new endpoint, required
+  by the pure-logic test mandate. Distinct component colors, red isolated
+  nodes, ⚙ connector badge, legend; edge tap → popover with Edit (hands off
+  to the List row's structured editor) / Delete; node tap → neighbor
+  highlight; ghost tap → the register shortcut; cose layout;
+  `cy.destroy()` on toggle/section switch.
+
+Additions from the research pass (marked as such):
+
+- [x] **(v3-d, addition — finding 1)** `save_table` logs
+  `REL_SAVE_UNKNOWN_COLUMN` when a posted relation references a column absent
+  from the posted/registered metadata — observability for the wizard path
+  WITHOUT changing the frozen API contract (rejecting would break payloads
+  the API must keep accepting; the structured editor removes the UI-side
+  cause).
+- [x] **(v3-e, addition — finding 4)** Overview entries whose
+  `related_table_id` no longer resolves are flagged "target registration
+  deleted" in warning style (no more raw hex labels) and keep one-click
+  delete; the graph already skips them (logged).
+- [x] **(v3-f, addition — finding 7)** Failed `/relations/accept` validation
+  now writes an `ok:false` audit row (parity with `admin.denied`).
+
+Deferred (recorded, out of v3 scope): evidence upgrades for already-confirmed
+edges (frozen candidate rules); auto re-analyze after registering from an SQL
+hint; snapshot-free metadata edits; favicon 404; richer near-miss suggestions
+in validation errors.

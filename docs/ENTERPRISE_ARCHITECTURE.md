@@ -708,6 +708,32 @@ and shows the physical `schema.table` under the display names, so duplicate
 registrations are visible instead of looking like inexplicable twins.
 Findings + plan: `docs/RELATIONS_UX_PLAN.md`.
 
+**Relations v3 — structured editing, missing-table hints, graph.** Manual
+join keys are edited ONLY through the structured pair editor (paired column
+dropdowns fed by stored registry metadata; non-blocking dtype-family warning
+mirroring the verification rule; stored columns absent from the registry
+render "(missing)" and gate Save on the accept-backed paths — the wizard's
+store-verbatim save contract is frozen, so unknown columns there are made
+observable via the `REL_SAVE_UNKNOWN_COLUMN` log instead of rejected). FKs
+pointing at UNREGISTERED tables surface after a scan as "Referenced but not
+registered" rows, and analyze_sql's unknown tables carry the same
+"Register as connector" shortcut when the connection is unambiguous — the
+shortcut only PREFILLS the register wizard (connection/schema/table +
+connector ticked); nothing auto-registers, and the post-registration flow is
+the normal one (the next scan proposes its relations). The Relations section
+has a Graph view (List default): nodes = registered tables (connector-badged,
+sized by relation count, component-colored, isolated tables warned "the AI
+cannot combine it with others"), edges = confirmed relations labeled with
+join keys + cardinality (same-physical noise in warning style, dangling refs
+skipped), dashed ghost nodes for the unregistered FK refs, edge popover with
+Edit (hands off to the list's structured editor) and Delete. Rendering uses
+**vendored Cytoscape.js 3.34.0 (MIT license, `static/vendor/cytoscape/`
+with license sidecar)** — enterprise clients run on LANs, so no CDN ever;
+graph data is assembled by the pure `relation_discovery.build_graph` behind
+`POST /api/admin/relations/graph` (metadata only). Dangling relations (a
+deleted target registration) are flagged in the list instead of showing raw
+ids; failed relation-accept validation is audited `ok:false`.
+
 **Security** — see AI_CONSTITUTION Article VII (rules 8–9): SELECT-only
 connector, sandbox import denylist (defense in depth — the customer's
 dedicated SELECT-only DB login is the real guarantee), encrypted credentials,
