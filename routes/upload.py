@@ -738,11 +738,16 @@ def _db_meta_entry(row: dict, df_key: str, auto_included: bool,
         rid = rel.get("related_table_id") or rel.get("related_table")
         related_key = (name_of.get(rid) or name_of.get(str(rid).lower())
                        or rel.get("related_df_key"))
-        relations.append({
+        entry = {
             "related_table_id": rid,
             "related_df_key": related_key,
             "join_keys": rel.get("join_keys") or [],
-        })
+        }
+        # Discovered-relation extra (additive): schema_builder renders the
+        # cardinality suffix when present; old registry rows stay byte-identical.
+        if rel.get("cardinality") in ("N:1", "1:1", "1:N", "N:M"):
+            entry["cardinality"] = rel["cardinality"]
+        relations.append(entry)
     return {
         "file_name": df_key,
         "file_description": row.get("description") or "",

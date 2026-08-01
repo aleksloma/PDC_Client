@@ -59,8 +59,11 @@
   let wizardConnId = null;
   let wizardStep = 1;
 
+  let RELCANDIDATES = [];       // discover-relations proposals (session-local)
+  const REL_DISMISSED = new Set(); // dismissed candidate ids (session-local by design)
+
   // ── Sidebar navigation ─────────────────────────────────────────────────
-  const SECTIONS = ['connections', 'tables', 'schedule', 'audit'];
+  const SECTIONS = ['connections', 'tables', 'relations', 'schedule', 'audit'];
 
   function showSection(name) {
     if (!SECTIONS.includes(name)) name = 'connections';
@@ -96,6 +99,7 @@
     renderConnections();
     renderTables();
     renderSchedule(s.data);
+    renderRelDialects();
   }
 
   // ── Connections ────────────────────────────────────────────────────────
@@ -556,6 +560,7 @@
     const box = $('twRelations');
     const row = document.createElement('div');
     row.className = 'adm-rel-row';
+    row._rel = rel || null;   // original dict — extra keys (cardinality/origin) survive an unchanged save
     const options = TABLES
       .filter((t) => t.id !== editingTableId)
       .map((t) => `<option value="${esc(t.id)}" ${rel && rel.related_table_id === t.id ? 'selected' : ''}>${esc(t.display_name)}</option>`)
@@ -572,18 +577,249 @@
     box.appendChild(row);
   }
 
+  function parseJoinKeys(text) {
+    return String(text || '').split(',')
+      .map((s) => s.trim()).filter(Boolean)
+      .map((s) => s.split('=').map((x) => x.trim()))
+      .filter((p) => p.length === 2 && p[0] && p[1]);
+  }
+
   function collectRelations() {
     const rels = [];
     document.querySelectorAll('#twRelations .adm-rel-row').forEach((row) => {
       const target = row.querySelector('.tw-rel-target').value;
       if (!target) return;
-      const pairs = row.querySelector('.tw-rel-keys').value.split(',')
-        .map((s) => s.trim()).filter(Boolean)
-        .map((s) => s.split('=').map((x) => x.trim()))
-        .filter((p) => p.length === 2 && p[0] && p[1]);
-      if (pairs.length) rels.push({ related_table_id: target, join_keys: pairs });
+      const pairs = parseJoinKeys(row.querySelector('.tw-rel-keys').value);
+      if (!pairs.length) return;
+      // Carry discovered extras (cardinality/origin) through an UNCHANGED
+      // manual save — a re-save must not silently strip them. Changed target
+      // or keys invalidate the measured extras, so they are dropped then.
+      const orig = row._rel;
+      const unchanged = orig && orig.related_table_id === target
+        && JSON.stringify(orig.join_keys || []) === JSON.stringify(pairs);
+      rels.push(Object.assign({}, unchanged ? orig : {},
+        { related_table_id: target, join_keys: pairs }));
     });
     return rels;
+  }
+
+  // ── Discover relations ─────────────────────────────────────────────────
+  const REL_CARD_LABEL = { 'N:1': 'many-to-one', '1:1': 'one-to-one',
+                           '1:N': 'one-to-many', 'N:M': 'many-to-many' };
+
+  function renderRelDialects() {
+    const sel = $('relSqlDialect');
+    if (!sel) return;
+    const current = sel.value;
+    const types = Array.from(new Set(CONNECTIONS.map((c) => c.db_type))).sort();
+    sel.innerHTML = '<option value="">auto</option>' +
+      types.map((t) => `<option value="${esc(t)}">${esc(t)}</option>`).join('');
+    if (types.includes(current)) sel.value = current;
+  }
+
+  function mergeRelCandidates(list, opts) {
+    const replaceNonSql = !!(opts && opts.replaceNonSql);
+    const byId = {};
+    RELCANDIDATES.forEach((c) => {
+      if (replaceNonSql && !(c.sources || []).includes('sql')) return;
+      byId[c.candidate_id] = c;
+    });
+    (list || []).forEach((c) => {
+      if (REL_DISMISSED.has(c.candidate_id)) return;
+      const cur = byId[c.candidate_id];
+      if (!cur) { byId[c.candidate_id] = c; return; }
+      // Prefer the fresher entry but keep the union of evidence.
+      const merged = Object.assign({}, cur, c);
+      merged.sources = ['fk', 'sql', 'name', 'description']
+        .filter((s) => (cur.sources || []).includes(s) || (c.sources || []).includes(s));
+      merged.sql_frequency = Math.max(cur.sql_frequency || 0, c.sql_frequency || 0);
+      merged.evidence = Object.assign({}, cur.evidence || {}, c.evidence || {});
+      byId[c.candidate_id] = merged;
+    });
+    RELCANDIDATES = Object.values(byId);
+  }
+
+  function relCandRow(c) {
+    const pairs = (c.join_keys || []).map((p) =>
+      `<strong>${esc(c.table_label)}</strong>.${esc(p[0])} → ` +
+      `<strong>${esc(c.related_label)}</strong>.${esc(p[1])}`).join('<br>');
+    const chips = [];
+    if (c.cardinality) chips.push(`<span class="adm-chip">${esc(REL_CARD_LABEL[c.cardinality] || c.cardinality)}</span>`);
+    if (c.verified) {
+      chips.push(`<span class="adm-chip ${c.overlap_pct >= 95 ? 'ok' : ''}">${esc(c.overlap_pct)}% match · ${esc(Number(c.orphans).toLocaleString())} orphan(s)</span>`);
+    } else {
+      chips.push(`<span class="adm-chip bad" title="${esc(c.unverified_reason || '')}">unverified</span>`);
+    }
+    (c.sources || []).forEach((s) => chips.push(`<span class="adm-chip conn">${esc(s)}</span>`));
+    if (c.sql_frequency > 0) chips.push(`<span class="adm-chip">×${esc(c.sql_frequency)} statement(s)</span>`);
+    return `
+      <div class="adm-rel-cand" data-cid="${esc(c.candidate_id)}">
+        <input type="checkbox" class="rel-check" ${c.band === 'confirmed' ? 'checked' : ''}>
+        <div class="adm-rel-cand-main">
+          <div class="adm-rel-cand-title">${pairs}</div>
+          <div class="adm-rel-cand-meta">${chips.join(' ')}</div>
+        </div>
+        <div class="adm-rel-cand-actions">
+          <button class="adm-btn ghost small" data-act="accept">Accept</button>
+          <button class="adm-icon-btn" data-act="edit" title="Edit before accepting">✎</button>
+          <button class="adm-icon-btn" data-act="dismiss" title="Dismiss candidate">✕</button>
+        </div>
+      </div>`;
+  }
+
+  function updateRelChecked() {
+    const n = document.querySelectorAll('#relBands .rel-check:checked').length;
+    $('relCheckedCount').textContent = n ? `${n} selected` : '';
+  }
+
+  function renderRelCandidates() {
+    const bands = { confirmed: [], suggested: [], attention: [] };
+    RELCANDIDATES.forEach((c) => (bands[c.band] || bands.attention).push(c));
+    $('navRelCount').textContent = RELCANDIDATES.length || '';
+    $('relEmpty').classList.toggle('hidden', !!RELCANDIDATES.length);
+    $('relBands').classList.toggle('hidden', !RELCANDIDATES.length);
+    [['relBandConfirmed', 'confirmed'], ['relBandSuggested', 'suggested'],
+     ['relBandAttention', 'attention']].forEach(([boxId, band]) => {
+      const box = $(boxId);
+      box.innerHTML = bands[band].length
+        ? bands[band].map(relCandRow).join('')
+        : '<div class="adm-muted adm-rel-band-empty">None.</div>';
+    });
+    document.querySelectorAll('#relBands .adm-rel-cand').forEach((row) => {
+      const cand = RELCANDIDATES.find((c) => c.candidate_id === row.dataset.cid);
+      row.querySelectorAll('button').forEach((b) => {
+        b.addEventListener('click', () => relCandAction(b.dataset.act, cand, row));
+      });
+      row.querySelector('.rel-check').addEventListener('change', updateRelChecked);
+    });
+    updateRelChecked();
+  }
+
+  async function scanRelations() {
+    _busy('Scanning registered tables for relations… reading foreign keys from your databases.');
+    let r;
+    try {
+      r = await api('/api/admin/relations/scan', { method: 'POST', body: '{}' });
+    } finally { _busyDone(); }
+    if (!r.data.ok) { toast(r.data.error || 'Scan failed', true); return; }
+    mergeRelCandidates(r.data.candidates || [], { replaceNonSql: true });
+    const deg = r.data.degraded || [];
+    const degBox = $('relDegraded');
+    degBox.classList.toggle('hidden', !deg.length);
+    degBox.innerHTML = deg.length
+      ? '<strong>Some sources were unavailable:</strong><br>' + deg.map((d) =>
+          `${esc(d.connection)}${d.table ? ' · ' + esc(d.table) : ''} — ${esc(d.error)}`).join('<br>')
+      : '';
+    renderRelCandidates();
+    toast(`Scan complete — ${(r.data.candidates || []).length} candidate(s)`);
+  }
+
+  async function analyzeRelSql() {
+    const sql = $('relSqlInput').value;
+    if (!sql.trim()) { toast('Paste one or more SELECT statements first', true); return; }
+    _busy('Analyzing SQL…');
+    let r;
+    try {
+      r = await api('/api/admin/relations/analyze_sql', {
+        method: 'POST', body: JSON.stringify({ sql, db_type: $('relSqlDialect').value }) });
+    } finally { _busyDone(); }
+    if (!r.data.ok) { toast(r.data.error || 'SQL analysis failed', true); return; }
+    mergeRelCandidates(r.data.candidates || []);
+    renderRelCandidates();
+    const st = r.data.stats || {};
+    const failNote = st.failed ? ` (${st.failed} statement(s) could not be parsed)` : '';
+    toast(`Analyzed ${st.statements || 0} statement(s) — ${(r.data.candidates || []).length} candidate(s)${failNote}`, !!st.failed);
+  }
+
+  async function acceptRelCandidates(cands) {
+    if (!cands.length) { toast('Nothing selected', true); return; }
+    const body = { relations: cands.map((c) => ({
+      table_id: c.table_id,
+      related_table_id: c.related_table_id,
+      join_keys: c.join_keys,
+      cardinality: c.cardinality || null,
+      origin: (c.sources || [])[0] || null,
+    })) };
+    _busy('Saving relations…');
+    let r;
+    try {
+      r = await api('/api/admin/relations/accept', { method: 'POST', body: JSON.stringify(body) });
+    } finally { _busyDone(); }
+    if (!r.data.ok) { toast(r.data.error || 'Accept failed', true); return; }
+    const ids = new Set(cands.map((c) => c.candidate_id));
+    RELCANDIDATES = RELCANDIDATES.filter((c) => !ids.has(c.candidate_id));
+    renderRelCandidates();
+    const skipNote = r.data.skipped ? ` (${r.data.skipped} already declared)` : '';
+    toast(`Accepted ${r.data.accepted} relation(s)${skipNote}`);
+    loadAll();
+  }
+
+  function relCandAction(act, cand, row) {
+    if (!cand) return;
+    if (act === 'accept') {
+      acceptRelCandidates([cand]);
+    } else if (act === 'dismiss') {
+      dismissRelCandidate(cand);
+    } else if (act === 'edit') {
+      editRelCandidate(cand, row);
+    }
+  }
+
+  async function dismissRelCandidate(cand) {
+    if (!window.confirm('Dismiss this candidate? (It may reappear on the next scan.)')) return;
+    await api('/api/admin/relations/dismiss', {
+      method: 'POST',
+      body: JSON.stringify({ table_id: cand.table_id, related_table_id: cand.related_table_id,
+        join_keys: cand.join_keys, band: cand.band }),
+    });
+    REL_DISMISSED.add(cand.candidate_id);
+    RELCANDIDATES = RELCANDIDATES.filter((c) => c.candidate_id !== cand.candidate_id);
+    renderRelCandidates();
+  }
+
+  // Inline editor: the SAME controls as the manual relations editor (target
+  // table select + "a=b, c=d" keys text), saved through the lightweight
+  // accept endpoint — deliberately NOT the full table wizard, whose save
+  // path re-introspects, re-confirms, and re-snapshots.
+  function editRelCandidate(cand, row) {
+    const options = TABLES
+      .filter((t) => t.id !== cand.table_id)
+      .map((t) => `<option value="${esc(t.id)}" ${cand.related_table_id === t.id ? 'selected' : ''}>${esc(t.display_name)}</option>`)
+      .join('');
+    const pairs = (cand.join_keys || []).map((p) => `${p[0]}=${p[1]}`).join(', ');
+    const main = row.querySelector('.adm-rel-cand-main');
+    main.innerHTML = `
+      <div class="adm-rel-row">
+        <span><strong>${esc(cand.table_label)}</strong> joins</span>
+        <select class="tw-rel-target"><option value="">— pick table —</option>${options}</select>
+        <span>on</span>
+        <input type="text" class="tw-rel-keys" placeholder="my_col=their_col, …" value="${esc(pairs)}">
+      </div>`;
+    const actions = row.querySelector('.adm-rel-cand-actions');
+    actions.innerHTML = `
+      <button class="adm-btn primary small" data-act="save">Save</button>
+      <button class="adm-btn ghost small" data-act="cancel">Cancel</button>`;
+    actions.querySelector('[data-act="save"]').addEventListener('click', async () => {
+      const target = main.querySelector('.tw-rel-target').value;
+      const jk = parseJoinKeys(main.querySelector('.tw-rel-keys').value);
+      if (!target || !jk.length) { toast('Pick a table and at least one col=col pair', true); return; }
+      const unchanged = target === cand.related_table_id
+        && JSON.stringify(jk) === JSON.stringify(cand.join_keys || []);
+      await acceptRelCandidates([Object.assign({}, cand, {
+        related_table_id: target,
+        join_keys: jk,
+        // measured cardinality only holds for the measured target+keys
+        cardinality: unchanged ? cand.cardinality : null,
+      })]);
+    });
+    actions.querySelector('[data-act="cancel"]').addEventListener('click', renderRelCandidates);
+  }
+
+  function acceptCheckedRelCandidates() {
+    const ids = Array.from(document.querySelectorAll('#relBands .rel-check:checked'))
+      .map((cb) => cb.closest('.adm-rel-cand').dataset.cid);
+    const cands = RELCANDIDATES.filter((c) => ids.includes(c.candidate_id));
+    acceptRelCandidates(cands);
   }
 
   async function draftWithAI() {
@@ -774,6 +1010,10 @@
     $('btnAddRelation').addEventListener('click', () => addRelationRow(null));
     $('twConfirm').addEventListener('change', updateSaveEnabled);
     $('btnSaveTable').addEventListener('click', saveTable);
+
+    $('btnRelScan').addEventListener('click', scanRelations);
+    $('btnRelAnalyzeSql').addEventListener('click', analyzeRelSql);
+    $('btnRelAcceptChecked').addEventListener('click', acceptCheckedRelCandidates);
 
     $('btnSaveSchedule').addEventListener('click', saveSchedule);
     $('btnReloadAudit').addEventListener('click', loadAudit);

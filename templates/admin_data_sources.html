@@ -30,6 +30,10 @@
           <span class="adm-nav-ico">📋</span> Registered tables
           <span class="adm-nav-count" id="navTableCount"></span>
         </button>
+        <button class="adm-nav-item" data-section="relations">
+          <span class="adm-nav-ico">🔗</span> Discover relations
+          <span class="adm-nav-count" id="navRelCount"></span>
+        </button>
         <button class="adm-nav-item" data-section="schedule">
           <span class="adm-nav-ico">⏱️</span> Refresh schedule
         </button>
@@ -101,6 +105,59 @@
           <button id="btnRegisterTable" class="adm-btn primary">＋ Register table</button>
         </header>
         <div id="tablesList"></div>
+      </section>
+
+      <!-- Discover relations -->
+      <section id="secRelations" class="adm-section" hidden>
+        <header class="adm-page-head">
+          <div>
+            <h1>Discover relations</h1>
+            <p class="adm-page-sub">Proposals only — nothing is applied until you accept it.
+               Accepted relations become join hints the AI uses to combine tables correctly.</p>
+          </div>
+          <button id="btnRelScan" class="adm-btn primary">🔍 Scan for relations</button>
+        </header>
+
+        <div class="adm-card adm-rel-sql-card">
+          <div class="adm-subhead">
+            <h4>Analyze SQL <span class="adm-label-note">(optional — paste SELECT queries your team
+              already runs; their joins become candidates)</span></h4>
+          </div>
+          <textarea id="relSqlInput" rows="5"
+            placeholder="Paste one or more SELECT statements…"></textarea>
+          <div class="adm-rel-sql-actions">
+            <label>Dialect
+              <select id="relSqlDialect"><option value="">auto</option></select>
+            </label>
+            <button id="btnRelAnalyzeSql" class="adm-btn ghost">Analyze SQL</button>
+            <span class="adm-muted">SQL is parsed in memory on this server only — it is never
+              stored, logged, or sent anywhere.</span>
+          </div>
+        </div>
+
+        <div id="relDegraded" class="adm-alert warn hidden"></div>
+        <div id="relEmpty" class="adm-empty">
+          <div class="adm-empty-ico">🔗</div>
+          <p>No candidates yet.</p>
+          <p class="adm-muted">Run “Scan for relations” to propose joins from foreign keys and
+            column-name similarity, or paste SQL above.</p>
+        </div>
+
+        <div id="relBands" class="hidden">
+          <div class="adm-rel-bulkbar">
+            <button id="btnRelAcceptChecked" class="adm-btn primary">✔ Accept all checked</button>
+            <span id="relCheckedCount" class="adm-muted"></span>
+          </div>
+          <div class="adm-subhead"><h4>Confirmed <span class="adm-label-note">(strong evidence —
+            pre-checked)</span></h4></div>
+          <div id="relBandConfirmed"></div>
+          <div class="adm-subhead"><h4>Suggested <span class="adm-label-note">(good evidence —
+            review and tick to accept)</span></h4></div>
+          <div id="relBandSuggested"></div>
+          <div class="adm-subhead"><h4>Needs attention <span class="adm-label-note">(weak overlap,
+            many-to-many, or unverified)</span></h4></div>
+          <div id="relBandAttention"></div>
+        </div>
       </section>
 
       <!-- Refresh schedule -->

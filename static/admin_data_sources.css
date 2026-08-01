@@ -243,6 +243,30 @@ body.admin-ds-page {
 }
 @keyframes adm-spin { to { transform: rotate(360deg); } }
 
+/* ── Discover relations ────────────────────────────────────────────────── */
+.adm-rel-sql-card { margin-bottom: 16px; }
+.adm-rel-sql-card textarea {
+  width: 100%; box-sizing: border-box; resize: vertical;
+  border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+}
+.adm-rel-sql-actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; flex-wrap: wrap; font-size: 13px; }
+.adm-rel-sql-actions label { display: flex; align-items: center; gap: 6px; color: #64748b; }
+.adm-rel-sql-actions select { border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px 8px; }
+.adm-rel-bulkbar { display: flex; align-items: center; gap: 12px; margin: 4px 0 12px; }
+.adm-rel-cand {
+  display: flex; align-items: flex-start; gap: 12px;
+  background: #fff; border: 1px solid #e2e8f0; border-radius: 10px;
+  padding: 10px 14px; margin-bottom: 8px;
+}
+.adm-rel-cand .rel-check { margin-top: 4px; }
+.adm-rel-cand-main { flex: 1; min-width: 0; }
+.adm-rel-cand-title { font-size: 13.5px; color: #0f172a; line-height: 1.5; }
+.adm-rel-cand-meta { margin-top: 4px; display: flex; gap: 6px; flex-wrap: wrap; }
+.adm-rel-cand-actions { display: flex; gap: 6px; align-items: center; flex: 0 0 auto; }
+.adm-rel-band-empty { padding: 6px 2px 14px; font-size: 13px; }
+
 /* ── Toast ─────────────────────────────────────────────────────────────── */
 .adm-toast {
   position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);

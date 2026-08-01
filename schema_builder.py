@@ -169,6 +169,10 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
     # Declared join keys between database tables (admin-defined relations).
     # A relation renders only when BOTH endpoints are loaded in this chat —
     # the planner must never be pointed at a frame that isn't in dfs.
+    # Local on purpose (schema_builder stays import-light); values mirror
+    # relation_discovery.CARDINALITY_LABEL.
+    _card_label = {"N:1": "many-to-one", "1:1": "one-to-one",
+                   "1:N": "one-to-many", "N:M": "many-to-many"}
     db_rel_lines: list[str] = []
     seen_rels: set = set()
     for fname, f in (schema_docs or {}).items():
@@ -180,6 +184,10 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
             other = rel.get("related_df_key")
             if not other or other not in dfs:
                 continue
+            # Optional discovered-relation extra; absent/unknown values render
+            # byte-identically to the pre-discovery format.
+            card = _card_label.get(rel.get("cardinality"))
+            suffix = f" ({card})" if card else ""
             for pair in rel.get("join_keys") or []:
                 try:
                     c1, c2 = pair[0], pair[1]
@@ -189,7 +197,7 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
                 if ident in seen_rels:
                     continue
                 seen_rels.add(ident)
-                db_rel_lines.append(f"  - {fname}[{c1}] ⟷ {other}[{c2}]")
+                db_rel_lines.append(f"  - {fname}[{c1}] ⟷ {other}[{c2}]{suffix}")
     if db_rel_lines:
         parts.append("\nDatabase Relations (declared join keys):\n" + "\n".join(db_rel_lines))
 

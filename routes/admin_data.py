@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse
 import brain_client
 import db_connector
 import db_sources
+import relation_discovery
 from local_store import AuthStore
 from logger_utils import log_with_sid
 from settings import settings
@@ -272,6 +273,251 @@ async def refresh_connection(request: Request, cid: str):
                         "ok": bool(res.get("ok")),
                         "rows": res.get("rows"), "error": res.get("error")})
     return {"ok": True, "results": results}
+
+
+# ---------------------------------------------------------------------------
+# Relation discovery (proposals only — ladmin accepts explicitly)
+# ---------------------------------------------------------------------------
+
+def _snapshot_key_loader(tid: str, cols: list):
+    """Column-projected snapshot read for verification. None on any failure
+    (missing snapshot, missing column, bad id) — the candidate just renders
+    as "unverified". Values stay in-process; only aggregates leave."""
+    import pandas as pd
+    import local_store
+    try:
+        return pd.read_parquet(local_store.db_snapshot_path(tid), columns=cols)
+    except Exception as e:
+        log_with_sid("admin", "info",
+                     f"REL_SNAPSHOT_UNAVAILABLE table={tid}: {type(e).__name__}")
+        return None
+
+
+def _verify_and_band(candidates: list) -> list:
+    verified = relation_discovery.verify_candidates(candidates, _snapshot_key_loader)
+    return relation_discovery.band_all(verified)
+
+
+@router.post("/relations/scan")
+async def scan_relations(request: Request):
+    """Run the FK + name/description discovery pipeline over ALL registered
+    tables. FKs are fetched by LIVE introspection (they are not persisted in
+    the registry); an unreachable connection degrades that source only —
+    name/description candidates still come back. Nothing is written."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    store = db_sources.DataSourceStore()
+    tables = store.list_tables()
+    degraded: list = []
+    fk_map: dict = {}
+
+    by_conn: dict = {}
+    for t in tables:
+        by_conn.setdefault(t.get("connection_id"), []).append(t)
+    for cid, conn_tables in by_conn.items():
+        conn = store.get_connection(cid)
+        conn_name = (conn or {}).get("name") or cid or "?"
+        # A registry row with a missing/unknown connection must degrade, not
+        # fall into _conn_cfg_and_password's unsaved-draft branch (which would
+        # hand introspect an all-None cfg).
+        if not cid or conn is None:
+            degraded.append({"connection": conn_name,
+                             "error": "connection unavailable — FK evidence skipped"})
+            continue
+        cfg, password, resp = _conn_cfg_and_password(store, {"connection_id": cid})
+        if resp is not None:
+            degraded.append({"connection": conn_name,
+                             "error": "connection unavailable — FK evidence skipped"})
+            continue
+        intros = await asyncio.gather(*[
+            _run(db_connector.introspect, cfg, password,
+                 (t.get("schema") or "").strip() or None, t.get("table_name"),
+                 sid=f"admin:{email}")
+            for t in conn_tables], return_exceptions=True)
+        for t, intro in zip(conn_tables, intros):
+            if isinstance(intro, dict) and intro.get("ok"):
+                fk_map[t["id"]] = intro
+            else:
+                if isinstance(intro, BaseException):
+                    log_with_sid(email, "warning",
+                                 f"REL_SCAN_INTROSPECT_RAISED table={t.get('id')}: "
+                                 f"{type(intro).__name__}")
+                degraded.append({"connection": conn_name,
+                                 "table": t.get("display_name") or t.get("table_name"),
+                                 "error": "introspection failed — FK evidence skipped"})
+
+    cands = await _run(relation_discovery.discover, tables, fk_map)
+    cands = await _run(_verify_and_band, cands)
+    db_sources.audit(email, "relations.scan",
+                     detail={"tables": len(tables), "candidates": len(cands),
+                             "degraded": len(degraded)})
+    return {"ok": True, "candidates": cands, "degraded": degraded}
+
+
+@router.post("/relations/analyze_sql")
+async def analyze_sql(request: Request):
+    """Extract join candidates from admin-pasted SELECT statements. The SQL is
+    parsed IN MEMORY on this client and never persisted, logged, audited, or
+    sent to the brain (Article II) — the audit row carries counts only, and
+    sqlglot's error text (it embeds the SQL) never leaves the parser."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    body = await _json_body(request)
+    sql_text = body.get("sql") or ""
+    if not sql_text.strip():
+        return JSONResponse({"error": "sql is required."}, status_code=400)
+    dialect = relation_discovery.SQLGLOT_DIALECT.get(
+        (body.get("db_type") or "").strip().lower())
+    store = db_sources.DataSourceStore()
+    tables = store.list_tables()
+    cands, stats = await _run(relation_discovery.extract_sql_joins,
+                              sql_text, tables, dialect)
+    cands = relation_discovery.filter_existing(cands, tables)
+    cands = await _run(_verify_and_band, cands)
+    db_sources.audit(email, "relations.analyze_sql",
+                     detail={"statements": stats.get("statements"),
+                             "failed": stats.get("failed"),
+                             "candidates": len(cands)})
+    return {"ok": True, "candidates": cands, "stats": stats}
+
+
+_REL_CARDINALITIES = {"N:1", "1:1", "1:N", "N:M"}
+_REL_ORIGINS = {"fk", "sql", "name", "description"}
+
+
+@router.post("/relations/accept")
+async def accept_relations(request: Request):
+    """Write accepted relation candidates into the registry. Body
+    {relations: [{table_id, related_table_id, join_keys, cardinality?, origin?}]}
+    (bulk accept = the same endpoint). Deliberately NO confirm gate, NO
+    SCHEMA_DRIFT check, and NO re-snapshot: those locks protect the
+    column/description shape, which this endpoint cannot touch — it only
+    appends to `relations` on the child table's doc."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    body = await _json_body(request)
+    items = body.get("relations")
+    if not isinstance(items, list) or not items:
+        return JSONResponse({"error": "relations list is required."}, status_code=400)
+
+    store = db_sources.DataSourceStore()
+    by_child: dict = {}
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            return JSONResponse({"error": f"relations[{idx}] must be an object."},
+                                status_code=400)
+        child = store.get_table((item.get("table_id") or "").strip())
+        parent = store.get_table((item.get("related_table_id") or "").strip())
+        if child is None or parent is None:
+            return JSONResponse({"error": f"relations[{idx}]: unknown table id."},
+                                status_code=400)
+        jk = item.get("join_keys")
+        ok_shape = (isinstance(jk, list) and jk and all(
+            isinstance(p, (list, tuple)) and len(p) == 2
+            and str(p[0] or "").strip() and str(p[1] or "").strip() for p in jk))
+        if not ok_shape:
+            return JSONResponse(
+                {"error": f"relations[{idx}]: join_keys must be a non-empty "
+                          "list of [child_col, parent_col] pairs."}, status_code=400)
+        jk = [[str(p[0]).strip(), str(p[1]).strip()] for p in jk]
+        jk = list(dict.fromkeys(map(tuple, jk)))       # drop repeated pairs
+        jk = [list(p) for p in jk]
+        child_cols = {c.get("name") for c in (child.get("columns") or [])}
+        parent_cols = {c.get("name") for c in (parent.get("columns") or [])}
+        for a, b in jk:
+            if a not in child_cols or b not in parent_cols:
+                return JSONResponse(
+                    {"error": f"relations[{idx}]: column '{a}={b}' not found "
+                              "on the registered tables."}, status_code=400)
+        cardinality = item.get("cardinality")
+        if cardinality is not None and cardinality not in _REL_CARDINALITIES:
+            return JSONResponse({"error": f"relations[{idx}]: invalid cardinality."},
+                                status_code=400)
+        origin = item.get("origin")
+        if origin is not None and origin not in _REL_ORIGINS:
+            return JSONResponse({"error": f"relations[{idx}]: invalid origin."},
+                                status_code=400)
+        by_child.setdefault(child["id"], []).append(
+            {"parent": parent, "join_keys": jk,
+             "cardinality": cardinality, "origin": origin})
+
+    accepted = skipped = 0
+    # ONE read-modify-write per child table: upsert_table is a full replace,
+    # so per-item writes to the same doc would lose all but the last.
+    for tid, batch in by_child.items():
+        doc = store.get_table(tid)
+        if doc is None:
+            log_with_sid(email, "warning", f"REL_ACCEPT_TABLE_VANISHED table={tid}")
+            continue
+        existing = doc.get("relations") or []
+        existing_ids = set()
+        for rel in existing:
+            if not isinstance(rel, dict):
+                continue
+            rid = rel.get("related_table_id") or rel.get("related_table")
+            try:
+                pairs = [(str(p[0]), str(p[1])) for p in (rel.get("join_keys") or [])]
+            except Exception as e:
+                log_with_sid(email, "warning",
+                             f"REL_ACCEPT_MALFORMED_EXISTING table={tid}: {type(e).__name__}")
+                continue
+            if rid and pairs:
+                existing_ids.add(relation_discovery.candidate_id(
+                    tid, [p[0] for p in pairs], str(rid), [p[1] for p in pairs]))
+        changed = False
+        for item in batch:
+            cand_key = relation_discovery.candidate_id(
+                tid, [p[0] for p in item["join_keys"]],
+                item["parent"]["id"], [p[1] for p in item["join_keys"]])
+            if cand_key in existing_ids:
+                skipped += 1
+                continue
+            rel = {"related_table_id": item["parent"]["id"],
+                   "join_keys": item["join_keys"]}
+            if item["origin"]:
+                rel["origin"] = item["origin"]
+            if item["cardinality"]:
+                rel["cardinality"] = item["cardinality"]
+            existing.append(rel)
+            existing_ids.add(cand_key)
+            accepted += 1
+            changed = True
+        if changed:
+            doc["relations"] = existing
+            await _run(store.upsert_table, doc, actor=email)
+
+    db_sources.audit(email, "relations.accept",
+                     detail={"accepted": accepted, "skipped": skipped,
+                             "tables": sorted(by_child.keys())})
+    return {"ok": True, "accepted": accepted, "skipped": skipped}
+
+
+@router.post("/relations/dismiss")
+async def dismiss_relation(request: Request):
+    """Audit trail for a dismissed candidate. Dismissals are session-local by
+    design (no persistence) — this endpoint exists so the action is on the
+    record like every other ladmin decision."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    body = await _json_body(request)
+    tid = (body.get("table_id") or "").strip()
+    rid = (body.get("related_table_id") or "").strip()
+    if not (db_sources.DataSourceStore.valid_id(tid)
+            and db_sources.DataSourceStore.valid_id(rid)):
+        return JSONResponse({"error": "Unknown table id."}, status_code=400)
+    jk = body.get("join_keys")
+    jk = [[str(p[0])[:128], str(p[1])[:128]] for p in jk
+          if isinstance(p, (list, tuple)) and len(p) == 2] if isinstance(jk, list) else []
+    band = body.get("band")
+    db_sources.audit(email, "relations.dismiss", target=f"{tid}->{rid}",
+                     detail={"join_keys": jk,
+                             "band": band if band in ("confirmed", "suggested",
+                                                      "attention") else None})
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

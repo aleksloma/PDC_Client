@@ -33,6 +33,9 @@ DENIED_MODULES = frozenset({
     # this client's credential surface
     "db_connector", "db_sources", "db_scheduler", "local_store", "settings",
     "brain_client", "password_utils",
+    # relation discovery: one hop from the registry, and the sandbox has no
+    # business growing a SQL parser for free
+    "relation_discovery", "sqlglot",
 })
 
 _REAL_IMPORT = _builtins.__import__
