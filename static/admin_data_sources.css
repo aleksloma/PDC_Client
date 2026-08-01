@@ -243,7 +243,10 @@ body.admin-ds-page {
 }
 @keyframes adm-spin { to { transform: rotate(360deg); } }
 
-/* ── Discover relations ────────────────────────────────────────────────── */
+/* ── Relations (confirmed overview + discovery) ────────────────────────── */
+.adm-rel-confirmed-card { margin-bottom: 16px; }
+.adm-rel-nonew { padding: 10px 2px; font-size: 13.5px; }
+.adm-rel-suggestion { background: #f8fafc; }
 .adm-rel-sql-card { margin-bottom: 16px; }
 .adm-rel-sql-card textarea {
   width: 100%; box-sizing: border-box; resize: vertical;

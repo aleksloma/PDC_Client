@@ -4,8 +4,10 @@
  * framework, no dashboard.js. Talks only to /api/admin/* and /auth/*.
  * Credentials never render — the API returns masked rows.
  *
- * Layout: sidebar nav switches four sections (connections / tables /
- * schedule / audit); state is a full refetch after every mutation.
+ * Layout: sidebar nav switches five sections (connections / tables /
+ * relations / schedule / audit); state is a full refetch after every
+ * mutation. The Relations section shows every confirmed relation (Zone A)
+ * above the discovery tools (Zone B).
  *
  * Mandatory-confirm (client side): "Save & snapshot" stays disabled until
  * the review checkbox is ticked, and the tick is force-cleared whenever a
@@ -56,8 +58,11 @@
   let editingConnId = null;     // null = creating
   let editingTableId = null;    // null = registering new
   let currentIntro = null;      // last introspection result (register wizard)
+  let currentPreview = null;    // last preview sample (feeds wizard suggestions)
   let wizardConnId = null;
   let wizardStep = 1;
+  let WIZ_SUGGESTIONS = [];     // wizard relation suggestions (step 3)
+  let _wizSuggestToken = 0;     // supersedes stale in-flight suggestion loads
 
   let RELCANDIDATES = [];       // discover-relations proposals (session-local)
   const REL_DISMISSED = new Set(); // dismissed candidate ids (session-local by design)
@@ -96,10 +101,15 @@
     });
     $('navConnCount').textContent = CONNECTIONS.length || '';
     $('navTableCount').textContent = TABLES.length || '';
+    $('navRelCount').textContent = confirmedRelCount() || '';
+    // The zero-new explainer quotes a confirmed count — hide it once any
+    // mutation refetches state, rather than showing a stale number.
+    $('relNoNew').classList.add('hidden');
     renderConnections();
     renderTables();
     renderSchedule(s.data);
     renderRelDialects();
+    renderRelOverview();
   }
 
   // ── Connections ────────────────────────────────────────────────────────
@@ -362,7 +372,10 @@
     $('btnTwBack').hidden = (n === 1);
     $('btnTwNext').hidden = (n === 3);
     $('btnSaveTable').hidden = (n !== 3);
-    if (n === 3) renderSummary();
+    if (n === 3) {
+      renderSummary();
+      loadWizardSuggestions();   // recomputed on every step-3 open
+    }
   }
 
   async function openTableWizard(connId, existing, chooseConn) {
@@ -454,6 +467,7 @@
     }
     $('twPickStatus').textContent = '';
     currentIntro = r.data.introspection;
+    currentPreview = r.data.preview || null;   // feeds the wizard suggestions
     const prevByName = {};
     (existing && existing.columns || []).forEach((c) => { prevByName[c.name] = c; });
 
@@ -498,7 +512,11 @@
       prevW.innerHTML = `<div class="adm-muted">${esc(p.error || 'No preview rows.')}</div>`;
     }
 
-    renderRelations(existing ? (existing.relations || []) : seedRelationsFromFks());
+    // New tables: FK relations are no longer pre-seeded as manual rows —
+    // they arrive as PRE-CHECKED rows in the step-3 suggestion block (same
+    // save outcome, now with origin/cardinality + verification shown; seeded
+    // rows would dedupe the suggestions away). Edits keep their stored rows.
+    renderRelations(existing ? (existing.relations || []) : []);
     $('twConfirm').checked = false;
     $('twDraftBanner').classList.add('hidden');
     updateSaveEnabled();
@@ -532,22 +550,6 @@
       <div class="adm-summary-row"><span>Column descriptions</span><strong>${filled} of ${described.length} filled</strong></div>
       <div class="adm-summary-note">Saving takes a local snapshot now — user questions run against
         the snapshot, never against your database.</div>`;
-  }
-
-  // Pre-seed the relations editor from the introspected FKs when the referred
-  // table is already registered on the same connection.
-  function seedRelationsFromFks() {
-    const rels = [];
-    (currentIntro.foreign_keys || []).forEach((fk) => {
-      const target = TABLES.find((t) => t.connection_id === wizardConnId
-        && t.table_name === fk.referred_table
-        && (!fk.referred_schema || t.schema === fk.referred_schema));
-      if (!target) return;
-      const pairs = (fk.constrained_columns || []).map((c, i) =>
-        [c, (fk.referred_columns || [])[i] || c]);
-      rels.push({ related_table_id: target.id, join_keys: pairs });
-    });
-    return rels;
   }
 
   function renderRelations(rels) {
@@ -603,9 +605,224 @@
     return rels;
   }
 
-  // ── Discover relations ─────────────────────────────────────────────────
+  // ── Wizard relation suggestions (step 3) ───────────────────────────────
+  // Computed purely from wizard-held state (introspected FKs + preview
+  // sample + typed descriptions); FK rows arrive pre-checked, similarity
+  // rows unchecked. Checked rows ride the NORMAL table save.
+  async function loadWizardSuggestions() {
+    const box = $('twSuggestions');
+    WIZ_SUGGESTIONS = [];
+    if (!currentIntro) {
+      _wizSuggestToken++;            // invalidate any in-flight load
+      box.className = 'adm-muted adm-rel-band-empty';
+      box.textContent = 'No suggested relations found.';
+      return;
+    }
+    const token = ++_wizSuggestToken;
+    box.className = 'adm-muted adm-rel-band-empty';
+    box.textContent = 'Loading suggestions…';
+    const columns = [];
+    document.querySelectorAll('#twColsBody tr').forEach((tr) => {
+      columns.push({ name: tr.dataset.name, pk: !!tr.dataset.pk,
+        description: tr.querySelector('.tw-col-desc').value.trim() });
+    });
+    const p = currentPreview;
+    const r = await api('/api/admin/relations/wizard_suggest', {
+      method: 'POST',
+      body: JSON.stringify({
+        editing_tid: editingTableId || '',
+        schema: $('twSchema').value,
+        table_name: $('twTable').value,
+        display_name: $('twDisplayName').value.trim(),
+        columns,
+        foreign_keys: currentIntro.foreign_keys || [],
+        relations: collectRelations(),
+        sample: p && p.ok ? { columns: p.columns, rows: p.rows } : null,
+      }),
+    });
+    if (token !== _wizSuggestToken) return;   // superseded by a newer open
+    if (!r.data.ok) {
+      box.textContent = 'No suggested relations found.';
+      return;
+    }
+    WIZ_SUGGESTIONS = r.data.candidates || [];
+    renderWizardSuggestions();
+  }
+
+  function renderWizardSuggestions() {
+    const box = $('twSuggestions');
+    if (!WIZ_SUGGESTIONS.length) {
+      box.className = 'adm-muted adm-rel-band-empty';
+      box.textContent = 'No suggested relations found.';
+      return;
+    }
+    box.className = '';
+    box.innerHTML = WIZ_SUGGESTIONS.map((c, i) => {
+      const pairs = (c.join_keys || []).map((pair) =>
+        `${esc(pair[0])} → <strong>${esc(c.related_label)}</strong>.${esc(pair[1])}`).join('<br>');
+      const chips = [];
+      if (c.cardinality) chips.push(`<span class="adm-chip">${esc(REL_CARD_LABEL[c.cardinality] || c.cardinality)}</span>`);
+      if (c.verified && c.overlap_pct != null) {
+        chips.push(`<span class="adm-chip">≈${esc(c.overlap_pct)}% key match (estimated from sample) · ${esc(Number(c.orphans).toLocaleString())} orphan(s)</span>`);
+      } else if (!c.verified) {
+        chips.push(`<span class="adm-chip bad" title="${esc(c.unverified_reason || '')}">unverified</span>`);
+      }
+      (c.sources || []).forEach((s) => chips.push(`<span class="adm-chip conn">${esc(s)}</span>`));
+      return `
+        <div class="adm-rel-cand adm-rel-suggestion" data-idx="${i}">
+          <input type="checkbox" class="tw-sugg-check" ${c.precheck ? 'checked' : ''}>
+          <div class="adm-rel-cand-main">
+            <div class="adm-rel-cand-title">${pairs}</div>
+            <div class="adm-rel-cand-meta">${chips.join(' ')}</div>
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  function collectCheckedSuggestions() {
+    const out = [];
+    document.querySelectorAll('#twSuggestions .adm-rel-suggestion').forEach((row) => {
+      if (!row.querySelector('.tw-sugg-check').checked) return;
+      const c = WIZ_SUGGESTIONS[parseInt(row.dataset.idx, 10)];
+      if (!c) return;
+      const rel = { related_table_id: c.related_table_id, join_keys: c.join_keys };
+      if ((c.sources || []).length) rel.origin = c.sources[0];
+      if (c.cardinality) rel.cardinality = c.cardinality;
+      out.push(rel);
+    });
+    return out;
+  }
+
+  // ── Relations: confirmed overview (Zone A) ─────────────────────────────
   const REL_CARD_LABEL = { 'N:1': 'many-to-one', '1:1': 'one-to-one',
                            '1:N': 'one-to-many', 'N:M': 'many-to-many' };
+  const REL_ORIGINS = ['fk', 'sql', 'name', 'description'];
+
+  function confirmedRelCount() {
+    let n = 0;
+    TABLES.forEach((t) => (t.relations || []).forEach((r) => {
+      if (r && typeof r === 'object') n++;
+    }));
+    return n;
+  }
+
+  function relOverviewEntries() {
+    const nameOf = (tid) => (TABLES.find((t) => t.id === tid) || {}).display_name;
+    const entries = [];
+    TABLES.forEach((t) => (t.relations || []).forEach((rel) => {
+      if (!rel || typeof rel !== 'object') return;
+      const rid = rel.related_table_id || rel.related_table || '';
+      entries.push({
+        table_id: t.id,
+        child_label: t.display_name,
+        related_ref: String(rid),
+        related_is_id: !!rel.related_table_id,
+        related_label: nameOf(rel.related_table_id) || String(rid) || '?',
+        join_keys: (rel.join_keys || [])
+          .filter((p) => Array.isArray(p) && p.length === 2)
+          .map((p) => [String(p[0]), String(p[1])]),
+        cardinality: rel.cardinality || null,
+        origin: rel.origin || 'manual',       // pre-discovery entries had no origin
+      });
+    }));
+    return entries;
+  }
+
+  function renderRelOverview() {
+    const list = $('relConfirmedList');
+    if (!list) return;
+    const entries = relOverviewEntries();
+    $('relConfirmedEmpty').classList.toggle('hidden', !!entries.length);
+    list.innerHTML = entries.map((e, i) => {
+      const pairs = e.join_keys.map((p) =>
+        `<strong>${esc(e.child_label)}</strong>.${esc(p[0])} → ` +
+        `<strong>${esc(e.related_label)}</strong>.${esc(p[1])}`).join('<br>');
+      const chips = [];
+      if (e.cardinality) chips.push(`<span class="adm-chip">${esc(REL_CARD_LABEL[e.cardinality] || e.cardinality)}</span>`);
+      chips.push(`<span class="adm-chip conn">${esc(e.origin)}</span>`);
+      return `
+        <div class="adm-rel-cand" data-idx="${i}">
+          <div class="adm-rel-cand-main">
+            <div class="adm-rel-cand-title">${pairs || esc(e.child_label) + ' → ' + esc(e.related_label)}</div>
+            <div class="adm-rel-cand-meta">${chips.join(' ')}</div>
+          </div>
+          <div class="adm-rel-cand-actions">
+            <button class="adm-icon-btn" data-act="edit" title="Edit relation">✎</button>
+            <button class="adm-icon-btn" data-act="delete" title="Delete relation">🗑</button>
+          </div>
+        </div>`;
+    }).join('');
+    list.querySelectorAll('.adm-rel-cand').forEach((row) => {
+      const entry = entries[parseInt(row.dataset.idx, 10)];
+      row.querySelectorAll('button').forEach((b) => {
+        b.addEventListener('click', () => (b.dataset.act === 'edit'
+          ? relOverviewEdit(entry, row) : relOverviewDelete(entry)));
+      });
+    });
+  }
+
+  async function relOverviewDelete(e) {
+    // Name the join keys — several relations can link the same table pair.
+    const keys = e.join_keys.map((p) => `${p[0]}=${p[1]}`).join(', ');
+    if (!window.confirm(`Delete the relation ${e.child_label} → ${e.related_label} on ${keys}? The AI stops receiving this join hint.`)) return;
+    const body = { table_id: e.table_id, join_keys: e.join_keys };
+    if (e.related_is_id) body.related_table_id = e.related_ref;
+    else body.related_table = e.related_ref;
+    const r = await api('/api/admin/relations/delete', {
+      method: 'POST', body: JSON.stringify(body) });
+    if (!r.data.ok) { toast(r.data.error || 'Delete failed', true); return; }
+    toast('Relation deleted');
+    loadAll();
+  }
+
+  // Same inline editor as candidates (target select + "a=b, c=d" keys); the
+  // save goes through /relations/accept with `replaces` so old→new swaps in
+  // one write. An edit colliding with another existing relation is skipped
+  // server-side WITH the old entry preserved.
+  function relOverviewEdit(e, row) {
+    const options = TABLES.filter((t) => t.id !== e.table_id)
+      .map((t) => `<option value="${esc(t.id)}" ${e.related_is_id && e.related_ref === t.id ? 'selected' : ''}>${esc(t.display_name)}</option>`)
+      .join('');
+    const pairsText = e.join_keys.map((p) => `${p[0]}=${p[1]}`).join(', ');
+    const main = row.querySelector('.adm-rel-cand-main');
+    main.innerHTML = `
+      <div class="adm-rel-row">
+        <span><strong>${esc(e.child_label)}</strong> joins</span>
+        <select class="tw-rel-target"><option value="">— pick table —</option>${options}</select>
+        <span>on</span>
+        <input type="text" class="tw-rel-keys" placeholder="my_col=their_col, …" value="${esc(pairsText)}">
+      </div>`;
+    const actions = row.querySelector('.adm-rel-cand-actions');
+    actions.innerHTML = `
+      <button class="adm-btn primary small" data-act="save">Save</button>
+      <button class="adm-btn ghost small" data-act="cancel">Cancel</button>`;
+    actions.querySelector('[data-act="save"]').addEventListener('click', async () => {
+      const target = main.querySelector('.tw-rel-target').value;
+      const jk = parseJoinKeys(main.querySelector('.tw-rel-keys').value);
+      if (!target || !jk.length) { toast('Pick a table and at least one col=col pair', true); return; }
+      const unchanged = e.related_is_id && target === e.related_ref
+        && JSON.stringify(jk) === JSON.stringify(e.join_keys);
+      const item = {
+        table_id: e.table_id, related_table_id: target, join_keys: jk,
+        // measured cardinality/provenance only hold for the original
+        // target+keys — a changed relation reverts to manual
+        cardinality: unchanged ? e.cardinality : null,
+        origin: unchanged && REL_ORIGINS.includes(e.origin) ? e.origin : null,
+        replaces: Object.assign({ join_keys: e.join_keys },
+          e.related_is_id ? { related_table_id: e.related_ref }
+                          : { related_table: e.related_ref }),
+      };
+      const r = await api('/api/admin/relations/accept', {
+        method: 'POST', body: JSON.stringify({ relations: [item] }) });
+      if (!r.data.ok) { toast(r.data.error || 'Save failed', true); return; }
+      toast(r.data.skipped ? 'Not saved — an identical relation already exists'
+                           : 'Relation updated', !!r.data.skipped);
+      loadAll();
+    });
+    actions.querySelector('[data-act="cancel"]').addEventListener('click', renderRelOverview);
+  }
+
+  // ── Relations: discovery (Zone B) ──────────────────────────────────────
 
   function renderRelDialects() {
     const sel = $('relSqlDialect');
@@ -675,8 +892,10 @@
   function renderRelCandidates() {
     const bands = { confirmed: [], suggested: [], attention: [] };
     RELCANDIDATES.forEach((c) => (bands[c.band] || bands.attention).push(c));
-    $('navRelCount').textContent = RELCANDIDATES.length || '';
-    $('relEmpty').classList.toggle('hidden', !!RELCANDIDATES.length);
+    // The nav badge counts CONFIRMED relations (set in loadAll), not candidates.
+    // #relEmpty (never-scanned state) yields to the explanatory #relNoNew line.
+    $('relEmpty').classList.toggle('hidden',
+      !!RELCANDIDATES.length || !$('relNoNew').classList.contains('hidden'));
     $('relBands').classList.toggle('hidden', !RELCANDIDATES.length);
     [['relBandConfirmed', 'confirmed'], ['relBandSuggested', 'suggested'],
      ['relBandAttention', 'attention']].forEach(([boxId, band]) => {
@@ -710,8 +929,24 @@
       ? '<strong>Some sources were unavailable:</strong><br>' + deg.map((d) =>
           `${esc(d.connection)}${d.table ? ' · ' + esc(d.table) : ''} — ${esc(d.error)}`).join('<br>')
       : '';
+    // Zero-new must be judged from the RESPONSE (the merged list can retain
+    // earlier SQL-derived candidates) and explained via the confirmed count.
+    _renderNoNew((r.data.candidates || []).length, r.data.confirmed_count || 0);
     renderRelCandidates();
     toast(`Scan complete — ${(r.data.candidates || []).length} candidate(s)`);
+  }
+
+  function _renderNoNew(freshCount, confirmedCount) {
+    const box = $('relNoNew');
+    if (freshCount) {
+      box.classList.add('hidden');
+      box.textContent = '';
+      return;
+    }
+    box.textContent = confirmedCount
+      ? `No new candidates found — ${confirmedCount} relation(s) already confirmed (listed above); confirmed relations are excluded from scans.`
+      : 'No candidates found.';
+    box.classList.remove('hidden');
   }
 
   async function analyzeRelSql() {
@@ -725,6 +960,7 @@
     } finally { _busyDone(); }
     if (!r.data.ok) { toast(r.data.error || 'SQL analysis failed', true); return; }
     mergeRelCandidates(r.data.candidates || []);
+    _renderNoNew((r.data.candidates || []).length, r.data.confirmed_count || 0);
     renderRelCandidates();
     const st = r.data.stats || {};
     const failNote = st.failed ? ` (${st.failed} statement(s) could not be parsed)` : '';
@@ -865,6 +1101,14 @@
         description: tr.querySelector('.tw-col-desc').value.trim(),
       });
     });
+    // Manual rows + checked suggestions, deduped by target + pairs (both are
+    // child-first, so a direct compare suffices).
+    const rels = collectRelations();
+    const relKey = (r) => r.related_table_id + '|' + JSON.stringify(r.join_keys);
+    const seenRels = new Set(rels.map(relKey));
+    collectCheckedSuggestions().forEach((s) => {
+      if (!seenRels.has(relKey(s))) { rels.push(s); seenRels.add(relKey(s)); }
+    });
     const body = {
       connection_id: wizardConnId,
       schema: $('twSchema').value,
@@ -873,7 +1117,7 @@
       description: $('twDescription').value.trim(),
       columns,
       is_connector: $('twIsConnector').checked,
-      relations: collectRelations(),
+      relations: rels,
       confirm: $('twConfirm').checked === true,
     };
     $('btnSaveTable').disabled = true;

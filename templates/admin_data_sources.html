@@ -31,7 +31,7 @@
           <span class="adm-nav-count" id="navTableCount"></span>
         </button>
         <button class="adm-nav-item" data-section="relations">
-          <span class="adm-nav-ico">🔗</span> Discover relations
+          <span class="adm-nav-ico">🔗</span> Relations
           <span class="adm-nav-count" id="navRelCount"></span>
         </button>
         <button class="adm-nav-item" data-section="schedule">
@@ -107,16 +107,27 @@
         <div id="tablesList"></div>
       </section>
 
-      <!-- Discover relations -->
+      <!-- Relations: confirmed overview (Zone A) + discovery (Zone B) -->
       <section id="secRelations" class="adm-section" hidden>
         <header class="adm-page-head">
           <div>
-            <h1>Discover relations</h1>
-            <p class="adm-page-sub">Proposals only — nothing is applied until you accept it.
-               Accepted relations become join hints the AI uses to combine tables correctly.</p>
+            <h1>Relations</h1>
+            <p class="adm-page-sub">Join hints the AI uses to combine tables correctly. Confirmed
+               relations are listed first; discovery below only ever proposes — nothing is applied
+               until you accept it.</p>
           </div>
           <button id="btnRelScan" class="adm-btn primary">🔍 Scan for relations</button>
         </header>
+
+        <!-- Zone A: every confirmed relation across all registered tables -->
+        <div id="relConfirmedCard" class="adm-card adm-rel-confirmed-card">
+          <div class="adm-subhead"><h4>Confirmed relations</h4></div>
+          <div id="relConfirmedEmpty" class="adm-muted adm-rel-band-empty hidden">
+            No relations confirmed yet — scan below for proposals, or add them manually in each
+            table's settings (Registered tables → ✎).
+          </div>
+          <div id="relConfirmedList" class="adm-table-scroll"></div>
+        </div>
 
         <div class="adm-card adm-rel-sql-card">
           <div class="adm-subhead">
@@ -136,6 +147,7 @@
         </div>
 
         <div id="relDegraded" class="adm-alert warn hidden"></div>
+        <div id="relNoNew" class="adm-muted adm-rel-nonew hidden"></div>
         <div id="relEmpty" class="adm-empty">
           <div class="adm-empty-ico">🔗</div>
           <p>No candidates yet.</p>
@@ -327,6 +339,12 @@
             <span><strong>Connector table</strong> — a helper/dictionary table users should not pick
             directly; it is auto-included whenever a related table is used.</span>
           </label>
+
+          <div class="adm-subhead">
+            <h4>Suggested relations <span class="adm-label-note">(from this table's foreign keys and
+              column-name similarity — checked rows are saved with the table)</span></h4>
+          </div>
+          <div id="twSuggestions" class="adm-muted adm-rel-band-empty">Loading suggestions…</div>
 
           <div class="adm-subhead">
             <h4>Relations <span class="adm-label-note">(join keys to other registered tables — lets the AI join correctly)</span></h4>

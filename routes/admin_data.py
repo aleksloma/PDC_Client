@@ -298,6 +298,28 @@ def _verify_and_band(candidates: list) -> list:
     return relation_discovery.band_all(verified)
 
 
+def _confirmed_relation_count(tables: list) -> int:
+    """Total confirmed relation entries across the registry — the UI uses it
+    to explain a zero-candidate scan ("N already confirmed, excluded")."""
+    return sum(1 for t in tables or []
+               for r in (t.get("relations") or []) if isinstance(r, dict))
+
+
+def _rel_matches(rel: dict, ref: str, jk: list) -> bool:
+    """Exact match of a stored relation entry: same related ref (id or legacy
+    name) AND join_keys equal as ordered [[child, parent], ...] lists."""
+    rid = str(rel.get("related_table_id") or rel.get("related_table") or "")
+    if rid != ref:
+        return False
+    try:
+        pairs = [[str(p[0]), str(p[1])] for p in (rel.get("join_keys") or [])]
+    except Exception as e:
+        log_with_sid("admin", "warning",
+                     f"REL_MATCH_MALFORMED_ENTRY ref={ref}: {type(e).__name__}")
+        return False
+    return pairs == jk
+
+
 @router.post("/relations/scan")
 async def scan_relations(request: Request):
     """Run the FK + name/description discovery pipeline over ALL registered
@@ -352,7 +374,8 @@ async def scan_relations(request: Request):
     db_sources.audit(email, "relations.scan",
                      detail={"tables": len(tables), "candidates": len(cands),
                              "degraded": len(degraded)})
-    return {"ok": True, "candidates": cands, "degraded": degraded}
+    return {"ok": True, "candidates": cands, "degraded": degraded,
+            "confirmed_count": _confirmed_relation_count(tables)}
 
 
 @router.post("/relations/analyze_sql")
@@ -380,21 +403,174 @@ async def analyze_sql(request: Request):
                      detail={"statements": stats.get("statements"),
                              "failed": stats.get("failed"),
                              "candidates": len(cands)})
-    return {"ok": True, "candidates": cands, "stats": stats}
+    return {"ok": True, "candidates": cands, "stats": stats,
+            "confirmed_count": _confirmed_relation_count(tables)}
 
 
 _REL_CARDINALITIES = {"N:1", "1:1", "1:N", "N:M"}
 _REL_ORIGINS = {"fk", "sql", "name", "description"}
 
+# Sentinel child id for a table being registered (no id yet). Deliberately
+# NON-hex: it fails DataSourceStore.valid_id, so it can never collide with a
+# real id or slip through /relations/accept.
+_WIZARD_CHILD_ID = "__wizard__"
+
+
+def _sample_frame(sample):
+    """Wizard preview sample → DataFrame, or None (absent/failed preview →
+    every candidate renders "unverified", never an error)."""
+    try:
+        if not isinstance(sample, dict):
+            return None
+        cols = [str(c) for c in (sample.get("columns") or [])]
+        rows = sample.get("rows") or []
+        if not cols or not rows:
+            return None
+        import pandas as pd
+        return pd.DataFrame(rows, columns=cols)
+    except Exception as e:
+        log_with_sid("admin", "info", f"REL_WIZARD_SAMPLE_INVALID: {type(e).__name__}")
+        return None
+
+
+def _wizard_suggest_candidates(body: dict, registered: list) -> list:
+    """Assemble relation suggestions for the wizard's relations step, purely
+    from wizard-held state (introspected FKs, preview sample, typed
+    descriptions) + registry metadata + parent snapshots. Reuses the discovery
+    generators/verification; the wizard table is normalized to ALWAYS be the
+    stored child, because the wizard save can only write relations onto the
+    table being saved."""
+    editing_tid = (body.get("editing_tid") or "").strip()
+    child_id = (editing_tid if db_sources.DataSourceStore.valid_id(editing_tid)
+                else _WIZARD_CHILD_ID)
+    child = {
+        "id": child_id,
+        "schema": (body.get("schema") or "").strip(),
+        "table_name": (body.get("table_name") or "").strip(),
+        "display_name": ((body.get("display_name") or "").strip()
+                         or (body.get("table_name") or "").strip()),
+        "columns": [{"name": str(c.get("name")), "pk": bool(c.get("pk")),
+                     "description": (c.get("description") or "").strip()}
+                    for c in (body.get("columns") or [])
+                    if isinstance(c, dict) and c.get("name")],
+        # Current wizard rows + (for edits) stored relations arrive here so
+        # filter_existing dedupes against BOTH, either orientation.
+        "relations": [r for r in (body.get("relations") or []) if isinstance(r, dict)],
+        # Honest flag: these descriptions are confirmed by the very save the
+        # suggestions feed into — lets description_candidates use them.
+        "descriptions_confirmed_by": "wizard",
+    }
+    # Child FIRST: the (0, j) pairs enumerate before any registered-vs-
+    # registered pair, so MAX_CANDIDATES_PER_SOURCE can't starve child pairs.
+    tables = [child] + [t for t in registered if t.get("id") != child_id]
+    fk_map = {child_id: {"ok": True,
+                         "foreign_keys": body.get("foreign_keys") or []}}
+    cands = relation_discovery.merge_candidates(
+        relation_discovery.fk_candidates(tables, fk_map),
+        relation_discovery.name_candidates(tables),
+        relation_discovery.description_candidates(tables))
+    cands = [c for c in cands if child_id in (c["table_id"], c["related_table_id"])]
+    cands = relation_discovery.filter_existing(cands, tables)
+
+    def _swap_orientation(c):
+        c["table_id"], c["related_table_id"] = c["related_table_id"], c["table_id"]
+        c["table_label"], c["related_label"] = c["related_label"], c["table_label"]
+        c["join_keys"] = [[b, a] for a, b in c["join_keys"]]
+        if c.get("cardinality") == "N:1":
+            c["cardinality"] = "1:N"
+        elif c.get("cardinality") == "1:N":
+            c["cardinality"] = "N:1"
+        c["child_unique"], c["parent_unique"] = \
+            c.get("parent_unique"), c.get("child_unique")
+
+    # Pre-normalize BEFORE verification so overlap is measured in the spec's
+    # direction — share of SAMPLE key values found in the parent snapshot —
+    # even when the generation heuristics oriented the registered table as
+    # child. (FK candidates are generated wizard-child already.)
+    for c in cands:
+        if c["table_id"] != child_id:
+            _swap_orientation(c)
+
+    sample_df = _sample_frame(body.get("sample"))
+
+    def loader(tid, wanted):
+        if tid == child_id:
+            if sample_df is None or any(c not in sample_df.columns for c in wanted):
+                return None
+            return sample_df[wanted]
+        return _snapshot_key_loader(tid, wanted)
+
+    out = []
+    for c in relation_discovery.verify_candidates(cands, loader):
+        if c["table_id"] != child_id:
+            # The data flip put the registered side back as child (wizard side
+            # unique, snapshot side not). Restore the wizard as stored child —
+            # the wizard save can only write onto the table being saved — and
+            # DROP the measured numbers: they describe snapshot→capped-sample,
+            # which systematically understates overlap in the stored
+            # direction. The structural facts (uniqueness → cardinality) hold.
+            _swap_orientation(c)
+            c["overlap_pct"] = None
+            c["orphans"] = None
+            c["child_nonnull"] = None
+        if "fk" in c.get("sources", ()):
+            # FK direction is ground truth and sample uniqueness is noise —
+            # default to N:1 unless the PARENT side was MEASURED non-unique
+            # (that is a real data-quality signal worth surfacing).
+            if c.get("parent_unique") is not False:
+                c["cardinality"] = "N:1"
+        c["estimated"] = bool(c.get("verified"))   # child side is a sample
+        c["precheck"] = "fk" in c.get("sources", ())
+        out.append(c)
+    out.sort(key=lambda c: (0 if c["precheck"] else 1,
+                            -(c.get("overlap_pct") or 0.0),
+                            c.get("related_label") or ""))
+    return out
+
+
+@router.post("/relations/wizard_suggest")
+async def wizard_suggest(request: Request):
+    """Relation suggestions for the register wizard's relations step. Computed
+    ONLY from state the wizard already holds (the table's own introspection
+    FKs + preview sample + typed descriptions) plus registry metadata and
+    parent snapshots — no live DB access, nothing written. Sample row values
+    stay in-process; the audit row carries counts only (Article II)."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    body = await _json_body(request)
+    table_name = (body.get("table_name") or "").strip()
+    if not table_name:
+        return JSONResponse({"error": "table_name is required."}, status_code=400)
+    registered = db_sources.DataSourceStore().list_tables()
+    try:
+        cands = await _run(_wizard_suggest_candidates, body, registered)
+    except Exception as e:
+        # A malformed body field must degrade, not 500 (Article IV). Only the
+        # exception TYPE is logged — the body carries sample row values.
+        log_with_sid(email, "warning",
+                     f"REL_WIZARD_SUGGEST_FAILED table={table_name}: {type(e).__name__}")
+        return {"ok": False, "error": "Could not compute suggestions."}
+    db_sources.audit(email, "relations.wizard_suggest",
+                     target=f"{(body.get('schema') or '').strip()}.{table_name}",
+                     detail={"candidates": len(cands),
+                             "fk": sum(1 for c in cands if "fk" in c["sources"]),
+                             "registered": len(registered)})
+    return {"ok": True, "candidates": cands}
+
 
 @router.post("/relations/accept")
 async def accept_relations(request: Request):
     """Write accepted relation candidates into the registry. Body
-    {relations: [{table_id, related_table_id, join_keys, cardinality?, origin?}]}
-    (bulk accept = the same endpoint). Deliberately NO confirm gate, NO
-    SCHEMA_DRIFT check, and NO re-snapshot: those locks protect the
+    {relations: [{table_id, related_table_id, join_keys, cardinality?, origin?,
+    replaces?: {related_table_id|related_table, join_keys}}]} (bulk accept =
+    the same endpoint; `replaces` = the overview Edit path — the matching old
+    entry is swapped for the new one in the same write, and when the edited
+    entry would duplicate ANOTHER existing entry it is skipped WITH the old
+    entry left untouched, never a silent delete). Deliberately NO confirm
+    gate, NO SCHEMA_DRIFT check, and NO re-snapshot: those locks protect the
     column/description shape, which this endpoint cannot touch — it only
-    appends to `relations` on the child table's doc."""
+    edits `relations` on the child table's doc."""
     email, err = _require_admin(request)
     if err:
         return err
@@ -440,11 +616,26 @@ async def accept_relations(request: Request):
         if origin is not None and origin not in _REL_ORIGINS:
             return JSONResponse({"error": f"relations[{idx}]: invalid origin."},
                                 status_code=400)
+        replaces = item.get("replaces")
+        if replaces is not None:
+            rep_ref = (str(replaces.get("related_table_id")
+                           or replaces.get("related_table") or "").strip()
+                       if isinstance(replaces, dict) else "")
+            rep_jk = replaces.get("join_keys") if isinstance(replaces, dict) else None
+            ok_rep = (rep_ref and isinstance(rep_jk, list) and rep_jk and all(
+                isinstance(p, (list, tuple)) and len(p) == 2 for p in rep_jk))
+            if not ok_rep:
+                return JSONResponse({"error": f"relations[{idx}]: invalid replaces."},
+                                    status_code=400)
+            # No truncation: the ref is compared against stored values, never
+            # stored itself — a shortened ref could silently stop matching.
+            replaces = {"ref": rep_ref,
+                        "join_keys": [[str(p[0]), str(p[1])] for p in rep_jk]}
         by_child.setdefault(child["id"], []).append(
             {"parent": parent, "join_keys": jk,
-             "cardinality": cardinality, "origin": origin})
+             "cardinality": cardinality, "origin": origin, "replaces": replaces})
 
-    accepted = skipped = 0
+    accepted = skipped = replaced = 0
     # ONE read-modify-write per child table: upsert_table is a full replace,
     # so per-item writes to the same doc would lose all but the last.
     for tid, batch in by_child.items():
@@ -453,28 +644,43 @@ async def accept_relations(request: Request):
             log_with_sid(email, "warning", f"REL_ACCEPT_TABLE_VANISHED table={tid}")
             continue
         existing = doc.get("relations") or []
-        existing_ids = set()
-        for rel in existing:
-            if not isinstance(rel, dict):
-                continue
+
+        def entry_key(rel):
             rid = rel.get("related_table_id") or rel.get("related_table")
             try:
                 pairs = [(str(p[0]), str(p[1])) for p in (rel.get("join_keys") or [])]
             except Exception as e:
                 log_with_sid(email, "warning",
                              f"REL_ACCEPT_MALFORMED_EXISTING table={tid}: {type(e).__name__}")
-                continue
-            if rid and pairs:
-                existing_ids.add(relation_discovery.candidate_id(
-                    tid, [p[0] for p in pairs], str(rid), [p[1] for p in pairs]))
+                return None
+            if not rid or not pairs:
+                return None
+            return relation_discovery.candidate_id(
+                tid, [p[0] for p in pairs], str(rid), [p[1] for p in pairs])
+
         changed = False
         for item in batch:
+            rep = item.get("replaces")
+            is_old = (lambda r: isinstance(r, dict)
+                      and _rel_matches(r, rep["ref"], rep["join_keys"])) if rep \
+                else (lambda r: False)
+            # Dup-check against everything EXCEPT the entries being replaced —
+            # so an edit never self-collides, and an edit that duplicates a
+            # DIFFERENT entry is skipped with the old entry left untouched
+            # (never a silent delete). A stale `replaces` (old entry already
+            # gone) degrades to a plain accept.
+            other_ids = {entry_key(r) for r in existing
+                         if isinstance(r, dict) and not is_old(r)} - {None}
             cand_key = relation_discovery.candidate_id(
                 tid, [p[0] for p in item["join_keys"]],
                 item["parent"]["id"], [p[1] for p in item["join_keys"]])
-            if cand_key in existing_ids:
+            if cand_key in other_ids:
                 skipped += 1
                 continue
+            old_count = sum(1 for r in existing if is_old(r))
+            if old_count:
+                existing = [r for r in existing if not is_old(r)]
+                replaced += old_count
             rel = {"related_table_id": item["parent"]["id"],
                    "join_keys": item["join_keys"]}
             if item["origin"]:
@@ -482,7 +688,6 @@ async def accept_relations(request: Request):
             if item["cardinality"]:
                 rel["cardinality"] = item["cardinality"]
             existing.append(rel)
-            existing_ids.add(cand_key)
             accepted += 1
             changed = True
         if changed:
@@ -491,8 +696,10 @@ async def accept_relations(request: Request):
 
     db_sources.audit(email, "relations.accept",
                      detail={"accepted": accepted, "skipped": skipped,
+                             "replaced": replaced,
                              "tables": sorted(by_child.keys())})
-    return {"ok": True, "accepted": accepted, "skipped": skipped}
+    return {"ok": True, "accepted": accepted, "skipped": skipped,
+            "replaced": replaced}
 
 
 @router.post("/relations/dismiss")
@@ -518,6 +725,46 @@ async def dismiss_relation(request: Request):
                              "band": band if band in ("confirmed", "suggested",
                                                       "attention") else None})
     return {"ok": True}
+
+
+@router.post("/relations/delete")
+async def delete_relation(request: Request):
+    """Remove a confirmed relation from the owning (child) table's doc.
+    Matches by related ref (id or legacy `related_table` name) + ORDERED
+    join_keys, and removes EVERY exact match — identical duplicates are
+    indistinguishable in the overview UI. Distinct from /relations/dismiss,
+    which is audit-only and never mutates the registry."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    body = await _json_body(request)
+    tid = (body.get("table_id") or "").strip()
+    if not db_sources.DataSourceStore.valid_id(tid):
+        return JSONResponse({"error": "Unknown table id."}, status_code=400)
+    ref = str(body.get("related_table_id")
+              or body.get("related_table") or "").strip()
+    jk = body.get("join_keys")
+    if not ref or not isinstance(jk, list) or not jk or not all(
+            isinstance(p, (list, tuple)) and len(p) == 2 for p in jk):
+        return JSONResponse(
+            {"error": "related table ref and join_keys pairs are required."},
+            status_code=400)
+    jk = [[str(p[0]), str(p[1])] for p in jk]
+    store = db_sources.DataSourceStore()
+    doc = store.get_table(tid)
+    if doc is None:
+        return JSONResponse({"error": "Unknown table."}, status_code=404)
+    kept = [r for r in (doc.get("relations") or [])
+            if not (isinstance(r, dict) and _rel_matches(r, ref, jk))]
+    removed = len(doc.get("relations") or []) - len(kept)
+    if not removed:
+        return JSONResponse({"error": "Relation not found on this table."},
+                            status_code=404)
+    doc["relations"] = kept
+    await _run(store.upsert_table, doc, actor=email)
+    db_sources.audit(email, "relations.delete", target=f"{tid}->{ref}",
+                     detail={"join_keys": jk, "removed": removed})
+    return {"ok": True, "removed": removed}
 
 
 # ---------------------------------------------------------------------------
