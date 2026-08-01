@@ -116,22 +116,38 @@
                relations are listed first; discovery below only ever proposes — nothing is applied
                until you accept it.</p>
           </div>
-          <button id="btnRelScan" class="adm-btn primary">🔍 Scan for relations</button>
+          <div class="adm-rel-headactions">
+            <div class="adm-rel-viewtoggle" role="group" aria-label="Relations view">
+              <button id="btnRelViewList" class="adm-btn ghost small active">☰ List</button>
+              <button id="btnRelViewGraph" class="adm-btn ghost small">🕸 Graph</button>
+            </div>
+            <button id="btnRelScan" class="adm-btn primary">🔍 Scan for relations</button>
+          </div>
         </header>
 
         <!-- Zone A: every confirmed relation across all registered tables -->
         <div id="relConfirmedCard" class="adm-card adm-rel-confirmed-card">
           <div class="adm-subhead">
             <h4>Confirmed relations</h4>
+            <button id="btnRelAddManual" class="adm-btn ghost small">＋ Add relation</button>
             <button id="btnRelDeleteFlagged" class="adm-btn ghost small hidden"
               title="Delete every relation flagged as joining a table to its own duplicate registration">
               🗑 Delete all flagged</button>
           </div>
+          <div id="relAddForm" class="hidden"></div>
           <div id="relConfirmedEmpty" class="adm-muted adm-rel-band-empty hidden">
             No relations confirmed yet — scan for proposals in the candidates panel, or add them
             manually in each table's settings (Registered tables → ✎).
           </div>
           <div id="relConfirmedList"></div>
+        </div>
+
+        <!-- Graph view of the confirmed relations (toggled with the List) -->
+        <div id="relGraphCard" class="adm-card adm-rel-graph-card hidden">
+          <div class="adm-subhead"><h4>Relations graph</h4></div>
+          <div id="relGraphLegend" class="adm-rel-legend"></div>
+          <div id="relGraph" class="adm-rel-graph"></div>
+          <div id="relGraphPopover" class="adm-rel-popover hidden"></div>
         </div>
 
         <!-- Zone B: discovery output, directly under the confirmed list so a
@@ -141,6 +157,8 @@
             “Scan for relations” above and “Analyze SQL” below — nothing is applied until you
             accept)</span></h4></div>
           <div id="relDegraded" class="adm-alert warn hidden"></div>
+          <div id="relGhostList" class="hidden"></div>
+          <div id="relUnknownList" class="hidden"></div>
           <div id="relNoNew" class="adm-muted adm-rel-nonew hidden"></div>
           <div id="relEmpty" class="adm-empty">
             <div class="adm-empty-ico">🔗</div>

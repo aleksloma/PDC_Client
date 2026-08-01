@@ -374,10 +374,15 @@ async def scan_relations(request: Request):
 
     cands = await _run(relation_discovery.discover, tables, fk_map)
     cands = await _run(_verify_and_band, cands)
+    # FKs pointing at tables the admin never registered — the "forgot the
+    # dictionary table" signal (rendered with a Register-as-connector shortcut).
+    unregistered = relation_discovery.unregistered_fk_refs(tables, fk_map)
     db_sources.audit(email, "relations.scan",
                      detail={"tables": len(tables), "candidates": len(cands),
-                             "degraded": len(degraded)})
+                             "degraded": len(degraded),
+                             "unregistered_refs": len(unregistered)})
     return {"ok": True, "candidates": cands, "degraded": degraded,
+            "unregistered_refs": unregistered,
             "confirmed_count": _confirmed_relation_count(tables)}
 
 
@@ -404,11 +409,14 @@ async def analyze_sql(request: Request):
     cands = relation_discovery.filter_existing_physical(cands, tables)
     cands = relation_discovery.dedupe_physical_targets(cands, tables)
     cands = await _run(_verify_and_band, cands)
+    hints = relation_discovery.resolve_unknown_tables(
+        stats.get("unknown_tables") or [], tables, store.list_connections())
     db_sources.audit(email, "relations.analyze_sql",
                      detail={"statements": stats.get("statements"),
                              "failed": stats.get("failed"),
                              "candidates": len(cands)})
     return {"ok": True, "candidates": cands, "stats": stats,
+            "unknown_table_hints": hints,
             "confirmed_count": _confirmed_relation_count(tables)}
 
 
@@ -583,29 +591,34 @@ async def accept_relations(request: Request):
     if err:
         return err
     body = await _json_body(request)
+
+    def _reject(msg: str):
+        # A rejected write is an admin action too — leave an ok:false trace
+        # (parity with admin.denied; previously a failed accept vanished).
+        db_sources.audit(email, "relations.accept", ok=False,
+                         detail={"error": msg[:200]})
+        return JSONResponse({"error": msg}, status_code=400)
+
     items = body.get("relations")
     if not isinstance(items, list) or not items:
-        return JSONResponse({"error": "relations list is required."}, status_code=400)
+        return _reject("relations list is required.")
 
     store = db_sources.DataSourceStore()
     by_child: dict = {}
     for idx, item in enumerate(items):
         if not isinstance(item, dict):
-            return JSONResponse({"error": f"relations[{idx}] must be an object."},
-                                status_code=400)
+            return _reject(f"relations[{idx}] must be an object.")
         child = store.get_table((item.get("table_id") or "").strip())
         parent = store.get_table((item.get("related_table_id") or "").strip())
         if child is None or parent is None:
-            return JSONResponse({"error": f"relations[{idx}]: unknown table id."},
-                                status_code=400)
+            return _reject(f"relations[{idx}]: unknown table id.")
         jk = item.get("join_keys")
         ok_shape = (isinstance(jk, list) and jk and all(
             isinstance(p, (list, tuple)) and len(p) == 2
             and str(p[0] or "").strip() and str(p[1] or "").strip() for p in jk))
         if not ok_shape:
-            return JSONResponse(
-                {"error": f"relations[{idx}]: join_keys must be a non-empty "
-                          "list of [child_col, parent_col] pairs."}, status_code=400)
+            return _reject(f"relations[{idx}]: join_keys must be a non-empty "
+                           "list of [child_col, parent_col] pairs.")
         jk = [[str(p[0]).strip(), str(p[1]).strip()] for p in jk]
         jk = list(dict.fromkeys(map(tuple, jk)))       # drop repeated pairs
         jk = [list(p) for p in jk]
@@ -613,17 +626,14 @@ async def accept_relations(request: Request):
         parent_cols = {c.get("name") for c in (parent.get("columns") or [])}
         for a, b in jk:
             if a not in child_cols or b not in parent_cols:
-                return JSONResponse(
-                    {"error": f"relations[{idx}]: column '{a}={b}' not found "
-                              "on the registered tables."}, status_code=400)
+                return _reject(f"relations[{idx}]: column '{a}={b}' not found "
+                               "on the registered tables.")
         cardinality = item.get("cardinality")
         if cardinality is not None and cardinality not in _REL_CARDINALITIES:
-            return JSONResponse({"error": f"relations[{idx}]: invalid cardinality."},
-                                status_code=400)
+            return _reject(f"relations[{idx}]: invalid cardinality.")
         origin = item.get("origin")
         if origin is not None and origin not in _REL_ORIGINS:
-            return JSONResponse({"error": f"relations[{idx}]: invalid origin."},
-                                status_code=400)
+            return _reject(f"relations[{idx}]: invalid origin.")
         replaces = item.get("replaces")
         if replaces is not None:
             rep_ref = (str(replaces.get("related_table_id")
@@ -633,8 +643,7 @@ async def accept_relations(request: Request):
             ok_rep = (rep_ref and isinstance(rep_jk, list) and rep_jk and all(
                 isinstance(p, (list, tuple)) and len(p) == 2 for p in rep_jk))
             if not ok_rep:
-                return JSONResponse({"error": f"relations[{idx}]: invalid replaces."},
-                                    status_code=400)
+                return _reject(f"relations[{idx}]: invalid replaces.")
             # No truncation: the ref is compared against stored values, never
             # stored itself — a shortened ref could silently stop matching.
             replaces = {"ref": rep_ref,
@@ -733,6 +742,22 @@ async def dismiss_relation(request: Request):
                              "band": band if band in ("confirmed", "suggested",
                                                       "attention") else None})
     return {"ok": True}
+
+
+@router.post("/relations/graph")
+async def relations_graph(request: Request):
+    """Graph-view data for the Relations section: registered tables as nodes,
+    confirmed relations as edges, connected components/isolated flags, and
+    dashed ghost nodes for the client's last-scan unregistered FK refs
+    (passed back in the body — the graph never introspects). Read-only."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    body = await _json_body(request)
+    refs = [r for r in (body.get("unregistered_refs") or []) if isinstance(r, dict)]
+    tables = db_sources.DataSourceStore().list_tables()
+    graph = await _run(relation_discovery.build_graph, tables, refs)
+    return {"ok": True, "nodes": graph["nodes"], "edges": graph["edges"]}
 
 
 @router.post("/relations/delete")
@@ -980,6 +1005,28 @@ async def save_table(request: Request, tid: str = ""):
         "descriptions_confirmed_by": email,        # session identity — never the body
         "descriptions_confirmed_at": now,          # server clock
     }
+    # Relations are stored verbatim here (frozen contract — rejecting would
+    # break payloads this API must keep accepting), but a join key naming a
+    # column neither side has is a silent broken hint: make it observable.
+    # The structured editor removes the UI-side cause.
+    try:
+        own_cols = {str(c.get("name")) for c in doc["columns"]}
+        for rel in doc["relations"]:
+            rid = rel.get("related_table_id")
+            parent = store.get_table(rid) if isinstance(rid, str) else None
+            parent_cols = ({str(c.get("name")) for c in (parent.get("columns") or [])}
+                           if parent else None)
+            for p in (rel.get("join_keys") or []):
+                if not (isinstance(p, (list, tuple)) and len(p) == 2):
+                    continue
+                a, b = str(p[0]), str(p[1])
+                if a not in own_cols or (parent_cols is not None and b not in parent_cols):
+                    log_with_sid(email, "warning",
+                                 f"REL_SAVE_UNKNOWN_COLUMN table={table} "
+                                 f"target={rid} pair={a}={b}")
+    except Exception as e:
+        log_with_sid(email, "warning", f"REL_SAVE_COLCHECK_FAILED: {type(e).__name__}")
+
     saved = store.upsert_table(doc, actor=email)
 
     # Snapshot (or re-snapshot). A failure keeps the registration saved with

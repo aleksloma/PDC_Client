@@ -524,6 +524,136 @@ def test_sql_same_name_two_connections_dropped_not_unknown():
     assert stats["unknown_tables"] == []         # ...but NOT "not registered"
 
 
+# ── missing-table hints (unregistered FK refs + SQL unknown-table hints) ───
+
+def _fk_to(table, cols=("city_code",), rcols=("city_code",), schema=None):
+    return {"constrained_columns": list(cols), "referred_schema": schema,
+            "referred_table": table, "referred_columns": list(rcols)}
+
+
+def test_unregistered_fk_refs_detects_and_aggregates():
+    orders = _phys_table(TID_A, "orders", ["city_code"], display="Orders")
+    invoices = _phys_table(TID_B, "invoices", ["city_code"], display="Invoices")
+    fk_map = {
+        TID_A: {"ok": True, "foreign_keys": [_fk_to("city_dict")]},
+        TID_B: {"ok": True, "foreign_keys": [_fk_to("city_dict"),
+                                             _fk_to("city_dict")]},   # dup FK
+    }
+    refs = rd.unregistered_fk_refs([orders, invoices], fk_map)
+    assert len(refs) == 1
+    r = refs[0]
+    assert r["connection_id"] == "conn-1"
+    assert r["schema"] == "shop"                # falls back to the child's
+    assert r["table"] == "city_dict"
+    assert r["referenced_by"] == ["Invoices", "Orders"]
+    assert r["referenced_by_ids"] == [TID_B, TID_A]
+
+
+def test_unregistered_fk_refs_connection_scoped_and_registered_ignored():
+    orders = _phys_table(TID_A, "orders", ["city_code"])
+    # same-named table registered on ANOTHER connection must not mask it
+    other_conn = _phys_table(TID_B, "city_dict", ["city_code"], conn="conn-2")
+    fk_map = {TID_A: {"ok": True, "foreign_keys": [_fk_to("city_dict")]}}
+    refs = rd.unregistered_fk_refs([orders, other_conn], fk_map)
+    assert len(refs) == 1 and refs[0]["table"] == "city_dict"
+    # registered on the SAME connection -> not a ghost
+    same_conn = _phys_table(TID_C, "city_dict", ["city_code"])
+    assert rd.unregistered_fk_refs([orders, same_conn, other_conn], fk_map) == []
+    # failed introspection contributes nothing
+    assert rd.unregistered_fk_refs([orders], {TID_A: {"ok": False}}) == []
+
+
+def test_resolve_unknown_tables_rules():
+    orders = _phys_table(TID_A, "orders", ["x"])
+    conn1 = {"id": "conn-1", "name": "one"}
+    conn2 = {"id": "conn-2", "name": "two"}
+    # single connection -> everything unregistered resolves to it
+    hints = rd.resolve_unknown_tables(["shop.warehouses"], [orders], [conn1])
+    assert hints == [{"name": "shop.warehouses", "connection_id": "conn-1",
+                      "schema": "shop", "table": "warehouses"}]
+    # two connections + schema shared by exactly one connection's tables
+    hints = rd.resolve_unknown_tables(["shop.warehouses"], [orders], [conn1, conn2])
+    assert hints and hints[0]["connection_id"] == "conn-1"
+    # bare name with two connections -> no schema to match -> no hint
+    assert rd.resolve_unknown_tables(["warehouses"], [orders], [conn1, conn2]) == []
+    # already-registered name -> never hinted (re-registering is blocked)
+    assert rd.resolve_unknown_tables(["shop.orders"], [orders], [conn1]) == []
+    assert rd.resolve_unknown_tables(["orders"], [orders], [conn1]) == []
+
+
+# ── graph assembly ─────────────────────────────────────────────────────────
+
+def _graph_tables():
+    a = _phys_table(TID_A, "orders", ["city_code"], display="Orders",
+                    relations=[{"related_table_id": TID_B,
+                                "join_keys": [["city_code", "city_code"]],
+                                "origin": "fk", "cardinality": "N:1"}])
+    b = _phys_table(TID_B, "city_dict", ["city_code"], display="Cities",
+                    connector=True)
+    c = _phys_table(TID_C, "lonely", ["x"], display="Lonely")
+    return [a, b, c]
+
+
+def test_build_graph_components_isolated_and_counts():
+    g = rd.build_graph(_graph_tables())
+    nodes = {n["id"]: n for n in g["nodes"]}
+    assert nodes[TID_A]["component"] == nodes[TID_B]["component"]
+    assert nodes[TID_C]["component"] != nodes[TID_A]["component"]
+    assert nodes[TID_C]["isolated"] is True and nodes[TID_A]["isolated"] is False
+    assert nodes[TID_B]["connector"] is True
+    assert nodes[TID_A]["relation_count"] == 1 and nodes[TID_B]["relation_count"] == 1
+    assert nodes[TID_A]["sub"] == "shop.orders"
+    assert len(g["edges"]) == 1
+    e = g["edges"][0]
+    assert (e["source"], e["target"]) == (TID_A, TID_B)
+    assert e["keys_label"] == "city_code = city_code"
+    assert e["cardinality"] == "N:1" and e["origin"] == "fk"
+    assert e["suspicious"] is False
+
+
+def test_build_graph_suspicious_and_legacy_name_resolution():
+    dup1 = _phys_table(TID_A, "city_dict", ["region"], display="Cities A",
+                       relations=[{"related_table_id": TID_B,
+                                   "join_keys": [["region", "region"]]}])
+    dup2 = _phys_table(TID_B, "city_dict", ["region"], display="Cities B")
+    legacy = _phys_table(TID_C, "orders", ["city_code"], display="Orders",
+                         relations=[
+                             {"related_table": "shop.city_dict",       # name ref
+                              "join_keys": [["city_code", "region"]]},
+                             {"related_table": "shop.vanished",        # dangling
+                              "join_keys": [["city_code", "x"]]},
+                         ])
+    g = rd.build_graph([dup1, dup2, legacy])
+    edges = {e["id"]: e for e in g["edges"]}
+    sus = [e for e in edges.values() if e["suspicious"]]
+    assert len(sus) == 1 and sus[0]["source"] == TID_A     # same-physical pair
+    # legacy name ref resolves to the preferred registration (rank order);
+    # the dangling ref is skipped, not crashed on
+    legacy_edges = [e for e in edges.values() if e["source"] == TID_C]
+    assert len(legacy_edges) == 1
+    assert legacy_edges[0]["target"] in (TID_A, TID_B)
+    assert legacy_edges[0]["related_is_id"] is False
+
+
+def test_build_graph_ghost_nodes_and_edges():
+    g = rd.build_graph(_graph_tables(), unregistered_refs=[
+        {"connection_id": "conn-1", "schema": "shop", "table": "prod_dict",
+         "referenced_by": ["Orders"], "referenced_by_ids": [TID_A]}])
+    ghosts = [n for n in g["nodes"] if n["ghost"]]
+    assert len(ghosts) == 1
+    gh = ghosts[0]
+    assert gh["sub"] == "shop.prod_dict"
+    assert gh["schema"] == "shop" and gh["connection_id"] == "conn-1"
+    ghost_edges = [e for e in g["edges"] if e["ghost"]]
+    assert len(ghost_edges) == 1
+    assert ghost_edges[0]["source"] == TID_A and ghost_edges[0]["target"] == gh["id"]
+    # unknown referencing id -> no edge, no crash
+    g2 = rd.build_graph(_graph_tables(), unregistered_refs=[
+        {"connection_id": "c", "schema": "s", "table": "x",
+         "referenced_by_ids": ["ffffffffffffffff"]}])
+    assert [e for e in g2["edges"] if e["ghost"]] == []
+
+
 def test_discover_end_to_end_excludes_declared():
     fk_map = {TID_A: _fk_intro([{
         "constrained_columns": ["customer_id"], "referred_schema": None,

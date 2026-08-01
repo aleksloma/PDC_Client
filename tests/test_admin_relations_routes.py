@@ -244,6 +244,11 @@ def test_accept_validation_errors(client, fk_setup):
                            json=body).status_code == code, body
     # nothing was written by any failed call
     assert db_sources.DataSourceStore().get_table(fk_setup["orders"])["relations"] == []
+    # v3: every rejected write leaves an ok:false audit trace (parity with
+    # admin.denied — a failed accept used to vanish)
+    rejected = [r for r in db_sources.read_audit_tail(500)
+                if r["action"] == "relations.accept" and r["ok"] is False]
+    assert len(rejected) == len(cases)
 
 
 def test_accepted_relation_feeds_connector_closure(client, fk_setup):
@@ -628,6 +633,55 @@ def test_scan_and_analyze_report_confirmed_count(client, fk_setup):
     data = r.json()
     assert data["confirmed_count"] == 1
     assert data["candidates"] == []                        # already declared
+
+
+# ── missing-table hints + graph route ──────────────────────────────────────
+
+def test_scan_reports_unregistered_fk_refs(client, fk_setup):
+    # both FK endpoints registered -> no ghosts
+    data = client.post("/api/admin/relations/scan", json={}).json()
+    assert data["unregistered_refs"] == []
+    # drop the customers registration: orders' FK now points at an
+    # unregistered physical table
+    db_sources.DataSourceStore().delete_table(fk_setup["customers"], actor=ADMIN)
+    data = client.post("/api/admin/relations/scan", json={}).json()
+    refs = data["unregistered_refs"]
+    assert len(refs) == 1
+    assert refs[0]["table"] == "customers"
+    assert refs[0]["connection_id"] == fk_setup["cid"]
+    assert refs[0]["referenced_by"] == ["Orders"]
+    assert refs[0]["referenced_by_ids"] == [fk_setup["orders"]]
+
+
+def test_analyze_sql_reports_unknown_table_hints(client, fk_setup):
+    data = client.post("/api/admin/relations/analyze_sql", json={
+        "sql": "SELECT 1 FROM orders o JOIN warehouses w ON o.customer_id = w.id",
+        "db_type": "sqlite"}).json()
+    assert data["stats"]["unknown_tables"] == ["warehouses"]   # pinned shape
+    # single registered connection -> the shortcut hint resolves to it
+    assert data["unknown_table_hints"] == [{
+        "name": "warehouses", "connection_id": fk_setup["cid"],
+        "schema": "", "table": "warehouses"}]
+
+
+def test_graph_route_shape_and_ghost_passthrough(client, fk_setup):
+    _seed_orders_relation(fk_setup)
+    r = client.post("/api/admin/relations/graph", json={"unregistered_refs": [
+        {"connection_id": fk_setup["cid"], "schema": "", "table": "prods",
+         "referenced_by": ["Orders"],
+         "referenced_by_ids": [fk_setup["orders"]]}]})
+    data = r.json()
+    assert data["ok"] is True
+    nodes = {n["id"]: n for n in data["nodes"]}
+    assert nodes[fk_setup["orders"]]["component"] == \
+        nodes[fk_setup["customers"]]["component"]
+    assert nodes[fk_setup["orders"]]["isolated"] is False
+    ghosts = [n for n in data["nodes"] if n["ghost"]]
+    assert len(ghosts) == 1 and ghosts[0]["table"] == "prods"
+    real_edges = [e for e in data["edges"] if not e["ghost"]]
+    ghost_edges = [e for e in data["edges"] if e["ghost"]]
+    assert len(real_edges) == 1 and len(ghost_edges) == 1
+    assert real_edges[0]["keys_label"] == "customer_id = id"
 
 
 # ── dismiss ────────────────────────────────────────────────────────────────

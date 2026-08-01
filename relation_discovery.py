@@ -314,6 +314,190 @@ def dedupe_physical_targets(candidates: list, tables: list) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Missing-table hints + graph assembly (pure; rendered by the admin UI)
+# ---------------------------------------------------------------------------
+
+def unregistered_fk_refs(tables: list, fk_map: dict) -> list:
+    """FKs on registered tables that point at UNREGISTERED physical tables —
+    the dictionary/bridge tables the admin forgot to register. Connection-
+    scoped: a same-named registration on ANOTHER connection does not mask a
+    missing table (FKs never cross connections, so the ghost's connection is
+    the child's). Referred schema falls back to the child's (inspectors
+    return None for search-path refs)."""
+    registered = build_registered_map(tables)
+    by_id = {t.get("id"): t for t in tables or []}
+    refs: dict = {}
+    for tid, intro in (fk_map or {}).items():
+        child = by_id.get(tid)
+        if not child or not isinstance(intro, dict) or not intro.get("ok"):
+            continue
+        conn = str(child.get("connection_id") or "")
+        for fk in intro.get("foreign_keys") or []:
+            if not isinstance(fk, dict):
+                continue
+            rtable = str(fk.get("referred_table") or "").strip()
+            if not rtable:
+                continue
+            rschema = str(fk.get("referred_schema")
+                          or child.get("schema") or "").strip()
+            hits = _resolve_physical(registered, rschema, rtable)
+            if any(str(h.get("connection_id") or "") == conn for h in hits):
+                continue
+            key = (conn, rschema.lower(), rtable.lower())
+            entry = refs.setdefault(key, {
+                "connection_id": conn, "schema": rschema, "table": rtable,
+                "referenced_by": [], "referenced_by_ids": []})
+            label = child.get("display_name") or child.get("table_name")
+            if child.get("id") not in entry["referenced_by_ids"]:
+                entry["referenced_by_ids"].append(child.get("id"))
+                entry["referenced_by"].append(str(label))
+    out = [refs[k] for k in sorted(refs)]
+    for e in out:
+        order = sorted(range(len(e["referenced_by"])),
+                       key=lambda i: e["referenced_by"][i])
+        e["referenced_by"] = [e["referenced_by"][i] for i in order]
+        e["referenced_by_ids"] = [e["referenced_by_ids"][i] for i in order]
+    return out
+
+
+def resolve_unknown_tables(unknown: list, tables: list, connections: list) -> list:
+    """Register-shortcut hints for analyze_sql's unknown table names. A hint
+    is offered only when the connection is unambiguous: exactly one connection
+    exists, or exactly one connection's registered tables share the entry's
+    schema. Names that already match a registered table get NO hint —
+    re-registering them is blocked (bare-ambiguous names resolve to [] in
+    extraction but ARE registered)."""
+    registered = build_registered_map(tables)
+    hints = []
+    for name in unknown or []:
+        raw = str(name)
+        sc, _, tn = raw.rpartition(".")
+        sc_l, tn_l = sc.lower(), tn.lower()
+        if registered["by_name"].get(tn_l) or \
+                registered["by_schema_table"].get((sc_l, tn_l)):
+            continue
+        conn_id = None
+        conns_list = [c for c in (connections or []) if isinstance(c, dict)]
+        if len(conns_list) == 1:
+            conn_id = conns_list[0].get("id")
+        elif sc_l:
+            conns = {str(t.get("connection_id") or "") for t in tables or []
+                     if str(t.get("schema") or "").lower() == sc_l}
+            conns.discard("")
+            if len(conns) == 1:
+                conn_id = next(iter(conns))
+        if conn_id:
+            hints.append({"name": raw, "connection_id": conn_id,
+                          "schema": sc, "table": tn})
+    return hints
+
+
+def build_graph(tables: list, unregistered_refs: Optional[list] = None) -> dict:
+    """Graph-view data: registered tables as nodes, confirmed relations as
+    child→parent edges, connected components (undirected BFS, deterministic),
+    isolated flags, and dashed ghost nodes/edges for the unregistered FK
+    refs. Pure — the route feeds it the registry and the client's last scan
+    ghosts; the browser only renders."""
+    tables = [t for t in (tables or []) if t.get("id")]
+    by_id = {t["id"]: t for t in tables}
+    registered = build_registered_map(tables)
+    nodes = {t["id"]: {
+        "id": t["id"],
+        "label": str(t.get("display_name") or t.get("table_name") or t["id"]),
+        "sub": (f"{t.get('schema')}.{t.get('table_name')}" if t.get("schema")
+                else str(t.get("table_name") or "")),
+        "connector": bool(t.get("is_connector")),
+        "relation_count": 0, "component": None,
+        "isolated": True, "ghost": False,
+    } for t in tables}
+
+    edges: list = []
+    adj: dict = {tid: set() for tid in nodes}
+    for t in tables:
+        for i, rel in enumerate(t.get("relations") or []):
+            if not isinstance(rel, dict):
+                continue
+            parent = by_id.get(rel.get("related_table_id"))
+            related_ref = rel.get("related_table_id") or rel.get("related_table") or ""
+            if parent is None and rel.get("related_table"):
+                name = str(rel.get("related_table"))
+                sc, _, tn = name.rpartition(".")
+                parent = prefer_registration(_resolve_physical(registered, sc, tn))
+            if parent is None:
+                log_with_sid("relation_discovery", "info",
+                             f"REL_GRAPH_DANGLING table={t['id']}")
+                continue
+            # Per-pair filtering (like the list view) — one malformed pair
+            # must not strip a whole edge's keys.
+            raw_jk = rel.get("join_keys") or []
+            jk = [[str(p[0]), str(p[1])] for p in raw_jk
+                  if isinstance(p, (list, tuple)) and len(p) == 2]
+            if len(jk) != len(raw_jk):
+                log_with_sid("relation_discovery", "warning",
+                             f"REL_GRAPH_MALFORMED table={t['id']}")
+            edges.append({
+                "id": f"rel:{t['id']}:{i}",
+                "source": t["id"], "target": parent["id"],
+                "keys_label": ", ".join(f"{a} = {b}" for a, b in jk),
+                "cardinality": rel.get("cardinality"),
+                "origin": rel.get("origin") or "manual",
+                "suspicious": _keys_match(physical_key(t), physical_key(parent)),
+                "ghost": False, "join_keys": jk,
+                "related_ref": str(related_ref),
+                "related_is_id": bool(rel.get("related_table_id")),
+            })
+            nodes[t["id"]]["relation_count"] += 1
+            nodes[parent["id"]]["relation_count"] += 1
+            adj[t["id"]].add(parent["id"])
+            adj[parent["id"]].add(t["id"])
+
+    comp = 0
+    seen: set = set()
+    for tid in nodes:                       # insertion order → deterministic
+        if tid in seen:
+            continue
+        queue = [tid]
+        seen.add(tid)
+        while queue:
+            cur = queue.pop(0)
+            nodes[cur]["component"] = comp
+            for nb in sorted(adj.get(cur, ())):
+                if nb not in seen:
+                    seen.add(nb)
+                    queue.append(nb)
+        comp += 1
+    for tid, n in nodes.items():
+        n["isolated"] = not adj.get(tid)
+
+    out_nodes = list(nodes.values())
+    for ref in unregistered_refs or []:
+        if not isinstance(ref, dict) or not ref.get("table"):
+            continue
+        gid = (f"ghost:{ref.get('connection_id', '')}/"
+               f"{str(ref.get('schema') or '').lower()}/"
+               f"{str(ref.get('table')).lower()}")
+        out_nodes.append({
+            "id": gid, "label": str(ref.get("table")),
+            "sub": (f"{ref.get('schema')}.{ref.get('table')}"
+                    if ref.get("schema") else str(ref.get("table"))),
+            "connector": False, "relation_count": 0, "component": None,
+            "isolated": False, "ghost": True,
+            "connection_id": ref.get("connection_id"),
+            "schema": ref.get("schema"), "table": ref.get("table"),
+        })
+        for src_id in ref.get("referenced_by_ids") or []:
+            if src_id in by_id:
+                edges.append({
+                    "id": f"ghostedge:{src_id}:{gid}",
+                    "source": src_id, "target": gid,
+                    "keys_label": "FK", "cardinality": None, "origin": "fk",
+                    "suspicious": False, "ghost": True, "join_keys": [],
+                    "related_ref": "", "related_is_id": False,
+                })
+    return {"nodes": out_nodes, "edges": edges}
+
+
+# ---------------------------------------------------------------------------
 # Source a) declared foreign keys
 # ---------------------------------------------------------------------------
 

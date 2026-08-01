@@ -61,6 +61,7 @@
   let currentPreview = null;    // last preview sample (feeds wizard suggestions)
   let wizardConnId = null;
   let wizardStep = 1;
+  let wizardPrefill = null;     // ghost-hint shortcut: {schema, table, connector}
   let WIZ_SUGGESTIONS = [];     // wizard relation suggestions (step 3)
   let _wizSuggestToken = 0;     // supersedes stale in-flight suggestion loads
   let _wizSuggestLoading = false; // blocks Save mid-load (pre-checked rows!)
@@ -80,6 +81,11 @@
     document.querySelectorAll('.adm-nav-item').forEach((b) => {
       b.classList.toggle('active', b.dataset.section === name);
     });
+    if (name !== 'relations' && cyInstance) {   // leak-free view teardown
+      cyInstance.destroy();
+      cyInstance = null;
+    }
+    if (name === 'relations' && relView === 'graph') refreshRelGraph();
     if (name === 'audit') loadAudit();
     if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
   }
@@ -111,6 +117,8 @@
     renderSchedule(s.data);
     renderRelDialects();
     renderRelOverview();
+    renderRelGhosts();                       // re-filters just-registered ghosts
+    if (relView === 'graph' && !$('secRelations').hidden) refreshRelGraph();
   }
 
   // ── Connections ────────────────────────────────────────────────────────
@@ -379,9 +387,13 @@
     }
   }
 
-  async function openTableWizard(connId, existing, chooseConn) {
+  async function openTableWizard(connId, existing, chooseConn, prefill) {
     wizardConnId = connId;
     editingTableId = existing ? existing.id : null;
+    // "Register as connector" shortcut state (ghost hints). Cleared on every
+    // open; the connector tick is applied inside introspectNow, which would
+    // otherwise overwrite it.
+    wizardPrefill = prefill || null;
     currentIntro = null;
     $('tableModalTitle').textContent = existing
       ? `Edit table — ${existing.display_name}` : 'Register table';
@@ -415,10 +427,25 @@
       cf.value = (CONNECTIONS.find((c) => c.id === connId) || {}).name || '';
     }
 
-    await loadSchemas(existing);
+    // Prefill rides the existing loadSchemas path (it reads only `.schema`
+    // and its explicit loadTableNames() call does the reload — programmatic
+    // .value writes fire no onchange).
+    await loadSchemas(existing || (wizardPrefill ? { schema: wizardPrefill.schema } : null));
     if (existing) {
       $('twTable').value = existing.table_name;
       await introspectNow(existing, { advance: false });
+    } else if (wizardPrefill && wizardPrefill.table) {
+      // Case-insensitive option match (Oracle case-folds catalog names).
+      const sel = $('twTable');
+      const want = String(wizardPrefill.table).toLowerCase();
+      const opt = Array.from(sel.options).find(
+        (o) => o.value.toLowerCase() === want && !o.disabled);
+      if (opt) {
+        sel.value = opt.value;
+      } else {
+        $('twPickStatus').textContent =
+          `Could not preselect "${wizardPrefill.table}" — pick the table manually.`;
+      }
     }
   }
 
@@ -496,7 +523,8 @@
 
     $('twDisplayName').value = existing ? existing.display_name
       : $('twTable').value.toLowerCase().replace(/_/g, ' ');
-    $('twIsConnector').checked = existing ? !!existing.is_connector : false;
+    $('twIsConnector').checked = existing ? !!existing.is_connector
+      : !!(wizardPrefill && wizardPrefill.connector);
     $('twDescription').value = existing ? (existing.description || '')
       : (currentIntro.table_comment || '');
 
@@ -581,32 +609,196 @@
     (rels || []).forEach((rel) => addRelationRow(rel));
   }
 
+  function wizardLeftCols() {
+    const cols = [];
+    document.querySelectorAll('#twColsBody tr').forEach((tr) => {
+      cols.push({ name: tr.dataset.name, dtype: tr.dataset.dtype || '' });
+    });
+    return cols;
+  }
+
   function addRelationRow(rel) {
     const box = $('twRelations');
     const row = document.createElement('div');
-    row.className = 'adm-rel-row';
+    row.className = 'adm-rel-row adm-rel-row-block';
     row._rel = rel || null;   // original dict — extra keys (cardinality/origin) survive an unchanged save
     const options = TABLES
       .filter((t) => t.id !== editingTableId)
       .map((t) => `<option value="${esc(t.id)}" ${rel && rel.related_table_id === t.id ? 'selected' : ''}>${esc(t.display_name)}</option>`)
       .join('');
-    const pairs = (rel && rel.join_keys || [['', '']])
-      .map((p) => `${p[0]}=${p[1]}`).join(', ');
     row.innerHTML = `
-      <span>joins</span>
-      <select class="tw-rel-target"><option value="">— pick table —</option>${options}</select>
-      <span>on</span>
-      <input type="text" class="tw-rel-keys" placeholder="my_col=their_col, …" value="${esc(pairs)}">
-      <button type="button" class="adm-icon-btn tw-rel-remove" title="Remove relation">×</button>`;
+      <div class="adm-rel-row-head">
+        <span>joins</span>
+        <select class="tw-rel-target"><option value="">— pick table —</option>${options}</select>
+        <span>on</span>
+        <button type="button" class="adm-icon-btn tw-rel-remove" title="Remove relation">×</button>
+      </div>`;
+    const editor = createPairEditor({
+      leftCols: wizardLeftCols(),
+      rightCols: tableCols(rel && rel.related_table_id),
+      pairs: (rel && rel.join_keys) || [],
+    });
+    row._pairEditor = editor;
+    row.appendChild(editor.el);
+    const targetSel = row.querySelector('.tw-rel-target');
+    targetSel.addEventListener('change', () => editor.setRightCols(tableCols(targetSel.value)));
     row.querySelector('.tw-rel-remove').addEventListener('click', () => row.remove());
     box.appendChild(row);
   }
 
-  function parseJoinKeys(text) {
-    return String(text || '').split(',')
-      .map((s) => s.trim()).filter(Boolean)
-      .map((s) => s.split('=').map((x) => x.trim()))
-      .filter((p) => p.length === 2 && p[0] && p[1]);
+  // ── Structured join-key pair editor ────────────────────────────────────
+  // Replaces the old free-text "a=b, c=d" input everywhere relations are
+  // manually created/edited. Columns come from stored registry metadata
+  // only (TABLES / the wizard's introspected columns) — no live DB calls.
+
+  // SQL type string -> family. Mirrors the verification rule in
+  // relation_discovery._verify_one (numeric joins numeric; other families
+  // must match), applied to the registry's SQLAlchemy type strings.
+  const DTYPE_FAMILIES = [
+    ['numeric', /^(TINY|SMALL|MEDIUM|BIG)?INT(?!ERVAL)|^(NUMERIC|DECIMAL|NUMBER|FLOAT|REAL|DOUBLE|MONEY|SERIAL)/],
+    ['text', /^(N?VAR)?CHAR|^N?TEXT|^CLOB|^STRING|^UUID|^ENUM/],
+    ['temporal', /^DATE|^TIME|^DATETIME|^TIMESTAMP|^SMALLDATETIME/],
+    ['bool', /^BOOL|^BIT/],
+  ];
+  function dtypeFamily(dtype) {
+    const d = String(dtype || '').trim().toUpperCase();
+    if (!d) return null;
+    for (const [fam, re] of DTYPE_FAMILIES) { if (re.test(d)) return fam; }
+    return null;
+  }
+
+  function tableCols(tid) {
+    const t = TABLES.find((x) => x.id === tid);
+    return ((t && t.columns) || []).map((c) => ({ name: c.name, dtype: c.dtype || '' }));
+  }
+
+  function createPairEditor(opts) {
+    // opts: {leftCols, rightCols, pairs, onChange}; cols = [{name, dtype}].
+    // Returns {el, getPairs(), hasMissing(), setRightCols()}. getPairs()
+    // keeps the old parseJoinKeys contract: [[l, r], ...], incomplete rows
+    // dropped — and works synchronously right after construction.
+    const el = document.createElement('div');
+    el.className = 'adm-pair-editor';
+    const rowsBox = document.createElement('div');
+    el.appendChild(rowsBox);
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'adm-btn ghost small';
+    addBtn.textContent = '＋ add column pair';
+    el.appendChild(addBtn);
+    const warnBox = document.createElement('div');
+    warnBox.className = 'adm-pair-warnings';
+    el.appendChild(warnBox);
+
+    let rightCols = opts.rightCols || [];
+    const leftCols = opts.leftCols || [];
+
+    function colSelect(cols, side, value) {
+      const sel = document.createElement('select');
+      sel.className = 'adm-pair-col ' + side;
+      const empty = document.createElement('option');
+      empty.value = '';
+      empty.textContent = '— column —';
+      sel.appendChild(empty);
+      let found = !value;
+      cols.forEach((c) => {
+        const o = document.createElement('option');
+        o.value = c.name;
+        o.textContent = c.name + (c.dtype ? ` (${c.dtype})` : '');
+        o.dataset.dtype = c.dtype || '';
+        if (c.name === value) found = true;
+        sel.appendChild(o);
+      });
+      if (!found && value) {
+        // A stored column the registry no longer has: keep it visible and
+        // selected, clearly invalid — NEVER silently dropped.
+        const o = document.createElement('option');
+        o.value = value;
+        o.textContent = `${value} (missing)`;
+        o.dataset.missing = '1';
+        sel.appendChild(o);
+      }
+      sel.value = value || '';
+      sel.addEventListener('change', refresh);
+      return sel;
+    }
+
+    function addRow(pair) {
+      const row = document.createElement('div');
+      row.className = 'adm-pair-row';
+      const left = colSelect(leftCols, 'left', pair && pair[0]);
+      const eq = document.createElement('span');
+      eq.textContent = '=';
+      const right = colSelect(rightCols, 'right', pair && pair[1]);
+      const rm = document.createElement('button');
+      rm.type = 'button';
+      rm.className = 'adm-icon-btn';
+      rm.title = 'Remove pair';
+      rm.textContent = '×';
+      rm.addEventListener('click', () => { row.remove(); refresh(); });
+      row.append(left, eq, right, rm);
+      rowsBox.appendChild(row);
+    }
+
+    function refresh() {
+      const notes = [];
+      let missing = false;
+      rowsBox.querySelectorAll('.adm-pair-row').forEach((row) => {
+        const l = row.querySelector('.adm-pair-col.left');
+        const r = row.querySelector('.adm-pair-col.right');
+        const lo = l.selectedOptions[0];
+        const ro = r.selectedOptions[0];
+        l.classList.toggle('adm-invalid', !!(lo && lo.dataset.missing));
+        r.classList.toggle('adm-invalid', !!(ro && ro.dataset.missing));
+        if ((lo && lo.dataset.missing) || (ro && ro.dataset.missing)) missing = true;
+        if (l.value && r.value && lo && ro && !lo.dataset.missing && !ro.dataset.missing) {
+          const lf = dtypeFamily(lo.dataset.dtype);
+          const rf = dtypeFamily(ro.dataset.dtype);
+          if (lf && rf && lf !== rf) {
+            notes.push(`⚠ ${l.value} and ${r.value} types may be incompatible (${lo.dataset.dtype || '?'} vs ${ro.dataset.dtype || '?'})`);
+          }
+        }
+      });
+      if (missing) {
+        notes.unshift('⚠ a selected column no longer exists in the registry — pick a current column');
+      }
+      warnBox.textContent = notes.join('  ·  ');
+      // Never during construction: callers capture the returned editor in a
+      // const, so a synchronous onChange would hit the temporal dead zone.
+      // They set the initial button state themselves right after creation.
+      if (ready && typeof opts.onChange === 'function') opts.onChange();
+    }
+
+    addBtn.addEventListener('click', () => addRow(null));
+    let ready = false;
+    ((opts.pairs && opts.pairs.length) ? opts.pairs : [null]).forEach(addRow);
+    refresh();
+    ready = true;
+
+    return {
+      el,
+      getPairs() {
+        const out = [];
+        rowsBox.querySelectorAll('.adm-pair-row').forEach((row) => {
+          const l = row.querySelector('.adm-pair-col.left').value;
+          const r = row.querySelector('.adm-pair-col.right').value;
+          if (l && r) out.push([l, r]);
+        });
+        return out;
+      },
+      hasMissing() {
+        return !!rowsBox.querySelector('.adm-pair-col option[data-missing]:checked');
+      },
+      setRightCols(cols) {
+        // target-table change: rebuild right selects, reset in-progress picks
+        rightCols = cols || [];
+        rowsBox.querySelectorAll('.adm-pair-row').forEach((row) => {
+          const right = row.querySelector('.adm-pair-col.right');
+          right.replaceWith(colSelect(rightCols, 'right', ''));
+        });
+        refresh();
+      },
+    };
   }
 
   function collectRelations() {
@@ -614,7 +806,7 @@
     document.querySelectorAll('#twRelations .adm-rel-row').forEach((row) => {
       const target = row.querySelector('.tw-rel-target').value;
       if (!target) return;
-      const pairs = parseJoinKeys(row.querySelector('.tw-rel-keys').value);
+      const pairs = row._pairEditor ? row._pairEditor.getPairs() : [];
       if (!pairs.length) return;
       // Carry discovered extras (cardinality/origin) through an UNCHANGED
       // manual save — a re-save must not silently strip them. Changed target
@@ -799,14 +991,20 @@
       const suspicious = parentDoc
         ? _samePhysicalDocs(t, parentDoc)
         : (!rel.related_table_id && String(rid).toLowerCase() === _physLabel(t).toLowerCase());
+      // Dangling = an id ref whose registration was deleted: the relation
+      // resolves to nothing downstream — surface it, don't show a raw hex id.
+      const dangling = !!rel.related_table_id && !parentDoc;
       entries.push({
         table_id: t.id,
         child_label: t.display_name,
         child_phys: _physLabel(t),
         related_ref: String(rid),
         related_is_id: !!rel.related_table_id,
-        related_label: (parentDoc || {}).display_name || String(rid) || '?',
-        parent_phys: parentDoc ? _physLabel(parentDoc) : String(rid),
+        related_label: (parentDoc || {}).display_name
+          || (dangling ? '(deleted registration)' : String(rid) || '?'),
+        parent_phys: parentDoc ? _physLabel(parentDoc)
+          : (dangling ? `was id ${String(rid).slice(0, 8)}…` : String(rid)),
+        dangling,
         join_keys: (rel.join_keys || [])
           .filter((p) => Array.isArray(p) && p.length === 2)
           .map((p) => [String(p[0]), String(p[1])]),
@@ -848,6 +1046,7 @@
         const keys = e.join_keys.map((p) => `${esc(p[0])} = ${esc(p[1])}`).join(', ');
         const chips = [];
         if (e.suspicious) chips.push('<span class="adm-chip bad" title="Both sides are registrations of the same physical source table — this relation joins a table to its own copy and is almost certainly noise. Delete it.">⚠ same physical table</span>');
+        if (e.dangling) chips.push('<span class="adm-chip bad" title="The registration this relation points at was deleted — the AI receives no join hint from it. Delete it, or re-create it against the current registration.">⚠ target registration deleted</span>');
         chips.push(cardChip(e.cardinality));
         chips.push(originChip(e.origin));
         return `
@@ -898,6 +1097,138 @@
     loadAll();
   }
 
+  // ── Overview "+ Add relation" (structured, manual) ─────────────────────
+  function relOverviewAdd() {
+    const box = $('relAddForm');
+    if (!box.classList.contains('hidden')) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+    if (TABLES.length < 2) { toast('Register at least two tables first', true); return; }
+    box.classList.remove('hidden');
+    box.className = 'adm-rel-addform';
+    const opts = (skip) => TABLES.filter((t) => t.id !== skip)
+      .map((t) => `<option value="${esc(t.id)}">${esc(t.display_name)}</option>`).join('');
+    box.innerHTML = `
+      <div class="adm-rel-row-head">
+        <select class="rel-add-child"><option value="">— table —</option>${opts(null)}</select>
+        <span>joins</span>
+        <select class="rel-add-target"><option value="">— target table —</option></select>
+        <span>on</span>
+      </div>`;
+    const childSel = box.querySelector('.rel-add-child');
+    const targetSel = box.querySelector('.rel-add-target');
+    let editor = null;
+    const actions = document.createElement('div');
+    actions.className = 'adm-rel-cand-actions';
+    actions.innerHTML = `
+      <button class="adm-btn primary small" data-act="save" disabled>Save relation</button>
+      <button class="adm-btn ghost small" data-act="cancel">Cancel</button>`;
+    const saveBtn = actions.querySelector('[data-act="save"]');
+
+    function rebuildEditor() {
+      if (editor) editor.el.remove();
+      editor = createPairEditor({
+        leftCols: tableCols(childSel.value),
+        rightCols: tableCols(targetSel.value),
+        pairs: [],
+        onChange: () => {
+          saveBtn.disabled = !childSel.value || !targetSel.value
+            || !editor.getPairs().length || editor.hasMissing();
+        },
+      });
+      box.insertBefore(editor.el, actions);
+      saveBtn.disabled = true;
+    }
+    childSel.addEventListener('change', () => {
+      // child excluded from its own target list
+      targetSel.innerHTML = `<option value="">— target table —</option>${opts(childSel.value)}`;
+      rebuildEditor();
+    });
+    targetSel.addEventListener('change', () => {
+      editor.setRightCols(tableCols(targetSel.value));
+      saveBtn.disabled = true;
+    });
+    box.appendChild(actions);
+    rebuildEditor();
+    actions.querySelector('[data-act="cancel"]').addEventListener('click', () => {
+      box.classList.add('hidden');
+      box.innerHTML = '';
+    });
+    saveBtn.addEventListener('click', async () => {
+      const jk = editor.getPairs();
+      if (!childSel.value || !targetSel.value || !jk.length) return;
+      const r = await api('/api/admin/relations/accept', {
+        method: 'POST',
+        body: JSON.stringify({ relations: [{
+          table_id: childSel.value, related_table_id: targetSel.value,
+          join_keys: jk, cardinality: null, origin: null }] }),
+      });
+      if (!r.data.ok) { toast(r.data.error || 'Save failed', true); return; }
+      toast(r.data.skipped ? 'Not saved — an identical relation already exists'
+                           : 'Relation added', !!r.data.skipped);
+      box.classList.add('hidden');
+      box.innerHTML = '';
+      loadAll();
+    });
+  }
+
+  // ── Missing-table hints (unregistered FK refs + SQL unknowns) ──────────
+  let REL_GHOSTS = [];          // last scan's unregistered FK refs
+  let REL_UNKNOWN_HINTS = [];   // last analyze_sql's register shortcuts
+
+  function _ghostRegistered(ref) {
+    // a just-registered ghost disappears without re-scanning
+    return TABLES.some((t) => t.connection_id === ref.connection_id
+      && String(t.schema || '').toLowerCase() === String(ref.schema || '').toLowerCase()
+      && String(t.table_name || '').toLowerCase() === String(ref.table || '').toLowerCase());
+  }
+
+  function renderRelGhosts() {
+    const box = $('relGhostList');
+    const live = REL_GHOSTS.filter((g) => !_ghostRegistered(g));
+    box.classList.toggle('hidden', !live.length);
+    box.innerHTML = live.length ? '<div class="adm-subhead"><h4>Referenced but not registered</h4></div>'
+      + live.map((g, i) => {
+          const phys = g.schema ? `${g.schema}.${g.table}` : g.table;
+          return `
+            <div class="adm-rel-ghost-row" data-idx="${i}">
+              <span><strong>${esc((g.referenced_by || []).join(', '))}</strong> references
+                <strong>${esc(phys)}</strong> (not registered) — the AI cannot use this join
+                until it is registered.</span>
+              <button class="adm-btn ghost small" data-act="register">＋ Register as connector</button>
+            </div>`;
+        }).join('') : '';
+    box.querySelectorAll('[data-act="register"]').forEach((b) => {
+      const g = live[parseInt(b.closest('.adm-rel-ghost-row').dataset.idx, 10)];
+      b.addEventListener('click', () => registerGhost(g));
+    });
+  }
+
+  function registerGhost(g) {
+    openTableWizard(g.connection_id, null, false,
+      { schema: g.schema || '', table: g.table, connector: true });
+  }
+
+  function renderRelUnknowns(unknown, hints) {
+    const box = $('relUnknownList');
+    const hintByName = {};
+    (hints || []).forEach((h) => { hintByName[h.name] = h; });
+    const rows = (unknown || []).map((name) => {
+      const h = hintByName[name];
+      const btn = h ? '<button class="adm-btn ghost small" data-act="register">＋ Register as connector</button>' : '';
+      return `<div class="adm-rel-ghost-row" data-name="${esc(name)}">
+        <span><strong>${esc(name)}</strong> appears in the SQL but is not a registered table.</span>${btn}</div>`;
+    });
+    box.classList.toggle('hidden', !rows.length);
+    box.innerHTML = rows.length
+      ? '<div class="adm-subhead"><h4>Tables in the SQL that are not registered</h4></div>' + rows.join('')
+      : '';
+    box.querySelectorAll('[data-act="register"]').forEach((b) => {
+      const name = b.closest('.adm-rel-ghost-row').dataset.name;
+      const h = hintByName[name];
+      b.addEventListener('click', () => registerGhost({
+        connection_id: h.connection_id, schema: h.schema, table: h.table }));
+    });
+  }
+
   async function relOverviewDelete(e) {
     // Name the join keys — several relations can link the same table pair.
     const keys = e.join_keys.map((p) => `${p[0]}=${p[1]}`).join(', ');
@@ -920,23 +1251,33 @@
     const options = TABLES.filter((t) => t.id !== e.table_id)
       .map((t) => `<option value="${esc(t.id)}" ${e.related_is_id && e.related_ref === t.id ? 'selected' : ''}>${esc(t.display_name)}</option>`)
       .join('');
-    const pairsText = e.join_keys.map((p) => `${p[0]}=${p[1]}`).join(', ');
     const main = row.querySelector('.adm-rel-cand-main');
     main.innerHTML = `
-      <div class="adm-rel-row">
+      <div class="adm-rel-row-head">
         <span><strong>${esc(e.child_label)}</strong> joins</span>
         <select class="tw-rel-target"><option value="">— pick table —</option>${options}</select>
         <span>on</span>
-        <input type="text" class="tw-rel-keys" placeholder="my_col=their_col, …" value="${esc(pairsText)}">
       </div>`;
     const actions = row.querySelector('.adm-rel-cand-actions');
     actions.innerHTML = `
       <button class="adm-btn primary small" data-act="save">Save</button>
       <button class="adm-btn ghost small" data-act="cancel">Cancel</button>`;
-    actions.querySelector('[data-act="save"]').addEventListener('click', async () => {
-      const target = main.querySelector('.tw-rel-target').value;
-      const jk = parseJoinKeys(main.querySelector('.tw-rel-keys').value);
-      if (!target || !jk.length) { toast('Pick a table and at least one col=col pair', true); return; }
+    const saveBtn = actions.querySelector('[data-act="save"]');
+    const editor = createPairEditor({
+      leftCols: tableCols(e.table_id),
+      rightCols: e.related_is_id ? tableCols(e.related_ref) : [],
+      pairs: e.join_keys,
+      // accept 400s on columns absent from the registry — gate the save
+      onChange: () => { saveBtn.disabled = editor.hasMissing(); },
+    });
+    main.appendChild(editor.el);
+    saveBtn.disabled = editor.hasMissing();
+    const targetSel = main.querySelector('.tw-rel-target');
+    targetSel.addEventListener('change', () => editor.setRightCols(tableCols(targetSel.value)));
+    saveBtn.addEventListener('click', async () => {
+      const target = targetSel.value;
+      const jk = editor.getPairs();
+      if (!target || !jk.length) { toast('Pick a table and at least one column pair', true); return; }
       const unchanged = e.related_is_id && target === e.related_ref
         && JSON.stringify(jk) === JSON.stringify(e.join_keys);
       const item = {
@@ -957,6 +1298,218 @@
       loadAll();
     });
     actions.querySelector('[data-act="cancel"]').addEventListener('click', renderRelOverview);
+  }
+
+  // ── Relations graph view (vendored Cytoscape, never a CDN) ─────────────
+  let cyInstance = null;
+  let relView = 'list';
+  const REL_COMPONENT_COLORS = ['#1276C2', '#059669', '#9333ea', '#d97706',
+    '#0e7490', '#be185d', '#4d7c0f', '#7c3aed', '#0f766e', '#b91c1c'];
+  const REL_ISOLATED_COLOR = '#dc2626';
+  const REL_GHOST_COLOR = '#94a3b8';
+
+  let _cyLoadPromise = null;
+  function ensureCytoscape() {
+    if (window.cytoscape) return Promise.resolve();
+    if (_cyLoadPromise) return _cyLoadPromise;   // single-flight
+    _cyLoadPromise = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = '/static/vendor/cytoscape/cytoscape.min.js';
+      s.onload = resolve;
+      s.onerror = () => { _cyLoadPromise = null; reject(new Error('cytoscape load failed')); };
+      document.head.appendChild(s);
+    });
+    return _cyLoadPromise;
+  }
+
+  function setRelView(view) {
+    relView = view;
+    $('btnRelViewList').classList.toggle('active', view === 'list');
+    $('btnRelViewGraph').classList.toggle('active', view === 'graph');
+    $('relConfirmedCard').classList.toggle('hidden', view !== 'list');
+    $('relGraphCard').classList.toggle('hidden', view !== 'graph');
+    if (view === 'graph') {
+      refreshRelGraph();
+    } else if (cyInstance) {
+      cyInstance.destroy();
+      cyInstance = null;
+    }
+  }
+
+  async function refreshRelGraph() {
+    try {
+      await ensureCytoscape();
+    } catch (e) {
+      toast('Could not load the graph library', true);
+      setRelView('list');
+      return;
+    }
+    const live = REL_GHOSTS.filter((g) => !_ghostRegistered(g));
+    const r = await api('/api/admin/relations/graph', {
+      method: 'POST', body: JSON.stringify({ unregistered_refs: live }) });
+    if (!r.data.ok) { toast(r.data.error || 'Could not load the graph', true); return; }
+    renderRelGraph(r.data.nodes || [], r.data.edges || []);
+  }
+
+  function _hideGraphPopover() {
+    $('relGraphPopover').classList.add('hidden');
+  }
+
+  function renderRelGraph(nodes, edges) {
+    if (cyInstance) { cyInstance.destroy(); cyInstance = null; }
+    _hideGraphPopover();
+    const elements = [];
+    nodes.forEach((n) => {
+      const color = n.ghost ? REL_GHOST_COLOR
+        : n.isolated ? REL_ISOLATED_COLOR
+        : REL_COMPONENT_COLORS[(n.component || 0) % REL_COMPONENT_COLORS.length];
+      elements.push({ data: {
+        id: n.id,
+        display: n.label + (n.connector ? ' ⚙' : '') + '\n' + (n.sub || ''),
+        color,
+        size: 34 + Math.min(26, (n.relation_count || 0) * 6),
+        connector: n.connector ? 1 : 0,
+        ghost: n.ghost ? 1 : 0,
+        isolated: n.isolated ? 1 : 0,
+        connection_id: n.connection_id || '', schema: n.schema || '',
+        table: n.table || '', label: n.label,
+      } });
+    });
+    edges.forEach((e) => {
+      elements.push({ data: {
+        id: e.id, source: e.source, target: e.target,
+        elabel: (e.keys_label || '')
+          + (e.cardinality ? ` · ${REL_CARD_LABEL[e.cardinality] || e.cardinality}` : ''),
+        ghost: e.ghost ? 1 : 0,
+        suspicious: e.suspicious ? 1 : 0,
+        keys_label: e.keys_label || '', cardinality: e.cardinality || '',
+        origin: e.origin || 'manual', join_keys: e.join_keys || [],
+        related_ref: e.related_ref || '', related_is_id: e.related_is_id ? 1 : 0,
+      } });
+    });
+    cyInstance = cytoscape({
+      container: $('relGraph'),
+      elements,
+      style: [
+        { selector: 'node', style: {
+          label: 'data(display)', 'text-wrap': 'wrap', 'text-valign': 'bottom',
+          'text-margin-y': 6, 'font-size': 10, color: '#334155',
+          width: 'data(size)', height: 'data(size)',
+          'background-color': 'data(color)',
+        } },
+        { selector: 'node[connector = 1]', style: {
+          shape: 'round-rectangle', 'border-width': 3, 'border-color': '#0f172a',
+        } },
+        { selector: 'node[ghost = 1]', style: {
+          'background-opacity': 0.15, 'border-width': 2,
+          'border-style': 'dashed', 'border-color': REL_GHOST_COLOR,
+        } },
+        { selector: 'edge', style: {
+          'curve-style': 'bezier', width: 2, 'line-color': '#94a3b8',
+          'target-arrow-shape': 'triangle', 'target-arrow-color': '#94a3b8',
+          label: 'data(elabel)', 'font-size': 9, color: '#64748b',
+          'text-rotation': 'autorotate', 'text-background-color': '#fff',
+          'text-background-opacity': 0.85, 'text-background-padding': 2,
+        } },
+        { selector: 'edge[ghost = 1]', style: { 'line-style': 'dashed' } },
+        { selector: 'edge[suspicious = 1]', style: {
+          'line-style': 'dashed', 'line-color': REL_ISOLATED_COLOR,
+          'target-arrow-color': REL_ISOLATED_COLOR,
+        } },
+        { selector: '.dim', style: { opacity: 0.15 } },
+      ],
+      layout: { name: 'cose', animate: false, padding: 30 },
+    });
+
+    cyInstance.on('tap', (evt) => {
+      if (evt.target === cyInstance) {           // background tap: clear
+        cyInstance.elements().removeClass('dim');
+        _hideGraphPopover();
+      }
+    });
+    cyInstance.on('tap', 'node', (evt) => {
+      const n = evt.target;
+      _hideGraphPopover();
+      if (Number(n.data('ghost'))) {
+        registerGhost({ connection_id: n.data('connection_id'),
+          schema: n.data('schema'), table: n.data('table') });
+        return;
+      }
+      cyInstance.elements().addClass('dim');
+      n.closedNeighborhood().removeClass('dim');
+      if (Number(n.data('isolated'))) {
+        _showGraphPopover(evt.renderedPosition,
+          `<strong>${esc(n.data('label'))}</strong><div class="adm-muted">Not joined to any
+           table — the AI cannot combine it with others.</div>`);
+      }
+    });
+    cyInstance.on('tap', 'edge', (evt) => {
+      const e = evt.target;
+      if (Number(e.data('ghost'))) return;
+      const src = e.source(); const tgt = e.target();
+      const card = e.data('cardinality');
+      _showGraphPopover(evt.renderedPosition, `
+        <strong>${esc(src.data('label'))}</strong> → <strong>${esc(tgt.data('label'))}</strong>
+        <div class="adm-rel-cand-meta" style="margin:6px 0">
+          <span class="adm-chip">${esc(e.data('keys_label') || '—')}</span>
+          ${card ? cardChip(card) : ''} ${originChip(e.data('origin'))}
+        </div>
+        <div class="adm-rel-cand-actions">
+          <button class="adm-btn ghost small" data-act="gedit">✎ Edit</button>
+          <button class="adm-btn ghost small" data-act="gdelete">🗑 Delete</button>
+        </div>`);
+      const pop = $('relGraphPopover');
+      pop.querySelector('[data-act="gedit"]').addEventListener('click', () => {
+        _hideGraphPopover();
+        openOverviewEditorFor(e.data());
+      });
+      pop.querySelector('[data-act="gdelete"]').addEventListener('click', async () => {
+        if (!window.confirm(`Delete the relation ${src.data('label')} → ${tgt.data('label')} on ${e.data('keys_label')}?`)) return;
+        const body = { table_id: e.data('source'), join_keys: e.data('join_keys') };
+        if (Number(e.data('related_is_id'))) body.related_table_id = e.data('related_ref');
+        else body.related_table = e.data('related_ref');
+        const r = await api('/api/admin/relations/delete', {
+          method: 'POST', body: JSON.stringify(body) });
+        _hideGraphPopover();
+        if (!r.data.ok) { toast(r.data.error || 'Delete failed', true); return; }
+        toast('Relation deleted');
+        loadAll();
+      });
+    });
+
+    $('relGraphLegend').innerHTML = `
+      <span class="lg"><span class="sw" style="background:${REL_COMPONENT_COLORS[0]}"></span> cluster (one color per group of joined tables)</span>
+      <span class="lg"><span class="sw" style="background:${REL_ISOLATED_COLOR}"></span> not joined to any table — the AI cannot combine it</span>
+      <span class="lg"><span class="sw" style="border:2px solid #0f172a; background:#fff"></span> ⚙ connector table</span>
+      <span class="lg"><span class="sw" style="border:2px dashed ${REL_GHOST_COLOR}; background:#fff"></span> referenced but not registered (click to register)</span>
+      <span class="lg">— arrow points child → parent; dashed red = same physical table</span>`;
+  }
+
+  function _showGraphPopover(pos, html) {
+    const pop = $('relGraphPopover');
+    pop.innerHTML = html;
+    pop.classList.remove('hidden');
+    const host = $('relGraph').getBoundingClientRect();
+    const card = $('relGraphCard').getBoundingClientRect();
+    const left = Math.min(pos.x + (host.left - card.left) + 12,
+                          card.width - 330);
+    pop.style.left = Math.max(8, left) + 'px';
+    pop.style.top = (pos.y + (host.top - card.top) + 12) + 'px';
+  }
+
+  function openOverviewEditorFor(d) {
+    setRelView('list');
+    renderRelOverview();
+    const entries = relOverviewEntries();
+    const idx = entries.findIndex((e) => e.table_id === d.source
+      && e.related_ref === d.related_ref
+      && JSON.stringify(e.join_keys) === JSON.stringify(d.join_keys));
+    if (idx < 0) { toast('Relation not found — refreshing', true); loadAll(); return; }
+    const row = $('relConfirmedList').querySelector(`[data-idx="${idx}"]`);
+    if (row) {
+      relOverviewEdit(entries[idx], row);
+      row.scrollIntoView({ block: 'center' });
+    }
   }
 
   // ── Relations: discovery (Zone B) ──────────────────────────────────────
@@ -1070,6 +1623,8 @@
     // Zero-new must be judged from the RESPONSE (the merged list can retain
     // earlier SQL-derived candidates) and explained via the confirmed count.
     _renderNoNew((r.data.candidates || []).length, r.data.confirmed_count || 0);
+    REL_GHOSTS = r.data.unregistered_refs || [];
+    renderRelGhosts();
     renderRelCandidates();
     toast(`Scan complete — ${(r.data.candidates || []).length} candidate(s)`);
   }
@@ -1100,12 +1655,13 @@
     mergeRelCandidates(r.data.candidates || []);
     const st = r.data.stats || {};
     const unknown = st.unknown_tables || [];
+    REL_UNKNOWN_HINTS = r.data.unknown_table_hints || [];
+    // The honest reason beats "already confirmed": unregistered tables in
+    // the SQL can never become candidates — list them, with a one-click
+    // register shortcut where the connection is unambiguous.
+    renderRelUnknowns(unknown, REL_UNKNOWN_HINTS);
     if (!(r.data.candidates || []).length && unknown.length) {
-      // The honest reason beats "already confirmed": the SQL joins tables
-      // that are not registered, so they can never become candidates.
-      const box = $('relNoNew');
-      box.textContent = `No candidates — these tables in the SQL are not registered: ${unknown.join(', ')}. Register them first, then analyze again.`;
-      box.classList.remove('hidden');
+      $('relNoNew').classList.add('hidden');
     } else {
       _renderNoNew((r.data.candidates || []).length, r.data.confirmed_count || 0);
     }
@@ -1169,23 +1725,32 @@
       .filter((t) => t.id !== cand.table_id)
       .map((t) => `<option value="${esc(t.id)}" ${cand.related_table_id === t.id ? 'selected' : ''}>${esc(t.display_name)}</option>`)
       .join('');
-    const pairs = (cand.join_keys || []).map((p) => `${p[0]}=${p[1]}`).join(', ');
     const main = row.querySelector('.adm-rel-cand-main');
     main.innerHTML = `
-      <div class="adm-rel-row">
+      <div class="adm-rel-row-head">
         <span><strong>${esc(cand.table_label)}</strong> joins</span>
         <select class="tw-rel-target"><option value="">— pick table —</option>${options}</select>
         <span>on</span>
-        <input type="text" class="tw-rel-keys" placeholder="my_col=their_col, …" value="${esc(pairs)}">
       </div>`;
     const actions = row.querySelector('.adm-rel-cand-actions');
     actions.innerHTML = `
       <button class="adm-btn primary small" data-act="save">Save</button>
       <button class="adm-btn ghost small" data-act="cancel">Cancel</button>`;
-    actions.querySelector('[data-act="save"]').addEventListener('click', async () => {
-      const target = main.querySelector('.tw-rel-target').value;
-      const jk = parseJoinKeys(main.querySelector('.tw-rel-keys').value);
-      if (!target || !jk.length) { toast('Pick a table and at least one col=col pair', true); return; }
+    const saveBtn = actions.querySelector('[data-act="save"]');
+    const editor = createPairEditor({
+      leftCols: tableCols(cand.table_id),
+      rightCols: tableCols(cand.related_table_id),
+      pairs: cand.join_keys || [],
+      onChange: () => { saveBtn.disabled = editor.hasMissing(); },
+    });
+    main.appendChild(editor.el);
+    saveBtn.disabled = editor.hasMissing();
+    const targetSel = main.querySelector('.tw-rel-target');
+    targetSel.addEventListener('change', () => editor.setRightCols(tableCols(targetSel.value)));
+    saveBtn.addEventListener('click', async () => {
+      const target = targetSel.value;
+      const jk = editor.getPairs();
+      if (!target || !jk.length) { toast('Pick a table and at least one column pair', true); return; }
       const unchanged = target === cand.related_table_id
         && JSON.stringify(jk) === JSON.stringify(cand.join_keys || []);
       await acceptRelCandidates([Object.assign({}, cand, {
@@ -1412,6 +1977,9 @@
     $('btnRelAnalyzeSql').addEventListener('click', analyzeRelSql);
     $('btnRelAcceptChecked').addEventListener('click', acceptCheckedRelCandidates);
     $('btnRelDeleteFlagged').addEventListener('click', deleteFlaggedRelations);
+    $('btnRelAddManual').addEventListener('click', relOverviewAdd);
+    $('btnRelViewList').addEventListener('click', () => setRelView('list'));
+    $('btnRelViewGraph').addEventListener('click', () => setRelView('graph'));
 
     $('btnSaveSchedule').addEventListener('click', saveSchedule);
     $('btnReloadAudit').addEventListener('click', loadAudit);
