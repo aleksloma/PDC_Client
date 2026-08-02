@@ -19,10 +19,19 @@ class Settings(BaseModel):
     MAX_FILES: int = Field(default_factory=lambda: int(os.getenv("MAX_FILES", "5")))
     SECRET_KEY: str = Field(default_factory=lambda: os.getenv("SECRET_KEY", "replace-me-in-prod"))
 
+    # Build identity — baked in as Docker build args (see the Dockerfile).
+    # Empty on an unstamped build; the app then reports its start time.
+    BUILD_COMMIT: str = Field(default_factory=lambda: os.getenv("BUILD_COMMIT", ""))
+    BUILD_TIME: str = Field(default_factory=lambda: os.getenv("BUILD_TIME", ""))
+
     # Brain connection (injected per-tenant at install time)
     BRAIN_URL: str = Field(default_factory=lambda: os.getenv("BRAIN_URL", "http://localhost:8080"))
     BRAIN_TENANT_TOKEN: str = Field(default_factory=lambda: os.getenv("BRAIN_TENANT_TOKEN", ""))
     BRAIN_REQUEST_TIMEOUT: float = Field(default_factory=lambda: float(os.getenv("BRAIN_REQUEST_TIMEOUT", "180.0")))
+    # Tighter cap for brain calls made behind an interactive admin click (the
+    # AI description draft during table registration): a stalled brain must
+    # surface as a named error, not as a spinner nobody can wait out.
+    BRAIN_DRAFT_TIMEOUT: float = Field(default_factory=lambda: float(os.getenv("BRAIN_DRAFT_TIMEOUT", "60.0")))
 
     # Same prompt-trim defaults as the B2C app (used by the client when it
     # builds schema text and history before posting to the brain).

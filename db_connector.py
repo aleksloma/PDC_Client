@@ -26,6 +26,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -146,6 +147,12 @@ def _oracle_query_args(cfg: dict) -> dict:
     return {}
 
 
+def _oracle_connect_args(cfg: dict, timeout: int) -> dict:
+    # Thin-mode oracledb: without this the connect falls back to the OS TCP
+    # timeout (~127s on Linux), the one dialect that could outlast a click.
+    return {"tcp_connect_timeout": float(timeout)}
+
+
 def _oracle_stmt_timeout(conn, seconds: int) -> None:
     try:
         conn.connection.dbapi_connection.call_timeout = int(seconds) * 1000
@@ -210,7 +217,8 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
         drivername="oracle+oracledb", driver_module="oracledb",
         default_port=1521, quote=('"', '"'), needs=("service_name",),
         supports_schemas=True, select1_sql="SELECT 1 FROM DUAL",
-        query_args=_oracle_query_args, apply_stmt_timeout=_oracle_stmt_timeout,
+        connect_args=_oracle_connect_args, query_args=_oracle_query_args,
+        apply_stmt_timeout=_oracle_stmt_timeout,
         limit_clause=lambda sql, n: f"{sql} FETCH FIRST {int(n)} ROWS ONLY",
         row_count_sql=("SELECT num_rows FROM all_tables "
                        "WHERE owner = :schema AND table_name = :table"),
@@ -262,6 +270,39 @@ def _scrub(text_val: str, *secrets_: Optional[str]) -> str:
         if s:
             out = out.replace(s, "***")
     return out[:300]
+
+
+# Anchored on timeout PHRASES, not the bare word: a connect error that
+# merely echoes the DSN would otherwise match (postgres embeds
+# `options=-c statement_timeout=…` in every connection). Oracle's DPY-6005
+# is deliberately absent — it is the generic "cannot connect" (listener
+# down, refused, bad DNS), and relabelling those as a timeout would destroy
+# the very diagnosability this helper exists for.
+_TIMEOUT_PAT = re.compile(
+    r"timed[ _-]?out"
+    r"|timeout (?:expired|exceeded)"
+    # SPACE-separated only: `statement_timeout=…` is a DSN parameter psycopg2
+    # echoes back in unrelated connect errors, not a timeout report.
+    r"|(?:login|connection|connect|statement|query|lock|read|write) timeout"
+    r"|timeouterror|HYT00", re.I)
+
+
+def _friendly_db_error(exc: Exception, phrase: str, *secrets_: Optional[str]) -> str:
+    """One clear sentence when a driver error is timeout-shaped, so the admin
+    reads "the database did not answer" instead of a 300-char driver dump.
+    Each of the five drivers words it differently (psycopg2 "timeout expired",
+    pyodbc HYT00, oracledb DPY-6005, …), so the whole cause chain is checked.
+    Anything not timeout-shaped keeps its scrubbed driver text — no error is
+    ever replaced by a guess."""
+    seen = 0
+    e: Optional[BaseException] = exc
+    while e is not None and seen < 5:
+        if isinstance(e, (TimeoutError, socket.timeout)) or \
+                _TIMEOUT_PAT.search(f"{type(e).__name__} {e}"):
+            return phrase
+        e = e.__cause__ or e.__context__
+        seen += 1
+    return _scrub(f"{type(exc).__name__}: {exc}", *secrets_)
 
 
 _FORBIDDEN_TOKENS = re.compile(
@@ -346,7 +387,7 @@ def test_connection(cfg: dict, password: str, *, sid: str) -> dict:
                 "server_version": ".".join(map(str, ver)) if ver else None,
                 "elapsed_ms": elapsed}
     except Exception as e:
-        err = _scrub(f"{type(e).__name__}: {e}", password)
+        err = _friendly_db_error(e, "Database connection timed out.", password)
         log_with_sid(sid, "warning",
                      f"DB_TEST_FAILED type={cfg.get('db_type')} host={cfg.get('host')} err={err}")
         return {"ok": False, "error": err, "server_version": None,
@@ -369,7 +410,7 @@ def list_schemas(cfg: dict, password: str, *, sid: str) -> dict:
         default = getattr(insp, "default_schema_name", None) or (schemas[0] if schemas else None)
         return {"ok": True, "schemas": schemas, "default_schema": default}
     except Exception as e:
-        err = _scrub(f"{type(e).__name__}: {e}", password)
+        err = _friendly_db_error(e, "Database connection timed out.", password)
         log_with_sid(sid, "warning", f"DB_LIST_SCHEMAS_FAILED err={err}")
         return {"ok": False, "error": err, "schemas": [], "default_schema": None}
     finally:
@@ -394,7 +435,7 @@ def list_tables(cfg: dict, password: str, schema: Optional[str], *, sid: str) ->
         out.sort(key=lambda r: r["name"])
         return {"ok": True, "tables": out}
     except Exception as e:
-        err = _scrub(f"{type(e).__name__}: {e}", password)
+        err = _friendly_db_error(e, "Database connection timed out.", password)
         log_with_sid(sid, "warning", f"DB_LIST_TABLES_FAILED schema={schema} err={err}")
         return {"ok": False, "error": err, "tables": []}
     finally:
@@ -457,6 +498,12 @@ def introspect(cfg: dict, password: str, schema: Optional[str], table: str,
         row_count = None
         size_bytes = None
         with engine.connect() as conn:
+            # The catalog estimates are the slow part here (Oracle's
+            # all_tables/all_segments especially) and introspect runs behind
+            # an admin click, so bound the statements as preview/snapshot do.
+            d.apply_stmt_timeout(
+                conn, int(cfg.get("statement_timeout")
+                          or settings.DB_STATEMENT_TIMEOUT))
             if d.row_count_sql:
                 try:
                     row_count = conn.execute(
@@ -501,7 +548,7 @@ def introspect(cfg: dict, password: str, schema: Optional[str], table: str,
                 "size_bytes_estimate": size_bytes,
                 "degraded": degraded}
     except Exception as e:
-        err = _scrub(f"{type(e).__name__}: {e}", password)
+        err = _friendly_db_error(e, "Database connection timed out.", password)
         log_with_sid(sid, "warning", f"DB_INTROSPECT_FAILED table={schema}.{table} err={err}")
         return {"ok": False, "error": err}
     finally:
@@ -548,7 +595,7 @@ def preview_rows(cfg: dict, password: str, schema: Optional[str], table: str,
                       for v in row] for row in raw_rows]
         return {"ok": True, "columns": [str(c) for c in df.columns], "rows": json_rows}
     except Exception as e:
-        err = _scrub(f"{type(e).__name__}: {e}", password)
+        err = _friendly_db_error(e, "Database connection timed out.", password)
         log_with_sid(sid, "warning", f"DB_PREVIEW_FAILED table={schema}.{table} err={err}")
         return {"ok": False, "error": err, "columns": [], "rows": []}
     finally:
@@ -674,7 +721,7 @@ def snapshot_table(cfg: dict, password: str, *, schema: Optional[str], table: st
                 "columns": out_columns, "dtype_plan": plan,
                 "truncated": bool(row_cap and rows_total >= int(row_cap)), "error": None}
     except Exception as e:
-        err = _scrub(f"{type(e).__name__}: {e}", password)
+        err = _friendly_db_error(e, "Database snapshot timed out.", password)
         log_with_sid(sid, "error", f"DB_SNAPSHOT_FAILED table={schema}.{table} err={err}")
         return {"ok": False, "rows": rows_total, "bytes": None,
                 "elapsed_s": round(time.monotonic() - t0, 2),

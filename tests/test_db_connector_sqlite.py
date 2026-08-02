@@ -209,3 +209,102 @@ def test_every_text_literal_is_select_or_set():
         assert m.group(1) in ("SELECT",)
     for m in re.finditer(r'text\(f?"([A-Za-z]+)[ _]', src):
         assert m.group(1).upper() in ("SELECT", "SET"), m.group(0)
+
+
+# ---------------------------------------------------------------------------
+# v4.2 — timeout bounds and timeout-shaped error wording
+# ---------------------------------------------------------------------------
+
+def test_every_networked_dialect_bounds_the_connect():
+    """A dialect with no connect bound falls back to the OS TCP timeout
+    (~127s) — long enough to outlast any admin click. Oracle was that gap."""
+    for key, d in db_connector.DIALECTS.items():
+        if d.hidden:
+            continue                      # sqlite is a local file
+        args = d.connect_args({}, 8)
+        query = d.query_args({})
+        bounded = any("timeout" in str(k).lower() for k in args) or \
+            any("timeout" in str(k).lower() for k in query)
+        assert bounded, f"{key} has no connect timeout"
+
+
+def test_oracle_connect_args_carry_the_driver_kwarg():
+    """Pinned oracledb 2.5.1 thin mode spells it `tcp_connect_timeout`."""
+    args = db_connector.DIALECTS["oracle"].connect_args({}, 8)
+    assert args == {"tcp_connect_timeout": 8.0}
+
+
+def test_friendly_error_maps_timeout_error_in_the_cause_chain():
+    phrase = "Database connection timed out."
+    try:
+        try:
+            raise TimeoutError("socket timed out")
+        except TimeoutError as inner:
+            raise RuntimeError("could not connect") from inner
+    except RuntimeError as e:
+        assert db_connector._friendly_db_error(e, phrase) == phrase
+
+
+def test_friendly_error_maps_driver_specific_timeout_strings():
+    phrase = "Database connection timed out."
+    for msg in ("connection timeout expired",
+                "('HYT00', '[HYT00] Login timeout expired')",
+                "Lost connection: read timed out",
+                "QueryCanceled: canceling statement due to statement timeout",
+                "TimeoutError raised by the pool"):
+        e = RuntimeError(msg)
+        assert db_connector._friendly_db_error(e, phrase) == phrase, msg
+
+
+def test_friendly_error_does_not_relabel_generic_connect_failures():
+    """DPY-6005 is oracledb's generic "cannot connect" — listener down,
+    refused, bad DNS. Calling those a timeout destroys the diagnosability
+    this helper exists for."""
+    e = RuntimeError("DPY-6005: cannot connect to database")
+    out = db_connector._friendly_db_error(e, "Database connection timed out.")
+    assert "DPY-6005" in out and "timed out" not in out
+
+
+def test_friendly_error_ignores_the_word_timeout_inside_a_dsn_echo():
+    """Postgres puts `options=-c statement_timeout=…` in EVERY connection, so
+    a connect error echoing the DSN must not read as a timeout."""
+    e = RuntimeError("could not translate host name; "
+                     "options='-c statement_timeout=300000'")
+    out = db_connector._friendly_db_error(e, "Database connection timed out.")
+    assert "could not translate host name" in out
+
+
+def test_friendly_error_keeps_non_timeout_driver_text():
+    """A wrong password must never be reported as a timeout."""
+    e = RuntimeError('FATAL: password authentication failed for user "pdc"')
+    out = db_connector._friendly_db_error(e, "Database connection timed out.")
+    assert "password authentication failed" in out
+    assert "timed out" not in out
+
+
+def test_friendly_error_scrubs_the_password_from_non_timeout_text():
+    e = RuntimeError("connection string used s3cr3t-pw")
+    out = db_connector._friendly_db_error(
+        e, "Database connection timed out.", "s3cr3t-pw")
+    assert "s3cr3t-pw" not in out and "***" in out
+
+
+def test_friendly_error_survives_a_self_referential_cause_chain():
+    """Never hang on a cycle — the walk is depth-capped."""
+    a = RuntimeError("a")
+    b = RuntimeError("b")
+    a.__cause__ = b
+    b.__cause__ = a
+    assert "RuntimeError" in db_connector._friendly_db_error(a, "phrase")
+
+
+def test_snapshot_failure_uses_the_snapshot_phrase(sqlite_cfg, tmp_path, monkeypatch):
+    """A statement timeout during snapshot must not read as a CONNECT failure."""
+    def boom(*a, **kw):
+        raise RuntimeError("canceling statement due to statement timeout")
+    monkeypatch.setattr(db_connector.pd, "read_sql", boom)
+    res = db_connector.snapshot_table(
+        sqlite_cfg, "", schema=None, table="clients",
+        dest=tmp_path / "s.parquet", sid="t")
+    assert res["ok"] is False
+    assert res["error"] == "Database snapshot timed out."

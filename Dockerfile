@@ -40,6 +40,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Build identity, surfaced by GET /version and the admin sidebar. Build args
+# (NOT install-time config): `.git` is dockerignored, so the commit can only
+# arrive from the builder. Declared AFTER the pip layer so passing them never
+# invalidates the dependency cache. Absent -> the app shows its start time.
+ARG BUILD_COMMIT=""
+ARG BUILD_TIME=""
+ENV BUILD_COMMIT=${BUILD_COMMIT} \
+    BUILD_TIME=${BUILD_TIME}
+
 RUN mkdir -p /data/client /app/logs
 
 EXPOSE 8000

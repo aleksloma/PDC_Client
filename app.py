@@ -16,6 +16,7 @@ from __future__ import annotations
 import sys
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -41,6 +42,22 @@ from routes.admin_data import router as admin_data_router
 _HERE = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(_HERE / "templates"))
 
+_STARTED_AT = datetime.now(timezone.utc)
+
+
+def _build_stamp() -> str:
+    """One line identifying the RUNNING build, for the admin sidebar.
+
+    Deliberately not the `?v=` static cache-buster: that is the page-render
+    clock, recomputed per request, and reading it as a build marker has twice
+    sent verification down the wrong path. An unstamped image (no build args)
+    honestly reports when this process started instead of faking an identity.
+    """
+    if settings.BUILD_COMMIT:
+        return f"build {settings.BUILD_COMMIT}" + (
+            f" · {settings.BUILD_TIME}" if settings.BUILD_TIME else "")
+    return f"started {_STARTED_AT:%Y-%m-%d %H:%M} UTC"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -52,10 +69,13 @@ async def lifespan(app: FastAPI):
                  data_root=settings.DATA_ROOT,
                  brain_url=settings.BRAIN_URL,
                  token_set=bool(settings.BRAIN_TENANT_TOKEN))
-    # Build marker — lets an operator confirm from the logs that the running
-    # image actually carries the clone renderer (a stale image is the classic
-    # "decks still look un-branded" cause: the new code never got deployed).
-    log_with_sid("startup", "info", "CLIENT_BUILD", marker="db-tables-phase1")
+    # Build marker — lets an operator confirm from the logs WHICH image is
+    # running (a stale image is the classic "my fix isn't live" cause). Fed by
+    # the Docker build args; also served by GET /version.
+    log_with_sid("startup", "info", "CLIENT_BUILD",
+                 commit=settings.BUILD_COMMIT or "dev",
+                 build_time=settings.BUILD_TIME or "unstamped",
+                 started_at=_STARTED_AT.isoformat(timespec="seconds"))
     # Fixed local admin bootstrap (idempotent; never overwrites an existing
     # password) + the nightly database-snapshot refresh scheduler. Both are
     # lifespan-scoped on purpose: an import-time thread would leak into every
@@ -339,6 +359,7 @@ async def admin_data_sources_page(request: Request):
     return templates.TemplateResponse(
         "admin_data_sources.html",
         {"request": request, "ts": int(time.time()), "username": email,
+         "build_stamp": _build_stamp(),
          "subscription_plan": "Enterprise", **_profile_context(email)},
     )
 
@@ -351,4 +372,17 @@ async def health():
         "service": "client",
         "brain_reachable": brain_health() if settings.BRAIN_TENANT_TOKEN else None,
         "tenant_token_configured": bool(settings.BRAIN_TENANT_TOKEN),
+        "build_commit": settings.BUILD_COMMIT or None,
+    }
+
+
+@app.get("/version")
+async def version():
+    """Which build is running — checkable without shell access (the point:
+    the static `?v=` parameter is a per-request clock, not a build marker).
+    Unauthenticated like /health, and carries no secrets."""
+    return {
+        "commit": settings.BUILD_COMMIT or None,
+        "build_time": settings.BUILD_TIME or None,
+        "started_at": _STARTED_AT.isoformat(timespec="seconds"),
     }

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -555,6 +556,9 @@ async def analyze_sql(request: Request):
 
 _REL_CARDINALITIES = {"N:1", "1:1", "1:N", "N:M"}
 _REL_ORIGINS = {"fk", "sql", "name", "description"}
+# How a table may be registered. "connector" = helper/dictionary table hidden
+# from the user picker and auto-included via relations; "normal" = pickable.
+_TABLE_TYPES = {"connector", "normal"}
 
 # Sentinel child id for a table being registered (no id yet). Deliberately
 # NON-hex: it fails DataSourceStore.valid_id, so it can never collide with a
@@ -968,22 +972,81 @@ async def recommendation_status(request: Request):
     return {"ok": True, "recommendation": rec}
 
 
-@router.post("/relations/recommendations/accept")
-async def accept_recommendation(request: Request):
-    """One-click registration of a recommended table as a CONNECTOR:
-    introspect → AI-draft descriptions (the existing draft mechanism) →
-    register + snapshot (the same doc shape and snapshot path as the wizard
-    save), then replay the stored SQL evidence through the NORMAL candidate
-    pipeline so relations are proposed instantly — proposed, never
-    auto-confirmed. The UI confirm dialog is the review act (it states the
-    descriptions are AI-drafted and editable later in the table's settings).
-    Any failure leaves NO half-registered state and the recommendation open;
-    connectivity-style failures return 200 {ok:false}."""
+def _classify_fallback() -> dict:
+    """The classifier's own degraded answer — asked for, never re-spelled
+    here, so the wording can't drift between the two."""
+    return relation_discovery.classify_table_type([])
+
+
+@router.post("/relations/recommendations/classify")
+async def classify_recommendation(request: Request):
+    """Suggest how a recommended table should be registered (connector vs
+    normal) so the accept dialog can default the admin's choice instead of
+    silently hard-coding connector. Metadata only: one bounded introspection
+    of column names + dtypes, no brain call, no data values, no writes.
+
+    A SUGGESTION only — the admin confirms or flips it, and the registration
+    uses their choice. Any failure degrades to the historical default rather
+    than blocking Accept; the real error surfaces on the accept attempt."""
     email, err = _require_admin(request)
     if err:
         return err
     body = await _json_body(request)
     rid = (body.get("id") or "").strip()
+    store = db_sources.DataSourceStore()
+    rec = next((r for r in await _run(store.list_recommendations)
+                if r.get("id") == rid), None)
+    if rec is None:
+        return JSONResponse({"error": "Unknown recommendation."},
+                            status_code=404)
+    cfg, password, resp = _conn_cfg_and_password(
+        store, {"connection_id": str(rec.get("connection_id") or "")})
+    if resp is not None:
+        return {"ok": True, "classified": False, **_classify_fallback()}
+    schema = (rec.get("schema") or "").strip() or None
+    table = str(rec.get("table") or "").strip()
+    intro = await _run(db_connector.introspect, cfg, password, schema, table,
+                       sid=f"admin:{email}")
+    if not intro.get("ok"):
+        log_with_sid(email, "warning",
+                     f"REC_CLASSIFY_UNAVAILABLE rid={rid} table={table}")
+        return {"ok": True, "classified": False, **_classify_fallback()}
+    out = relation_discovery.classify_table_type(intro.get("columns") or [])
+    log_with_sid(email, "info",
+                 f"REC_CLASSIFY rid={rid} table={table} "
+                 f"suggested={out['suggested_type']}")
+    return {"ok": True, "classified": True, **out}
+
+
+@router.post("/relations/recommendations/accept")
+async def accept_recommendation(request: Request):
+    """One-click registration of a recommended table as the type the ADMIN
+    chose in the accept dialog (connector or normal — the classifier only
+    suggests): introspect → AI-draft descriptions (the existing draft
+    mechanism) → register + snapshot (the same doc shape and snapshot path as
+    the wizard save), then replay the stored SQL evidence through the NORMAL
+    candidate pipeline so relations are proposed instantly — proposed, never
+    auto-confirmed. The UI confirm dialog is the review act (it states the
+    descriptions are AI-drafted and editable later in the table's settings).
+    Any failure leaves NO half-registered state and the recommendation open;
+    connectivity-style failures return 200 {ok:false} naming the dependency
+    that failed. Every dependency on this path is time-bounded."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    body = await _json_body(request)
+    rid = (body.get("id") or "").strip()
+    chosen_type = str(body.get("chosen_type") or "connector").strip().lower()
+    if chosen_type not in _TABLE_TYPES:
+        return JSONResponse(
+            {"error": "chosen_type must be 'connector' or 'normal'."},
+            status_code=400)
+    # Audit metadata only (what the dialog offered vs what the admin picked) —
+    # deliberately not recomputed here: it would cost a second introspection
+    # and cannot change what gets registered.
+    suggested_type = str(body.get("suggested_type") or "").strip().lower()
+    if suggested_type not in _TABLE_TYPES:
+        suggested_type = None
     store = db_sources.DataSourceStore()
     rec = next((r for r in await _run(store.list_recommendations)
                 if r.get("id") == rid), None)
@@ -1010,15 +1073,27 @@ async def accept_recommendation(request: Request):
         await _run(store.sync_recommendations)
         db_sources.audit(email, "relations.rec_accept", target=rid, ok=True,
                          detail={"table": f"{schema}.{table}" if schema else table,
-                                 "note": "already_registered"})
+                                 "note": "already_registered",
+                                 "suggested_type": suggested_type,
+                                 "chosen_type": chosen_type})
         return {"ok": True, "status": "registered",
                 "note": "This table is already registered.", "candidates": []}
 
+    phys = f"{schema}.{table}" if schema else table
+
+    def _phase(name: str) -> None:
+        # Entry (not completion) logging: a wedged accept used to leave NO log
+        # line at all, because every dependency logs only once it returns.
+        log_with_sid(email, "info",
+                     f"REC_ACCEPT_PHASE phase={name} rid={rid} table={phys}")
+
     def _register():
+        _phase("introspect")
         intro = db_connector.introspect(cfg, password, schema, table,
                                         sid=f"admin:{email}")
         if not intro.get("ok"):
             return {"ok": False, "error": intro.get("error")}
+        _phase("draft")
         draft = _draft_table_descriptions(cfg, password, schema, table, email,
                                           intro=intro)
         if not draft.get("ok"):
@@ -1037,10 +1112,13 @@ async def accept_recommendation(request: Request):
             # Same humanized-name convention the wizard prefills client-side.
             display_name=table.lower().replace("_", " "),
             description=(draft.get("draft") or {}).get("table_description") or "",
-            columns=columns, is_connector=True, relations=[],
+            columns=columns, is_connector=(chosen_type == "connector"),
+            relations=[],
             intro=intro, where_filter=None, row_cap=None, email=email)
+        _phase("register")
         saved = store.upsert_table(doc, actor=email)
         import db_scheduler
+        _phase("snapshot")
         snap = db_scheduler.refresh_one_table(saved["id"], actor=email)
         if not snap.get("ok"):
             # Accept is one atomic gesture: unlike the wizard save (which
@@ -1055,10 +1133,15 @@ async def accept_recommendation(request: Request):
                     + " — the table was not registered."}
         return {"ok": True, "table_id": saved["id"], "snapshot": snap}
 
+    t0 = time.monotonic()
     res = await _run(_register)
+    log_with_sid(email, "info",
+                 f"REC_ACCEPT_DONE rid={rid} table={phys} "
+                 f"ok={bool(res.get('ok'))} elapsed_s={time.monotonic() - t0:.2f}")
     db_sources.audit(email, "relations.rec_accept", target=rid,
                      ok=bool(res.get("ok")),
-                     detail={"table": f"{schema}.{table}" if schema else table})
+                     detail={"table": phys, "suggested_type": suggested_type,
+                             "chosen_type": chosen_type})
     if not res.get("ok"):
         return {"ok": False, "error": res.get("error")}
 
@@ -1157,7 +1240,11 @@ async def introspect_table(request: Request):
                      detail={"columns": len(intro.get("columns") or []),
                              "degraded": intro.get("degraded")})
     return {"ok": True, "introspection": intro, "preview": preview,
-            "degraded": intro.get("degraded") or []}
+            "degraded": intro.get("degraded") or [],
+            # Pre-ticks the wizard's connector box from the columns already in
+            # hand (no extra round-trip). A suggestion the admin edits freely.
+            "classification": relation_discovery.classify_table_type(
+                intro.get("columns") or [])}
 
 
 def _draft_table_descriptions(cfg: dict, password: str, schema, table: str,
@@ -1200,7 +1287,17 @@ def _draft_table_descriptions(cfg: dict, password: str, schema, table: str,
             lang_name="English",
             desc_word_limit=settings.SCHEMA_AUTOFILL_DESC_WORD_LIMIT,
             user_email=email,
+            # Behind an interactive click: a stalled brain must fail fast and
+            # by name, not ride the 180s client-wide default.
+            timeout=settings.BRAIN_DRAFT_TIMEOUT,
         )
+    # Before the generic handler — the admin needs to know WHICH dependency
+    # stalled to act on it (Article IV: named fallback, never silent).
+    except brain_client.BrainTimeoutError:
+        log_with_sid(email, "warning", f"DB_DRAFT_LLM_TIMEOUT table={table}")
+        return {"ok": False,
+                "error": "The AI description service did not respond within "
+                         f"{int(settings.BRAIN_DRAFT_TIMEOUT)}s."}
     except Exception as e:
         log_with_sid(email, "warning", f"DB_DRAFT_LLM_FAIL table={table}: {e}")
         return {"ok": False, "error": "AI drafting is unavailable right now."}

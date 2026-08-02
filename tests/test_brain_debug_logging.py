@@ -25,7 +25,7 @@ class _FakeClient:
     def __init__(self, resp):
         self._resp = resp
 
-    def post(self, path, json=None, headers=None):
+    def post(self, path, json=None, headers=None, timeout=None):
         return self._resp
 
 

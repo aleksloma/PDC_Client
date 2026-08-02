@@ -56,6 +56,9 @@ SOURCE_PRECEDENCE = ("fk", "sql", "name", "description")
 _MAX_RESOLVE_DEPTH = 5        # CTE/subquery column-resolution recursion cap
 MAX_CANDIDATES_PER_SOURCE = 200  # bound for the O(tables²·cols²) pair scans
 UNREG_TABLE_CAP = 20          # distinct unregistered tables tracked per analyze
+KEYLIKE_SUFFIXES = ("id", "code", "key", "no", "num")  # table-type classifier
+KEYLIKE_SHORT_VARCHAR_MAX = 32   # char length still "key-like", not free text
+CLASSIFY_REASON_MAX_COLS = 4     # descriptive column names named in the reason
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +608,78 @@ def recommendation_summary(rec: dict, tables: list) -> dict:
     return {"role": "bridge" if n_reg >= 2 else "referenced",
             "joins": joins, "pending": pending,
             "evidence_warnings": invalid}
+
+
+# ---------------------------------------------------------------------------
+# Table-type classification (connector vs normal) — Accept / register wizard
+# ---------------------------------------------------------------------------
+
+_INT_DTYPE_RE = re.compile(r"\b(big|small|tiny|medium)?int(eger)?\b", re.I)
+_VARCHAR_DTYPE_RE = re.compile(
+    r"\b(?:n?(?:var)?char|character(?:\s+varying)?)\s*\(\s*(\d+)", re.I)
+
+
+def _is_keylike(col: dict) -> bool:
+    """A column reads as a key/code: its NAME ends with (or equals) one of
+    KEYLIKE_SUFFIXES *and* its dtype is an integer or a short varchar. Both
+    halves are required — a `VARCHAR(4000) note_code` is free text, and a
+    plain `INTEGER amount` is a measure.
+
+    When the name is separated (`is_valid`, `client_id`) the ending must be
+    a whole TOKEN, so a flag table doesn't read as a junction table on the
+    "id" inside "valid". Unseparated names (`clientid`) fall back to a plain
+    suffix test."""
+    raw = str(col.get("name") or "").strip().lower()
+    parts = [p for p in re.split(r"[^a-z0-9]+", raw) if p]
+    if not parts:
+        return False
+    if len(parts) > 1:
+        if parts[-1] not in KEYLIKE_SUFFIXES:
+            return False
+    else:
+        name = parts[0]
+        if not any(name == s or name.endswith(s) for s in KEYLIKE_SUFFIXES):
+            return False
+    dtype = str(col.get("dtype") or "")
+    if str(col.get("py_type") or "") == "int" or _INT_DTYPE_RE.search(dtype):
+        return True
+    m = _VARCHAR_DTYPE_RE.search(dtype)
+    return bool(m) and int(m.group(1)) <= KEYLIKE_SHORT_VARCHAR_MAX
+
+
+def classify_table_type(columns: list) -> dict:
+    """Suggest how a table should be registered from METADATA ONLY (column
+    names + dtypes as introspected). A table whose every column is key-like is
+    a pure junction/dictionary table — a true connector; anything carrying
+    descriptive fields is something users may want to pick directly, so
+    hiding it behind a connector registration would be wrong.
+
+    A SUGGESTION, never applied on its own: the admin confirms or flips it in
+    the Accept dialog / register wizard. Deliberately deterministic and
+    metadata-only — no brain call, no data values. Never raises (Article IV):
+    anything unexpected degrades to the safe historical default (connector).
+    """
+    fallback = {"suggested_type": "connector",
+                "reason": "could not classify — defaulted to connector"}
+    try:
+        cols = [c for c in (columns or []) if isinstance(c, dict)
+                and str(c.get("name") or "").strip()]
+        if not cols:
+            return fallback
+        descriptive = [str(c.get("name")) for c in cols if not _is_keylike(c)]
+        if not descriptive:
+            return {"suggested_type": "connector",
+                    "reason": f"All {len(cols)} columns look like keys or codes."}
+        named = descriptive[:CLASSIFY_REASON_MAX_COLS]
+        more = len(descriptive) - len(named)
+        return {"suggested_type": "normal",
+                "reason": "Contains descriptive fields: "
+                          + ", ".join(named)
+                          + (f" (+{more} more)" if more else "") + "."}
+    except Exception as e:
+        log_with_sid("relation_discovery", "warning",
+                     f"CLASSIFY_TABLE_TYPE_FAILED {type(e).__name__}")
+        return fallback
 
 
 def build_graph(tables: list, unregistered_refs: Optional[list] = None) -> dict:

@@ -19,10 +19,23 @@
 # Usage:
 #   cp client.local.env.example client.local.env    # fill in once
 #   docker compose -f docker-compose.local.yml up -d --build
+#
+# Stamp the build so /version and the admin sidebar identify it (PowerShell):
+#   $env:BUILD_COMMIT = git rev-parse --short HEAD
+#   $env:BUILD_TIME   = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mmZ")
+#   docker compose -f docker-compose.local.yml up -d --build
+# Unset -> an unstamped image that honestly reports its start time instead
+# of a commit (a placeholder like "dev" would just be a different lie).
+# NEVER read the static ?v=
+# parameter as a build marker: it is the page-render clock, per request.
 
 services:
   client:
-    build: .
+    build:
+      context: .
+      args:
+        BUILD_COMMIT: "${BUILD_COMMIT:-}"
+        BUILD_TIME: "${BUILD_TIME:-}"
     image: powerdatachat-client:enterprise
     container_name: pdc-client
     env_file:

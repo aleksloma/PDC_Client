@@ -49,6 +49,8 @@
         </div>
         <button id="btnAdmChangePw" class="adm-footer-btn">Change password</button>
         <button id="btnAdmLogout" class="adm-footer-btn">Sign out</button>
+        <div class="adm-build-stamp" title="The running build — also served by /version">
+          {{ build_stamp }}</div>
       </div>
     </aside>
 
@@ -429,6 +431,38 @@
         <span class="adm-spacer"></span>
         <button id="btnCancelPw" class="adm-btn ghost">Cancel</button>
         <button id="btnSavePw" class="adm-btn primary">Change password</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Accept-a-recommendation modal ─────────────────────────────────────
+       Replaces a native confirm(): it has to carry the table-type choice,
+       and confirm() blocks the page thread while the suggestion loads. -->
+  <div id="recAcceptModal" class="adm-modal-backdrop hidden">
+    <div class="adm-modal adm-modal-narrow">
+      <div class="adm-modal-head">
+        <h3>Register table</h3>
+        <button id="closeRecAccept" class="adm-x">✕</button>
+      </div>
+      <div class="adm-modal-body">
+        <p id="recAcceptText" class="adm-muted"></p>
+        <div class="adm-subhead"><h4>How should users see this table?</h4></div>
+        <label class="adm-check">
+          <input type="radio" name="recAcceptType" id="recTypeConnector" value="connector" />
+          <span><strong>Connector table</strong> — a helper/dictionary table users should
+          not pick directly; it is auto-included whenever a related table is used.</span>
+        </label>
+        <label class="adm-check">
+          <input type="radio" name="recAcceptType" id="recTypeNormal" value="normal" />
+          <span><strong>Normal table</strong> — users can pick it directly when they
+          start a chat.</span>
+        </label>
+        <div id="recAcceptReason" class="adm-label-note"></div>
+      </div>
+      <div class="adm-modal-foot">
+        <span class="adm-spacer"></span>
+        <button id="btnRecAcceptCancel" class="adm-btn ghost">Cancel</button>
+        <button id="btnRecAcceptGo" class="adm-btn primary">Register &amp; snapshot</button>
       </div>
     </div>
   </div>

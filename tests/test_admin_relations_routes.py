@@ -1211,3 +1211,207 @@ def test_get_recommendations_carries_full_evidence_and_pending(client, chain_set
     assert set(pend[("cl_info.client_id", "tr_data.client_id")]) == \
         {"cl_info", "tr_data"}
     assert cl["evidence_warnings"] == []
+
+
+# ---------------------------------------------------------------------------
+# v4.2 — time-bounded Accept, table-type classification, audit fields
+# ---------------------------------------------------------------------------
+
+def _seed_junction_table(fk_setup):
+    """A pure link table: every column a key/code."""
+    from sqlalchemy import create_engine, text
+    eng = create_engine(f"sqlite+pysqlite:///{fk_setup['db']}")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE link_t (order_id INTEGER, "
+                          "region_id INTEGER, city_code VARCHAR(8))"))
+        conn.execute(text("INSERT INTO link_t VALUES (10, 1, 'A')"))
+    eng.dispose()
+
+
+def _analyze_regions(client):
+    client.post("/api/admin/relations/analyze_sql", json={"db_type": "sqlite",
+        "sql": "SELECT 1 FROM orders o JOIN regions r ON o.customer_id = r.region_id"})
+    return _recs()[0]["id"]
+
+
+def _rec_accept_audit():
+    return [r for r in db_sources.read_audit_tail(500)
+            if r["action"] == "relations.rec_accept"]
+
+
+def test_accept_brain_timeout_names_the_dependency_and_rolls_nothing(
+        client, fk_setup, monkeypatch):
+    """The reported hang class: a stalled brain must abort by name, leave the
+    recommendation open, and write nothing."""
+    _seed_regions_table(fk_setup)
+    import routes.admin_data as admin_mod
+
+    def slow(**kw):
+        raise admin_mod.brain_client.BrainTimeoutError("Brain timed out: ReadTimeout")
+    monkeypatch.setattr(admin_mod.brain_client, "schema_autofill", slow)
+    rid = _analyze_regions(client)
+    before = len(db_sources.DataSourceStore().list_tables())
+    data = client.post("/api/admin/relations/recommendations/accept",
+                       json={"id": rid}).json()
+    assert data["ok"] is False
+    assert "AI description service did not respond" in data["error"]
+    assert "Edit first" in data["error"]        # the actionable way forward
+    assert len(db_sources.DataSourceStore().list_tables()) == before
+    assert _recs()[0]["status"] == "open"
+
+
+def test_accept_passes_the_draft_timeout_to_the_brain_call(
+        client, fk_setup, monkeypatch):
+    """Without a per-call cap the draft rides the 180s client-wide default."""
+    _seed_regions_table(fk_setup)
+    import routes.admin_data as admin_mod
+    seen = {}
+
+    def fake_autofill(**kw):
+        seen.update(kw)
+        return {"file_description": "d", "columns": {}}
+    monkeypatch.setattr(admin_mod.brain_client, "schema_autofill", fake_autofill)
+    monkeypatch.setattr(settings, "BRAIN_DRAFT_TIMEOUT", 42.0)
+    rid = _analyze_regions(client)
+    client.post("/api/admin/relations/recommendations/accept", json={"id": rid})
+    assert seen["timeout"] == 42.0
+
+
+def test_accept_db_timeout_names_the_database_and_rolls_back(
+        client, fk_setup, monkeypatch):
+    """Snapshot timeout: rollback stays intact and the message names the DB."""
+    _seed_regions_table(fk_setup)
+    _stub_autofill(monkeypatch)
+    rid = _analyze_regions(client)
+    import db_scheduler
+    monkeypatch.setattr(db_scheduler, "refresh_one_table",
+                        lambda tid, actor: {"ok": False,
+                                            "error": "Database snapshot timed out."})
+    before = {t["id"] for t in db_sources.DataSourceStore().list_tables()}
+    data = client.post("/api/admin/relations/recommendations/accept",
+                       json={"id": rid}).json()
+    assert data["ok"] is False
+    assert "Database snapshot timed out." in data["error"]
+    assert "not registered" in data["error"]
+    assert {t["id"] for t in db_sources.DataSourceStore().list_tables()} == before
+    assert _recs()[0]["status"] == "open"
+
+
+def test_accept_honors_a_flipped_choice_over_the_suggestion(
+        client, fk_setup, monkeypatch):
+    """The admin's pick decides — a suggestion never overrides it."""
+    _seed_regions_table(fk_setup)
+    _stub_autofill(monkeypatch)
+    rid = _analyze_regions(client)
+    data = client.post("/api/admin/relations/recommendations/accept",
+                       json={"id": rid, "chosen_type": "normal",
+                             "suggested_type": "connector"}).json()
+    assert data["ok"] is True
+    assert data["table"]["is_connector"] is False
+
+
+def test_accept_defaults_to_connector_without_a_chosen_type(
+        client, fk_setup, monkeypatch):
+    """Older callers keep the historical behavior."""
+    _seed_regions_table(fk_setup)
+    _stub_autofill(monkeypatch)
+    rid = _analyze_regions(client)
+    data = client.post("/api/admin/relations/recommendations/accept",
+                       json={"id": rid}).json()
+    assert data["table"]["is_connector"] is True
+
+
+def test_accept_rejects_an_unknown_chosen_type(client, fk_setup, monkeypatch):
+    _seed_regions_table(fk_setup)
+    _stub_autofill(monkeypatch)
+    rid = _analyze_regions(client)
+    r = client.post("/api/admin/relations/recommendations/accept",
+                    json={"id": rid, "chosen_type": "hidden"})
+    assert r.status_code == 400
+    assert _recs()[0]["status"] == "open"
+
+
+def test_accept_audit_records_suggested_and_chosen(client, fk_setup, monkeypatch):
+    """Both are needed to tell "the tool was wrong" from "the admin chose"."""
+    _seed_regions_table(fk_setup)
+    _stub_autofill(monkeypatch)
+    rid = _analyze_regions(client)
+    client.post("/api/admin/relations/recommendations/accept",
+                json={"id": rid, "chosen_type": "normal",
+                      "suggested_type": "connector"})
+    row = _rec_accept_audit()[-1]
+    assert row["detail"]["suggested_type"] == "connector"
+    assert row["detail"]["chosen_type"] == "normal"
+
+
+def test_accept_audit_ignores_a_garbage_suggested_type(client, fk_setup, monkeypatch):
+    _seed_regions_table(fk_setup)
+    _stub_autofill(monkeypatch)
+    rid = _analyze_regions(client)
+    client.post("/api/admin/relations/recommendations/accept",
+                json={"id": rid, "suggested_type": "<script>"})
+    row = _rec_accept_audit()[-1]
+    assert row["detail"]["suggested_type"] is None
+
+
+def test_classify_suggests_normal_for_a_table_with_descriptive_columns(
+        client, fk_setup):
+    _seed_regions_table(fk_setup)
+    rid = _analyze_regions(client)
+    data = client.post("/api/admin/relations/recommendations/classify",
+                       json={"id": rid}).json()
+    assert data == {"ok": True, "classified": True, "suggested_type": "normal",
+                    "reason": "Contains descriptive fields: rname."}
+
+
+def test_classify_suggests_connector_for_a_pure_junction_table(client, fk_setup):
+    _seed_junction_table(fk_setup)
+    client.post("/api/admin/relations/analyze_sql", json={"db_type": "sqlite",
+        "sql": "SELECT 1 FROM orders o JOIN link_t l ON o.order_id = l.order_id"})
+    rid = _recs()[0]["id"]
+    data = client.post("/api/admin/relations/recommendations/classify",
+                       json={"id": rid}).json()
+    assert data["classified"] is True
+    assert data["suggested_type"] == "connector"
+
+
+def test_classify_writes_nothing(client, fk_setup):
+    """A read-only probe: no registration, no status change, no audit row."""
+    _seed_regions_table(fk_setup)
+    rid = _analyze_regions(client)
+    before_tables = len(db_sources.DataSourceStore().list_tables())
+    before_audit = len(db_sources.read_audit_tail(500))
+    client.post("/api/admin/relations/recommendations/classify", json={"id": rid})
+    assert len(db_sources.DataSourceStore().list_tables()) == before_tables
+    assert len(db_sources.read_audit_tail(500)) == before_audit
+    assert _recs()[0]["status"] == "open"
+
+
+def test_classify_degrades_instead_of_blocking_when_the_table_is_gone(
+        client, fk_setup):
+    """Introspection failure must never stop the admin from accepting."""
+    client.post("/api/admin/relations/analyze_sql", json={"db_type": "sqlite",
+        "sql": "SELECT 1 FROM orders o JOIN nope_t n ON o.order_id = n.oid"})
+    rid = _recs()[0]["id"]
+    r = client.post("/api/admin/relations/recommendations/classify",
+                    json={"id": rid})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "classified": False,
+                        "suggested_type": "connector",
+                        "reason": "could not classify — defaulted to connector"}
+
+
+def test_classify_unknown_recommendation_is_404(client, fk_setup):
+    assert client.post("/api/admin/relations/recommendations/classify",
+                       json={"id": "ff00ff00ff00ff00"}).status_code == 404
+
+
+def test_introspect_carries_a_classification_for_the_wizard(client, fk_setup):
+    """Edit-first pre-ticks from this — no second round-trip."""
+    _seed_regions_table(fk_setup)
+    data = client.post("/api/admin/tables/introspect",
+                       json={"connection_id": fk_setup["cid"],
+                             "schema": "", "table": "regions"}).json()
+    assert data["ok"] is True
+    assert data["classification"]["suggested_type"] == "normal"
+    assert "rname" in data["classification"]["reason"]

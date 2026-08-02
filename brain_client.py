@@ -31,6 +31,11 @@ class TenantRevokedError(BrainError):
     """Raised when the brain responds with 401/403 — token revoked/suspended."""
 
 
+class BrainTimeoutError(BrainError):
+    """Raised when a call exceeds its timeout, so callers can name the stalled
+    dependency instead of showing a generic "cannot reach brain"."""
+
+
 _CLIENT: Optional[httpx.Client] = None
 _CLIENT_LOCK = threading.Lock()
 
@@ -71,14 +76,25 @@ def _headers() -> dict[str, str]:
     }
 
 
-def _post(path: str, payload: dict[str, Any], sid: str) -> dict:
-    """POST to the brain and return the parsed JSON body."""
+def _post(path: str, payload: dict[str, Any], sid: str,
+          timeout: float | None = None) -> dict:
+    """POST to the brain and return the parsed JSON body.
+
+    `timeout` overrides the client-wide BRAIN_REQUEST_TIMEOUT for calls made
+    behind an interactive click, where waiting minutes is worse than failing.
+    """
     if not settings.BRAIN_TENANT_TOKEN:
         raise BrainError("BRAIN_TENANT_TOKEN is not configured")
     client = _get_client()
     t0 = time.monotonic()
     try:
-        resp = client.post(path, json=payload, headers=_headers())
+        resp = client.post(
+            path, json=payload, headers=_headers(),
+            timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout)
+    # Before RequestError — TimeoutException is a subclass of it.
+    except httpx.TimeoutException as e:
+        log_with_sid(sid, "error", f"BRAIN_TIMEOUT {path}: {type(e).__name__}")
+        raise BrainTimeoutError(f"Brain timed out: {type(e).__name__}") from e
     except httpx.RequestError as e:
         log_with_sid(sid, "error", f"BRAIN_NETWORK_ERROR {path}: {e}")
         raise BrainError(f"Cannot reach brain: {e}") from e
@@ -235,6 +251,7 @@ def schema_autofill(
     lang_name: str = "English",
     desc_word_limit: int = 20,
     user_email: str | None = None,
+    timeout: float | None = None,
 ) -> dict:
     """Combined autofill (file + per-column descriptions). One LLM call per file
     on the brain. Verbatim port of global's `_build_combined_autofill_prompt`.
@@ -255,7 +272,7 @@ def schema_autofill(
         "lang_name": lang_name,
         "desc_word_limit": desc_word_limit,
         "user_email": user_email,
-    }, sid)
+    }, sid, timeout=timeout)
 
 
 def health() -> bool:

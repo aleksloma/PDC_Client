@@ -1025,3 +1025,138 @@ def test_summary_pending_preview_sql_only_blockers_and_invalid_excluded():
     s2 = rd.recommendation_summary(rec, [cl, cd])
     assert all(p["blocked_by"] == ["shop.tr_data"] for p in s2["pending"])
     assert len(s2["pending"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# v4.2 — table-type classification (connector vs normal)
+# ---------------------------------------------------------------------------
+
+def _col(name, dtype="", py_type=None):
+    c = {"name": name, "dtype": dtype}
+    if py_type is not None:
+        c["py_type"] = py_type
+    return c
+
+
+def test_classify_pure_junction_is_connector():
+    """Every column a key/code -> a true connector (junction/link table)."""
+    r = rd.classify_table_type([
+        _col("client_id", "INTEGER", "int"),
+        _col("city_code", "VARCHAR(10)", "str"),
+        _col("product_no", "BIGINT", "int"),
+    ])
+    assert r["suggested_type"] == "connector"
+    assert "3 columns" in r["reason"]
+
+
+def test_classify_descriptive_columns_is_normal_and_names_them():
+    """prod_dict-shaped: the deciding columns are named in the reason."""
+    r = rd.classify_table_type([
+        _col("product_id", "INTEGER", "int"),
+        _col("product_name", "VARCHAR(200)", "str"),
+        _col("category", "VARCHAR(80)", "str"),
+    ])
+    assert r["suggested_type"] == "normal"
+    assert "product_name" in r["reason"] and "category" in r["reason"]
+    assert "product_id" not in r["reason"]
+
+
+def test_classify_one_descriptive_column_flips_to_normal():
+    """Mixed table: a single non-key column is enough — connector requires ALL."""
+    r = rd.classify_table_type([
+        _col("city_code", "VARCHAR(10)", "str"),
+        _col("city_name", "VARCHAR(120)", "str"),
+    ])
+    assert r["suggested_type"] == "normal"
+    assert "city_name" in r["reason"]
+
+
+def test_classify_reason_caps_named_columns():
+    cols = [_col("a_id", "INTEGER", "int")] + [
+        _col(f"note{i}", "TEXT", "str") for i in range(6)]
+    r = rd.classify_table_type(cols)
+    assert r["suggested_type"] == "normal"
+    assert "(+2 more)" in r["reason"]
+    assert r["reason"].count("note") == rd.CLASSIFY_REASON_MAX_COLS
+
+
+def test_classify_keylike_name_needs_a_keylike_dtype():
+    """A key-shaped NAME on free text is not a key: `VARCHAR(4000) note_code`
+    keeps the table normal, while the same name as a short varchar does not."""
+    long_text = rd.classify_table_type([
+        _col("client_id", "INTEGER", "int"),
+        _col("note_code", "VARCHAR(4000)", "str"),
+    ])
+    assert long_text["suggested_type"] == "normal"
+    short = rd.classify_table_type([
+        _col("client_id", "INTEGER", "int"),
+        _col("note_code", "VARCHAR(20)", "str"),
+    ])
+    assert short["suggested_type"] == "connector"
+
+
+def test_classify_varchar_boundary_is_inclusive():
+    at_limit = f"VARCHAR({rd.KEYLIKE_SHORT_VARCHAR_MAX})"
+    over = f"VARCHAR({rd.KEYLIKE_SHORT_VARCHAR_MAX + 1})"
+    assert rd.classify_table_type(
+        [_col("x_code", at_limit, "str")])["suggested_type"] == "connector"
+    assert rd.classify_table_type(
+        [_col("x_code", over, "str")])["suggested_type"] == "normal"
+
+
+def test_classify_dtype_spellings_across_dialects():
+    """Dialect dtype spellings that must read as key-like."""
+    for dtype in ("INTEGER", "BIGINT", "SMALLINT", "int", "NUMBER",
+                  "character varying(12)", "NVARCHAR(8)", "CHAR(3)"):
+        cols = [_col("thing_code", dtype, "int" if "int" in dtype.lower()
+                     or dtype == "NUMBER" else "str")]
+        # NUMBER only qualifies through py_type — that is the point of the pair.
+        assert rd.classify_table_type(cols)["suggested_type"] == "connector", dtype
+
+
+def test_classify_word_bounded_int_match_does_not_catch_point():
+    """`POINT` contains 'int' — a substring match would misread geometry as a key."""
+    r = rd.classify_table_type([_col("shape_code", "POINT")])
+    assert r["suggested_type"] == "normal"
+
+
+def test_classify_generic_name_without_suffix_is_descriptive():
+    r = rd.classify_table_type([
+        _col("id", "INTEGER", "int"),
+        _col("amount", "INTEGER", "int"),
+    ])
+    assert r["suggested_type"] == "normal"
+    assert "amount" in r["reason"]
+
+
+def test_classify_empty_or_odd_input_falls_back_to_connector():
+    """Never raises; the fallback wording is the contract the dialog shows."""
+    for bad in ([], None, [{}], [{"name": "  "}], "not-a-list"):
+        r = rd.classify_table_type(bad)
+        assert r["suggested_type"] == "connector"
+        assert r["reason"] == "could not classify — defaulted to connector"
+
+
+def test_classify_missing_dtype_metadata_is_not_keylike():
+    """No dtype at all -> the pair test fails -> normal (never a silent connector)."""
+    r = rd.classify_table_type([{"name": "client_id"}, {"name": "city_code"}])
+    assert r["suggested_type"] == "normal"
+
+
+def test_classify_separated_name_needs_a_whole_key_token():
+    """A flag table must not read as a junction table on the "id" inside
+    "valid" — with separators the ending has to be a whole token."""
+    r = rd.classify_table_type([
+        {"name": "is_valid", "dtype": "INTEGER", "py_type": "int"},
+        {"name": "is_paid", "dtype": "INTEGER", "py_type": "int"},
+    ])
+    assert r["suggested_type"] == "normal"
+    assert "is_valid" in r["reason"]
+
+
+def test_classify_unseparated_name_still_matches_by_suffix():
+    r = rd.classify_table_type([
+        {"name": "clientid", "dtype": "INTEGER", "py_type": "int"},
+        {"name": "CityCode", "dtype": "VARCHAR(8)", "py_type": "str"},
+    ])
+    assert r["suggested_type"] == "connector"

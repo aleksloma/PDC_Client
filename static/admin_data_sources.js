@@ -42,13 +42,41 @@
     $('admBusy').classList.add('hidden');
   }
 
+  // Time budgets for the register-a-recommendation gesture. The server bounds
+  // every dependency it owns; these bound the WAIT so the page never shows a
+  // spinner nobody can wait out.
+  const CLASSIFY_TIMEOUT_MS = 15000;   // type-suggestion probe (optional)
+  const ACCEPT_WARN_MS = 20000;        // upgrade the busy message
+  const ACCEPT_ABORT_MS = 390000;      // 60s draft + 300s statement + margin
+
   async function api(path, opts) {
-    const res = await fetch(path, Object.assign({
-      headers: { 'Content-Type': 'application/json' },
-    }, opts || {}));
+    let res;
+    try {
+      res = await fetch(path, Object.assign({
+        headers: { 'Content-Type': 'application/json' },
+      }, opts || {}));
+    } catch (e) {
+      // A rejected fetch (abort, network drop) used to leave callers
+      // dereferencing undefined — an unhandled TypeError and NO message at
+      // all. Shaped like a normal reply so every call site's error path runs.
+      return { status: 0, ok: false, aborted: (e && e.name === 'AbortError'),
+        data: { error: (e && e.name === 'AbortError')
+          ? 'Timed out waiting for the server.'
+          : 'Network error — the server did not respond.' } };
+    }
     let data = null;
     try { data = await res.json(); } catch (e) { data = null; }
     return { status: res.status, ok: res.ok, data: data || {} };
+  }
+
+  // api() with a hard client-side cap. Aborting only stops OUR wait — the
+  // server may still finish, so callers refetch rather than assert failure.
+  async function apiTimed(path, opts, ms) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), ms);
+    try {
+      return await api(path, Object.assign({ signal: ctl.signal }, opts || {}));
+    } finally { clearTimeout(timer); }
   }
 
   let DIALECTS = [];
@@ -464,7 +492,11 @@
     else if (r.data.default_schema) sel.value = r.data.default_schema;
     sel.onchange = loadTableNames;
     await loadTableNames();
-    $('twPickStatus').textContent = r.data.ok === false ? (r.data.error || 'Failed to list schemas') : '';
+    // `r.ok` too, not just the body flag: a transport failure carries no
+    // body, and clearing the status there would leave an empty dropdown
+    // with no explanation at all.
+    $('twPickStatus').textContent = (r.ok && r.data.ok !== false)
+      ? '' : (r.data.error || 'Failed to list schemas');
   }
 
   async function loadTableNames() {
@@ -523,8 +555,18 @@
 
     $('twDisplayName').value = existing ? existing.display_name
       : $('twTable').value.toLowerCase().replace(/_/g, ' ');
+    // An explicit prefill wins; otherwise the server's suggestion pre-ticks
+    // the box (a registered table always keeps its stored type).
+    const cls = r.data.classification || {};
     $('twIsConnector').checked = existing ? !!existing.is_connector
-      : !!(wizardPrefill && wizardPrefill.connector);
+      : (wizardPrefill && typeof wizardPrefill.connector === 'boolean')
+        ? wizardPrefill.connector
+        : cls.suggested_type === 'connector';
+    const connLabel = $('twIsConnector').closest('label');
+    if (connLabel && !existing && cls.reason) {
+      connLabel.title = `Suggested: ${cls.suggested_type === 'connector'
+        ? 'connector' : 'normal table'} — ${cls.reason}`;
+    }
     $('twDescription').value = existing ? (existing.description || '')
       : (currentIntro.table_comment || '');
 
@@ -1242,6 +1284,13 @@
           ? 'Joins two or more registered tables — registering it connects them'
           : 'Referenced by one registered table'}">${esc(rec.role)}</span>`,
       ].concat((rec.sources || []).map(originChip));
+      // Session-local: set once the accept dialog has classified this table.
+      // Listing recommendations never probes the database on its own.
+      if (rec._typeHint) {
+        badges.push(`<span class="adm-chip${rec._typeHint === 'connector' ? ' conn' : ''}"
+          title="Suggested registration type — you confirm or change it when accepting"
+          >${rec._typeHint === 'connector' ? 'connector?' : 'normal?'}</span>`);
+      }
       if ((rec.evidence_warnings || []).length) {
         badges.push(`<span class="adm-chip bad" title="${esc((rec.evidence_warnings || [])
           .map((w) => `“${w.table}” has no column “${w.column}”`).join('; '))
@@ -1294,25 +1343,105 @@
     loadRelRecommendations();
   }
 
-  async function acceptRecommendation(rec) {
+  // ── Accept dialog ────────────────────────────────────────────────────────
+  // The type is SUGGESTED (from column names/dtypes, server-side) and always
+  // confirmed here: registering a content table as a connector would hide it
+  // from users, so this may never be applied silently.
+  let recAcceptCtx = null;      // { rec, suggested, dirty }
+
+  function _closeRecAccept() {
+    $('recAcceptModal').classList.add('hidden');
+    recAcceptCtx = null;
+  }
+
+  function _setRecType(type) {
+    $(type === 'normal' ? 'recTypeNormal' : 'recTypeConnector').checked = true;
+  }
+
+  function acceptRecommendation(rec) {
     const phys = _recPhysLabel(rec);
-    if (!window.confirm(`Register "${phys}" as a connector table now?\n\n`
-      + 'Descriptions are AI-drafted — you can edit them later in the table’s settings '
-      + '(Registered tables → ✎). A snapshot of the table is taken, and its relations are '
-      + 'proposed for review right away.')) return;
+    recAcceptCtx = { rec, suggested: null, dirty: false };
+    $('recAcceptText').innerHTML = `Register <strong>${esc(phys)}</strong>? `
+      + 'Descriptions are AI-drafted — you can edit them later in the table’s '
+      + 'settings (Registered tables → ✎). A snapshot is taken and its relations '
+      + 'are proposed for review right away.';
+    // Historical default until the probe answers; never gate the button on it.
+    _setRecType('connector');
+    $('recAcceptReason').textContent = 'Checking column types…';
+    $('btnRecAcceptGo').disabled = false;
+    $('recAcceptModal').classList.remove('hidden');
+    _classifyRecommendation(rec);
+  }
+
+  async function _classifyRecommendation(rec) {
+    // One probe per recommendation per session: it costs a live
+    // introspection on a 4-worker pool, and reopening the dialog does not
+    // make the table's columns any newer.
+    if (rec._classification) { _applyClassification(rec, rec._classification); return; }
+    const r = await apiTimed('/api/admin/relations/recommendations/classify',
+      { method: 'POST', body: JSON.stringify({ id: rec.id }) }, CLASSIFY_TIMEOUT_MS);
+    const out = {
+      classified: !!(r.data && r.data.classified),
+      suggested_type: (r.data && r.data.suggested_type) || 'connector',
+      reason: (r.data && r.data.reason)
+        || 'could not classify — defaulted to connector',
+    };
+    if (out.classified) rec._classification = out;   // never cache a failure
+    _applyClassification(rec, out);
+  }
+
+  function _applyClassification(rec, out) {
+    // The admin may have moved on (closed the dialog, or picked a type).
+    if (!recAcceptCtx || recAcceptCtx.rec.id !== rec.id) return;
+    // Only a REAL classification is reported as a suggestion — in the audit
+    // row and as a list chip alike. A fallback means "we could not tell",
+    // and recording it as advice the admin overrode would be a lie.
+    if (out.classified) {
+      recAcceptCtx.suggested = out.suggested_type;
+      rec._typeHint = out.suggested_type;
+    }
+    if (!recAcceptCtx.dirty) _setRecType(out.suggested_type);
+    $('recAcceptReason').textContent = out.classified
+      ? `Suggested: ${out.suggested_type === 'connector'
+          ? 'connector' : 'normal table'} — ${out.reason}`
+      : out.reason;
+    renderRelRecommended();
+  }
+
+  async function _runAcceptRecommendation() {
+    if (!recAcceptCtx) return;
+    const { rec, suggested } = recAcceptCtx;
+    const chosen = $('recTypeNormal').checked ? 'normal' : 'connector';
+    const phys = _recPhysLabel(rec);
+    _closeRecAccept();
     _busy(`Registering ${phys}… introspecting, drafting descriptions, snapshotting.`);
+    // Long DB/AI work is legitimate; silence is not. Say so at 20s.
+    const warn = setTimeout(() => {
+      $('admBusyMsg').textContent = 'Still working — AI drafting and snapshotting '
+        + 'can take a few minutes on large tables…';
+    }, ACCEPT_WARN_MS);
     let r;
     try {
-      r = await api('/api/admin/relations/recommendations/accept', {
-        method: 'POST', body: JSON.stringify({ id: rec.id }) });
-    } finally { _busyDone(); }
+      r = await apiTimed('/api/admin/relations/recommendations/accept', {
+        method: 'POST',
+        body: JSON.stringify({ id: rec.id, chosen_type: chosen,
+          suggested_type: suggested }),
+      }, ACCEPT_ABORT_MS);
+    } finally { clearTimeout(warn); _busyDone(); }
+    if (r.aborted) {
+      // Our wait ended; the server's work did not. Say exactly that.
+      toast('Timed out waiting for the server — it may still finish in the '
+        + 'background. Reload the Relations section in a minute.', true);
+      loadRelRecommendations();
+      return;
+    }
     if (!r.data.ok) {
       toast(r.data.error || 'Registration failed — the recommendation stays open', true);
       loadRelRecommendations();
       return;
     }
-    toast(r.data.note
-      || `Registered "${phys}" as a connector — review its proposed relations below`);
+    toast(r.data.note || `Registered "${phys}" as a ${chosen === 'connector'
+      ? 'connector' : 'normal table'} — review its proposed relations below`);
     mergeRelCandidates(r.data.candidates || []);
     renderRelCandidates();
     _renderRelWarnings(_warnLinesFromReplay(r.data.evidence_warnings));
@@ -1321,8 +1450,10 @@
   }
 
   function registerGhost(g) {
+    // connector: null -> the wizard pre-ticks from the same suggestion
+    // instead of assuming every recommended table is a connector.
     openTableWizard(g.connection_id, null, false,
-      { schema: g.schema || '', table: g.table, connector: true });
+      { schema: g.schema || '', table: g.table, connector: null });
   }
 
   function renderRelUnknowns(unknown, hints) {
@@ -2119,6 +2250,16 @@
     $('closePwModal').addEventListener('click', () => $('pwModal').classList.add('hidden'));
     $('btnCancelPw').addEventListener('click', () => $('pwModal').classList.add('hidden'));
     $('btnSavePw').addEventListener('click', savePassword);
+
+    $('closeRecAccept').addEventListener('click', _closeRecAccept);
+    $('btnRecAcceptCancel').addEventListener('click', _closeRecAccept);
+    $('btnRecAcceptGo').addEventListener('click', _runAcceptRecommendation);
+    // A manual pick wins over a suggestion that lands afterwards.
+    document.querySelectorAll('input[name="recAcceptType"]').forEach((el) => {
+      el.addEventListener('change', () => {
+        if (recAcceptCtx) recAcceptCtx.dirty = true;
+      });
+    });
 
     loadAll();
   });
