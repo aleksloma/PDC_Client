@@ -695,3 +695,314 @@ def test_dismiss_audits_and_persists_nothing(client, fk_setup):
     after = json.dumps(db_sources.DataSourceStore().read_doc()["tables"])
     assert before == after
     assert "relations.dismiss" in _audit_actions()
+
+
+# ── v4: persistent "Recommended tables" ────────────────────────────────────
+
+def _recs():
+    return db_sources.DataSourceStore().list_recommendations()
+
+
+def test_analyze_sql_persists_sql_recommendation_with_evidence(client, fk_setup):
+    sql = ("SELECT 1 FROM orders o JOIN regions r ON o.customer_id = r.region_id;"
+           "SELECT 2 FROM orders o JOIN regions r ON r.region_id = o.customer_id")
+    data = client.post("/api/admin/relations/analyze_sql",
+                       json={"sql": sql, "db_type": "sqlite"}).json()
+    assert data["ok"] is True
+    assert data["recommendations"] == {"created": 1, "updated": 0}
+    recs = _recs()
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec["table"] == "regions" and rec["status"] == "open"
+    assert rec["connection_id"] == fk_setup["cid"]
+    assert rec["sources"] == ["sql"] and rec["frequency"] == 2
+    ev = rec["evidence"]
+    # anchored: the MISSING table's column first, both predicate orientations
+    # collapsed into one entry counted per distinct statement
+    assert len(ev) == 1 and ev[0]["origin"] == "sql"
+    assert ev[0]["pairs"] == [["region_id", "customer_id"]]
+    assert ev[0]["count"] == 2
+    assert ev[0]["other"]["table"] == "orders"
+    # Re-analyzing accumulates.
+    client.post("/api/admin/relations/analyze_sql",
+                json={"sql": sql, "db_type": "sqlite"})
+    rec = _recs()[0]
+    assert rec["frequency"] == 4 and rec["evidence"][0]["count"] == 4
+
+
+def test_scan_persists_fk_recommendation_and_sql_merges_into_it(client, fk_setup):
+    # Unregister customers: orders' live FK now points at an unregistered
+    # physical table -> the scan persists an fk-sourced recommendation.
+    db_sources.DataSourceStore().delete_table(fk_setup["customers"], actor=ADMIN)
+    data = client.post("/api/admin/relations/scan", json={}).json()
+    assert data["ok"] is True
+    assert [r["table"] for r in data["unregistered_refs"]] == ["customers"]
+    recs = _recs()
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec["table"] == "customers" and rec["sources"] == ["fk"]
+    fk_ev = [e for e in rec["evidence"] if e["origin"] == "fk"]
+    assert fk_ev and fk_ev[0]["pairs"] == [["id", "customer_id"]]
+    # SQL evidence for the same physical table merges into the SAME rec —
+    # one row, both source badges.
+    client.post("/api/admin/relations/analyze_sql",
+                json={"sql": "SELECT 1 FROM orders o JOIN customers c "
+                             "ON o.customer_id = c.id", "db_type": "sqlite"})
+    recs = _recs()
+    assert len(recs) == 1
+    assert recs[0]["sources"] == ["fk", "sql"]
+    assert {e["origin"] for e in recs[0]["evidence"]} == {"fk", "sql"}
+
+
+def test_recommendations_get_role_sort_and_persistent_dismiss(client, fk_setup):
+    # regions joins BOTH registered tables -> bridge; solo_t joins one ->
+    # referenced. Bridge ranks first despite the lower frequency.
+    client.post("/api/admin/relations/analyze_sql", json={"db_type": "sqlite",
+        "sql": "SELECT 1 FROM orders o JOIN regions r ON o.customer_id = r.region_id "
+               "JOIN customers c ON c.id = r.region_id"})
+    client.post("/api/admin/relations/analyze_sql", json={"db_type": "sqlite",
+        "sql": "SELECT 1 FROM orders o JOIN solo_t s ON o.order_id = s.oid;"
+               "SELECT 2 FROM orders o JOIN solo_t s ON o.order_id = s.oid;"
+               "SELECT 3 FROM orders o JOIN solo_t s ON o.order_id = s.oid"})
+    data = client.get("/api/admin/relations/recommendations").json()
+    assert data["ok"] is True
+    rows = data["recommendations"]
+    assert [(r["table"], r["role"]) for r in rows] == \
+        [("regions", "bridge"), ("solo_t", "referenced")]
+    assert {j["label"] for j in rows[0]["joins"]} == {"Orders", "Customers"}
+    # Dismiss survives requests; restore brings it back; registered guard 400s.
+    rid = rows[1]["id"]
+    r = client.post("/api/admin/relations/recommendations/status",
+                    json={"id": rid, "status": "dismissed"})
+    assert r.status_code == 200
+    rows2 = client.get("/api/admin/relations/recommendations").json()["recommendations"]
+    assert [x["status"] for x in rows2 if x["id"] == rid] == ["dismissed"]
+    assert client.post("/api/admin/relations/recommendations/status",
+                       json={"id": rid, "status": "open"}).status_code == 200
+    assert client.post("/api/admin/relations/recommendations/status",
+                       json={"id": rid, "status": "nope"}).status_code == 400
+    assert client.post("/api/admin/relations/recommendations/status",
+                       json={"id": "ff00ff00ff00ff00", "status": "open"}).status_code == 404
+
+
+def _seed_regions_table(fk_setup, rows=3):
+    from sqlalchemy import create_engine, text
+    eng = create_engine(f"sqlite+pysqlite:///{fk_setup['db']}")
+    with eng.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE regions (region_id INTEGER PRIMARY KEY, rname TEXT)"))
+        for i in range(1, rows + 1):
+            conn.execute(text(f"INSERT INTO regions VALUES ({i}, 'R{i}')"))
+    eng.dispose()
+
+
+def _stub_autofill(monkeypatch):
+    import routes.admin_data as admin_mod
+
+    def fake_autofill(**kw):
+        return {"file_description": "AI regions table",
+                "columns": {"region_id": "AI region id", "rname": "AI name"}}
+    monkeypatch.setattr(admin_mod.brain_client, "schema_autofill", fake_autofill)
+
+
+def test_accept_recommendation_happy_path(client, fk_setup, monkeypatch):
+    _seed_regions_table(fk_setup)
+    _stub_autofill(monkeypatch)
+    client.post("/api/admin/relations/analyze_sql", json={"db_type": "sqlite",
+        "sql": "SELECT 1 FROM orders o JOIN regions r ON o.customer_id = r.region_id"})
+    rid = _recs()[0]["id"]
+    r = client.post("/api/admin/relations/recommendations/accept", json={"id": rid})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    t = data["table"]
+    # Auto-derived name, connector flag, AI-drafted descriptions, confirm
+    # stamps from the session, snapshot taken.
+    assert t["display_name"] == "regions"
+    assert t["is_connector"] is True
+    assert t["descriptions_confirmed_by"] == ADMIN
+    assert {c["name"]: c["description"] for c in t["columns"]}["rname"] == "AI name"
+    assert data["snapshot"]["ok"] is True and data["snapshot"]["rows"] == 3
+    assert local_store.db_snapshot_path(t["id"]).exists()
+    # Rec auto-transitioned.
+    rec = _recs()[0]
+    assert rec["status"] == "registered" and rec["registered_table_id"] == t["id"]
+    # The stored SQL evidence came back as NORMAL banded candidates instantly.
+    cands = data["candidates"]
+    assert len(cands) == 1
+    c = cands[0]
+    assert c["sources"] == ["sql"]
+    assert sorted([c["table_id"], c["related_table_id"]]) == \
+        sorted([t["id"], fk_setup["orders"]])
+    assert c["verified"] is True and c["band"] in ("confirmed", "suggested", "attention")
+    assert "relations.rec_accept" in _audit_actions()
+    # Proposed, not auto-confirmed: nothing written to relations.
+    assert db_sources.DataSourceStore().get_table(fk_setup["orders"])["relations"] == []
+    assert db_sources.DataSourceStore().get_table(t["id"])["relations"] == []
+
+
+def test_accept_snapshot_failure_rolls_back_completely(client, fk_setup, monkeypatch):
+    _seed_regions_table(fk_setup)
+    _stub_autofill(monkeypatch)
+    client.post("/api/admin/relations/analyze_sql", json={"db_type": "sqlite",
+        "sql": "SELECT 1 FROM orders o JOIN regions r ON o.customer_id = r.region_id"})
+    rid = _recs()[0]["id"]
+    import db_scheduler
+    monkeypatch.setattr(db_scheduler, "refresh_one_table",
+                        lambda tid, actor: {"ok": False, "error": "disk full"})
+    tables_before = {t["id"] for t in db_sources.DataSourceStore().list_tables()}
+    r = client.post("/api/admin/relations/recommendations/accept", json={"id": rid})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is False and "disk full" in data["error"]
+    # NO half-registered state: registry unchanged, no snapshot, rec open.
+    assert {t["id"] for t in db_sources.DataSourceStore().list_tables()} == tables_before
+    rec = _recs()[0]
+    assert rec["status"] == "open" and "registered_table_id" not in rec
+
+
+def test_accept_draft_failure_aborts_before_any_write(client, fk_setup, monkeypatch):
+    _seed_regions_table(fk_setup)
+    import routes.admin_data as admin_mod
+
+    def boom(**kw):
+        raise RuntimeError("brain down")
+    monkeypatch.setattr(admin_mod.brain_client, "schema_autofill", boom)
+    client.post("/api/admin/relations/analyze_sql", json={"db_type": "sqlite",
+        "sql": "SELECT 1 FROM orders o JOIN regions r ON o.customer_id = r.region_id"})
+    rid = _recs()[0]["id"]
+    tables_before = len(db_sources.DataSourceStore().list_tables())
+    data = client.post("/api/admin/relations/recommendations/accept",
+                       json={"id": rid}).json()
+    assert data["ok"] is False and "Edit first" in data["error"]
+    assert len(db_sources.DataSourceStore().list_tables()) == tables_before
+    assert _recs()[0]["status"] == "open"
+
+
+def test_accept_nonexistent_table_fails_cleanly(client, fk_setup, monkeypatch):
+    # A typo'd table in the SQL: the rec exists, Accept's introspect surfaces
+    # the truth, the rec stays open (Dismiss is the cleanup).
+    _stub_autofill(monkeypatch)
+    client.post("/api/admin/relations/analyze_sql", json={"db_type": "sqlite",
+        "sql": "SELECT 1 FROM orders o JOIN nope_t n ON o.order_id = n.oid"})
+    rid = _recs()[0]["id"]
+    data = client.post("/api/admin/relations/recommendations/accept",
+                       json={"id": rid}).json()
+    assert data["ok"] is False
+    assert _recs()[0]["status"] == "open"
+
+
+def test_accept_guards_status_and_unknown_id(client, fk_setup):
+    client.post("/api/admin/relations/analyze_sql", json={"db_type": "sqlite",
+        "sql": "SELECT 1 FROM orders o JOIN regions r ON o.customer_id = r.region_id"})
+    rid = _recs()[0]["id"]
+    client.post("/api/admin/relations/recommendations/status",
+                json={"id": rid, "status": "dismissed"})
+    assert client.post("/api/admin/relations/recommendations/accept",
+                       json={"id": rid}).status_code == 400
+    assert client.post("/api/admin/relations/recommendations/accept",
+                       json={"id": "ff00ff00ff00ff00"}).status_code == 404
+
+
+def test_accept_already_registered_race_syncs_and_reports_ok(client, fk_setup):
+    # The race branch: rec open while its physical table IS registered. The
+    # store's hooks make this unreachable normally — construct it directly.
+    import json as _json
+    client.post("/api/admin/relations/analyze_sql", json={"db_type": "sqlite",
+        "sql": "SELECT 1 FROM orders o JOIN regions r ON o.customer_id = r.region_id"})
+    store = db_sources.DataSourceStore()
+    doc = store.read_doc()
+    doc["tables"].append({"id": "ee00ee00ee00ee00",
+                          "connection_id": fk_setup["cid"], "schema": "",
+                          "table_name": "regions", "display_name": "regions"})
+    p = db_sources._doc_path()
+    p.write_text(_json.dumps(doc), encoding="utf-8")
+    rid = _recs()[0]["id"]
+    data = client.post("/api/admin/relations/recommendations/accept",
+                       json={"id": rid}).json()
+    assert data["ok"] is True and data["status"] == "registered"
+    assert _recs()[0]["status"] == "registered"
+
+
+def test_wizard_save_flips_open_recommendation_to_registered(client, fk_setup):
+    # Registration via the NORMAL wizard save path (not Accept) transitions
+    # the rec; its SQL evidence then replays on the next scan.
+    _seed_regions_table(fk_setup)
+    client.post("/api/admin/relations/analyze_sql", json={"db_type": "sqlite",
+        "sql": "SELECT 1 FROM orders o JOIN regions r ON o.customer_id = r.region_id;"
+               "SELECT 2 FROM orders o JOIN regions r ON o.customer_id = r.region_id"})
+    assert _recs()[0]["status"] == "open"
+    r = client.post("/api/admin/tables", json={
+        "connection_id": fk_setup["cid"], "schema": "", "table_name": "regions",
+        "display_name": "Regions", "confirm": True,
+        "columns": [{"name": "region_id", "description": "id"},
+                    {"name": "rname", "description": "name"}]})
+    assert r.status_code == 201
+    rec = _recs()[0]
+    assert rec["status"] == "registered"
+    # Next scan replays the stored SQL evidence through the normal pipeline.
+    data = client.post("/api/admin/relations/scan", json={}).json()
+    sql_cands = [c for c in data["candidates"] if c["sources"] == ["sql"]]
+    assert len(sql_cands) == 1
+    assert sql_cands[0]["sql_frequency"] == 2
+    assert sql_cands[0]["verified"] is True
+
+
+def test_graph_includes_open_recs_excludes_dismissed(client, fk_setup):
+    client.post("/api/admin/relations/analyze_sql", json={"db_type": "sqlite",
+        "sql": "SELECT 1 FROM orders o JOIN regions r ON o.customer_id = r.region_id"})
+    rid = _recs()[0]["id"]
+    g = client.post("/api/admin/relations/graph", json={}).json()
+    ghosts = [n for n in g["nodes"] if n["ghost"]]
+    assert [n["table"] for n in ghosts] == ["regions"]
+    sql_edges = [e for e in g["edges"] if e["origin"] == "sql" and e["ghost"]]
+    assert len(sql_edges) == 1
+    assert sql_edges[0]["keys_label"] == "region_id = customer_id"
+    # Body-passed refs still union in (compat with the pre-v4 frontend).
+    g2 = client.post("/api/admin/relations/graph", json={"unregistered_refs": [
+        {"connection_id": fk_setup["cid"], "schema": "", "table": "legacy_t",
+         "referenced_by": ["Orders"], "referenced_by_ids": [fk_setup["orders"]]},
+    ]}).json()
+    assert {n["table"] for n in g2["nodes"] if n["ghost"]} == {"regions", "legacy_t"}
+    # Dismissed -> gone.
+    client.post("/api/admin/relations/recommendations/status",
+                json={"id": rid, "status": "dismissed"})
+    g3 = client.post("/api/admin/relations/graph", json={}).json()
+    assert [n for n in g3["nodes"] if n["ghost"]] == []
+
+
+def test_recommendation_store_never_holds_sql_text_or_literals(client, fk_setup, tmp_path):
+    marker = "zz_secret_value_marker"
+    alias = "zz_weird_alias_marker"
+    sql = (f"SELECT o.amount FROM orders {alias} "
+           f"JOIN regions r ON {alias}.customer_id = r.region_id "
+           f"WHERE {alias}.city = '{marker}'")
+    client.post("/api/admin/relations/analyze_sql",
+                json={"sql": sql, "db_type": "sqlite"})
+    assert _recs()                                   # the rec DID persist
+    store_text = (tmp_path / "data_sources.json").read_text(encoding="utf-8")
+    audit_text = (tmp_path / "admin_audit.jsonl").read_text(encoding="utf-8")
+    for blob in (store_text, audit_text):
+        assert marker not in blob                    # literal never persists
+        assert alias not in blob                     # alias never persists
+        assert "SELECT" not in blob and "JOIN" not in blob
+
+
+
+def test_analyze_sql_both_sides_unknown_creates_two_linked_recs(client, fk_setup):
+    # Two unregistered tables joined to each other: TWO recommendations, each
+    # anchored at itself with a name-based other upgraded with the resolved
+    # connection (single-connection rule).
+    data = client.post("/api/admin/relations/analyze_sql", json={
+        "db_type": "sqlite",
+        "sql": "SELECT 1 FROM ax_dict a JOIN bx_dict b ON a.k = b.bk"}).json()
+    assert data["recommendations"] == {"created": 2, "updated": 0}
+    recs = {r["table"]: r for r in _recs()}
+    assert set(recs) == {"ax_dict", "bx_dict"}
+    a_ev = recs["ax_dict"]["evidence"]
+    assert a_ev[0]["other"]["table"] == "bx_dict"
+    assert a_ev[0]["other"]["connection_id"] == fk_setup["cid"]
+    assert a_ev[0]["pairs"] == [["k", "bk"]]
+    b_ev = recs["bx_dict"]["evidence"]
+    assert b_ev[0]["other"]["table"] == "ax_dict"
+    assert b_ev[0]["pairs"] == [["bk", "k"]]

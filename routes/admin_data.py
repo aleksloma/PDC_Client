@@ -308,6 +308,70 @@ def _confirmed_relation_count(tables: list) -> int:
                for r in (t.get("relations") or []) if isinstance(r, dict))
 
 
+def _persist_sql_recommendations(store, tables: list, stats: dict,
+                                 email: str) -> dict:
+    """Turn extraction's unregistered-join evidence into persistent
+    "Recommended tables". Only names resolvable to ONE connection (the same
+    resolve_unknown_tables rule the register shortcut uses) become
+    recommendations — the rest stay ephemeral unknown_tables strings.
+    Identifiers and counts only; the SQL text never reaches this function.
+    Never raises — a store failure must not discard the already-computed
+    candidates of the analyze response (Article IV)."""
+    try:
+        return _persist_sql_recommendations_inner(store, tables, stats, email)
+    except Exception as e:
+        log_with_sid(email, "error",
+                     f"REL_RECOMMEND_PERSIST_FAILED: {type(e).__name__}")
+        return {"created": 0, "updated": 0}
+
+
+def _persist_sql_recommendations_inner(store, tables: list, stats: dict,
+                                       email: str) -> dict:
+    joins = stats.get("unregistered_joins") or []
+    if not joins:
+        return {"created": 0, "updated": 0}
+    names = sorted({str(j.get("name")) for j in joins if j.get("name")})
+    resolved = {h["name"]: h for h in relation_discovery.resolve_unknown_tables(
+        names, tables, store.list_connections())}
+    table_freq = {e.get("name"): int(e.get("count") or 0)
+                  for e in stats.get("unregistered_tables") or []}
+    by_id = {t.get("id"): t for t in tables}
+    batch: dict = {}
+    for j in joins:
+        name = str(j.get("name") or "")
+        hint = resolved.get(name)
+        if hint is None:
+            continue
+        item = batch.get(name)
+        if item is None:
+            item = batch[name] = {
+                "connection_id": hint["connection_id"],
+                "schema": hint["schema"], "table": hint["table"],
+                "source": "sql", "frequency": int(table_freq.get(name) or 0),
+                "evidence": []}
+        other = j.get("other") or {}
+        if "table_id" in other:
+            ot = by_id.get(other.get("table_id"))
+            if ot is None:
+                continue
+            oref = {"connection_id": str(ot.get("connection_id") or ""),
+                    "schema": str(ot.get("schema") or ""),
+                    "table": str(ot.get("table_name") or "")}
+        else:
+            oname = str(other.get("name") or "")
+            osc, _, otn = oname.rpartition(".")
+            oref = {"schema": osc, "table": otn}
+            ohint = resolved.get(oname)
+            if ohint:
+                oref["connection_id"] = ohint["connection_id"]
+        item["evidence"].append({"origin": "sql", "other": oref,
+                                 "pairs": j.get("pairs") or [],
+                                 "count": int(j.get("count") or 0)})
+    if not batch:
+        return {"created": 0, "updated": 0}
+    return store.upsert_recommendations(list(batch.values()), actor=email)
+
+
 def _rel_matches(rel: dict, ref: str, jk: list) -> bool:
     """Exact match of a stored relation entry: same related ref (id or legacy
     name) AND join_keys equal as ordered [[child, parent], ...] lists."""
@@ -372,11 +436,46 @@ async def scan_relations(request: Request):
                                  "table": t.get("display_name") or t.get("table_name"),
                                  "error": "introspection failed — FK evidence skipped"})
 
-    cands = await _run(relation_discovery.discover, tables, fk_map)
-    cands = await _run(_verify_and_band, cands)
     # FKs pointing at tables the admin never registered — the "forgot the
-    # dictionary table" signal (rendered with a Register-as-connector shortcut).
+    # dictionary table" signal (rendered with a Register-as-connector shortcut)
+    # — persisted as fk-sourced recommendations so they survive the session.
     unregistered = relation_discovery.unregistered_fk_refs(tables, fk_map)
+    by_id = {t.get("id"): t for t in tables}
+    fk_batch = []
+    for ref in unregistered:
+        evidence = []
+        for src_id, pairs in zip(ref.get("referenced_by_ids") or [],
+                                 ref.get("referenced_pairs") or []):
+            src = by_id.get(src_id)
+            if src is None:
+                continue
+            evidence.append({
+                "origin": "fk",
+                "other": {"connection_id": str(src.get("connection_id") or ""),
+                          "schema": str(src.get("schema") or ""),
+                          "table": str(src.get("table_name") or "")},
+                "pairs": pairs, "count": 0})
+        fk_batch.append({"connection_id": ref.get("connection_id"),
+                         "schema": ref.get("schema"), "table": ref.get("table"),
+                         "source": "fk", "frequency": 0, "evidence": evidence})
+    if fk_batch:
+        await _run(store.upsert_recommendations, fk_batch, email)
+
+    cands = await _run(relation_discovery.discover, tables, fk_map)
+    # Close the loop for registrations made OUTSIDE instant-Accept (wizard,
+    # ghost shortcut): stored SQL evidence of now-registered recommendations
+    # replays through the same pipeline — no re-pasting.
+    rec_cands: list = []
+    for rec in await _run(store.list_recommendations):
+        if rec.get("status") == "registered":
+            rec_cands.extend(
+                relation_discovery.recommendation_candidates(rec, tables))
+    if rec_cands:
+        rec_cands = relation_discovery.filter_same_physical(rec_cands, tables)
+        rec_cands = relation_discovery.filter_existing_physical(rec_cands, tables)
+        rec_cands = relation_discovery.dedupe_physical_targets(rec_cands, tables)
+        cands = relation_discovery.merge_candidates(cands, rec_cands)
+    cands = await _run(_verify_and_band, cands)
     db_sources.audit(email, "relations.scan",
                      detail={"tables": len(tables), "candidates": len(cands),
                              "degraded": len(degraded),
@@ -388,10 +487,12 @@ async def scan_relations(request: Request):
 
 @router.post("/relations/analyze_sql")
 async def analyze_sql(request: Request):
-    """Extract join candidates from admin-pasted SELECT statements. The SQL is
-    parsed IN MEMORY on this client and never persisted, logged, audited, or
-    sent to the brain (Article II) — the audit row carries counts only, and
-    sqlglot's error text (it embeds the SQL) never leaves the parser."""
+    """Extract join candidates from admin-pasted SELECT statements. The SQL
+    TEXT is parsed IN MEMORY on this client and never persisted, logged,
+    audited, or sent to the brain (Article II) — the audit rows carry counts
+    only, and sqlglot's error text (it embeds the SQL) never leaves the
+    parser. Only table/column IDENTIFIERS extracted from it persist, as the
+    "Recommended tables" evidence for unregistered join endpoints."""
     email, err = _require_admin(request)
     if err:
         return err
@@ -411,12 +512,14 @@ async def analyze_sql(request: Request):
     cands = await _run(_verify_and_band, cands)
     hints = relation_discovery.resolve_unknown_tables(
         stats.get("unknown_tables") or [], tables, store.list_connections())
+    recs = await _run(_persist_sql_recommendations, store, tables, stats, email)
     db_sources.audit(email, "relations.analyze_sql",
                      detail={"statements": stats.get("statements"),
                              "failed": stats.get("failed"),
                              "candidates": len(cands)})
     return {"ok": True, "candidates": cands, "stats": stats,
             "unknown_table_hints": hints,
+            "recommendations": recs,
             "confirmed_count": _confirmed_relation_count(tables)}
 
 
@@ -748,16 +851,192 @@ async def dismiss_relation(request: Request):
 async def relations_graph(request: Request):
     """Graph-view data for the Relations section: registered tables as nodes,
     confirmed relations as edges, connected components/isolated flags, and
-    dashed ghost nodes for the client's last-scan unregistered FK refs
-    (passed back in the body — the graph never introspects). Read-only."""
+    dashed ghost nodes for OPEN recommended tables (server-side, persistent)
+    unioned with any body-passed last-scan refs (kept for compatibility —
+    the graph never introspects). Dismissed recommendations never render.
+    Read-only."""
     email, err = _require_admin(request)
     if err:
         return err
     body = await _json_body(request)
-    refs = [r for r in (body.get("unregistered_refs") or []) if isinstance(r, dict)]
-    tables = db_sources.DataSourceStore().list_tables()
-    graph = await _run(relation_discovery.build_graph, tables, refs)
+    store = db_sources.DataSourceStore()
+    tables = store.list_tables()
+    refs: dict = {}
+    for r in body.get("unregistered_refs") or []:
+        if isinstance(r, dict) and r.get("table"):
+            key = (str(r.get("connection_id") or ""),
+                   str(r.get("schema") or "").lower(),
+                   str(r.get("table") or "").lower())
+            refs.setdefault(key, dict(r))
+    for rec in await _run(store.list_recommendations):
+        if rec.get("status") != "open" or not rec.get("table"):
+            continue
+        key = (str(rec.get("connection_id") or ""),
+               str(rec.get("schema") or "").lower(),
+               str(rec.get("table") or "").lower())
+        entry = refs.setdefault(key, {
+            "connection_id": rec.get("connection_id"),
+            "schema": rec.get("schema"), "table": rec.get("table"),
+            "referenced_by": [], "referenced_by_ids": []})
+        entry.setdefault("evidence", []).extend(
+            ev for ev in (rec.get("evidence") or []) if isinstance(ev, dict))
+    graph = await _run(relation_discovery.build_graph, tables,
+                       [refs[k] for k in sorted(refs)])
     return {"ok": True, "nodes": graph["nodes"], "edges": graph["edges"]}
+
+
+@router.get("/relations/recommendations")
+async def list_recommendations(request: Request):
+    """The persistent "Recommended tables" (SQL + FK evidence), enriched at
+    read time with the dynamic role and resolved join partners. Bridge rows
+    rank above referenced rows; within a role, by frequency. Dismissed rows
+    are included (flagged by status) so the UI can offer show/restore."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    store = db_sources.DataSourceStore()
+    tables = store.list_tables()
+    out = []
+    for rec in await _run(store.list_recommendations):
+        summary = relation_discovery.recommendation_summary(rec, tables)
+        out.append({**rec, **summary})
+    out.sort(key=lambda r: (0 if r.get("role") == "bridge" else 1,
+                            -(int(r.get("frequency") or 0)),
+                            str(r.get("schema") or ""),
+                            str(r.get("table") or "")))
+    return {"ok": True, "recommendations": out}
+
+
+@router.post("/relations/recommendations/status")
+async def recommendation_status(request: Request):
+    """Persistent dismiss / restore for one recommended table. A dismissed
+    recommendation never reappears on later scans/analyzes until restored;
+    registered ones are immutable here (the registry owns them)."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    body = await _json_body(request)
+    rid = (body.get("id") or "").strip()
+    status = (body.get("status") or "").strip()
+    if not db_sources.DataSourceStore.valid_id(rid) or \
+            status not in ("open", "dismissed"):
+        return JSONResponse(
+            {"error": "id and status (open|dismissed) are required."},
+            status_code=400)
+    rec = await _run(db_sources.DataSourceStore().set_recommendation_status,
+                     rid, status, email)
+    if rec is None:
+        return JSONResponse(
+            {"error": "Unknown recommendation (or already registered)."},
+            status_code=404)
+    return {"ok": True, "recommendation": rec}
+
+
+@router.post("/relations/recommendations/accept")
+async def accept_recommendation(request: Request):
+    """One-click registration of a recommended table as a CONNECTOR:
+    introspect → AI-draft descriptions (the existing draft mechanism) →
+    register + snapshot (the same doc shape and snapshot path as the wizard
+    save), then replay the stored SQL evidence through the NORMAL candidate
+    pipeline so relations are proposed instantly — proposed, never
+    auto-confirmed. The UI confirm dialog is the review act (it states the
+    descriptions are AI-drafted and editable later in the table's settings).
+    Any failure leaves NO half-registered state and the recommendation open;
+    connectivity-style failures return 200 {ok:false}."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    body = await _json_body(request)
+    rid = (body.get("id") or "").strip()
+    store = db_sources.DataSourceStore()
+    rec = next((r for r in await _run(store.list_recommendations)
+                if r.get("id") == rid), None)
+    if rec is None:
+        return JSONResponse({"error": "Unknown recommendation."},
+                            status_code=404)
+    if rec.get("status") != "open":
+        return JSONResponse(
+            {"error": f"Recommendation is {rec.get('status')}."},
+            status_code=400)
+    cid = str(rec.get("connection_id") or "")
+    cfg, password, resp = _conn_cfg_and_password(store, {"connection_id": cid})
+    if resp is not None:
+        return resp
+    schema = (rec.get("schema") or "").strip() or None
+    table = str(rec.get("table") or "").strip()
+
+    # Registered by another path since the rec was written? The end-state the
+    # admin wants already exists — sync statuses and report success.
+    new_key = relation_discovery.physical_key(
+        {"connection_id": cid, "schema": schema or "", "table_name": table})
+    if any(relation_discovery.physical_key(t) == new_key
+           for t in store.list_tables()):
+        await _run(store.sync_recommendations)
+        db_sources.audit(email, "relations.rec_accept", target=rid, ok=True,
+                         detail={"table": f"{schema}.{table}" if schema else table,
+                                 "note": "already_registered"})
+        return {"ok": True, "status": "registered",
+                "note": "This table is already registered.", "candidates": []}
+
+    def _register():
+        intro = db_connector.introspect(cfg, password, schema, table,
+                                        sid=f"admin:{email}")
+        if not intro.get("ok"):
+            return {"ok": False, "error": intro.get("error")}
+        draft = _draft_table_descriptions(cfg, password, schema, table, email,
+                                          intro=intro)
+        if not draft.get("ok"):
+            return {"ok": False,
+                    "error": (draft.get("error") or "AI drafting failed.")
+                    + " Use “Edit first” to register with manually "
+                      "written descriptions."}
+        dcols = (draft.get("draft") or {}).get("columns") or {}
+        columns = [{
+            "name": c.get("name"), "dtype": c.get("dtype") or "",
+            "description": str(dcols.get(str(c.get("name")), "") or "").strip(),
+            "indexed": bool(c.get("indexed")), "pk": bool(c.get("pk")),
+        } for c in (intro.get("columns") or []) if c.get("name")]
+        doc = _build_table_doc(
+            tid="", connection_id=cid, schema=schema, table=table,
+            # Same humanized-name convention the wizard prefills client-side.
+            display_name=table.lower().replace("_", " "),
+            description=(draft.get("draft") or {}).get("table_description") or "",
+            columns=columns, is_connector=True, relations=[],
+            intro=intro, where_filter=None, row_cap=None, email=email)
+        saved = store.upsert_table(doc, actor=email)
+        import db_scheduler
+        snap = db_scheduler.refresh_one_table(saved["id"], actor=email)
+        if not snap.get("ok"):
+            # Accept is one atomic gesture: unlike the wizard save (which
+            # keeps the registration for a manual "Refresh now"), roll the
+            # registration back so no half-registered state remains — the
+            # store's reconcile hook restores the rec to open. A nightly-
+            # scheduler race can at worst leave an orphan parquet, the same
+            # window a plain table delete has today.
+            store.delete_table(saved["id"], actor=email)
+            return {"ok": False,
+                    "error": (snap.get("error") or "Snapshot failed")
+                    + " — the table was not registered."}
+        return {"ok": True, "table_id": saved["id"], "snapshot": snap}
+
+    res = await _run(_register)
+    db_sources.audit(email, "relations.rec_accept", target=rid,
+                     ok=bool(res.get("ok")),
+                     detail={"table": f"{schema}.{table}" if schema else table})
+    if not res.get("ok"):
+        return {"ok": False, "error": res.get("error")}
+
+    # Replay the stored SQL evidence through the NORMAL candidate pipeline
+    # (same chain as analyze_sql). FK evidence is not replayed — the next
+    # scan's live introspection re-derives it as ground truth.
+    tables = store.list_tables()
+    cands = relation_discovery.recommendation_candidates(rec, tables)
+    cands = relation_discovery.filter_same_physical(cands, tables)
+    cands = relation_discovery.filter_existing_physical(cands, tables)
+    cands = relation_discovery.dedupe_physical_targets(cands, tables)
+    cands = await _run(_verify_and_band, cands)
+    return {"ok": True, "table": store.get_table(res["table_id"]),
+            "snapshot": res["snapshot"], "candidates": cands}
 
 
 @router.post("/relations/delete")
@@ -842,6 +1121,56 @@ async def introspect_table(request: Request):
             "degraded": intro.get("degraded") or []}
 
 
+def _draft_table_descriptions(cfg: dict, password: str, schema, table: str,
+                              email: str, intro: Optional[dict] = None) -> dict:
+    """The ONE AI-draft mechanism (the existing schema-autofill brain call) —
+    used by the draft_descriptions route and the recommendation Accept, so
+    the two can never fork. Sync (run via _run). Pass a fresh `intro` to skip
+    the internal introspection (Accept already has one — no second live
+    catalog round-trip against the customer DB). Returns {"ok": True,
+    "draft": {...}, "confirmed": False} or {"ok": False, "error": ...}."""
+    import pandas as pd
+    from routes.upload import _prepare_file_context
+    if intro is None:
+        intro = db_connector.introspect(cfg, password, schema, table,
+                                        sid=f"admin:{email}")
+    if not intro.get("ok"):
+        return {"ok": False, "error": intro.get("error")}
+    # A larger sample than the visual preview so unique_hints are honest
+    # (still truncated by the same SCHEMA_AUTOFILL_* rules files use).
+    prev = db_connector.preview_rows(cfg, password, schema, table,
+                                     limit=200, sid=f"admin:{email}")
+    if not prev.get("ok"):
+        return {"ok": False, "error": prev.get("error")}
+    df = pd.DataFrame(prev.get("rows") or [], columns=prev.get("columns") or [])
+    entry = {"file_name": f"{schema}.{table}" if schema else table,
+             "file_description": intro.get("table_comment") or "",
+             "schema": {"file_name": table, "fields": {}}}
+    ctx = _prepare_file_context(entry["file_name"], df, entry, "")
+    try:
+        rsp = brain_client.schema_autofill(
+            sid=f"dbdraft:{email}",
+            fname=ctx["fname"],
+            cols_to_fill=ctx["cols_to_fill"],
+            unique_hints=ctx["unique_hints"],
+            dtypes=ctx["dtypes"],
+            file_desc=ctx["file_desc"],
+            notes_text="",
+            # English per the feature spec — NOT the column-language
+            # detection uploaded files use.
+            lang_name="English",
+            desc_word_limit=settings.SCHEMA_AUTOFILL_DESC_WORD_LIMIT,
+            user_email=email,
+        )
+    except Exception as e:
+        log_with_sid(email, "warning", f"DB_DRAFT_LLM_FAIL table={table}: {e}")
+        return {"ok": False, "error": "AI drafting is unavailable right now."}
+    return {"ok": True,
+            "draft": {"table_description": (rsp.get("file_description") or "").strip(),
+                      "columns": rsp.get("columns") or {}},
+            "confirmed": False}
+
+
 @router.post("/tables/draft_descriptions")
 async def draft_descriptions(request: Request):
     """AI-drafted table + column descriptions in ENGLISH via the EXISTING
@@ -860,52 +1189,43 @@ async def draft_descriptions(request: Request):
     table = (body.get("table") or "").strip()
     if not table:
         return JSONResponse({"error": "table is required."}, status_code=400)
-
-    def _build_and_call():
-        import pandas as pd
-        from routes.upload import _prepare_file_context
-        intro = db_connector.introspect(cfg, password, schema, table,
-                                        sid=f"admin:{email}")
-        if not intro.get("ok"):
-            return {"ok": False, "error": intro.get("error")}
-        # A larger sample than the visual preview so unique_hints are honest
-        # (still truncated by the same SCHEMA_AUTOFILL_* rules files use).
-        prev = db_connector.preview_rows(cfg, password, schema, table,
-                                         limit=200, sid=f"admin:{email}")
-        if not prev.get("ok"):
-            return {"ok": False, "error": prev.get("error")}
-        df = pd.DataFrame(prev.get("rows") or [], columns=prev.get("columns") or [])
-        entry = {"file_name": f"{schema}.{table}" if schema else table,
-                 "file_description": intro.get("table_comment") or "",
-                 "schema": {"file_name": table, "fields": {}}}
-        ctx = _prepare_file_context(entry["file_name"], df, entry, "")
-        try:
-            rsp = brain_client.schema_autofill(
-                sid=f"dbdraft:{email}",
-                fname=ctx["fname"],
-                cols_to_fill=ctx["cols_to_fill"],
-                unique_hints=ctx["unique_hints"],
-                dtypes=ctx["dtypes"],
-                file_desc=ctx["file_desc"],
-                notes_text="",
-                # English per the feature spec — NOT the column-language
-                # detection uploaded files use.
-                lang_name="English",
-                desc_word_limit=settings.SCHEMA_AUTOFILL_DESC_WORD_LIMIT,
-                user_email=email,
-            )
-        except Exception as e:
-            log_with_sid(email, "warning", f"DB_DRAFT_LLM_FAIL table={table}: {e}")
-            return {"ok": False, "error": "AI drafting is unavailable right now."}
-        return {"ok": True,
-                "draft": {"table_description": (rsp.get("file_description") or "").strip(),
-                          "columns": rsp.get("columns") or {}},
-                "confirmed": False}
-
-    res = await _run(_build_and_call)
+    res = await _run(_draft_table_descriptions, cfg, password, schema, table, email)
     db_sources.audit(email, "table.draft_descriptions",
                      target=f"{schema}.{table}", ok=bool(res.get("ok")))
     return res
+
+
+def _build_table_doc(*, tid: str, connection_id, schema, table: str,
+                     display_name: str, description: str, columns: list,
+                     is_connector: bool, relations: list, intro: dict,
+                     where_filter, row_cap, email: str) -> dict:
+    """The ONE stored table-doc shape — built here for both the wizard save
+    and the recommendation Accept, so the two can never drift. The confirm
+    stamps come from the SESSION identity + server clock, never a body."""
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "id": tid if db_sources.DataSourceStore.valid_id(tid) else None,
+        "connection_id": connection_id,
+        "schema": schema or "",
+        "table_name": table,
+        "display_name": (display_name or "").strip(),
+        "description": (description or "").strip(),
+        "columns": [{
+            "name": c.get("name"),
+            "dtype": c.get("dtype") or "",
+            "description": (c.get("description") or "").strip(),
+            "indexed": bool(c.get("indexed")),
+            "pk": bool(c.get("pk")),
+        } for c in (columns or []) if c.get("name")],
+        "is_connector": bool(is_connector),
+        "relations": [r for r in (relations or []) if isinstance(r, dict)],
+        "row_count": intro.get("row_count_estimate"),
+        "size_bytes": intro.get("size_bytes_estimate"),
+        "where_filter": (where_filter or "").strip() or None,
+        "row_cap": _safe_int(row_cap),
+        "descriptions_confirmed_by": email,        # session identity — never the body
+        "descriptions_confirmed_at": now,          # server clock
+    }
 
 
 def _validate_table_body(body: dict, store: db_sources.DataSourceStore):
@@ -981,30 +1301,15 @@ async def save_table(request: Request, tid: str = ""):
             {"error": "Table structure changed since introspection — re-run introspect.",
              "code": "SCHEMA_DRIFT"}, status_code=409)
 
-    now = datetime.now(timezone.utc).isoformat()
-    doc = {
-        "id": tid if db_sources.DataSourceStore.valid_id(tid) else None,
-        "connection_id": body.get("connection_id"),
-        "schema": schema or "",
-        "table_name": table,
-        "display_name": (body.get("display_name") or "").strip(),
-        "description": (body.get("description") or "").strip(),
-        "columns": [{
-            "name": c.get("name"),
-            "dtype": c.get("dtype") or "",
-            "description": (c.get("description") or "").strip(),
-            "indexed": bool(c.get("indexed")),
-            "pk": bool(c.get("pk")),
-        } for c in (body.get("columns") or []) if c.get("name")],
-        "is_connector": bool(body.get("is_connector")),
-        "relations": [r for r in (body.get("relations") or []) if isinstance(r, dict)],
-        "row_count": intro.get("row_count_estimate"),
-        "size_bytes": intro.get("size_bytes_estimate"),
-        "where_filter": (body.get("where_filter") or "").strip() or None,
-        "row_cap": _safe_int(body.get("row_cap")),
-        "descriptions_confirmed_by": email,        # session identity — never the body
-        "descriptions_confirmed_at": now,          # server clock
-    }
+    doc = _build_table_doc(
+        tid=tid, connection_id=body.get("connection_id"), schema=schema,
+        table=table, display_name=body.get("display_name") or "",
+        description=body.get("description") or "",
+        columns=body.get("columns") or [],
+        is_connector=bool(body.get("is_connector")),
+        relations=body.get("relations") or [], intro=intro,
+        where_filter=body.get("where_filter"), row_cap=body.get("row_cap"),
+        email=email)
     # Relations are stored verbatim here (frozen contract — rejecting would
     # break payloads this API must keep accepting), but a join key naming a
     # column neither side has is a silent broken hint: make it observable.

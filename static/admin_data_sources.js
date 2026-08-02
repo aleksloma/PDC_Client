@@ -117,7 +117,7 @@
     renderSchedule(s.data);
     renderRelDialects();
     renderRelOverview();
-    renderRelGhosts();                       // re-filters just-registered ghosts
+    loadRelRecommendations();                // persistent Recommended tables
     if (relView === 'graph' && !$('secRelations').hidden) refreshRelGraph();
   }
 
@@ -1170,36 +1170,115 @@
     });
   }
 
-  // ── Missing-table hints (unregistered FK refs + SQL unknowns) ──────────
-  let REL_GHOSTS = [];          // last scan's unregistered FK refs
-  let REL_UNKNOWN_HINTS = [];   // last analyze_sql's register shortcuts
+  // ── Recommended tables (persistent — SQL + FK evidence) ────────────────
+  let REL_RECS = [];            // server-persisted recommendations
+  let relShowDismissed = false;
 
-  function _ghostRegistered(ref) {
-    // a just-registered ghost disappears without re-scanning
-    return TABLES.some((t) => t.connection_id === ref.connection_id
-      && String(t.schema || '').toLowerCase() === String(ref.schema || '').toLowerCase()
-      && String(t.table_name || '').toLowerCase() === String(ref.table || '').toLowerCase());
+  async function loadRelRecommendations() {
+    const r = await api('/api/admin/relations/recommendations');
+    if (r.data && r.data.ok) {
+      REL_RECS = r.data.recommendations || [];
+      renderRelRecommended();
+    }
   }
 
-  function renderRelGhosts() {
-    const box = $('relGhostList');
-    const live = REL_GHOSTS.filter((g) => !_ghostRegistered(g));
-    box.classList.toggle('hidden', !live.length);
-    box.innerHTML = live.length ? '<div class="adm-subhead"><h4>Referenced but not registered</h4></div>'
-      + live.map((g, i) => {
-          const phys = g.schema ? `${g.schema}.${g.table}` : g.table;
-          return `
-            <div class="adm-rel-ghost-row" data-idx="${i}">
-              <span><strong>${esc((g.referenced_by || []).join(', '))}</strong> references
-                <strong>${esc(phys)}</strong> (not registered) — the AI cannot use this join
-                until it is registered.</span>
-              <button class="adm-btn ghost small" data-act="register">＋ Register as connector</button>
-            </div>`;
-        }).join('') : '';
-    box.querySelectorAll('[data-act="register"]').forEach((b) => {
-      const g = live[parseInt(b.closest('.adm-rel-ghost-row').dataset.idx, 10)];
-      b.addEventListener('click', () => registerGhost(g));
+  function _recPhysLabel(rec) {
+    return rec.schema ? `${rec.schema}.${rec.table}` : rec.table;
+  }
+
+  function _recEvidenceLine(rec) {
+    const joins = (rec.joins || []).map((j) =>
+      `<strong>${esc(j.label)}</strong>${(j.cols || []).length ? ' (' + esc(j.cols.join(', ')) + ')' : ''}`);
+    const parts = [];
+    if (joins.length) parts.push('joins ' + joins.join(' and '));
+    if (rec.frequency > 0) parts.push(`seen in ${esc(rec.frequency)} statement(s)`);
+    return parts.join(' · ') || 'referenced by your team’s SQL or foreign keys';
+  }
+
+  function renderRelRecommended() {
+    const box = $('relRecommended');
+    if (!box) return;
+    const open = REL_RECS.filter((r) => r.status === 'open');
+    const dismissed = REL_RECS.filter((r) => r.status === 'dismissed');
+    box.classList.toggle('hidden', !open.length && !dismissed.length);
+    if (!open.length && !dismissed.length) { box.innerHTML = ''; return; }
+    const shown = open.concat(relShowDismissed ? dismissed : []);
+    const rows = shown.map((rec) => {
+      const badges = [
+        `<span class="adm-chip ${rec.role === 'bridge' ? 'ok' : ''}" title="${rec.role === 'bridge'
+          ? 'Joins two or more registered tables — registering it connects them'
+          : 'Referenced by one registered table'}">${esc(rec.role)}</span>`,
+      ].concat((rec.sources || []).map(originChip));
+      const actions = rec.status === 'dismissed'
+        ? '<button class="adm-btn ghost small" data-act="restore">Restore</button>'
+        : `<button class="adm-btn primary small" data-act="accept">✔ Accept</button>
+           <button class="adm-btn ghost small" data-act="edit"
+             title="Review in the register wizard before saving">Edit first</button>
+           <button class="adm-icon-btn" data-act="dismiss"
+             title="Dismiss — it will not reappear until restored">✕</button>`;
+      return `<div class="adm-rel-ghost-row${rec.status === 'dismissed' ? ' adm-rel-rec-dismissed' : ''}"
+          data-rid="${esc(rec.id)}">
+          <span><strong>${esc(_recPhysLabel(rec))}</strong> ${badges.join(' ')}<br>
+            <span class="adm-muted">${_recEvidenceLine(rec)}</span></span>
+          <span class="adm-rel-rec-actions">${actions}</span>
+        </div>`;
     });
+    const toggle = dismissed.length
+      ? `<button id="relRecShowDismissed" class="adm-btn ghost small">${relShowDismissed
+          ? 'Hide' : 'Show'} dismissed (${dismissed.length})</button>`
+      : '';
+    box.innerHTML = '<div class="adm-subhead"><h4>Recommended tables <span class="adm-label-note">'
+      + '(referenced by your SQL or foreign keys but not registered — Accept registers one in a '
+      + 'single click)</span></h4></div>' + rows.join('') + toggle;
+    box.querySelectorAll('[data-act]').forEach((b) => {
+      const rec = REL_RECS.find((r) => r.id === b.closest('.adm-rel-ghost-row').dataset.rid);
+      if (!rec) return;
+      const act = b.dataset.act;
+      if (act === 'accept') b.addEventListener('click', () => acceptRecommendation(rec));
+      else if (act === 'edit') b.addEventListener('click', () => registerGhost({
+        connection_id: rec.connection_id, schema: rec.schema, table: rec.table }));
+      else if (act === 'dismiss') b.addEventListener('click', () => setRecStatus(rec, 'dismissed'));
+      else if (act === 'restore') b.addEventListener('click', () => setRecStatus(rec, 'open'));
+    });
+    const tog = $('relRecShowDismissed');
+    if (tog) {
+      tog.addEventListener('click', () => {
+        relShowDismissed = !relShowDismissed;
+        renderRelRecommended();
+      });
+    }
+  }
+
+  async function setRecStatus(rec, status) {
+    const r = await api('/api/admin/relations/recommendations/status', {
+      method: 'POST', body: JSON.stringify({ id: rec.id, status }) });
+    if (!r.data.ok) { toast(r.data.error || 'Update failed', true); return; }
+    loadRelRecommendations();
+  }
+
+  async function acceptRecommendation(rec) {
+    const phys = _recPhysLabel(rec);
+    if (!window.confirm(`Register "${phys}" as a connector table now?\n\n`
+      + 'Descriptions are AI-drafted — you can edit them later in the table’s settings '
+      + '(Registered tables → ✎). A snapshot of the table is taken, and its relations are '
+      + 'proposed for review right away.')) return;
+    _busy(`Registering ${phys}… introspecting, drafting descriptions, snapshotting.`);
+    let r;
+    try {
+      r = await api('/api/admin/relations/recommendations/accept', {
+        method: 'POST', body: JSON.stringify({ id: rec.id }) });
+    } finally { _busyDone(); }
+    if (!r.data.ok) {
+      toast(r.data.error || 'Registration failed — the recommendation stays open', true);
+      loadRelRecommendations();
+      return;
+    }
+    toast(r.data.note
+      || `Registered "${phys}" as a connector — review its proposed relations below`);
+    mergeRelCandidates(r.data.candidates || []);
+    renderRelCandidates();
+    loadRelRecommendations();
+    loadAll();
   }
 
   function registerGhost(g) {
@@ -1208,10 +1287,21 @@
   }
 
   function renderRelUnknowns(unknown, hints) {
+    // Only names that could NOT become recommendations render here: no
+    // resolvable connection (plain text), or a resolvable hint without any
+    // join evidence (register shortcut). Names already covered by a
+    // recommendation row are dropped — one table, one row.
     const box = $('relUnknownList');
     const hintByName = {};
     (hints || []).forEach((h) => { hintByName[h.name] = h; });
-    const rows = (unknown || []).map((name) => {
+    const recKeys = new Set(REL_RECS.map((r) =>
+      `${r.connection_id}|${String(r.schema || '').toLowerCase()}|${String(r.table || '').toLowerCase()}`));
+    const names = (unknown || []).filter((name) => {
+      const h = hintByName[name];
+      return !(h && recKeys.has(
+        `${h.connection_id}|${String(h.schema || '').toLowerCase()}|${String(h.table || '').toLowerCase()}`));
+    });
+    const rows = names.map((name) => {
       const h = hintByName[name];
       const btn = h ? '<button class="adm-btn ghost small" data-act="register">＋ Register as connector</button>' : '';
       return `<div class="adm-rel-ghost-row" data-name="${esc(name)}">
@@ -1344,9 +1434,10 @@
       setRelView('list');
       return;
     }
-    const live = REL_GHOSTS.filter((g) => !_ghostRegistered(g));
+    // Ghosts come from the server-persisted open recommendations now — the
+    // body's unregistered_refs param stays accepted server-side (compat).
     const r = await api('/api/admin/relations/graph', {
-      method: 'POST', body: JSON.stringify({ unregistered_refs: live }) });
+      method: 'POST', body: '{}' });
     if (!r.data.ok) { toast(r.data.error || 'Could not load the graph', true); return; }
     renderRelGraph(r.data.nodes || [], r.data.edges || []);
   }
@@ -1623,8 +1714,7 @@
     // Zero-new must be judged from the RESPONSE (the merged list can retain
     // earlier SQL-derived candidates) and explained via the confirmed count.
     _renderNoNew((r.data.candidates || []).length, r.data.confirmed_count || 0);
-    REL_GHOSTS = r.data.unregistered_refs || [];
-    renderRelGhosts();
+    loadRelRecommendations();     // scan persists fk-sourced recommendations
     renderRelCandidates();
     toast(`Scan complete — ${(r.data.candidates || []).length} candidate(s)`);
   }
@@ -1655,11 +1745,10 @@
     mergeRelCandidates(r.data.candidates || []);
     const st = r.data.stats || {};
     const unknown = st.unknown_tables || [];
-    REL_UNKNOWN_HINTS = r.data.unknown_table_hints || [];
-    // The honest reason beats "already confirmed": unregistered tables in
-    // the SQL can never become candidates — list them, with a one-click
-    // register shortcut where the connection is unambiguous.
-    renderRelUnknowns(unknown, REL_UNKNOWN_HINTS);
+    // Refresh the persistent recommendations FIRST — the unknown list only
+    // keeps names that did not become a recommendation row.
+    await loadRelRecommendations();
+    renderRelUnknowns(unknown, r.data.unknown_table_hints || []);
     if (!(r.data.candidates || []).length && unknown.length) {
       $('relNoNew').classList.add('hidden');
     } else {

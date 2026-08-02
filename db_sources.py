@@ -211,7 +211,33 @@ def _default_doc() -> dict:
         },
         "connections": [],
         "tables": [],
+        "recommendations": [],
     }
+
+
+def _rec_phys_key(obj: dict) -> tuple:
+    """Physical identity of a recommendation or table doc: (connection_id,
+    schema, table), case-insensitive on the names. Mirrors
+    relation_discovery.physical_key locally (this store stays a leaf module);
+    accepts both the rec shape (`table`) and the table-doc shape
+    (`table_name`)."""
+    return (str(obj.get("connection_id") or ""),
+            str(obj.get("schema") or "").lower(),
+            str(obj.get("table") or obj.get("table_name") or "").lower())
+
+
+def _rec_evidence_key(ev: dict) -> tuple:
+    """Union key for one evidence entry: (origin, other physical name, ordered
+    pair set). Identical evidence from a later run accumulates its count onto
+    the stored entry instead of appending a duplicate."""
+    other = ev.get("other") or {}
+    okey = (str(other.get("connection_id") or ""),
+            str(other.get("schema") or "").lower(),
+            str(other.get("table") or "").lower())
+    pairs = tuple(sorted((str(p[0]), str(p[1]))
+                         for p in (ev.get("pairs") or [])
+                         if isinstance(p, (list, tuple)) and len(p) == 2))
+    return (str(ev.get("origin") or ""), okey, pairs)
 
 
 class DataSourceStore:
@@ -243,6 +269,7 @@ class DataSourceStore:
             base["settings"].update({k: stg[k] for k in base["settings"] if k in stg})
         base["connections"] = [c for c in (doc.get("connections") or []) if isinstance(c, dict)]
         base["tables"] = [t for t in (doc.get("tables") or []) if isinstance(t, dict)]
+        base["recommendations"] = [r for r in (doc.get("recommendations") or []) if isinstance(r, dict)]
         return base
 
     def _write_doc(self, doc: dict) -> None:
@@ -362,6 +389,13 @@ class DataSourceStore:
                 keep_ids = {t.get("id") for t in dependent}
                 doc["tables"] = [t for t in doc["tables"] if t.get("id") not in keep_ids]
                 deleted_tables = sorted(keep_ids)
+            if deleted:
+                # A recommendation against a vanished connection can never be
+                # accepted — drop them with the connection.
+                doc["recommendations"] = [
+                    r for r in doc.get("recommendations") or []
+                    if str(r.get("connection_id") or "") != cid]
+                self._reconcile_recommendations(doc)
             self._write_doc(doc)
         for tid in deleted_tables:
             self._drop_snapshot(tid)
@@ -406,6 +440,7 @@ class DataSourceStore:
                     break
             if not replaced:
                 doc["tables"].append(table_doc)
+            self._reconcile_recommendations(doc)
             self._write_doc(doc)
         audit(actor, "table.save", target=tid,
               detail={"display_name": table_doc.get("display_name"),
@@ -423,6 +458,7 @@ class DataSourceStore:
             doc["tables"] = [t for t in doc["tables"] if t.get("id") != tid]
             deleted = len(doc["tables"]) < before
             if deleted:
+                self._reconcile_recommendations(doc)
                 self._write_doc(doc)
         if deleted and drop_snapshot:
             self._drop_snapshot(tid)
@@ -467,6 +503,159 @@ class DataSourceStore:
                         return
         except Exception as e:
             log_with_sid("db_sources", "error", f"DB_MARK_REFRESHED_FAILED table={tid}: {e}")
+
+    # ---- recommended tables (v4) -------------------------------------------
+    def list_recommendations(self) -> list[dict]:
+        return [dict(r) for r in self.read_doc()["recommendations"]]
+
+    def upsert_recommendations(self, batch: list, actor: str) -> dict:
+        """Merge identifier-only evidence into the persistent "Recommended
+        tables". Merge key = physical identity (connection + schema + table,
+        case-insensitive). Frequencies accumulate; evidence entries union by
+        (origin, other, pairs) with counts accumulating. A DISMISSED rec stays
+        dismissed (evidence still merges — restore shows the full picture); a
+        REGISTERED rec is untouched (the live pipeline owns it); an entry
+        whose physical table is already registered creates nothing. Batch
+        items: {connection_id, schema, table, source, frequency, evidence}."""
+        created = updated = 0
+        now = _now()
+        with _LOCK:
+            doc = self.read_doc()
+            reg_keys = set()
+            for t in doc["tables"]:
+                k = _rec_phys_key(t)
+                if k[0] and k[2]:
+                    reg_keys.add(k)
+            by_key: dict = {}
+            for r in doc["recommendations"]:
+                by_key.setdefault(_rec_phys_key(r), r)
+            for item in batch or []:
+                if not isinstance(item, dict):
+                    continue
+                key = _rec_phys_key(item)
+                if not key[0] or not key[2]:
+                    continue
+                rec = by_key.get(key)
+                if rec is None:
+                    if key in reg_keys:
+                        continue
+                    rec = {"id": secrets.token_hex(8),
+                           "connection_id": str(item.get("connection_id")),
+                           "schema": str(item.get("schema") or ""),
+                           "table": str(item.get("table")),
+                           "status": "open",
+                           "sources": [], "frequency": 0, "evidence": [],
+                           "first_seen_at": now, "last_seen_at": now}
+                    doc["recommendations"].append(rec)
+                    by_key[key] = rec
+                    created += 1
+                else:
+                    if rec.get("status") == "registered":
+                        continue
+                    updated += 1
+                src = str(item.get("source") or "")
+                if src and src not in (rec.get("sources") or []):
+                    rec["sources"] = list(rec.get("sources") or []) + [src]
+                rec["frequency"] = (int(rec.get("frequency") or 0)
+                                    + int(item.get("frequency") or 0))
+                existing: dict = {}
+                for ev in rec.get("evidence") or []:
+                    existing.setdefault(_rec_evidence_key(ev), ev)
+                for ev in item.get("evidence") or []:
+                    if not isinstance(ev, dict):
+                        continue
+                    ek = _rec_evidence_key(ev)
+                    cur = existing.get(ek)
+                    if cur is None:
+                        clean = {"origin": str(ev.get("origin") or ""),
+                                 "other": {k2: str(v) for k2, v in
+                                           (ev.get("other") or {}).items() if v},
+                                 "pairs": [[str(p[0]), str(p[1])]
+                                           for p in (ev.get("pairs") or [])
+                                           if isinstance(p, (list, tuple)) and len(p) == 2],
+                                 "count": int(ev.get("count") or 0)}
+                        rec.setdefault("evidence", []).append(clean)
+                        existing[ek] = clean
+                    else:
+                        cur["count"] = (int(cur.get("count") or 0)
+                                        + int(ev.get("count") or 0))
+                rec["last_seen_at"] = now
+            if created or updated:
+                self._write_doc(doc)
+        if created or updated:
+            audit(actor, "relations.recommend",
+                  detail={"created": created, "updated": updated})
+        return {"created": created, "updated": updated}
+
+    def set_recommendation_status(self, rec_id: str, status: str,
+                                  actor: str) -> Optional[dict]:
+        """Persistent dismiss / restore. Only open<->dismissed; a registered
+        rec is immutable here (the registry owns it)."""
+        if status not in ("open", "dismissed"):
+            return None
+        out = None
+        with _LOCK:
+            doc = self.read_doc()
+            for r in doc["recommendations"]:
+                if r.get("id") == rec_id:
+                    if r.get("status") == "registered":
+                        return None
+                    r["status"] = status
+                    out = dict(r)
+                    self._write_doc(doc)
+                    break
+        if out is not None:
+            audit(actor, "relations.rec_status", target=rec_id,
+                  detail={"status": status})
+        return out
+
+    def sync_recommendations(self) -> None:
+        """Re-run the registry<->recommendations reconciliation on demand —
+        used by the accept race branch (a table registered between rec
+        creation and accept). Normal mutations reconcile inline. Writes only
+        when something actually changed."""
+        with _LOCK:
+            doc = self.read_doc()
+            if self._reconcile_recommendations(doc):
+                self._write_doc(doc)
+
+    def _reconcile_recommendations(self, doc: dict) -> bool:
+        """Keep recommendation statuses consistent with the registry — called
+        inside every registry mutation, same lock, same write. An
+        open/dismissed rec whose physical table is now registered flips to
+        `registered` (prior_status remembered); a `registered` rec with NO
+        remaining registration reverts to prior_status — never blanket
+        'open', a dismissed rec must not resurrect on a rollback/delete.
+        Returns whether anything changed."""
+        changed = False
+        reg: dict = {}
+        for t in doc.get("tables") or []:
+            k = _rec_phys_key(t)
+            if k[0] and k[2]:
+                reg.setdefault(k, t)
+        for r in doc.get("recommendations") or []:
+            k = _rec_phys_key(r)
+            if not k[0] or not k[2]:
+                continue
+            hit = reg.get(k)
+            if hit is not None:
+                if r.get("status") != "registered":
+                    r["prior_status"] = r.get("status") or "open"
+                    r["status"] = "registered"
+                    changed = True
+                    log_with_sid("db_sources", "info",
+                                 f"REL_REC_REGISTERED rec={r.get('id')} "
+                                 f"table={hit.get('id')}")
+                if r.get("registered_table_id") != hit.get("id"):
+                    r["registered_table_id"] = hit.get("id")
+                    changed = True
+            elif r.get("status") == "registered":
+                r["status"] = r.pop("prior_status", "open") or "open"
+                r.pop("registered_table_id", None)
+                changed = True
+                log_with_sid("db_sources", "info",
+                             f"REL_REC_REVERTED rec={r.get('id')}")
+        return changed
 
     # ---- refresh settings --------------------------------------------------
     def get_refresh_settings(self) -> dict:

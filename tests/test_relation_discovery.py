@@ -664,3 +664,189 @@ def test_discover_end_to_end_excludes_declared():
     declared = dict(ORDERS, relations=[{"related_table_id": TID_B,
                                         "join_keys": [["customer_id", "id"]]}])
     assert rd.discover([declared, CUSTOMERS], fk_map) == []
+
+
+# ── v4: unregistered-join evidence (persistent recommendations) ────────────
+
+def _reg_pair():
+    """cl_info + tr_data registered on one connection; city_dict is not."""
+    cl = _phys_table(TID_A, "cl_info", ["client_id", "city_code"])
+    tr = _phys_table(TID_B, "tr_data", ["client_id", "product_id", "amount"])
+    return [cl, tr]
+
+
+def test_unregistered_joins_anchored_evidence_and_statement_dedupe():
+    tables = _reg_pair()
+    sql = (
+        "SELECT 1 FROM shop.cl_info c JOIN shop.city_dict ci "
+        "  ON c.city_code = ci.city_code;"
+        "SELECT 1 FROM shop.cl_info c JOIN shop.city_dict ci "
+        "  ON ci.city_code = c.city_code "
+        "JOIN shop.tr_data t ON t.client_id = c.client_id "
+        "WHERE ci.region = t.region_code"
+    )
+    _, stats = rd.extract_sql_joins(sql, tables, "sqlite")
+    joins = stats["unregistered_joins"]
+    # Evidence is anchored: the UNREGISTERED table's column always first,
+    # regardless of predicate orientation (stmt 2 flips the EQ sides).
+    to_cl = [j for j in joins if j["other"] == {"table_id": TID_A}]
+    assert len(to_cl) == 1
+    assert to_cl[0]["name"] == "shop.city_dict"
+    assert to_cl[0]["pairs"] == [["city_code", "city_code"]]
+    assert to_cl[0]["count"] == 2                 # distinct statements
+    to_tr = [j for j in joins if j["other"] == {"table_id": TID_B}]
+    assert len(to_tr) == 1
+    assert to_tr[0]["pairs"] == [["region", "region_code"]]
+    assert to_tr[0]["count"] == 1
+    # Per-TABLE distinct-statement count (not the sum of edge counts).
+    assert stats["unregistered_tables"] == [{"name": "shop.city_dict", "count": 2}]
+
+
+def test_unregistered_joins_both_sides_unknown_two_anchored_records():
+    tables = _reg_pair()
+    sql = ("SELECT 1 FROM shop.x_dict x JOIN shop.y_dict y "
+           "ON x.k = y.yk")
+    _, stats = rd.extract_sql_joins(sql, tables, "sqlite")
+    joins = stats["unregistered_joins"]
+    assert {"name": "shop.x_dict", "other": {"name": "shop.y_dict"},
+            "pairs": [["k", "yk"]], "count": 1} in joins
+    assert {"name": "shop.y_dict", "other": {"name": "shop.x_dict"},
+            "pairs": [["yk", "k"]], "count": 1} in joins
+
+
+def test_unregistered_joins_ambiguous_registered_other_skipped():
+    # "customers" registered as DIFFERENT physical tables on two connections:
+    # the registered side stays ambiguous -> no evidence row (same rule as
+    # candidate extraction), and the table itself is not "unknown".
+    tables = [_phys_table(TID_A, "customers", ["id"], conn="conn-1", schema=""),
+              _phys_table(TID_B, "customers", ["id"], conn="conn-2", schema="")]
+    sql = "SELECT 1 FROM ghost_t g JOIN customers c ON g.cid = c.id"
+    _, stats = rd.extract_sql_joins(sql, tables, "sqlite")
+    assert stats["unregistered_joins"] == []
+    assert stats["unregistered_tables"] == []
+    assert "ghost_t" in stats["unknown_tables"]
+
+
+def test_unregistered_joins_table_cap():
+    tables = _reg_pair()
+    n = rd.UNREG_TABLE_CAP + 5
+    sql = ";".join(
+        "SELECT 1 FROM shop.cl_info c JOIN shop.u%02d u ON c.client_id = u.cid" % i
+        for i in range(n))
+    _, stats = rd.extract_sql_joins(sql, tables, "sqlite")
+    anchors = {j["name"] for j in stats["unregistered_joins"]}
+    assert len(anchors) == rd.UNREG_TABLE_CAP
+
+
+def test_unregistered_fk_refs_carry_referenced_pairs():
+    cl = _phys_table(TID_A, "cl_info", ["client_id", "city_code"])
+    tr = _phys_table(TID_B, "tr_data", ["client_id", "city_code"])
+    fk_map = {
+        TID_A: _fk_intro([{"referred_table": "city_dict",
+                           "constrained_columns": ["city_code"],
+                           "referred_columns": ["city_code"]}]),
+        # length mismatch -> lenient: ref listed, no pairs
+        TID_B: _fk_intro([{"referred_table": "city_dict",
+                           "constrained_columns": ["city_code", "x"],
+                           "referred_columns": ["city_code"]}]),
+    }
+    refs = rd.unregistered_fk_refs([cl, tr], fk_map)
+    assert len(refs) == 1
+    ref = refs[0]
+    assert ref["referenced_by"] == ["cl info", "tr data"]
+    # aligned with referenced_by_ids; MISSING-table column first
+    assert ref["referenced_pairs"] == [[["city_code", "city_code"]], []]
+
+
+def test_recommendation_candidates_sql_only_and_skips_unregistered_other():
+    cl = _phys_table(TID_A, "cl_info", ["client_id", "city_code"])
+    cd = _phys_table(TID_B, "city_dict", ["city_code", "city_name"],
+                     connector=True)
+    rec = {"connection_id": "conn-1", "schema": "shop", "table": "city_dict",
+           "evidence": [
+               {"origin": "sql", "other": {"connection_id": "conn-1",
+                                           "schema": "shop", "table": "cl_info"},
+                "pairs": [["city_code", "city_code"]], "count": 3},
+               {"origin": "fk", "other": {"schema": "shop", "table": "cl_info"},
+                "pairs": [["city_code", "city_code"]], "count": 0},
+               {"origin": "sql", "other": {"schema": "shop", "table": "nope"},
+                "pairs": [["a", "b"]], "count": 1},
+           ]}
+    out = rd.recommendation_candidates(rec, [cl, cd])
+    assert len(out) == 1                          # fk + unresolvable skipped
+    c = out[0]
+    assert c["table_id"] == TID_B and c["related_table_id"] == TID_A
+    assert c["join_keys"] == [["city_code", "city_code"]]
+    assert c["sources"] == ["sql"] and c["sql_frequency"] == 3
+
+
+def test_recommendation_candidates_unregistered_rec_table_yields_nothing():
+    rec = {"connection_id": "conn-1", "schema": "shop", "table": "city_dict",
+           "evidence": [{"origin": "sql",
+                         "other": {"schema": "shop", "table": "cl_info"},
+                         "pairs": [["a", "b"]], "count": 1}]}
+    assert rd.recommendation_candidates(rec, _reg_pair()[:1]) == []
+
+
+def test_recommendation_summary_role_and_partners():
+    cl = _phys_table(TID_A, "cl_info", ["city_code"])
+    tr = _phys_table(TID_B, "tr_data", ["city_code"])
+    rec = {"connection_id": "conn-1", "schema": "shop", "table": "city_dict",
+           "evidence": [
+               {"origin": "sql", "other": {"schema": "shop", "table": "cl_info"},
+                "pairs": [["city_code", "city_code"]], "count": 2},
+               {"origin": "fk", "other": {"schema": "shop", "table": "tr_data"},
+                "pairs": [["city_code", "city_code"]], "count": 0},
+           ]}
+    s = rd.recommendation_summary(rec, [cl, tr])
+    assert s["role"] == "bridge"                  # two distinct partners
+    assert [j["label"] for j in s["joins"]] == ["cl info", "tr data"]
+    assert s["joins"][0]["cols"] == ["city_code"]
+    # One partner registered -> referenced.
+    assert rd.recommendation_summary(rec, [cl])["role"] == "referenced"
+
+
+def test_build_graph_recommendation_evidence_edges():
+    cl = _phys_table(TID_A, "cl_info", ["city_code"])
+    refs = [
+        {"connection_id": "conn-1", "schema": "shop", "table": "x_dict",
+         "referenced_by": ["cl info"], "referenced_by_ids": [TID_A],
+         "evidence": [
+             # fk evidence to a table ALREADY drawn via referenced_by_ids —
+             # must not double the edge
+             {"origin": "fk", "other": {"schema": "shop", "table": "cl_info"},
+              "pairs": [["xc", "x_code"]], "count": 0},
+             {"origin": "sql", "other": {"schema": "shop", "table": "cl_info"},
+              "pairs": [["xc", "x_code"]], "count": 1},
+             {"origin": "sql", "other": {"schema": "shop", "table": "y_dict"},
+              "pairs": [["k", "k"]], "count": 1}]},
+        {"connection_id": "conn-1", "schema": "shop", "table": "y_dict",
+         "referenced_by": [], "referenced_by_ids": [],
+         "evidence": [
+             # mirrored record of the x_dict<->y_dict join — deduped
+             {"origin": "sql", "other": {"schema": "shop", "table": "x_dict"},
+              "pairs": [["k", "k"]], "count": 1},
+             # fk evidence with NO referenced_by_ids row -> classic edge drawn
+             {"origin": "fk", "other": {"schema": "shop", "table": "cl_info"},
+              "pairs": [["yc", "y_code"]], "count": 0},
+             # sql evidence duplicating the drawn fk edge -> suppressed
+             {"origin": "sql", "other": {"schema": "shop", "table": "cl_info"},
+              "pairs": [["yc", "y_code"]], "count": 2}]},
+    ]
+    g = rd.build_graph([cl], refs)
+    gx = "ghost:conn-1/shop/x_dict"
+    gy = "ghost:conn-1/shop/y_dict"
+    assert {n["id"] for n in g["nodes"] if n["ghost"]} == {gx, gy}
+    edges = [(e["source"], e["target"], e["origin"], e["keys_label"])
+             for e in g["edges"]]
+    assert (TID_A, gx, "fk", "FK") in edges                    # classic row
+    assert (gx, gy, "sql", "k = k") in edges
+    assert (TID_A, gy, "fk", "y_code = yc") in edges           # fk evidence edge
+    # FK evidence is ground truth: a same-pairs SQL edge never overlaps an
+    # FK-covered relationship — exactly ONE edge per endpoint pair here.
+    assert len([e for e in edges if gx in (e[0], e[1]) and TID_A in (e[0], e[1])]) == 1
+    assert len([e for e in edges if gy in (e[0], e[1]) and TID_A in (e[0], e[1])]) == 1
+    # no duplicate fk edge for x_dict, no mirrored sql edge for y_dict
+    assert len([e for e in edges if e[2] == "fk" and gx in (e[0], e[1])]) == 1
+    assert len([e for e in edges if e[:2] == (gy, gx)]) == 0
+

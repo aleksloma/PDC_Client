@@ -157,7 +157,7 @@
             “Scan for relations” above and “Analyze SQL” below — nothing is applied until you
             accept)</span></h4></div>
           <div id="relDegraded" class="adm-alert warn hidden"></div>
-          <div id="relGhostList" class="hidden"></div>
+          <div id="relRecommended" class="hidden"></div>
           <div id="relUnknownList" class="hidden"></div>
           <div id="relNoNew" class="adm-muted adm-rel-nonew hidden"></div>
           <div id="relEmpty" class="adm-empty">
@@ -195,8 +195,9 @@
               <select id="relSqlDialect"><option value="">auto</option></select>
             </label>
             <button id="btnRelAnalyzeSql" class="adm-btn ghost">Analyze SQL</button>
-            <span class="adm-muted">SQL is parsed in memory on this server only — it is never
-              stored, logged, or sent anywhere.</span>
+            <span class="adm-muted">SQL is parsed in memory on this server only — the SQL text is
+              never stored, logged, or sent anywhere. Only the table and column names found in it
+              are kept on this server to recommend missing tables.</span>
           </div>
         </div>
       </section>

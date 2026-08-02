@@ -7,9 +7,12 @@ review UI. The route layer (routes/admin_data.py) owns introspection, the
 registry, and snapshot loading.
 
 Security invariants (Article II / VII):
-  - Pasted SQL is parsed in memory only. It is never persisted, logged,
-    audited, or sent to the brain — and neither are sqlglot's error messages,
-    which embed the offending SQL text.
+  - Pasted SQL is parsed in memory only. The SQL TEXT is never persisted,
+    logged, audited, or sent to the brain — and neither are sqlglot's error
+    messages, which embed the offending SQL text. Only table/column
+    IDENTIFIERS and statement counts extracted from it may persist locally
+    (the "Recommended tables" evidence); literals never survive extraction
+    because only Column = Column predicates are read at all.
   - Verification emits aggregates only (counts, percentages, dtype names).
     No cell value ever enters a candidate dict, a log line, or a response.
 
@@ -52,6 +55,7 @@ CARDINALITY_LABEL = {"N:1": "many-to-one", "1:1": "one-to-one",
 SOURCE_PRECEDENCE = ("fk", "sql", "name", "description")
 _MAX_RESOLVE_DEPTH = 5        # CTE/subquery column-resolution recursion cap
 MAX_CANDIDATES_PER_SOURCE = 200  # bound for the O(tables²·cols²) pair scans
+UNREG_TABLE_CAP = 20          # distinct unregistered tables tracked per analyze
 
 
 # ---------------------------------------------------------------------------
@@ -346,17 +350,32 @@ def unregistered_fk_refs(tables: list, fk_map: dict) -> list:
             key = (conn, rschema.lower(), rtable.lower())
             entry = refs.setdefault(key, {
                 "connection_id": conn, "schema": rschema, "table": rtable,
-                "referenced_by": [], "referenced_by_ids": []})
+                "referenced_by": [], "referenced_by_ids": [],
+                "referenced_pairs": []})
             label = child.get("display_name") or child.get("table_name")
+            # Column pairs, MISSING-table-column first ([referred, constrained])
+            # — the same anchor-first orientation the SQL evidence uses.
+            # Length mismatch -> no pairs for this FK (lenient, additive).
+            ccols = [str(x) for x in (fk.get("constrained_columns") or [])]
+            rcols = [str(x) for x in (fk.get("referred_columns") or [])]
+            pairs = [[r, cc] for cc, r in zip(ccols, rcols)] \
+                if ccols and len(ccols) == len(rcols) else []
             if child.get("id") not in entry["referenced_by_ids"]:
                 entry["referenced_by_ids"].append(child.get("id"))
                 entry["referenced_by"].append(str(label))
+                entry["referenced_pairs"].append(pairs)
+            else:
+                idx = entry["referenced_by_ids"].index(child.get("id"))
+                for p in pairs:
+                    if p not in entry["referenced_pairs"][idx]:
+                        entry["referenced_pairs"][idx].append(p)
     out = [refs[k] for k in sorted(refs)]
     for e in out:
         order = sorted(range(len(e["referenced_by"])),
                        key=lambda i: e["referenced_by"][i])
         e["referenced_by"] = [e["referenced_by"][i] for i in order]
         e["referenced_by_ids"] = [e["referenced_by_ids"][i] for i in order]
+        e["referenced_pairs"] = [e["referenced_pairs"][i] for i in order]
     return out
 
 
@@ -390,6 +409,86 @@ def resolve_unknown_tables(unknown: list, tables: list, connections: list) -> li
             hints.append({"name": raw, "connection_id": conn_id,
                           "schema": sc, "table": tn})
     return hints
+
+
+def recommendation_candidates(rec: dict, tables: list) -> list:
+    """Relation candidates replayed from a recommendation's stored SQL
+    evidence once its table is registered. SQL evidence ONLY — FK evidence is
+    deliberately never replayed: the next scan's live introspection re-derives
+    those through fk_candidates, and a replayed candidate must never carry
+    "fk" in sources (band()'s fk-auto-confirm is for ground truth only).
+    Stored pairs are anchor-column-first, so child = the recommended table;
+    verification flips direction as usual if the data says otherwise. Others
+    still unregistered or ambiguous are skipped — their evidence stays stored
+    until that side is registered too."""
+    registered = build_registered_map(tables)
+    rconn = str(rec.get("connection_id") or "")
+    hits = _resolve_physical(registered, rec.get("schema"), rec.get("table"))
+    if rconn:
+        hits = [h for h in hits if str(h.get("connection_id") or "") == rconn]
+    child = prefer_registration(hits)
+    if child is None:
+        return []
+    out = []
+    for ev in rec.get("evidence") or []:
+        if not isinstance(ev, dict) or ev.get("origin") != "sql":
+            continue
+        other = ev.get("other") or {}
+        pairs = [(str(p[0]), str(p[1])) for p in (ev.get("pairs") or [])
+                 if isinstance(p, (list, tuple)) and len(p) == 2]
+        if not pairs:
+            continue
+        oconn = str(other.get("connection_id") or "") or rconn
+        ohits = _resolve_physical(registered, other.get("schema"),
+                                  other.get("table"))
+        if oconn:
+            ohits = [h for h in ohits
+                     if str(h.get("connection_id") or "") == oconn]
+        parent = prefer_registration(ohits)
+        if parent is None or parent.get("id") == child.get("id"):
+            continue
+        count = int(ev.get("count") or 0)
+        cand = _make_candidate(child, parent, pairs, "sql",
+                               {"frequency": count})
+        cand["sql_frequency"] = count
+        out.append(cand)
+    return out
+
+
+def recommendation_summary(rec: dict, tables: list) -> dict:
+    """Read-time enrichment of one stored recommendation for the admin UI:
+    dynamic role (bridge = its evidence joins >= 2 DIFFERENT registered
+    physical tables in the CURRENT registry, else referenced — never stored,
+    registrations change it) plus the resolved join partners
+    [{label, cols, origins}]. Pure; identifiers only."""
+    registered = build_registered_map(tables)
+    rconn = str(rec.get("connection_id") or "")
+    partners: dict = {}
+    for ev in rec.get("evidence") or []:
+        if not isinstance(ev, dict):
+            continue
+        other = ev.get("other") or {}
+        oconn = str(other.get("connection_id") or "") or rconn
+        hits = _resolve_physical(registered, other.get("schema"),
+                                 other.get("table"))
+        if oconn:
+            hits = [h for h in hits
+                    if str(h.get("connection_id") or "") == oconn]
+        pref = prefer_registration(hits)
+        if pref is None:
+            continue
+        p = partners.setdefault(physical_key(pref), {
+            "label": _label(pref), "cols": set(), "origins": set()})
+        for pr in ev.get("pairs") or []:
+            if isinstance(pr, (list, tuple)) and len(pr) == 2:
+                p["cols"].add(str(pr[0]))
+        if ev.get("origin"):
+            p["origins"].add(str(ev.get("origin")))
+    joins = [{"label": p["label"], "cols": sorted(p["cols"]),
+              "origins": sorted(p["origins"])}
+             for _k, p in sorted(partners.items())]
+    return {"role": "bridge" if len(partners) >= 2 else "referenced",
+            "joins": joins}
 
 
 def build_graph(tables: list, unregistered_refs: Optional[list] = None) -> dict:
@@ -470,12 +569,20 @@ def build_graph(tables: list, unregistered_refs: Optional[list] = None) -> dict:
         n["isolated"] = not adj.get(tid)
 
     out_nodes = list(nodes.values())
+    # Two passes over the ghosts: nodes first, then edges — an evidence edge
+    # may target a ghost that appears LATER in the list (ghost↔ghost joins).
+    ghost_refs: list = []
+    ghost_ids: set = set()
     for ref in unregistered_refs or []:
         if not isinstance(ref, dict) or not ref.get("table"):
             continue
         gid = (f"ghost:{ref.get('connection_id', '')}/"
                f"{str(ref.get('schema') or '').lower()}/"
                f"{str(ref.get('table')).lower()}")
+        if gid in ghost_ids:
+            continue
+        ghost_ids.add(gid)
+        ghost_refs.append((ref, gid))
         out_nodes.append({
             "id": gid, "label": str(ref.get("table")),
             "sub": (f"{ref.get('schema')}.{ref.get('table')}"
@@ -485,8 +592,12 @@ def build_graph(tables: list, unregistered_refs: Optional[list] = None) -> dict:
             "connection_id": ref.get("connection_id"),
             "schema": ref.get("schema"), "table": ref.get("table"),
         })
+    seen_ev_edges: set = set()
+    for ref, gid in ghost_refs:
+        drawn_fk: set = set()
         for src_id in ref.get("referenced_by_ids") or []:
             if src_id in by_id:
+                drawn_fk.add(src_id)
                 edges.append({
                     "id": f"ghostedge:{src_id}:{gid}",
                     "source": src_id, "target": gid,
@@ -494,6 +605,75 @@ def build_graph(tables: list, unregistered_refs: Optional[list] = None) -> dict:
                     "suspicious": False, "ghost": True, "join_keys": [],
                     "related_ref": "", "related_is_id": False,
                 })
+        # Recommendation-evidence edges. Pairs are anchored ghost-column-
+        # first. FK-origin evidence draws the classic child→ghost edge (with
+        # real key labels), deduped against the referenced_by_ids edges above;
+        # SQL-origin evidence draws ghost→partner (registered or ghost).
+        # FK entries are processed FIRST and register their endpoint+pairs
+        # key: an SQL edge duplicating a drawn FK edge is suppressed (FK is
+        # ground truth — two overlapping dashed edges read as a bug).
+        n_ev = 0
+        evidence = sorted(
+            (ev for ev in ref.get("evidence") or [] if isinstance(ev, dict)),
+            key=lambda ev: 0 if str(ev.get("origin") or "") == "fk" else 1)
+        for ev in evidence:
+            other = ev.get("other") or {}
+            pairs = [[str(p[0]), str(p[1])] for p in (ev.get("pairs") or [])
+                     if isinstance(p, (list, tuple)) and len(p) == 2]
+            oconn = (str(other.get("connection_id") or "")
+                     or str(ref.get("connection_id") or ""))
+            ohits = _resolve_physical(registered, other.get("schema"),
+                                      other.get("table"))
+            if oconn:
+                ohits = [h for h in ohits
+                         if str(h.get("connection_id") or "") == oconn]
+            pref = prefer_registration(ohits)
+            if str(ev.get("origin") or "") == "fk":
+                if pref is None or pref["id"] == gid:
+                    continue
+                # Register the endpoint+pairs key even when the classic edge
+                # already covers this partner — the relationship IS drawn, a
+                # same-pairs SQL edge on top would just overlap it.
+                seen_ev_edges.add((tuple(sorted((gid, pref["id"]))),
+                                   tuple(sorted(tuple(sorted(p)) for p in pairs))))
+                if pref["id"] in drawn_fk:
+                    continue
+                drawn_fk.add(pref["id"])
+                edges.append({
+                    "id": f"ghostedge:{pref['id']}:{gid}",
+                    "source": pref["id"], "target": gid,
+                    "keys_label": ", ".join(f"{b} = {a}" for a, b in pairs) or "FK",
+                    "cardinality": None, "origin": "fk",
+                    "suspicious": False, "ghost": True,
+                    "join_keys": [[b, a] for a, b in pairs],
+                    "related_ref": "", "related_is_id": False,
+                })
+                continue
+            if pref is not None:
+                target = pref["id"]
+            else:
+                ogid = (f"ghost:{oconn}/"
+                        f"{str(other.get('schema') or '').lower()}/"
+                        f"{str(other.get('table') or '').lower()}")
+                target = ogid if ogid in ghost_ids else None
+            if not target or target == gid:
+                continue
+            # One edge per unordered endpoint pair + pair set — the mirrored
+            # record on the other anchor must not draw a second edge.
+            ekey = (tuple(sorted((gid, target))),
+                    tuple(sorted(tuple(sorted(p)) for p in pairs)))
+            if ekey in seen_ev_edges:
+                continue
+            seen_ev_edges.add(ekey)
+            edges.append({
+                "id": f"ghostsql:{gid}:{target}:{n_ev}",
+                "source": gid, "target": target,
+                "keys_label": ", ".join(f"{a} = {b}" for a, b in pairs) or "SQL",
+                "cardinality": None, "origin": "sql",
+                "suspicious": False, "ghost": True, "join_keys": pairs,
+                "related_ref": "", "related_is_id": False,
+            })
+            n_ev += 1
     return {"nodes": out_nodes, "edges": edges}
 
 
@@ -730,6 +910,25 @@ def build_schema_map(tables: list) -> dict:
     return out
 
 
+def _unreg_evidence_rows(a, b, ta, tb) -> list:
+    """Anchored evidence rows for a predicate with >=1 unregistered side:
+    (anchor_name, other, pair) with the ANCHOR's column always first in the
+    pair — orientation is fixed by construction, so merged evidence can never
+    mix directions. Both sides unregistered -> two rows, one per anchor. An
+    ambiguous registered other (prefer_registration -> None) yields no row —
+    the same rule candidate extraction applies. Identifiers only."""
+    def _nm(x):
+        return f"{x[0]}.{x[1]}" if x[0] else x[1]
+    if not ta and not tb:
+        return [(_nm(a), {"name": _nm(b)}, (a[2], b[2])),
+                (_nm(b), {"name": _nm(a)}, (b[2], a[2]))]
+    if not ta:
+        other = prefer_registration(tb)
+        return [(_nm(a), {"table_id": other["id"]}, (a[2], b[2]))] if other else []
+    other = prefer_registration(ta)
+    return [(_nm(b), {"table_id": other["id"]}, (b[2], a[2]))] if other else []
+
+
 def extract_sql_joins(sql_text: str, tables: list,
                       dialect: Optional[str]) -> tuple:
     """(candidates, stats) from pasted SELECT statements. Only equality
@@ -737,9 +936,15 @@ def extract_sql_joins(sql_text: str, tables: list,
     which is what "strip literals" means here); both endpoints must resolve to
     registered tables. Composite predicates between one table pair inside one
     ON clause collapse to one multi-column candidate; WHERE-style implicit
-    joins group per statement. Frequency counts DISTINCT statements."""
+    joins group per statement. Frequency counts DISTINCT statements.
+
+    Predicates touching UNREGISTERED tables additionally leave identifier-only
+    evidence in stats["unregistered_joins"] (name, other endpoint, column
+    pairs, distinct-statement count) — the raw material for the persistent
+    "Recommended tables". Never any SQL text or literal."""
     stats = {"statements": 0, "parsed": 0, "failed": 0, "non_select": 0,
-             "unknown_tables": []}
+             "unknown_tables": [], "unregistered_joins": [],
+             "unregistered_tables": []}
     unknown: set = set()
     registered = build_registered_map(tables)
     schema_map = build_schema_map(tables)
@@ -757,6 +962,11 @@ def extract_sql_joins(sql_text: str, tables: list,
 
     freq: Counter = Counter()
     by_id: dict = {}
+    unreg_freq: Counter = Counter()
+    unreg_by_key: dict = {}
+    unreg_anchors: set = set()
+    unreg_table_freq: Counter = Counter()   # distinct statements per TABLE
+    unreg_capped = False
     for stmt in stmts:
         if not list(stmt.find_all(exp.Select)):
             stats["non_select"] += 1
@@ -769,6 +979,7 @@ def extract_sql_joins(sql_text: str, tables: list,
                          f"REL_SQL_QUALIFY_FALLBACK: {type(e).__name__}")
             qualified = stmt          # best-effort; raw tree still resolvable
         stmt_candidates: dict = {}
+        unreg_groups: dict = {}   # (gkey, anchor, other_key) -> {"other", "pairs"}
         try:
             scopes = traverse_scope(qualified)
         except Exception as e:
@@ -804,6 +1015,19 @@ def extract_sql_joins(sql_text: str, tables: list,
                     if not tb:
                         unknown.add(f"{b[0]}.{b[1]}" if b[0] else b[1])
                     if not ta or not tb:
+                        # v4: keep identifier-only evidence for the missing
+                        # side(s) — this is what "Recommended tables" run on.
+                        for anchor, other, pair in _unreg_evidence_rows(a, b, ta, tb):
+                            if anchor not in unreg_anchors:
+                                if len(unreg_anchors) >= UNREG_TABLE_CAP:
+                                    unreg_capped = True
+                                    continue
+                                unreg_anchors.add(anchor)
+                            okey = ("id", other["table_id"]) if "table_id" in other \
+                                else ("name", other["name"])
+                            grp = unreg_groups.setdefault(
+                                (gkey, anchor, okey), {"other": other, "pairs": set()})
+                            grp["pairs"].add(pair)
                         continue
                     # Duplicate registrations of one physical table resolve to
                     # the PREFERRED registration (connector first); hits that
@@ -834,6 +1058,19 @@ def extract_sql_joins(sql_text: str, tables: list,
             freq[cid] += 1
             if cid not in by_id:
                 by_id[cid] = cand
+        # Per-statement dedupe for the unregistered evidence too: one
+        # statement contributes at most +1 count per (anchor, other, pairs).
+        stmt_unreg: dict = {}
+        for (_g, anchor, okey), grp in unreg_groups.items():
+            pairs = tuple(sorted(grp["pairs"]))
+            stmt_unreg[(anchor, okey, pairs)] = {
+                "name": anchor, "other": grp["other"],
+                "pairs": [[p[0], p[1]] for p in pairs]}
+        for k, rec in stmt_unreg.items():
+            unreg_freq[k] += 1
+            unreg_by_key.setdefault(k, rec)
+        for anchor in {k[0] for k in stmt_unreg}:
+            unreg_table_freq[anchor] += 1
 
     out = []
     for cid, cand in by_id.items():
@@ -843,6 +1080,17 @@ def extract_sql_joins(sql_text: str, tables: list,
     # Join endpoints that are not registered tables — names come from the
     # admin's own pasted SQL and go only back to the admin's browser.
     stats["unknown_tables"] = sorted(unknown)[:10]
+    if unreg_capped:
+        log_with_sid("relation_discovery", "info",
+                     f"REL_UNREG_EVIDENCE_CAP cap={UNREG_TABLE_CAP}")
+    stats["unregistered_joins"] = [
+        {**unreg_by_key[k], "count": int(unreg_freq[k])}
+        for k in sorted(unreg_by_key, key=lambda k: (k[0], str(k[1]), k[2]))
+    ]
+    stats["unregistered_tables"] = [
+        {"name": n, "count": int(unreg_table_freq[n])}
+        for n in sorted(unreg_table_freq)
+    ]
     return out, stats
 
 

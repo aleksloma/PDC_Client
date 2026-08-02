@@ -200,3 +200,116 @@ def test_connector_closure_dangling_and_cap(store, monkeypatch):
     out = db_sources.expand_with_connectors([ids["A"]], store)
     # Cap 1: only one connector auto-added.
     assert len([i for i in out if i != ids["A"]]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Recommended tables (v4)
+# ---------------------------------------------------------------------------
+
+def _rec_item(cid, table="city_dict", source="sql", frequency=2, count=2,
+              other=None, pairs=None):
+    return {"connection_id": cid, "schema": "shop", "table": table,
+            "source": source, "frequency": frequency,
+            "evidence": [{"origin": source,
+                          "other": other or {"schema": "shop", "table": "cl_info"},
+                          "pairs": pairs or [["city_code", "city_code"]],
+                          "count": count}]}
+
+
+def test_recommendations_merge_accumulate_and_union(store):
+    cid = _mk_conn(store)["id"]
+    r1 = store.upsert_recommendations([_rec_item(cid)], actor="ladmin")
+    assert r1 == {"created": 1, "updated": 0}
+    # Same physical table, different case + fk source + one identical and one
+    # new evidence entry: frequencies accumulate, evidence unions, counts add.
+    item2 = {"connection_id": cid, "schema": "SHOP", "table": "City_Dict",
+             "source": "fk", "frequency": 1,
+             "evidence": [
+                 {"origin": "sql", "other": {"schema": "shop", "table": "cl_info"},
+                  "pairs": [["city_code", "city_code"]], "count": 3},
+                 {"origin": "fk", "other": {"schema": "shop", "table": "tr_data"},
+                  "pairs": [["city_code", "city_code"]], "count": 0}]}
+    r2 = store.upsert_recommendations([item2], actor="ladmin")
+    assert r2 == {"created": 0, "updated": 1}
+    recs = store.list_recommendations()
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec["status"] == "open"
+    assert rec["sources"] == ["sql", "fk"]
+    assert rec["frequency"] == 3
+    sql_ev = [e for e in rec["evidence"] if e["origin"] == "sql"]
+    assert len(sql_ev) == 1 and sql_ev[0]["count"] == 5      # 2 + 3
+    assert len(rec["evidence"]) == 2
+
+
+def test_recommendations_dismiss_sticky_and_restore(store):
+    cid = _mk_conn(store)["id"]
+    store.upsert_recommendations([_rec_item(cid)], actor="ladmin")
+    rid = store.list_recommendations()[0]["id"]
+    assert store.set_recommendation_status(rid, "dismissed", "ladmin")["status"] == "dismissed"
+    # Re-analyze: evidence still merges, status stays dismissed.
+    store.upsert_recommendations([_rec_item(cid, frequency=4)], actor="ladmin")
+    rec = store.list_recommendations()[0]
+    assert rec["status"] == "dismissed" and rec["frequency"] == 6
+    # Restore.
+    assert store.set_recommendation_status(rid, "open", "ladmin")["status"] == "open"
+    # Bogus status refused.
+    assert store.set_recommendation_status(rid, "registered", "ladmin") is None
+
+
+def test_recommendations_skip_creation_for_registered_physical(store):
+    cid = _mk_conn(store)["id"]
+    store.upsert_table({"connection_id": cid, "schema": "shop",
+                        "table_name": "city_dict", "display_name": "cd",
+                        "columns": []}, actor="ladmin")
+    out = store.upsert_recommendations([_rec_item(cid)], actor="ladmin")
+    assert out == {"created": 0, "updated": 0}
+    assert store.list_recommendations() == []
+
+
+def test_recommendations_transition_and_prior_status_revert(store):
+    cid = _mk_conn(store)["id"]
+    store.upsert_recommendations([_rec_item(cid)], actor="ladmin")
+    rid = store.list_recommendations()[0]["id"]
+    store.set_recommendation_status(rid, "dismissed", "ladmin")
+    # ANY registration path (store-level hook) flips it to registered.
+    t = store.upsert_table({"connection_id": cid, "schema": "Shop",
+                            "table_name": "CITY_DICT", "display_name": "cd",
+                            "columns": []}, actor="ladmin")
+    rec = store.list_recommendations()[0]
+    assert rec["status"] == "registered"
+    assert rec["registered_table_id"] == t["id"]
+    # Registered recs are untouched by further upserts.
+    assert store.upsert_recommendations([_rec_item(cid)], actor="ladmin") == \
+        {"created": 0, "updated": 0}
+    # Table deleted -> reverts to PRIOR status (dismissed, not open).
+    store.delete_table(t["id"], actor="ladmin")
+    rec = store.list_recommendations()[0]
+    assert rec["status"] == "dismissed"
+    assert "prior_status" not in rec and "registered_table_id" not in rec
+
+
+def test_recommendations_connection_cascade_drops_recs(store):
+    cid = _mk_conn(store)["id"]
+    store.upsert_recommendations([_rec_item(cid)], actor="ladmin")
+    assert store.list_recommendations()
+    store.delete_connection(cid, actor="ladmin", cascade=True)
+    assert store.list_recommendations() == []
+
+
+def test_recommendations_old_shape_doc_defaults_section(tmp_path, monkeypatch):
+    monkeypatch.setattr(db_sources.settings, "DATA_ROOT", str(tmp_path))
+    (tmp_path / "data_sources.json").write_text(
+        json.dumps({"connections": [], "tables": []}), encoding="utf-8")
+    store = db_sources.DataSourceStore()
+    assert store.read_doc()["recommendations"] == []
+    assert store.list_recommendations() == []
+
+
+def test_recommendations_audit_counts_only(store, tmp_path):
+    cid = _mk_conn(store)["id"]
+    store.upsert_recommendations([_rec_item(cid)], actor="ladmin")
+    rows = [r for r in db_sources.read_audit_tail(50)
+            if r["action"] == "relations.recommend"]
+    assert rows and rows[0]["detail"] == {"created": 1, "updated": 0}
+
