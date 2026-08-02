@@ -308,6 +308,27 @@ def _confirmed_relation_count(tables: list) -> int:
                for r in (t.get("relations") or []) if isinstance(r, dict))
 
 
+def _collect_evidence_warnings(recs: list, tables: list, email: str) -> list:
+    """Replay-validation warnings for the admin UI ("never silent"): stored
+    pasted-SQL evidence naming columns a now-known registration lacks — the
+    pairs are excluded from replay by validate_rec_evidence; this surfaces
+    them. Deduped on (table, column); identifiers only."""
+    out: list = []
+    seen: set = set()
+    for rec in recs:
+        _clean, invalid = relation_discovery.validate_rec_evidence(rec, tables)
+        for w in invalid:
+            key = (w["table"], w["column"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({**w, "source": "sql-evidence"})
+            log_with_sid(email, "warning",
+                         f"REL_REPLAY_INVALID_COLUMN table={w['table']} "
+                         f"col={w['column']}")
+    return out
+
+
 def _persist_sql_recommendations(store, tables: list, stats: dict,
                                  email: str) -> dict:
     """Turn extraction's unregistered-join evidence into persistent
@@ -353,6 +374,10 @@ def _persist_sql_recommendations_inner(store, tables: list, stats: dict,
         if "table_id" in other:
             ot = by_id.get(other.get("table_id"))
             if ot is None:
+                # Should be unreachable: table_id evidence is minted and
+                # consumed from the SAME tables list within one request.
+                log_with_sid(email, "warning",
+                             "REL_RECOMMEND_STALE_TABLE_ID dropped")
                 continue
             oref = {"connection_id": str(ot.get("connection_id") or ""),
                     "schema": str(ot.get("schema") or ""),
@@ -464,12 +489,16 @@ async def scan_relations(request: Request):
     cands = await _run(relation_discovery.discover, tables, fk_map)
     # Close the loop for registrations made OUTSIDE instant-Accept (wizard,
     # ghost shortcut): stored SQL evidence of now-registered recommendations
-    # replays through the same pipeline — no re-pasting.
+    # replays through the same pipeline — no re-pasting. v4.1: evidence pairs
+    # naming columns the registration lacks are excluded by the replay
+    # validator and surfaced as warnings, never as bogus candidates.
     rec_cands: list = []
-    for rec in await _run(store.list_recommendations):
-        if rec.get("status") == "registered":
-            rec_cands.extend(
-                relation_discovery.recommendation_candidates(rec, tables))
+    registered_recs = [r for r in await _run(store.list_recommendations)
+                       if r.get("status") == "registered"]
+    evidence_warnings = _collect_evidence_warnings(registered_recs, tables, email)
+    for rec in registered_recs:
+        rec_cands.extend(
+            relation_discovery.recommendation_candidates(rec, tables))
     if rec_cands:
         rec_cands = relation_discovery.filter_same_physical(rec_cands, tables)
         rec_cands = relation_discovery.filter_existing_physical(rec_cands, tables)
@@ -482,6 +511,7 @@ async def scan_relations(request: Request):
                              "unregistered_refs": len(unregistered)})
     return {"ok": True, "candidates": cands, "degraded": degraded,
             "unregistered_refs": unregistered,
+            "evidence_warnings": evidence_warnings,
             "confirmed_count": _confirmed_relation_count(tables)}
 
 
@@ -725,12 +755,18 @@ async def accept_relations(request: Request):
         jk = [[str(p[0]).strip(), str(p[1]).strip()] for p in jk]
         jk = list(dict.fromkeys(map(tuple, jk)))       # drop repeated pairs
         jk = [list(p) for p in jk]
+        # Per-side, per-column messages naming the table (BUG B was this
+        # check formatting the pair as one fused 'a=b' token plus leaking
+        # relations[idx] internals — unreadable for the admin).
         child_cols = {c.get("name") for c in (child.get("columns") or [])}
         parent_cols = {c.get("name") for c in (parent.get("columns") or [])}
         for a, b in jk:
-            if a not in child_cols or b not in parent_cols:
-                return _reject(f"relations[{idx}]: column '{a}={b}' not found "
-                               "on the registered tables.")
+            if a not in child_cols:
+                return _reject(f"Column '{a}' does not exist on "
+                               f"'{child.get('display_name') or child.get('table_name')}'.")
+            if b not in parent_cols:
+                return _reject(f"Column '{b}' does not exist on "
+                               f"'{parent.get('display_name') or parent.get('table_name')}'.")
         cardinality = item.get("cardinality")
         if cardinality is not None and cardinality not in _REL_CARDINALITIES:
             return _reject(f"relations[{idx}]: invalid cardinality.")
@@ -1028,15 +1064,18 @@ async def accept_recommendation(request: Request):
 
     # Replay the stored SQL evidence through the NORMAL candidate pipeline
     # (same chain as analyze_sql). FK evidence is not replayed — the next
-    # scan's live introspection re-derives it as ground truth.
+    # scan's live introspection re-derives it as ground truth. v4.1: invalid
+    # evidence pairs are excluded by the replay validator and surfaced.
     tables = store.list_tables()
+    warnings = _collect_evidence_warnings([rec], tables, email)
     cands = relation_discovery.recommendation_candidates(rec, tables)
     cands = relation_discovery.filter_same_physical(cands, tables)
     cands = relation_discovery.filter_existing_physical(cands, tables)
     cands = relation_discovery.dedupe_physical_targets(cands, tables)
     cands = await _run(_verify_and_band, cands)
     return {"ok": True, "table": store.get_table(res["table_id"]),
-            "snapshot": res["snapshot"], "candidates": cands}
+            "snapshot": res["snapshot"], "candidates": cands,
+            "evidence_warnings": warnings}
 
 
 @router.post("/relations/delete")

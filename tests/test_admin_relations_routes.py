@@ -1006,3 +1006,208 @@ def test_analyze_sql_both_sides_unknown_creates_two_linked_recs(client, fk_setup
     b_ev = recs["bx_dict"]["evidence"]
     assert b_ev[0]["other"]["table"] == "ax_dict"
     assert b_ev[0]["pairs"] == [["bk", "k"]]
+
+
+# ── v4.1: the user scenario end-to-end + wrong-SQL validation ──────────────
+
+CHAIN_SQL = (
+    # 6 statements, aliases + one (plain-projection) CTE; joins:
+    # tr_data.client_id=cl_info.client_id, cl_info.city_code=city_dict.city_code,
+    # tr_data.product_id=prod_dict.product_id
+    "SELECT t.tr_id FROM tr_data t JOIN cl_info c ON t.client_id = c.client_id;"
+    "SELECT c.first_name, ci.city_name FROM cl_info c "
+    "JOIN city_dict ci ON c.city_code = ci.city_code;"
+    "SELECT 1 FROM cl_info c JOIN city_dict ci ON ci.city_code = c.city_code;"
+    "WITH s AS (SELECT t.client_id, t.product_id, t.amount FROM tr_data t) "
+    "SELECT * FROM s JOIN prod_dict p ON s.product_id = p.product_id;"
+    "SELECT 2 FROM cl_info c2 JOIN city_dict cd ON c2.city_code = cd.city_code;"
+    "SELECT 3 FROM tr_data tt JOIN cl_info cc ON tt.client_id = cc.client_id"
+)
+
+
+@pytest.fixture
+def chain_setup(client, tmp_path):
+    """The user's registry state: city_dict REGISTERED (with snapshot);
+    cl_info / tr_data / prod_dict exist in the DB but are UNREGISTERED."""
+    from sqlalchemy import create_engine, text
+    db = tmp_path / "chain.db"
+    eng = create_engine(f"sqlite+pysqlite:///{db}")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE cl_info (client_id INTEGER PRIMARY KEY,"
+                          " city_code INTEGER, first_name TEXT)"))
+        conn.execute(text("CREATE TABLE tr_data (tr_id INTEGER PRIMARY KEY,"
+                          " client_id INTEGER, product_id INTEGER, amount REAL)"))
+        conn.execute(text("CREATE TABLE city_dict (city_code INTEGER PRIMARY KEY,"
+                          " city_name TEXT)"))
+        conn.execute(text("CREATE TABLE prod_dict (product_id INTEGER PRIMARY KEY,"
+                          " pname TEXT)"))
+        conn.execute(text("INSERT INTO city_dict VALUES (1,'A'),(2,'B')"))
+        conn.execute(text("INSERT INTO cl_info VALUES (10,1,'x'),(11,2,'y')"))
+        conn.execute(text("INSERT INTO tr_data VALUES (100,10,7,5.0),(101,11,8,6.0)"))
+        conn.execute(text("INSERT INTO prod_dict VALUES (7,'p'),(8,'q')"))
+    eng.dispose()
+    store = db_sources.DataSourceStore()
+    cid = store.create_connection(
+        {"name": "CHAIN", "db_type": "sqlite",
+         "url_override": f"sqlite+pysqlite:///{db}"}, "pw", actor=ADMIN)["id"]
+    cd_tid = store.upsert_table({
+        "connection_id": cid, "schema": "", "table_name": "city_dict",
+        "display_name": "city dict", "description": "",
+        "columns": [{"name": "city_code", "pk": True}, {"name": "city_name"}],
+        "is_connector": True, "relations": [],
+        "descriptions_confirmed_by": ADMIN,
+        "descriptions_confirmed_at": "2026-08-01T00:00:00+00:00",
+    }, actor=ADMIN)["id"]
+    pd.DataFrame({"city_code": [1, 2], "city_name": ["A", "B"]}).to_parquet(
+        local_store.db_snapshot_path(cd_tid))
+    return {"cid": cid, "city_dict": cd_tid, "db": db}
+
+
+def _accept_rec_by_table(client, table):
+    rec = next(r for r in _recs() if r["table"] == table)
+    r = client.post("/api/admin/relations/recommendations/accept",
+                    json={"id": rec["id"]})
+    assert r.status_code == 200 and r.json()["ok"] is True, r.json()
+    return r.json()
+
+
+def _assert_candidates_reference_real_columns(cands):
+    store = db_sources.DataSourceStore()
+    for c in cands:
+        child = store.get_table(c["table_id"])
+        parent = store.get_table(c["related_table_id"])
+        ccols = {x["name"] for x in child["columns"]}
+        pcols = {x["name"] for x in parent["columns"]}
+        for a, b in c["join_keys"]:
+            assert a in ccols, (c["table_label"], a)
+            assert b in pcols, (c["related_label"], b)
+
+
+@pytest.mark.parametrize("order", [("cl_info", "tr_data"), ("tr_data", "cl_info")])
+def test_user_scenario_chain_no_bogus_candidates_both_orders(
+        client, chain_setup, monkeypatch, order):
+    """The EXACT reported scenario: analyze the 6-statement set with three
+    unregistered chained tables, accept sequentially in both orders — every
+    replayed candidate must reference only real columns and accept cleanly;
+    the round-trip also pins the shared join_keys contract."""
+    _stub_autofill(monkeypatch)
+    data = client.post("/api/admin/relations/analyze_sql",
+                       json={"sql": CHAIN_SQL, "db_type": "sqlite"}).json()
+    assert data["ok"] is True
+    assert data["stats"]["invalid_column_refs"] == []
+    assert {r["table"] for r in _recs()} == {"cl_info", "tr_data", "prod_dict"}
+
+    all_cands = []
+    for table in order:
+        res = _accept_rec_by_table(client, table)
+        all_cands.extend(res["candidates"])
+        assert res["evidence_warnings"] == []
+    # A final scan replays anything the accept order left blocked.
+    scan = client.post("/api/admin/relations/scan", json={}).json()
+    assert scan["evidence_warnings"] == []
+    all_cands.extend(scan["candidates"])
+
+    _assert_candidates_reference_real_columns(all_cands)
+    # The two REAL relations are proposed...
+    pairs = {(c["table_label"], c["related_label"], tuple(map(tuple, c["join_keys"])))
+             for c in all_cands}
+    flat = {frozenset((p[0], p[1])) for p in pairs}
+    assert frozenset(("cl info", "city dict")) in flat
+    assert frozenset(("tr data", "cl info")) in flat
+    # ...and NO candidate ever pairs city_dict with tr_data (the v4 bogus).
+    assert frozenset(("city dict", "tr data")) not in flat
+    # Every proposed candidate ACCEPTS cleanly (dedupe by candidate_id).
+    seen = set()
+    for c in all_cands:
+        if c["candidate_id"] in seen:
+            continue
+        seen.add(c["candidate_id"])
+        r = client.post("/api/admin/relations/accept", json={"relations": [{
+            "table_id": c["table_id"], "related_table_id": c["related_table_id"],
+            "join_keys": c["join_keys"], "cardinality": c.get("cardinality"),
+            "origin": (c.get("sources") or ["sql"])[0]}]})
+        assert r.status_code == 200, r.json()
+
+
+def test_analyze_reports_wrong_registered_column_and_keeps_valid_pairs(
+        client, chain_setup):
+    """Genuinely wrong SQL against a REGISTERED table: reported at analyze
+    time with the statement identified; the statement's valid pair persists."""
+    sql = ("SELECT 1 FROM cl_info c JOIN city_dict ci "
+           "ON c.city_code = ci.city_code AND c.client_id = ci.nope_col")
+    data = client.post("/api/admin/relations/analyze_sql",
+                       json={"sql": sql, "db_type": "sqlite"}).json()
+    assert data["stats"]["invalid_column_refs"] == [
+        {"statement": 1, "table": "city dict", "column": "nope_col"}]
+    rec = next(r for r in _recs() if r["table"] == "cl_info")
+    assert rec["evidence"][0]["pairs"] == [["city_code", "city_code"]]
+
+
+def test_scan_over_corrupted_store_warns_and_never_proposes(client, fk_setup):
+    """A corrupted/stale rec (pre-validation store): its invalid pair is
+    excluded at replay and surfaced as an evidence warning — never a bogus
+    candidate. Seeded directly into the store, as a legacy release left it."""
+    store = db_sources.DataSourceStore()
+    store.upsert_recommendations([{
+        "connection_id": fk_setup["cid"], "schema": "", "table": "regions",
+        "source": "sql", "frequency": 1,
+        "evidence": [
+            {"origin": "sql",
+             "other": {"connection_id": fk_setup["cid"], "schema": "",
+                       "table": "orders"},
+             "pairs": [["region_id", "nope_col"]], "count": 1},
+            {"origin": "sql",
+             "other": {"connection_id": fk_setup["cid"], "schema": "",
+                       "table": "orders"},
+             "pairs": [["region_id", "customer_id"]], "count": 1}],
+    }], actor=ADMIN)
+    # Register regions -> the store hook flips the rec; scan then replays it.
+    rid = store.upsert_table({
+        "connection_id": fk_setup["cid"], "schema": "", "table_name": "regions",
+        "display_name": "Regions",
+        "columns": [{"name": "region_id", "pk": True}],
+        "is_connector": False, "relations": [],
+    }, actor=ADMIN)["id"]
+    pd.DataFrame({"region_id": [1, 2]}).to_parquet(local_store.db_snapshot_path(rid))
+    data = client.post("/api/admin/relations/scan", json={}).json()
+    assert {"table": "Orders", "column": "nope_col",
+            "source": "sql-evidence"} in data["evidence_warnings"]
+    for c in data["candidates"]:
+        assert "nope_col" not in str(c["join_keys"])
+    # The VALID stored pair still replays.
+    assert any(c["join_keys"] == [["region_id", "customer_id"]]
+               or c["join_keys"] == [["customer_id", "region_id"]]
+               for c in data["candidates"])
+
+
+def test_accept_rejects_unknown_column_with_readable_message(client, fk_setup):
+    base = {"table_id": fk_setup["orders"],
+            "related_table_id": fk_setup["customers"]}
+    r = client.post("/api/admin/relations/accept", json={"relations": [
+        dict(base, join_keys=[["nope", "id"]])]})
+    assert r.status_code == 400
+    assert r.json()["error"] == "Column 'nope' does not exist on 'Orders'."
+    r2 = client.post("/api/admin/relations/accept", json={"relations": [
+        dict(base, join_keys=[["customer_id", "ghost"]])]})
+    assert r2.status_code == 400
+    assert r2.json()["error"] == "Column 'ghost' does not exist on 'Customers'."
+    assert "relations[" not in r.json()["error"] + r2.json()["error"]
+
+
+def test_get_recommendations_carries_full_evidence_and_pending(client, chain_setup):
+    client.post("/api/admin/relations/analyze_sql",
+                json={"sql": CHAIN_SQL, "db_type": "sqlite"})
+    rows = client.get("/api/admin/relations/recommendations").json()["recommendations"]
+    by_tbl = {r["table"]: r for r in rows}
+    cl = by_tbl["cl_info"]
+    # Full evidence: the registered partner AND the unregistered one.
+    labels = {j["label"]: j for j in cl["joins"]}
+    assert labels["city dict"]["registered"] is True
+    assert labels["tr_data"]["registered"] is False
+    # Pending preview: blocked by cl_info itself (city_dict is registered),
+    # and by BOTH sides for the cl_info<->tr_data pair.
+    pend = {(p["left"], p["right"]): p["blocked_by"] for p in cl["pending"]}
+    assert pend[("cl_info.city_code", "city dict.city_code")] == ["cl_info"]
+    assert set(pend[("cl_info.client_id", "tr_data.client_id")]) == \
+        {"cl_info", "tr_data"}
+    assert cl["evidence_warnings"] == []

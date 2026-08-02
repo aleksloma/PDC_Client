@@ -100,6 +100,21 @@ def _label(t: dict) -> str:
     return t.get("display_name") or t.get("table_name") or t.get("id") or "?"
 
 
+def _has_column(t: dict, col: str) -> bool:
+    """Case-insensitive column-existence check against registry metadata.
+    Case-insensitive on purpose: sqlglot's qualify normalizes identifier case
+    on the happy path (lowercase on postgres, uppercase on oracle), but the
+    qualify-FALLBACK path preserves the raw SQL casing — an exact match would
+    false-flag valid pairs there, while a column absent under ANY casing is
+    absent case-insensitively. A doc with NO column metadata (legacy shapes)
+    is unvalidatable — treated like an unresolved side, never flagged."""
+    names = [str(c.get("name") or "").lower()
+             for c in (t.get("columns") or []) if c.get("name")]
+    if not names:
+        return True
+    return str(col or "").lower() in names
+
+
 def _make_candidate(child: dict, parent: dict, join_keys: list,
                     source: str, evidence) -> dict:
     jk = [[str(a), str(b)] for a, b in join_keys]
@@ -411,6 +426,68 @@ def resolve_unknown_tables(unknown: list, tables: list, connections: list) -> li
     return hints
 
 
+def validate_rec_evidence(rec: dict, tables: list) -> tuple:
+    """(clean_evidence, invalid) — replay-time column validation for stored
+    evidence, applied to every side that RESOLVES to a registration in the
+    CURRENT registry. The columns were unknowable at analyze time when the
+    table was unregistered (analysis is metadata-only by design); once they
+    are known, a pair naming a column the registration does not have is
+    dropped and reported — never a bogus candidate, never a silent drop. An
+    entry is dropped only when NO valid pairs remain; unresolvable sides stay
+    unvalidated (nothing knowable). This is also the corrupted-store guard:
+    stale/wrong evidence from any earlier release dies here, no migration.
+    Case-insensitive (same rule as analyze time); identifiers only.
+    invalid = [{"table": label, "column": col}] deduped."""
+    registered = build_registered_map(tables)
+    rconn = str(rec.get("connection_id") or "")
+    rhits = _resolve_physical(registered, rec.get("schema"), rec.get("table"))
+    if rconn:
+        rhits = [h for h in rhits if str(h.get("connection_id") or "") == rconn]
+    child = prefer_registration(rhits)
+    clean: list = []
+    invalid: list = []
+    seen: set = set()
+
+    def _bad(t: dict, col) -> None:
+        key = (_label(t), str(col))
+        if key not in seen:
+            seen.add(key)
+            invalid.append({"table": _label(t), "column": str(col)})
+
+    for ev in rec.get("evidence") or []:
+        if not isinstance(ev, dict):
+            continue
+        other = ev.get("other") or {}
+        oconn = str(other.get("connection_id") or "") or rconn
+        ohits = _resolve_physical(registered, other.get("schema"),
+                                  other.get("table"))
+        if oconn:
+            ohits = [h for h in ohits
+                     if str(h.get("connection_id") or "") == oconn]
+        parent = prefer_registration(ohits)
+        pairs_ok: list = []
+        dropped = False
+        for p in ev.get("pairs") or []:
+            if not (isinstance(p, (list, tuple)) and len(p) == 2):
+                dropped = True
+                continue
+            ok = True
+            if child is not None and not _has_column(child, p[0]):
+                _bad(child, p[0])
+                ok = False
+            if parent is not None and not _has_column(parent, p[1]):
+                _bad(parent, p[1])
+                ok = False
+            if ok:
+                pairs_ok.append([str(p[0]), str(p[1])])
+            else:
+                dropped = True
+        if not pairs_ok and (ev.get("pairs") or []):
+            continue                    # nothing valid left in this entry
+        clean.append({**ev, "pairs": pairs_ok} if dropped else ev)
+    return clean, invalid
+
+
 def recommendation_candidates(rec: dict, tables: list) -> list:
     """Relation candidates replayed from a recommendation's stored SQL
     evidence once its table is registered. SQL evidence ONLY — FK evidence is
@@ -420,7 +497,10 @@ def recommendation_candidates(rec: dict, tables: list) -> list:
     Stored pairs are anchor-column-first, so child = the recommended table;
     verification flips direction as usual if the data says otherwise. Others
     still unregistered or ambiguous are skipped — their evidence stays stored
-    until that side is registered too."""
+    until that side is registered too. v4.1: evidence passes
+    validate_rec_evidence first — pairs naming columns a now-known
+    registration lacks can never become candidates (the route surfaces them
+    as warnings)."""
     registered = build_registered_map(tables)
     rconn = str(rec.get("connection_id") or "")
     hits = _resolve_physical(registered, rec.get("schema"), rec.get("table"))
@@ -429,8 +509,9 @@ def recommendation_candidates(rec: dict, tables: list) -> list:
     child = prefer_registration(hits)
     if child is None:
         return []
+    clean, _invalid = validate_rec_evidence(rec, tables)
     out = []
-    for ev in rec.get("evidence") or []:
+    for ev in clean:
         if not isinstance(ev, dict) or ev.get("origin") != "sql":
             continue
         other = ev.get("other") or {}
@@ -457,16 +538,29 @@ def recommendation_candidates(rec: dict, tables: list) -> list:
 
 def recommendation_summary(rec: dict, tables: list) -> dict:
     """Read-time enrichment of one stored recommendation for the admin UI:
-    dynamic role (bridge = its evidence joins >= 2 DIFFERENT registered
+    dynamic role (bridge = its evidence joins >= 2 DIFFERENT REGISTERED
     physical tables in the CURRENT registry, else referenced — never stored,
-    registrations change it) plus the resolved join partners
-    [{label, cols, origins}]. Pure; identifiers only."""
+    and unregistered partners deliberately don't count: the semantic is
+    "registering it CONNECTS >= 2 registered tables"), the FULL join-partner
+    list — v4.1: unresolved partners are listed with registered:false instead
+    of being dropped, so a row is never frequency-only — the locked "pending
+    relations" preview (SQL-origin evidence only: replay never proposes FK
+    evidence, scan re-derives that live after registration), and the per-rec
+    replay-validation warnings. Evidence passes validate_rec_evidence first,
+    so invalid pairs appear in evidence_warnings, never in joins/pending.
+    Pure; identifiers only; nothing persisted."""
     registered = build_registered_map(tables)
     rconn = str(rec.get("connection_id") or "")
+    rec_phys = (f"{rec.get('schema')}.{rec.get('table')}"
+                if rec.get("schema") else str(rec.get("table") or ""))
+    rhits = _resolve_physical(registered, rec.get("schema"), rec.get("table"))
+    if rconn:
+        rhits = [h for h in rhits if str(h.get("connection_id") or "") == rconn]
+    rec_registered = prefer_registration(rhits) is not None
+    clean, invalid = validate_rec_evidence(rec, tables)
     partners: dict = {}
-    for ev in rec.get("evidence") or []:
-        if not isinstance(ev, dict):
-            continue
+    pending: list = []
+    for ev in clean:
         other = ev.get("other") or {}
         oconn = str(other.get("connection_id") or "") or rconn
         hits = _resolve_physical(registered, other.get("schema"),
@@ -475,20 +569,42 @@ def recommendation_summary(rec: dict, tables: list) -> dict:
             hits = [h for h in hits
                     if str(h.get("connection_id") or "") == oconn]
         pref = prefer_registration(hits)
-        if pref is None:
-            continue
-        p = partners.setdefault(physical_key(pref), {
-            "label": _label(pref), "cols": set(), "origins": set()})
+        oname = (f"{other.get('schema')}.{other.get('table')}"
+                 if other.get("schema") else str(other.get("table") or ""))
+        if pref is not None:
+            pkey = physical_key(pref)
+            label, is_reg = _label(pref), True
+        else:
+            pkey = ("", str(other.get("schema") or "").lower(),
+                    str(other.get("table") or "").lower())
+            label, is_reg = oname, False
+        p = partners.setdefault(pkey, {
+            "label": label, "registered": is_reg,
+            "cols": set(), "origins": set()})
         for pr in ev.get("pairs") or []:
             if isinstance(pr, (list, tuple)) and len(pr) == 2:
                 p["cols"].add(str(pr[0]))
         if ev.get("origin"):
             p["origins"].add(str(ev.get("origin")))
-    joins = [{"label": p["label"], "cols": sorted(p["cols"]),
-              "origins": sorted(p["origins"])}
+        if str(ev.get("origin") or "") != "sql":
+            continue
+        blocked = ([] if rec_registered else [rec_phys]) \
+            + ([] if is_reg else [oname])
+        if blocked:
+            for pr in ev.get("pairs") or []:
+                if isinstance(pr, (list, tuple)) and len(pr) == 2:
+                    pending.append({
+                        "left": f"{rec.get('table')}.{pr[0]}",
+                        "right": f"{label}.{pr[1]}",
+                        "blocked_by": blocked,
+                    })
+    joins = [{"label": p["label"], "registered": p["registered"],
+              "cols": sorted(p["cols"]), "origins": sorted(p["origins"])}
              for _k, p in sorted(partners.items())]
-    return {"role": "bridge" if len(partners) >= 2 else "referenced",
-            "joins": joins}
+    n_reg = sum(1 for p in partners.values() if p["registered"])
+    return {"role": "bridge" if n_reg >= 2 else "referenced",
+            "joins": joins, "pending": pending,
+            "evidence_warnings": invalid}
 
 
 def build_graph(tables: list, unregistered_refs: Optional[list] = None) -> dict:
@@ -941,13 +1057,38 @@ def extract_sql_joins(sql_text: str, tables: list,
     Predicates touching UNREGISTERED tables additionally leave identifier-only
     evidence in stats["unregistered_joins"] (name, other endpoint, column
     pairs, distinct-statement count) — the raw material for the persistent
-    "Recommended tables". Never any SQL text or literal."""
+    "Recommended tables". Never any SQL text or literal.
+
+    v4.1: any predicate side that resolves to a REGISTERED table has its
+    column validated (case-insensitively) against registry metadata — wrong
+    SQL is a first-class case, not a silent drop: the pair is skipped
+    (candidate AND evidence, valid pairs of the same statement are kept) and
+    reported in stats["invalid_column_refs"] with the statement number.
+    Predicates whose column reference cannot be resolved at all (computed
+    CTE/subquery projections, unqualified column refs) are counted in
+    stats["unresolved_predicates"] — a known limitation made visible,
+    semantics unchanged."""
     stats = {"statements": 0, "parsed": 0, "failed": 0, "non_select": 0,
              "unknown_tables": [], "unregistered_joins": [],
-             "unregistered_tables": []}
+             "unregistered_tables": [], "invalid_column_refs": [],
+             "unresolved_predicates": 0}
     unknown: set = set()
     registered = build_registered_map(tables)
+    tables_by_id = {t.get("id"): t for t in tables or [] if t.get("id")}
     schema_map = build_schema_map(tables)
+    invalid_seen: set = set()
+
+    def _record_invalid(stmt_no: int, table_label: str, column: str) -> None:
+        # Reported with the SQL-side spelling — never canonicalized.
+        key = (stmt_no, table_label, column)
+        if key in invalid_seen or len(stats["invalid_column_refs"]) >= 20:
+            return
+        invalid_seen.add(key)
+        stats["invalid_column_refs"].append(
+            {"statement": stmt_no, "table": table_label, "column": column})
+        log_with_sid("relation_discovery", "warning",
+                     f"REL_SQL_INVALID_COLUMN stmt={stmt_no} "
+                     f"table={table_label} col={column}")
     try:
         from sqlglot import exp
         from sqlglot.optimizer.qualify import qualify
@@ -967,7 +1108,9 @@ def extract_sql_joins(sql_text: str, tables: list,
     unreg_anchors: set = set()
     unreg_table_freq: Counter = Counter()   # distinct statements per TABLE
     unreg_capped = False
-    for stmt in stmts:
+    # 1-based over the ANALYZED statements — the split-salvage parse path
+    # drops unparseable chunks, so this is "Nth analyzed", not Nth pasted.
+    for stmt_no, stmt in enumerate(stmts, 1):
         if not list(stmt.find_all(exp.Select)):
             stats["non_select"] += 1
             continue
@@ -1006,7 +1149,14 @@ def extract_sql_joins(sql_text: str, tables: list,
                         continue
                     a = _resolve_column(scope, l)
                     b = _resolve_column(scope, r)
-                    if not a or not b or (a[0], a[1]) == (b[0], b[1]):
+                    if not a or not b:
+                        # Computed CTE/subquery projections and unqualified
+                        # column refs resolve to None — the predicate
+                        # contributes nothing (known limitation, counted so
+                        # the drop is at least visible).
+                        stats["unresolved_predicates"] += 1
+                        continue
+                    if (a[0], a[1]) == (b[0], b[1]):
                         continue
                     ta = _resolve_physical(registered, a[0], a[1])
                     tb = _resolve_physical(registered, b[0], b[1])
@@ -1018,6 +1168,15 @@ def extract_sql_joins(sql_text: str, tables: list,
                         # v4: keep identifier-only evidence for the missing
                         # side(s) — this is what "Recommended tables" run on.
                         for anchor, other, pair in _unreg_evidence_rows(a, b, ta, tb):
+                            # v4.1: the REGISTERED side of a mixed pair is
+                            # validatable NOW (pair[1] — anchor-first). Wrong
+                            # SQL never becomes evidence; it gets reported.
+                            reg_doc = tables_by_id.get(other.get("table_id")) \
+                                if "table_id" in other else None
+                            if reg_doc is not None and \
+                                    not _has_column(reg_doc, pair[1]):
+                                _record_invalid(stmt_no, _label(reg_doc), pair[1])
+                                continue
                             if anchor not in unreg_anchors:
                                 if len(unreg_anchors) >= UNREG_TABLE_CAP:
                                     unreg_capped = True
@@ -1036,6 +1195,16 @@ def extract_sql_joins(sql_text: str, tables: list,
                     ta0 = prefer_registration(ta)
                     tb0 = prefer_registration(tb)
                     if ta0 is None or tb0 is None or ta0["id"] == tb0["id"]:
+                        continue
+                    # v4.1: both sides registered — both columns validatable.
+                    # An invalid pair is skipped + reported; the other pairs
+                    # of a composite ON clause are kept.
+                    bad = False
+                    for t0, col in ((ta0, a[2]), (tb0, b[2])):
+                        if not _has_column(t0, col):
+                            _record_invalid(stmt_no, _label(t0), col)
+                            bad = True
+                    if bad:
                         continue
                     # Canonical endpoint order inside the group so composite
                     # pairs line up regardless of predicate orientation.

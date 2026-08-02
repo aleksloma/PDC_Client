@@ -1186,13 +1186,46 @@
     return rec.schema ? `${rec.schema}.${rec.table}` : rec.table;
   }
 
+  // Pasted-SQL evidence warnings (analyze-time invalid_column_refs and
+  // scan/accept-time evidence_warnings) — a dedicated box, deliberately NOT
+  // #relDegraded (that one is scan-owned and overwritten wholesale).
+  function _renderRelWarnings(lines) {
+    const box = $('relWarnings');
+    if (!box) return;
+    box.classList.toggle('hidden', !lines.length);
+    box.innerHTML = lines.length
+      ? '<strong>Some pasted-SQL join references don’t match the registered '
+        + 'tables</strong> — the script may be outdated or wrong; treat its '
+        + 'evidence with caution:<br>' + lines.map(esc).join('<br>')
+      : '';
+  }
+
+  function _warnLinesFromAnalyze(refs) {
+    return (refs || []).map((r) =>
+      `statement ${r.statement}: “${r.table}” has no column “${r.column}”`);
+  }
+
+  function _warnLinesFromReplay(warns) {
+    return (warns || []).map((w) =>
+      `“${w.table}” has no column “${w.column}” (stored pasted-SQL evidence)`);
+  }
+
   function _recEvidenceLine(rec) {
     const joins = (rec.joins || []).map((j) =>
-      `<strong>${esc(j.label)}</strong>${(j.cols || []).length ? ' (' + esc(j.cols.join(', ')) + ')' : ''}`);
+      `<strong>${esc(j.label)}</strong>${(j.cols || []).length ? ' (' + esc(j.cols.join(', ')) + ')' : ''}`
+      + (j.registered === false ? ' <span class="adm-rel-notreg">not registered</span>' : ''));
     const parts = [];
     if (joins.length) parts.push('joins ' + joins.join(' and '));
     if (rec.frequency > 0) parts.push(`seen in ${esc(rec.frequency)} statement(s)`);
     return parts.join(' · ') || 'referenced by your team’s SQL or foreign keys';
+  }
+
+  // Locked preview of the relations that WILL be proposed once the blocking
+  // table(s) register — rendered from stored evidence, non-interactive.
+  function _recPendingRows(rec) {
+    return (rec.pending || []).map((p) =>
+      `<span class="adm-rel-pending-row" title="Becomes a normal proposed candidate once the blocking table is registered">🔒 ${esc(p.left)} → ${esc(p.right)}`
+      + ` <span class="adm-muted">— pending: register ${esc((p.blocked_by || []).join(', '))}</span></span>`).join('');
   }
 
   function renderRelRecommended() {
@@ -1209,6 +1242,11 @@
           ? 'Joins two or more registered tables — registering it connects them'
           : 'Referenced by one registered table'}">${esc(rec.role)}</span>`,
       ].concat((rec.sources || []).map(originChip));
+      if ((rec.evidence_warnings || []).length) {
+        badges.push(`<span class="adm-chip bad" title="${esc((rec.evidence_warnings || [])
+          .map((w) => `“${w.table}” has no column “${w.column}”`).join('; '))
+          } — the pasted SQL may be outdated or wrong; these pairs are excluded">⚠ evidence</span>`);
+      }
       const actions = rec.status === 'dismissed'
         ? '<button class="adm-btn ghost small" data-act="restore">Restore</button>'
         : `<button class="adm-btn primary small" data-act="accept">✔ Accept</button>
@@ -1219,7 +1257,7 @@
       return `<div class="adm-rel-ghost-row${rec.status === 'dismissed' ? ' adm-rel-rec-dismissed' : ''}"
           data-rid="${esc(rec.id)}">
           <span><strong>${esc(_recPhysLabel(rec))}</strong> ${badges.join(' ')}<br>
-            <span class="adm-muted">${_recEvidenceLine(rec)}</span></span>
+            <span class="adm-muted">${_recEvidenceLine(rec)}</span>${_recPendingRows(rec)}</span>
           <span class="adm-rel-rec-actions">${actions}</span>
         </div>`;
     });
@@ -1277,6 +1315,7 @@
       || `Registered "${phys}" as a connector — review its proposed relations below`);
     mergeRelCandidates(r.data.candidates || []);
     renderRelCandidates();
+    _renderRelWarnings(_warnLinesFromReplay(r.data.evidence_warnings));
     loadRelRecommendations();
     loadAll();
   }
@@ -1714,6 +1753,7 @@
     // Zero-new must be judged from the RESPONSE (the merged list can retain
     // earlier SQL-derived candidates) and explained via the confirmed count.
     _renderNoNew((r.data.candidates || []).length, r.data.confirmed_count || 0);
+    _renderRelWarnings(_warnLinesFromReplay(r.data.evidence_warnings));
     loadRelRecommendations();     // scan persists fk-sourced recommendations
     renderRelCandidates();
     toast(`Scan complete — ${(r.data.candidates || []).length} candidate(s)`);
@@ -1749,6 +1789,7 @@
     // keeps names that did not become a recommendation row.
     await loadRelRecommendations();
     renderRelUnknowns(unknown, r.data.unknown_table_hints || []);
+    _renderRelWarnings(_warnLinesFromAnalyze(st.invalid_column_refs));
     if (!(r.data.candidates || []).length && unknown.length) {
       $('relNoNew').classList.add('hidden');
     } else {

@@ -669,9 +669,12 @@ def test_discover_end_to_end_excludes_declared():
 # ── v4: unregistered-join evidence (persistent recommendations) ────────────
 
 def _reg_pair():
-    """cl_info + tr_data registered on one connection; city_dict is not."""
+    """cl_info + tr_data registered on one connection; city_dict is not.
+    region_code exists on tr_data so the orientation test's mixed pair stays
+    VALID under the v4.1 registered-side column validation."""
     cl = _phys_table(TID_A, "cl_info", ["client_id", "city_code"])
-    tr = _phys_table(TID_B, "tr_data", ["client_id", "product_id", "amount"])
+    tr = _phys_table(TID_B, "tr_data",
+                     ["client_id", "product_id", "amount", "region_code"])
     return [cl, tr]
 
 
@@ -850,3 +853,175 @@ def test_build_graph_recommendation_evidence_edges():
     assert len([e for e in edges if e[2] == "fk" and gx in (e[0], e[1])]) == 1
     assert len([e for e in edges if e[:2] == (gy, gx)]) == 0
 
+
+
+# ── v4.1: wrong-SQL validation (analyze + replay) and evidence UX ──────────
+
+def test_invalid_registered_side_reported_not_persisted():
+    """BUG A shape: a wrong join names a column the REGISTERED side doesn't
+    have — the pair never becomes evidence, it is reported with the statement
+    number, and VALID pairs from the same statement survive."""
+    tables = _reg_pair()                    # tr_data has NO city_code
+    sql = ("SELECT 1 FROM shop.cl_info c JOIN shop.tr_data t "
+           "ON t.client_id = c.client_id;"
+           "SELECT 2 FROM shop.cl_info c JOIN shop.city_dict ci "
+           "ON c.city_code = ci.city_code "
+           "JOIN shop.tr_data t ON t.city_code = ci.city_code")
+    _, stats = rd.extract_sql_joins(sql, tables, "sqlite")
+    # The wrong pair (t.city_code, registered side) is reported...
+    assert stats["invalid_column_refs"] == [
+        {"statement": 2, "table": "tr data", "column": "city_code"}]
+    # ...and produced NO evidence row whose registered partner is tr_data
+    # with a city_code pair (the invalid pair must never be born)...
+    assert not any(j["other"] == {"table_id": TID_B}
+                   and any("city_code" in p for p in j["pairs"])
+                   for j in stats["unregistered_joins"])
+    # ...while the statement's valid pair (cl_info<->city_dict) survived.
+    cl_ev = [j for j in stats["unregistered_joins"]
+             if j["name"] == "shop.city_dict"
+             and j["other"] == {"table_id": TID_A}]
+    assert cl_ev and cl_ev[0]["pairs"] == [["city_code", "city_code"]]
+
+
+def test_plausible_wrong_column_on_both_tables_stays_byte_identical():
+    """When the (wrong) column genuinely exists on both tables the pair is
+    valid to every layer — this pins that validation never over-filters; the
+    inherent limit is recorded in the v4.1 plan doc + caution wording."""
+    cl = _phys_table(TID_A, "cl_info", ["client_id", "city_code"])
+    tr = _phys_table(TID_B, "tr_data",
+                     ["client_id", "product_id", "amount", "city_code"])
+    sql = ("SELECT 1 FROM shop.city_dict ci JOIN shop.tr_data t "
+           "ON t.city_code = ci.city_code")
+    _, stats = rd.extract_sql_joins(sql, [cl, tr], "sqlite")
+    assert stats["invalid_column_refs"] == []
+    ev = [j for j in stats["unregistered_joins"]
+          if j["other"] == {"table_id": TID_B}]
+    assert ev and ev[0]["pairs"] == [["city_code", "city_code"]]
+
+
+def test_composite_on_keeps_valid_pairs_drops_invalid_one():
+    tables = _reg_pair()                    # both registered
+    sql = ("SELECT 1 FROM shop.cl_info c JOIN shop.tr_data t "
+           "ON t.client_id = c.client_id AND t.nope_col = c.city_code")
+    cands, stats = rd.extract_sql_joins(sql, tables, "sqlite")
+    assert len(cands) == 1
+    assert cands[0]["join_keys"] == [["client_id", "client_id"]]
+    assert stats["invalid_column_refs"] == [
+        {"statement": 1, "table": "tr data", "column": "nope_col"}]
+
+
+def test_column_validation_is_case_insensitive():
+    """Registry stores 'Client_ID'; qualify lowercases the SQL identifier —
+    an exact comparison would false-flag a valid pair. Case-insensitive
+    matching never flags an existing column and still catches BUG A (a
+    column absent under ANY casing)."""
+    cl = _phys_table(TID_A, "cl_info", ["Client_ID", "city_code"])
+    tr = _phys_table(TID_B, "tr_data", ["CLIENT_ID", "amount"])
+    sql = ("SELECT 1 FROM shop.cl_info c JOIN shop.tr_data t "
+           "ON t.client_id = c.client_id")
+    cands, stats = rd.extract_sql_joins(sql, [cl, tr], "sqlite")
+    assert stats["invalid_column_refs"] == []
+    assert len(cands) == 1
+
+
+def test_unresolved_predicates_counter_for_computed_cte_projection():
+    """Known limitation made visible: a join through a COMPUTED CTE
+    projection resolves to None and the predicate vanishes — v4.1 counts it
+    (additive observability, no semantic change)."""
+    tables = _reg_pair()
+    sql = ("WITH s AS (SELECT MAX(t.product_id) AS product_id "
+           "FROM shop.tr_data t) "
+           "SELECT * FROM s JOIN shop.prod_dict p "
+           "ON s.product_id = p.product_id")
+    _, stats = rd.extract_sql_joins(sql, tables, "postgres")
+    assert stats["unresolved_predicates"] >= 1
+    assert stats["unregistered_joins"] == []
+
+
+def test_validate_rec_evidence_kills_the_live_corrupted_shape():
+    """The EXACT stale rec shape found on the live store: city_dict evidence
+    naming tr_data.city_code, which tr_data does not have."""
+    cl = _phys_table(TID_A, "cl_info", ["client_id", "city_code"])
+    tr = _phys_table(TID_B, "tr_data", ["client_id", "product_id", "amount"])
+    cd = _phys_table(TID_C, "city_dict", ["city_code", "city_name"])
+    rec = {"connection_id": "conn-1", "schema": "shop", "table": "city_dict",
+           "status": "registered",
+           "evidence": [
+               {"origin": "sql",
+                "other": {"connection_id": "conn-1", "schema": "shop",
+                          "table": "cl_info"},
+                "pairs": [["city_code", "city_code"]], "count": 1},
+               {"origin": "sql",
+                "other": {"connection_id": "conn-1", "schema": "shop",
+                          "table": "tr_data"},
+                "pairs": [["city_code", "city_code"]], "count": 1},
+           ]}
+    clean, invalid = rd.validate_rec_evidence(rec, [cl, tr, cd])
+    assert invalid == [{"table": "tr data", "column": "city_code"}]
+    assert [e["other"]["table"] for e in clean] == ["cl_info"]
+    # And the replay can no longer produce the bogus candidate.
+    cands = rd.recommendation_candidates(rec, [cl, tr, cd])
+    assert [c["related_label"] for c in cands] == ["cl info"]
+
+
+def test_validate_rec_evidence_multi_pair_keeps_valid_pairs():
+    cl = _phys_table(TID_A, "cl_info", ["client_id", "city_code"])
+    cd = _phys_table(TID_B, "city_dict", ["city_code"])
+    rec = {"connection_id": "conn-1", "schema": "shop", "table": "city_dict",
+           "evidence": [{"origin": "sql",
+                         "other": {"schema": "shop", "table": "cl_info"},
+                         "pairs": [["city_code", "city_code"],
+                                   ["city_code", "nope"]], "count": 2}]}
+    clean, invalid = rd.validate_rec_evidence(rec, [cl, cd])
+    assert invalid == [{"table": "cl info", "column": "nope"}]
+    assert clean[0]["pairs"] == [["city_code", "city_code"]]
+
+
+def test_summary_lists_unregistered_partners_and_role_counts_registered_only():
+    cl = _phys_table(TID_A, "cl_info", ["client_id", "city_code"])
+    rec = {"connection_id": "conn-1", "schema": "shop", "table": "city_dict",
+           "evidence": [
+               {"origin": "sql", "other": {"schema": "shop", "table": "cl_info"},
+                "pairs": [["city_code", "city_code"]], "count": 2},
+               {"origin": "sql", "other": {"schema": "shop", "table": "tr_data"},
+                "pairs": [["city_code", "city_code"]], "count": 1},
+           ]}
+    s = rd.recommendation_summary(rec, [cl])
+    assert s["role"] == "referenced"        # 1 REGISTERED partner only
+    by_label = {j["label"]: j for j in s["joins"]}
+    assert by_label["cl info"]["registered"] is True
+    assert by_label["shop.tr_data"]["registered"] is False
+    assert by_label["shop.tr_data"]["cols"] == ["city_code"]
+
+
+def test_summary_pending_preview_sql_only_blockers_and_invalid_excluded():
+    cl = _phys_table(TID_A, "cl_info", ["client_id", "city_code"])
+    rec = {"connection_id": "conn-1", "schema": "shop", "table": "city_dict",
+           "evidence": [
+               # blocked by the rec's own unregistered table only
+               {"origin": "sql", "other": {"schema": "shop", "table": "cl_info"},
+                "pairs": [["city_code", "city_code"]], "count": 2},
+               # blocked by BOTH sides
+               {"origin": "sql", "other": {"schema": "shop", "table": "tr_data"},
+                "pairs": [["city_code", "city_code"]], "count": 1},
+               # fk evidence NEVER previews (replay never proposes it)
+               {"origin": "fk", "other": {"schema": "shop", "table": "cl_info"},
+                "pairs": [["city_code", "city_code"]], "count": 0},
+               # invalid at replay (cl_info has no 'ghost_col') -> excluded
+               {"origin": "sql", "other": {"schema": "shop", "table": "cl_info"},
+                "pairs": [["city_code", "ghost_col"]], "count": 1},
+           ]}
+    s = rd.recommendation_summary(rec, [cl])
+    assert s["evidence_warnings"] == [{"table": "cl info", "column": "ghost_col"}]
+    pend = s["pending"]
+    assert {"left": "city_dict.city_code", "right": "cl info.city_code",
+            "blocked_by": ["shop.city_dict"]} in pend
+    assert {"left": "city_dict.city_code", "right": "shop.tr_data.city_code",
+            "blocked_by": ["shop.city_dict", "shop.tr_data"]} in pend
+    assert len(pend) == 2                   # fk + invalid excluded
+    # Once the rec's table registers, its still-blocked pairs remain pending
+    # only for the unregistered partner.
+    cd = _phys_table(TID_C, "city_dict", ["city_code", "city_name"])
+    s2 = rd.recommendation_summary(rec, [cl, cd])
+    assert all(p["blocked_by"] == ["shop.tr_data"] for p in s2["pending"])
+    assert len(s2["pending"]) == 1
