@@ -682,6 +682,55 @@ def classify_table_type(columns: list) -> dict:
         return fallback
 
 
+def edge_label(join_keys: list, fallback: str = "") -> str:
+    """The join columns as an ER edge caption — columns ONLY, no cardinality
+    (that is read off the line-end markers instead of a fused, rotated
+    string that used to truncate). A pair of identically-named columns
+    prints once: `city_code`, not `city_code = city_code`.
+
+    Never raises (Article IV): anything unusable degrades to `fallback` (the
+    edge's own keys_label, e.g. the "FK"/"SQL" captions ghost evidence
+    edges carry)."""
+    try:
+        parts = []
+        for pair in join_keys or []:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                continue
+            a, b = str(pair[0]), str(pair[1])
+            parts.append(a if a == b else f"{a} = {b}")
+        return ", ".join(parts) or str(fallback or "")
+    except Exception:
+        return str(fallback or "")
+
+
+def edge_end_markers(cardinality) -> tuple:
+    """ER end markers for one edge: (source_marker, target_marker), each
+    "one" | "many" | None.
+
+    Graph edges run child → parent and `cardinality` reads child:parent, so
+    "N:1" puts the many end at the SOURCE. Unknown/absent cardinality (every
+    ghost edge) yields (None, None) — a plain directed line, never a guess.
+
+    Feeds EVERY edge, so it must never raise: a stored value that is not even
+    a string (a hand-edited registry) is simply unknown, not a 500."""
+    if not isinstance(cardinality, str):
+        return (None, None)
+    return {
+        "N:1": ("many", "one"),
+        "1:1": ("one", "one"),
+        "1:N": ("one", "many"),
+        "N:M": ("many", "many"),
+    }.get(cardinality, (None, None))
+
+
+def _er_edge_fields(join_keys: list, keys_label: str, cardinality=None) -> dict:
+    """The three additive ER-rendering keys, spread into every edge dict so
+    the four construction sites can never drift apart."""
+    src, tgt = edge_end_markers(cardinality)
+    return {"label": edge_label(join_keys, keys_label),
+            "source_marker": src, "target_marker": tgt}
+
+
 def build_graph(tables: list, unregistered_refs: Optional[list] = None) -> dict:
     """Graph-view data: registered tables as nodes, confirmed relations as
     child→parent edges, connected components (undirected BFS, deterministic),
@@ -725,16 +774,18 @@ def build_graph(tables: list, unregistered_refs: Optional[list] = None) -> dict:
             if len(jk) != len(raw_jk):
                 log_with_sid("relation_discovery", "warning",
                              f"REL_GRAPH_MALFORMED table={t['id']}")
+            keys_label = ", ".join(f"{a} = {b}" for a, b in jk)
             edges.append({
                 "id": f"rel:{t['id']}:{i}",
                 "source": t["id"], "target": parent["id"],
-                "keys_label": ", ".join(f"{a} = {b}" for a, b in jk),
+                "keys_label": keys_label,
                 "cardinality": rel.get("cardinality"),
                 "origin": rel.get("origin") or "manual",
                 "suspicious": _keys_match(physical_key(t), physical_key(parent)),
                 "ghost": False, "join_keys": jk,
                 "related_ref": str(related_ref),
                 "related_is_id": bool(rel.get("related_table_id")),
+                **_er_edge_fields(jk, keys_label, rel.get("cardinality")),
             })
             nodes[t["id"]]["relation_count"] += 1
             nodes[parent["id"]]["relation_count"] += 1
@@ -795,6 +846,7 @@ def build_graph(tables: list, unregistered_refs: Optional[list] = None) -> dict:
                     "keys_label": "FK", "cardinality": None, "origin": "fk",
                     "suspicious": False, "ghost": True, "join_keys": [],
                     "related_ref": "", "related_is_id": False,
+                    **_er_edge_fields([], "FK"),
                 })
         # Recommendation-evidence edges. Pairs are anchored ghost-column-
         # first. FK-origin evidence draws the classic child→ghost edge (with
@@ -830,14 +882,16 @@ def build_graph(tables: list, unregistered_refs: Optional[list] = None) -> dict:
                 if pref["id"] in drawn_fk:
                     continue
                 drawn_fk.add(pref["id"])
+                fk_jk = [[b, a] for a, b in pairs]
                 edges.append({
                     "id": f"ghostedge:{pref['id']}:{gid}",
                     "source": pref["id"], "target": gid,
                     "keys_label": ", ".join(f"{b} = {a}" for a, b in pairs) or "FK",
                     "cardinality": None, "origin": "fk",
                     "suspicious": False, "ghost": True,
-                    "join_keys": [[b, a] for a, b in pairs],
+                    "join_keys": fk_jk,
                     "related_ref": "", "related_is_id": False,
+                    **_er_edge_fields(fk_jk, "FK"),
                 })
                 continue
             if pref is not None:
@@ -863,6 +917,7 @@ def build_graph(tables: list, unregistered_refs: Optional[list] = None) -> dict:
                 "cardinality": None, "origin": "sql",
                 "suspicious": False, "ghost": True, "join_keys": pairs,
                 "related_ref": "", "related_is_id": False,
+                **_er_edge_fields(pairs, "SQL"),
             })
             n_ev += 1
     return {"nodes": out_nodes, "edges": edges}

@@ -1568,17 +1568,68 @@
   const REL_ISOLATED_COLOR = '#dc2626';
   const REL_GHOST_COLOR = '#94a3b8';
 
+  // ER line-end cardinality text (the server picks "one"/"many" per end).
+  const REL_END_TEXT = { one: '1', many: 'N' };
+  // Layered left-to-right: text-sized cards are wide, so ranks read as tidy
+  // columns and the mostly-horizontal edges suit the horizontal key chips.
+  const REL_DAGRE_LAYOUT = { name: 'dagre', rankDir: 'LR', nodeSep: 30,
+    rankSep: 110, edgeSep: 20, padding: 30, animate: false };
+  const REL_FALLBACK_LAYOUT = { name: 'breadthfirst', directed: true,
+    spacingFactor: 1.5, padding: 30, animate: false };
+
   let _cyLoadPromise = null;
-  function ensureCytoscape() {
-    if (window.cytoscape) return Promise.resolve();
-    if (_cyLoadPromise) return _cyLoadPromise;   // single-flight
-    _cyLoadPromise = new Promise((resolve, reject) => {
+  let _dagreOk = false;          // false -> the built-in fallback layout
+
+  function relLayoutConfig() {
+    return _dagreOk ? REL_DAGRE_LAYOUT : REL_FALLBACK_LAYOUT;
+  }
+
+  function _runRelLayout() {
+    // The layered layout is an enhancement; a throw inside it must never
+    // leave the admin staring at an unlaid-out pile (Article IV).
+    try {
+      cyInstance.layout(relLayoutConfig()).run();
+    } catch (e) {
+      console.warn('REL_GRAPH layout failed — breadthfirst fallback', e);
+      _dagreOk = false;
+      cyInstance.layout(REL_FALLBACK_LAYOUT).run();
+    }
+  }
+
+  function _loadScript(src) {
+    return new Promise((resolve, reject) => {
       const s = document.createElement('script');
-      s.src = '/static/vendor/cytoscape/cytoscape.min.js';
+      s.src = src;
       s.onload = resolve;
-      s.onerror = () => { _cyLoadPromise = null; reject(new Error('cytoscape load failed')); };
+      s.onerror = () => reject(new Error(`load failed: ${src}`));
       document.head.appendChild(s);
     });
+  }
+
+  function ensureCytoscape() {
+    if (_cyLoadPromise) return _cyLoadPromise;   // single-flight
+    _cyLoadPromise = (async () => {
+      if (!window.cytoscape) {
+        // Core failure REJECTS — refreshRelGraph falls back to the list view.
+        await _loadScript('/static/vendor/cytoscape/cytoscape.min.js');
+      }
+      // The layered layout is an ENHANCEMENT: losing it must never cost the
+      // admin the graph (Article IV), so this branch never rejects. dagre
+      // first — cytoscape-dagre reads it off the global.
+      try {
+        if (!window.dagre) await _loadScript('/static/vendor/dagre/dagre.min.js');
+        if (!window.cytoscapeDagre) {
+          await _loadScript('/static/vendor/cytoscape-dagre/cytoscape-dagre.js');
+        }
+        window.cytoscape.use(window.cytoscapeDagre);
+        _dagreOk = true;
+      } catch (e) {
+        // Deliberately sticky for the session: the resolved promise stays
+        // cached, so a missing extension is not re-requested on every toggle.
+        // A page reload retries it; the fallback layout works meanwhile.
+        console.warn('REL_GRAPH dagre unavailable — falling back to breadthfirst', e);
+      }
+    })().catch((e) => { _cyLoadPromise = null; throw e; });
     return _cyLoadPromise;
   }
 
@@ -1616,19 +1667,29 @@
     $('relGraphPopover').classList.add('hidden');
   }
 
+  function _relGraphZoom(factor) {
+    if (!cyInstance) return;
+    _hideGraphPopover();
+    const box = $('relGraph').getBoundingClientRect();
+    // Zoom about the viewport centre so the diagram stays put.
+    cyInstance.zoom({ level: cyInstance.zoom() * factor,
+      renderedPosition: { x: box.width / 2, y: box.height / 2 } });
+  }
+
   function renderRelGraph(nodes, edges) {
     if (cyInstance) { cyInstance.destroy(); cyInstance = null; }
     _hideGraphPopover();
     const elements = [];
     nodes.forEach((n) => {
-      const color = n.ghost ? REL_GHOST_COLOR
+      // The cluster color is an ACCENT (border), never a fill — a solid fill
+      // made every table in a single-cluster registry one identical blob.
+      const accent = n.ghost ? REL_GHOST_COLOR
         : n.isolated ? REL_ISOLATED_COLOR
         : REL_COMPONENT_COLORS[(n.component || 0) % REL_COMPONENT_COLORS.length];
       elements.push({ data: {
         id: n.id,
         display: n.label + (n.connector ? ' ⚙' : '') + '\n' + (n.sub || ''),
-        color,
-        size: 34 + Math.min(26, (n.relation_count || 0) * 6),
+        accent,
         connector: n.connector ? 1 : 0,
         ghost: n.ghost ? 1 : 0,
         isolated: n.isolated ? 1 : 0,
@@ -1637,12 +1698,19 @@
       } });
     });
     edges.forEach((e) => {
+      // Cardinality is read off the LINE ENDS (ER convention). The server
+      // decides the markers; here they only become cytoscape properties.
+      // A "one" end fuses the bar into the direction arrow (triangle-tee).
       elements.push({ data: {
         id: e.id, source: e.source, target: e.target,
-        elabel: (e.keys_label || '')
-          + (e.cardinality ? ` · ${REL_CARD_LABEL[e.cardinality] || e.cardinality}` : ''),
+        elabel: e.label || e.keys_label || '',
+        srcLabel: REL_END_TEXT[e.source_marker] || '',
+        tgtLabel: e.target_marker === 'many' ? REL_END_TEXT.many : '',
+        tgtArrow: e.target_marker === 'one' ? 'triangle-tee' : 'triangle',
         ghost: e.ghost ? 1 : 0,
         suspicious: e.suspicious ? 1 : 0,
+        // Everything below feeds the click popover's Edit/Delete — carried
+        // forward verbatim.
         keys_label: e.keys_label || '', cardinality: e.cardinality || '',
         origin: e.origin || 'manual', join_keys: e.join_keys || [],
         related_ref: e.related_ref || '', related_is_id: e.related_is_id ? 1 : 0,
@@ -1651,26 +1719,40 @@
     cyInstance = cytoscape({
       container: $('relGraph'),
       elements,
+      minZoom: 0.2,
+      maxZoom: 2.5,
       style: [
+        // Table CARD: name + schema.table inside the box, sized to the text.
         { selector: 'node', style: {
-          label: 'data(display)', 'text-wrap': 'wrap', 'text-valign': 'bottom',
-          'text-margin-y': 6, 'font-size': 10, color: '#334155',
-          width: 'data(size)', height: 'data(size)',
-          'background-color': 'data(color)',
+          shape: 'round-rectangle',
+          width: 'label', height: 'label', padding: '10px',
+          label: 'data(display)', 'text-wrap': 'wrap',
+          'text-valign': 'center', 'text-halign': 'center',
+          'font-size': 11, color: '#1e293b',
+          'background-color': '#ffffff',
+          'border-width': 2, 'border-color': 'data(accent)',
         } },
         { selector: 'node[connector = 1]', style: {
-          shape: 'round-rectangle', 'border-width': 3, 'border-color': '#0f172a',
+          'border-style': 'double', 'border-width': 4,   // double needs >= 3
         } },
         { selector: 'node[ghost = 1]', style: {
-          'background-opacity': 0.15, 'border-width': 2,
-          'border-style': 'dashed', 'border-color': REL_GHOST_COLOR,
+          'border-style': 'dashed', color: '#64748b',
+          'background-color': '#f8fafc',
         } },
         { selector: 'edge', style: {
           'curve-style': 'bezier', width: 2, 'line-color': '#94a3b8',
-          'target-arrow-shape': 'triangle', 'target-arrow-color': '#94a3b8',
-          label: 'data(elabel)', 'font-size': 9, color: '#64748b',
-          'text-rotation': 'autorotate', 'text-background-color': '#fff',
-          'text-background-opacity': 0.85, 'text-background-padding': 2,
+          'target-arrow-shape': 'data(tgtArrow)', 'target-arrow-color': '#94a3b8',
+          // Join COLUMNS only, horizontal, on a chip — the old rotated
+          // "columns · cardinality" string truncated and was unreadable.
+          label: 'data(elabel)', 'font-size': 10, color: '#475569',
+          'text-rotation': 'none',
+          'text-background-color': '#fff', 'text-background-opacity': 0.9,
+          'text-background-padding': 3,
+          'text-background-shape': 'round-rectangle',
+          'source-label': 'data(srcLabel)', 'target-label': 'data(tgtLabel)',
+          'source-text-offset': 20, 'target-text-offset': 24,
+          'source-text-margin-y': -8, 'target-text-margin-y': -8,
+          'font-weight': 'bold',
         } },
         { selector: 'edge[ghost = 1]', style: { 'line-style': 'dashed' } },
         { selector: 'edge[suspicious = 1]', style: {
@@ -1679,7 +1761,12 @@
         } },
         { selector: '.dim', style: { opacity: 0.15 } },
       ],
-      layout: { name: 'cose', animate: false, padding: 30 },
+      // A REAL layout must run during construction: `preset` with no
+      // positions parks every element at (0,0), and the renderer caches that
+      // degenerate state — nodes and edges then stay unpainted even after a
+      // later layout assigns real positions. `grid` is built-in and cannot
+      // throw, so the guarded layered layout below can safely replace it.
+      layout: { name: 'grid' },
     });
 
     cyInstance.on('tap', (evt) => {
@@ -1688,6 +1775,10 @@
         _hideGraphPopover();
       }
     });
+    // The popover is placed in card coordinates, so it would drift away from
+    // its element on pan/zoom/drag. Hiding it is the honest fix.
+    cyInstance.on('pan zoom', _hideGraphPopover);
+    cyInstance.on('drag', 'node', _hideGraphPopover);
     cyInstance.on('tap', 'node', (evt) => {
       const n = evt.target;
       _hideGraphPopover();
@@ -1739,11 +1830,18 @@
     });
 
     $('relGraphLegend').innerHTML = `
-      <span class="lg"><span class="sw" style="background:${REL_COMPONENT_COLORS[0]}"></span> cluster (one color per group of joined tables)</span>
-      <span class="lg"><span class="sw" style="background:${REL_ISOLATED_COLOR}"></span> not joined to any table — the AI cannot combine it</span>
-      <span class="lg"><span class="sw" style="border:2px solid #0f172a; background:#fff"></span> ⚙ connector table</span>
-      <span class="lg"><span class="sw" style="border:2px dashed ${REL_GHOST_COLOR}; background:#fff"></span> referenced but not registered (click to register)</span>
-      <span class="lg">— arrow points child → parent; dashed red = same physical table</span>`;
+      <span class="lg"><span class="sw" style="border:2px solid ${REL_COMPONENT_COLORS[0]}"></span> table card — border color = its cluster of joined tables</span>
+      <span class="lg"><span class="sw" style="border:2px solid ${REL_ISOLATED_COLOR}"></span> not joined to any table — the AI cannot combine it</span>
+      <span class="lg"><span class="sw" style="border:3px double #0f172a"></span> ⚙ connector table</span>
+      <span class="lg"><span class="sw" style="border:2px dashed ${REL_GHOST_COLOR}; background:#f8fafc"></span> referenced but not registered (click to register)</span>
+      <span class="lg">line ends = cardinality: <strong>N</strong> = many, a <strong>bar across the arrow</strong> (or <strong>1</strong>) = exactly one; no marks = not measured</span>
+      <span class="lg">→ points child → parent · the label on the line = the join columns</span>
+      <span class="lg">dashed red line = joins a table to its own duplicate registration</span>`;
+
+    // Last: the constructor's grid layout already painted a valid state, so
+    // if the layered layout AND its fallback both fail, the admin is left
+    // with a wired, clickable graph and its legend — not a bare canvas.
+    _runRelLayout();
   }
 
   function _showGraphPopover(pos, html) {
@@ -2241,6 +2339,12 @@
     $('btnRelAddManual').addEventListener('click', relOverviewAdd);
     $('btnRelViewList').addEventListener('click', () => setRelView('list'));
     $('btnRelViewGraph').addEventListener('click', () => setRelView('graph'));
+    // Wired once; the buttons outlive every cy instance (destroy/recreate).
+    $('btnRelGraphZoomIn').addEventListener('click', () => _relGraphZoom(1.25));
+    $('btnRelGraphZoomOut').addEventListener('click', () => _relGraphZoom(1 / 1.25));
+    $('btnRelGraphFit').addEventListener('click', () => {
+      if (cyInstance) { _hideGraphPopover(); cyInstance.fit(undefined, 30); }
+    });
 
     $('btnSaveSchedule').addEventListener('click', saveSchedule);
     $('btnReloadAudit').addEventListener('click', loadAudit);

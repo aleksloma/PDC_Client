@@ -1160,3 +1160,102 @@ def test_classify_unseparated_name_still_matches_by_suffix():
         {"name": "CityCode", "dtype": "VARCHAR(8)", "py_type": "str"},
     ])
     assert r["suggested_type"] == "connector"
+
+
+# ---------------------------------------------------------------------------
+# v4.3 — ER edge captions + line-end cardinality markers
+# ---------------------------------------------------------------------------
+
+def test_edge_label_collapses_a_same_name_pair():
+    """The ER caption names the join column once — `city_code`, not the
+    `city_code = city_code` echo the list view spells out."""
+    assert rd.edge_label([["city_code", "city_code"]]) == "city_code"
+
+
+def test_edge_label_keeps_differing_names_and_joins_composites():
+    assert rd.edge_label([["cust_id", "id"]]) == "cust_id = id"
+    assert rd.edge_label([["cust_id", "id"], ["region", "region"]]) \
+        == "cust_id = id, region"
+
+
+def test_edge_label_falls_back_when_there_are_no_usable_pairs():
+    """Ghost evidence edges carry no join_keys — their keys_label caption
+    ("FK"/"SQL") is the fallback."""
+    assert rd.edge_label([], "FK") == "FK"
+    assert rd.edge_label(None, "SQL") == "SQL"
+    assert rd.edge_label([["only-one-item"], "garbage", None], "FK") == "FK"
+    assert rd.edge_label([]) == ""
+
+
+def test_edge_label_never_raises_on_unusable_input():
+    assert rd.edge_label("not-a-list", "FK") == "FK"
+    # Non-string column names are str()-coerced into a normal pair caption.
+    assert " = " in rd.edge_label([[object(), object()]], "FK")
+
+
+def test_edge_end_markers_survives_a_non_string_cardinality():
+    """Feeds EVERY edge: a hand-edited registry must not 500 the graph."""
+    for junk in (["N:1"], {"a": 1}, 7, object()):
+        assert rd.edge_end_markers(junk) == (None, None)
+
+
+def test_build_graph_survives_a_corrupted_cardinality():
+    a = _phys_table(TID_A, "orders", ["city_code"], display="Orders",
+                    relations=[{"related_table_id": TID_B,
+                                "join_keys": [["city_code", "city_code"]],
+                                "origin": "fk", "cardinality": ["N:1"]}])
+    b = _phys_table(TID_B, "city_dict", ["city_code"], display="Cities")
+    g = rd.build_graph([a, b])
+    assert len(g["edges"]) == 1
+    assert (g["edges"][0]["source_marker"],
+            g["edges"][0]["target_marker"]) == (None, None)
+
+
+@pytest.mark.parametrize("card,expected", [
+    # source is the CHILD and cardinality reads child:parent
+    ("N:1", ("many", "one")),
+    ("1:1", ("one", "one")),
+    ("1:N", ("one", "many")),
+    ("N:M", ("many", "many")),
+    (None, (None, None)),          # unverified relation -> plain line
+    ("", (None, None)),
+    ("bogus", (None, None)),
+])
+def test_edge_end_markers_mapping(card, expected):
+    assert rd.edge_end_markers(card) == expected
+
+
+def test_build_graph_edges_carry_label_and_markers():
+    """The renderer reads these instead of fusing a rotated caption itself."""
+    g = rd.build_graph(_graph_tables())
+    e = g["edges"][0]
+    assert e["label"] == "city_code"
+    assert (e["source_marker"], e["target_marker"]) == ("many", "one")
+    # The frozen keys_label is untouched — additive fields only.
+    assert e["keys_label"] == "city_code = city_code"
+
+
+def test_build_graph_ghost_edges_have_captions_but_no_markers():
+    """Ghost evidence is never measured, so it must not imply a cardinality."""
+    tables = _graph_tables()
+    refs = [{"connection_id": "conn-1", "schema": "shop", "table": "x_dict",
+             "referenced_by": ["orders"], "referenced_by_ids": [TID_A]}]
+    g = rd.build_graph(tables, refs)
+    ghosts = [e for e in g["edges"] if e["ghost"]]
+    assert ghosts and all(
+        e["source_marker"] is None and e["target_marker"] is None
+        for e in ghosts)
+    assert ghosts[0]["label"] == "FK"
+
+
+def test_build_graph_composite_relation_label():
+    a = _phys_table(TID_A, "orders", ["cust_id", "region"], display="Orders",
+                    relations=[{"related_table_id": TID_B,
+                                "join_keys": [["cust_id", "id"],
+                                              ["region", "region"]],
+                                "origin": "fk", "cardinality": "1:N"}])
+    b = _phys_table(TID_B, "customers", ["id", "region"], display="Customers")
+    g = rd.build_graph([a, b])
+    e = g["edges"][0]
+    assert e["label"] == "cust_id = id, region"
+    assert (e["source_marker"], e["target_marker"]) == ("one", "many")

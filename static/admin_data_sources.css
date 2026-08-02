@@ -300,6 +300,10 @@ body.admin-ds-page {
 .adm-rel-viewtoggle .adm-btn:last-child { border-radius: 0 8px 8px 0; }
 .adm-rel-viewtoggle .adm-btn.active { background: #1276C2; color: #fff; }
 .adm-rel-graph-card { position: relative; margin-bottom: 16px; }
+/* The group floats right as ONE unit — the subhead's generic
+   `.adm-btn { margin-left:auto }` would otherwise scatter the three. */
+.adm-rel-graph-tools { display: flex; gap: 6px; margin-left: auto; }
+.adm-rel-graph-tools .adm-btn { margin-left: 0; }
 .adm-rel-graph { width: 100%; height: 62vh; min-height: 380px; }
 .adm-rel-legend {
   display: flex; gap: 14px; flex-wrap: wrap; align-items: center;

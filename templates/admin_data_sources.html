@@ -146,7 +146,17 @@
 
         <!-- Graph view of the confirmed relations (toggled with the List) -->
         <div id="relGraphCard" class="adm-card adm-rel-graph-card hidden">
-          <div class="adm-subhead"><h4>Relations graph</h4></div>
+          <div class="adm-subhead">
+            <h4>Relations graph</h4>
+            <div class="adm-rel-graph-tools">
+              <button id="btnRelGraphZoomIn" class="adm-btn ghost small"
+                      title="Zoom in">＋</button>
+              <button id="btnRelGraphZoomOut" class="adm-btn ghost small"
+                      title="Zoom out">－</button>
+              <button id="btnRelGraphFit" class="adm-btn ghost small"
+                      title="Fit the whole diagram in view">⤢ Fit</button>
+            </div>
+          </div>
           <div id="relGraphLegend" class="adm-rel-legend"></div>
           <div id="relGraph" class="adm-rel-graph"></div>
           <div id="relGraphPopover" class="adm-rel-popover hidden"></div>
