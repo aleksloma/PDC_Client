@@ -202,3 +202,92 @@ Deferred (recorded, out of v3 scope): evidence upgrades for already-confirmed
 edges (frozen candidate rules); auto re-analyze after registering from an SQL
 hint; snapshot-free metadata edits; favicon 404; richer near-miss suggestions
 in validation errors.
+
+---
+
+## v4 — persistent SQL-derived table recommendations (this iteration)
+
+### Baseline findings (research pass, verified in-browser on the HEAD stack)
+
+1. **Nothing persists.** Scan ghosts (`unregistered_refs`) and SQL unknown
+   names live in page-scope JS arrays; an F5 wipes every trace, and the graph
+   can only ever show ghost nodes in the same session as a scan (the legend
+   still advertises them — mildly misleading after reload).
+2. **Join evidence is thrown away.** Predicates touching an unregistered
+   table are dropped at extraction; only the bare table name survives. After
+   registering the table the admin must re-paste the SQL to rediscover its
+   relations.
+3. **Duplicate rows.** The FK-ghost list and the SQL-unknown list do not
+   dedupe against each other — one missing table could render two rows with
+   two Register buttons (confirmed in code; both lists share row class and
+   action).
+4. **SQL hints are not existence-verified.** A typo'd table name gets a
+   Register shortcut that dead-ends in the wizard.
+
+### Design decisions
+
+- **Merged block (decision recorded per the task):** ONE persistent
+  "Recommended tables" block replaces the session FK-ghost list, absorbing
+  FK- and SQL-derived hints — one row per physical table, both source badges,
+  combined evidence. The SQL-unknown list remains ONLY for names that cannot
+  become recommendations (no resolvable connection, or no join evidence),
+  filtered against the recommendation rows so no table shows twice
+  (fixes finding 3).
+- **Storage:** additive top-level `recommendations` section in
+  `data_sources.json` (`_default_doc` + `read_doc` both updated — read_doc
+  whitelists sections). Rec doc: physical identity + status
+  (open/dismissed/registered) + `prior_status` + sources + accumulated
+  frequency + evidence entries `{origin, other (physical names, no id
+  hints), pairs (rec-table column FIRST — orientation fixed by
+  construction), count}`. Identifiers and counts ONLY; the privacy grep test
+  pins that no SQL text/literals persist.
+- **Extraction:** additive `stats["unregistered_joins"]` (per-edge,
+  per-statement-deduped) + `stats["unregistered_tables"]` (accurate distinct-
+  statement count per table) — not a return-shape change (11 test unpackings
+  pinned the 2-tuple, and the existing SQL-marker privacy test covers the new
+  keys for free). Both-sides-unknown predicates emit two anchored records.
+  Cap: 20 distinct unregistered tables per analyze (logged).
+- **Statuses & lifecycle:** a store-level reconcile hook runs inside every
+  registry mutation (upsert, delete, connection cascade): any registration
+  path flips matching recs to `registered` (remembering `prior_status`); a
+  vanished registration reverts to `prior_status` — a dismissed rec can never
+  resurrect via Accept-rollback or table deletion. Connection delete drops
+  its recs entirely.
+- **Instant Accept:** one server-side route reusing the exact existing
+  pieces — introspect → `_draft_table_descriptions` (the draft route's
+  mechanism, extracted, not forked) → `_build_table_doc` (save_table's doc
+  shape, extracted) → `upsert_table` → `refresh_one_table`. On snapshot
+  failure the registration is DELETED (rollback; unlike the wizard save,
+  which keeps it for "Refresh now" — Accept is one atomic gesture) and the
+  rec reverts to open. The UI confirm dialog is the review act; it states
+  descriptions are AI-drafted and editable later.
+- **Close the loop:** after registration the stored SQL evidence replays
+  through the NORMAL candidate pipeline (`recommendation_candidates` → the
+  same filter chain + `_verify_and_band` as analyze_sql) — instantly on
+  Accept, on the next scan for other paths. FK evidence is deliberately NOT
+  replayed: the next scan's live introspection re-derives it as ground truth
+  (and replayed candidates never carry `fk` in sources, so banding's
+  fk-auto-confirm cannot fire — proposed, never auto-confirmed).
+- **Role:** bridge/referenced computed at read time from the current
+  registry (a stored role would go stale); bridge rows first, then by
+  frequency.
+- **Graph:** the route unions server-side OPEN recs (dismissed excluded)
+  with any body-passed refs (param kept for compatibility; the frontend
+  stops sending it); recommendation evidence renders as keys-labeled dashed
+  edges (ghost→registered and ghost→ghost), FK evidence as the classic
+  child→ghost edges.
+- **Privacy wording** (SQL box, minimal + truthful): "SQL is parsed in
+  memory on this server only — the SQL text is never stored, logged, or sent
+  anywhere. Only the table and column names found in it are kept on this
+  server to recommend missing tables." Mirrored in the module/route
+  docstrings and Article VII rule 10.
+- **Typo'd tables** (finding 4, recorded): recommendations are still not
+  existence-verified at creation (that would need live DB calls inside
+  analyze). Accept's introspect surfaces a nonexistent table with a clear
+  error and the rec stays open; Dismiss is the cleanup. Deliberate.
+
+### Deferred (recorded, out of v4 scope)
+
+Existence pre-verification of recommended tables; recommendation rows for
+bare-ambiguous names (multi-connection registries); wording alignment of the
+scan button labels; favicon 404 (pre-existing).

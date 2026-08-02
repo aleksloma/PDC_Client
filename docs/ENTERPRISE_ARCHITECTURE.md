@@ -734,14 +734,49 @@ graph data is assembled by the pure `relation_discovery.build_graph` behind
 deleted target registration) are flagged in the list instead of showing raw
 ids; failed relation-accept validation is audited `ok:false`.
 
+**Relations v4 — persistent "Recommended tables".** Join evidence that used
+to be thrown away (predicates touching UNREGISTERED tables) is retained as
+identifier-only evidence and persisted in a new additive top-level
+`recommendations` section of `data_sources.json` (`_default_doc` +
+`read_doc` both know the key — read_doc whitelists sections; old docs load
+unchanged). One entry per unregistered physical table (merge by connection +
+schema + table, case-insensitive) with `status open|dismissed|registered`,
+accumulated statement frequency, and anchored evidence entries
+`{origin sql|fk, other (physical names, resolved fresh at read), pairs
+(recommended-table column FIRST — orientation fixed by construction),
+count}`. Sources are ONLY pasted-SQL joins (names resolvable to one
+connection via the hint rule) and the scan's live FK introspection — no
+schema-wide scanning. Dismiss is PERSISTENT (with restore); a store-level
+reconcile hook inside every registry mutation keeps statuses consistent:
+any registration path flips a matching rec to `registered` (remembering
+`prior_status`), a vanished registration reverts to `prior_status` (a
+dismissed rec can never resurrect), a deleted connection drops its recs.
+One-click **Accept** registers the table as a connector server-side reusing
+the existing pieces verbatim (`_draft_table_descriptions` = the draft
+route's AI mechanism; `_build_table_doc` = the wizard save's doc shape;
+`refresh_one_table` = the one snapshot path) — with STRICTER atomicity than
+the wizard save: a snapshot failure deletes the just-created registration so
+no half-registered state remains. After any registration the stored SQL
+evidence replays through the NORMAL candidate pipeline (instantly on
+Accept, next scan otherwise); FK evidence is never replayed — live
+introspection re-derives it, and replayed candidates never carry `fk`, so
+banding's fk-auto-confirm cannot fire (proposed, never auto-confirmed).
+Roles (bridge/referenced) are computed at read time from the current
+registry. The graph renders open recommendations as ghost nodes with
+evidence-labeled dashed edges; dismissed ones never render.
+
 **Security** — see AI_CONSTITUTION Article VII (rules 8–9): SELECT-only
 connector, sandbox import denylist (defense in depth — the customer's
 dedicated SELECT-only DB login is the real guarantee), encrypted credentials,
 append-only admin audit JSONL. Relation discovery adds one more invariant:
-**admin-pasted SQL is parsed in memory on this client only** — never
+**admin-pasted SQL text is parsed in memory on this client only** — never
 persisted, logged, audited, or sent to the brain; sqlglot error messages
 (they embed the SQL text) never leave the parser (exception types only), and
 snapshot verification emits aggregates only (counts/percentages, no values).
+v4 amendment (Article VII rule 10): table/column IDENTIFIERS and statement
+counts extracted from the SQL may persist locally as recommendation
+evidence — literals never survive extraction (only Column = Column
+predicates are read), and the SQL-box UI states this truthfully.
 
 **Phase 2 (later, client + brain in parallel — NOT built):** live SQL mode
 for large tables (brain writes dialect-aware aggregation SELECTs; client

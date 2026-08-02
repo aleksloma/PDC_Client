@@ -224,12 +224,16 @@ client must be closed on FastAPI lifespan shutdown.
    executes it).
 10. **Admin-pasted SQL never leaves this client.** The relation-discovery
    "Analyze SQL" box (`relation_discovery.py`) parses pasted SELECT
-   statements in memory only: the SQL text is never persisted, logged,
+   statements in memory only: the SQL TEXT is never persisted, logged,
    audited, or included in any `brain_client` payload, and sqlglot error
    messages — which embed the offending SQL — never leave the parser
    (exception TYPES only may be logged). Audit rows carry counts only.
-   Snapshot verification emits aggregates only (uniqueness, overlap %,
-   orphan counts) — never cell values.
+   Table/column IDENTIFIERS and statement counts extracted from the SQL
+   MAY persist locally (the "Recommended tables" evidence in
+   `data_sources.json`) — literals never survive extraction because only
+   Column = Column predicates are read at all, and the SQL-box UI states
+   this truthfully. Snapshot verification emits aggregates only
+   (uniqueness, overlap %, orphan counts) — never cell values.
 
 ---
 
