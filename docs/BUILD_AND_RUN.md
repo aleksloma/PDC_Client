@@ -47,8 +47,16 @@ Open `http://localhost:8080/admin/login` and sign in as `admin` /
 
 ```bash
 cd enterprise/client
-docker build -t powerdatachat-client:enterprise .
+docker build -t powerdatachat-client:enterprise \
+  --build-arg BUILD_COMMIT=$(git rev-parse --short HEAD) \
+  --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%MZ) .
 ```
+
+The two build args stamp the image: `GET /version` and the admin sidebar then
+name the exact commit running. They are optional — an unstamped image reports
+its start time instead. (`.git` is dockerignored, so the commit cannot be read
+from inside the build.) Never read the static `?v=` query parameter as a build
+marker: it is `int(time.time())` at page render, per request.
 
 The client image is heavier because it ships pandas, matplotlib, plotly,
 kaleido, scikit-learn, python-pptx — every library the user's generated

@@ -402,3 +402,158 @@ contribute no evidence.
 - The warning box is per-response (a later warning-free scan/accept clears
   it); per-rec warn chips persist the signal.
 - Evidence-line partner order follows stored-evidence order.
+
+
+---
+
+# v4.2 — time-bounded Accept, table-type classification, real build stamp
+
+## The Accept hang — what the investigation actually found
+
+**Symptom (live testing, 2026-08-02).** Accept on the `shop.city_dict`
+recommendation spun for over 60s: two spinners, no error, no timeout, the
+recommendation never resolved.
+
+**Finding 1 — the hang left NO log line, and that is the root finding.**
+Nothing on the accept path logs until a dependency RETURNS: `BRAIN_OK`,
+`DB_SNAPSHOT_OK`, `DB_INTROSPECT_FAILED` are all completion events. A request
+blocked *inside* a dependency that has not yet timed out is therefore
+invisible — the app log for the window contains no accept-related line at
+all. Post-hoc attribution was impossible (the container was recreated at
+11:17, killing any in-flight request). v4.2 adds `REC_ACCEPT_PHASE` entry
+logging so the next occurrence names its own wedged phase.
+
+**Finding 2 — only one dependency could have exceeded 60s.** Measured from
+the same log: every completed accept took draft 1.2–1.8s and snapshot
+0.02–1.4s. The test Postgres (`pdc-test-db`) was up for 20 hours across the
+window, and its connects are bounded at `DB_CONNECT_TIMEOUT` (8s). The brain
+is remote (Cloud Run) and `brain_client._post` passed **no per-call timeout**,
+so the draft rode the client-wide `BRAIN_REQUEST_TIMEOUT` — **180s**. That is
+the only unbounded-enough path, and it is the prime suspect; recorded as such
+rather than as proof.
+
+**Finding 3 — three more unbounded points, fixed while in here.**
+- `_run` has no deadline, and executor threads are not cancellable, so a hung
+  accept permanently consumes 1 of the 4 `db_admin` workers.
+- The **oracle** dialect carried no `connect_args` at all — its connect fell
+  back to the OS TCP timeout (~127s on Linux), the one dialect that could
+  outlast a click on its own.
+- The admin page's `api()` helper had no abort and a real bug: a rejected
+  `fetch` left `r` undefined, so the caller's `r.data.ok` threw a TypeError
+  and the user got **no message at all**.
+
+## Design decision — bound each dependency, not the whole gesture
+
+No `asyncio.wait_for` around `_run(_register)`. Executor threads cannot be
+cancelled: an outer deadline would report failure to the browser while the
+registration continued in the thread — precisely the half-registered state
+Accept exists to prevent. Each dependency is bounded at its own seam instead
+(httpx per-call timeout; driver connect + statement timeouts), so the worker
+thread itself can no longer hang unboundedly, and the existing snapshot
+rollback stays the single abort path.
+
+Timeout budgets: `BRAIN_DRAFT_TIMEOUT` 60s (new, env-tunable) for the draft
+only — upload autofill keeps the 180s default, unchanged. Client-side:
+15s on the classify probe, a "still working" message at 20s, and a 390s hard
+abort (60s draft + 300s statement + margin). Aborting only ends OUR wait, so
+that toast says the server may still finish and the list is refetched rather
+than asserting failure.
+
+Timeout-shaped driver errors become one sentence ("Database connection timed
+out." / "Database snapshot timed out.") via `_friendly_db_error`, which walks
+the whole `__cause__`/`__context__` chain because each of the five drivers
+words it differently (psycopg2 "timeout expired", pyodbc `HYT00`, oracledb
+`DPY-6005`, …). Anything not timeout-shaped keeps its scrubbed driver text —
+no error is ever replaced by a guess, and a wrong password can never be
+reported as a timeout.
+
+## Table-type classification — why it is deterministic, not AI
+
+One-click Accept hard-coded `is_connector=True`. That is right for a pure
+junction table and wrong for a content table like `prod_dict`
+(`product_name`, `category`): registering it as a connector hides it from the
+user picker entirely.
+
+**Investigated first, per the task: the AI route is not available from this
+repo.** The schema-autofill prompt is built entirely brain-side
+(`PDC_Brain/routes/llm.py:_build_combined_autofill_prompt`), the brain's
+response parser hard-drops any key outside `file_description`/`columns`, and
+no generic completion endpoint exists on the `/v1` surface. The only
+free-form field the client sends (`notes_text`) reaches the prompt but cannot
+widen the response contract. An AI-suggested `{suggested_type, reason}`
+therefore **requires a brain-side change**, which this task forbids — so v4.2
+ships the deterministic client-side classifier and the AI version stays
+commissionable separately.
+
+`relation_discovery.classify_table_type(columns)` — pure, never raises:
+a column is key-like when its NAME equals/ends with `id|code|key|no|num`
+**and** its dtype is an integer family or a varchar of ≤32 chars. Both halves
+are required: `VARCHAR(4000) note_code` is free text, `INTEGER amount` is a
+measure. Every column key-like → `connector`; otherwise `normal` with the
+deciding columns named. Empty/odd input → `connector` with "could not
+classify — defaulted to connector". Deliberately does NOT consult PK/FK/row
+count (a richer signal set is a future option, not this change).
+
+The suggestion is never applied by itself. The native `window.confirm` is
+replaced by an in-page dialog (the existing narrow-modal chrome) that states
+the descriptions are AI-drafted and carries the Connector/Normal choice
+defaulted to the suggestion with its one-line reason; a manual pick wins over
+a suggestion that lands afterwards; the Register button is never gated on the
+probe. "Edit first" pre-ticks the wizard from the same suggestion (served
+additively by `tables/introspect`, no extra round-trip) instead of assuming
+connector. The audit row records `suggested_type` AND `chosen_type`, so a bad
+suggestion is distinguishable from a deliberate admin choice.
+
+## Build stamp
+
+The static `?v=` parameter is `int(time.time())` computed per request at page
+render. It looks like a build marker and is not one — it sent build
+verification down the wrong path twice. `GET /version` +
+`{{ build_stamp }}` in the admin sidebar now report the real thing, fed by
+`BUILD_COMMIT`/`BUILD_TIME` Docker build args (`.git` is dockerignored, so
+the commit can only come from the builder). An unstamped image reports its
+process start time rather than faking an identity. The `?v=` behavior is
+unchanged; the old hardcoded `CLIENT_BUILD marker=` startup log now carries
+the same commit/time.
+
+Verification workflow going forward: check `GET /version` after a rebuild —
+not file hashes.
+
+## Deferrals / known limits (v4.2)
+
+- The classifier reads names + dtypes only. `INTEGER amount` on an
+  all-numeric fact table can still read as connector-ish only if it is also
+  named like a key; PK/FK/row-count signals are deliberately unused.
+- `suggested_type` is trusted from the dialog for the audit row (enum-
+  validated). Recomputing it server-side would cost a second introspection
+  and cannot change the registration.
+- The 390s client abort ends the wait, not the server's work; the toast says
+  so explicitly.
+- The oracle connect bound ships tested at the dict level only (kwarg
+  `tcp_connect_timeout` verified against the pinned oracledb 2.5.1 in the
+  running image; no Oracle instance exists in the local stack).
+- Blocking store reads still run on the event loop at two spots in the accept
+  route (`list_tables` before and after `_register`) — pre-existing, out of
+  scope.
+- The classify probe costs one live introspection on the 4-worker
+  `_DB_EXEC` pool. Mitigated, not eliminated: the browser caches a
+  successful classification per recommendation for the session (a failure is
+  never cached — the next open retries), so repeated dialog opens cost
+  nothing. Against a slow database, several *first* opens can still occupy
+  workers; the abort ends the wait, not the thread.
+- `_TIMEOUT_PAT` is anchored on timeout PHRASES rather than the bare word,
+  because postgres embeds `statement_timeout=…` in every DSN and an
+  unrelated connect error echoing it would otherwise be relabelled a
+  timeout (a regression test pins exactly that string). Oracle's `DPY-6005`
+  is deliberately NOT treated as a timeout — it is the generic "cannot
+  connect" (listener down, refused, bad DNS). A driver phrasing the list
+  misses simply keeps its scrubbed driver text, which is still truthful.
+- Key-suffix matching requires a whole TOKEN when the column name is
+  separated (`is_valid` is a flag, not a key) and falls back to a plain
+  suffix test for unseparated names (`clientid`). An unseparated flag name
+  can still read as key-like — the admin sees the reason and can flip it.
+- The register wizard's draft banner claims "Only column names and types were
+  shared with the AI, never row values", but `_draft_table_descriptions`
+  sends the same truncated sampled values file uploads do (documented,
+  deliberate parity). The wording is inaccurate and should be corrected in a
+  separate change — it is not a leak, it is a labeling bug.

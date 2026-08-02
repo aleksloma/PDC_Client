@@ -21,8 +21,12 @@ but code — their users, chats, uploads, and history live on the volume.
 
 ## 2. Build an immutable tag
 ```
-docker build -t powerdatachat-client:enterprise-<git-sha-or-date> .
+docker build -t powerdatachat-client:enterprise-<git-sha-or-date> \
+  --build-arg BUILD_COMMIT=$(git rev-parse --short HEAD) \
+  --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%MZ) .
 ```
+The build args are what `GET /version` and the admin sidebar report — omit
+them and the running image can only say when it started.
 (`:enterprise` stays a local/moving tag; customers get immutable tags so
 rollback is deterministic.)
 

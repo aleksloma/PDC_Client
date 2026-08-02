@@ -486,10 +486,17 @@ dispatch routes to the clone with no fallback.
 - **The CLIENT IMAGE MUST BE REBUILT after a renderer change.** A stale
   `pdc-client` container ran the old native path and produced un-branded
   decks even though the clone code was committed — the classic "decks still
-  look un-branded" symptom is an undeployed image, not a render bug. The
-  `CLIENT_BUILD marker=` startup log lets an operator confirm the running
-  image carries the new renderer (`docker logs pdc-client | grep
-  CLIENT_BUILD`).
+  look un-branded" symptom is an undeployed image, not a render bug.
+  **Which build is running is now a first-class fact** (v4.2): `GET /version`
+  returns `{commit, build_time, started_at}`, the admin sidebar shows the same
+  one-line stamp, and the `CLIENT_BUILD` startup log carries the commit
+  (`docker logs pdc-client | grep CLIENT_BUILD`). All three are fed by the
+  `BUILD_COMMIT`/`BUILD_TIME` **Docker build args** — `.git` is dockerignored,
+  so the commit can only arrive from the builder; an unstamped image reports
+  its process start time instead of faking an identity. **Never read the
+  static `?v=` query parameter as a build marker**: it is `int(time.time())`
+  computed per request at page render, and mistaking it for one has sent
+  release verification down the wrong path twice.
 - **A `replace:*` label can target a shape OFF-CANVAS, OVER A LOGO, or a
   blank full-bleed rectangle on a logo-only cover** (the analyzer backstop
   — or the LLM — mislabeling decorative geometry; the real Time template
@@ -793,6 +800,30 @@ the relations that will be proposed once the blocking tables register
 (SQL-origin evidence only; identifiers only, computed at read time, nothing
 new persisted); accepting the blocker turns them into normal candidates via
 the same validated replay — one pipeline, no fork.
+
+**Relations v4.2 — time-bounded Accept + table-type choice.** Accept is one
+interactive click, so every dependency it touches is bounded at its OWN seam
+(root causes in docs/RELATIONS_UX_PLAN.md § v4.2): the AI draft carries
+`BRAIN_DRAFT_TIMEOUT` (60s, env-tunable) instead of riding the 180s
+client-wide default, and timeout-shaped driver errors become one sentence
+naming the database. Deliberately NOT an `asyncio.wait_for` around the whole
+gesture: executor threads cannot be cancelled, so an outer deadline would
+report failure while the registration continued in the thread — exactly the
+half-registered state the snapshot rollback exists to prevent. `REC_ACCEPT_PHASE`
+logs on ENTRY to each phase, because the original hang produced no log line
+at all (every dependency logged only on return, so a wedged request was
+invisible). The browser caps its own wait too, and says honestly that an
+aborted wait does not stop the server.
+**Table type is suggested, never assumed.** Accept used to hard-code
+`is_connector=True`, which hides a content table like `prod_dict` from the
+user picker. `relation_discovery.classify_table_type` (pure, metadata-only:
+a column is key-like when its name ends with `id|code|key|no|num` AND its
+dtype is integer-family or a ≤32-char varchar; all key-like → connector, else
+normal naming the descriptive columns) feeds a dialog default the admin
+confirms or flips; the audit row keeps both `suggested_type` and
+`chosen_type`. It is deterministic rather than AI because the schema-autofill
+prompt lives brain-side and that repo is out of scope for this change — an
+AI-suggested type is a separate, brain-side commission.
 
 **Security** — see AI_CONSTITUTION Article VII (rules 8–9): SELECT-only
 connector, sandbox import denylist (defense in depth — the customer's

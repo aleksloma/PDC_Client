@@ -87,6 +87,13 @@ gcloud builds submit . --project=pdc-enterprise \
 
 Use the short git SHA as an immutable tag (same convention as the brain).
 
+`gcloud builds submit --tag` cannot pass Docker build args, so the demo image
+ships **unstamped**: `GET /version` reports `commit: null` and the admin
+sidebar shows the container start time instead of a commit. The image tag is
+the identity here — adding a `cloudbuild.yaml` just to carry two build args
+was judged not worth it. A local `docker build` (see `docs/BUILD_AND_RUN.md`)
+does stamp the image.
+
 ## Deploy
 
 First-time deploy (full flag set):
