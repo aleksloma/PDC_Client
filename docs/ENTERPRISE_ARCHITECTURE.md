@@ -734,8 +734,9 @@ cannot combine it with others"), edges = confirmed relations labeled with
 join keys + cardinality (same-physical noise in warning style, dangling refs
 skipped), dashed ghost nodes for the unregistered FK refs, edge popover with
 Edit (hands off to the list's structured editor) and Delete. Rendering uses
-**vendored Cytoscape.js 3.34.0 (MIT license, `static/vendor/cytoscape/`
-with license sidecar)** — enterprise clients run on LANs, so no CDN ever;
+**vendored Cytoscape.js 3.34.0 + dagre 0.8.5 + cytoscape-dagre 2.5.0 (all
+MIT, under `static/vendor/` with license sidecars)** — enterprise clients
+run on LANs, so no CDN ever;
 graph data is assembled by the pure `relation_discovery.build_graph` behind
 `POST /api/admin/relations/graph` (metadata only). Dangling relations (a
 deleted target registration) are flagged in the list instead of showing raw
@@ -824,6 +825,32 @@ confirms or flips; the audit row keeps both `suggested_type` and
 `chosen_type`. It is deterministic rather than AI because the schema-autofill
 prompt lives brain-side and that repo is out of scope for this change — an
 AI-suggested type is a separate, brain-side commission.
+
+**Relations v4.3 — the graph reads as an ER diagram.** Database relations
+have an established visual language (Power BI model view, dbdiagram.io,
+DBeaver), and the force-directed original fought it: labels sat OUTSIDE
+circles and collided, one rotated mid-edge string fused join columns with
+cardinality and truncated ("city_code · ma…"), the cluster color filled the
+whole node so a single-cluster registry was a field of identical blobs.
+Now: **table CARDS** (round-rectangle, sized to the text, name + schema.table
+INSIDE), the cluster color as a border ACCENT rather than a fill, connector
+tables double-bordered with ⚙, ghosts dashed and still click-to-register,
+isolated tables keeping their red accent. **Cardinality moved to the line
+ENDS** — `N` at the many end, a bar fused into the direction arrow
+(`triangle-tee`) at the one end, nothing at all when cardinality is unknown
+(every ghost edge) — so the mid-edge chip carries the join COLUMNS only,
+horizontal and legible. The decisions are server-side and unit-tested
+(`edge_label`, `edge_end_markers` → additive `label`/`source_marker`/
+`target_marker`), which also retired the client-side
+string-fusing that produced the old rotated caption. Layout is layered left-to-right via **vendored dagre**, with the
+built-in `breadthfirst` as a fallback that engages if the extension fails to
+load OR throws at run time — the layered layout is an enhancement, and
+losing it must never cost the admin the graph (Article IV). Zoom in/out/fit
+controls were added (wheel zoom and node dragging kept), and the click
+popover now hides on pan/zoom/drag instead of drifting away from its edge.
+Honest limit: Cytoscape canvas labels take ONE font per node, so both card
+lines share a size and weight — accepted over vendoring an HTML-label
+overlay for typography alone.
 
 **Security** — see AI_CONSTITUTION Article VII (rules 8–9): SELECT-only
 connector, sandbox import denylist (defense in depth — the customer's

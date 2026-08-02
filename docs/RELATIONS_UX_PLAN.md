@@ -557,3 +557,130 @@ not file hashes.
   sends the same truncated sampled values file uploads do (documented,
   deliberate parity). The wording is inaccurate and should be corrected in a
   separate change — it is not a leak, it is a labeling bug.
+
+
+---
+
+# v4.3 — the graph reads as an ER diagram
+
+## What was wrong
+
+The v3 graph rendered generic network blobs. Live testing named five concrete
+defects:
+
+1. Nodes were solid circles with labels OUTSIDE, below them — labels collided
+   with edges and with each other.
+2. The mid-edge label fused join columns and cardinality into one rotated
+   string that truncated ("city_code · ma…").
+3. Cardinality was therefore unreadable at a glance, and the direction arrow
+   drowned in the label noise.
+4. The cluster color filled the whole circle, so a single-cluster registry —
+   the normal case — was a field of identical blue blobs, and the
+   connector/ghost distinctions were lost inside it.
+5. `cose` (force-directed) produced crossings and no hierarchy.
+
+Database relations have an established visual language (Power BI model view,
+dbdiagram.io, DBeaver, draw.io): entities as rectangular cards with the name
+INSIDE, cardinality read off markers at the LINE ENDS, layered layouts. v4.3
+adopts it. Rendering only — `build_graph`'s existing keys, every endpoint, the
+List view, the popover Edit/Delete semantics, ghost/register behavior, and the
+warning semantics are unchanged.
+
+## Cards, accents, ends
+
+- **Table cards**: round-rectangle sized to its text (`width/height: 'label'`,
+  10px padding), display name on line 1 and `schema.table` on line 2, both
+  INSIDE the box. Connector tables carry a double border + ⚙; ghosts are
+  dashed, muted, and still click-to-register.
+- **The cluster color is a border ACCENT, never a fill.** That single change
+  is what makes connector/ghost/isolated styling legible again — the fill was
+  swallowing all of it. Isolated tables keep the red accent.
+- **Cardinality moved to the line ends**: `N` text at the many end, and at the
+  "one" end the bar is fused into the direction arrow (`triangle-tee`) so one
+  glyph carries both direction and "exactly one". Unknown cardinality — which
+  is EVERY ghost edge, since evidence is never measured — renders a plain
+  directed line with no end markers at all rather than implying a guess.
+- The mid-edge chip therefore carries the join COLUMNS only, horizontal
+  (`text-rotation: none`) on a white round-rect background: `city_code`, or
+  `cust_id = id, region` for a composite. A pair of identically-named columns
+  prints once — the `city_code = city_code` echo was pure noise on a diagram.
+  Full details (cardinality wording, origin, both table names) still live in
+  the click popover, unchanged.
+
+## Where the decisions live
+
+`edge_label` and `edge_end_markers` are pure functions in
+`relation_discovery.py`, feeding three ADDITIVE edge fields (`label`,
+`source_marker`, `target_marker`) from all four edge-construction sites via
+`_er_edge_fields` — so the four sites cannot drift. This satisfies the
+unit-test mandate (rendering config is only testable in a browser; these
+decisions are testable offline) and it retired the client-side caption
+fusing that was an untested seam. (The cardinality-WORDING map stays in the
+JS — the click popover's chip still spells out "many-to-one".)
+`keys_label` and every pre-v4.3 key are untouched, which is what keeps the
+four tests that pin its exact strings green.
+
+Marker orientation is the one subtle bit: graph edges run child → parent and
+`cardinality` reads child:parent, so `N:1` puts the MANY end at the source.
+
+## Layout and controls
+
+Layered left-to-right via vendored **dagre 0.8.5 + cytoscape-dagre 2.5.0**
+(both MIT, license sidecars, `static/vendor/` — never a CDN; dagre's dist
+bundles graphlib, so no fourth script). LR was chosen over top-down because
+text-sized cards are wide: ranks become tidy vertical columns, the edges run
+mostly horizontally, and horizontal edges are what the horizontal key chips
+need. `rankSep` is 110 to leave room for those chips.
+
+**The layered layout is an enhancement, not a dependency.** A load failure of
+either extension, or a throw inside the layout at run time, falls back to the
+built-in `breadthfirst` with a console warning — the admin keeps the graph
+(Article IV). Only a failure of the Cytoscape CORE still rejects, which is the
+pre-existing "could not load the graph library" path.
+
+Added: zoom in / zoom out / Fit buttons in the graph subhead, and
+`minZoom`/`maxZoom` 0.2–2.5. Wheel zoom and node dragging are Cytoscape
+defaults and stay. The click popover is positioned in card coordinates, so it
+used to drift away from its edge when the canvas moved; it now hides on
+pan/zoom/node-drag — the honest fix, since re-anchoring it every frame buys
+nothing the popover needs.
+
+## Deferrals / honest limits
+
+- **Uniform card typography.** Cytoscape canvas labels take ONE font, size and
+  weight per node, so the two card lines cannot differ in weight/size. The
+  alternatives were vendoring an HTML-label overlay (a third library, plus
+  overlay/event and `.dim`-mirroring friction) or generating per-node SVG
+  backgrounds (DIY text metrics, blurs when zoomed). Chosen deliberately by
+  the user: keep one font, no new library.
+- Node positions are still not persisted, and every data change rebuilds the
+  instance — so a hand-arranged layout does not survive an edit. Unchanged
+  from v3 and out of scope here.
+- No export-to-image, no column-level edge anchoring (cards are table-level;
+  join columns live on the edge label and in the popover).
+- `relation_count` is no longer read by the renderer (node size was the only
+  consumer). It stays in the contract — the List view and any future consumer
+  may still want it, and removing a contract key is not additive.
+- **`width/height: 'label'` logs a deprecation warning on every render** and
+  is kept deliberately. It is what auto-sizes a card to its text using real
+  font metrics; the alternative is measuring the label ourselves, which would
+  mis-size non-Latin table names (this deployment has Georgian-speaking
+  customers). Cytoscape is vendored at a pinned 3.34.0, so the value cannot
+  disappear underneath us — an upgrade would be a deliberate act that
+  revisits this.
+
+## Caught in browser verification (recorded so it is not repeated)
+
+The first build of this rework constructed the graph with
+`layout: { name: 'preset' }`, intending the guarded layered layout to run
+immediately afterwards. With no `position` on any element, `preset` parks
+everything at (0,0) and the renderer caches that degenerate zero-area state:
+the later layout assigned correct positions, but **most cards and every edge
+were never painted** (2 of 5 cards, 0 of 6 edges on real data; 14 of 29 and
+0 of 24 on the synthetic set). Nothing in the model looked wrong —
+`ele.visible()` reported true — and the elements only appeared after an
+unrelated class mutation. The constructor now runs `grid` (built-in, cannot
+throw) so positions are always real before first paint, and the guarded dagre
+run replaces them. **A cytoscape instance must be constructed with a layout
+that actually positions its elements** — this is exactly the class of defect
+that unit tests cannot see and only a browser pass catches.
