@@ -765,6 +765,35 @@ Roles (bridge/referenced) are computed at read time from the current
 registry. The graph renders open recommendations as ghost nodes with
 evidence-labeled dashed edges; dismissed ones never render.
 
+**Relations v4.1 — evidence validation + evidence UX.** Wrong pasted SQL is
+a first-class case with visible feedback, never a silent drop and never a
+bogus candidate (root causes recorded in docs/RELATIONS_UX_PLAN.md § v4.1):
+column-existence validation runs at TWO stages, both case-insensitive
+(sqlglot's qualify normalizes identifier case on the happy path; its
+fallback preserves raw casing — exact matching would false-flag).
+At ANALYZE time, any predicate side resolving to a registered table is
+validated against registry metadata; invalid pairs are skipped (valid pairs
+of the same statement kept) and reported with the statement number
+(`stats.invalid_column_refs`). At REPLAY time — for evidence on tables that
+were unregistered at analyze time, whose columns were unknowable then
+(analysis stays metadata-only, no live DB calls) — the pure
+`validate_rec_evidence` excludes pairs the now-known registration cannot
+satisfy and surfaces them as `evidence_warnings` + a log line; this is also
+the corrupted-store guard (stale evidence from any earlier release dies at
+replay; no migration). The accept endpoint's column rejection names the
+table and the missing column instead of the v1-era fused `'a=b'` token.
+Honest limit: a wrong join naming a column that exists on BOTH tables is
+genuinely valid to every layer — mitigated by the analyze-time report and
+the "script may be outdated" caution wording. Known limitation (visible via
+`stats.unresolved_predicates`): joins through COMPUTED CTE/subquery
+projections cannot be column-resolved and contribute no evidence.
+Evidence UX: recommendation rows always render their FULL join evidence —
+unregistered partners tagged "not registered" — plus a locked 🔒 preview of
+the relations that will be proposed once the blocking tables register
+(SQL-origin evidence only; identifiers only, computed at read time, nothing
+new persisted); accepting the blocker turns them into normal candidates via
+the same validated replay — one pipeline, no fork.
+
 **Security** — see AI_CONSTITUTION Article VII (rules 8–9): SELECT-only
 connector, sandbox import denylist (defense in depth — the customer's
 dedicated SELECT-only DB login is the real guarantee), encrypted credentials,

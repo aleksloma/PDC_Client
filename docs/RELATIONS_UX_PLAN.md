@@ -291,3 +291,114 @@ in validation errors.
 Existence pre-verification of recommended tables; recommendation rows for
 bare-ambiguous names (multi-connection registries); wording alignment of the
 scan button labels; favicon 404 (pre-existing).
+
+---
+
+## v4.1 — evidence-replay bugs: root causes (recorded BEFORE fixing) + evidence UX
+
+### Reproduction method
+
+Both bugs were reproduced offline against a byte copy of the LIVE dev store
+(the state the user's session left behind), plus three discriminator SQL
+variants for the missing-evidence observation — no guesswork.
+
+### BUG A — bogus candidate "city dict.city_code → tr data.city_code"
+
+**Root cause: stale invalid evidence + a missing column-validation layer. NOT
+cross-table mis-attribution.** The live store's city_dict recommendation
+(created in an earlier session) still carried evidence
+`{origin sql, other tr_data, pairs [["city_code","city_code"]], count 1}` —
+because THAT session's pasted SQL genuinely contained the wrong join
+`t.city_code = ci.city_code` (tr_data has no city_code). v4 attribution
+followed the SQL faithfully; nothing ever crossed wires, and accept order is
+irrelevant. The defects are: (1) `recommendation_candidates` replayed stored
+evidence with NO column validation once the partner table's columns became
+known; (2) analyze time never validated even the REGISTERED side's columns.
+When the user re-registered tr_data, the scan's registered-rec replay
+resurrected the stale pair as an unverifiable candidate. Replay of the rec
+reproduced the exact bogus candidate; the user's own recs contain only
+correct client_id/city_code evidence — their SQL was right.
+**Honest limit:** when wrong SQL names a column that exists on BOTH tables,
+no validation layer can flag it (the pair is genuinely valid to every layer)
+— that case is mitigated by the analyze-time report + caution wording, and a
+byte-identical guard test pins that valid pairs are never over-filtered.
+
+### BUG B — toast "relations[0]: column 'city_code=city_code' not found"
+
+**Root cause: v1-era message formatting in the accept validation (predates
+v4; fixed where it lives).** routes/admin_data.py formatted the per-pair
+column check failure as `column '{a}={b}'` — fusing a well-formed
+[child_col, parent_col] pair into what reads as a single column token, plus
+leaking `relations[idx]` internals. There is NO serialization mismatch:
+replay-produced candidates are built by the SAME `_make_candidate`
+constructor as scan-produced ones (verified + now pinned by an
+analyze→persist→replay→accept round-trip test).
+
+### Finding — silent predicate drop for computed CTE projections
+
+The user's tr_data↔prod_dict joins left no evidence anywhere. Discriminators
+(same 5-statement base + one CTE variant each): a join INSIDE a CTE body and
+an outer join through a PLAIN-projection CTE alias both persist evidence; an
+outer join through a COMPUTED projection (`MAX(t.product_id) AS product_id`)
+silently drops the whole predicate — `_resolve_column` returns None for
+computed projections and the pair vanishes without a trace (not even into
+`unknown_tables`; `failed` stays 0). The `_persist_sql_recommendations`
+table_id branch was ruled out (dead defensive code — ids are minted and
+consumed from one tables list inside a single request; a log line was added).
+Fixing the resolution semantics is out of scope (frozen extraction
+semantics); v4.1 adds only the additive observability counter
+`stats["unresolved_predicates"]` so the drop is at least visible, and records
+this as a KNOWN LIMITATION: joins through computed CTE/subquery projections
+contribute no evidence.
+
+### v4.1 fixes (validated design)
+
+- Analyze-time validation inside extraction (where the statement index
+  lives): any predicate side resolving to a REGISTERED table has its column
+  checked (CASE-INSENSITIVELY — qualify normalizes case on the happy path
+  but the qualify-fallback preserves raw SQL casing; reporting keeps the
+  SQL-side spelling, never canonicalizes) against registry metadata. Invalid
+  → the pair is skipped (candidate AND evidence; composite ONs keep their
+  valid pairs) and reported in additive `stats["invalid_column_refs"]`
+  `[{statement (Nth ANALYZED statement), table, column}]`.
+- Replay-time validation — pure `validate_rec_evidence(rec, tables)` — for
+  evidence sides unknowable at analyze time: pairs naming columns the
+  now-known registration lacks are skipped and surfaced (warn box + log),
+  never a bogus candidate, never silent. Corrupted existing stores are
+  handled by exactly this path; no migration.
+- Accept rejection message names the table and the missing column, no list
+  internals. Semantics (400 + ok:false audit) unchanged.
+- Warnings surface: `#relWarnings` (a NEW sibling of #relDegraded — that box
+  is scan-owned and overwritten wholesale) with "the script may be outdated
+  or wrong — treat its evidence with caution" wording, fed by analyze's
+  `invalid_column_refs` and scan/accept's additive `evidence_warnings`.
+
+### v4.1 evidence UX
+
+- Recommendation rows always render FULL join evidence: unresolved partners
+  are now listed with a "not registered" tag instead of being dropped from
+  the summary (role still counts REGISTERED partners only — the bridge
+  semantic is "registering it connects ≥2 registered tables").
+- Locked "pending relations" preview INSIDE each recommendation row (data is
+  strictly per-rec; a separate block would duplicate names, need its own
+  empty state, and desync on show/hide-dismissed): SQL-origin evidence only
+  (replay never proposes FK evidence — scan re-derives it live), rows like
+  "cl_info.city_code → city dict.city_code — pending: register shop.cl_info",
+  lock glyph, muted, non-interactive; invalid-at-replay pairs excluded.
+  Rendered from stored evidence at read time — identifiers only, nothing new
+  persisted. When the blocker registers, the same (now validated) replay
+  turns them into normal candidates — same pipeline, no fork.
+
+### v4.1 deferrals (recorded)
+
+- `/relations/accept` keeps its EXACT-match column check by design: stored
+  join_keys are consumed downstream by exact-match code (connector closure,
+  verification, schema_text), so accepting a case-mismatched pair verbatim
+  would trade a visible 400 for silent downstream misses. The
+  analyze/replay validators are case-insensitive for REPORTING only. A
+  candidate minted through the qualify-fallback path against a mixed-case
+  registry can therefore still 400 at accept — now with a readable message
+  naming the column.
+- The warning box is per-response (a later warning-free scan/accept clears
+  it); per-rec warn chips persist the signal.
+- Evidence-line partner order follows stored-evidence order.
