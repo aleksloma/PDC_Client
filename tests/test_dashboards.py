@@ -235,7 +235,7 @@ def test_remove_tile(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _stub_refresh(monkeypatch, result):
-    async def fake(chat_id, code, kind, sid):
+    async def fake(chat_id, code, kind, sid, *, drop_df_keys=None):
         return result
     monkeypatch.setattr(dash_mod, "run_item_refresh", fake)
 
@@ -395,7 +395,7 @@ def test_refresh_self_heals_wrong_table_code(client, monkeypatch):
                                        "code": "RESULT = dfs['f']"}
     seen = {}
 
-    async def fake(chat_id, code, kind, sid):
+    async def fake(chat_id, code, kind, sid, *, drop_df_keys=None):
         seen["code"] = code
         return {"ok": True, "kind": "table",
                 "table": {"columns": ["a"], "rows": [{"a": 2}], "total_rows": 1}}
@@ -422,7 +422,7 @@ def test_refresh_table_with_result_key_uses_reexecute(client, monkeypatch):
                                        "result_key": "t1"}
     seen = {}
 
-    async def fake_reexec(chat_id, code, result_key=None):
+    async def fake_reexec(chat_id, code, result_key=None, *, drop_df_keys=None):
         seen["args"] = (chat_id, code, result_key)
         return pd.DataFrame({"a": [7, 8]})
     monkeypatch.setattr(dash_mod, "_reexecute_full_df", fake_reexec)
@@ -477,7 +477,7 @@ def test_refresh_item_endpoint_contract_after_extraction(client, monkeypatch):
     assert client.post("/api/chat/c1/refresh_item",
                        json={"code": "a ###NEXT_PLOT### b"}).status_code == 400
     # Execution path delegates to run_item_refresh with the same payload out.
-    async def fake(chat_id, code, kind, sid):
+    async def fake(chat_id, code, kind, sid, *, drop_df_keys=None):
         assert chat_id == "c1" and code == "print(1)" and kind == "chart"
         return {"ok": True, "kind": "chart", "image_base64": "IMG", "is_plotly": False}
     monkeypatch.setattr(chat_mod, "run_item_refresh", fake)

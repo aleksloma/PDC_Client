@@ -16,7 +16,7 @@
   let grid = null;          // GridStack instance
   let isOwner = false;
   let saveTimer = null;
-  const chatDfKeys = {};    // chat_id -> Set(df keys) | null (unknown)
+  const chatDfKeys = {};    // chat_id -> {keys: Set, blocked: Set} | null (unknown)
 
   function _t(key, fallback) {
     if (window.i18n && typeof window.i18n.t === 'function') {
@@ -218,6 +218,11 @@
     }
     if (reason === 'access_revoked') {
       return _t('dash.no_access', 'No access to the source data — showing saved result');
+    }
+    if (reason === 'role_denied') {
+      // Caller-specific, never persisted — the tile stays live for viewers
+      // whose role covers the table (mirror of access_revoked).
+      return _t('dash.frozen_role_denied', "Your role doesn't include this data — showing saved result");
     }
     return _t('dash.stale', 'Saved result shown');
   }
@@ -446,7 +451,13 @@
       const res = await fetch(`/api/chat/${chatId}/schema`);
       if (!res.ok) { chatDfKeys[chatId] = null; return null; }
       const data = await res.json();
-      chatDfKeys[chatId] = new Set((data.files || []).map(f => f.file_name).filter(Boolean));
+      chatDfKeys[chatId] = {
+        keys: new Set((data.files || []).map(f => f.file_name).filter(Boolean)),
+        // DB tables the viewer's role does not cover (rows with allowed=false)
+        // — their refresh buttons pre-freeze with the role tooltip.
+        blocked: new Set((data.db_tables || [])
+          .filter(t => t.allowed === false).map(t => t.df_key).filter(Boolean)),
+      };
     } catch (_) {
       chatDfKeys[chatId] = null;
     }
@@ -463,12 +474,16 @@
 
   async function applyRefreshPreFreeze(tile, refreshBtn) {
     if (!refreshBtn || !tile.code) return;
-    const keys = await loadChatDfKeys(tile.chat_id);
-    if (!keys) return;   // unknown → leave enabled
-    const missing = extractDfKeys(tile.code).some(k => !keys.has(k));
-    if (missing) {
+    const info = await loadChatDfKeys(tile.chat_id);
+    if (!info) return;   // unknown → leave enabled
+    const refs = extractDfKeys(tile.code);
+    if (refs.some(k => !info.keys.has(k))) {
       refreshBtn.disabled = true;
       refreshBtn.title = _t('lab.refresh_frozen', "Data structure changed — this chart/table can't be refreshed.");
+    } else if (refs.some(k => info.blocked.has(k))) {
+      refreshBtn.disabled = true;
+      refreshBtn.title = _t('dash.frozen_role_denied',
+        "Your role doesn't include this data — showing saved result");
     }
   }
 

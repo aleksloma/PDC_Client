@@ -34,6 +34,14 @@
           <span class="adm-nav-ico">🔗</span> Relations
           <span class="adm-nav-count" id="navRelCount"></span>
         </button>
+        <button class="adm-nav-item" data-section="users">
+          <span class="adm-nav-ico">👥</span> Users
+          <span class="adm-nav-count" id="navUserCount"></span>
+        </button>
+        <button class="adm-nav-item" data-section="roles">
+          <span class="adm-nav-ico">🛡️</span> Roles
+          <span class="adm-nav-count" id="navRoleCount"></span>
+        </button>
         <button class="adm-nav-item" data-section="schedule">
           <span class="adm-nav-ico">⏱️</span> Refresh schedule
         </button>
@@ -213,6 +221,39 @@
               are kept on this server to recommend missing tables.</span>
           </div>
         </div>
+      </section>
+
+      <!-- Users (role assignment; the local admin is config-only and never
+           listed here) -->
+      <section id="secUsers" class="adm-section" hidden>
+        <header class="adm-page-head">
+          <div>
+            <h1>Users</h1>
+            <p class="adm-page-sub">Everyone who has signed in. Each user has ONE role that
+               controls which registered database tables they can pick and refresh.
+               Existing chats always keep their saved data.</p>
+          </div>
+        </header>
+        <div class="adm-users-toolbar">
+          <input type="search" id="userSearch" class="adm-search" placeholder="Search by email…" />
+        </div>
+        <div id="usersList"></div>
+      </section>
+
+      <!-- Roles (grants live HERE — explicit tables + schema/connection scope
+           grants that also cover tables registered later) -->
+      <section id="secRoles" class="adm-section" hidden>
+        <header class="adm-page-head">
+          <div>
+            <h1>Roles</h1>
+            <p class="adm-page-sub">A role grants access to registered database tables — explicit
+               tables, or a whole schema/connection (which also covers tables registered later).
+               Connector tables are always included automatically for joins. New users start in
+               the built-in Base role.</p>
+          </div>
+          <button id="btnAddRole" class="adm-btn primary">＋ Add role</button>
+        </header>
+        <div id="rolesList"></div>
       </section>
 
       <!-- Refresh schedule -->
@@ -399,6 +440,12 @@
           </div>
           <div id="twRelations"></div>
 
+          <div class="adm-subhead">
+            <h4>Access <span class="adm-label-note">(roles whose members can pick this table —
+              roles already covering it via a schema/connection grant are shown locked)</span></h4>
+          </div>
+          <div id="twAccessRoles" class="adm-access-panel adm-muted">Loading roles…</div>
+
           <label class="adm-check adm-confirm">
             <input type="checkbox" id="twConfirm" />
             <span>I have reviewed the table and column descriptions</span>
@@ -473,6 +520,58 @@
         <span class="adm-spacer"></span>
         <button id="btnRecAcceptCancel" class="adm-btn ghost">Cancel</button>
         <button id="btnRecAcceptGo" class="adm-btn primary">Register &amp; snapshot</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Role editor modal (create + edit; the access tree covers every
+       connection → schema → registered non-connector table) ─────────────── -->
+  <div id="roleModal" class="adm-modal-backdrop hidden">
+    <div class="adm-modal">
+      <div class="adm-modal-head">
+        <h3 id="roleModalTitle">Add role</h3>
+        <button id="closeRoleModal" class="adm-x">✕</button>
+      </div>
+      <div class="adm-modal-body">
+        <div class="adm-form-grid">
+          <label class="span2">Role name
+            <input type="text" id="roleName" placeholder="e.g. Finance" />
+          </label>
+          <label class="span2">Description
+            <textarea id="roleDesc" rows="2"
+              placeholder="Who is this role for? (optional)"></textarea>
+          </label>
+        </div>
+        <div class="adm-subhead">
+          <h4>Table access <span class="adm-label-note">(checking a schema or connection grants
+            every table under it — including tables registered later)</span></h4>
+        </div>
+        <div id="roleAccessTree" class="adm-tree"></div>
+        <div id="roleError" class="adm-test-result bad hidden"></div>
+      </div>
+      <div class="adm-modal-foot">
+        <span class="adm-spacer"></span>
+        <button id="btnCancelRole" class="adm-btn ghost">Cancel</button>
+        <button id="btnSaveRole" class="adm-btn primary">💾 Save role</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Delete-role confirm (replaces confirm(): it must show the member
+       count; members revert to Base dynamically — nothing is rewritten) ── -->
+  <div id="roleDeleteModal" class="adm-modal-backdrop hidden">
+    <div class="adm-modal adm-modal-narrow">
+      <div class="adm-modal-head">
+        <h3>Delete role</h3>
+        <button id="closeRoleDelete" class="adm-x">✕</button>
+      </div>
+      <div class="adm-modal-body">
+        <p id="roleDeleteText" class="adm-muted"></p>
+      </div>
+      <div class="adm-modal-foot">
+        <span class="adm-spacer"></span>
+        <button id="btnRoleDeleteCancel" class="adm-btn ghost">Cancel</button>
+        <button id="btnRoleDeleteGo" class="adm-btn danger">Delete role</button>
       </div>
     </div>
   </div>

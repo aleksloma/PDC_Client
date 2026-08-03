@@ -83,6 +83,16 @@ def registry(tmp_path):
         ids[tname] = t["id"]
         pd.DataFrame({"city_code": [1, 2]}).to_parquet(
             local_store.db_snapshot_path(t["id"]))
+    # The role gate (roles_store) fronts /api/db_tables + /session/db_tables:
+    # grant the built-in Base role the whole connection so these pre-roles
+    # selection/closure tests keep exercising the same behavior as before.
+    # (Role-gate denial cases live in tests/test_role_access_enforcement.py.)
+    import roles_store
+    rs = roles_store.RolesStore()
+    rs.ensure_base_role()
+    rs.update_role(roles_store.BASE_ROLE_ID,
+                   {"scope_grants": [{"connection_id": conn["id"], "schema": None}]},
+                   actor="ladmin")
     return ids
 
 

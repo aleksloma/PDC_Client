@@ -869,6 +869,68 @@ predicates are read), and the SQL-box UI states this truthfully.
 for large tables (brain writes dialect-aware aggregation SELECTs; client
 validates + executes). Per `docs/DB_TABLES_PLAN.md`.
 
+### 10b. User roles & DB-table privileges (client-side only)
+
+The role-based table-visibility follow-up to §10a. Entirely client-side — no
+brain involvement, no protocol change.
+
+**Model.** ONE role per user. Roles live in `DATA_ROOT/roles.json`
+(`roles_store.RolesStore`, DataSourceStore discipline: locked atomic writes,
+section-whitelisting reads, 16-hex ids): `{id, name, description,
+table_ids: [], scope_grants: [{connection_id, schema|null}]}`. A scope grant
+with `schema:null` covers the whole connection; schemas match
+case-insensitively; `schema:""` is a legal literal (sqlite). The built-in
+**Base** role (literal id `"base"`) is seeded at boot right after the ladmin
+bootstrap — undeletable, unrenamable, grants editable, empty by default. The
+user's role id is the additive `data_role` field on
+`users/{email}/profile.json` (default `"base"`; `last_login_at` is stamped
+there by the login funnel). Old-shape profiles and an absent roles.json keep
+loading — everything resolves to Base through `.get()` defaults.
+
+**Effective access is computed at request time**, never frozen:
+`allowed_table_ids_for(email)` = explicit `table_ids` ∩ live registry ∪
+scope-grant matches. So a table registered later under a granted schema is
+covered without a role edit, grant changes propagate instantly, and deleting a
+role reverts its members to Base dynamically (a dangling `data_role` resolves
+to Base at read time — no profile rewrites, which is also why role deletion is
+safe against concurrent logins). **Connector tables are exempt** from role
+checks everywhere: they are invisible to users and auto-included through the
+relations closure — gating them would silently break allowed joins.
+
+**Enforcement points** (and, just as deliberately, non-enforcement):
+
+- `GET /api/db_tables` — the picker lists only allowed tables.
+- `POST /session/db_tables` — non-allowed SEEDS → 403 `ROLE_DENIED`; the
+  connector closure stays exempt.
+- Per-item refresh (chat `refresh_item` + BOTH dashboard tile branches) —
+  blocked per-table via `routes.chat._role_refresh_block`: the item's code is
+  scanned with the same `dfs['…']` key regex the frontend freeze uses; an
+  item touching only allowed tables still refreshes. Denied frames are also
+  dropped from the exec namespace after the (per-chat, user-agnostic) cached
+  load. Dashboard denials are caller-specific and never persisted (mirror of
+  `access_revoked`). Genuine denials fail CLOSED (Base defaults); an
+  unexpected gate crash fails OPEN with `ROLE_GATE_FAILED` logged.
+- `GET /api/chat/{id}/schema` — advisory per-table `allowed` flag so the /lab
+  and dashboard-view UIs grey refresh buttons proactively.
+- **Not gated by design** (confirmed decisions — no retroactive blocking;
+  snapshot data the user could already see stays viewable): `chat/stream`,
+  `edit_regenerate`, full-table/Download-Excel re-execution, Auto Analytics,
+  `add_data_to_chat` (its DB entries were validated at selection time), and
+  the central nightly snapshot scheduler. Shared-chat/dashboard recipients
+  keep VIEWING stored snapshots; only their fresh re-execution is gated, keyed
+  on the requester.
+
+**Canonical storage on the role record, never the table doc:** the register
+wizard's step-3 Access panel posts `access_role_ids`, which the save
+reconciles into the roles via `set_table_roles`; table deletion prunes the id
+from every role. Admin surface: `routes/admin_users.py` (`/api/admin/users*`,
+`/api/admin/roles*`, same `_require_admin` guard, audited `user.set_role` /
+`role.*`), plus the Users + Roles sections on the admin page (searchable user
+list with instant role dropdown; role cards + tri-state access tree
+connection → schema → tables). The ladmin account is config-only and is
+excluded from the Users window. `roles_store` is denied inside the code-exec
+sandbox (grant tampering = privilege escalation).
+
 ---
 
 ## 11. Sharing restriction

@@ -118,13 +118,21 @@ def _load_full_table_record(store, key: str) -> dict | None:
     return _FULL_TABLE_CACHE.get(key)
 
 
-async def _reexecute_full_df(chat_id: str, code: str | None, result_key: str | None = None):
+async def _reexecute_full_df(chat_id: str, code: str | None, result_key: str | None = None,
+                             *, drop_df_keys=None):
     """Re-run stored code locally to produce the COMPLETE (uncapped) DataFrame.
     Returns a DataFrame or None (caller falls back to the stored preview rows).
 
     `result_key`: for multi-table answers (RESULT was a dict of DataFrames) the
     durable record stores which dict entry this table came from — pick it out
     of the re-executed dict before the normal normalization.
+
+    `drop_df_keys`: df keys removed from the exec namespace AFTER load (role
+    gate defense in depth — the dashboard tile-refresh path passes the denied
+    set; the full_table/Download-Excel callers pass nothing and stay ungated
+    by design: viewing existing data is never blocked retroactively). Filtered
+    post-load on purpose — _load_dataframes_cached's cache key is per-chat,
+    not per-user, so the cache must always hold the full set.
 
     Article II: execution is local — nothing here touches the brain.
     Article V: reads local DataFrames only. Article IV: never raises."""
@@ -136,6 +144,8 @@ async def _reexecute_full_df(chat_id: str, code: str | None, result_key: str | N
         store = local_store.ChatDataStore(chat_id)
         loop = asyncio.get_running_loop()
         dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
+        if drop_df_keys:
+            dfs = {k: v for k, v in dfs.items() if k not in drop_df_keys}
         if not dfs:
             return None
         exec_out = await loop.run_in_executor(
@@ -455,6 +465,16 @@ async def get_schema(request: Request, chat_id: str):
             registry = {t.get("id"): t for t in DataSourceStore().list_tables()}
         except Exception:
             registry = {}
+        # Role gate (additive `allowed` flag so the UI can grey refresh
+        # buttons proactively). Helper failure → None → every row reports
+        # allowed=true (the server-side refresh gate is the enforcement).
+        allowed_ids = None
+        try:
+            import roles_store
+            allowed_ids = roles_store.allowed_table_ids_for(email)
+        except Exception as e:
+            log_with_sid(email, "warning", f"SCHEMA_ROLE_PROBE_FAILED: {e}",
+                         chat_id=chat_id)
         for entry in db_entries:
             db = entry.get("db") or {}
             tid = db.get("table_id")
@@ -476,6 +496,8 @@ async def get_schema(request: Request, chat_id: str):
                 "row_count": (reg or {}).get("row_count") or db.get("row_count"),
                 "refreshed_at": refreshed,
                 "missing": missing,
+                "allowed": bool(db.get("is_connector")) or allowed_ids is None
+                           or tid in allowed_ids,
             })
         stamps = [t["refreshed_at"] for t in db_tables if t.get("refreshed_at")]
         data_as_of = min(stamps) if stamps else None  # oldest data in the chat
@@ -1497,17 +1519,64 @@ async def full_table_get(request: Request, chat_id: str, key: str):
 # return 200 {ok: false, error} so the frontend keeps the previous render and
 # shows a small non-blocking note (Article IV: logged, safe fallback).
 
-async def run_item_refresh(chat_id: str, code: str, kind: str, sid: str) -> dict:
+_DF_KEY_RE = re.compile(r"dfs\[\s*['\"]([^'\"]+)['\"]\s*\]")
+
+
+def _role_refresh_block(email: str, chat_id: str, code: str):
+    """Role gate for the refresh paths (chat refresh_item + dashboard tile
+    refresh, both branches). Returns (denied_df_keys, blocked_display_names):
+
+      denied_df_keys — frozenset of the chat's df keys whose backing DB table
+        the REQUESTER's role does not cover (non-connector entries only —
+        connectors are exempt by design). Passed as drop_df_keys so denied
+        frames never enter the exec namespace even when unreferenced.
+      blocked_display_names — the denied tables this item's code actually
+        references (the same dfs['…'] key regex dashboard.js freezes on) —
+        non-empty means the refresh must be refused; empty means the item
+        only touches allowed tables and proceeds (per-table semantics).
+
+    Genuine denials fail CLOSED by construction (.get() defaults resolve to
+    Base → empty grant set). An unexpected crash inside the helper fails OPEN
+    (logged ROLE_GATE_FAILED) — a bug here must not freeze every refresh
+    fleet-wide for data the user can already see as a snapshot."""
+    try:
+        meta = local_store.ChatDataStore(chat_id).read_meta()
+        entries = [e for e in local_store.db_entries_from_meta(meta)
+                   if not (e.get("db") or {}).get("is_connector")]
+        if not entries:
+            return frozenset(), []
+        import roles_store
+        allowed = roles_store.allowed_table_ids_for(email)
+        denied = {e["file_name"]: ((e.get("db") or {}).get("display_name") or e["file_name"])
+                  for e in entries
+                  if e.get("file_name")
+                  and (e.get("db") or {}).get("table_id") not in allowed}
+        if not denied:
+            return frozenset(), []
+        referenced = set(_DF_KEY_RE.findall(code or ""))
+        return frozenset(denied), sorted(denied[k] for k in referenced if k in denied)
+    except Exception as e:
+        log_with_sid(email, "warning", f"ROLE_GATE_FAILED chat={chat_id}: {e}")
+        return frozenset(), []
+
+
+async def run_item_refresh(chat_id: str, code: str, kind: str, sid: str,
+                           *, drop_df_keys=None) -> dict:
     """Re-run ONE item's stored code against the chat's current dataframes and
     return the re-rendered item. Shared by `refresh_item` (per-message refresh
     in /lab) and the dashboard tile refresh (routes/dashboards.py). Purely
     local (Article II). Returns `{ok: True, ...}` payloads identical to the
     historical refresh_item contract, or `{ok: False, error}` on any execution
-    failure (Article IV: logged, safe fallback — never raises)."""
+    failure (Article IV: logged, safe fallback — never raises).
+
+    `drop_df_keys` — see _reexecute_full_df: role-denied df keys filtered out
+    AFTER the (per-chat, user-agnostic) cached load."""
     store = local_store.ChatDataStore(chat_id)
     loop = asyncio.get_running_loop()
     try:
         dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
+        if drop_df_keys:
+            dfs = {k: v for k, v in dfs.items() if k not in drop_df_keys}
         if not dfs:
             return {"ok": False, "error": "Chat dataset is empty."}
 
@@ -1577,7 +1646,17 @@ async def refresh_item(request: Request, chat_id: str):
     if "###NEXT_PLOT###" in code:
         # Legacy joined multi-chart record — not a single executable block.
         return JSONResponse({"error": "This item cannot be refreshed."}, status_code=400)
-    return await run_item_refresh(chat_id, code, kind, secrets.token_hex(8))
+    drop, blocked = _role_refresh_block(email, chat_id, code)
+    if blocked:
+        # Role denial follows the EXECUTION-failure contract (200 {ok:false})
+        # — the frontend keeps the previous render and fail-freezes the button.
+        log_with_sid(email, "info", "REFRESH_ROLE_DENIED",
+                     chat_id=chat_id, tables=blocked)
+        return {"ok": False, "code": "ROLE_DENIED", "blocked_tables": blocked,
+                "error": "Your role does not include this table's data — "
+                         "refresh is unavailable."}
+    return await run_item_refresh(chat_id, code, kind, secrets.token_hex(8),
+                                  drop_df_keys=drop)
 
 
 # --- Downloads (chart PNG + table Excel) -------------------------------------

@@ -29,7 +29,8 @@ from brain_client import TenantRevokedError, BrainError
 from logger_utils import log_with_sid
 from routes.chat import (_FULL_KEY_RE, _json_safe, _load_full_table_record,
                          _persist_full_table, _persistable_chart_data,
-                         _reexecute_full_df, _require_chat, run_item_refresh)
+                         _reexecute_full_df, _require_chat, _role_refresh_block,
+                         run_item_refresh)
 
 router = APIRouter(prefix="/api/dashboards", tags=["client-dashboards"])
 
@@ -373,11 +374,21 @@ async def refresh_tile(request: Request, dash_id: str, tile_id: str):
     if not code:
         return {"ok": False, "error": "This tile cannot be refreshed."}
 
+    # Role gate — BEFORE the branch split so both execution paths are covered.
+    # Caller-specific like access_revoked above: never persisted, the tile
+    # stays live for viewers whose role covers the table.
+    drop, blocked = _role_refresh_block(email, chat_id, code)
+    if blocked:
+        log_with_sid(email, "info",
+                     f"DASH_TILE_ROLE_DENIED dash={dash_id} tile={tile_id}")
+        return {"ok": False, "frozen": True, "reason": "role_denied",
+                "blocked_tables": blocked}
+
     if kind == "table" and result_key is not None:
         # Multi-table answers: the code's RESULT is a dict of tables; the
         # record's result_key names this tile's entry — _reexecute_full_df
         # (the Download-Excel path) handles the selection.
-        df = await _reexecute_full_df(chat_id, code, result_key)
+        df = await _reexecute_full_df(chat_id, code, result_key, drop_df_keys=drop)
         if df is None or getattr(df, "empty", True):
             result = {"ok": False, "error": "Could not re-run this table with the current data."}
         else:
@@ -392,7 +403,8 @@ async def refresh_tile(request: Request, dash_id: str, tile_id: str):
             if new_key:
                 result["full_table_key"] = new_key
     else:
-        result = await run_item_refresh(chat_id, code, kind, secrets.token_hex(8))
+        result = await run_item_refresh(chat_id, code, kind, secrets.token_hex(8),
+                                        drop_df_keys=drop)
     if not isinstance(result, dict) or not result.get("ok"):
         return _json_safe(result if isinstance(result, dict)
                           else {"ok": False, "error": "Refresh failed."})

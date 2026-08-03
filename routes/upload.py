@@ -698,11 +698,19 @@ async def api_db_tables(request: Request):
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
     try:
         from db_sources import DataSourceStore
+        import roles_store
+
         # Off the event loop: the registry read is disk I/O (a network round
         # trip per syscall on the GCS-fuse-mounted demo volume).
+        def _visible():
+            rows = DataSourceStore().list_tables(include_connector=False)
+            # Role gate: only tables the user's role covers right now (a
+            # helper failure resolves to Base → empty list, fail-closed).
+            allowed = roles_store.allowed_table_ids_for(email)
+            return [r for r in rows if r.get("id") in allowed]
+
         loop = asyncio.get_running_loop()
-        rows = await loop.run_in_executor(
-            _EXEC, lambda: DataSourceStore().list_tables(include_connector=False))
+        rows = await loop.run_in_executor(_EXEC, _visible)
     except Exception as e:
         log_with_sid(email, "warning", f"DB_TABLES_LIST_FAILED: {e}")
         rows = []
@@ -802,6 +810,19 @@ async def session_db_tables(request: Request):
         return JSONResponse(
             {"error": "Connector tables are included automatically and cannot be selected directly."},
             status_code=400)
+    # Role gate on the SEEDS only — the connector closure below is exempt by
+    # design (connectors are invisible to users; gating them would silently
+    # break allowed joins).
+    import roles_store
+    allowed = roles_store.allowed_table_ids_for(email)
+    denied = [t for t in ids if t not in allowed]
+    if denied:
+        names = sorted((tables[t].get("display_name") or tables[t].get("table_name") or t)
+                       for t in denied)
+        log_with_sid(email, "warning",
+                     f"SESSION_DB_TABLES_ROLE_DENIED sid={sid} tables={names}")
+        return JSONResponse({"error": "Your role does not include: " + ", ".join(names),
+                             "code": "ROLE_DENIED"}, status_code=403)
 
     closure = expand_with_connectors(ids, reg) if ids else []
 

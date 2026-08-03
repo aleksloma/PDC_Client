@@ -97,8 +97,14 @@
   let RELCANDIDATES = [];       // discover-relations proposals (session-local)
   const REL_DISMISSED = new Set(); // dismissed candidate ids (session-local by design)
 
+  let USERS = [];               // admin Users window rows
+  let ROLES = [];               // roles registry (Base first, server-sorted)
+  let editingRoleId = null;     // null = creating
+  let roleDraft = null;         // role-modal working state (Sets, re-rendered per toggle)
+  let roleDeleteCtx = null;     // {id, name, member_count} for the delete confirm
+
   // ── Sidebar navigation ─────────────────────────────────────────────────
-  const SECTIONS = ['connections', 'tables', 'relations', 'schedule', 'audit'];
+  const SECTIONS = ['connections', 'tables', 'relations', 'users', 'roles', 'schedule', 'audit'];
 
   function showSection(name) {
     if (!SECTIONS.includes(name)) name = 'connections';
@@ -114,15 +120,17 @@
       cyInstance = null;
     }
     if (name === 'relations' && relView === 'graph') refreshRelGraph();
+    if (name === 'users') loadUsers();     // lazy refetch, like the audit tail
     if (name === 'audit') loadAudit();
     if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
   }
 
   // ── Bootstrap ──────────────────────────────────────────────────────────
   async function loadAll() {
-    const [d, c, t, s] = await Promise.all([
+    const [d, c, t, s, ro] = await Promise.all([
       api('/api/admin/dialects'), api('/api/admin/connections'),
       api('/api/admin/tables'), api('/api/admin/refresh_settings'),
+      api('/api/admin/roles'),
     ]);
     DIALECTS = d.data.dialects || [];
     CONNECTIONS = c.data.connections || [];
@@ -137,6 +145,9 @@
     $('navConnCount').textContent = CONNECTIONS.length || '';
     $('navTableCount').textContent = TABLES.length || '';
     $('navRelCount').textContent = confirmedRelCount() || '';
+    ROLES = ro.ok ? (ro.data.roles || []) : ROLES;   // keep last good on failure
+    $('navRoleCount').textContent = ROLES.length || '';
+    renderRoles();
     // The zero-new explainer quotes a confirmed count — hide it once any
     // mutation refetches state, rather than showing a stale number.
     $('relNoNew').classList.add('hidden');
@@ -412,6 +423,7 @@
     if (n === 3) {
       renderSummary();
       loadWizardSuggestions();   // recomputed on every step-3 open
+      renderWizardAccess();      // synchronous — ROLES loaded at page load
     }
   }
 
@@ -2197,6 +2209,9 @@
       relations: rels,
       confirm: $('twConfirm').checked === true,
     };
+    // Access panel → role records. Omitted (not []) when roles were
+    // unavailable, so an edit-save can never strip existing grants.
+    if (_wizAccessReady) body.access_role_ids = collectCheckedAccessRoles();
     $('btnSaveTable').disabled = true;
     $('btnSaveTable').textContent = 'Snapshotting…';
     _busy(`Saving "${body.display_name}" and taking a snapshot… large tables can take a while.`);
@@ -2265,6 +2280,319 @@
           <td class="adm-cell-mono">${esc(row.target || '')}</td>
           <td>${row.ok === false ? '<span class="adm-chip bad">failed</span>' : ''}</td>
         </tr>`).join('')}</tbody></table></div>`;
+  }
+
+  // ── Users (role assignment) ────────────────────────────────────────────
+  async function loadUsers() {
+    const r = await api('/api/admin/users');
+    if (r.ok) USERS = r.data.users || [];
+    $('navUserCount').textContent = USERS.length || '';
+    renderUsers();
+  }
+
+  function renderUsers() {
+    const box = $('usersList');
+    const q = ($('userSearch').value || '').trim().toLowerCase();
+    const rows = q ? USERS.filter((u) => (u.email || '').toLowerCase().includes(q)) : USERS;
+    if (!rows.length) {
+      box.innerHTML = `<div class="adm-card"><div class="adm-empty">
+        ${q ? 'No users match the search.' : 'No users yet — users appear after their first sign-in.'}
+      </div></div>`;
+      return;
+    }
+    const options = (selected) => ROLES.map((ro) =>
+      `<option value="${esc(ro.id)}" ${ro.id === selected ? 'selected' : ''}>${esc(ro.name)}</option>`).join('');
+    const fmt = (ts) => ts ? esc(String(ts).replace('T', ' ').slice(0, 16)) : '—';
+    box.innerHTML = `<div class="adm-card adm-table-scroll"><table class="adm-table">
+      <thead><tr><th>Email</th><th>Role</th><th>First login</th><th>Last login</th></tr></thead>
+      <tbody>${rows.map((u) => `
+        <tr data-email="${esc(u.email)}">
+          <td>${esc(u.email)}</td>
+          <td><select class="adm-user-role" data-prev="${esc(u.role_id)}">${options(u.role_id)}</select></td>
+          <td class="adm-cell-mono">${fmt(u.created_at)}</td>
+          <td class="adm-cell-mono">${fmt(u.last_login_at)}</td>
+        </tr>`).join('')}</tbody></table></div>`;
+    box.querySelectorAll('.adm-user-role').forEach((sel) => {
+      sel.addEventListener('change', async () => {
+        const email = sel.closest('tr').dataset.email;
+        const r = await api('/api/admin/users/set_role', {
+          method: 'POST',
+          body: JSON.stringify({ email, role_id: sel.value }),
+        });
+        if (r.ok) {
+          sel.dataset.prev = sel.value;
+          toast(`Role updated for ${email}`);
+          const u = USERS.find((x) => x.email === email);
+          if (u && r.data.user) Object.assign(u, r.data.user);
+        } else {
+          toast(r.data.error || 'Could not change the role', true);
+          sel.value = sel.dataset.prev;   // revert the dropdown
+        }
+      });
+    });
+  }
+
+  // ── Roles (grants registry) ────────────────────────────────────────────
+  function roleGrantSummary(ro) {
+    const bits = [];
+    const conns = (ro.scope_grants || []).filter((g) => g.schema == null).length;
+    const schemas = (ro.scope_grants || []).length - conns;
+    if (conns) bits.push(`${conns} connection grant${conns > 1 ? 's' : ''}`);
+    if (schemas) bits.push(`${schemas} schema grant${schemas > 1 ? 's' : ''}`);
+    if ((ro.table_ids || []).length) bits.push(`${ro.table_ids.length} table${ro.table_ids.length > 1 ? 's' : ''}`);
+    return bits.join(' · ') || 'No table access';
+  }
+
+  function renderRoles() {
+    const box = $('rolesList');
+    if (!box) return;
+    if (!ROLES.length) {
+      box.innerHTML = '<div class="adm-card"><div class="adm-empty">Roles unavailable.</div></div>';
+      return;
+    }
+    box.innerHTML = ROLES.map((ro) => `
+      <div class="adm-card adm-role-card" data-rid="${esc(ro.id)}">
+        <div class="adm-role-main">
+          <div class="adm-role-title">${esc(ro.name)}
+            ${ro.is_base ? '<span class="adm-chip">built-in</span>' : ''}
+            <span class="adm-chip">${ro.member_count || 0} member${ro.member_count === 1 ? '' : 's'}</span>
+          </div>
+          ${ro.description ? `<div class="adm-muted">${esc(ro.description)}</div>` : ''}
+          <div class="adm-role-grants">${esc(roleGrantSummary(ro))}</div>
+        </div>
+        <div class="adm-role-actions">
+          <button class="adm-icon-btn" data-act="edit" title="Edit role">✏️</button>
+          ${ro.is_base ? '' : '<button class="adm-icon-btn" data-act="delete" title="Delete role">🗑️</button>'}
+        </div>
+      </div>`).join('');
+    box.querySelectorAll('button').forEach((b) => {
+      b.addEventListener('click', () => {
+        const ro = ROLES.find((x) => x.id === b.closest('.adm-role-card').dataset.rid);
+        if (!ro) return;
+        if (b.dataset.act === 'edit') openRoleModal(ro);
+        else if (b.dataset.act === 'delete') openRoleDelete(ro);
+      });
+    });
+  }
+
+  // Role editor — tri-state tree connection → schema → tables, built from the
+  // already-loaded CONNECTIONS + TABLES (non-connector). Working state lives
+  // in `roleDraft` Sets; every toggle re-renders the (small) tree from it.
+  const _schemaKey = (cid, schema) => cid + '|' + String(schema || '').toLowerCase();
+
+  function openRoleModal(role) {
+    editingRoleId = role ? role.id : null;
+    roleDraft = {
+      isBase: !!(role && role.is_base),
+      tableIds: new Set(role ? role.table_ids || [] : []),
+      connGrants: new Set((role ? role.scope_grants || [] : [])
+        .filter((g) => g.schema == null).map((g) => g.connection_id)),
+      schemaGrants: new Map((role ? role.scope_grants || [] : [])
+        .filter((g) => g.schema != null)
+        .map((g) => [_schemaKey(g.connection_id, g.schema),
+                     { connection_id: g.connection_id, schema: g.schema }])),
+    };
+    $('roleModalTitle').textContent = role ? `Edit role — ${role.name}` : 'Add role';
+    $('roleName').value = role ? role.name : '';
+    $('roleName').disabled = roleDraft.isBase;   // Base is unrenamable
+    $('roleName').title = roleDraft.isBase ? 'The built-in Base role cannot be renamed' : '';
+    $('roleDesc').value = role ? role.description || '' : '';
+    $('roleError').classList.add('hidden');
+    renderRoleTree();
+    $('roleModal').classList.remove('hidden');
+    if (!roleDraft.isBase) $('roleName').focus();
+  }
+
+  function renderRoleTree() {
+    const box = $('roleAccessTree');
+    const tables = TABLES.filter((t) => !t.is_connector);
+    if (!CONNECTIONS.length || !tables.length) {
+      box.innerHTML = '<div class="adm-empty">No registered tables yet — register tables first, '
+        + 'or grant a whole connection once one exists.</div>';
+      if (!CONNECTIONS.length) return;
+    }
+    const html = CONNECTIONS.map((c) => {
+      const connGranted = roleDraft.connGrants.has(c.id);
+      const connTables = tables.filter((t) => t.connection_id === c.id);
+      // Group by lower-cased schema, keep the first raw name as the label.
+      const schemas = new Map();
+      connTables.forEach((t) => {
+        const key = String(t.schema || '').toLowerCase();
+        if (!schemas.has(key)) schemas.set(key, { raw: t.schema || '', tables: [] });
+        schemas.get(key).tables.push(t);
+      });
+      const schemaHtml = Array.from(schemas.values()).map((s) => {
+        const sKey = _schemaKey(c.id, s.raw);
+        const schemaGranted = roleDraft.schemaGrants.has(sKey);
+        const leaves = s.tables.map((t) => {
+          const covered = connGranted || schemaGranted;
+          const checked = covered || roleDraft.tableIds.has(t.id);
+          return `<label class="adm-tree-leaf adm-check">
+            <input type="checkbox" class="rt-table" data-tid="${esc(t.id)}"
+              ${checked ? 'checked' : ''} ${covered ? 'disabled' : ''}>
+            <span>${esc(t.display_name || t.table_name)}
+              ${covered ? `<span class="adm-label-note">${connGranted ? 'via connection' : 'via schema'}</span>` : ''}
+            </span>
+          </label>`;
+        }).join('');
+        return `<div class="adm-tree-schema-block">
+          <label class="adm-tree-schema adm-check">
+            <input type="checkbox" class="rt-schema" data-cid="${esc(c.id)}"
+              data-schema="${esc(s.raw)}" ${connGranted || schemaGranted ? 'checked' : ''}
+              ${connGranted ? 'disabled' : ''}>
+            <span>${esc(s.raw || '(no schema)')}
+              <span class="adm-label-note">${connGranted ? 'via connection'
+                : 'schema grant — includes tables registered later'}</span>
+            </span>
+          </label>
+          <div class="adm-tree-leaves">${leaves}</div>
+        </div>`;
+      }).join('');
+      return `<div class="adm-tree-conn-block">
+        <label class="adm-tree-conn adm-check">
+          <input type="checkbox" class="rt-conn" data-cid="${esc(c.id)}"
+            ${connGranted ? 'checked' : ''}>
+          <span><strong>${esc(c.name)}</strong>
+            <span class="adm-label-note">whole connection — includes tables registered later</span>
+          </span>
+        </label>
+        <div class="adm-tree-schemas">${schemaHtml
+          || '<div class="adm-muted adm-tree-empty">No registered tables on this connection yet.</div>'}</div>
+      </div>`;
+    }).join('');
+    const scroll = box.scrollTop;
+    box.innerHTML = html;
+    box.scrollTop = scroll;
+    // Indeterminate = some (not all) descendants checked and the node itself
+    // not granted. Set after render (no HTML attribute exists for it).
+    box.querySelectorAll('.adm-tree-conn-block').forEach((cb) => {
+      const conn = cb.querySelector('.rt-conn');
+      if (conn.checked) return;
+      const boxes = Array.from(cb.querySelectorAll('.rt-schema, .rt-table'));
+      const n = boxes.filter((x) => x.checked).length;
+      conn.indeterminate = n > 0 && n < boxes.length;
+    });
+    box.querySelectorAll('.adm-tree-schema-block').forEach((sb) => {
+      const sch = sb.querySelector('.rt-schema');
+      if (sch.checked) return;
+      const boxes = Array.from(sb.querySelectorAll('.rt-table'));
+      const n = boxes.filter((x) => x.checked).length;
+      sch.indeterminate = n > 0 && n < boxes.length;
+    });
+    box.querySelectorAll('input[type="checkbox"]').forEach((el) => {
+      el.addEventListener('change', () => {
+        if (el.classList.contains('rt-conn')) {
+          if (el.checked) roleDraft.connGrants.add(el.dataset.cid);
+          else roleDraft.connGrants.delete(el.dataset.cid);
+        } else if (el.classList.contains('rt-schema')) {
+          const key = _schemaKey(el.dataset.cid, el.dataset.schema);
+          if (el.checked) {
+            roleDraft.schemaGrants.set(key,
+              { connection_id: el.dataset.cid, schema: el.dataset.schema });
+          } else roleDraft.schemaGrants.delete(key);
+        } else if (el.classList.contains('rt-table')) {
+          if (el.checked) roleDraft.tableIds.add(el.dataset.tid);
+          else roleDraft.tableIds.delete(el.dataset.tid);
+        }
+        renderRoleTree();
+      });
+    });
+  }
+
+  async function saveRole() {
+    const err = $('roleError');
+    err.classList.add('hidden');
+    // Redundant grants/ids dropped at save: a schema grant under a granted
+    // connection, and explicit table ids a grant already covers.
+    const scope_grants = [
+      ...Array.from(roleDraft.connGrants).map((cid) => ({ connection_id: cid, schema: null })),
+      ...Array.from(roleDraft.schemaGrants.values())
+        .filter((g) => !roleDraft.connGrants.has(g.connection_id)),
+    ];
+    const covered = (t) => roleDraft.connGrants.has(t.connection_id)
+      || roleDraft.schemaGrants.has(_schemaKey(t.connection_id, t.schema || ''));
+    const tablesById = new Map(TABLES.map((t) => [t.id, t]));
+    const table_ids = Array.from(roleDraft.tableIds).filter((tid) => {
+      const t = tablesById.get(tid);
+      return t && !covered(t);
+    });
+    const body = { description: $('roleDesc').value.trim(), table_ids, scope_grants };
+    if (!roleDraft.isBase) body.name = $('roleName').value.trim();
+    const path = editingRoleId ? `/api/admin/roles/${editingRoleId}` : '/api/admin/roles';
+    const r = await api(path, { method: 'POST', body: JSON.stringify(body) });
+    if (!(r.status === 200 || r.status === 201)) {
+      err.textContent = r.data.error || 'Save failed';
+      err.classList.remove('hidden');
+      return;
+    }
+    toast('Role saved');
+    $('roleModal').classList.add('hidden');
+    await loadAll();
+    if (!$('secUsers').hidden) loadUsers();   // role names feed the dropdown
+  }
+
+  function openRoleDelete(ro) {
+    roleDeleteCtx = ro;
+    const n = ro.member_count || 0;
+    $('roleDeleteText').textContent =
+      `Delete role "${ro.name}"? ${n} user${n === 1 ? '' : 's'} will revert to the Base role. `
+      + 'Existing chats keep their saved data.';
+    $('roleDeleteModal').classList.remove('hidden');
+  }
+
+  async function runRoleDelete() {
+    if (!roleDeleteCtx) return;
+    const r = await api(`/api/admin/roles/${roleDeleteCtx.id}/delete`, { method: 'POST' });
+    $('roleDeleteModal').classList.add('hidden');
+    roleDeleteCtx = null;
+    if (r.ok) {
+      toast(`Role deleted — ${r.data.reverted_members || 0} member(s) reverted to Base`);
+      await loadAll();
+      if (!$('secUsers').hidden) loadUsers();
+    } else {
+      toast(r.data.error || 'Delete failed', true);
+    }
+  }
+
+  // ── Wizard step-3 Access panel (writes to ROLE records via the save's
+  // access_role_ids — never to the table doc) ────────────────────────────
+  let _wizAccessReady = false;   // roles rendered → saveTable may send the field
+
+  function renderWizardAccess() {
+    const box = $('twAccessRoles');
+    _wizAccessReady = false;
+    if (!ROLES.length) {
+      // Roles fetch failed at load — sending [] would strip existing grants
+      // on an edit, so the save omits the field entirely.
+      box.className = 'adm-access-panel adm-muted';
+      box.textContent = 'Roles unavailable — manage access from the Roles section.';
+      return;
+    }
+    const schema = ($('twSchema').value || '').trim().toLowerCase();
+    box.className = 'adm-access-panel';
+    box.innerHTML = ROLES.map((ro) => {
+      const grant = (ro.scope_grants || []).find((g) =>
+        g.connection_id === wizardConnId
+        && (g.schema == null || String(g.schema).toLowerCase() === schema));
+      const explicit = !!(editingTableId && (ro.table_ids || []).includes(editingTableId));
+      const covered = !!grant;
+      return `<label class="adm-check tw-access-row">
+        <input type="checkbox" class="tw-access-check" data-rid="${esc(ro.id)}"
+          ${covered || explicit ? 'checked' : ''} ${covered ? 'disabled' : ''}>
+        <span>${esc(ro.name)}${ro.is_base ? ' <span class="adm-chip">built-in</span>' : ''}
+          ${covered ? `<span class="adm-label-note">via ${grant.schema == null ? 'connection' : 'schema'} grant — no change needed</span>` : ''}
+        </span>
+      </label>`;
+    }).join('');
+    _wizAccessReady = true;
+  }
+
+  function collectCheckedAccessRoles() {
+    const out = [];
+    document.querySelectorAll('#twAccessRoles .tw-access-check').forEach((el) => {
+      if (el.checked && !el.disabled) out.push(el.dataset.rid);
+    });
+    return out;
   }
 
   // ── Account (sidebar footer) ───────────────────────────────────────────
@@ -2345,6 +2673,15 @@
     $('btnRelGraphFit').addEventListener('click', () => {
       if (cyInstance) { _hideGraphPopover(); cyInstance.fit(undefined, 30); }
     });
+
+    $('userSearch').addEventListener('input', renderUsers);
+    $('btnAddRole').addEventListener('click', () => openRoleModal(null));
+    $('closeRoleModal').addEventListener('click', () => $('roleModal').classList.add('hidden'));
+    $('btnCancelRole').addEventListener('click', () => $('roleModal').classList.add('hidden'));
+    $('btnSaveRole').addEventListener('click', saveRole);
+    $('closeRoleDelete').addEventListener('click', () => $('roleDeleteModal').classList.add('hidden'));
+    $('btnRoleDeleteCancel').addEventListener('click', () => $('roleDeleteModal').classList.add('hidden'));
+    $('btnRoleDeleteGo').addEventListener('click', runRoleDelete);
 
     $('btnSaveSchedule').addEventListener('click', saveSchedule);
     $('btnReloadAudit').addEventListener('click', loadAudit);

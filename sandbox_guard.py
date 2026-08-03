@@ -33,6 +33,9 @@ DENIED_MODULES = frozenset({
     # this client's credential surface
     "db_connector", "db_sources", "db_scheduler", "local_store", "settings",
     "brain_client", "password_utils",
+    # role grants: sandboxed code must not rewrite roles.json (privilege
+    # escalation for the DB-table role gate)
+    "roles_store",
     # relation discovery: one hop from the registry, and the sandbox has no
     # business growing a SQL parser for free
     "relation_discovery", "sqlglot",

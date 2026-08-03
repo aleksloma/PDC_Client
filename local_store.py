@@ -762,6 +762,75 @@ class AuthStore:
     def is_admin(self, email: str) -> bool:
         return self.get_role(email) == "admin"
 
+    # --- Data role (roles_store.py role id; gates DB-table access) ----------
+    #
+    # Same storage decision as `role` above: profile.json, not auth.json.
+    # Missing/dangling ids resolve to the built-in Base role dynamically
+    # (roles_store.role_for_email) — deleting a role needs no profile rewrites
+    # and an old-shape profile keeps loading (stored-shape backward compat).
+
+    def get_data_role(self, email: str) -> str:
+        return (self.get_profile(email) or {}).get("data_role") or "base"
+
+    def set_data_role(self, email: str, role_id: str) -> None:
+        email = _safe_email(email)
+        with _LOCK:
+            prof = self.get_profile(email) or {"email": email, "created_at": _now()}
+            if prof.get("data_role") == role_id:
+                return
+            prof["data_role"] = role_id
+            p = _data_root() / "users" / email / "profile.json"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            _write_json_atomic(p, prof)
+        log_with_sid(email, "info", f"USER_DATA_ROLE_SET role_id={role_id}")
+
+    def touch_last_login(self, email: str) -> None:
+        """Stamp last_login_at on the profile. Best-effort — a failed stamp
+        must never break a login (Article IV)."""
+        try:
+            email = _safe_email(email)
+            with _LOCK:
+                prof = self.get_profile(email) or {"email": email, "created_at": _now()}
+                prof["last_login_at"] = _now()
+                p = _data_root() / "users" / email / "profile.json"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                _write_json_atomic(p, prof)
+        except Exception as e:
+            log_with_sid(email, "warning", f"LAST_LOGIN_STAMP_FAILED: {e}")
+
+    def list_users(self) -> list:
+        """Every non-admin user with a readable profile.json, sorted by email.
+        Skips the config-only local admin (and any role=admin profile) — the
+        admin Users window manages regular users only. Unreadable profiles are
+        skipped, never fatal (Article IV)."""
+        users_dir = _data_root() / "users"
+        if not users_dir.exists():
+            return []
+        ladmin = (settings.LOCAL_ADMIN_USERNAME or "").strip().lower()
+        rows = []
+        for udir in users_dir.iterdir():
+            try:
+                if not udir.is_dir() or udir.name == ladmin:
+                    continue
+                p = udir / "profile.json"
+                if not p.exists():
+                    continue
+                prof = json.loads(p.read_text(encoding="utf-8"))
+                if not isinstance(prof, dict) or prof.get("role") == "admin":
+                    continue
+                email = prof.get("email") or udir.name
+                rows.append({
+                    "email": email,
+                    "data_role": prof.get("data_role") or "base",
+                    "created_at": prof.get("created_at"),
+                    "last_login_at": prof.get("last_login_at"),
+                })
+            except Exception as e:
+                log_with_sid("admin", "warning", f"LIST_USERS_SKIP dir={udir.name}: {e}")
+                continue
+        rows.sort(key=lambda r: r["email"])
+        return rows
+
     def ensure_local_admin(self) -> None:
         """Idempotent boot-time bootstrap of the fixed local admin account
         (settings.LOCAL_ADMIN_USERNAME, default "ladmin"). Only a HASH is ever

@@ -380,3 +380,56 @@ body.admin-ds-page {
   .adm-build-stamp { display: none; }   /* the strip has no room; /version does */
   .adm-main { padding: 20px 16px 50px; }
 }
+
+/* ── Users & Roles ─────────────────────────────────────────────────────── */
+.adm-btn.danger { background: #dc2626; color: #fff; }
+.adm-btn.danger:hover { background: #b91c1c; }
+.adm-users-toolbar { margin-bottom: 12px; }
+.adm-search {
+  width: 320px; max-width: 100%; box-sizing: border-box;
+  border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 12px;
+  font-size: 14px; font-family: inherit;
+}
+.adm-user-role {
+  border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px 8px;
+  font-size: 13px; font-family: inherit;
+}
+.adm-role-card {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 14px 16px; margin-bottom: 10px;
+}
+.adm-role-main { flex: 1; min-width: 0; }
+.adm-role-title {
+  font-weight: 600; font-size: 15px; color: #0f172a;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.adm-role-grants { font-size: 12.5px; color: #64748b; margin-top: 4px; }
+.adm-role-actions { display: flex; gap: 6px; }
+#roleDesc {
+  width: 100%; box-sizing: border-box; resize: vertical;
+  border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 10px;
+  font-family: inherit; font-size: 13.5px;
+}
+
+/* Role access tree (connection → schema → tables) */
+.adm-tree {
+  border: 1px solid #e2e8f0; border-radius: 10px; background: #f8fafc;
+  max-height: 320px; overflow-y: auto; padding: 10px 12px;
+}
+.adm-tree-conn-block { margin-bottom: 10px; }
+.adm-tree-conn-block:last-child { margin-bottom: 0; }
+.adm-tree-schemas { margin-left: 22px; }
+.adm-tree-schema-block { margin-top: 4px; }
+.adm-tree-leaves { margin-left: 22px; }
+.adm-tree-leaf { margin-top: 2px; }
+.adm-tree-empty { font-size: 12.5px; padding: 2px 0 4px; }
+.adm-tree .adm-label-note { margin-left: 6px; }
+.adm-tree input:disabled + span { color: #94a3b8; }
+
+/* Wizard step-3 Access panel */
+.adm-access-panel {
+  border: 1px solid #e2e8f0; border-radius: 10px; background: #f8fafc;
+  padding: 8px 12px; margin-bottom: 14px;
+}
+.tw-access-row { margin: 3px 0; }
+.tw-access-row input:disabled + span { color: #94a3b8; }

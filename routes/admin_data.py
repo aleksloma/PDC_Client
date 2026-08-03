@@ -220,6 +220,14 @@ async def delete_connection(request: Request, cid: str):
             {"error": "Registered tables still use this connection.",
              "tables": res.get("tables") or []},
             status_code=409)
+    # Best-effort prune of the connection's scope grants + cascaded table ids
+    # from every role (mirror of the single-table delete prune).
+    try:
+        import roles_store
+        roles_store.RolesStore().remove_connection(
+            cid, res.get("deleted_tables") or [], actor=email)
+    except Exception as e:
+        log_with_sid(email, "warning", f"CONN_DELETE_ROLE_PRUNE_FAILED: {e}")
     return res
 
 
@@ -1470,6 +1478,20 @@ async def save_table(request: Request, tid: str = ""):
 
     saved = store.upsert_table(doc, actor=email)
 
+    # Access panel (wizard step 3): canonical storage on the ROLE records,
+    # never on the table doc. Absent field ⇒ no role writes (recommendation
+    # Accept + pre-feature API payloads). Best-effort: a role write failure
+    # never fails the save (Article IV).
+    access_role_ids = body.get("access_role_ids")
+    if isinstance(access_role_ids, list):
+        try:
+            import roles_store
+            roles_store.RolesStore().set_table_roles(
+                saved["id"], [r for r in access_role_ids if isinstance(r, str)],
+                actor=email)
+        except Exception as e:
+            log_with_sid(email, "warning", f"TABLE_ACCESS_ROLES_FAILED: {e}")
+
     # Snapshot (or re-snapshot). A failure keeps the registration saved with
     # last_refresh_error set — "Refresh now" retries.
     import db_scheduler
@@ -1489,6 +1511,14 @@ async def delete_table(request: Request, tid: str):
         tid, actor=email, drop_snapshot=body.get("drop_snapshot", True))
     if not ok:
         return JSONResponse({"error": "Unknown table."}, status_code=404)
+    # Best-effort prune from every role's table_ids (a stale id grants
+    # nothing — the effective set intersects the live registry — but would
+    # clutter the roles UI forever).
+    try:
+        import roles_store
+        roles_store.RolesStore().remove_table(tid, actor=email)
+    except Exception as e:
+        log_with_sid(email, "warning", f"TABLE_DELETE_ROLE_PRUNE_FAILED: {e}")
     return {"ok": True}
 
 

@@ -37,6 +37,7 @@ from routes.report import router as report_router
 from routes.schema import router as schema_router
 from routes.dashboards import router as dashboards_router
 from routes.admin_data import router as admin_data_router
+from routes.admin_users import router as admin_users_router
 
 
 _HERE = Path(__file__).resolve().parent
@@ -81,6 +82,8 @@ async def lifespan(app: FastAPI):
     # lifespan-scoped on purpose: an import-time thread would leak into every
     # pytest session (the local_store sweeper lesson).
     AuthStore().ensure_local_admin()
+    import roles_store
+    roles_store.RolesStore().ensure_base_role()
     import db_scheduler
     db_scheduler.start()
     yield
@@ -170,6 +173,7 @@ app.include_router(chat_router)
 app.include_router(report_router)
 app.include_router(dashboards_router)
 app.include_router(admin_data_router)
+app.include_router(admin_users_router)
 
 
 @app.get("/", response_class=HTMLResponse)

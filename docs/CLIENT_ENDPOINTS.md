@@ -225,8 +225,8 @@ files already send cross via `schema_text` / `schema_autofill`.
 
 | Method | Path | Behavior |
 |---|---|---|
-| `GET` | `/api/db_tables` | Registered NON-connector tables for the Create-New / Add Data picker: `{tables: [{table_id, display_name, description, row_count, refreshed_at}]}`. Connector (helper/join) tables are never listed — they are auto-included through the relations graph. |
-| `POST` | `/session/db_tables` | Body `{table_ids: [...]}`. Sets the temp session's DB-table selection: validates ids, **rejects a directly-selected connector (400)**, expands through the connector relations graph (transitive, undirected, capped — frozen into the session meta so later admin edits never silently change an existing chat), REPLACES any previous selection, and writes meta-only entries built from the registry (no brain call, no snapshot read). The wizard calls it between `/upload` and `/schema_autofill_full`; `/upload` defensively preserves DB entries across its session reset. |
+| `GET` | `/api/db_tables` | Registered NON-connector tables for the Create-New / Add Data picker, **filtered to the requester's role** (`roles_store.allowed_table_ids_for` — explicit grants ∪ schema/connection scope grants, computed per request): `{tables: [{table_id, display_name, description, row_count, refreshed_at}]}`. Connector (helper/join) tables are never listed — they are auto-included through the relations graph and exempt from role checks. A Base-role user with no grants gets an empty list. |
+| `POST` | `/session/db_tables` | Body `{table_ids: [...]}`. Sets the temp session's DB-table selection: validates ids, **rejects a directly-selected connector (400)**, **rejects seeds outside the requester's role (403 `{error, code:"ROLE_DENIED"}` naming the denied display names)** — the connector CLOSURE below stays exempt (gating connectors would silently break allowed joins) — expands through the connector relations graph (transitive, undirected, capped — frozen into the session meta so later admin edits never silently change an existing chat), REPLACES any previous selection, and writes meta-only entries built from the registry (no brain call, no snapshot read). The wizard calls it between `/upload` and `/schema_autofill_full`; `/upload` defensively preserves DB entries across its session reset. |
 
 `/schema_autofill_full`, `/generate_chatdata` and `/add_data_to_chat` accept a
 DB-only session (their "no dataframes → 400" guards also count DB selections);
@@ -242,14 +242,20 @@ chats get `db_tables: []`, `data_as_of: null`):
 ```jsonc
 {
   "db_tables": [{"df_key", "table_id", "display_name", "is_connector",
-                  "auto_included", "row_count", "refreshed_at", "missing"}],
+                  "auto_included", "row_count", "refreshed_at", "missing",
+                  "allowed"}],
   "data_as_of": "2026-07-27T00:00:12+00:00"   // MIN refreshed_at — oldest data in the chat
 }
 ```
 
 The `/lab` topbar shows "Data as of <refreshed_at>" from this. A `missing`
 table (unregistered / snapshot gone) is skipped by `load_dataframes` and the
-existing refresh key-freeze disables items that referenced its key.
+existing refresh key-freeze disables items that referenced its key. `allowed`
+(additive) is the requester's ROLE verdict per table (connectors always
+`true`; a role-probe failure reports `true` — the server-side refresh gate is
+the enforcement): dashboard.js / dashboard_view.js pre-freeze refresh buttons
+whose code references an `allowed:false` table with a role tooltip instead of
+letting the click fail.
 
 ### Admin routes — `/api/admin/*` (role == "admin" only)
 
@@ -267,14 +273,14 @@ or `url_override`). Every admin action appends to the append-only audit JSONL
 | `GET/POST` | `/api/admin/connections` | list (masked) / create. Create requires `CLIENT_ENCRYPTION_KEY` (else 503 — passwords are Fernet-encrypted at rest, never plaintext) |
 | `POST` | `/api/admin/connections/test` | SELECT-1 probe with a short connect timeout. Accepts `{connection_id}` OR a full unsaved draft incl. `password` (Test-before-Save). `{ok, error?, server_version?, elapsed_ms}` |
 | `POST` | `/api/admin/connections/{cid}` | edit; omitted/empty `password` keeps the stored credential |
-| `POST` | `/api/admin/connections/{cid}/delete` | `409 {tables:[…]}` while registered tables reference it; `{cascade:true}` deletes those tables + snapshots too |
+| `POST` | `/api/admin/connections/{cid}/delete` | `409 {tables:[…]}` while registered tables reference it; `{cascade:true}` deletes those tables + snapshots too. Best-effort prunes the connection's scope grants + cascaded table ids from every role (`roles_store.remove_connection`) |
 | `GET` | `/api/admin/connections/{cid}/schemas`, `…/tables?schema=` | live introspection listings; already-registered tables carry `registered`, `table_id`, and `registered_as` (the registration's display name — the wizard disables those rows: a physical table registers only once) |
 | `POST` | `/api/admin/connections/{cid}/refresh` | Refresh-now for every table on the connection (sequential) |
 | `POST` | `/api/admin/tables/introspect` | columns+dtypes / PK / FK / indexes / comment via SQLAlchemy Inspector + catalog-estimate row count & size (degraded gracefully on missing catalog privileges — never `COUNT(*)` on a customer table) + first-rows preview (admin's browser only). v4.2: additive `classification:{suggested_type, reason}` from the columns already in hand (no extra round-trip) — the wizard pre-ticks its connector box from it instead of assuming every recommended table is a connector; an explicit prefill and a registered table's stored type both win over it |
 | `POST` | `/api/admin/tables/draft_descriptions` | AI-drafted ENGLISH table+column descriptions via the existing `brain_client.schema_autofill` (same truncated sampled hints files send; payload carries no host/user/password/connection id). **Persists nothing** — one of the four mandatory-confirm locks |
-| `GET/POST` | `/api/admin/tables`, `POST /api/admin/tables/{tid}` | list / register / edit + snapshot. **One registration per physical table** (connection + schema + table, case-insensitive): a save creating a physical mapping another registration already covers → `400 DUPLICATE_TABLE` naming it; an edit that keeps its stored physical key always passes — including on a LEGACY duplicate (stored duplicates keep loading and working; only NEW saves are blocked, connector-vs-normal is toggled on the existing registration instead). **Mandatory confirm**: `confirm:true` required (`400 CONFIRM_REQUIRED`); `descriptions_confirmed_by/at` stamped from the session + server clock, never the body; a fresh introspection must match the posted column set (`409 SCHEMA_DRIFT`). Snapshot failure keeps the registration saved with `last_refresh_error` (Refresh retries); success = chunked SELECT → parquet, atomic `os.replace` |
+| `GET/POST` | `/api/admin/tables`, `POST /api/admin/tables/{tid}` | list / register / edit + snapshot. Optional body field `access_role_ids: [role ids]` (the wizard step-3 **Access** panel): after the save, the table id is reconciled into exactly those roles' `table_ids` via `roles_store.set_table_roles` (canonical storage on the ROLE record — the table doc never carries access; scope-covered roles are checked+disabled in the UI and excluded from the list). Field ABSENT ⇒ no role writes (recommendation-Accept + pre-feature payloads); a role write failure never fails the save. **One registration per physical table** (connection + schema + table, case-insensitive): a save creating a physical mapping another registration already covers → `400 DUPLICATE_TABLE` naming it; an edit that keeps its stored physical key always passes — including on a LEGACY duplicate (stored duplicates keep loading and working; only NEW saves are blocked, connector-vs-normal is toggled on the existing registration instead). **Mandatory confirm**: `confirm:true` required (`400 CONFIRM_REQUIRED`); `descriptions_confirmed_by/at` stamped from the session + server clock, never the body; a fresh introspection must match the posted column set (`409 SCHEMA_DRIFT`). Snapshot failure keeps the registration saved with `last_refresh_error` (Refresh retries); success = chunked SELECT → parquet, atomic `os.replace` |
 | `POST` | `/api/admin/tables/{tid}/refresh` | Refresh-now (same `db_scheduler.refresh_one_table` the nightly run uses). Returns `{ok, rows, bytes, refreshed_at, drift:{added,removed}}`; on schema drift every chat meta referencing the table is re-synced with the `_resync_meta_after_add` carry-over rules (user edits survive, vanished columns deleted). A failed refresh keeps the previous snapshot AND `refreshed_at` — chats serve the last good data |
-| `POST` | `/api/admin/tables/{tid}/delete` | unregister (+ delete the snapshot by default) |
+| `POST` | `/api/admin/tables/{tid}/delete` | unregister (+ delete the snapshot by default). Best-effort prunes the id from every role's `table_ids` (a stale id grants nothing — effective access intersects the live registry — but would clutter the roles UI) |
 | `POST` | `/api/admin/relations/scan` | **relation discovery** (proposals only — nothing is applied without an explicit accept): live-introspects every registered table for declared FKs (FKs are not persisted in the registry; an unreachable connection lands in `degraded[]` and only skips FK evidence) + deterministic name/description-similarity candidates (ubiquity down-weighted, no LLM), verifies each candidate against the local snapshot parquets (cardinality with direction normalization, overlap %, orphan count; missing snapshot → `unverified`), excludes already-declared relations (either orientation), and bands `confirmed` / `suggested` / `attention`. PHYSICAL-IDENTITY PRECISION: candidates joining two registrations of ONE physical source (connection + schema + table) are never proposed; a relation confirmed to ANY registration of a physical target suppresses re-proposals to its duplicates; duplicate-registration fan-out collapses to ONE candidate targeting the preferred registration (connector first, then earliest-registered) carrying `alternate_targets:[{id,label}]`. Returns `{ok, candidates:[…], degraded:[…], confirmed_count, unregistered_refs:[{connection_id, schema, table, referenced_by, referenced_by_ids}]}` (`confirmed_count` = total confirmed relation entries, explains a zero-candidate scan — `analyze_sql` returns it too; `unregistered_refs` = FKs on registered tables pointing at UNREGISTERED physical tables, connection-scoped, each entry additively carrying `referenced_pairs` aligned with `referenced_by_ids` — missing-table column first, empty on a malformed FK, rendered with a "Register as connector" wizard-prefill shortcut) — aggregates only, never values. v4: the scan also UPSERTS these refs into the persistent "Recommended tables" (source `fk`), and replays the stored SQL evidence of `registered`-status recommendations through the same candidate pipeline (merge → verify → band), so a table registered via the wizard gets its SQL-derived relations proposed on the next scan without re-pasting anything. v4.1: replayed evidence passes `validate_rec_evidence` first — pairs naming columns the now-known registration lacks are excluded (never a bogus candidate; this is also how corrupted/stale stores are handled, no migration) and surfaced in the additive response key `evidence_warnings:[{table, column, source:"sql-evidence"}]` + a `REL_REPLAY_INVALID_COLUMN` log line per pair |
 | `POST` | `/api/admin/relations/analyze_sql` | `{sql, db_type?}` — extracts join candidates from admin-pasted SELECT statements with sqlglot (aliases/CTEs/subqueries resolved; composite ON predicates → one multi-column candidate; literal predicates dropped; pair frequency counted across distinct statements). **The SQL TEXT is parsed in memory on this client only — never persisted, logged, audited, or sent to the brain**; the audit rows and any error text carry counts only (sqlglot messages embed the SQL and never leave the parser). v4: only table/column IDENTIFIERS extracted from it persist — predicates touching UNREGISTERED tables leave anchored evidence in `stats.unregistered_joins` (`{name, other:{table_id|name}, pairs [missing-table column first], count}`, per-statement-deduped, ≤20 distinct tables per analyze) plus per-table counts in `stats.unregistered_tables`, and evidence whose name resolves to ONE connection (the hint rule) is upserted into the persistent "Recommended tables" (source `sql`; response gains `recommendations:{created,updated}`). v4.1 — wrong SQL is a first-class case, never a silent drop: any predicate side resolving to a REGISTERED table has its column validated (case-insensitively — sqlglot's qualify normalizes identifier case on the happy path, the fallback path preserves raw casing) against registry metadata; an invalid pair is skipped (candidate AND evidence — valid pairs of the same statement are kept) and reported in additive `stats.invalid_column_refs:[{statement (1-based over the ANALYZED statements — the salvage parser drops unparseable chunks), table, column (SQL-side spelling)}]` (deduped, capped 20) which the UI renders with "the script may be outdated or wrong — treat its evidence with caution" wording. Additive `stats.unresolved_predicates` counts predicates whose column reference cannot be resolved at all (computed CTE/subquery projections, unqualified column refs — a KNOWN LIMITATION: such joins contribute no evidence; the counter makes the drop visible, semantics unchanged). Join endpoints resolving to duplicate registrations of one physical table pick the preferred registration; endpoints spanning DIFFERENT physical tables (same name, two connections) stay ambiguous and are dropped; endpoints matching NO registration are reported in `stats.unknown_tables` (names from the admin's own SQL, response-only — the UI explains a zero-candidate run with them). The same physical-identity filters/dedupe as scan apply. Returns candidates + `stats {statements, parsed, failed, unknown_tables}` + `unknown_table_hints:[{name, connection_id, schema, table}]` (register-shortcut hints, offered only when the connection is unambiguous — one connection exists, or exactly one connection's registered tables share the schema — and never for names that already match a registered table) |
 | `POST` | `/api/admin/relations/accept` | `{relations:[{table_id, related_table_id, join_keys, cardinality?, origin?, replaces?}]}` (bulk = same endpoint) — writes accepted candidates into the child table's `relations` in `data_sources.json` using the extended format. Validates ids/columns/cardinality/origin (400), skips duplicates in either orientation (`skipped` count), groups items per child table into ONE read-modify-write. v4.1: a join key naming a nonexistent column is rejected with a readable per-side message naming the table and the column ("Column 'city_code' does not exist on 'tr data'.") — the v1-era message fused the pair into a single 'a=b' token and leaked `relations[N]` internals; semantics (400 + ok:false audit) unchanged. `replaces: {related_table_id|related_table, join_keys}` is the overview **Edit** path: the matching old entry is swapped for the new one in the same write (`replaced` count in the response/audit); an edit that would duplicate a DIFFERENT existing entry is skipped WITH the old entry preserved (never a silent delete); a stale `replaces` degrades to a plain accept. Deliberately **no confirm gate / SCHEMA_DRIFT / re-snapshot** — those locks protect the column+description shape, which this endpoint cannot touch. NOTE: the read-modify-write is not atomic vs a concurrent nightly refresh of the same table doc (same exposure class as save) |
@@ -288,6 +294,41 @@ or `url_override`). Every admin action appends to the append-only audit JSONL
 | `POST` | `/api/admin/relations/wizard_suggest` | relation suggestions for the register wizard's relations step: `{editing_tid?, connection_id?, schema, table_name, display_name?, columns:[{name,pk?,description?}], foreign_keys:[introspection fk dicts], relations:[current wizard rows], sample:{columns,rows}?}` (`connection_id` feeds the physical-identity filters — same-physical exclusion and duplicate-registration dedupe apply exactly as in scan) — everything comes from state the wizard already holds; **no live DB access, nothing written**. FK candidates (`precheck:true`, cardinality `N:1` unless the parent snapshot measured non-unique — FK direction is ground truth, and referred tables resolve across ALL connections) + name/description similarity (`precheck:false`); duplicates vs stored AND just-typed relations excluded in either orientation. Verification: parent side from its snapshot parquet, child side ESTIMATED from the preview sample (`estimated:true`; overlap = share of sample keys found in the parent snapshot; a candidate whose measured direction had to be flipped drops its numbers rather than show a misleading estimate; missing snapshot/sample → `unverified`). Orientation is always normalized so the WIZARD table is the stored child. Sample row values never reach the audit — counts only (Article II) |
 | `GET/POST` | `/api/admin/refresh_settings` | nightly schedule `{refresh_enabled, refresh_time "HH:MM" container-local, next_run_at, last_run_at, last_run_summary}`; 400 on a bad time |
 | `GET` | `/api/admin/audit?limit=` | newest-first tail of `admin_audit.jsonl` |
+
+### Admin routes — Users & Roles (`routes/admin_users.py`, same `/api/admin` prefix + guard)
+
+User management for the DB-table role gate. One role per user (`data_role` on
+`users/{email}/profile.json`, default the built-in **Base** role, id `"base"`);
+roles live in `DATA_ROOT/roles.json` (`roles_store.RolesStore`) as
+`{id, name, description, table_ids:[], scope_grants:[{connection_id,
+schema|null}]}` — `schema:null` = the whole connection, grants cover tables
+**registered later** too (effective access is computed per request, never
+frozen). Deleting a role reverts its members to Base DYNAMICALLY — dangling
+`data_role` ids resolve to Base at read time, no profile rewrites. Emails are
+always body-carried (never path params); role ids are path params.
+
+| Method | Path | Behavior |
+|---|---|---|
+| `GET` | `/api/admin/users` | Everyone with a readable profile, sorted by email: `{users:[{email, role_id (RESOLVED — dangling→"base"), role_name, created_at, last_login_at}]}`. The config-only local admin and any `role=="admin"` profile are excluded. `last_login_at` is stamped by `_start_session` on every login (both branches); `created_at` = first login |
+| `POST` | `/api/admin/users/set_role` | `{email, role_id}` → `{ok, user}`. 400 missing email / ladmin / admin account / unknown role; 404 unknown user. Audited `user.set_role` |
+| `GET` | `/api/admin/roles` | `{roles:[{…, is_base, member_count}]}` — Base first, then name order; `member_count` counts RESOLVED members |
+| `POST` | `/api/admin/roles` | create: `{name, description?, table_ids?, scope_grants?}` → 201 `{role}`. 400: empty/duplicate name (case-insensitive, "base" reserved), unknown table id, **connector table id** (exempt from role checks — ungrantable), unknown connection in a grant, malformed grant. Audited `role.create` |
+| `POST` | `/api/admin/roles/{rid}` | edit (fields present ⇒ replace, absent ⇒ keep). 404 unknown; 400 renaming Base (description/grants stay editable). Audited `role.update` |
+| `POST` | `/api/admin/roles/{rid}/delete` | → `{ok, reverted_members}` (a COUNT — the revert is dynamic, nothing rewritten). 400 Base; 404 unknown. Audited `role.delete` |
+
+The wizard save's `access_role_ids` writes through `roles_store.set_table_roles`
+(audited `role.set_tables`). Admin-page UI: **Users** section (searchable list,
+instant role dropdown) + **Roles** section (cards + a tri-state access tree
+connection → schema → tables; checking a schema/connection stores a scope
+grant and locks its descendants "via schema/connection").
+
+**Role-gate enforcement map** (client-side only, no brain involvement):
+`GET /api/db_tables` (picker filter) · `POST /session/db_tables` (403 seeds)
+· `POST /api/chat/{id}/refresh_item` + dashboard tile refresh (per-table
+block, below) · `GET /api/chat/{id}/schema` (advisory `allowed` flag).
+Deliberately NOT gated (decision: no retroactive blocking — snapshots stay
+viewable): `chat/stream`, `edit_regenerate`, full-table/Download-Excel
+re-execution, Auto Analytics, and the central nightly scheduler.
 
 **Security invariants** (stated in code — `db_connector.py`, `sandbox_guard.py`):
 the connector only ever issues SELECT/introspection statements
@@ -467,6 +508,19 @@ refreshed to reflect the new data.
 - Auth/permission failures use HTTP codes; **execution** failures return
   `200 {ok: false, error}` — the frontend keeps the previous render and shows
   a small non-blocking note.
+- **Role gate** (`_role_refresh_block`, shared with the dashboard tile
+  refresh): when the item's code references (same `dfs['…']` key regex as the
+  freeze below) a non-connector DB table the REQUESTER's role does not cover,
+  the refresh returns `200 {ok:false, code:"ROLE_DENIED", blocked_tables,
+  error}` — per-table semantics: an item touching only allowed tables still
+  refreshes even when the chat holds denied ones. Denied frames are ALSO
+  dropped from the exec namespace (`drop_df_keys`, filtered AFTER the per-chat
+  cached load) so unreferenced access is impossible. For shared chats the gate
+  keys on the requester, not the owner. The dashboard tile variant returns the
+  caller-specific `{ok:false, frozen:true, reason:"role_denied",
+  blocked_tables}` — never persisted (mirror of `access_revoked`). File-only
+  chats perform zero role reads. An unexpected gate crash fails OPEN (logged
+  `ROLE_GATE_FAILED`); genuine denials fail closed through Base-role defaults.
 - **Refresh freezing** (frontend): a button whose stored code subscripts a df
   key (`dfs['…']` / `dfs["…"]` — exact keys only, no column analysis) that no
   longer exists in `/api/chat/{id}/schema` renders **disabled** (greyed, not

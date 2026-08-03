@@ -110,6 +110,9 @@ def _start_session(request: Request, email: str, *, remember: bool,
     # Issue a per-session SID for the temp UserStore (the upload flow keys off it)
     if not request.session.get("sid"):
         request.session["sid"] = "s_" + secrets.token_hex(8)
+    # Single funnel for BOTH login branches (new-user and returning) — the one
+    # place to stamp last_login_at. touch_last_login never raises.
+    AuthStore().touch_last_login(email)
 
 
 def _send_welcome_email_async(email: str) -> None:

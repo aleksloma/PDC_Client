@@ -1941,17 +1941,24 @@ function _splitJoinedCode(code) {
 // static analysis of the code. Evaluated when buttons render (live + history
 // reload) and re-evaluated after an Add Data completes.
 let currentChatDfKeys = null;   // Set of df keys for the open chat; null = unknown → leave enabled
+// DB-table df keys the user's ROLE does not cover (schema rows with
+// allowed=false) — refresh buttons referencing one grey out proactively with
+// a role tooltip; the server-side gate is the enforcement. null = unknown.
+let currentChatBlockedKeys = null;
 
 async function _loadCurrentDfKeys(chatId) {
   try {
     const res = await fetch(`/api/chat/${chatId}/schema`);
-    if (!res.ok) { currentChatDfKeys = null; _updateDataAsOfBadge(null); return; }
+    if (!res.ok) { currentChatDfKeys = null; currentChatBlockedKeys = null; _updateDataAsOfBadge(null); return; }
     const data = await res.json();
     currentChatDfKeys = new Set((data.files || []).map(f => f.file_name).filter(Boolean));
+    currentChatBlockedKeys = new Set((data.db_tables || [])
+      .filter(t => t.allowed === false).map(t => t.df_key).filter(Boolean));
     _updateDataAsOfBadge(data);
   } catch (e) {
     console.warn('df-keys fetch failed — refresh pre-freeze inactive:', e);
     currentChatDfKeys = null;
+    currentChatBlockedKeys = null;
     _updateDataAsOfBadge(null);
   }
 }
@@ -1985,11 +1992,11 @@ function _extractDfKeysFromCode(code) {
   return keys;
 }
 
-function _freezeRefreshButton(btn) {
+function _freezeRefreshButton(btn, title) {
   btn.disabled = true;
   btn.classList.add('pdc-refresh-frozen');
   btn.classList.remove('pdc-refresh-spinning');
-  btn.title = _t('lab.refresh_frozen', "Data structure changed — this chart/table can't be refreshed.");
+  btn.title = title || _t('lab.refresh_frozen', "Data structure changed — this chart/table can't be refreshed.");
 }
 
 function _unfreezeRefreshButton(btn) {
@@ -2003,8 +2010,17 @@ function _unfreezeRefreshButton(btn) {
 function _applyKeyFreeze(btn) {
   if (btn._pdcFailFrozen) { _freezeRefreshButton(btn); return; }
   if (!currentChatDfKeys) return;   // keys unknown → leave as-is
-  const missing = _extractDfKeysFromCode(btn._pdcCode).some(k => !currentChatDfKeys.has(k));
-  if (missing) _freezeRefreshButton(btn); else _unfreezeRefreshButton(btn);
+  const keys = _extractDfKeysFromCode(btn._pdcCode);
+  const missing = keys.some(k => !currentChatDfKeys.has(k));
+  if (missing) { _freezeRefreshButton(btn); return; }
+  // Role gate pre-freeze: the item references a DB table the user's role
+  // does not cover — the server would refuse the refresh anyway.
+  if (currentChatBlockedKeys && keys.some(k => currentChatBlockedKeys.has(k))) {
+    _freezeRefreshButton(btn, _t('lab.refresh_no_access',
+      "Your role doesn't include this table's data — refresh is unavailable. Showing the last saved result."));
+    return;
+  }
+  _unfreezeRefreshButton(btn);
 }
 
 // Re-evaluate every rendered refresh button (called after Add Data completes —
@@ -2065,7 +2081,13 @@ async function _postRefreshItem(code, kind) {
     let data = null;
     try { data = await res.json(); } catch (e) { data = null; }
     if (!res.ok || !data || data.error || data.ok === false) {
-      return { __error: (data && (data.error || null)) || undefined };
+      // Role denials carry a machine code — map to the localized message
+      // (the server's `error` string is English-only).
+      const msg = data && data.code === 'ROLE_DENIED'
+        ? _t('lab.refresh_no_access',
+             "Your role doesn't include this table's data — refresh is unavailable. Showing the last saved result.")
+        : (data && (data.error || null)) || undefined;
+      return { __error: msg };
     }
     return data;
   } catch (e) {
