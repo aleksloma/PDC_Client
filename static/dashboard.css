@@ -2419,6 +2419,17 @@ button.danger:hover {
   white-space: nowrap;
 }
 .db-table-empty { color: #6b7280; font-size: 13px; padding: 8px; }
+/* ADD-mode marking: tables already in the target chat (checked + disabled) */
+.db-table-row-existing { cursor: default; }
+.db-table-row-existing:hover { background: transparent; }
+.db-table-row input:disabled + .db-table-name { color: #9ca3af; }
+.db-table-note {
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: #9ca3af;
+  white-space: nowrap;
+}
 .selected-file-row .selected-file-badge.db { background: #001E44; color: #fff; }
 
 /* Top-bar "Data as of" badge (chats using database tables) */

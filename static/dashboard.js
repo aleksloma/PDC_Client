@@ -26,6 +26,12 @@ let addDataTargetChatId = null;
 // sha256}}) of the target chat's source files, fetched when the Add Data
 // wizard opens. Awaited in addFilesToSelection so a fast picker can't race it.
 let addDataFingerprintsPromise = null;
+// DB tables ALREADY in the Add-Data target chat (non-connector table_ids from
+// /schema, fetched at wizard open) — the picker renders them checked+disabled
+// ("Already in this chat"). Deliberately disabled, not just pre-checked:
+// /add_data_to_chat's DB merge is ADD/UPDATE only, so an uncheckable box
+// would falsely suggest removal. null = unknown/create mode (no marking).
+let addDataExistingDbTableIds = null;
 
 const ALLOWED_UPLOAD_EXTENSIONS = ['xlsx', 'xls', 'csv', 'tsv'];
 
@@ -3436,6 +3442,7 @@ function openCreateWizard() {
   _setWizardMode('create');
   addDataTargetChatId = null;
   addDataFingerprintsPromise = null;
+  addDataExistingDbTableIds = null;
   selectedFiles = [];
   renderSelectedFilesList();
   _updateWizardGenerateBtn();
@@ -3575,16 +3582,25 @@ function _renderDbTableList() {
   (_dbTablesCache || []).forEach(t => {
     const name = t.display_name || '';
     if (q && !name.toLowerCase().includes(q)) return;
+    // ADD mode: tables the target chat already contains render checked +
+    // DISABLED (display-only — they never join selectedFiles, so the count
+    // badge keeps counting NEW selections only).
+    const already = wizardMode === 'add' && addDataExistingDbTableIds
+      && addDataExistingDbTableIds.has(t.table_id);
     const row = document.createElement('label');
-    row.className = 'db-table-row';
+    row.className = 'db-table-row' + (already ? ' db-table-row-existing' : '');
     row.title = t.description || '';
     row.innerHTML = `
-      <input type="checkbox" class="db-table-check" ${selected.has(t.table_id) ? 'checked' : ''} />
+      <input type="checkbox" class="db-table-check"
+        ${already || selected.has(t.table_id) ? 'checked' : ''} ${already ? 'disabled' : ''} />
       <span class="db-table-name">${escapeHtml(name)}</span>
+      ${already ? `<span class="db-table-note">${escapeHtml(_t('wizard.db_already_in_chat', 'Already in this chat'))}</span>` : ''}
     `;
-    row.querySelector('.db-table-check').addEventListener('change', (e) => {
-      _toggleDbTable(t, e.target.checked);
-    });
+    if (!already) {
+      row.querySelector('.db-table-check').addEventListener('change', (e) => {
+        _toggleDbTable(t, e.target.checked);
+      });
+    }
     list.appendChild(row);
   });
   if (!list.children.length) {
@@ -3627,6 +3643,11 @@ function openAddDataWizard() {
   // Existing-file fingerprints for the name-collision check — kicked off now,
   // awaited when files are actually picked (addFilesToSelection).
   addDataFingerprintsPromise = _fetchChatFingerprints(currentChatId);
+  // Already-added DB tables for the picker marking — fire-and-forget; the
+  // stateless list render upgrades in place when it lands. Failure → null →
+  // no marking (never blocks the picker).
+  addDataExistingDbTableIds = null;
+  _fetchAddDataDbTableIds(currentChatId);
   const chats = listCache.get('activeChats') || [];
   const chat = chats.find(c => c.chat_id === currentChatId);
   _setWizardMode('add', (chat && chat.name) || '');
@@ -3637,6 +3658,27 @@ function openAddDataWizard() {
   // Fresh temp session for this upload batch (same as Create New)
   fetch('/new_session', { method: 'POST' });
   document.getElementById('createNewModal').classList.remove('hidden');
+}
+
+// Non-connector table_ids already in the Add-Data target chat, from /schema
+// (which the picker's marking needs but _loadCurrentDfKeys doesn't retain).
+async function _fetchAddDataDbTableIds(chatId) {
+  try {
+    const res = await fetch(`/api/chat/${chatId}/schema`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const ids = (data.db_tables || [])
+      .filter(t => !t.is_connector && t.table_id)
+      .map(t => t.table_id);
+    // Only mark while still adding to the SAME chat (a slow response must not
+    // leak into a wizard reopened for another chat or in create mode).
+    if (wizardMode === 'add' && addDataTargetChatId === chatId) {
+      addDataExistingDbTableIds = new Set(ids);
+      _renderDbTableList();
+    }
+  } catch (e) {
+    console.warn('db-table marking fetch failed — picker unmarked:', e);
+  }
 }
 
 // Enable Generate Chat only when there's at least one selected file (or shared Google Sheet).

@@ -234,7 +234,11 @@ autofill **skips** database entries (descriptions are ladmin-confirmed — never
 overwritten). `/add_data_to_chat` merges DB selections by `table_id`: an
 already-present table keeps the chat's (possibly user-edited) descriptions via
 the shared `merge_schema_entry` carry-over; new tables append with a df key
-deduped against the chat's existing keys.
+deduped against the chat's existing keys. Frontend: in ADD mode the picker
+dropdown renders tables already in the target chat **checked + disabled** with
+an "Already in this chat" note (table_ids from a wizard-open `/schema` fetch)
+— disabled deliberately, since the merge is add/update-only and unchecking
+could not remove; merge semantics unchanged.
 
 `GET /api/chat/{chat_id}/schema` additionally returns (additive — file-only
 chats get `db_tables: []`, `data_as_of: null`):
