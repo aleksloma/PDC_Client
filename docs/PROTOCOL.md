@@ -68,13 +68,21 @@ the convenience `kind` + `code` from `_extract_code_kind`.
 ```jsonc
 {
   "raw_text": "```python\\nresult = df.groupby('department')['salary'].mean()...\\n```",
-  "kind": "PYTHON",                       // PYTHON | PLOT_CODE | NO_CODE | CLARIFICATION
+  "kind": "PYTHON",                       // PYTHON | PLOT_CODE | NO_CODE | CLARIFICATION | ANSWER
   "code": "result = df.groupby('department')['salary'].mean()",
   "usage": { "input_tokens": 1234, "output_tokens": 56, "total_tokens": 1290 },
   "context_decision": { "complexity": "simple", "complexity_score": 5, "skills_needed": ["analytics_libraries"], "is_greeting": false, ... },
   "model_used": "gemini-2.5-pro"
 }
 ```
+
+`kind` semantics: `PYTHON` / `PLOT_CODE` carry executable code in `code`;
+`CLARIFICATION` carries the clarifying question in `code`; `NO_CODE` is
+greetings-only (empty `code`); `ANSWER` carries a plain-text/markdown answer
+in `code` for questions about an EXISTING result or method (e.g. "how did
+you compute this?") that need no new computation. The client returns
+`CLARIFICATION` and `ANSWER` text to the user directly without executing
+anything; a flow that requires code treats `ANSWER` exactly like `NO_CODE`.
 
 ---
 
@@ -107,7 +115,7 @@ code" prompt and calls the simple (or complex, on later attempts) model.
 ```jsonc
 {
   "raw_text": "...",
-  "kind": "PYTHON",
+  "kind": "PYTHON",                       // PYTHON | PLOT_CODE | NO_CODE | CLARIFICATION | ANSWER
   "code": "df.groupby('department')['salary'].mean()",
   "usage": { ... },
   "model_used": "gemini-2.5-pro"

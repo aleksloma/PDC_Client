@@ -393,6 +393,66 @@ async def subscription_const(request: Request):
     return {"plan": _FIXED_PLAN, "subscription_plan": _FIXED_PLAN}
 
 
+# --- B2C billing / publishing — disabled in enterprise -----------------------
+# The dashboard template is a verbatim B2C copy that still calls the Paddle
+# billing + publish endpoints. Enterprise has no subscriptions (constant
+# "Enterprise" plan) and no public publishing. We return clean responses so the
+# UI degrades gracefully and the access log carries no 404s (mirrors the
+# chat-level publish stub in routes/chat.py). No internals are exposed (Art. IV).
+
+@router.get("/paddle/config")
+async def paddle_config_disabled(request: Request):
+    """Billing is disabled in the enterprise build. Return a benign config so the
+    dashboard's page-load Paddle bootstrap is a no-op (no `client_token` → no
+    `Paddle.Initialize`) and produces no 404 / console error."""
+    return {"enabled": False, "client_token": None, "environment": None}
+
+
+@router.post("/auth/subscription")
+async def subscription_change_disabled(request: Request):
+    """B2C plan-change POST. Enterprise plan is constant; no changes allowed."""
+    email = request.session.get("email")
+    if not email:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    log_with_sid(email, "info", "SUBSCRIPTION_CHANGE_DISABLED")
+    return JSONResponse(
+        {"ok": False, "error": "Subscription changes are not available in the enterprise build."},
+        status_code=400,
+    )
+
+
+@router.post("/api/paddle/subscription/update-payment")
+@router.post("/api/paddle/subscription/reactivate")
+@router.post("/api/paddle/subscription/preview")
+@router.post("/api/paddle/subscription/cancel")
+@router.post("/api/paddle/subscription/update")
+async def paddle_subscription_disabled(request: Request):
+    """All Paddle subscription-management calls — billing is off-prem."""
+    email = request.session.get("email")
+    if not email:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    log_with_sid(email, "info", "PADDLE_SUBSCRIPTION_DISABLED")
+    return JSONResponse(
+        {"ok": False, "error": "Billing is not available in the enterprise build."},
+        status_code=400,
+    )
+
+
+@router.post("/auth/conversations/{conv_id}/publish")
+@router.post("/auth/conversations/{conv_id}/unpublish")
+async def conversation_publish_disabled(request: Request, conv_id: str):
+    """Conversation-level public publish — not available on-prem (sharing is
+    recipient-list only). Mirrors the chat-level publish stub."""
+    email = request.session.get("email")
+    if not email:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    log_with_sid(email, "info", f"CONVERSATION_PUBLISH_DISABLED conv_id={conv_id}")
+    return JSONResponse(
+        {"error": "Public publish is not available in the on-prem build."},
+        status_code=400,
+    )
+
+
 # --- Sidebar listings + renaming --------------------------------------------
 
 @router.get("/auth/active_chats")

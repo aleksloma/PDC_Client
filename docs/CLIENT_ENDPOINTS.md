@@ -400,9 +400,21 @@ The full enterprise split inside one turn:
 1. Client loads dfs from local disk + builds schema text (`_schema_text` port).
 2. POST → `/v1/plan` → brain returns code.
 3. Client executes code locally with `safe_execute` / `render_plot_safe`.
-4. On execution error → POST `/v1/retry` (up to 2 retries), client retries.
+4. On execution error → POST `/v1/retry` → client re-executes. The orchestrator
+   (`run_chat_local`) retries each failing unit up to **3 attempts**, escalating
+   `use_pro` / `use_search` to `true` from the 2nd retry onward. A retry that
+   returns prose (`NO_CODE`/`CLARIFICATION`/`ANSWER`) or the wrong code kind
+   counts as a failed attempt — it never aborts the loop early, so the
+   harder-model escalation is always reached. In a multi-chart response a retry
+   that returns runnable `PYTHON` is executed and accepted only if it produces a
+   chart image. If a multi-chart turn ends with **zero** rendered charts (and no
+   tables), the persisted answer is "Something went wrong with this analysis.
+   Please try again." (never the bare "Analysis complete.").
 5. POST → `/v1/describe` (or `/v1/summarize` for scalar results) → brain
    returns the natural-language intro. No row values cross the boundary.
+6. A plan of kind `CLARIFICATION` or `ANSWER` skips execution entirely — the
+   text is returned to the user as-is (`ANSWER` = a context-based explanation,
+   e.g. "how did you compute this?").
 
 ---
 
@@ -608,6 +620,10 @@ gracefully handles them:
 | `POST /api/chat/{id}/publish`, `/unpublish` | 400 | no public pages on-prem (architecture: sharing is OPEN, public publish is out of scope) |
 | `POST /upload/init`, `/upload/finalize` | 400 | direct-to-GCS path only |
 | `POST /upload_from_url` | 400 | Google Drive/Sheets are off-prem |
+| `GET /paddle/config` | 200 `{enabled:false, client_token:null}` | page-load Paddle bootstrap becomes a no-op (no 404 / console error) |
+| `POST /auth/subscription` | 400 | enterprise plan is constant |
+| `POST /api/paddle/subscription/update-payment`, `/reactivate`, `/preview`, `/cancel`, `/update` | 400 | billing is off-prem |
+| `POST /auth/conversations/{id}/publish`, `/unpublish` | 400 | no public pages on-prem (mirrors the chat-level stub) |
 
 > Auto Analytics (`*/auto_analysis/start|status|download`) is **implemented** on-prem
 > (brain-side planner + client-side execution + PPTX render). See the "Implemented

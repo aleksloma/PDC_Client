@@ -77,6 +77,16 @@ docker run --rm -p 8000:8000 \
 
 Open `http://localhost:8000` → sign in with your work email + password (first login sets the password) → land in `/lab`.
 
+Diagnostic env flags (see `.env.example`):
+
+| Var | Purpose |
+|---|---|
+| `CLIENT_LLM_DEBUG`   | Verbose brain-call debug logging to the LOCAL client log (default OFF; `1`/`true` to enable). Logs `BRAIN_REQUEST` / `BRAIN_RESPONSE` per call. Boundary-safe — brain payloads carry no row values (Art. II). Turn back OFF after diagnosing. |
+| `CLIENT_LLM_DEBUG_MAX_CHARS` | Per-field truncation for the debug logs (default `20000`). |
+
+A failed brain call always logs its HTTP status + body snippet (~2000 chars)
+regardless of `CLIENT_LLM_DEBUG` — an API rejection is never silently swallowed.
+
 ---
 
 ## 3. Local testing — ALWAYS the Docker stack, ALWAYS the persistent data

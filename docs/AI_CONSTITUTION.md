@@ -61,6 +61,21 @@ weaken or bypass this.
 The brain must NOT log full payloads. Use truncated logging
 (`log_with_sid(sid, "info", f"PLAN q='{question[:120]}'")`), never `repr(body)`.
 
+**Exception — `LLM_DEBUG_LOG` (default OFF).** When the operator sets the
+`LLM_DEBUG_LOG` env flag ON, `_call_gemini_rest` emits the FULL system
+instruction + prompt (`LLM_REQUEST`) and the full raw model response
+(`LLM_RESPONSE`), each truncated to `LLM_DEBUG_LOG_MAX_CHARS` (default 20000).
+This stays inside the data boundary because the brain only ever receives the
+Article II metadata (question text, schema text — which, per Article II,
+includes truncated unique-value hints for low-cardinality columns — generated
+code, error text); no raw rows or result tables ever reach the brain, so the
+debug log can expose at most what the protocol already sends the LLM. It is a
+diagnostic switch for validating LLM behavior, OFF by default, and must be
+turned back OFF once validation is done. Independently of the flag, the HTTP
+error body on any non-200 / exception is logged UNCONDITIONALLY (truncated to
+`LLM_ERROR_BODY_LOG_CHARS`, default 2000) — an API rejection must never be
+silently swallowed (Article IV).
+
 ### Shared-vs-client classification
 Skill DEFINITIONS (the YAML files under `brain/skills/domain/` and
 `brain/skills/core/`) are shared brain assets, reusable across all
