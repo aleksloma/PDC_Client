@@ -55,6 +55,7 @@ relay (`/v1/send_welcome_email`, `/v1/send_password_reset_email`).
 | `GET`  | `/auth/active_chats` | list of user's chats |
 | `GET`  | `/auth/conversations` | list of user's conversations |
 | `POST` | `/auth/active_chats/rename` | `{chat_id, title}` |
+| `POST` | `/auth/active_chats/pin` | `{chat_id, pinned}` → `{ok, pinned}` — pin/unpin a chat; pinned chats sort FIRST in `/auth/active_chats` (then newest-first as before). Additive `pinned` flag on the user's own jsonl row; absent = unpinned (old rows unaffected) |
 | `POST` | `/auth/conversations/rename` | `{conv_id, title}` |
 | `POST` | `/auth/conversations/delete` | `{conv_id}` |
 
@@ -70,8 +71,17 @@ enterprise build keeps the same shape so the existing JS works unchanged:
 
 2. **`POST /upload`** (multipart, field `files`) — saves uploads to the
    per-session temp area (under `<DATA_ROOT>/sessions/<sid>/files/`).
-   Returns `{ok, saved, dataframes}` (the same shape the B2C `/upload`
-   returns). **Raw bytes never leave this server.** Excel workbooks load
+   Returns `{ok, saved, dataframes, files}` — the B2C keys unchanged, plus an
+   additive per-file result list: `files: [{file, status: "ok"|"warning"|
+   "error", skipped_rows?, first_bad_line?, message?}]`. CSV parsing is
+   TOLERANT (strict parse first; on failure the python engine skips and
+   COUNTS malformed rows — e.g. an unquoted comma inside a value): a parsed
+   file with skips gets a `warning` row the frontend toasts. A saved file
+   that yields NO dataframe is a per-file `error`, and `/upload` then
+   answers `ok: false` with a top-level `error` naming the bad file(s)
+   (HTTP 400 when every file failed) — it never again answers `ok: true`
+   with an empty `dataframes` list (the old silent no-op). **Raw bytes
+   never leave this server.** Excel workbooks load
    only **visible** sheets — hidden and veryHidden sheets are skipped by
    `load_excel_sheets` (the single choke point every load path shares:
    chat creation, Add Data, and chat-time dataframe loading). A workbook
@@ -345,6 +355,32 @@ never at importable module scope in cleartext.
 
 ---
 
+## Execution sandbox namespace
+
+Generated code runs at two exec sites — `code_exec.safe_execute` (PYTHON
+blocks) and `plot_utils.render_plot_safe` (PLOT_CODE) — each with a
+pre-imported namespace. **Any helper the brain's AVAILABLE LIBRARIES prompt
+promises must be registered at BOTH sites**, or plot code will NameError
+(`upset_plot_from_sets` set the precedent; `exec_sanitizer` and
+`sandbox_guard.SANDBOX_BUILTINS` are likewise installed at both).
+
+Injected names (kept in sync with the brain's planner/classifier library
+lists): `pd, np, plt, sns, px, go` (+ `mticker, mpatches, make_subplots` at
+the plot site); specialized viz `venn2, venn3, venn2_circles, venn3_circles,
+WordCloud, nx, squarify, scipy_stats, msno, calplot, upset_plot_from_sets,
+adjust_text`; ML `train_test_split, LogisticRegression,
+DecisionTreeClassifier, plot_tree, RandomForestClassifier, KMeans,
+StandardScaler, LabelEncoder, accuracy_score, classification_report,
+confusion_matrix, roc_curve, auc, silhouette_score`; deterministic outlier
+helpers **`outlier_mask(series)`** and **`drop_extreme_outliers(df, col) →
+(filtered_df, n_dropped)`** (`outlier_utils.py` — the union of robust
+median/MAD + 1st-99th percentile + 3×IQR tests with a gap guard, exactly the
+algorithm the planner prompt used to spell out inline; QA 2.6); data
+`dfs` (+ a `df` first-frame alias at the python site) and `RESULT`; guarded
+`__builtins__` (per-call copy of `SANDBOX_BUILTINS`).
+
+---
+
 ## Chat (SSE stream)
 
 **`POST /api/chat/{chat_id}/chat/stream`** — body `{question, conv_id?}`.
@@ -366,6 +402,16 @@ single final event but the frontend handles both paths identically.
 On kill-switch (tenant revoked / suspended), the stream emits a single
 `{error: "Service unavailable. Please contact your administrator.", done: true}`
 event and the chat UI surfaces it to the user.
+
+**Auto Analytics busy guard (QA 2.3):** when Auto Analytics is currently
+`processing` for the chat, `chat/stream` and `edit-regenerate` return an
+immediate `409 {error: "Auto Analytics is currently running for this chat…",
+busy: "auto_analysis"}` BEFORE any history append (fail-open on a corrupt
+meta). The frontend's non-SSE fallback renders the message in the chat. A
+`BrainTimeoutError` mid-generation (pool/connection contention, a subclass of
+`BrainError` caught first) now reads "The analysis service is busy right now.
+Please try again in a moment." — the generic "temporarily unavailable" text is
+reserved for genuine brain unreachability.
 
 **`GET /api/chat/{chat_id}/conversation/{conv_id}/status`** → `{"generating": bool}`.
 Lightweight in-memory registry lookup (no I/O): `true` while a generation worker
@@ -575,7 +621,8 @@ chars, regex-guarded (path-traversal safe). Old-shape docs load with defaults
 | `GET` | `/api/dashboards/{id}` | full doc + `is_owner`; **bumps `last_used_at`** (opened == used) |
 | `POST` | `/api/dashboards/{id}/rename` | `{name}` — owner only (shared recipients → 403) |
 | `POST` | `/api/dashboards/{id}/delete` | owner → deletes the doc (+ own index row); shared recipient → drops only their pointer row (`{ok, deleted: bool}`); idempotent |
-| `POST` | `/api/dashboards/{id}/tiles` | pin one item. Body `{chat_id, kind: "chart"\|"table", description?, code?, image_base64?, is_plotly?, table?, full_table_key?, chart_data?\|chart_data_key?}`. Owner only + `_require_chat(chat_id)` (can only pin from accessible chats). Volatile `chart_data_key` is resolved to durable inline data AT PIN TIME; table rows capped at 50 (honest `total_rows`) with `styled_html`/`dtype`/`title` preserved (styled_html dropped only over 2M chars — plain rows remain) so conditional formatting survives on the tile; chart snapshots >5M chars → 400; `###NEXT_PLOT###` code is nulled (tile renders, can't refresh). **Table code is authoritative-from-record**: when `full_table_key` resolves to a durable record with clean `code`, that code (+ its `result_key`) is stored on the tile — the client-sent code can be the CHART's code in mixed chart+table answers, and the frontend sends no code for a table pinned from such a message. Auto-placed at the layout bottom (w6×h5 on a 12-col grid). |
+| `POST` | `/api/dashboards/{id}/tiles` | pin one item. Body `{chat_id, kind: "chart"\|"table", description?, code?, image_base64?, is_plotly?, table?, full_table_key?, chart_data?\|chart_data_key?}`. Owner only + `_require_chat(chat_id)` (can only pin from accessible chats). Volatile `chart_data_key` is resolved to durable inline data AT PIN TIME; table rows capped at 50 (honest `total_rows`) with `styled_html`/`dtype`/`title` preserved (styled_html dropped only over 2M chars — plain rows remain) so conditional formatting survives on the tile; chart snapshots >5M chars → 400; `###NEXT_PLOT###` code is nulled (tile renders, can't refresh). **Table code is authoritative-from-record**: when `full_table_key` resolves to a durable record with clean `code`, that code (+ its `result_key`) is stored on the tile — the client-sent code can be the CHART's code in mixed chart+table answers, and the frontend sends no code for a table pinned from such a message. **Journal layout defaults (QA 3.1)**: charts are HALF-width (w6) and a new chart pairs into the right half of the previous left-half chart's row (2 per row); tables are FULL-width (w12); text blocks w12×h2. **Text blocks**: `{kind: "text", text (≤2000, required), style: header1\|header2\|paragraph, color: default\|gray\|red\|orange\|green\|blue\|purple, size: S\|M\|L}` — no `chat_id`/snapshot/code; invalid enums → 400; rendered as styled text tiles (draggable/resizable like any tile, visible read-only in the shared view; refresh on them is a no-op that never freezes). Legacy layoutless tiles get a computed half-width default in the GET RESPONSE only (never persisted — the first drag persists real positions). |
+| `POST` | `/api/dashboards/{id}/tiles/{tile_id}/update` | owner only; TEXT tiles only (chart/table tiles → 400 — their content changes via refresh, never free edits). Body: any subset of `{text, style, color, size}`, same validation as create; empty body → 400. Returns `{ok, tile}`. |
 | `POST` | `/api/dashboards/{id}/tiles/{tile_id}/remove` | owner only |
 | `POST` | `/api/dashboards/{id}/layout` | `{tiles: [{tile_id, x, y, w, h}]}` bulk save — owner only; ints validated/clamped, unknown tile_ids ignored (stale client) |
 | `POST` | `/api/dashboards/{id}/tiles/{tile_id}/refresh` | allowed for owner AND shared recipients. Table tiles first **re-resolve + self-heal** their code from the durable full-table record (tiles pinned with a wrong/chart code get the corrected code persisted); tiles with a `result_key` (one table of a multi-table RESULT) re-execute via `_reexecute_full_df` and persist a fresh durable key, others via `run_item_refresh` (Styler results keep `styled_html`). Deleted source chat → persists `frozen/frozen_reason="source_deleted"` on the tile, returns `200 {ok:false, frozen:true, reason}`; a caller without source-chat access gets the same shape with `reason:"access_revoked"` but nothing is persisted (caller-specific). Execution failures → `200 {ok:false, error}`, stored snapshot untouched. Success updates the snapshot (+ re-inlined `chart_data` / new `full_table_key`), clears `frozen`, returns `{ok, kind, image_base64\|table, is_plotly?, tile}`. |
@@ -597,8 +644,13 @@ its `.pdc-action-bar` (live stream, history reload, multi-chart, multi-table)
 that opens the anchored combobox popover; the payload is read at CLICK time so a
 prior in-chat refresh pins the refreshed render. The dashboard page uses
 vendored GridStack 10.3.1 (`static/vendor/gridstack/`, MIT, offline) — drag by
-the tile grab strip, resize by edges, non-overlapping gravity packing, 1-column
-read-only mode under 768px (narrow layout is presentational and never saved).
+the tile grab strip (now a `⠿` grip glyph; the old grey title snippet is gone —
+QA 3.1 — the title lives in the strip tooltip and the info popover), resize by
+edges, non-overlapping gravity packing, 1-column read-only mode under 768px
+(narrow layout is presentational and never saved). Owner-only "＋ Header" /
+"＋ Text" top-bar buttons open the `#textTileModal` (textarea + style/size
+selects + 7 color swatches) to add text blocks between visuals; text tiles get
+an owner-only ✏ edit button instead of the data/code/download/refresh actions.
 Tile toolbar: description popover (backdrop-dismissed — clicks inside Plotly
 iframes don't bubble), Show data / Show code (PDCViewers), Download
 (`export_plotly_png` / client-side PNG / `download_excel`), View larger,

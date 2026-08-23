@@ -493,6 +493,22 @@ async def rename_chat(request: Request):
     return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
 
 
+@router.post("/auth/active_chats/pin")
+async def pin_chat(request: Request):
+    """Pin/unpin a chat in the sidebar (QA 3.2). Body: {chat_id, pinned}.
+    Per-user (each user's own active_chats.jsonl); pinned chats sort first."""
+    email = request.session.get("email")
+    if not email:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    body = await request.json()
+    chat_id = body.get("chat_id")
+    pinned = bool(body.get("pinned"))
+    if not chat_id:
+        return JSONResponse({"error": "Missing chat_id"}, status_code=400)
+    ok = AuthStore().set_chat_pinned(email, chat_id, pinned)
+    return JSONResponse({"ok": ok, "pinned": pinned}, status_code=200 if ok else 404)
+
+
 @router.post("/auth/conversations/rename")
 async def rename_conv(request: Request):
     email = request.session.get("email")

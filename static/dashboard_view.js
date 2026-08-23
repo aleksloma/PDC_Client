@@ -116,6 +116,18 @@
   function renderTileBody(bodyEl, tile) {
     bodyEl.innerHTML = '';
     const snap = tile.snapshot || {};
+    if (tile.kind === 'text') {
+      // Text block (header/comment). textContent only — never innerHTML with
+      // user text (XSS); line breaks via pre-wrap.
+      const div = document.createElement('div');
+      div.className = 'pdc-tile-text'
+        + ' tt-style-' + (tile.style || 'paragraph')
+        + ' tt-color-' + (tile.color || 'default')
+        + ' tt-size-' + (tile.size || 'M');
+      div.textContent = tile.text || '';
+      bodyEl.appendChild(div);
+      return;
+    }
     if (tile.kind === 'chart') {
       const content = snap.image_base64 || '';
       if (isPlotlySnapshot(tile)) {
@@ -247,14 +259,19 @@
     document.body.appendChild(backdrop);
     const pop = document.createElement('div');
     pop.className = 'pdc-tile-pop';
-    pop.textContent = tile.description || '';
+    // Title first (it no longer renders on the tile strip), then description.
+    const title = (tile.title || '').trim();
+    const desc = (tile.description || '').trim();
+    pop.textContent = title && desc && !desc.startsWith(title)
+      ? title + '\n\n' + desc
+      : (desc || title);
     tileCard.appendChild(pop);
     document.addEventListener('keydown', popEscHandler);
   }
 
   // ── tile actions ─────────────────────────────────────────────────────────
   function actShowData(tile) {
-    if (!window.PDCViewers) return;
+    if (!window.PDCViewers || tile.kind === 'text') return;
     if (tile.kind === 'chart') {
       if (tile.chart_data) window.PDCViewers.openData(tile.chart_data);
       return;
@@ -275,6 +292,7 @@
   }
 
   async function actDownload(tile, btn) {
+    if (tile.kind === 'text') return; // no button is rendered; defense in depth
     const original = btn.innerHTML;
     btn.disabled = true;
     try {
@@ -513,38 +531,49 @@
 
     const dragStrip = document.createElement('div');
     dragStrip.className = 'pdc-tile-drag';
-    const titleSpan = document.createElement('span');
-    titleSpan.className = 'pdc-tile-title';
-    titleSpan.textContent = tile.title || '';
-    dragStrip.appendChild(titleSpan);
+    // Grab-handle glyph instead of the old grey title snippet (QA 3.1) — the
+    // title/description stay reachable via the info (i) button.
+    const grip = document.createElement('span');
+    grip.className = 'pdc-tile-grip';
+    grip.textContent = '⠿';
+    grip.setAttribute('aria-hidden', 'true');
+    dragStrip.title = tile.title || '';
+    dragStrip.appendChild(grip);
     content.appendChild(dragStrip);
 
+    const isText = tile.kind === 'text';
     const toolbar = document.createElement('div');
     toolbar.className = 'pdc-tile-toolbar';
-    if (tile.description) {
+    if (!isText && (tile.description || tile.title)) {
       toolbar.appendChild(toolbarBtn('t-info', 'ℹ', _t('dash.tile_description', 'Show description'),
         () => openDescription(content, tile)));
     }
-    const hasData = tile.kind === 'chart'
+    const hasData = !isText && (tile.kind === 'chart'
       ? !!tile.chart_data
-      : !!(tile.full_table_key || ((tile.snapshot || {}).table || {}).rows);
+      : !!(tile.full_table_key || ((tile.snapshot || {}).table || {}).rows));
     if (hasData) {
       toolbar.appendChild(toolbarBtn('t-data', '📊', _t('dash.show_data', 'Show data'),
         () => actShowData(tile)));
     }
-    if (tile.code) {
+    if (!isText && tile.code) {
       toolbar.appendChild(toolbarBtn('t-code', '⟨⟩', _t('dash.show_code', 'Show code'),
         () => actShowCode(tile)));
     }
-    toolbar.appendChild(toolbarBtn('t-dl', '📥', _t('dash.download', 'Download'),
-      (b) => actDownload(tile, b)));
-    toolbar.appendChild(toolbarBtn('t-big', '🔍', _t('dash.view_larger', 'View larger'),
-      () => actViewLarger(tile)));
+    if (!isText) {
+      toolbar.appendChild(toolbarBtn('t-dl', '📥', _t('dash.download', 'Download'),
+        (b) => actDownload(tile, b)));
+      toolbar.appendChild(toolbarBtn('t-big', '🔍', _t('dash.view_larger', 'View larger'),
+        () => actViewLarger(tile)));
+    }
     let refreshBtn = null;
-    if (tile.code) {
+    if (!isText && tile.code) {
       refreshBtn = toolbarBtn('t-refresh', REFRESH_SVG, _t('dash.refresh', 'Refresh with current data'),
         (b) => actRefresh(tile, item, b));
       toolbar.appendChild(refreshBtn);
+    }
+    if (isText && isOwner) {
+      toolbar.appendChild(toolbarBtn('t-edit', '✏️', _t('dash.edit_text', 'Edit text'),
+        () => openTextModal(tile, item)));
     }
     if (isOwner) {
       toolbar.appendChild(toolbarBtn('t-remove', '✕', _t('dash.remove_tile', 'Remove from dashboard'),
@@ -655,6 +684,111 @@
   // ── top-bar actions ──────────────────────────────────────────────────────
   function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
   function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
+
+  // ── text tiles (headers / comments between visuals, QA 3.1) ─────────────
+  const TEXT_COLORS = ['default', 'gray', 'red', 'orange', 'green', 'blue', 'purple'];
+  let textModalState = null; // {tile, item} when editing; null when creating
+
+  function selectedTextColor() {
+    const sel = document.querySelector('#textTileColors .text-swatch.selected');
+    return sel ? sel.dataset.color : 'default';
+  }
+
+  function buildColorSwatches(selected) {
+    const wrap = document.getElementById('textTileColors');
+    wrap.innerHTML = '';
+    TEXT_COLORS.forEach(color => {
+      const s = document.createElement('button');
+      s.type = 'button';
+      s.className = 'text-swatch tt-swatch-' + color + (color === selected ? ' selected' : '');
+      s.dataset.color = color;
+      s.title = color;
+      s.addEventListener('click', () => {
+        wrap.querySelectorAll('.text-swatch').forEach(el => el.classList.remove('selected'));
+        s.classList.add('selected');
+      });
+      wrap.appendChild(s);
+    });
+  }
+
+  function openTextModal(tile, item, preset) {
+    textModalState = tile ? { tile, item } : null;
+    const p = tile || preset || {};
+    document.getElementById('textTileModalTitle').textContent = tile
+      ? _t('dash.edit_text', 'Edit text')
+      : ((preset && preset.style === 'header1')
+        ? _t('dash.add_header', 'Add header') : _t('dash.add_text', 'Add text'));
+    document.getElementById('textTileInput').value = tile ? (tile.text || '') : '';
+    document.getElementById('textTileStyle').value = p.style || 'paragraph';
+    document.getElementById('textTileSize').value = p.size || 'M';
+    buildColorSwatches(p.color || 'default');
+    openModal('textTileModal');
+    document.getElementById('textTileInput').focus();
+  }
+
+  async function saveTextModal() {
+    const text = document.getElementById('textTileInput').value;
+    if (!text.trim()) {
+      showToast(_t('dash.text_required', 'Please enter some text'), true);
+      return;
+    }
+    const fields = {
+      text,
+      style: document.getElementById('textTileStyle').value,
+      size: document.getElementById('textTileSize').value,
+      color: selectedTextColor(),
+    };
+    const btn = document.getElementById('btnSaveTextTile');
+    btn.disabled = true;
+    try {
+      if (textModalState) {
+        // edit in place
+        const { tile, item } = textModalState;
+        const res = await fetch(`/api/dashboards/${DASH_ID}/tiles/${tile.tile_id}/update`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(fields),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data || !data.ok) throw new Error((data && data.error) || 'update failed');
+        Object.assign(tile, fields);
+        renderTileBody(item.querySelector('.pdc-tile-body'), tile);
+      } else {
+        const res = await fetch(`/api/dashboards/${DASH_ID}/tiles`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ kind: 'text', ...fields }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data || !data.ok || !data.tile) throw new Error((data && data.error) || 'add failed');
+        dash.tiles = dash.tiles || [];
+        dash.tiles.push(data.tile);
+        const el = buildTileEl(data.tile);
+        document.getElementById('dashGrid').appendChild(el);
+        if (grid) grid.makeWidget(el);
+        updateEmptyState();
+      }
+      closeModal('textTileModal');
+    } catch (e) {
+      showToast(String(e.message || e), true);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function wireTextTileButtons() {
+    const addHeaderBtn = document.getElementById('btnAddHeader');
+    const addTextBtn = document.getElementById('btnAddText');
+    if (isOwner) {
+      addHeaderBtn.classList.remove('hidden');
+      addTextBtn.classList.remove('hidden');
+      addHeaderBtn.addEventListener('click', () =>
+        openTextModal(null, null, { style: 'header1', size: 'L' }));
+      addTextBtn.addEventListener('click', () =>
+        openTextModal(null, null, { style: 'paragraph', size: 'M' }));
+    }
+    document.getElementById('btnSaveTextTile').addEventListener('click', saveTextModal);
+    document.getElementById('closeTextTile').addEventListener('click', () => closeModal('textTileModal'));
+    document.getElementById('btnCancelTextTile').addEventListener('click', () => closeModal('textTileModal'));
+  }
 
   function wireTopBar() {
     document.getElementById('btnRefreshAll').addEventListener('click', refreshAll);
@@ -818,6 +952,7 @@
     }
 
     wireTopBar();
+    wireTextTileButtons();
     updateEmptyState();
     initGrid();
   });

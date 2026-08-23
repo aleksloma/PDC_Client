@@ -135,10 +135,82 @@
 .pdc-tile-drag:active { cursor: grabbing; }
 .dash-readonly .pdc-tile-drag { cursor: default; }
 
-.pdc-tile-title {
-  overflow: hidden;
-  text-overflow: ellipsis;
+/* Grab-handle glyph (replaced the grey title snippet — QA 3.1; the title
+   lives in the strip's tooltip and the info popover now) */
+.pdc-tile-grip {
+  display: block;
+  width: 100%;
+  text-align: center;
+  color: #9ca3af;
+  font-size: 13px;
+  line-height: 1;
+  letter-spacing: 2px;
 }
+.dash-readonly .pdc-tile-grip { visibility: hidden; }
+
+/* Text tiles (headers / comments) */
+.pdc-tile-text {
+  padding: 4px 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+  height: 100%;
+}
+.tt-style-header1 { font-size: 1.6em; font-weight: 700; line-height: 1.25; }
+.tt-style-header2 { font-size: 1.25em; font-weight: 600; line-height: 1.3; }
+.tt-style-paragraph { font-size: 1em; font-weight: 400; line-height: 1.5; }
+.tt-size-S { font-size: 0.85em; }
+.tt-size-M { }
+.tt-size-L { font-size: 1.25em; }
+.tt-style-header1.tt-size-S { font-size: 1.35em; }
+.tt-style-header1.tt-size-M { font-size: 1.6em; }
+.tt-style-header1.tt-size-L { font-size: 2em; }
+.tt-style-header2.tt-size-S { font-size: 1.1em; }
+.tt-style-header2.tt-size-M { font-size: 1.25em; }
+.tt-style-header2.tt-size-L { font-size: 1.5em; }
+.tt-color-default { color: var(--ink, #1f2328); }
+.tt-color-gray { color: #6b7280; }
+.tt-color-red { color: #dc2626; }
+.tt-color-orange { color: #ea580c; }
+.tt-color-green { color: #16a34a; }
+.tt-color-blue { color: #2563eb; }
+.tt-color-purple { color: #7c3aed; }
+
+/* Text-tile modal controls */
+.text-tile-opts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 13px;
+}
+.text-tile-opts select {
+  padding: 6px 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  font-size: 13px;
+}
+.text-tile-colors {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+.text-swatch {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  padding: 0;
+}
+.text-swatch.selected { border-color: #111827; }
+.tt-swatch-default { background: #1f2328; }
+.tt-swatch-gray { background: #6b7280; }
+.tt-swatch-red { background: #dc2626; }
+.tt-swatch-orange { background: #ea580c; }
+.tt-swatch-green { background: #16a34a; }
+.tt-swatch-blue { background: #2563eb; }
+.tt-swatch-purple { background: #7c3aed; }
 
 /* Hover toolbar */
 .pdc-tile-toolbar {

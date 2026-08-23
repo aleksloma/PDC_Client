@@ -139,8 +139,13 @@ def _run_job(chat_id: str, user_email: str) -> None:
         def _build_one(idx: int, instruction: str):
             try:
                 local_sid = f"{sid}-{idx}"
+                # Per-worker copies: executed LLM code mutates frames in place,
+                # and the single load above would otherwise be SHARED by all 4
+                # concurrent workers — restoring the copy-on-get isolation the
+                # dataframe cache guarantees per load (QA 2.3).
+                local_dfs = {k: df.copy() for k, df in dfs.items()}
                 out = run_chat_local.run_chat(
-                    sid=local_sid, dfs=dfs, schema_docs=schema_docs,
+                    sid=local_sid, dfs=local_dfs, schema_docs=schema_docs,
                     question=instruction, history_rows=[],
                     user_email=user_email,
                 )

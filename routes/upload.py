@@ -116,9 +116,10 @@ async def upload(request: Request, files: List[UploadFile] = File(...), file_des
 
     # Try loading them to detect parse failures and to populate the dataframe-key
     # list — off the event loop, the detection pipeline blocks it otherwise.
-    # include_db=False: never read snapshot parquets just to list upload keys.
+    # The report variant returns per-file parse warnings/errors so a saved file
+    # that produced no dataframe FAILS LOUDLY instead of ok:true (QA 2.1).
     loop = asyncio.get_running_loop()
-    dfs = await loop.run_in_executor(_EXEC, lambda: store.load_dataframes(include_db=False))
+    dfs, load_report = await loop.run_in_executor(_EXEC, store.load_dataframes_with_report)
     df_names = list(dfs.keys())
 
     # Initialize empty schema entries (filled later by /schema_autofill_full)
@@ -200,8 +201,39 @@ async def upload(request: Request, files: List[UploadFile] = File(...), file_des
         meta["db_table_ids"] = preserved_db_ids
     store.write_meta(meta)
 
-    log_with_sid(email, "info", "UPLOAD_OK", saved=",".join(saved), dataframes=",".join(df_names))
-    return {"ok": True, "saved": saved, "dataframes": df_names}
+    # Per-file results: every saved file is either ok, parsed-with-warning, or
+    # failed. /upload must NEVER answer ok:true when a saved file produced no
+    # dataframe — that was the silent no-op the user saw (QA 2.1).
+    produced = {n.split("::")[0] for n in df_names} | set(df_names)
+    by_file = {r.get("file"): r for r in load_report}
+    file_results: list[dict] = []
+    failed: list[str] = []
+    for name in saved:
+        row = by_file.get(name)
+        if row is not None:
+            file_results.append(row)
+            if row.get("status") == "error":
+                failed.append(name)
+        elif name in produced:
+            file_results.append({"file": name, "status": "ok"})
+        else:
+            # saved but no dataframe and no report row (e.g. unsupported extension)
+            file_results.append({"file": name, "status": "error",
+                                 "message": "This file type could not be read as a table."})
+            failed.append(name)
+
+    log_with_sid(email, "info", "UPLOAD_OK", saved=",".join(saved), dataframes=",".join(df_names),
+                 failed=",".join(failed))
+    if failed:
+        payload = {
+            "ok": False, "saved": saved, "dataframes": df_names, "files": file_results,
+            "error": (f"{len(failed)} of {len(saved)} file(s) could not be read: "
+                      f"{', '.join(failed)}. Please fix or remove them and try again."),
+        }
+        # every file failed → hard 400; partial failure → 200 with ok:false so
+        # the frontend's existing error branch aborts the dialog with the message
+        return JSONResponse(payload, status_code=400) if len(failed) == len(saved) else payload
+    return {"ok": True, "saved": saved, "dataframes": df_names, "files": file_results}
 
 
 # ---------------------------------------------------------------------------

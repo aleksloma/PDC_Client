@@ -30,7 +30,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 import local_store
 import run_chat_local
 import brain_client
-from brain_client import TenantRevokedError, BrainError
+from brain_client import TenantRevokedError, BrainError, BrainTimeoutError
 from logger_utils import log_with_sid
 from schema_builder import _detect_language as _detect_lang_for_title
 
@@ -155,16 +155,43 @@ async def _reexecute_full_df(chat_id: str, code: str | None, result_key: str | N
         obj = exec_out.get("result")
         if isinstance(obj, dict) and result_key is not None:
             obj = obj.get(result_key)
+        # _normalize_df_for_table: same pivot normalization as the chat-time
+        # serializer (index surfaced, MultiIndex columns flattened) so the
+        # full-table view / Excel download match what the chat rendered (QA 2.2)
+        from run_chat_local import _normalize_df_for_table
         if isinstance(obj, pd.DataFrame):
-            return obj
+            return _normalize_df_for_table(obj)
         if isinstance(obj, pd.Series):
-            return obj.reset_index()
+            return _normalize_df_for_table(obj.reset_index())
         if hasattr(obj, "data") and isinstance(obj.data, pd.DataFrame):
-            return obj.data
+            return _normalize_df_for_table(obj.data)
         return None
     except Exception as e:
         log_with_sid(chat_id, "warning", f"DOWNLOAD_REEXEC_FAILED: {e}")
         return None
+
+
+def _auto_analysis_busy_response(store, email: str, chat_id: str):
+    """409 when Auto Analytics is running for this chat, else None (QA 2.3).
+
+    While the job runs, its 4 workers occupy the single code-exec worker and
+    the shared brain connection pool, so an interactive question times out
+    ~90s later with a misleading "temporarily unavailable" error. Telling the
+    user honestly and immediately — BEFORE any history append — is the fix.
+    Fail-open: a corrupt meta must never block chat (Article IV)."""
+    try:
+        import auto_analytics as aa
+        if aa.get_auto_analysis_state(store.read_meta()).get("status") == "processing":
+            log_with_sid(email, "info", f"CHAT_BLOCKED_AUTO_ANALYSIS chat={chat_id}")
+            return JSONResponse({
+                "error": ("Auto Analytics is currently running for this chat. "
+                          "Your question can start as soon as it finishes — "
+                          "please ask again then."),
+                "busy": "auto_analysis",
+            }, status_code=409)
+    except Exception as e:
+        log_with_sid(email, "warning", f"AUTO_BUSY_CHECK_FAILED chat={chat_id}: {e}")
+    return None
 
 
 # In-progress generation registry. A conv_id present here has a worker thread
@@ -749,6 +776,9 @@ async def chat_stream(request: Request, chat_id: str):
         return JSONResponse({"error": "Question cannot be empty."}, status_code=400)
 
     store = local_store.ChatDataStore(chat_id)
+    busy = _auto_analysis_busy_response(store, email, chat_id)
+    if busy is not None:
+        return busy
     # Off the event loop — parsing the source files blocks every other
     # request otherwise (same pattern as _reexecute_full_df / refresh_item).
     loop = asyncio.get_running_loop()
@@ -896,6 +926,13 @@ async def chat_stream(request: Request, chat_id: str):
                     }))
             except TenantRevokedError:
                 err_msg = "Service unavailable. Please contact your administrator."
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", err_msg))
+            except BrainTimeoutError:
+                # BrainTimeoutError subclasses BrainError — caught FIRST. A
+                # timeout under load (e.g. Auto Analytics occupying the shared
+                # connection pool) is contention, not an outage; the old
+                # "temporarily unavailable" wording was misleading (QA 2.3).
+                err_msg = "The analysis service is busy right now. Please try again in a moment."
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", err_msg))
             except BrainError:
                 err_msg = "Analysis service is temporarily unavailable."
@@ -1096,6 +1133,9 @@ async def edit_regenerate(request: Request, chat_id: str):
     store = local_store.ChatDataStore(chat_id)
     if not store.root.exists():
         return JSONResponse({"error": "Chat not found."}, status_code=404)
+    busy = _auto_analysis_busy_response(store, email, chat_id)
+    if busy is not None:
+        return busy
 
     history = store.get_history(conv_id)
     if len(history) < 2:
@@ -1141,6 +1181,12 @@ async def edit_regenerate(request: Request, chat_id: str):
         events = await loop.run_in_executor(_EXEC, _run_blocking)
     except TenantRevokedError:
         msg = "Service unavailable. Please contact your administrator."
+        store.append_history(conv_id, {"role": "ai", "content": msg, "ts": time.time()})
+        return JSONResponse({"error": msg, "conv_id": conv_id}, status_code=503)
+    except BrainTimeoutError as e:
+        # subclass of BrainError — caught first; see the chat_stream worker (QA 2.3)
+        msg = "The analysis service is busy right now. Please try again in a moment."
+        log_with_sid(chat_id, "warning", f"EDIT_REGENERATE_BRAIN_TIMEOUT: {e}")
         store.append_history(conv_id, {"role": "ai", "content": msg, "ts": time.time()})
         return JSONResponse({"error": msg, "conv_id": conv_id}, status_code=503)
     except BrainError as e:

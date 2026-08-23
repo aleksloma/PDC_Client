@@ -36,7 +36,7 @@ from local_store import LRUTTLCache
 _SCHEMA_TEXT_CACHE = LRUTTLCache(max_size=100, ttl_seconds=300)
 
 
-def _schema_text_cache_key(schema_docs, dfs, common_fields) -> str | None:
+def _schema_text_cache_key(schema_docs, dfs, common_fields, other_tables=None) -> str | None:
     try:
         df_idents = []
         for name in sorted(dfs.keys()):
@@ -54,14 +54,21 @@ def _schema_text_cache_key(schema_docs, dfs, common_fields) -> str | None:
             + "|" + json.dumps(df_idents, ensure_ascii=False)
             + "|" + json.dumps(common_fields or [], ensure_ascii=False, default=str)
         )
+        # other_tables rows carry the registry's updated_at, so a re-registered
+        # table changes the key automatically. Absent/empty → payload identical
+        # to the pre-feature key (existing caches stay valid).
+        if other_tables:
+            payload += "|" + json.dumps(other_tables, sort_keys=True,
+                                        ensure_ascii=False, default=str)
         return hashlib.md5(payload.encode("utf-8")).hexdigest()
     except Exception as e:
         log_with_sid("schema_text", "warning", f"SCHEMA_TEXT_CACHE_KEY_FAILED: {e}")
         return None
 
 
-def schema_text(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFrame], common_fields: list | None = None) -> str:
-    cache_key = _schema_text_cache_key(schema_docs, dfs, common_fields)
+def schema_text(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFrame], common_fields: list | None = None,
+                other_tables: list | None = None) -> str:
+    cache_key = _schema_text_cache_key(schema_docs, dfs, common_fields, other_tables)
     if cache_key is not None:
         try:
             cached = _SCHEMA_TEXT_CACHE.get(cache_key)
@@ -70,7 +77,7 @@ def schema_text(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFrame], comm
         except Exception as e:
             log_with_sid("schema_text", "warning", f"SCHEMA_TEXT_CACHE_GET_FAILED: {e}")
 
-    result = _schema_text_uncached(schema_docs, dfs, common_fields)
+    result = _schema_text_uncached(schema_docs, dfs, common_fields, other_tables)
 
     if cache_key is not None:
         try:
@@ -80,7 +87,8 @@ def schema_text(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFrame], comm
     return result
 
 
-def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFrame], common_fields: list | None = None) -> str:
+def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFrame], common_fields: list | None = None,
+                          other_tables: list | None = None) -> str:
     parts: list[str] = []
     for fname, df in dfs.items():
         cols = list(df.columns)
@@ -200,6 +208,34 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
                 db_rel_lines.append(f"  - {fname}[{c1}] ⟷ {other}[{c2}]{suffix}")
     if db_rel_lines:
         parts.append("\nDatabase Relations (declared join keys):\n" + "\n".join(db_rel_lines))
+
+    # OTHER REGISTERED TABLES (QA report §4 / MISSING_DATA): metadata rows the
+    # caller assembled from the registry (schema_builder stays import-light —
+    # never reads db_sources itself). Lets the planner suggest which table to
+    # ADD instead of fabricating values. Names/relations only — never values.
+    # Absent/empty → output byte-identical to before.
+    if other_tables:
+        ot_lines: list[str] = []
+        for t in other_tables:
+            if not isinstance(t, dict):
+                continue
+            name = t.get("display_name") or ""
+            cols = ", ".join(t.get("columns") or [])
+            ot_lines.append(f"  - {name}: columns [{cols}]")
+            for rel in t.get("relations") or []:
+                if not isinstance(rel, dict):
+                    continue
+                other = rel.get("related_display_name")
+                pairs = ", ".join(f"{p[0]} ⟷ {p[1]}" for p in (rel.get("join_keys") or [])
+                                  if isinstance(p, (list, tuple)) and len(p) == 2)
+                if other:
+                    ot_lines.append(f"    relates to loaded table {other}"
+                                    + (f" via [{pairs}]" if pairs else ""))
+        if ot_lines:
+            parts.append(
+                "\nOTHER REGISTERED TABLES (registered in this installation but NOT "
+                "loaded in this chat — their VALUES are not accessible to code; the "
+                "user can add them to the chat):\n" + "\n".join(ot_lines))
 
     return "\n\n".join(parts)
 

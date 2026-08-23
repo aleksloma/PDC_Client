@@ -180,11 +180,13 @@ function hideLoading() {
   if (overlay) overlay.classList.add('hidden');
 }
 
-// Toast notification (replaces browser alerts)
+// Toast notification (replaces browser alerts).
+// isError: false = green success, true = red error, 'warn' = amber warning.
 function showToast(text, isError = false) {
   const t = document.createElement('div');
   t.textContent = text;
-  t.style.cssText = `position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;color:#fff;font-size:14px;z-index:9999;box-shadow:0 4px 12px rgba(0,0,0,0.15);transition:opacity 0.3s;background:${isError ? '#ef4444' : '#10b981'};`;
+  const bg = isError === 'warn' ? '#f59e0b' : (isError ? '#ef4444' : '#10b981');
+  t.style.cssText = `position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;color:#fff;font-size:14px;z-index:9999;box-shadow:0 4px 12px rgba(0,0,0,0.15);transition:opacity 0.3s;background:${bg};`;
   document.body.appendChild(t);
   setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 3000);
 }
@@ -748,10 +750,10 @@ function renderUnifiedChatList(chats, conversations) {
             </svg>
           </button>
           <div class="chat-info">
-            <span class="chat-name">${escapeHtml(chat.name || 'Untitled')}</span>
+            <span class="chat-name">${chat.pinned ? '<span class="chat-pin-icon" title="Pinned">📌</span>' : ''}${escapeHtml(chat.name || 'Untitled')}</span>
             ${subtitle ? `<span class="chat-subtitle">${escapeHtml(subtitle)}</span>` : ''}
           </div>
-          <button class="chat-menu-btn" data-type="chat" data-chat-id="${chatId}" data-name="${escapeHtml(chat.name || 'Untitled')}" data-shared="${isShared ? 'true' : 'false'}" data-published="${isPublished ? 'true' : 'false'}" title="More options">
+          <button class="chat-menu-btn" data-type="chat" data-chat-id="${chatId}" data-name="${escapeHtml(chat.name || 'Untitled')}" data-shared="${isShared ? 'true' : 'false'}" data-published="${isPublished ? 'true' : 'false'}" data-pinned="${chat.pinned ? 'true' : 'false'}" title="More options">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
               <circle cx="8" cy="3" r="1.5"/>
               <circle cx="8" cy="8" r="1.5"/>
@@ -4074,6 +4076,11 @@ async function runFrictionlessFlow(files, opts) {
           showToast(msg, true);
           return;
         }
+        // Per-file parse warnings (e.g. "N malformed row(s) skipped") — the
+        // upload succeeded but the user must know some rows were dropped.
+        (upData.files || []).filter(f => f && f.status === 'warning').forEach(f => {
+          showToast(`${f.file}: ${f.message || 'some rows were skipped'}`, 'warn');
+        });
       }
     }
 
@@ -4948,6 +4955,14 @@ function showItemMenu(btn) {
 
   let menuItems = '';
 
+  // Pin / Unpin (chats only) — pinned chats sort first in the sidebar (QA 3.2)
+  const isPinned = btn.dataset.pinned === 'true';
+  if (type === 'chat') {
+    menuItems += `<button class="context-menu-item" data-action="pin">
+      <span>📌</span> ${isPinned ? 'Unpin' : 'Pin'}
+    </button>`;
+  }
+
   // Rename option (not for shared or published-only items)
   if (!isShared && !isPublished) {
     menuItems += `<button class="context-menu-item" data-action="rename">
@@ -5002,7 +5017,19 @@ function showItemMenu(btn) {
       const action = item.dataset.action;
       menu.remove();
 
-      if (action === 'rename') {
+      if (action === 'pin') {
+        try {
+          const res = await fetch('/auth/active_chats/pin', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, pinned: !isPinned }),
+          });
+          if (!res.ok) showToast('Could not update pin', true);
+        } catch (err) {
+          showToast('Could not update pin', true);
+        }
+        await loadUnifiedChatList(true);
+      } else if (action === 'rename') {
         await handleRename(type, chatId, convId, title);
       } else if (action === 'share') {
         await handleShare(type, chatId, convId, title);
@@ -5064,9 +5091,12 @@ async function handleRename(type, chatId, convId, currentName) {
           ? '/auth/conversations/rename'
           : '/auth/active_chats/rename';
         
+        // Both rename endpoints read `title` — the chat branch used to send
+        // `name`, which the server rejected with 400 (chat rename was fully
+        // broken; user-approved fix alongside QA 3.2).
         const body = type === 'conversation'
           ? { conv_id: convId, title: newName }
-          : { chat_id: chatId, name: newName };
+          : { chat_id: chatId, title: newName };
         
         const res = await fetch(endpoint, {
           method: 'POST',

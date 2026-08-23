@@ -74,6 +74,55 @@ def _styler_to_html(result_obj) -> Optional[str]:
         return None
 
 
+def _normalize_df_for_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Make a DataFrame serialize losslessly into the {columns, rows} JSON the
+    frontend renders (QA 2.2).
+
+    Two defects this fixes for pivot-shaped frames:
+      - the row index (the pivot's grouping key, e.g. city names) was dropped
+        by to_dict(orient="records") — reset a MEANINGFUL index into visible
+        columns (MultiIndex, any named level, or a non-integer index such as
+        Datetime/object). A plain RangeIndex or an unnamed integer index (a
+        filtered frame) passes through untouched;
+      - MultiIndex/tuple column labels became JSON arrays in `columns` but
+        "_"-joined strings as row-dict keys (local_store._json_safe), so the
+        frontend's by-name lookup missed every cell — flatten tuple labels to
+        strings here so both halves agree.
+    Never raises: any failure logs and returns the frame unchanged (Art. IV).
+    """
+    try:
+        out = df
+        idx = out.index
+        meaningful = (isinstance(idx, pd.MultiIndex)
+                      or any(n is not None for n in (idx.names or []))
+                      or not (isinstance(idx, pd.RangeIndex)
+                              or pd.api.types.is_integer_dtype(idx)))
+        if meaningful:
+            out = out.reset_index()
+        if isinstance(out.columns, pd.MultiIndex) or any(isinstance(c, tuple) for c in out.columns):
+            if out is df:
+                out = out.copy(deep=False)
+            out.columns = [
+                " / ".join(str(p) for p in c if str(p).strip()) if isinstance(c, tuple)
+                else str(c)
+                for c in out.columns]
+        # uniqueness after flattening (pandas "name.1" convention)
+        if len(set(map(str, out.columns))) != len(out.columns):
+            if out is df:
+                out = out.copy(deep=False)
+            seen: dict = {}
+            cols = []
+            for c in map(str, out.columns):
+                n = seen.get(c, 0)
+                seen[c] = n + 1
+                cols.append(c if n == 0 else f"{c}.{n}")
+            out.columns = cols
+        return out
+    except Exception as e:
+        log_with_sid("table", "warning", f"TABLE_NORMALIZE_FAILED: {e}")
+        return df
+
+
 def _build_table_from_result(result_obj) -> Optional[dict]:
     """Tiny port of the B2C `_build_table_from_result` for DataFrame / Series.
 
@@ -93,6 +142,7 @@ def _build_table_from_result(result_obj) -> Optional[dict]:
             df = result_obj.reset_index()
         else:
             return None
+        df = _normalize_df_for_table(df)
         rows = df.head(50).to_dict(orient="records")
         table = {
             "columns": list(df.columns),
@@ -145,6 +195,65 @@ def _tables_from_python_result(result_obj, table):
             table.pop("title", None)
             tables = None
     return table, tables
+
+
+def _other_registered_tables(schema_docs, dfs, user_email) -> list:
+    """Registry tables NOT loaded in this chat, as metadata rows for the
+    schema text's OTHER REGISTERED TABLES section (QA report §4 / MISSING_DATA).
+
+    Lets the planner NAME the table that would answer a question instead of
+    fabricating a mapping from domain context. Gated on the chat actually
+    using database tables (pure file-upload chats get no section — their
+    schema text stays byte-identical); role-filtered so a user is never shown
+    a table their role cannot add (fail-closed like the picker). Metadata
+    only — display names, column NAMES, declared relations — never values
+    (Article II). Never raises: any failure returns [] (Article IV)."""
+    try:
+        docs = schema_docs or {}
+        if not any(isinstance(v, dict) and v.get("source") == "database"
+                   for v in docs.values()):
+            return []
+        from db_sources import DataSourceStore
+        from roles_store import allowed_table_ids_for
+        rows = DataSourceStore().list_tables(include_connector=False)
+        if not rows:
+            return []
+        allowed = allowed_table_ids_for(user_email) if user_email else set()
+        loaded_names = set(dfs or {}) | set(docs)
+        id_to_name = {t.get("id"): (t.get("display_name") or "") for t in rows}
+        out = []
+        for t in rows:
+            name = t.get("display_name") or ""
+            if not name or name in loaded_names:
+                continue
+            if t.get("id") not in allowed:
+                continue
+            relations = []
+            for rel in (t.get("relations") or []):
+                if not isinstance(rel, dict):
+                    continue
+                parent_name = id_to_name.get(rel.get("related_table_id")
+                                             or rel.get("related_table"))
+                if parent_name and parent_name in loaded_names:
+                    relations.append({
+                        "related_display_name": parent_name,
+                        "join_keys": [[str(p[0]), str(p[1])]
+                                      for p in (rel.get("join_keys") or [])
+                                      if isinstance(p, (list, tuple)) and len(p) == 2],
+                    })
+            out.append({
+                "id": t.get("id"),
+                "display_name": name,
+                "updated_at": t.get("updated_at"),
+                "columns": [str(c.get("name"))
+                            for c in (t.get("columns") or []) if isinstance(c, dict)],
+                "relations": relations,
+            })
+        out.sort(key=lambda r: r["display_name"])
+        return out[:20]
+    except Exception as e:
+        log_with_sid(str(user_email or "?"), "warning", f"OTHER_TABLES_FAILED: {e}")
+        return []
 
 
 def _safe_preview(preview) -> Any:
@@ -200,7 +309,9 @@ def run_chat(
     """
     df_names = list(dfs.keys())
     df_columns = {name: list(df.columns) for name, df in dfs.items()}
-    schema_str = build_schema_text(schema_docs or {}, dfs, common_fields)
+    schema_str = build_schema_text(
+        schema_docs or {}, dfs, common_fields,
+        other_tables=_other_registered_tables(schema_docs, dfs, user_email))
 
     # 1) Plan
     plan_out = brain_client.plan(
@@ -219,7 +330,7 @@ def run_chat(
     log_with_sid(sid, "info", f"PLAN kind={kind} model={plan_out.get('model_used')}")
 
     # Clarification / text answer — return as text
-    if kind in ("CLARIFICATION", "ANSWER"):
+    if kind in ("CLARIFICATION", "ANSWER", "MISSING_DATA"):
         return {"text": code, "image_base64": None, "table": None, "code": None, "usage": usage}
 
     # Greeting — call brain for natural reply
@@ -253,9 +364,10 @@ def run_chat(
         new_kind = retry_out.get("kind")
         usage = _sum_usage(usage, retry_out.get("usage") or {})
         retry_count += 1
-        # A retry that returns prose (NO_CODE/CLARIFICATION/ANSWER) or no code
-        # is a FAILED attempt, not a reason to abort: keep retrying with escalation.
-        if not new_code or new_kind in ("NO_CODE", "CLARIFICATION", "ANSWER"):
+        # A retry that returns prose (NO_CODE/CLARIFICATION/ANSWER/MISSING_DATA)
+        # or no code is a FAILED attempt, not a reason to abort: keep retrying
+        # with escalation. Prose text must never reach an executor.
+        if not new_code or new_kind in ("NO_CODE", "CLARIFICATION", "ANSWER", "MISSING_DATA"):
             continue
         code = new_code
         kind = new_kind
@@ -818,7 +930,9 @@ def run_chat_multi_plot(
     """
     df_names = list(dfs.keys())
     df_columns = {name: list(df.columns) for name, df in dfs.items()}
-    schema_str = build_schema_text(schema_docs or {}, dfs, common_fields)
+    schema_str = build_schema_text(
+        schema_docs or {}, dfs, common_fields,
+        other_tables=_other_registered_tables(schema_docs, dfs, user_email))
 
     # 1) Plan once — reuse the raw_text for single-vs-multi detection
     plan_out = brain_client.plan(
@@ -943,7 +1057,8 @@ def run_chat_multi_plot(
                     plot_out = py_out
                     break
                 continue
-            # Any other kind (CLARIFICATION, ANSWER, …) → failed attempt; keep retrying.
+            # Any other kind (CLARIFICATION, ANSWER, MISSING_DATA, …) → failed
+            # attempt; keep retrying.
             continue
 
         # ── One-figure-per-chart enforcement ──
@@ -1151,7 +1266,7 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
                            kind, code, usage, context_decision) -> dict:
     """Execute one already-planned response (kind/code from a prior /v1/plan)
     locally, reusing the same retry + describe/summarize flow as run_chat."""
-    if kind in ("CLARIFICATION", "ANSWER"):
+    if kind in ("CLARIFICATION", "ANSWER", "MISSING_DATA"):
         return {"text": code, "image_base64": None, "table": None, "code": None, "usage": usage}
 
     if kind == "NO_CODE":
@@ -1184,9 +1299,10 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
         new_kind = retry_out.get("kind")
         usage = _sum_usage(usage, retry_out.get("usage") or {})
         retry_count += 1
-        # A retry that returns prose (NO_CODE/CLARIFICATION/ANSWER) or no code
-        # is a FAILED attempt, not a reason to abort: keep retrying with escalation.
-        if not new_code or new_kind in ("NO_CODE", "CLARIFICATION", "ANSWER"):
+        # A retry that returns prose (NO_CODE/CLARIFICATION/ANSWER/MISSING_DATA)
+        # or no code is a FAILED attempt, not a reason to abort: keep retrying
+        # with escalation. Prose text must never reach an executor.
+        if not new_code or new_kind in ("NO_CODE", "CLARIFICATION", "ANSWER", "MISSING_DATA"):
             continue
         code = new_code
         kind = new_kind

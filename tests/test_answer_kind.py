@@ -1,5 +1,5 @@
-"""The ANSWER plan kind (plain-text answer from the brain planner) must be
-returned to the user as text — exactly like CLARIFICATION — in BOTH
+"""The ANSWER and MISSING_DATA plan kinds (plain-text planner outcomes) must
+be returned to the user as text — exactly like CLARIFICATION — in BOTH
 plan-consuming paths (run_chat and, via run_chat_multi_plot's single_response
 delegation, _run_single_from_plan), and must NEVER be executed as Python.
 
@@ -94,6 +94,52 @@ def test_single_from_plan_clarification_still_returns_text(monkeypatch, dfs, exe
     result = _run_multi(dfs)
     assert result["text"] == "Which metric?"
     assert exec_guard == []
+
+
+# --- MISSING_DATA (same text-back contract as ANSWER/CLARIFICATION) ----------
+
+MISSING_TEXT = "No branch-to-city table is loaded. Add the 'branches dictionary' table."
+
+
+def test_run_chat_missing_data_returns_text_without_exec(monkeypatch, dfs, exec_guard):
+    _stub_plan(monkeypatch, "MISSING_DATA", MISSING_TEXT)
+    out = run_chat_local.run_chat(
+        sid="t", dfs=dfs, schema_docs={}, question="revenue by city",
+        history_rows=[], user_email="alice@acme.com")
+    assert out["text"] == MISSING_TEXT
+    assert out["image_base64"] is None and out["table"] is None and out["code"] is None
+    assert exec_guard == []
+
+
+def test_single_from_plan_missing_data_returns_text_without_exec(monkeypatch, dfs, exec_guard):
+    _stub_plan(monkeypatch, "MISSING_DATA", MISSING_TEXT)
+    result = _run_multi(dfs)
+    assert result["text"] == MISSING_TEXT
+    assert exec_guard == []
+
+
+def test_retry_missing_data_is_never_executed(monkeypatch, dfs):
+    _stub_plan(monkeypatch, "PYTHON", "RESULT = boom")
+    executed, retries = [], []
+
+    def failing_exec(code, dfs, sid, **kw):
+        executed.append(code)
+        return {"error": "NameError: boom", "result": None}
+
+    def fake_retry(**k):
+        retries.append(k)
+        return {"raw_text": "", "kind": "MISSING_DATA", "code": MISSING_TEXT, "usage": {}}
+
+    monkeypatch.setattr(run_chat_local, "safe_execute", failing_exec)
+    monkeypatch.setattr(run_chat_local, "render_plot_safe", failing_exec)
+    monkeypatch.setattr(run_chat_local.brain_client, "retry", fake_retry)
+
+    out = run_chat_local.run_chat(
+        sid="t", dfs=dfs, schema_docs={}, question="q",
+        history_rows=[], user_email="alice@acme.com")
+    assert executed == ["RESULT = boom"]
+    assert len(retries) == 3
+    assert "couldn't run this analysis" in out["text"]
 
 
 # --- retry loop: an ANSWER from /v1/retry is a failed attempt, never exec'd --

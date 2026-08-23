@@ -48,7 +48,11 @@ def _get_client() -> httpx.Client:
                 _CLIENT = httpx.Client(
                     base_url=settings.BRAIN_URL.rstrip("/"),
                     timeout=settings.BRAIN_REQUEST_TIMEOUT,
-                    limits=httpx.Limits(max_connections=10),
+                    # 20, not 10: an Auto Analytics job keeps 4 workers'
+                    # plan/retry/describe calls in flight; with interactive
+                    # chat on top, a 10-connection pool produced PoolTimeouts
+                    # that surfaced as "service unavailable" (QA 2.3).
+                    limits=httpx.Limits(max_connections=20),
                 )
     return _CLIENT
 

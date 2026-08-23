@@ -129,7 +129,40 @@ def _json_safe(value):
     return value
 
 
-def _load_one_file(path: Path) -> dict[str, pd.DataFrame]:
+# pandas C-engine ParserError text reads "Expected N fields in line 7, saw 8" —
+# the only place a bad line NUMBER is available (the tolerant python-engine
+# callable receives the split fields, not a line number).
+_BAD_LINE_RE = re.compile(r"line (\d+)")
+
+
+def _read_csv_tolerant(path: Path, sep: str = ",") -> tuple[Optional[pd.DataFrame], Optional[dict]]:
+    """Strict pd.read_csv first; on failure retry with the python engine
+    skipping (and COUNTING) malformed rows. Returns:
+      (df, None)                                    — clean strict parse
+      (df, {"skipped_rows": n, "first_bad_line": m}) — tolerant parse with skips
+      (None, {"error": reason})                     — even tolerant parse failed
+    A ragged CSV (unquoted comma inside a value) must never load as an empty
+    result with no signal — that produced the silent-upload-failure bug (QA 2.1).
+    """
+    try:
+        return pd.read_csv(path, sep=sep), None
+    except Exception as strict_err:
+        m = _BAD_LINE_RE.search(str(strict_err))
+        first_bad = int(m.group(1)) if m else None
+        try:
+            bad_rows: list = []
+            df = pd.read_csv(path, sep=sep, engine="python",
+                             on_bad_lines=lambda fields: bad_rows.append(fields) and None)
+            log_with_sid(path.name, "warning",
+                         f"FILE_LOAD_TOLERANT {path}: skipped={len(bad_rows)} "
+                         f"first_bad_line={first_bad}")
+            return df, {"skipped_rows": len(bad_rows), "first_bad_line": first_bad}
+        except Exception as e:
+            log_with_sid(path.name, "warning", f"FILE_LOAD_ERROR {path}: {e}")
+            return None, {"error": f"{type(strict_err).__name__}: {strict_err}"}
+
+
+def _load_one_file(path: Path, report: Optional[list] = None) -> dict[str, pd.DataFrame]:
     """Load one tabular file. Returns {key: df}. Excel sheets yield
     "<filename>::<sheet>" keys (single-sheet excels keep the bare filename).
 
@@ -137,22 +170,49 @@ def _load_one_file(path: Path) -> dict[str, pd.DataFrame]:
     (`excel_table_detector.load_excel_sheets`) — same algorithm the global B2C
     app uses, so multi-row headers, ListObjects, label-vs-measure splits,
     multilingual total-row drops, and text-above-the-table extraction all work.
+
+    `report` (optional list) collects per-file parse outcomes for the upload
+    flow: {"file", "status": "warning"|"error", ...}. Callers that don't pass
+    it (chat-time loads) behave exactly as before.
     """
     out: dict[str, pd.DataFrame] = {}
+
+    def _report(row: dict) -> None:
+        if report is not None:
+            report.append(row)
+
     try:
         ext = path.suffix.lower()
         if ext in (".xls", ".xlsx", ".xlsm"):
             out.update(load_excel_sheets(path, path.name))
-        elif ext == ".csv":
-            out[path.name] = pd.read_csv(path)
-        elif ext == ".tsv":
-            out[path.name] = pd.read_csv(path, sep="\t")
+        elif ext in (".csv", ".tsv"):
+            df, warn = _read_csv_tolerant(path, sep="\t" if ext == ".tsv" else ",")
+            if df is None:
+                _report({"file": path.name, "status": "error",
+                         "message": "Could not parse this file."})
+            elif warn is not None:
+                if len(df) == 0:
+                    # every data row was malformed — a header-only frame is
+                    # useless, surface it as a hard failure
+                    _report({"file": path.name, "status": "error",
+                             "message": "No valid data rows could be parsed."})
+                else:
+                    out[path.name] = df
+                    n = warn.get("skipped_rows")
+                    _report({"file": path.name, "status": "warning",
+                             "skipped_rows": n,
+                             "first_bad_line": warn.get("first_bad_line"),
+                             "message": f"{n} malformed row(s) skipped"})
+            else:
+                out[path.name] = df
         elif ext == ".json":
             out[path.name] = pd.read_json(path)
         elif ext == ".parquet":
             out[path.name] = pd.read_parquet(path)
     except Exception as e:
         log_with_sid(path.name, "warning", f"FILE_LOAD_ERROR {path}: {e}")
+        _report({"file": path.name, "status": "error",
+                 "message": "Could not parse this file."})
     return out
 
 
@@ -175,7 +235,10 @@ _PARQUET_CACHEABLE_EXTS = (".xls", ".xlsx", ".xlsm", ".csv", ".tsv", ".json")
 # version is a MISS, so caches written by an older parser self-heal by
 # re-parsing instead of serving stale shapes forever.
 # v2: column names str()-normalized + duplicate names deduped ("name.1").
-_PARQUET_CACHE_PARSER_VERSION = 2
+# v3: tolerant CSV parse (malformed rows skipped instead of the whole file
+#     failing) — previously-unparseable CSVs now yield dataframes, so older
+#     caches must re-parse (QA 2.1).
+_PARQUET_CACHE_PARSER_VERSION = 3
 
 
 def _parquet_cache_safe_name(key: str) -> str:
@@ -305,23 +368,27 @@ def _parquet_cache_write(path: Path, dfs: dict[str, pd.DataFrame],
         log_with_sid(path.name, "warning", f"PARQUET_CACHE_WRITE_FAILED {path}: {e}")
 
 
-def _load_one_file_cached(path: Path) -> dict[str, pd.DataFrame]:
+def _load_one_file_cached(path: Path, report: Optional[list] = None) -> dict[str, pd.DataFrame]:
     """Parquet-cache wrapper around `_load_one_file`. The source's size +
     mtime_ns are captured BEFORE parsing, so a file overwritten mid-parse
     stamps a stale manifest that self-heals on the next load. `.parquet`
-    sources are read directly — caching them would be a redundant copy."""
+    sources are read directly — caching them would be a redundant copy.
+
+    `report` is forwarded to `_load_one_file`; a cache HIT contributes no
+    report rows (meaningful only right after a write, when the stat change
+    guarantees a miss and the parse genuinely runs)."""
     if path.suffix.lower() not in _PARQUET_CACHEABLE_EXTS:
-        return _load_one_file(path)
+        return _load_one_file(path, report)
     try:
         st = path.stat()
         src_size, src_mtime_ns = st.st_size, st.st_mtime_ns
     except Exception as e:
         log_with_sid(path.name, "warning", f"PARQUET_CACHE_STAT_FAILED {path}: {e}")
-        return _load_one_file(path)
+        return _load_one_file(path, report)
     cached = _parquet_cache_read(path, src_size, src_mtime_ns)
     if cached is not None:
         return cached
-    out = _load_one_file(path)
+    out = _load_one_file(path, report)
     if out:
         _parquet_cache_write(path, out, src_size, src_mtime_ns)
     return out
@@ -930,10 +997,13 @@ class AuthStore:
                 continue
             row.setdefault("_seq", idx)   # stable file-order tiebreak
             out.append(row)
-        # Newest first (descending created_at). Rows missing created_at sort to
-        # the bottom (treated as oldest); file order breaks ties. Stable so the
-        # rest of the app sees a single consistent ordering.
-        out.sort(key=lambda r: (r.get("created_at") or "", r.get("_seq", 0)),
+        # Pinned chats first, then newest first (descending created_at). Rows
+        # missing created_at sort to the bottom (treated as oldest); file order
+        # breaks ties. Rows without a `pinned` key (every pre-feature row)
+        # sort exactly as before. Stable so the rest of the app sees a single
+        # consistent ordering.
+        out.sort(key=lambda r: (1 if r.get("pinned") else 0,
+                                r.get("created_at") or "", r.get("_seq", 0)),
                  reverse=True)
         for r in out:
             r.pop("_seq", None)
@@ -1020,6 +1090,32 @@ class AuthStore:
                     rec = json.loads(line)
                     if rec.get("chat_id") == chat_id:
                         rec["title"] = new_title
+                        found = True
+                    out_lines.append(json.dumps(rec, ensure_ascii=False))
+                except Exception:
+                    out_lines.append(line)
+            p.write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
+            return found
+
+    def set_chat_pinned(self, email: str, chat_id: str, pinned: bool) -> bool:
+        """Pin/unpin one of the user's active chats (QA 3.2). Additive flag on
+        the jsonl row — absent means unpinned, so old-shape rows and readers
+        are unaffected. Same rewrite idiom as rename_active_chat."""
+        with _LOCK:
+            email = _safe_email(email)
+            p = _data_root() / "users" / email / "active_chats.jsonl"
+            if not p.exists():
+                return False
+            out_lines = []
+            found = False
+            for line in p.read_text(encoding="utf-8").splitlines():
+                try:
+                    rec = json.loads(line)
+                    if rec.get("chat_id") == chat_id:
+                        if pinned:
+                            rec["pinned"] = True
+                        else:
+                            rec.pop("pinned", None)
                         found = True
                     out_lines.append(json.dumps(rec, ensure_ascii=False))
                 except Exception:
@@ -1176,6 +1272,23 @@ class UserStore:
         list keys)."""
         db = db_entries_from_meta(self.read_meta()) if include_db else None
         return _load_dataframes_cached(self.files_dir, self.sid, db)
+
+    def load_dataframes_with_report(self) -> tuple[dict[str, pd.DataFrame], list[dict]]:
+        """Upload-flow variant: parse the session's FILES (no DB snapshots)
+        and return (dfs, report) where report lists per-file parse warnings /
+        errors from `_load_one_file`. Deliberately bypasses the in-memory
+        `_DATAFRAME_CACHE` (it cannot carry a report); the parquet disk cache
+        still applies, and right after `save_upload` the stat change makes it
+        miss, so the parse genuinely runs and the report is complete (QA 2.1)."""
+        report: list[dict] = []
+        dfs: dict[str, pd.DataFrame] = {}
+        try:
+            for fp in sorted(self.files_dir.iterdir()):
+                if fp.is_file() and not fp.name.startswith("."):
+                    dfs.update(_load_one_file_cached(fp, report))
+        except Exception as e:
+            log_with_sid(self.sid, "warning", f"UPLOAD_LOAD_REPORT_FAILED: {e}")
+        return dfs, report
 
 
 # ---------------------------------------------------------------------------
@@ -1647,8 +1760,29 @@ class DashboardStore:
             tile["added_at"] = _now()
             tile.setdefault("frozen", False)
             tile.setdefault("frozen_reason", None)
-            tile["layout"] = {"x": 0, "y": bottom,
-                              "w": _DASH_DEFAULT_W, "h": _DASH_DEFAULT_H}
+            # Kind-aware defaults (QA 3.1): charts half-width, two per row —
+            # a new chart pairs with a previous LEFT-half chart on its row;
+            # tables/wide content full-width; text blocks a slim full row.
+            kind = (tile.get("kind") or "").lower()
+            if kind == "chart":
+                last = tiles[-1] if tiles else None
+                llay = (last or {}).get("layout") or {}
+                try:
+                    pair = (last is not None and (last.get("kind") or "").lower() == "chart"
+                            and int(llay.get("w", 12)) <= _DASH_DEFAULT_W
+                            and int(llay.get("x", 0)) == 0)
+                except Exception:
+                    pair = False
+                if pair:
+                    tile["layout"] = {"x": _DASH_DEFAULT_W, "y": int(llay.get("y", 0)),
+                                      "w": _DASH_DEFAULT_W, "h": _DASH_DEFAULT_H}
+                else:
+                    tile["layout"] = {"x": 0, "y": bottom,
+                                      "w": _DASH_DEFAULT_W, "h": _DASH_DEFAULT_H}
+            elif kind == "text":
+                tile["layout"] = {"x": 0, "y": bottom, "w": 12, "h": 2}
+            else:  # table / anything else → full-width
+                tile["layout"] = {"x": 0, "y": bottom, "w": 12, "h": _DASH_DEFAULT_H}
             tiles.append(tile)
             doc["tiles"] = tiles
             self._write_doc(owner_email, doc)

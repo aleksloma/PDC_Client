@@ -81,6 +81,7 @@ def test_all_endpoints_401_without_session(client):
                  f"/api/dashboards/{dash}/tiles", f"/api/dashboards/{dash}/layout",
                  f"/api/dashboards/{dash}/tiles/{tile}/remove",
                  f"/api/dashboards/{dash}/tiles/{tile}/refresh",
+                 f"/api/dashboards/{dash}/tiles/{tile}/update",
                  f"/api/dashboards/{dash}/share"):
         assert client.post(path, json={}).status_code == 401, path
 
@@ -140,9 +141,13 @@ def test_add_tile_chart_ok_and_shape(client, monkeypatch):
     assert tile["title"] == "Monthly revenue by region"
     assert tile["snapshot"]["image_base64"] == "iVBORfakepng"
     assert tile["layout"] == {"x": 0, "y": 0, "w": 6, "h": 5}
-    # Second tile auto-places below the first.
+    # Second CHART pairs into the right half of the same row (2-per-row
+    # journal default, QA 3.1); the third starts a new row on the left.
     tile2 = _pin_chart(client, dash).json()["tile"]
-    assert tile2["layout"]["y"] == 5
+    assert tile2["layout"] == {"x": 6, "y": 0, "w": 6, "h": 5}
+    tile3 = _pin_chart(client, dash).json()["tile"]
+    assert tile3["layout"]["x"] == 0
+    assert tile3["layout"]["y"] >= 5
 
 
 def test_add_tile_requires_chat_access(client, monkeypatch):
@@ -618,6 +623,131 @@ def test_old_shape_doc_loads_with_defaults(client, monkeypatch, tmp_path):
     assert rows and rows[0]["dash_id"] == dash_id
     doc = client.get(f"/api/dashboards/{dash_id}").json()
     assert doc["tiles"][0]["snapshot"]["image_base64"] == "OLD"
+    # A layoutless legacy tile gets a computed half-width default in the
+    # RESPONSE (QA 3.1) — and the stored file on disk stays byte-identical.
+    assert doc["tiles"][0]["layout"] == {"x": 0, "y": 0, "w": 6, "h": 5}
+    on_disk = json.loads((ddir / f"{dash_id}.json").read_text(encoding="utf-8"))
+    assert "layout" not in on_disk["tiles"][0]
     # Layout update on the old tile works (fills the missing layout).
     assert client.post(f"/api/dashboards/{dash_id}/layout", json={"tiles": [
         {"tile_id": "cd" * 8, "x": 1, "y": 1, "w": 3, "h": 3}]}).json()["ok"]
+
+
+# ---------------------------------------------------------------------------
+# Journal layout defaults + text tiles (QA 3.1)
+# ---------------------------------------------------------------------------
+
+def _pin_table(client, dash_id, chat_id="chat123"):
+    return client.post(f"/api/dashboards/{dash_id}/tiles",
+                       json={"chat_id": chat_id, "kind": "table",
+                             "description": "A table",
+                             "table": {"columns": ["a"], "rows": [{"a": 1}],
+                                       "total_rows": 1}})
+
+
+def test_table_tile_defaults_full_width(client, monkeypatch):
+    _stub_chat(monkeypatch)
+    client.post(f"/_login/{OWNER}")
+    dash = _mk_dash(client)
+    chart = _pin_chart(client, dash).json()["tile"]
+    assert chart["layout"]["w"] == 6
+    table = _pin_table(client, dash).json()["tile"]
+    assert table["layout"]["w"] == 12
+    assert table["layout"]["x"] == 0
+    # A chart after a full-width table starts its own row (no pairing).
+    chart2 = _pin_chart(client, dash).json()["tile"]
+    assert chart2["layout"]["x"] == 0
+
+
+def test_text_tile_create_defaults_and_validation(client):
+    client.post(f"/_login/{OWNER}")
+    dash = _mk_dash(client)
+    # defaults applied
+    resp = client.post(f"/api/dashboards/{dash}/tiles",
+                       json={"kind": "text", "text": "Q3 results"})
+    assert resp.status_code == 200
+    tile = resp.json()["tile"]
+    assert tile["kind"] == "text"
+    assert tile["text"] == "Q3 results"
+    assert tile["style"] == "paragraph"
+    assert tile["color"] == "default"
+    assert tile["size"] == "M"
+    assert tile["layout"] == {"x": 0, "y": 0, "w": 12, "h": 2}
+    # no chat_id required, no snapshot/code fields
+    assert "chat_id" not in tile and "snapshot" not in tile and "code" not in tile
+    # validation
+    assert client.post(f"/api/dashboards/{dash}/tiles",
+                       json={"kind": "text", "text": "  "}).status_code == 400
+    assert client.post(f"/api/dashboards/{dash}/tiles",
+                       json={"kind": "text", "text": "x", "style": "huge"}).status_code == 400
+    assert client.post(f"/api/dashboards/{dash}/tiles",
+                       json={"kind": "text", "text": "x", "color": "pink"}).status_code == 400
+    assert client.post(f"/api/dashboards/{dash}/tiles",
+                       json={"kind": "text", "text": "x", "size": "XXL"}).status_code == 400
+    assert client.post(f"/api/dashboards/{dash}/tiles",
+                       json={"kind": "text", "text": "x" * 2001}).status_code == 400
+
+
+def test_text_tile_update_and_remove(client):
+    client.post(f"/_login/{OWNER}")
+    dash = _mk_dash(client)
+    tile = client.post(f"/api/dashboards/{dash}/tiles",
+                       json={"kind": "text", "text": "Header", "style": "header1",
+                             "color": "blue", "size": "L"}).json()["tile"]
+    tid = tile["tile_id"]
+    # partial update round-trip
+    resp = client.post(f"/api/dashboards/{dash}/tiles/{tid}/update",
+                       json={"text": "New header", "color": "green"})
+    assert resp.status_code == 200
+    doc = client.get(f"/api/dashboards/{dash}").json()
+    saved = doc["tiles"][0]
+    assert saved["text"] == "New header"
+    assert saved["color"] == "green"
+    assert saved["style"] == "header1"   # untouched fields survive
+    assert saved["size"] == "L"
+    # invalid enum on update
+    assert client.post(f"/api/dashboards/{dash}/tiles/{tid}/update",
+                       json={"style": "bogus"}).status_code == 400
+    # empty body
+    assert client.post(f"/api/dashboards/{dash}/tiles/{tid}/update",
+                       json={}).status_code == 400
+    # unknown tile
+    assert client.post(f"/api/dashboards/{dash}/tiles/{'0' * 16}/update",
+                       json={"text": "x"}).status_code == 404
+    # refresh on a text tile is a harmless no-op (never freezes it)
+    r = client.post(f"/api/dashboards/{dash}/tiles/{tid}/refresh", json={}).json()
+    assert r["ok"] is False and "frozen" not in r
+    # remove works like any tile
+    assert client.post(f"/api/dashboards/{dash}/tiles/{tid}/remove", json={}).json()["ok"]
+    assert client.get(f"/api/dashboards/{dash}").json()["tiles"] == []
+
+
+def test_text_tile_update_rejected_for_chart(client, monkeypatch):
+    _stub_chat(monkeypatch)
+    client.post(f"/_login/{OWNER}")
+    dash = _mk_dash(client)
+    tile = _pin_chart(client, dash).json()["tile"]
+    assert client.post(f"/api/dashboards/{dash}/tiles/{tile['tile_id']}/update",
+                       json={"text": "x"}).status_code == 400
+
+
+def test_text_tile_update_owner_only(client, monkeypatch):
+    client.post(f"/_login/{OWNER}")
+    dash = _mk_dash(client)
+    tile = client.post(f"/api/dashboards/{dash}/tiles",
+                       json={"kind": "text", "text": "T"}).json()["tile"]
+    client.post(f"/_login/{FRIEND}")
+    resp = client.post(f"/api/dashboards/{dash}/tiles/{tile['tile_id']}/update",
+                       json={"text": "hacked"})
+    assert resp.status_code == 404  # not shared → not even visible
+
+
+def test_layout_roundtrip_includes_text_tile(client):
+    client.post(f"/_login/{OWNER}")
+    dash = _mk_dash(client)
+    tile = client.post(f"/api/dashboards/{dash}/tiles",
+                       json={"kind": "text", "text": "T"}).json()["tile"]
+    assert client.post(f"/api/dashboards/{dash}/layout", json={"tiles": [
+        {"tile_id": tile["tile_id"], "x": 2, "y": 1, "w": 8, "h": 3}]}).json()["ok"]
+    doc = client.get(f"/api/dashboards/{dash}").json()
+    assert doc["tiles"][0]["layout"] == {"x": 2, "y": 1, "w": 8, "h": 3}

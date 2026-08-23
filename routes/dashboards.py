@@ -154,6 +154,39 @@ async def create_dashboard(request: Request):
     return _json_safe(row)
 
 
+def _with_default_layouts(doc: dict) -> dict:
+    """Fill layouts for legacy tiles that predate the layout field — in the
+    RESPONSE only, never persisted (non-destructive; the user's first drag
+    persists real positions via /layout). Layoutless tiles are placed below
+    every positioned tile, half-width, two per row (QA 3.1)."""
+    try:
+        tiles = doc.get("tiles") or []
+        if all(isinstance(t.get("layout"), dict) for t in tiles):
+            return doc
+        bottom = 0
+        for t in tiles:
+            lay = t.get("layout")
+            if isinstance(lay, dict):
+                try:
+                    bottom = max(bottom, int(lay.get("y", 0)) + int(lay.get("h", 5)))
+                except Exception:
+                    continue
+        out_tiles = []
+        n = 0
+        for t in tiles:
+            if isinstance(t.get("layout"), dict):
+                out_tiles.append(t)
+                continue
+            t = dict(t)
+            t["layout"] = {"x": (n % 2) * 6, "y": bottom + (n // 2) * 5, "w": 6, "h": 5}
+            n += 1
+            out_tiles.append(t)
+        return {**doc, "tiles": out_tiles}
+    except Exception as e:
+        log_with_sid(doc.get("dash_id") or "?", "warning", f"DASH_DEFAULT_LAYOUT_FAILED: {e}")
+        return doc
+
+
 @router.get("/{dash_id}")
 async def get_dashboard(request: Request, dash_id: str):
     email, err = _require_email(request)
@@ -163,7 +196,7 @@ async def get_dashboard(request: Request, dash_id: str):
     if doc is None:
         return JSONResponse({"error": "Dashboard not found"}, status_code=404)
     _dash_store.touch_last_used(email, dash_id)
-    return _json_safe({**doc, "is_owner": is_owner})
+    return _json_safe({**_with_default_layouts(doc), "is_owner": is_owner})
 
 
 @router.post("/{dash_id}/rename")
@@ -204,13 +237,52 @@ async def delete_dashboard(request: Request, dash_id: str):
 # Tiles
 # ---------------------------------------------------------------------------
 
+# Text tiles (QA 3.1): headers/comments between visuals. Fixed enums so the
+# renderer's CSS classes are the whole styling surface.
+_TEXT_STYLES = ("header1", "header2", "paragraph")
+_TEXT_COLORS = ("default", "gray", "red", "orange", "green", "blue", "purple")
+_TEXT_SIZES = ("S", "M", "L")
+_MAX_TEXT_CHARS = 2000
+
+
+def _validate_text_fields(body: dict, *, require_text: bool):
+    """Validate {text, style, color, size} for a text tile. Returns
+    (fields_dict, error_response). Absent enum fields get defaults when
+    require_text (create); on update only supplied fields are validated."""
+    out: dict = {}
+    text = body.get("text")
+    if text is not None or require_text:
+        if not (isinstance(text, str) and text.strip()):
+            return None, JSONResponse({"error": "A text tile needs non-empty text."},
+                                      status_code=400)
+        if len(text) > _MAX_TEXT_CHARS:
+            return None, JSONResponse({"error": f"Text is limited to {_MAX_TEXT_CHARS} characters."},
+                                      status_code=400)
+        out["text"] = text
+    for field, allowed, default in (("style", _TEXT_STYLES, "paragraph"),
+                                    ("color", _TEXT_COLORS, "default"),
+                                    ("size", _TEXT_SIZES, "M")):
+        val = body.get(field)
+        if val is None:
+            if require_text:
+                out[field] = default
+            continue
+        if val not in allowed:
+            return None, JSONResponse(
+                {"error": f"{field} must be one of {', '.join(allowed)}."}, status_code=400)
+        out[field] = val
+    return out, None
+
+
 @router.post("/{dash_id}/tiles")
 async def add_tile(request: Request, dash_id: str):
-    """Pin one chart/table onto a dashboard. Body (from the /lab pin button):
+    """Pin one chart/table onto a dashboard, or add a text block. Body (from
+    the /lab pin button, or the dashboard page's Add header / Add text):
     {chat_id, kind: "chart"|"table", description?, code?,
      image_base64?, is_plotly?,            # charts
      table?, full_table_key?,              # tables
      chart_data? | chart_data_key?}        # charts' "Show data" source
+    {kind: "text", text, style?, color?, size?}   # text blocks (no chat)
     """
     email, err = _require_email(request)
     if err:
@@ -224,10 +296,22 @@ async def add_tile(request: Request, dash_id: str):
         body = {}
     body = body or {}
 
-    chat_id = str(body.get("chat_id") or "").strip()
     kind = str(body.get("kind") or "").strip().lower()
-    if kind not in ("chart", "table"):
-        return JSONResponse({"error": "kind must be 'chart' or 'table'."}, status_code=400)
+    if kind not in ("chart", "table", "text"):
+        return JSONResponse({"error": "kind must be 'chart', 'table', or 'text'."},
+                            status_code=400)
+
+    if kind == "text":
+        fields, terr = _validate_text_fields(body, require_text=True)
+        if terr:
+            return terr
+        tile = {"kind": "text", **fields}
+        saved = _dash_store.add_tile(email, dash_id, tile)
+        if saved is None:
+            return JSONResponse({"error": "Dashboard not found"}, status_code=404)
+        return _json_safe({"ok": True, "tile": saved})
+
+    chat_id = str(body.get("chat_id") or "").strip()
     _, chat_err = _require_chat(request, chat_id)
     if chat_err:
         return chat_err
@@ -307,6 +391,37 @@ async def remove_tile(request: Request, dash_id: str, tile_id: str):
     return {"ok": True}
 
 
+@router.post("/{dash_id}/tiles/{tile_id}/update")
+async def update_text_tile(request: Request, dash_id: str, tile_id: str):
+    """Edit a TEXT tile's content/style (owner-only). Body: any subset of
+    {text, style, color, size}. Chart/table tiles are immutable through this
+    endpoint (their content comes from refresh, never free edits)."""
+    email, err = _require_email(request)
+    if err:
+        return err
+    doc, err = _require_owned(email, dash_id)
+    if err:
+        return err
+    tile = next((t for t in (doc.get("tiles") or []) if t.get("tile_id") == tile_id), None)
+    if tile is None:
+        return JSONResponse({"error": "Tile not found"}, status_code=404)
+    if (tile.get("kind") or "").lower() != "text":
+        return JSONResponse({"error": "Only text tiles can be edited."}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    fields, terr = _validate_text_fields(body or {}, require_text=False)
+    if terr:
+        return terr
+    if not fields:
+        return JSONResponse({"error": "Nothing to update."}, status_code=400)
+    ok = _dash_store.update_tile(email, dash_id, tile_id, fields)
+    if not ok:
+        return JSONResponse({"error": "Tile not found"}, status_code=404)
+    return _json_safe({"ok": True, "tile": {**tile, **fields}})
+
+
 @router.post("/{dash_id}/layout")
 async def update_layout(request: Request, dash_id: str):
     email, err = _require_email(request)
@@ -344,6 +459,10 @@ async def refresh_tile(request: Request, dash_id: str, tile_id: str):
     tile = next((t for t in (doc.get("tiles") or []) if t.get("tile_id") == tile_id), None)
     if tile is None:
         return JSONResponse({"error": "Tile not found"}, status_code=404)
+    if (tile.get("kind") or "").lower() == "text":
+        # Text blocks have no source chat/code — refreshing is a no-op, and the
+        # chat-existence check below must never freeze them.
+        return {"ok": False, "error": "Text tiles have nothing to refresh."}
 
     chat_id = str(tile.get("chat_id") or "")
     if not chat_id or not local_store.chat_exists(chat_id):

@@ -44,6 +44,7 @@ try:
 except ImportError:
     calplot = None
 from plot_utils import upset_plot_from_sets
+from outlier_utils import outlier_mask, drop_extreme_outliers
 try:
     from adjustText import adjust_text
 except ImportError:
@@ -96,7 +97,12 @@ except Exception:
 # Execution timeout in seconds (Windows-compatible using ThreadPoolExecutor)
 CODE_EXEC_TIMEOUT_SECONDS = 60
 
-# Module-level executor for code execution (reused across calls)
+# Module-level executor for code execution (reused across calls).
+# max_workers MUST stay 1: `_figure_to_base64_if_any` reads and closes the
+# process-global pyplot current figure (plt.gcf()), so parallel exec threads
+# would capture/close each other's figures. The queue-wait this serialization
+# causes under Auto Analytics load is handled upstream by the chat busy guard
+# (routes/chat._auto_analysis_busy_response), not by widening this pool.
 _EXEC_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="code_exec")
 
 
@@ -194,6 +200,10 @@ def safe_execute(code: str, dfs: dict, sid: str | None = None, timeout: float = 
         "scipy_stats": scipy_stats, "msno": msno, "calplot": calplot,
         "upset_plot_from_sets": upset_plot_from_sets,
         "adjust_text": adjust_text,
+        # Deterministic outlier helpers (QA 2.6) — the planner prompt tells
+        # generated code to call these instead of re-implementing detection
+        "outlier_mask": outlier_mask,
+        "drop_extreme_outliers": drop_extreme_outliers,
         # Machine Learning
         "train_test_split": train_test_split,
         "LogisticRegression": LogisticRegression,

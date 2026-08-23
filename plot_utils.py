@@ -9,6 +9,10 @@ import numpy as np
 import pandas as pd
 import matplotlib.patches as mpatches
 
+# Deterministic outlier helpers for the plot exec namespace (leaf module —
+# pandas-only, no import cycle)
+from outlier_utils import outlier_mask, drop_extreme_outliers
+
 # Import visualization libraries
 try:
     import seaborn as sns
@@ -301,6 +305,10 @@ GLOBAL_PLOT_SCOPE = {
     "calplot": calplot,
     "upset_plot_from_sets": upset_plot_from_sets,
     "adjust_text": adjust_text,
+    # Deterministic outlier helpers (QA 2.6) — must exist at BOTH exec sites
+    # (code_exec.safe_execute registers the same pair)
+    "outlier_mask": outlier_mask,
+    "drop_extreme_outliers": drop_extreme_outliers,
     # Machine Learning
     "train_test_split": train_test_split,
     "LogisticRegression": LogisticRegression,

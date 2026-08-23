@@ -24,6 +24,8 @@
       <span id="dashSharedBadge" class="dash-shared-badge hidden"></span>
       <div class="top-bar-spacer"></div>
       <div class="top-bar-actions">
+        <button id="btnAddHeader" class="ghost small top-action-btn hidden" data-i18n="dash.add_header">＋ Header</button>
+        <button id="btnAddText" class="ghost small top-action-btn hidden" data-i18n="dash.add_text">＋ Text</button>
         <button id="btnRefreshAll" class="ghost small top-action-btn" data-i18n="dash.refresh_all">⟳ Refresh all</button>
         <button id="btnShareDash" class="ghost small top-action-btn hidden" data-i18n="dash.share">🔗 Share</button>
         <button id="btnDeleteDash" class="ghost small top-action-btn" data-i18n="dash.delete">🗑 Delete</button>
@@ -99,6 +101,40 @@
       <div class="modal-actions">
         <button id="btnCancelShareDash" class="ghost" data-i18n="common.cancel">Cancel</button>
         <button id="btnSaveShareDash" class="primary" data-i18n="common.share">Share</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Text tile modal (Add header / Add text / edit) -->
+  <div id="textTileModal" class="modal hidden">
+    <div class="modal-content small-modal">
+      <div class="modal-header">
+        <h3 id="textTileModalTitle" data-i18n="dash.add_text_title">Text block</h3>
+        <button id="closeTextTile" class="ghost">✕</button>
+      </div>
+      <div class="modal-body">
+        <textarea id="textTileInput" rows="4" maxlength="2000" data-i18n-placeholder="dash.text_placeholder" placeholder="Your text…" style="width:100%;padding:10px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;resize:vertical;"></textarea>
+        <div class="text-tile-opts">
+          <label data-i18n="dash.text_style">Style</label>
+          <select id="textTileStyle">
+            <option value="header1" data-i18n="dash.style_header1">Header 1</option>
+            <option value="header2" data-i18n="dash.style_header2">Header 2</option>
+            <option value="paragraph" data-i18n="dash.style_paragraph">Paragraph</option>
+          </select>
+          <label data-i18n="dash.text_size">Size</label>
+          <select id="textTileSize">
+            <option value="S">S</option>
+            <option value="M" selected>M</option>
+            <option value="L">L</option>
+          </select>
+        </div>
+        <div class="text-tile-colors" id="textTileColors">
+          <!-- swatches built by dashboard_view.js -->
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="ghost" id="btnCancelTextTile" data-i18n="dash.cancel">Cancel</button>
+        <button class="primary" id="btnSaveTextTile" data-i18n="dash.save">Save</button>
       </div>
     </div>
   </div>
