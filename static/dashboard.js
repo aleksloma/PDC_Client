@@ -5486,14 +5486,42 @@ function initDashboardsDropdown() {
     }
   }
 
+  // Loading/error rows keep the "＋ Add new" item on top like renderMenu does.
+  // The EMPTY-state may render only from a fresh successful fetch — a cold or
+  // failed cache used to paint "No dashboards yet" while the API had rows.
+  function renderStatusRow(text) {
+    renderMenu(null); // Add-new button + the empty-state row slot
+    const row = menu.querySelector('.dash-dd-empty');
+    if (row) row.textContent = text;
+  }
+
   btn.addEventListener('click', async () => {
     const isHidden = menu.classList.contains('hidden');
-    if (isHidden) {
-      renderMenu(_dashListCache.rows || []);   // instant paint from cache
-      menu.classList.remove('hidden');
-      renderMenu(await _dashList(true));       // then fresh MRU order
-    } else {
+    if (!isHidden) {
       menu.classList.add('hidden');
+      return;
+    }
+    // Instant paint from cache ONLY when it actually has rows; otherwise a
+    // loading row — never the empty-state from a cold/failed cache.
+    if (_dashListCache.rows && _dashListCache.rows.length) {
+      renderMenu(_dashListCache.rows);
+    } else {
+      renderStatusRow(_t('dash.loading', 'Loading…'));
+    }
+    menu.classList.remove('hidden');
+    // Always fetch fresh on open, DIRECTLY (not via _dashList, which swallows
+    // failures into an empty list): success is the only source of the
+    // empty-state; failure shows the reason instead of "No dashboards yet".
+    try {
+      const res = await fetch('/api/dashboards');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      _dashListCache = { rows: (data && data.dashboards) || [], ts: Date.now(), error: false };
+      renderMenu(_dashListCache.rows);
+    } catch (e) {
+      console.warn('Dashboard list fetch failed:', e);
+      renderStatusRow(_t('dash.list_failed', 'Could not load dashboards — try again')
+        + ' (' + String(e && e.message || e) + ')');
     }
   });
   // Close on outside click (same pattern as the report-download dropdown).
