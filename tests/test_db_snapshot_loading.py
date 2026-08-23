@@ -145,6 +145,67 @@ def test_db_snapshot_strings_stay_object_never_category():
     assert set(grouped.index) == {"a", "b"}
 
 
+# ── Missing-table diagnosis (Prompt 15 Fix 4) ───────────────────────────────
+# "Chat dataset is empty." was the only thing three live chats said after their
+# registered tables were removed — true, but it named nothing and offered no
+# next step.
+
+def _write_registry(*tids):
+    reg = {"connections": [], "tables": [{"id": t, "display_name": f"reg {t[:4]}"}
+                                         for t in tids]}
+    (Path(local_store.settings.DATA_ROOT) / "data_sources.json").write_text(
+        json.dumps(reg), encoding="utf-8")
+
+
+def test_missing_db_tables_reports_unregistered():
+    _write_registry()                       # registry holds nothing any more
+    store = _chat_with([_db_entry("transactions", TID)])
+    missing = local_store.missing_db_tables(store.read_meta())
+    assert [(m["display_name"], m["reason"]) for m in missing] == \
+        [("transactions", "unregistered")]
+
+
+def test_missing_db_tables_separates_a_vanished_snapshot():
+    _write_registry(TID)                    # still registered ...
+    store = _chat_with([_db_entry("transactions", TID)])   # ... but no parquet
+    missing = local_store.missing_db_tables(store.read_meta())
+    assert [(m["display_name"], m["reason"]) for m in missing] == \
+        [("transactions", "snapshot_missing")]
+
+
+def test_missing_db_tables_ignores_tables_that_load():
+    _write_registry(TID)
+    _write_snapshot(TID, pd.DataFrame({"a": [1]}))
+    store = _chat_with([_db_entry("ok table", TID), _db_entry("gone", TID2)])
+    missing = local_store.missing_db_tables(store.read_meta())
+    assert [m["display_name"] for m in missing] == ["gone"]
+
+
+def test_empty_dataset_message_names_the_missing_tables():
+    _write_registry()
+    store = _chat_with([_db_entry("products dictionary", TID),
+                        _db_entry("transactions", TID2)])
+    text, missing = local_store.empty_dataset_message(store.read_meta())
+    assert "'products dictionary'" in text and "'transactions'" in text
+    assert "no longer registered" in text
+    assert "administrator" in text and "add data" in text
+    assert len(missing) == 2
+
+
+def test_empty_dataset_message_unchanged_for_a_genuinely_empty_chat():
+    store = _chat_with([])
+    text, missing = local_store.empty_dataset_message(store.read_meta())
+    assert text == "Chat dataset is empty."
+    assert missing == []
+
+
+def test_empty_dataset_message_never_raises_without_a_registry():
+    # No data_sources.json at all — the reason degrades, the message survives.
+    store = _chat_with([_db_entry("transactions", TID)])
+    text, missing = local_store.empty_dataset_message(store.read_meta())
+    assert "'transactions'" in text and len(missing) == 1
+
+
 def test_unique_df_key():
     assert local_store.unique_df_key({"a.csv"}, "clients") == "clients"
     assert local_store.unique_df_key({"clients"}, "clients") == "clients (2)"

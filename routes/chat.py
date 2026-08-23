@@ -470,6 +470,22 @@ async def welcome(request: Request, chat_id: str):
     }
 
 
+def _empty_dataset_response(store, chat_id: str) -> JSONResponse:
+    """400 for a chat whose dataframes are empty. When the chat's registered
+    database tables are what vanished, the message NAMES them and says why —
+    the bare "Chat dataset is empty." left the user with no next step. Genuinely
+    empty chats keep that original wording."""
+    text, missing = local_store.empty_dataset_message(store.read_meta())
+    body = {"error": text}
+    if missing:
+        body["code"] = "DB_TABLES_MISSING"
+        body["missing_tables"] = missing
+        log_with_sid(chat_id, "warning",
+                     "CHAT_DB_TABLES_MISSING " + ", ".join(
+                         f"{m['display_name']}({m['reason']})" for m in missing))
+    return JSONResponse(body, status_code=400)
+
+
 @router.get("/{chat_id}/schema")
 async def get_schema(request: Request, chat_id: str):
     email, err = _require_chat(request, chat_id)
@@ -502,18 +518,20 @@ async def get_schema(request: Request, chat_id: str):
         except Exception as e:
             log_with_sid(email, "warning", f"SCHEMA_ROLE_PROBE_FAILED: {e}",
                          chat_id=chat_id)
+        # ONE classifier for "this table can no longer be loaded" (also used by
+        # the empty-dataset message, which needs the REASON as well).
+        try:
+            missing_by_id = {m["table_id"]: m for m in local_store.missing_db_tables(meta)}
+        except Exception as e:
+            log_with_sid(email, "warning", f"DB_TABLE_MISSING_PROBE_FAILED: {e}",
+                         chat_id=chat_id)
+            missing_by_id = {}
         for entry in db_entries:
             db = entry.get("db") or {}
             tid = db.get("table_id")
             reg = registry.get(tid)
             refreshed = (reg or {}).get("refreshed_at") or db.get("refreshed_at")
-            missing = True
-            try:
-                missing = reg is None or not local_store.db_snapshot_path(tid).exists()
-            except Exception as e:
-                log_with_sid(email, "warning",
-                             f"DB_TABLE_MISSING_PROBE_FAILED table={tid}: {e}",
-                             chat_id=chat_id)
+            missing = tid in missing_by_id
             db_tables.append({
                 "df_key": entry.get("file_name"),
                 "table_id": tid,
@@ -784,7 +802,7 @@ async def chat_stream(request: Request, chat_id: str):
     loop = asyncio.get_running_loop()
     dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
     if not dfs:
-        return JSONResponse({"error": "Chat dataset is empty."}, status_code=400)
+        return _empty_dataset_response(store, chat_id)
     schema_docs = await loop.run_in_executor(_EXEC, store.schema_docs)
     # Dataset profiles (computed facts for the planner). Backfilled from the
     # stored frames when missing/stale; a failure never blocks the chat.
@@ -1168,7 +1186,7 @@ async def edit_regenerate(request: Request, chat_id: str):
         loop = asyncio.get_running_loop()
         dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
         if not dfs:
-            return JSONResponse({"error": "Chat dataset is empty."}, status_code=400)
+            return _empty_dataset_response(store, chat_id)
         schema_docs = await loop.run_in_executor(_EXEC, store.schema_docs)
         try:
             dataset_profiles = await loop.run_in_executor(
@@ -1636,7 +1654,14 @@ async def run_item_refresh(chat_id: str, code: str, kind: str, sid: str,
         if drop_df_keys:
             dfs = {k: v for k, v in dfs.items() if k not in drop_df_keys}
         if not dfs:
-            return {"ok": False, "error": "Chat dataset is empty."}
+            # Names the de-registered / snapshot-less tables when that is the
+            # reason (drop_df_keys is a role denial, not a missing table).
+            text, missing = local_store.empty_dataset_message(store.read_meta())
+            out = {"ok": False, "error": text}
+            if missing:
+                out["code"] = "DB_TABLES_MISSING"
+                out["missing_tables"] = missing
+            return out
 
         if kind == "table":
             from code_exec import safe_execute

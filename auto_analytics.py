@@ -111,7 +111,10 @@ def _run_job(chat_id: str, user_email: str) -> None:
         common_fields = meta.get("common_fields", []) or []
         dfs = store.load_dataframes()
         if not dfs:
-            raise RuntimeError("Chat dataset is empty — nothing to analyze")
+            # Names the de-registered / snapshot-less tables when that is why
+            # (the bare wording left the operator with nothing to act on).
+            text, _missing = local_store.empty_dataset_message(meta)
+            raise RuntimeError(f"{text} Nothing to analyze.")
 
         # Step 1: Build schema_text locally (no row values)
         from schema_builder import schema_text as _schema_text

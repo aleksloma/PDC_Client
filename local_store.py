@@ -682,6 +682,81 @@ def db_entries_from_meta(meta) -> list[dict]:
             if isinstance(e, dict) and e.get("source") == "database"]
 
 
+def missing_db_tables(meta) -> list[dict]:
+    """The chat's database tables that can no longer be loaded, and WHY.
+
+    Returns [{df_key, table_id, display_name, reason}] with reason
+    "unregistered" (gone from the data-source registry — an admin deleted the
+    registration) or "snapshot_missing" (still registered, but its snapshot
+    parquet is absent). Empty for file-only chats and for tables that load.
+
+    The names come from the chat meta itself; the registry is read ONLY to tell
+    the two reasons apart, and a registry failure degrades to
+    "snapshot_missing" rather than raising (Article IV). This runs on message
+    paths only — never in the dataframe load funnel."""
+    entries = db_entries_from_meta(meta)
+    if not entries:
+        return []
+    registered: set = set()
+    registry_ok = False
+    try:
+        from db_sources import DataSourceStore
+        registered = {t.get("id") for t in DataSourceStore().list_tables()}
+        registry_ok = True
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid("missing-db", "warning", f"REGISTRY_PROBE_FAILED: {e}")
+    out = []
+    for entry in entries:
+        db = entry.get("db") or {}
+        tid = db.get("table_id")
+        try:
+            present = bool(tid) and db_snapshot_path(tid).exists()
+        except Exception:
+            present = False
+        if present:
+            continue
+        reason = "unregistered" if (registry_ok and tid not in registered) \
+            else "snapshot_missing"
+        out.append({
+            "df_key": entry.get("file_name"),
+            "table_id": tid,
+            "display_name": db.get("display_name") or entry.get("file_name") or "table",
+            "reason": reason,
+        })
+    return out
+
+
+def empty_dataset_message(meta) -> tuple[str, list]:
+    """(message, missing_tables) for a chat whose dataframes came back empty.
+
+    A chat that once had database tables is not "empty" — its tables were
+    de-registered or their snapshots were removed, and saying so is the
+    difference between a dead end and an actionable message. A genuinely empty
+    chat keeps the original wording."""
+    try:
+        missing = missing_db_tables(meta)
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid("missing-db", "warning", f"MISSING_DB_PROBE_FAILED: {e}")
+        missing = []
+    if not missing:
+        return "Chat dataset is empty.", []
+    names = ", ".join(f"'{m['display_name']}'" for m in missing)
+    unregistered = [m for m in missing if m["reason"] == "unregistered"]
+    if len(unregistered) == len(missing):
+        why = ("no longer registered as a data source"
+               if len(missing) == 1 else
+               "no longer registered as data sources")
+    elif not unregistered:
+        why = "missing their stored data" if len(missing) > 1 else "missing its stored data"
+    else:
+        why = "no longer available (some were removed from the data sources)"
+    return (f"This chat uses database {'table' if len(missing) == 1 else 'tables'} "
+            f"{names}, which {'is' if len(missing) == 1 else 'are'} {why}, so there "
+            f"is no data left to answer with. Ask your administrator to register "
+            f"{'it' if len(missing) == 1 else 'them'} again, or add data to this chat.",
+            missing)
+
+
 def _db_signature(db_entries) -> tuple:
     """(df_key, table_id, mtime_ns, size) per snapshot — the DB half of the
     memory-cache freshness proof. A missing snapshot contributes (None, None)

@@ -427,6 +427,25 @@ meta). The frontend's non-SSE fallback renders the message in the chat. A
 Please try again in a moment." — the generic "temporarily unavailable" text is
 reserved for genuine brain unreachability.
 
+**Missing database tables (Prompt 15):** when a chat's dataframes come back
+empty AND its meta references registered DB tables that can no longer be
+loaded, the 400 NAMES them instead of the bare "Chat dataset is empty.":
+`{error: "This chat uses database tables 'products dictionary',
+'transactions', which are no longer registered as data sources, so there is no
+data left to answer with. Ask your administrator to register them again, or add
+data to this chat.", code: "DB_TABLES_MISSING", missing_tables: [{df_key,
+table_id, display_name, reason: "unregistered"|"snapshot_missing"}]}`.
+`local_store.missing_db_tables` is the ONE classifier (also behind `/schema`'s
+`missing` flag): the names come from the chat meta, the registry is read only to
+tell the two reasons apart, and a registry failure degrades to
+`snapshot_missing` rather than failing the response. Applied to `chat/stream`,
+`edit-regenerate`, `run_item_refresh` (so per-message refresh and dashboard
+tiles say it too, as `{ok:false, code, missing_tables}`) and the Auto Analytics
+job error. A genuinely empty chat still returns exactly
+`"Chat dataset is empty."` with no `code`. The frontend needs no change — it
+already renders `error` verbatim; `code`/`missing_tables` are there for
+localization later.
+
 **`GET /api/chat/{chat_id}/conversation/{conv_id}/status`** → `{"generating": bool}`.
 Lightweight in-memory registry lookup (no I/O): `true` while a generation worker
 is still running for that conversation. The generation worker persists the AI
