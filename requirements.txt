@@ -45,3 +45,7 @@ oracledb==2.5.1
 # Relation discovery: parses admin-pasted SQL locally (never sent to the
 # brain, never persisted). Pure Python, denied inside the exec sandbox.
 sqlglot==30.14.0
+# Refresh scheduling: preset schedules (daily/weekly/monthly/interval/cron)
+# normalized to 5-field cron; croniter computes next runs (supports `l` =
+# last day of month — pinned by tests/test_schedule_utils.py). Pure Python.
+croniter==6.0.0

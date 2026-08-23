@@ -261,25 +261,51 @@
         <header class="adm-page-head">
           <div>
             <h1>Refresh schedule</h1>
-            <p class="adm-page-sub">Snapshots refresh automatically every night. A failed refresh
-               keeps the previous snapshot — chats never break.</p>
+            <p class="adm-page-sub">Snapshots refresh automatically on the schedule below. A failed
+               refresh keeps the previous snapshot — chats never break. Unchanged tables are
+               skipped (change detection runs first). Individual tables can override this
+               schedule from the Tables list (⏱).</p>
           </div>
         </header>
         <div class="adm-card adm-schedule-card">
           <label class="adm-switch-row">
             <input type="checkbox" id="refreshEnabled" />
-            <span>Nightly refresh enabled</span>
+            <span>Scheduled refresh enabled</span>
           </label>
-          <label class="adm-time-row">
-            <span>Run at (container-local time)</span>
-            <input type="time" id="refreshTime" value="00:00" />
-          </label>
-          <div id="scheduleInfo" class="adm-muted"></div>
+          <div id="globalScheduleFields"><!-- renderScheduleFields() --></div>
+          <div id="schedPreview" class="adm-muted"></div>
           <div class="adm-card-actions">
             <button id="btnSaveSchedule" class="adm-btn primary">Save schedule</button>
           </div>
         </div>
       </section>
+
+      <!-- Per-table schedule override modal (narrow #pwModal chrome) -->
+      <div id="tableScheduleModal" class="adm-modal-backdrop hidden">
+        <div class="adm-modal adm-modal-narrow">
+          <div class="adm-modal-head">
+            <h3 id="tsmTitle">Table schedule</h3>
+            <button id="closeTsmModal" class="adm-x">✕</button>
+          </div>
+          <div class="adm-modal-body">
+            <label class="adm-switch-row">
+              <input type="radio" name="tsmMode" id="tsmInherit" checked />
+              <span>Inherit the global schedule</span>
+            </label>
+            <label class="adm-switch-row">
+              <input type="radio" name="tsmMode" id="tsmOwn" />
+              <span>Own schedule for this table</span>
+            </label>
+            <div id="tsmFields" class="hidden"><!-- renderScheduleFields() --></div>
+            <div id="tsmPreview" class="adm-muted"></div>
+          </div>
+          <div class="adm-modal-foot">
+            <span class="adm-spacer"></span>
+            <button id="btnTsmCancel" class="adm-btn ghost">Cancel</button>
+            <button id="btnTsmSave" class="adm-btn primary">Save</button>
+          </div>
+        </div>
+      </div>
 
       <!-- Audit log -->
       <section id="secAudit" class="adm-section" hidden>

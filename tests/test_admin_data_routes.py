@@ -290,14 +290,83 @@ def test_refresh_now_unknown_table(client, sqlite_conn):
 
 
 def test_refresh_settings_roundtrip_and_validation(client, sqlite_conn):
+    # LEGACY body shape keeps working (mapped to daily) — mid-deploy compat.
     assert client.post("/api/admin/refresh_settings",
                        json={"refresh_time": "25:00", "refresh_enabled": True}
                        ).status_code == 400
     ok = client.post("/api/admin/refresh_settings",
                      json={"refresh_time": "02:15", "refresh_enabled": False})
     assert ok.status_code == 200
+    assert ok.json()["schedule"]["mode"] == "daily"
     got = client.get("/api/admin/refresh_settings").json()
     assert got["refresh_time"] == "02:15" and got["refresh_enabled"] is False
+    assert got["schedule"]["time"] == "02:15"
+    assert got["description"] == "Daily at 02:15"
+
+
+def test_refresh_settings_new_schedule_shape(client, sqlite_conn):
+    ok = client.post("/api/admin/refresh_settings", json={"schedule": {
+        "mode": "weekly", "time": "06:00", "weekdays": [1, 4], "enabled": True}})
+    assert ok.status_code == 200
+    data = ok.json()
+    assert data["schedule"]["mode"] == "weekly"
+    assert data["description"] == "Weekly on Mon, Thu at 06:00"
+    assert data["next_run_at"]                      # computed directly
+    # validation errors carry BAD_SCHEDULE + the exact message
+    bad = client.post("/api/admin/refresh_settings", json={"schedule": {
+        "mode": "interval", "every_minutes": 10, "enabled": True}})
+    assert bad.status_code == 400
+    assert bad.json()["code"] == "BAD_SCHEDULE"
+    assert bad.json()["error"] == "Interval must be at least 15 minutes."
+    empty = client.post("/api/admin/refresh_settings", json={"schedule": {
+        "mode": "weekly", "time": "06:00", "weekdays": [], "enabled": True}})
+    assert empty.status_code == 400
+    assert empty.json()["error"] == "Pick at least one weekday."
+    badcron = client.post("/api/admin/refresh_settings", json={"schedule": {
+        "mode": "cron", "cron": "* * *", "enabled": True}})
+    assert badcron.status_code == 400
+
+
+def test_schedule_preview_endpoint(client, sqlite_conn):
+    ok = client.post("/api/admin/schedule_preview", json={"schedule": {
+        "mode": "interval", "every_minutes": 15, "enabled": True}})
+    assert ok.status_code == 200
+    data = ok.json()
+    assert data["crons"] == ["*/15 * * * *"]
+    assert data["description"] == "Every 15 minutes"
+    assert len(data["next_runs"]) == 3
+    bad = client.post("/api/admin/schedule_preview", json={"schedule": {
+        "mode": "monthly", "time": "06:00", "monthly_days": [31],
+        "enabled": True}})
+    assert bad.status_code == 400 and bad.json()["code"] == "BAD_SCHEDULE"
+
+
+def test_table_schedule_override_endpoint(client, sqlite_conn):
+    _, cid = sqlite_conn
+    saved = client.post("/api/admin/tables", json=_table_body(cid)).json()
+    tid = saved["table"]["id"]
+    ok = client.post(f"/api/admin/tables/{tid}/schedule", json={"schedule": {
+        "mode": "interval", "every_minutes": 30, "enabled": True}})
+    assert ok.status_code == 200
+    assert ok.json()["table"]["schedule"]["mode"] == "interval"
+    assert ok.json()["description"] == "Every 30 minutes"
+    assert ok.json()["next_run_at"]
+    # wizard edit-save must carry the override through the whole-doc replace
+    body = _table_body(cid)
+    body["display_name"] = saved["table"]["display_name"]
+    edited = client.post(f"/api/admin/tables/{tid}", json=body)
+    assert edited.status_code == 200
+    assert edited.json()["table"]["schedule"]["mode"] == "interval"
+    # back to inherit
+    inh = client.post(f"/api/admin/tables/{tid}/schedule", json={"schedule": None})
+    assert inh.status_code == 200
+    assert "schedule" not in inh.json()["table"]
+    # 404 unknown, 400 invalid
+    assert client.post("/api/admin/tables/aa11bb22cc33dd44/schedule",
+                       json={"schedule": {"mode": "daily", "time": "06:00",
+                                          "enabled": True}}).status_code == 404
+    assert client.post(f"/api/admin/tables/{tid}/schedule", json={"schedule": {
+        "mode": "interval", "every_minutes": 5, "enabled": True}}).status_code == 400
 
 
 def test_delete_connection_conflict_then_cascade(client, sqlite_conn):

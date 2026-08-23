@@ -52,18 +52,25 @@ def _sqlite_setup(tmp_path, ddl_rows=3):
 
 
 # ---------------------------------------------------------------------------
-# compute_next_run (pure)
+# next-run computation (pure — full matrix in tests/test_schedule_utils.py)
 # ---------------------------------------------------------------------------
 
-def test_compute_next_run_before_after_and_exact():
+def test_daily_next_fire_before_after_and_exact():
+    import schedule_utils
     now = datetime(2026, 7, 28, 10, 30)
-    assert db_scheduler.compute_next_run(now, "11:00") == datetime(2026, 7, 28, 11, 0)
-    assert db_scheduler.compute_next_run(now, "09:00") == datetime(2026, 7, 29, 9, 0)
-    # Exactly at the boundary → tomorrow (target <= now).
-    assert db_scheduler.compute_next_run(datetime(2026, 7, 28, 0, 0), "00:00") == \
+
+    def daily(t):
+        return schedule_utils.validate_schedule({"mode": "daily", "time": t,
+                                                 "enabled": True})
+    assert schedule_utils.next_fire(daily("11:00"), now) == datetime(2026, 7, 28, 11, 0)
+    assert schedule_utils.next_fire(daily("09:00"), now) == datetime(2026, 7, 29, 9, 0)
+    # Exactly at the boundary → tomorrow (fire strictly after `after`).
+    assert schedule_utils.next_fire(daily("00:00"), datetime(2026, 7, 28, 0, 0)) == \
         datetime(2026, 7, 29, 0, 0)
-    # Garbage falls back to midnight.
-    assert db_scheduler.compute_next_run(now, "bogus") == datetime(2026, 7, 29, 0, 0)
+    # Garbage settings fall back to daily midnight via the migration seam.
+    g = schedule_utils.schedule_from_settings({"refresh_time": "bogus",
+                                               "refresh_enabled": True})
+    assert schedule_utils.next_fire(g, now) == datetime(2026, 7, 29, 0, 0)
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@
   shared between chat and dashboards).
 - The scheduler thread is started/stopped from app.py's LIFESPAN, never at
   import — an import-time thread would leak into every pytest session (the
-  local_store sweeper lesson). Tests call `run_all_due()` / `compute_next_run`
+  local_store sweeper lesson). Tests call `run_all_due()` / `schedule_utils`
   directly.
 - A refresh failure leaves the previous snapshot AND the previous
   refreshed_at in place — chats keep serving the last good data (Article IV).
@@ -21,7 +21,7 @@ import json
 import os
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -31,27 +31,23 @@ from logger_utils import log_with_sid
 import local_store
 import db_sources
 import db_connector
+import schedule_utils
 
 _STOP = threading.Event()
 _THREAD: Optional[threading.Thread] = None
 _STATE_LOCK = threading.Lock()
-_STATE = {"last_run_date": None, "next_run_at": None}
+_STATE = {"next_run_at": None}
 
 _LOCK_NAME = ".db_refresh.lock"
 
 
-def compute_next_run(now: datetime, hhmm: str) -> datetime:
-    """Pure: next occurrence of HH:MM (container-local naive time) at/after
-    `now`."""
+def _parse_iso(value) -> Optional[datetime]:
+    """Naive datetime from a stored ISO string; None on anything else."""
     try:
-        h, m = hhmm.split(":")
-        h, m = int(h), int(m)
+        dt = datetime.fromisoformat(str(value))
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
     except Exception:
-        h, m = 0, 0
-    target = now.replace(hour=h, minute=m, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return target
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -323,11 +319,14 @@ def _release_run_lock() -> None:
         pass
 
 
-def run_all_due(*, reason: str = "schedule") -> dict:
-    """Refresh every registered table SEQUENTIALLY (parallel snapshots would
+def run_all_due(*, reason: str = "schedule",
+                table_ids: Optional[list] = None) -> dict:
+    """Refresh registered tables SEQUENTIALLY (parallel snapshots would
     spike container RAM and hammer the customer DB at midnight). Each table
     individually try/except'd; _STOP checked between tables. The 'run once'
-    body — no loop, no sleep — so tests drive it directly."""
+    body — no loop, no sleep — so tests drive it directly. `table_ids`
+    filters the run (the scheduler separates inheriting tables from
+    per-table overrides with it); None = every table."""
     store = db_sources.DataSourceStore()
     if not db_sources.encryption_ready() and store.list_connections():
         log_with_sid("db_refresh", "warning", "DB_REFRESH_SKIPPED_NO_KEY")
@@ -338,6 +337,9 @@ def run_all_due(*, reason: str = "schedule") -> dict:
     results = []
     try:
         tables = store.list_tables()
+        if table_ids is not None:
+            wanted = set(table_ids)
+            tables = [t for t in tables if t.get("id") in wanted]
         log_with_sid("db_refresh", "info",
                      f"DB_REFRESH_RUN_START reason={reason} tables={len(tables)}")
         for t in tables:
@@ -377,28 +379,66 @@ def next_run_at() -> Optional[str]:
 
 
 def _loop() -> None:
+    """Generic next-run tracking (Prompt 13 Part B): the global schedule and
+    per-table overrides each keep a PERSISTED last-fired stamp; a fire moment
+    that passes (including while the container was down — catch-up, once) is
+    due when `next_fire(after=last_fired) <= now`. Stamps are written BEFORE
+    the run (backward clock jump / slow run can't double-fire). First-ever
+    start initializes stamps to now — no refresh storm on upgrade. ≤60s
+    slices are kept: settings/schedule edits apply without a restart."""
     log_with_sid("db_refresh", "info", "DB_SCHEDULER_STARTED")
     while not _STOP.is_set():
         try:
-            stg = db_sources.DataSourceStore().get_refresh_settings()
+            store = db_sources.DataSourceStore()
+            stg = store.get_refresh_settings()
             now = datetime.now()
-            nxt = compute_next_run(now, stg.get("refresh_time") or "00:00")
+            gsched = schedule_utils.schedule_from_settings(stg)
+            g_last = _parse_iso(stg.get("last_fired_at"))
+            if g_last is None:
+                store.mark_fired(now.isoformat())
+                g_last = now
+
+            tables = store.list_tables()
+            overridden = [(t, t.get("schedule")) for t in tables
+                          if isinstance(t.get("schedule"), dict)]
+            inheriting_ids = [t.get("id") for t in tables
+                              if not isinstance(t.get("schedule"), dict)]
+            table_last: dict = {}
+            for t, s in overridden:
+                tl = _parse_iso(t.get("schedule_last_fired_at"))
+                if tl is None:
+                    store.mark_table_fired(t.get("id"), now.isoformat())
+                    tl = now
+                table_last[t.get("id")] = tl
+
+            upcoming = [schedule_utils.next_fire(gsched, g_last)]
+            for t, s in overridden:
+                upcoming.append(schedule_utils.next_fire(
+                    schedule_utils.schedule_from_settings({"schedule": s}),
+                    table_last[t.get("id")]))
+            candidates = [u for u in upcoming if u is not None]
+            nxt = min(candidates) if candidates else None
             with _STATE_LOCK:
-                _STATE["next_run_at"] = nxt.isoformat()
-            remaining = (nxt - now).total_seconds()
+                _STATE["next_run_at"] = nxt.isoformat() if nxt else None
+            remaining = (nxt - now).total_seconds() if nxt else 60.0
             # ≤60s slices: DST/NTP shifts cost at most one slice; settings
             # changes take effect without a restart.
             if _STOP.wait(timeout=min(60.0, max(1.0, remaining))):
                 break
+
             now = datetime.now()
-            today = now.date().isoformat()
-            with _STATE_LOCK:
-                already_ran = _STATE.get("last_run_date") == today
-            if (not already_ran and stg.get("refresh_enabled")
-                    and now >= nxt.replace(tzinfo=None)):
-                with _STATE_LOCK:
-                    _STATE["last_run_date"] = today  # backward clock jump can't double-run
-                run_all_due(reason="schedule")
+            if schedule_utils.due_now(gsched, g_last, now):
+                store.mark_fired(now.isoformat())
+                run_all_due(reason="schedule", table_ids=inheriting_ids)
+            due_tables = []
+            for t, s in overridden:
+                sched = schedule_utils.schedule_from_settings({"schedule": s})
+                if schedule_utils.due_now(sched, table_last[t.get("id")], now):
+                    due_tables.append(t.get("id"))
+            if due_tables:
+                for tid in due_tables:
+                    store.mark_table_fired(tid, now.isoformat())
+                run_all_due(reason="schedule:table", table_ids=due_tables)
         except Exception as e:
             log_with_sid("db_refresh", "error", f"DB_SCHEDULER_LOOP_ERROR: {e}")
             if _STOP.wait(timeout=60.0):

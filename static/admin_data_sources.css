@@ -155,7 +155,19 @@ body.admin-ds-page {
 .adm-switch-row input { width: 17px; height: 17px; }
 .adm-time-row { display: flex; align-items: center; gap: 12px; font-size: 13.5px; color: #334155; }
 .adm-time-row input[type="time"] { border: 1px solid #d1d5db; border-radius: 7px; padding: 6px 10px; font-family: inherit; }
+.adm-time-row select, .adm-time-row input[type="number"], .adm-time-row input[type="text"] {
+  border: 1px solid #d1d5db; border-radius: 7px; padding: 6px 10px; font-family: inherit; }
+.adm-time-row input[type="number"] { width: 72px; }
+.adm-time-row input[type="text"] { flex: 1; font-family: ui-monospace, monospace; }
 .adm-card-actions { display: flex; justify-content: flex-end; }
+/* Schedule editor (Prompt 13): weekday checks + 1-28/Last day chips */
+.schedWeekdaysRow { display: flex; flex-wrap: wrap; gap: 10px; font-size: 13px; color: #334155; }
+.sched-dow { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.sched-days { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 6px; }
+.sched-day { cursor: pointer; border: 1px solid #d1d5db; background: #fff; }
+.sched-day.ok { border-color: #16a34a; }
+.sched-day-last { font-weight: 600; }
+.adm-bad-text { color: #b91c1c; }
 
 /* ── Modals ────────────────────────────────────────────────────────────── */
 .adm-modal-backdrop {

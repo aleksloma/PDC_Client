@@ -93,6 +93,9 @@ def test_old_shape_doc_loads_with_defaults(tmp_path, monkeypatch):
     doc = store.read_doc()
     assert doc["version"] == 1
     assert doc["settings"]["refresh_time"]
+    # Prompt 13 schedule keys default cleanly on old docs.
+    assert doc["settings"]["schedule"] is None
+    assert doc["settings"]["last_fired_at"] is None
     assert doc["tables"] == []
     rows = store.list_connections()
     assert rows[0]["name"] == "legacy"
@@ -127,10 +130,57 @@ def test_delete_connection_blocked_by_dependent_tables(store):
 
 def test_refresh_settings_validation(store):
     with pytest.raises(ValueError):
-        store.set_refresh_settings(refresh_time="25:00", refresh_enabled=True, actor="ladmin")
-    out = store.set_refresh_settings(refresh_time="02:30", refresh_enabled=False, actor="ladmin")
+        store.set_refresh_settings(
+            schedule={"mode": "daily", "time": "25:00", "enabled": True},
+            actor="ladmin")
+    out = store.set_refresh_settings(
+        schedule={"mode": "daily", "time": "02:30", "enabled": False},
+        actor="ladmin")
+    # Legacy mirror keys stay in sync for downgrade-compat.
     assert out["refresh_time"] == "02:30" and out["refresh_enabled"] is False
+    assert out["schedule"]["mode"] == "daily" and out["schedule"]["time"] == "02:30"
     assert store.get_refresh_settings()["refresh_time"] == "02:30"
+
+
+def test_refresh_settings_weekly_roundtrip_and_legacy_mirror(store):
+    out = store.set_refresh_settings(
+        schedule={"mode": "weekly", "time": "06:00", "weekdays": [4, 1],
+                  "enabled": True}, actor="ladmin")
+    assert out["schedule"]["weekdays"] == [1, 4]      # sorted, deduped
+    assert out["refresh_enabled"] is True
+    stored = store.get_refresh_settings()
+    assert stored["schedule"]["mode"] == "weekly"
+    # non-daily modes leave the legacy time untouched
+    assert stored["refresh_time"]
+
+
+def test_table_schedule_override_roundtrip(store):
+    masked = _mk_conn(store)
+    t = store.upsert_table({"connection_id": masked["id"], "schema": "s",
+                            "table_name": "t", "display_name": "t",
+                            "columns": []}, actor="ladmin")
+    tid = t["id"]
+    sched = {"mode": "interval", "every_minutes": 30, "enabled": True}
+    assert store.set_table_schedule(tid, sched, actor="ladmin") is True
+    row = store.get_table(tid)
+    assert row["schedule"]["mode"] == "interval"
+    assert row["schedule_last_fired_at"] is None
+    store.mark_table_fired(tid, "2026-08-23T10:00:00")
+    assert store.get_table(tid)["schedule_last_fired_at"] == "2026-08-23T10:00:00"
+    # back to inherit
+    assert store.set_table_schedule(tid, None, actor="ladmin") is True
+    row = store.get_table(tid)
+    assert "schedule" not in row and row["schedule_last_fired_at"] is None
+    # unknown table / invalid schedule
+    assert store.set_table_schedule("ff00ff00ff00ff00", sched, actor="ladmin") is False
+    with pytest.raises(ValueError):
+        store.set_table_schedule(tid, {"mode": "interval", "every_minutes": 5,
+                                       "enabled": True}, actor="ladmin")
+
+
+def test_mark_fired_persists(store):
+    store.mark_fired("2026-08-23T06:00:00")
+    assert store.get_refresh_settings()["last_fired_at"] == "2026-08-23T06:00:00"
 
 
 def test_mark_refreshed_error_keeps_previous_refreshed_at(store):

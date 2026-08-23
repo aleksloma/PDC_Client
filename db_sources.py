@@ -37,6 +37,7 @@ from typing import Optional
 
 from settings import settings
 from logger_utils import log_with_sid
+import schedule_utils
 from local_store import (_data_root, _json_safe, _now, _write_json_atomic,
                          _DB_SNAPSHOT_DIRNAME as _SNAPSHOT_DIRNAME,
                          db_snapshot_path)
@@ -206,6 +207,12 @@ def _default_doc() -> dict:
         "settings": {
             "refresh_enabled": bool(settings.DB_REFRESH_ENABLED),
             "refresh_time": settings.DB_REFRESH_TIME if _TIME_RE.match(settings.DB_REFRESH_TIME or "") else "00:00",
+            # Prompt 13 Part B: the schedule object (schedule_utils shape).
+            # None ⇒ legacy pair above applies (schedule_from_settings maps it
+            # to daily). Keys MUST be listed here — read_doc whitelists
+            # settings keys against this default.
+            "schedule": None,
+            "last_fired_at": None,
             "last_run_at": None,
             "last_run_summary": None,
         },
@@ -661,19 +668,70 @@ class DataSourceStore:
     def get_refresh_settings(self) -> dict:
         return dict(self.read_doc()["settings"])
 
-    def set_refresh_settings(self, *, refresh_time: str, refresh_enabled: bool,
-                             actor: str) -> dict:
-        if not _TIME_RE.match(refresh_time or ""):
-            raise ValueError("refresh_time must be HH:MM (24h)")
+    def set_refresh_settings(self, *, schedule: dict, actor: str) -> dict:
+        """Store the validated schedule object. Legacy keys are mirrored
+        (refresh_enabled always; refresh_time for daily mode) so a downgraded
+        image still reads a sensible daily setting. Raises ValueError with an
+        admin-readable message on a bad schedule (route maps it to 400)."""
+        sched = schedule_utils.validate_schedule(schedule)
         with _LOCK:
             doc = self.read_doc()
-            doc["settings"]["refresh_time"] = refresh_time
-            doc["settings"]["refresh_enabled"] = bool(refresh_enabled)
+            doc["settings"]["schedule"] = sched
+            doc["settings"]["refresh_enabled"] = bool(sched.get("enabled"))
+            if sched.get("mode") == "daily" and sched.get("time"):
+                doc["settings"]["refresh_time"] = sched["time"]
             self._write_doc(doc)
             out = dict(doc["settings"])
-        audit(actor, "refresh.settings", detail={"refresh_time": refresh_time,
-                                                 "refresh_enabled": bool(refresh_enabled)})
+        audit(actor, "refresh.settings", detail={"schedule": sched})
         return out
+
+    def mark_fired(self, fired_at_iso: str) -> None:
+        """Persist the global scheduler's last fire moment (stamped BEFORE the
+        run starts — the double-run / backward-clock guard). Never raises."""
+        try:
+            with _LOCK:
+                doc = self.read_doc()
+                doc["settings"]["last_fired_at"] = str(fired_at_iso)
+                self._write_doc(doc)
+        except Exception as e:
+            log_with_sid("db_sources", "warning", f"DB_MARK_FIRED_FAILED: {e}")
+
+    def set_table_schedule(self, tid: str, schedule: Optional[dict], *,
+                           actor: str) -> bool:
+        """Per-table schedule override (None ⇒ inherit global). Validates when
+        not None (ValueError propagates for the route's 400); resets the
+        table's own last-fired stamp. Returns False for an unknown table."""
+        sched = schedule_utils.validate_schedule(schedule) if schedule is not None else None
+        with _LOCK:
+            doc = self.read_doc()
+            for t in doc["tables"]:
+                if t.get("id") == tid:
+                    if sched is None:
+                        t.pop("schedule", None)
+                    else:
+                        t["schedule"] = sched
+                    t["schedule_last_fired_at"] = None
+                    self._write_doc(doc)
+                    break
+            else:
+                return False
+        audit(actor, "table.schedule", target=tid,
+              detail={"schedule": sched, "inherit": sched is None})
+        return True
+
+    def mark_table_fired(self, tid: str, fired_at_iso: str) -> None:
+        """Persist an overridden table's last fire moment. Never raises."""
+        try:
+            with _LOCK:
+                doc = self.read_doc()
+                for t in doc["tables"]:
+                    if t.get("id") == tid:
+                        t["schedule_last_fired_at"] = str(fired_at_iso)
+                        self._write_doc(doc)
+                        return
+        except Exception as e:
+            log_with_sid("db_sources", "warning",
+                         f"DB_MARK_TABLE_FIRED_FAILED table={tid}: {e}")
 
     def record_run(self, summary: dict) -> None:
         try:

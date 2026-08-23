@@ -112,11 +112,54 @@ description now shows as a hover tooltip. Selection semantics unchanged.)*
 
 ## Refresh
 
-Background scheduler (same pattern as auto_analytics): re-snapshot all registered
-tables at the admin-configured time (default midnight), plus "Refresh now" per
+Background scheduler (same pattern as auto_analytics): re-snapshot registered
+tables on the admin-configured schedule, plus "Refresh now" per
 table/connection in the admin UI. Show "data as of <refreshed_at>" on chats using
 DB tables. On schema drift (columns added/removed in the source DB), re-sync meta
 entries the way `_resync_meta_after_add` does.
+
+### Flexible scheduling (Prompt 13 Part B — implemented)
+
+One schedule object (global setting + optional per-table override, same
+shape) replaces the single daily `refresh_time`:
+`{mode: daily|weekly|monthly|interval|cron, time, weekdays, monthly_days,
+every_minutes, cron, enabled}` — see `schedule_utils.py`. Every mode
+normalizes to canonical 5-field cron:
+
+| mode | cron(s) |
+|---|---|
+| daily `02:30` | `30 2 * * *` |
+| weekly Mon+Thu `06:00` | `0 6 * * 1,4` |
+| monthly 1,15 `00:15` | `15 0 1,15 * *` |
+| monthly `last` `02:30` | `30 2 l * *` (separate cron — croniter's `l`, never mixed into a numeric day list) |
+| interval 15m / 2h | `*/15 * * * *` / `0 */2 * * *` (fixed-mark semantics — :00/:15/:30/:45, the established-scheduler convention) |
+| cron | passthrough (5 fields, croniter-validated) |
+
+- croniter pinned at 6.0.0; the `l` support is guaranteed by an executable
+  test (`tests/test_schedule_utils.py::test_croniter_last_day_of_month_pin`).
+  If a future re-pin loses `l`, monthly-"last" switches to a
+  `calendar.monthrange` daily check — the schedule shape does not change.
+- Days 29–31 are rejected on purpose (they silently skip shorter months);
+  28 or "last" always fires. Interval minimum is 15 minutes (don't hammer
+  the customer DB), under 60 minutes or whole hours only.
+- Times stay container-local naive (no timezone feature); the admin UI
+  always shows the computed next run so the semantics are visible.
+- The scheduler loop keeps its 60s slices (schedule edits apply without a
+  restart) and replaces the old once-per-day guard with PERSISTED
+  last-fired stamps (`settings.last_fired_at` global;
+  `schedule_last_fired_at` per overridden table). A fire moment that
+  passed while the container was down is caught up ONCE
+  (`next_fire(after=last_fired) <= now`); stamps are written BEFORE the
+  run so a backward clock jump or slow run can never double-fire.
+  First-ever start initializes stamps to now — no refresh storm on
+  upgrade. Overridden tables are excluded from the global run and get
+  their own due-checks — a table is never refreshed twice for one due
+  moment; the run lock still serializes all snapshot work.
+- Migration: an old `{refresh_time, refresh_enabled}` doc loads as
+  mode=daily (`schedule_from_settings`); POST /refresh_settings accepts
+  both body shapes; legacy keys are mirrored on write for downgrade-compat.
+- Connection-level "Refresh now" (`POST /connections/{cid}/refresh`)
+  bypasses the run-lock by design (pre-existing behavior, unchanged).
 
 ## Security invariants
 

@@ -1342,12 +1342,24 @@ async def draft_descriptions(request: Request):
 def _build_table_doc(*, tid: str, connection_id, schema, table: str,
                      display_name: str, description: str, columns: list,
                      is_connector: bool, relations: list, intro: dict,
-                     where_filter, row_cap, email: str) -> dict:
+                     where_filter, row_cap, email: str,
+                     existing: dict | None = None) -> dict:
     """The ONE stored table-doc shape — built here for both the wizard save
     and the recommendation Accept, so the two can never drift. The confirm
-    stamps come from the SESSION identity + server clock, never a body."""
+    stamps come from the SESSION identity + server clock, never a body.
+    `existing` carries fields upsert_table's whole-doc replace would drop:
+    the per-table schedule override + its fire stamp. Deliberately NOT
+    carried: `last_drift` / `last_fingerprint` — an edit-save is the admin
+    reviewing the table (drift review resolved), and the post-save refresh
+    stores a fresh fingerprint anyway."""
     now = datetime.now(timezone.utc).isoformat()
+    carried = {}
+    if isinstance(existing, dict):
+        if isinstance(existing.get("schedule"), dict):
+            carried["schedule"] = existing["schedule"]
+            carried["schedule_last_fired_at"] = existing.get("schedule_last_fired_at")
     return {
+        **carried,
         "id": tid if db_sources.DataSourceStore.valid_id(tid) else None,
         "connection_id": connection_id,
         "schema": schema or "",
@@ -1453,7 +1465,7 @@ async def save_table(request: Request, tid: str = ""):
         is_connector=bool(body.get("is_connector")),
         relations=body.get("relations") or [], intro=intro,
         where_filter=body.get("where_filter"), row_cap=body.get("row_cap"),
-        email=email)
+        email=email, existing=own)
     # Relations are stored verbatim here (frozen contract — rejecting would
     # break payloads this API must keep accepting), but a join key naming a
     # column neither side has is a silent broken hint: make it observable.
@@ -1535,15 +1547,47 @@ async def refresh_table(request: Request, tid: str):
 # Refresh schedule + audit
 # ---------------------------------------------------------------------------
 
+def _schedule_view(stg: dict) -> dict:
+    """The GET/POST response shape: settings + effective schedule object +
+    human description + directly-computed next_run_at (correct in tests and
+    before the scheduler thread's first tick; thread state is the fallback)."""
+    import schedule_utils
+    from datetime import datetime
+    out = dict(stg)
+    sched = schedule_utils.schedule_from_settings(stg)
+    out["schedule"] = sched
+    out["description"] = schedule_utils.describe_schedule(sched)
+    nxt = None
+    try:
+        import db_scheduler
+        after = db_scheduler._parse_iso(stg.get("last_fired_at")) or datetime.now()
+        fire = schedule_utils.next_fire(sched, after)
+        nxt = fire.isoformat() if fire else None
+        if nxt is None and sched.get("enabled"):
+            nxt = db_scheduler.next_run_at()
+    except Exception:
+        pass
+    out["next_run_at"] = nxt
+    return out
+
+
+def _schedule_from_body(body: dict) -> dict:
+    """Accept BOTH request shapes: the new {schedule: {...}} and the legacy
+    {refresh_time, refresh_enabled} pair (mapped to daily) so nothing breaks
+    mid-deploy."""
+    if isinstance(body.get("schedule"), dict):
+        return body["schedule"]
+    return {"mode": "daily",
+            "time": (body.get("refresh_time") or "00:00").strip() or "00:00",
+            "enabled": bool(body.get("refresh_enabled"))}
+
+
 @router.get("/refresh_settings")
 async def get_refresh_settings(request: Request):
     email, err = _require_admin(request)
     if err:
         return err
-    import db_scheduler
-    stg = db_sources.DataSourceStore().get_refresh_settings()
-    stg["next_run_at"] = db_scheduler.next_run_at()
-    return stg
+    return _schedule_view(db_sources.DataSourceStore().get_refresh_settings())
 
 
 @router.post("/refresh_settings")
@@ -1554,11 +1598,71 @@ async def set_refresh_settings(request: Request):
     body = await _json_body(request)
     try:
         out = db_sources.DataSourceStore().set_refresh_settings(
-            refresh_time=(body.get("refresh_time") or "").strip(),
-            refresh_enabled=bool(body.get("refresh_enabled")),
-            actor=email)
+            schedule=_schedule_from_body(body), actor=email)
     except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        return JSONResponse({"error": str(e), "code": "BAD_SCHEDULE"},
+                            status_code=400)
+    return _schedule_view(out)
+
+
+@router.post("/schedule_preview")
+async def schedule_preview(request: Request):
+    """Validate a schedule draft and echo it: canonical crons, human
+    description, next 3 runs. No writes, no audit — serves the editors'
+    live preview."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    import schedule_utils
+    from datetime import datetime
+    body = await _json_body(request)
+    try:
+        sched = schedule_utils.validate_schedule(body.get("schedule") or {})
+    except ValueError as e:
+        return JSONResponse({"error": str(e), "code": "BAD_SCHEDULE"},
+                            status_code=400)
+    now = datetime.now()
+    return {"ok": True,
+            "schedule": sched,
+            "crons": schedule_utils.to_crons(sched),
+            "description": schedule_utils.describe_schedule(sched),
+            "next_runs": [d.isoformat() for d in
+                          schedule_utils.preview(sched, now, 3)]}
+
+
+@router.post("/tables/{tid}/schedule")
+async def set_table_schedule(request: Request, tid: str):
+    """Per-table schedule override; {"schedule": null} (or absent) = inherit
+    the global schedule."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    import schedule_utils
+    from datetime import datetime
+    body = await _json_body(request)
+    store = db_sources.DataSourceStore()
+    sched_body = body.get("schedule")
+    if sched_body is not None and not isinstance(sched_body, dict):
+        return JSONResponse({"error": "Unknown schedule mode.",
+                             "code": "BAD_SCHEDULE"}, status_code=400)
+    try:
+        found = store.set_table_schedule(tid, sched_body, actor=email)
+    except ValueError as e:
+        return JSONResponse({"error": str(e), "code": "BAD_SCHEDULE"},
+                            status_code=400)
+    if not found:
+        return JSONResponse({"error": "Unknown table."}, status_code=404)
+    row = store.get_table(tid)
+    out = {"ok": True, "table": row, "next_run_at": None, "description": None}
+    try:
+        if isinstance((row or {}).get("schedule"), dict):
+            sched = schedule_utils.schedule_from_settings(
+                {"schedule": row["schedule"]})
+            out["description"] = schedule_utils.describe_schedule(sched)
+            fire = schedule_utils.next_fire(sched, datetime.now())
+            out["next_run_at"] = fire.isoformat() if fire else None
+    except Exception:
+        pass
     return out
 
 

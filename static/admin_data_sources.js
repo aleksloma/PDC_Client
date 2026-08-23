@@ -345,13 +345,16 @@
     const rows = TABLES.map((t) => `
       <tr data-tid="${esc(t.id)}">
         <td><strong>${esc(t.display_name)}</strong>${t.is_connector
-          ? ' <span class="adm-chip conn" title="Hidden from users; auto-included via relations">connector</span>' : ''}</td>
+          ? ' <span class="adm-chip conn" title="Hidden from users; auto-included via relations">connector</span>' : ''}${
+          t.schedule ? ' <span class="adm-chip conn" title="Refreshes on its own schedule">own schedule</span>'
+            : ' <span class="adm-chip" title="Follows the global refresh schedule">inherits global</span>'}</td>
         <td class="adm-cell-mono">${esc(connName(t.connection_id))} · ${esc([t.schema, t.table_name].filter(Boolean).join('.'))}</td>
         <td>${t.row_count != null ? Number(t.row_count).toLocaleString() : '—'}</td>
         <td title="${esc(t.last_refresh_error || '')}">${t.refreshed_at ? esc(t.refreshed_at)
           : (t.last_refresh_error ? '<span class="adm-chip bad">failed</span>' : '—')}</td>
         <td class="adm-actions-cell">
           <button class="adm-icon-btn" data-act="refresh" title="Refresh snapshot now">⟳</button>
+          <button class="adm-icon-btn" data-act="schedule" title="Refresh schedule for this table">⏱</button>
           <button class="adm-icon-btn" data-act="edit" title="Edit descriptions / relations">✎</button>
           <button class="adm-icon-btn" data-act="delete" title="Delete registered table">🗑</button>
         </td>
@@ -384,6 +387,8 @@
         toast(r.data.error || 'Refresh failed', true);
       }
       loadAll();
+    } else if (act === 'schedule') {
+      openTableScheduleModal(t);
     } else if (act === 'edit') {
       openTableWizard(t.connection_id, t);
     } else if (act === 'delete') {
@@ -2241,23 +2246,198 @@
   }
 
   // ── Schedule ───────────────────────────────────────────────────────────
-  function renderSchedule(s) {
-    $('refreshEnabled').checked = !!s.refresh_enabled;
-    $('refreshTime').value = s.refresh_time || '00:00';
+  // One shared field component serves the global card and the per-table
+  // override modal. Presets normalize server-side to 5-field cron; the
+  // /schedule_preview endpoint provides the live "Next run" echo.
+  const WEEKDAYS = [['1', 'Mon'], ['2', 'Tue'], ['3', 'Wed'], ['4', 'Thu'],
+    ['5', 'Fri'], ['6', 'Sat'], ['0', 'Sun']];  // Mon-first, cron values
+
+  function renderScheduleFields(container, sched) {
+    const s = sched || { mode: 'daily', time: '00:00' };
+    const dayChips = [];
+    for (let d = 1; d <= 28; d += 1) {
+      const on = (s.monthly_days || []).includes(d);
+      dayChips.push(`<button type="button" class="adm-chip sched-day${on ? ' ok' : ''}" data-day="${d}">${d}</button>`);
+    }
+    const lastOn = (s.monthly_days || []).includes('last');
+    container.innerHTML = `
+      <label class="adm-time-row"><span>Repeat</span>
+        <select class="schedMode">
+          <option value="daily">Daily</option>
+          <option value="weekly">Weekly</option>
+          <option value="monthly">Monthly</option>
+          <option value="interval">Every N minutes / hours</option>
+          <option value="cron">Custom cron</option>
+        </select>
+      </label>
+      <label class="adm-time-row schedTimeRow"><span>Run at (container-local time)</span>
+        <input type="time" class="schedTime" value="${esc(s.time || '00:00')}" />
+      </label>
+      <div class="schedWeekdaysRow">
+        ${WEEKDAYS.map(([v, n]) => `<label class="sched-dow"><input type="checkbox"
+          value="${v}" ${(s.weekdays || []).includes(Number(v)) ? 'checked' : ''} /> ${n}</label>`).join(' ')}
+      </div>
+      <div class="schedMonthDaysRow">
+        <div class="sched-days">${dayChips.join('')}
+          <button type="button" class="adm-chip sched-day sched-day-last${lastOn ? ' ok' : ''}" data-day="last">Last day</button></div>
+        <div class="adm-muted">Days 29–31 are deliberately unavailable — they'd skip
+          shorter months. Pick 28 or Last day.</div>
+      </div>
+      <label class="adm-time-row schedIntervalRow"><span>Every</span>
+        <input type="number" class="schedIntervalN" min="1" step="1"
+               value="${s.every_minutes && s.every_minutes % 60 === 0 ? s.every_minutes / 60 : (s.every_minutes || 1)}" />
+        <select class="schedIntervalUnit">
+          <option value="hours">hours</option>
+          <option value="minutes">minutes</option>
+        </select>
+        <span class="adm-muted">Minimum 15 minutes.</span>
+      </label>
+      <label class="adm-time-row schedCronRow"><span>Cron expression</span>
+        <input type="text" class="schedCron" placeholder="*/30 8-18 * * 1-5"
+               value="${esc(s.cron || '')}" />
+      </label>
+      <div class="adm-muted schedCronHelp">Standard 5-field cron
+        (minute hour day month weekday), container-local time. Validated on save.</div>`;
+    const modeSel = container.querySelector('.schedMode');
+    modeSel.value = s.mode || 'daily';
+    if (s.mode === 'interval' && s.every_minutes && s.every_minutes % 60 !== 0) {
+      container.querySelector('.schedIntervalUnit').value = 'minutes';
+    }
+    const applyMode = () => {
+      const m = modeSel.value;
+      container.querySelector('.schedTimeRow').classList.toggle('hidden', !['daily', 'weekly', 'monthly'].includes(m));
+      container.querySelector('.schedWeekdaysRow').classList.toggle('hidden', m !== 'weekly');
+      container.querySelector('.schedMonthDaysRow').classList.toggle('hidden', m !== 'monthly');
+      container.querySelector('.schedIntervalRow').classList.toggle('hidden', m !== 'interval');
+      container.querySelector('.schedCronRow').classList.toggle('hidden', m !== 'cron');
+      container.querySelector('.schedCronHelp').classList.toggle('hidden', m !== 'cron');
+    };
+    modeSel.addEventListener('change', () => { applyMode(); container.dispatchEvent(new Event('schedchange')); });
+    applyMode();
+    container.querySelectorAll('.sched-day').forEach((b) => {
+      b.addEventListener('click', () => { b.classList.toggle('ok'); container.dispatchEvent(new Event('schedchange')); });
+    });
+    container.querySelectorAll('input, select').forEach((el) => {
+      el.addEventListener('change', () => container.dispatchEvent(new Event('schedchange')));
+    });
+  }
+
+  function collectScheduleFields(container, enabled) {
+    const mode = container.querySelector('.schedMode').value;
+    const out = { mode, enabled: !!enabled };
+    if (['daily', 'weekly', 'monthly'].includes(mode)) {
+      out.time = container.querySelector('.schedTime').value || '00:00';
+    }
+    if (mode === 'weekly') {
+      out.weekdays = Array.from(container.querySelectorAll('.schedWeekdaysRow input:checked'))
+        .map((el) => Number(el.value));
+    }
+    if (mode === 'monthly') {
+      out.monthly_days = Array.from(container.querySelectorAll('.sched-day.ok'))
+        .map((b) => (b.dataset.day === 'last' ? 'last' : Number(b.dataset.day)));
+    }
+    if (mode === 'interval') {
+      const n = Number(container.querySelector('.schedIntervalN').value) || 0;
+      const unit = container.querySelector('.schedIntervalUnit').value;
+      out.every_minutes = unit === 'hours' ? n * 60 : n;
+    }
+    if (mode === 'cron') out.cron = container.querySelector('.schedCron').value.trim();
+    return out;
+  }
+
+  function _lastRunLine(s) {
     const bits = [];
     if (s.next_run_at) bits.push(`Next run: ${s.next_run_at}`);
-    if (s.last_run_at) bits.push(`Last run: ${s.last_run_at}`);
-    $('scheduleInfo').textContent = bits.join(' · ');
+    const sum = s.last_run_summary;
+    if (s.last_run_at && sum) {
+      const skipped = sum.skipped_count != null ? `, ${sum.skipped_count} unchanged` : '';
+      bits.push(`Last run ${s.last_run_at} — ${sum.ok_count ?? '?'} ok, ${sum.failed_count ?? '?'} failed${skipped}`);
+    } else if (s.last_run_at) {
+      bits.push(`Last run: ${s.last_run_at}`);
+    }
+    return bits.join(' · ');
+  }
+
+  let _previewTimer = null;
+  function schedulePreviewInto(container, previewEl, enabled) {
+    clearTimeout(_previewTimer);
+    _previewTimer = setTimeout(async () => {
+      const sched = collectScheduleFields(container, enabled);
+      const r = await api('/api/admin/schedule_preview', {
+        method: 'POST', body: JSON.stringify({ schedule: sched }) });
+      if (r.ok) {
+        previewEl.textContent = `${r.data.description} · Next runs: ${
+          (r.data.next_runs || []).join(', ') || '—'}`;
+        previewEl.classList.remove('adm-bad-text');
+      } else {
+        previewEl.textContent = r.data.error || 'Invalid schedule';
+        previewEl.classList.add('adm-bad-text');
+      }
+    }, 350);
+  }
+
+  function renderSchedule(s) {
+    $('refreshEnabled').checked = !!(s.schedule ? s.schedule.enabled : s.refresh_enabled);
+    renderScheduleFields($('globalScheduleFields'), s.schedule || {
+      mode: 'daily', time: s.refresh_time || '00:00' });
+    const line = [s.description, _lastRunLine(s)].filter(Boolean).join(' · ');
+    $('schedPreview').textContent = line;
+    $('schedPreview').classList.remove('adm-bad-text');
+    const gf = $('globalScheduleFields');
+    if (!gf.dataset.wired) {
+      gf.dataset.wired = '1';
+      gf.addEventListener('schedchange', () => {
+        schedulePreviewInto(gf, $('schedPreview'), $('refreshEnabled').checked);
+      });
+    }
   }
 
   async function saveSchedule() {
+    const sched = collectScheduleFields($('globalScheduleFields'),
+      $('refreshEnabled').checked);
     const r = await api('/api/admin/refresh_settings', {
-      method: 'POST',
-      body: JSON.stringify({ refresh_enabled: $('refreshEnabled').checked,
-        refresh_time: $('refreshTime').value }),
-    });
+      method: 'POST', body: JSON.stringify({ schedule: sched }) });
     if (r.ok) { toast('Schedule saved'); renderSchedule(r.data); }
     else toast(r.data.error || 'Save failed', true);
+  }
+
+  // ── Per-table schedule override modal ──────────────────────────────────
+  let _tsmTid = null;
+  function openTableScheduleModal(t) {
+    _tsmTid = t.id;
+    $('tsmTitle').textContent = `Schedule — ${t.display_name}`;
+    const own = t.schedule && typeof t.schedule === 'object';
+    $('tsmInherit').checked = !own;
+    $('tsmOwn').checked = !!own;
+    renderScheduleFields($('tsmFields'), own ? t.schedule : { mode: 'daily', time: '00:00' });
+    $('tsmFields').classList.toggle('hidden', !own);
+    $('tsmPreview').textContent = own ? '' : 'This table follows the global schedule.';
+    $('tsmPreview').classList.remove('adm-bad-text');
+    const tf = $('tsmFields');
+    if (!tf.dataset.wired) {
+      tf.dataset.wired = '1';
+      tf.addEventListener('schedchange', () => {
+        if ($('tsmOwn').checked) schedulePreviewInto(tf, $('tsmPreview'), true);
+      });
+    }
+    $('tableScheduleModal').classList.remove('hidden');
+  }
+
+  async function saveTableSchedule() {
+    const body = $('tsmOwn').checked
+      ? { schedule: collectScheduleFields($('tsmFields'), true) }
+      : { schedule: null };
+    const r = await api(`/api/admin/tables/${_tsmTid}/schedule`, {
+      method: 'POST', body: JSON.stringify(body) });
+    if (r.ok) {
+      toast(body.schedule ? `Table schedule saved (${r.data.description || 'own schedule'})`
+        : 'Table now inherits the global schedule');
+      $('tableScheduleModal').classList.add('hidden');
+      loadAll();
+    } else {
+      $('tsmPreview').textContent = r.data.error || 'Save failed';
+      $('tsmPreview').classList.add('adm-bad-text');
+    }
   }
 
   // ── Audit ──────────────────────────────────────────────────────────────
@@ -2684,6 +2864,18 @@
     $('btnRoleDeleteGo').addEventListener('click', runRoleDelete);
 
     $('btnSaveSchedule').addEventListener('click', saveSchedule);
+    $('btnTsmSave').addEventListener('click', saveTableSchedule);
+    $('btnTsmCancel').addEventListener('click', () => $('tableScheduleModal').classList.add('hidden'));
+    $('closeTsmModal').addEventListener('click', () => $('tableScheduleModal').classList.add('hidden'));
+    $('tsmInherit').addEventListener('change', () => {
+      $('tsmFields').classList.add('hidden');
+      $('tsmPreview').textContent = 'This table follows the global schedule.';
+      $('tsmPreview').classList.remove('adm-bad-text');
+    });
+    $('tsmOwn').addEventListener('change', () => {
+      $('tsmFields').classList.remove('hidden');
+      schedulePreviewInto($('tsmFields'), $('tsmPreview'), true);
+    });
     $('btnReloadAudit').addEventListener('click', loadAudit);
 
     $('btnAdmLogout').addEventListener('click', logout);
