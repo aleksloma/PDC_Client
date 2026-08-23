@@ -644,10 +644,14 @@ its `.pdc-action-bar` (live stream, history reload, multi-chart, multi-table)
 that opens the anchored combobox popover; the payload is read at CLICK time so a
 prior in-chat refresh pins the refreshed render. The dashboard page uses
 vendored GridStack 10.3.1 (`static/vendor/gridstack/`, MIT, offline) — drag by
-the tile grab strip (now a `⠿` grip glyph; the old grey title snippet is gone —
+the tile grab strip (a `⠿` grip glyph; the old grey title snippet is gone —
 QA 3.1 — the title lives in the strip tooltip and the info popover), resize by
-edges, non-overlapping gravity packing, 1-column read-only mode under 768px
-(narrow layout is presentational and never saved). Owner-only "＋ Header" /
+edges, **free placement** (`float:true`): tiles stay exactly where the user
+puts them, vertical gaps included — the only restriction is no overlap
+(dragging onto an occupied cell pushes). Layout saves are armed only AFTER the
+initial render (save-on-load guard), so loading a stored layout can never
+compact and overwrite it; 1-column read-only mode under 768px (narrow layout
+is presentational and never saved). Owner-only "＋ Header" /
 "＋ Text" top-bar buttons open the `#textTileModal` (textarea + style/size
 selects + 7 color swatches) to add text blocks between visuals; text tiles get
 an owner-only ✏ edit button instead of the data/code/download/refresh actions.

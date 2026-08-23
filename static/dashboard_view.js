@@ -16,6 +16,10 @@
   let grid = null;          // GridStack instance
   let isOwner = false;
   let saveTimer = null;
+  // Save-on-load guard: layout saves are armed only AFTER the initial render
+  // settles, so grid initialization/normalization can never overwrite the
+  // stored layout (a load-time save used to collapse user-left gaps).
+  let saveArmed = false;
   const chatDfKeys = {};    // chat_id -> {keys: Set, blocked: Set} | null (unknown)
 
   function _t(key, fallback) {
@@ -601,7 +605,12 @@
       column: GRID_COLUMNS,
       cellHeight: 80,
       margin: 8,
-      float: false,             // gravity packing, tiles never overlap
+      // float:true = FREE placement: tiles stay exactly where the user puts
+      // them, vertical gaps included — the only restriction is no overlap
+      // (dragging onto an occupied cell pushes, GridStack default). float
+      // is set at INIT, before widgets are adopted, so loading a saved
+      // layout never triggers upward compaction that would rewrite it.
+      float: true,
       animate: true,
       handle: '.pdc-tile-drag', // drag ONLY by the grab strip (iframe-safe)
       resizable: { handles: 'e,se,s,sw,w' },
@@ -612,10 +621,17 @@
 
     if (isOwner) {
       grid.on('change', () => {
+        // Gate at SCHEDULING time: a load-time 'change' must not queue a
+        // debounced save that would fire after arming.
+        if (!saveArmed) return;
         clearTimeout(saveTimer);
         saveTimer = setTimeout(saveLayout, 800);
       });
     }
+    // Arm saves only after the initial render settles (next tick): any
+    // 'change' GridStack emits while adopting/normalizing the loaded widgets
+    // must never persist — only real user drags/resizes save.
+    setTimeout(() => { saveArmed = true; }, 0);
     // While dragging/resizing, Plotly iframes must not swallow mouse events.
     ['dragstart', 'resizestart'].forEach(ev =>
       grid.on(ev, () => document.body.classList.add('pdc-grid-moving')));
@@ -624,7 +640,7 @@
   }
 
   async function saveLayout() {
-    if (!grid || !isOwner) return;
+    if (!grid || !isOwner || !saveArmed) return;
     // The 1-column narrow mode is presentational — saving it would destroy
     // the desktop layout.
     if (typeof grid.getColumn === 'function' && grid.getColumn() !== GRID_COLUMNS) return;
