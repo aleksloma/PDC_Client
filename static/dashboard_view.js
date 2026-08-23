@@ -127,7 +127,11 @@
       div.className = 'pdc-tile-text'
         + ' tt-style-' + (tile.style || 'paragraph')
         + ' tt-color-' + (tile.color || 'default')
-        + ' tt-size-' + (tile.size || 'M');
+        + ' tt-size-' + (tile.size || 'M')
+        // absent align/valign (tiles stored before the feature) render exactly
+        // as they always did — left/top
+        + ' tt-align-' + (tile.align || 'left')
+        + ' tt-valign-' + (tile.valign || 'top');
       div.textContent = tile.text || '';
       bodyEl.appendChild(div);
       return;
@@ -541,7 +545,11 @@
     grip.className = 'pdc-tile-grip';
     grip.textContent = '⠿';
     grip.setAttribute('aria-hidden', 'true');
-    dragStrip.title = tile.title || '';
+    // The grip is the ONLY way to move a tile (chart iframes swallow mouse
+    // events, so body-drag cannot work) — say so. Read-only viewers can't drag
+    // and the grip is hidden for them, so they keep the plain title tooltip.
+    const dragHint = isOwner ? _t('dash.drag_move', 'Drag to move') : '';
+    dragStrip.title = [tile.title || '', dragHint].filter(Boolean).join(' — ');
     dragStrip.appendChild(grip);
     content.appendChild(dragStrip);
 
@@ -732,11 +740,14 @@
     const p = tile || preset || {};
     document.getElementById('textTileModalTitle').textContent = tile
       ? _t('dash.edit_text', 'Edit text')
-      : ((preset && preset.style === 'header1')
-        ? _t('dash.add_header', 'Add header') : _t('dash.add_text', 'Add text'));
+      : _t('dash.add_header', 'Add header');
     document.getElementById('textTileInput').value = tile ? (tile.text || '') : '';
     document.getElementById('textTileStyle').value = p.style || 'paragraph';
     document.getElementById('textTileSize').value = p.size || 'M';
+    // Alignment defaults to the pre-alignment rendering (left/top) so tiles
+    // stored before this feature keep their exact look.
+    document.getElementById('textTileAlign').value = p.align || 'left';
+    document.getElementById('textTileValign').value = p.valign || 'top';
     buildColorSwatches(p.color || 'default');
     openModal('textTileModal');
     document.getElementById('textTileInput').focus();
@@ -753,6 +764,8 @@
       style: document.getElementById('textTileStyle').value,
       size: document.getElementById('textTileSize').value,
       color: selectedTextColor(),
+      align: document.getElementById('textTileAlign').value,
+      valign: document.getElementById('textTileValign').value,
     };
     const btn = document.getElementById('btnSaveTextTile');
     btn.disabled = true;
@@ -791,15 +804,13 @@
   }
 
   function wireTextTileButtons() {
+    // ONE add button: "+ Header" and "+ Text" opened the same modal with
+    // different presets — the style dropdown inside already covers both.
     const addHeaderBtn = document.getElementById('btnAddHeader');
-    const addTextBtn = document.getElementById('btnAddText');
     if (isOwner) {
       addHeaderBtn.classList.remove('hidden');
-      addTextBtn.classList.remove('hidden');
       addHeaderBtn.addEventListener('click', () =>
         openTextModal(null, null, { style: 'header1', size: 'L' }));
-      addTextBtn.addEventListener('click', () =>
-        openTextModal(null, null, { style: 'paragraph', size: 'M' }));
     }
     document.getElementById('btnSaveTextTile').addEventListener('click', saveTextModal);
     document.getElementById('closeTextTile').addEventListener('click', () => closeModal('textTileModal'));

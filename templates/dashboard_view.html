@@ -25,7 +25,6 @@
       <div class="top-bar-spacer"></div>
       <div class="top-bar-actions">
         <button id="btnAddHeader" class="ghost small top-action-btn hidden" data-i18n="dash.add_header">＋ Header</button>
-        <button id="btnAddText" class="ghost small top-action-btn hidden" data-i18n="dash.add_text">＋ Text</button>
         <button id="btnRefreshAll" class="ghost small top-action-btn" data-i18n="dash.refresh_all">⟳ Refresh all</button>
         <button id="btnShareDash" class="ghost small top-action-btn hidden" data-i18n="dash.share">🔗 Share</button>
         <button id="btnDeleteDash" class="ghost small top-action-btn" data-i18n="dash.delete">🗑 Delete</button>
@@ -126,6 +125,20 @@
             <option value="S">S</option>
             <option value="M" selected>M</option>
             <option value="L">L</option>
+          </select>
+        </div>
+        <div class="text-tile-opts">
+          <label data-i18n="dash.text_align">Align</label>
+          <select id="textTileAlign">
+            <option value="left" data-i18n="dash.align_left">Left</option>
+            <option value="center" data-i18n="dash.align_center">Center</option>
+            <option value="right" data-i18n="dash.align_right">Right</option>
+          </select>
+          <label data-i18n="dash.text_valign">Vertical</label>
+          <select id="textTileValign">
+            <option value="top" data-i18n="dash.valign_top">Top</option>
+            <option value="middle" data-i18n="dash.valign_middle">Middle</option>
+            <option value="bottom" data-i18n="dash.valign_bottom">Bottom</option>
           </select>
         </div>
         <div class="text-tile-colors" id="textTileColors">

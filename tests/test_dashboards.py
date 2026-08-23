@@ -672,6 +672,9 @@ def test_text_tile_create_defaults_and_validation(client):
     assert tile["style"] == "paragraph"
     assert tile["color"] == "default"
     assert tile["size"] == "M"
+    # alignment defaults reproduce the pre-alignment rendering
+    assert tile["align"] == "left"
+    assert tile["valign"] == "top"
     assert tile["layout"] == {"x": 0, "y": 0, "w": 12, "h": 2}
     # no chat_id required, no snapshot/code fields
     assert "chat_id" not in tile and "snapshot" not in tile and "code" not in tile
@@ -686,6 +689,67 @@ def test_text_tile_create_defaults_and_validation(client):
                        json={"kind": "text", "text": "x", "size": "XXL"}).status_code == 400
     assert client.post(f"/api/dashboards/{dash}/tiles",
                        json={"kind": "text", "text": "x" * 2001}).status_code == 400
+    assert client.post(f"/api/dashboards/{dash}/tiles",
+                       json={"kind": "text", "text": "x", "align": "justify"}).status_code == 400
+    assert client.post(f"/api/dashboards/{dash}/tiles",
+                       json={"kind": "text", "text": "x", "valign": "baseline"}).status_code == 400
+
+
+def test_text_tile_alignment_roundtrip(client):
+    """Alignment is persisted on the tile record (top level, NOT inside layout —
+    update_layout rewrites layout to exactly {x,y,w,h} on every drag) and stays
+    put across an edit and a layout move."""
+    client.post(f"/_login/{OWNER}")
+    dash = _mk_dash(client)
+    tile = client.post(f"/api/dashboards/{dash}/tiles",
+                       json={"kind": "text", "text": "Centered header",
+                             "style": "header1", "align": "center",
+                             "valign": "middle"}).json()["tile"]
+    tid = tile["tile_id"]
+    assert tile["align"] == "center" and tile["valign"] == "middle"
+    assert "align" not in tile["layout"]
+
+    # partial update changes only alignment
+    assert client.post(f"/api/dashboards/{dash}/tiles/{tid}/update",
+                       json={"align": "right"}).status_code == 200
+    saved = client.get(f"/api/dashboards/{dash}").json()["tiles"][0]
+    assert saved["align"] == "right"
+    assert saved["valign"] == "middle"      # untouched field survives
+    assert saved["text"] == "Centered header"
+
+    # a drag (layout save) must not drop the alignment fields
+    client.post(f"/api/dashboards/{dash}/layout", json={"tiles": [
+        {"tile_id": tid, "x": 2, "y": 3, "w": 6, "h": 4}]})
+    saved = client.get(f"/api/dashboards/{dash}").json()["tiles"][0]
+    assert saved["align"] == "right" and saved["valign"] == "middle"
+    assert saved["layout"]["x"] == 2
+
+
+def test_legacy_text_tile_without_alignment_still_loads(client, tmp_path):
+    """Old-shape guard: tiles stored before alignment existed have no align/
+    valign keys — they must keep loading and updating untouched (the frontend
+    falls back to left/top)."""
+    client.post(f"/_login/{OWNER}")
+    dash = _mk_dash(client)
+    tile = client.post(f"/api/dashboards/{dash}/tiles",
+                       json={"kind": "text", "text": "legacy"}).json()["tile"]
+    tid = tile["tile_id"]
+    # strip the keys on disk, as a pre-feature document would be
+    path = tmp_path / "users" / OWNER / "dashboards" / f"{dash}.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    for t in doc["tiles"]:
+        t.pop("align", None)
+        t.pop("valign", None)
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+    saved = client.get(f"/api/dashboards/{dash}").json()["tiles"][0]
+    assert "align" not in saved and "valign" not in saved
+    assert saved["text"] == "legacy"
+    # editing such a tile works and adds only what was supplied
+    assert client.post(f"/api/dashboards/{dash}/tiles/{tid}/update",
+                       json={"text": "still fine"}).status_code == 200
+    saved = client.get(f"/api/dashboards/{dash}").json()["tiles"][0]
+    assert saved["text"] == "still fine" and "align" not in saved
 
 
 def test_text_tile_update_and_remove(client):

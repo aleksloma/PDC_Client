@@ -635,8 +635,8 @@ chars, regex-guarded (path-traversal safe). Old-shape docs load with defaults
 | `GET` | `/api/dashboards/{id}` | full doc + `is_owner`; **bumps `last_used_at`** (opened == used) |
 | `POST` | `/api/dashboards/{id}/rename` | `{name}` — owner only (shared recipients → 403) |
 | `POST` | `/api/dashboards/{id}/delete` | owner → deletes the doc (+ own index row); shared recipient → drops only their pointer row (`{ok, deleted: bool}`); idempotent |
-| `POST` | `/api/dashboards/{id}/tiles` | pin one item. Body `{chat_id, kind: "chart"\|"table", description?, code?, image_base64?, is_plotly?, table?, full_table_key?, chart_data?\|chart_data_key?}`. Owner only + `_require_chat(chat_id)` (can only pin from accessible chats). Volatile `chart_data_key` is resolved to durable inline data AT PIN TIME; table rows capped at 50 (honest `total_rows`) with `styled_html`/`dtype`/`title` preserved (styled_html dropped only over 2M chars — plain rows remain) so conditional formatting survives on the tile; chart snapshots >5M chars → 400; `###NEXT_PLOT###` code is nulled (tile renders, can't refresh). **Table code is authoritative-from-record**: when `full_table_key` resolves to a durable record with clean `code`, that code (+ its `result_key`) is stored on the tile — the client-sent code can be the CHART's code in mixed chart+table answers, and the frontend sends no code for a table pinned from such a message. **Journal layout defaults (QA 3.1)**: charts are HALF-width (w6) and a new chart pairs into the right half of the previous left-half chart's row (2 per row); tables are FULL-width (w12); text blocks w12×h2. **Text blocks**: `{kind: "text", text (≤2000, required), style: header1\|header2\|paragraph, color: default\|gray\|red\|orange\|green\|blue\|purple, size: S\|M\|L}` — no `chat_id`/snapshot/code; invalid enums → 400; rendered as styled text tiles (draggable/resizable like any tile, visible read-only in the shared view; refresh on them is a no-op that never freezes). Legacy layoutless tiles get a computed half-width default in the GET RESPONSE only (never persisted — the first drag persists real positions). |
-| `POST` | `/api/dashboards/{id}/tiles/{tile_id}/update` | owner only; TEXT tiles only (chart/table tiles → 400 — their content changes via refresh, never free edits). Body: any subset of `{text, style, color, size}`, same validation as create; empty body → 400. Returns `{ok, tile}`. |
+| `POST` | `/api/dashboards/{id}/tiles` | pin one item. Body `{chat_id, kind: "chart"\|"table", description?, code?, image_base64?, is_plotly?, table?, full_table_key?, chart_data?\|chart_data_key?}`. Owner only + `_require_chat(chat_id)` (can only pin from accessible chats). Volatile `chart_data_key` is resolved to durable inline data AT PIN TIME; table rows capped at 50 (honest `total_rows`) with `styled_html`/`dtype`/`title` preserved (styled_html dropped only over 2M chars — plain rows remain) so conditional formatting survives on the tile; chart snapshots >5M chars → 400; `###NEXT_PLOT###` code is nulled (tile renders, can't refresh). **Table code is authoritative-from-record**: when `full_table_key` resolves to a durable record with clean `code`, that code (+ its `result_key`) is stored on the tile — the client-sent code can be the CHART's code in mixed chart+table answers, and the frontend sends no code for a table pinned from such a message. **Journal layout defaults (QA 3.1)**: charts are HALF-width (w6) and a new chart pairs into the right half of the previous left-half chart's row (2 per row); tables are FULL-width (w12); text blocks w12×h2. **Text blocks**: `{kind: "text", text (≤2000, required), style: header1\|header2\|paragraph, color: default\|gray\|red\|orange\|green\|blue\|purple, size: S\|M\|L, align: left\|center\|right (default left), valign: top\|middle\|bottom (default top)}` — no `chat_id`/snapshot/code; invalid enums → 400; alignment lives at tile TOP LEVEL (never inside `layout`, which every drag rewrites to exactly `{x,y,w,h}`) and tiles stored before it existed render as left/top; rendered as styled text tiles (draggable/resizable like any tile, visible read-only in the shared view; refresh on them is a no-op that never freezes). Legacy layoutless tiles get a computed half-width default in the GET RESPONSE only (never persisted — the first drag persists real positions). |
+| `POST` | `/api/dashboards/{id}/tiles/{tile_id}/update` | owner only; TEXT tiles only (chart/table tiles → 400 — their content changes via refresh, never free edits). Body: any subset of `{text, style, color, size, align, valign}`, same validation as create; empty body → 400. Returns `{ok, tile}`. |
 | `POST` | `/api/dashboards/{id}/tiles/{tile_id}/remove` | owner only |
 | `POST` | `/api/dashboards/{id}/layout` | `{tiles: [{tile_id, x, y, w, h}]}` bulk save — owner only; ints validated/clamped, unknown tile_ids ignored (stale client) |
 | `POST` | `/api/dashboards/{id}/tiles/{tile_id}/refresh` | allowed for owner AND shared recipients. Table tiles first **re-resolve + self-heal** their code from the durable full-table record (tiles pinned with a wrong/chart code get the corrected code persisted); tiles with a `result_key` (one table of a multi-table RESULT) re-execute via `_reexecute_full_df` and persist a fresh durable key, others via `run_item_refresh` (Styler results keep `styled_html`). Deleted source chat → persists `frozen/frozen_reason="source_deleted"` on the tile, returns `200 {ok:false, frozen:true, reason}`; a caller without source-chat access gets the same shape with `reason:"access_revoked"` but nothing is persisted (caller-specific). Execution failures → `200 {ok:false, error}`, stored snapshot untouched. Success updates the snapshot (+ re-inlined `chart_data` / new `full_table_key`), clears `frozen`, returns `{ok, kind, image_base64\|table, is_plotly?, tile}`. |
@@ -659,16 +659,25 @@ that opens the anchored combobox popover; the payload is read at CLICK time so a
 prior in-chat refresh pins the refreshed render. The dashboard page uses
 vendored GridStack 10.3.1 (`static/vendor/gridstack/`, MIT, offline) — drag by
 the tile grab strip (a `⠿` grip glyph; the old grey title snippet is gone —
-QA 3.1 — the title lives in the strip tooltip and the info popover), resize by
+QA 3.1 — the title lives in the strip tooltip and the info popover). The grip
+is the ONLY drag handle (`handle: '.pdc-tile-drag'`) because chart iframes
+swallow mouse events, so it names itself: owners see a localized
+"Drag to move" tooltip (appended after the tile title) on a `grab` cursor;
+read-only viewers, whose grip is hidden and dragging disabled, keep the plain
+title. Resize by
 edges, **free placement** (`float:true`): tiles stay exactly where the user
 puts them, vertical gaps included — the only restriction is no overlap
 (dragging onto an occupied cell pushes). Layout saves are armed only AFTER the
 initial render (save-on-load guard), so loading a stored layout can never
 compact and overwrite it; 1-column read-only mode under 768px (narrow layout
-is presentational and never saved). Owner-only "＋ Header" /
-"＋ Text" top-bar buttons open the `#textTileModal` (textarea + style/size
-selects + 7 color swatches) to add text blocks between visuals; text tiles get
-an owner-only ✏ edit button instead of the data/code/download/refresh actions.
+is presentational and never saved). ONE owner-only "＋ Header" top-bar button
+opens the `#textTileModal` (textarea + style/size/alignment selects + 7 color
+swatches) to add text blocks between visuals — the separate "＋ Text" button
+was removed: it opened the same modal with a different preset, and the style
+dropdown (header 1 / header 2 / paragraph) already covers both. Horizontal and
+vertical alignment render through `tt-align-*` / `tt-valign-*` classes in the
+one shared tile renderer, so owner and shared views always agree. Text tiles get
+an owner-only ✏ edit button (same modal) instead of the data/code/download/refresh actions.
 Tile toolbar: description popover (backdrop-dismissed — clicks inside Plotly
 iframes don't bubble), Show data / Show code (PDCViewers), Download
 (`export_plotly_png` / client-side PNG / `download_excel`), View larger,

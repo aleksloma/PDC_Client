@@ -242,11 +242,16 @@ async def delete_dashboard(request: Request, dash_id: str):
 _TEXT_STYLES = ("header1", "header2", "paragraph")
 _TEXT_COLORS = ("default", "gray", "red", "orange", "green", "blue", "purple")
 _TEXT_SIZES = ("S", "M", "L")
+# Word-style alignment. Defaults reproduce the pre-alignment rendering, and
+# tiles stored without the keys render the same way (the frontend falls back to
+# left/top) — no migration, no shifted dashboards.
+_TEXT_ALIGNS = ("left", "center", "right")
+_TEXT_VALIGNS = ("top", "middle", "bottom")
 _MAX_TEXT_CHARS = 2000
 
 
 def _validate_text_fields(body: dict, *, require_text: bool):
-    """Validate {text, style, color, size} for a text tile. Returns
+    """Validate {text, style, color, size, align, valign} for a text tile. Returns
     (fields_dict, error_response). Absent enum fields get defaults when
     require_text (create); on update only supplied fields are validated."""
     out: dict = {}
@@ -261,7 +266,9 @@ def _validate_text_fields(body: dict, *, require_text: bool):
         out["text"] = text
     for field, allowed, default in (("style", _TEXT_STYLES, "paragraph"),
                                     ("color", _TEXT_COLORS, "default"),
-                                    ("size", _TEXT_SIZES, "M")):
+                                    ("size", _TEXT_SIZES, "M"),
+                                    ("align", _TEXT_ALIGNS, "left"),
+                                    ("valign", _TEXT_VALIGNS, "top")):
         val = body.get(field)
         if val is None:
             if require_text:
@@ -282,7 +289,7 @@ async def add_tile(request: Request, dash_id: str):
      image_base64?, is_plotly?,            # charts
      table?, full_table_key?,              # tables
      chart_data? | chart_data_key?}        # charts' "Show data" source
-    {kind: "text", text, style?, color?, size?}   # text blocks (no chat)
+    {kind: "text", text, style?, color?, size?, align?, valign?}  # text blocks (no chat)
     """
     email, err = _require_email(request)
     if err:
@@ -394,7 +401,7 @@ async def remove_tile(request: Request, dash_id: str, tile_id: str):
 @router.post("/{dash_id}/tiles/{tile_id}/update")
 async def update_text_tile(request: Request, dash_id: str, tile_id: str):
     """Edit a TEXT tile's content/style (owner-only). Body: any subset of
-    {text, style, color, size}. Chart/table tiles are immutable through this
+    {text, style, color, size, align, valign}. Chart/table tiles are immutable through this
     endpoint (their content comes from refresh, never free edits)."""
     email, err = _require_email(request)
     if err:
