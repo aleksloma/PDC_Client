@@ -296,7 +296,10 @@ async function upload(e){
 
         const res = await fetch('/upload', { method: 'POST', body: formData });
         const js = await safeJson(res);
-        if (res.ok && js && (Array.isArray(js.saved) || js.ok)){
+        // js.ok must be strictly true: a partial parse failure now answers
+        // 200 {ok:false, error, saved:[...]} — `saved` alone is not success
+        // and would list the FAILED files as uploaded (QA 2.1).
+        if (res.ok && js && js.ok === true) {
           uploadedNames.push(...(js.saved || []));
         } else {
           allSuccess = false;

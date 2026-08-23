@@ -232,8 +232,12 @@ def _other_registered_tables(schema_docs, dfs, user_email) -> list:
             for rel in (t.get("relations") or []):
                 if not isinstance(rel, dict):
                     continue
-                parent_name = id_to_name.get(rel.get("related_table_id")
-                                             or rel.get("related_table"))
+                parent_name = id_to_name.get(rel.get("related_table_id"))
+                if not parent_name:
+                    # legacy relation shape stores a display NAME, not an id
+                    legacy = rel.get("related_table")
+                    if isinstance(legacy, str) and legacy in loaded_names:
+                        parent_name = legacy
                 if parent_name and parent_name in loaded_names:
                     relations.append({
                         "related_display_name": parent_name,
