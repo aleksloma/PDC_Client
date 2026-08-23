@@ -45,6 +45,11 @@ _VALUE_MAXLEN = 40      # constant-value hints crossing to the brain
 _MAX_FACTS = 6
 _ROUND_SIG = 4          # significant figures for series comparison
 
+# A matrix whose smaller dimension holds at most this many values is a grouped
+# bar waiting to happen — same threshold as the planner's grouped-bar default
+# (colour dimension <= 6). Above it, a matrix is a legitimate choice.
+MATRIX_SMALL_DIM_MAX = 6
+
 # Deterministic fallback sentences. Server-side i18n does not exist in this
 # client (schema_builder._detect_language is the only language signal), so
 # these are literals for the three languages that detector supports.
@@ -55,6 +60,8 @@ _FALLBACK = {
         "catalog": "შენიშვნა: ჩატვირთული მონაცემები კატალოგის/კავშირების ინფორმაციაა "
                    "(რა არსებობს), და არა გაზომილი რაოდენობები — ამიტომ ყველა ჯგუფს "
                    "ერთი და იგივე მნიშვნელობა აქვს.",
+        "matrix": "ეს რიცხვების ცხრილი (სითბური რუკა) ძნელად საკითხავია — "
+                  "დაჯგუფებული სვეტოვანი დიაგრამა ამ მონაცემებს უკეთ აჩვენებდა.",
     },
     "ru": {
         "generic": "Примечание: в этих данных показатель одинаков для всех групп, "
@@ -62,12 +69,16 @@ _FALLBACK = {
         "catalog": "Примечание: загруженные данные — это справочная информация о связях "
                    "(что существует), а не измеренные количества, поэтому у всех групп "
                    "одно и то же значение.",
+        "matrix": "Эту таблицу чисел (тепловую карту) трудно читать — "
+                  "сгруппированная столбчатая диаграмма показала бы эти данные лучше.",
     },
     "en": {
         "generic": "Note: in this data the metric is the same for every group, so the "
                    "result cannot show differences.",
         "catalog": "Note: the loaded data contains catalog/link information (what exists), "
                    "not measured quantities — that is why every group has the same value.",
+        "matrix": "This grid of numbers (a heatmap) is hard to read — a grouped bar "
+                  "chart would show this data better.",
     },
 }
 
@@ -234,14 +245,93 @@ def _identical_series_facts(rows: list) -> Optional[list]:
             f"numbers — every one of them repeats the same values"]
 
 
+def _matrix_shape(rows: list) -> Optional[tuple]:
+    """(series_col, other_col, n_series, n_other) when these rows describe a
+    MATRIX chart: no `Series` column (that marks a multi-trace chart), exactly
+    two label dimensions and exactly one numeric column — the signature
+    plot_utils emits for px.imshow / go.Heatmap. None otherwise."""
+    if not rows or not isinstance(rows[0], dict):
+        return None
+    if "Series" in rows[0]:
+        return None
+    num_cols = _numeric_columns(rows)
+    if len(num_cols) != 1:
+        return None
+    labels = [c for c in rows[0].keys() if c not in set(num_cols)]
+    if len(labels) != 2:
+        return None
+    counts = {c: len({str(r.get(c)) for r in rows if isinstance(r, dict)})
+              for c in labels}
+    series_col = min(labels, key=lambda c: counts[c])
+    other = [c for c in labels if c != series_col][0]
+    if counts[series_col] < 2 or counts[other] < 2:
+        return None
+    return series_col, other, counts[series_col], counts[other]
+
+
+def _is_count_like(rows: list, num_col: str) -> bool:
+    """True when the matrix cells hold COUNTS: whole numbers, none negative.
+    A measured quantity (revenue, averages) is not second-guessed."""
+    vals = _clean(r.get(num_col) for r in rows if isinstance(r, dict))
+    if len(vals) < 2 or not all(_is_num(v) for v in vals):
+        return False
+    return all(float(v) >= 0 and float(v) == int(float(v)) for v in vals)
+
+
+def matrix_readability(chart_data) -> Optional[dict]:
+    """A number-grid matrix small enough to read as a GROUPED BAR.
+
+    Verified live: a 13 city x 5 product count matrix rendered as px.imshow
+    with the numbers printed in the cells. Nothing about that result is wrong —
+    the encoding is. Fires only for a real grid of COUNTS whose smaller
+    dimension is at most MATRIX_SMALL_DIM_MAX values, which is exactly the
+    shape the planner's grouped-bar default covers."""
+    if not isinstance(chart_data, dict):
+        return None
+    for rows in _row_sets(chart_data):
+        if not rows:
+            continue
+        shape = _matrix_shape(rows)
+        if not shape:
+            continue
+        series_col, other, n_series, n_other = shape
+        if n_series > MATRIX_SMALL_DIM_MAX:
+            continue
+        num_col = _numeric_columns(rows)[0]
+        if not _is_count_like(rows, num_col):
+            continue
+        return {
+            "kind": "matrix_readability",
+            "matrix": True,
+            "facts": [f"the chart is a {n_other}x{n_series} grid of {num_col} "
+                      f"numbers; with only {n_series} {series_col} values a "
+                      f"grouped bar (one bar per {series_col}, grouped by "
+                      f"{other}) reads far better than a number grid"],
+        }
+    return None
+
+
 def inspect_chart(chart_data) -> Optional[dict]:
-    """Constant-metric / identical-series detection on a rendered chart's data.
-    None when the chart varies, has no numeric series, or data is unavailable."""
+    """Constant-metric / identical-series / matrix-readability detection on a
+    rendered chart's data. None when the chart varies, is readably encoded, has
+    no numeric series, or the data is unavailable.
+
+    A flat finding always wins — it is the more important thing to tell the
+    user — but when the flat chart is ALSO an unreadable matrix, the readable
+    alternative rides along on the same caveat."""
     if not isinstance(chart_data, dict):
         return None
     row_sets = [rows for rows in _row_sets(chart_data) if rows]
     if not row_sets:
         return None
+    readable = matrix_readability(chart_data)
+
+    def _with_matrix(det: dict) -> dict:
+        if readable:
+            det["facts"] = (det["facts"] + readable["facts"])[:_MAX_FACTS]
+            det["matrix"] = True
+        return det
+
     const_facts: list = []
     for rows in row_sets:
         facts = _constant_metric_facts(rows)
@@ -250,12 +340,13 @@ def inspect_chart(chart_data) -> Optional[dict]:
             break
         const_facts.extend(facts)
     if const_facts:
-        return {"kind": "constant_metric", "facts": const_facts[:_MAX_FACTS]}
+        return _with_matrix({"kind": "constant_metric",
+                             "facts": const_facts[:_MAX_FACTS]})
     for rows in row_sets:
         facts = _identical_series_facts(rows)
         if facts:
-            return {"kind": "identical_series", "facts": facts}
-    return None
+            return _with_matrix({"kind": "identical_series", "facts": facts})
+    return readable
 
 
 # ── table inspection (works off the real pandas RESULT object) ───────────────
@@ -290,31 +381,8 @@ def _value_columns(df: pd.DataFrame) -> list:
     return out
 
 
-def inspect_table(result_obj) -> Optional[dict]:
-    """Constant-value-column detection on an executed table result.
-
-    Fires only when EVERY value column is constant across >=2 rows — a table
-    with any varying measure is informative and must not be branded flat. A
-    dict of tables fires only when every member fires (one caveat, one answer).
-    """
-    if isinstance(result_obj, dict):
-        members = [v for v in result_obj.values() if _as_frame(v) is not None]
-        if not members:
-            return None
-        facts: list = []
-        for m in members:
-            det = inspect_table(m)
-            if det is None:
-                return None
-            facts.extend(det["facts"])
-        return {"kind": "constant_table", "facts": facts[:_MAX_FACTS]}
-
-    df = _as_frame(result_obj)
-    if df is None or len(df) < 2:
-        return None
-    cols = _value_columns(df)
-    if not cols:
-        return None
+def _constant_columns_facts(df: pd.DataFrame, cols: list) -> Optional[list]:
+    """Facts when EVERY value column is constant DOWN its rows, else None."""
     facts = []
     for col in cols:
         vals = list(df[col])
@@ -323,9 +391,74 @@ def inspect_table(result_obj) -> Optional[dict]:
         const = _clean(vals)[0]
         facts.append(f"{col} is the same in every row of the table "
                      f"(= {_fmt_value(const)})")
-    if not facts:
+    return facts or None
+
+
+def _identical_columns_facts(df: pd.DataFrame, cols: list) -> Optional[list]:
+    """Facts when >=2 value columns are identical TO EACH OTHER — the values
+    vary by row, but every column repeats the same series.
+
+    This is the wide twin of the identical-series chart case: a city x product
+    table where each product column carries the same per-city number says
+    nothing about products, even though nothing in it is constant."""
+    if len(cols) < 2:
         return None
-    return {"kind": "constant_table", "facts": facts[:_MAX_FACTS]}
+    signatures = []
+    for col in cols:
+        vals = list(df[col])
+        if not _clean(vals):
+            return None                      # an all-null column proves nothing
+        signatures.append(tuple(
+            None if v is None or (_is_num(v) and pd.isna(v)) else _round_sig(v)
+            if _is_num(v) else str(v)
+            for v in vals))
+    first = signatures[0]
+    if any(s != first for s in signatures[1:]):
+        return None
+    return [f"all {len(cols)} value columns in the table ({', '.join(str(c) for c in cols[:5])}"
+            f"{'…' if len(cols) > 5 else ''}) carry identical numbers — every "
+            f"column repeats the same values row by row"]
+
+
+def inspect_table(result_obj) -> Optional[dict]:
+    """Flat-result detection on an executed table result.
+
+    Two shapes fire: every value column CONSTANT down its rows
+    (`constant_table`), or >=2 value columns IDENTICAL to each other while
+    varying by row (`identical_series` — the same finding a multi-series chart
+    would report, so it takes the same caveat path). A table with any genuinely
+    varying, distinct measure is informative and must not be branded flat. A
+    dict of tables fires only when every member fires (one caveat, one answer).
+    """
+    if isinstance(result_obj, dict):
+        members = [v for v in result_obj.values() if _as_frame(v) is not None]
+        if not members:
+            return None
+        facts: list = []
+        kinds = set()
+        for m in members:
+            det = inspect_table(m)
+            if det is None:
+                return None
+            kinds.add(det["kind"])
+            facts.extend(det["facts"])
+        # Mixed findings across members: report the weaker, always-true one.
+        kind = kinds.pop() if len(kinds) == 1 else "constant_table"
+        return {"kind": kind, "facts": facts[:_MAX_FACTS]}
+
+    df = _as_frame(result_obj)
+    if df is None or len(df) < 2:
+        return None
+    cols = _value_columns(df)
+    if not cols:
+        return None
+    facts = _constant_columns_facts(df, cols)
+    if facts:
+        return {"kind": "constant_table", "facts": facts[:_MAX_FACTS]}
+    facts = _identical_columns_facts(df, cols)
+    if facts:
+        return {"kind": "identical_series", "facts": facts[:_MAX_FACTS]}
+    return None
 
 
 # ── public entry ─────────────────────────────────────────────────────────────
@@ -359,11 +492,20 @@ def inspect_outputs(*, chart_data=None, chart_data_list=None, result_obj=None,
         return None
 
 
-def fallback_sentence(lang: str, *, catalog: bool) -> str:
+def fallback_sentence(lang: str, *, catalog: bool, matrix: bool = False,
+                      flat: bool = True) -> str:
     """The client's own explanation, used when the model's description does not
-    carry the marker. `lang` is a schema_builder._detect_language code."""
+    carry the marker. `lang` is a schema_builder._detect_language code.
+
+    `matrix` appends the readable-alternative clause; `flat=False` (a chart that
+    is only badly encoded, not flat) returns that clause alone."""
     table = _FALLBACK.get(lang) or _FALLBACK["en"]
-    return table["catalog" if catalog else "generic"]
+    parts = []
+    if flat:
+        parts.append(table["catalog" if catalog else "generic"])
+    if matrix:
+        parts.append(table["matrix"])
+    return " ".join(parts) if parts else table["generic"]
 
 
 def strip_marker(text: str) -> str:

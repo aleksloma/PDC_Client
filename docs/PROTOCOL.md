@@ -37,7 +37,7 @@ lookup; revoked / suspended tenants get **HTTP 403** (the kill-switch).
 | `preview` (summarize) | the `safe_preview` value the B2C code already restricts to scalars | client |
 | `qa_pairs` (report) | the `findings_for_llm` list the B2C `_generate_report_structure` already builds | client |
 | `dataset_profile` (plan/retry, **optional**) | enterprise-only (no B2C equivalent): `{df_key: profile}` of computed FACTS per loaded table — rows, duplicate count, per-column dtype/nunique/null rates/min-max/constant/all-unique flags, truncated top-value hints, detected grain, deterministic warnings. Aggregate metadata only, never row data (Article II — same class as the cardinality hints in `technical_description`). Absent field ⇒ pre-profile behavior everywhere | client (`dataset_profile.compute_profile`, stored as sidecar JSON, compacted by `brain_client._compact_profiles_for_transport`) |
-| `data_caveat` (describe, **optional**) | enterprise-only: the client's DETERMINISTIC post-execution finding about the result it just rendered — `{kind: constant_metric\|identical_series\|constant_table, facts[], grain[], catalog}`. Aggregate findings + column names + truncated constant-value hints only (Article II, same class as `dataset_profile`). Makes the flat-result explanation mandatory instead of prompt-dependent; absent field ⇒ byte-identical describe prompt | client (`result_backstop.inspect_outputs`, compacted by `brain_client._compact_caveat_for_transport`) |
+| `data_caveat` (describe, **optional**) | enterprise-only: the client's DETERMINISTIC post-execution finding about the result it just rendered — `{kind: constant_metric\|identical_series\|constant_table\|matrix_readability, facts[], grain[], catalog}`. Aggregate findings + column names + truncated constant-value hints only (Article II, same class as `dataset_profile`). Makes the flat-result explanation mandatory instead of prompt-dependent; absent field ⇒ byte-identical describe prompt | client (`result_backstop.inspect_outputs`, compacted by `brain_client._compact_caveat_for_transport`) |
 
 ---
 
@@ -171,7 +171,11 @@ from **the code only**, never the result. No data values ever sent.
   // result — pure pandas, no values. Sent only when a flat/degenerate result was
   // detected; absent ⇒ the describe prompt is byte-identical to before.
   "data_caveat": {
-    "kind": "constant_metric",          // | identical_series | constant_table
+    // constant_metric | identical_series | constant_table | matrix_readability
+    // (Prompt 15: matrix_readability = the result is fine but the ENCODING is
+    // not — a count matrix small enough to read as a grouped bar. The client
+    // asks the planner for one redraw first; the caveat is the fallback.)
+    "kind": "constant_metric",
     "facts": ["Quantity is the same for every group in the chart (= 1)"],
     "grain": ["cl prod link: one row per (client_id, product_id)"],
     "catalog": true                      // catalog/link grain, not measured quantities

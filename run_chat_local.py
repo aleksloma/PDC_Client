@@ -567,7 +567,9 @@ def _describe_with_backstop(sid: str, question: str, code: str,
     # client states it itself, FIRST, so the user can never see a flat result
     # without the explanation.
     lang = _detect_answer_language(question)
-    sentence = result_backstop.fallback_sentence(lang, catalog=catalog)
+    sentence = result_backstop.fallback_sentence(
+        lang, catalog=catalog, matrix=bool(det.get("matrix")),
+        flat=det["kind"] != "matrix_readability")
     log_with_sid(sid, "info", f"RESULT_BACKSTOP_NOTE_PREPENDED reason={reason}")
     combined = f"{sentence}\n\n{text}".strip() if text else sentence
     return {"text": combined, "usage": d.get("usage") or {}}
@@ -590,6 +592,30 @@ _MAX_MULTI_AXES_RETRY = 1
 # regress to seaborn on retry/stochastically — this guard makes interactivity
 # reliable rather than dependent on model compliance).
 _MAX_PLOTLY_REGEN = 1
+# One redraw for a number-grid matrix that should have been a grouped bar
+# (verified live: px.imshow with text_auto over city x product row counts).
+# Same shape as the interactivity regen below — the brain returns NEW CODE, so
+# the stored code and the rendered chart stay in sync and per-message Refresh /
+# dashboard tiles reproduce what the user saw. A server-built figure would not.
+_MAX_MATRIX_REGEN = 1
+_MATRIX_CODE_RE = re.compile(r"imshow|Heatmap|density_heatmap", re.IGNORECASE)
+# A user who ASKED for a heatmap/matrix gets one — the planner rules allow it
+# explicitly, and silently redrawing a requested chart is worse than a grid.
+# Stems only — Georgian and Russian inflect ("тепловую карту", "სითბურ რუკას").
+_MATRIX_ASKED_RE = re.compile(
+    r"heat\s?map|matrix|სითბურ|თბურ|რუკ|матриц|теплов|теплокарт",
+    re.IGNORECASE)
+_MATRIX_REGEN_INSTRUCTION = (
+    "UnreadableMatrixError: this chart is a number-grid matrix (heatmap) of "
+    "COUNTS whose smaller dimension has 6 or fewer categories. Redraw it as a "
+    "GROUPED BAR — px.bar(agg, x=<the larger dimension>, y=<the value>, "
+    "color=<the smaller dimension>, barmode='group', "
+    "color_discrete_sequence=px.colors.qualitative.Set2, template='plotly_white') "
+    "— keeping the same aggregation, title and labels. Do NOT use px.imshow, "
+    "go.Heatmap or px.density_heatmap. A matrix is only allowed here if you "
+    "encode BINARY exists/absent availability with no numeric cell values."
+)
+
 _PLOTLY_REGEN_INSTRUCTION = (
     "NonInteractiveChartError: this is a STANDARD chart but it was rendered with "
     "matplotlib/seaborn. Rewrite it using INTERACTIVE Plotly — plotly.express (px) "
@@ -1104,9 +1130,10 @@ def run_chat_multi_plot(
     produced_data_sigs: list = []
 
     # Worklist so a single block can EXPAND into several (when a multi-axes block
-    # is regenerated as separate ###NEXT_PLOT### blocks). Each item: (code, n_ma_retry).
+    # is regenerated as separate ###NEXT_PLOT### blocks). Each item:
+    # (code, n_multi_axes_retry, n_plotly_retry, n_matrix_retry).
     from collections import deque
-    work = deque((blk, 0, 0) for blk in plot_blocks)
+    work = deque((blk, 0, 0, 0) for blk in plot_blocks)
     produced = 0
     log_with_sid(sid, "info", f"MULTI_PLOT_START blocks={len(work)}")
 
@@ -1117,7 +1144,7 @@ def run_chat_multi_plot(
         if produced >= _MAX_MULTI_PLOTS:
             log_with_sid(sid, "info", f"MULTI_PLOT_EMIT_CAP reached={produced}")
             break
-        code, ma_retry, np_retry = work.popleft()
+        code, ma_retry, np_retry, mx_retry = work.popleft()
         try:
             ch = hashlib.sha256(code.encode("utf-8", errors="ignore")).hexdigest()[:settings.CODE_HASH_LEN]
             log_with_sid(sid, "info", f"MULTI_PLOT_EXEC produced={produced} remaining={len(work)} code_hash={ch}")
@@ -1183,7 +1210,7 @@ def run_chat_multi_plot(
                 if new_code:
                     blocks = _split_code_on_delimiter(new_code) or [new_code]
                     for b in blocks:
-                        work.append((b, ma_retry + 1, np_retry))
+                        work.append((b, ma_retry + 1, np_retry, mx_retry))
                     continue
             # Fallback: split the rendered figure into one image (+ data) per axis.
             split_out = render_plot_safe(code, dfs, sid, split_multi_axes=True)
@@ -1249,8 +1276,35 @@ def run_chat_multi_plot(
             new_code = retry_out.get("code") or ""
             if new_code and retry_out.get("kind") == "PLOT_CODE":
                 # Reprocess this item next (preserve order); np_retry+1 caps it.
-                work.appendleft((new_code, ma_retry, np_retry + 1))
+                work.appendleft((new_code, ma_retry, np_retry + 1, mx_retry))
                 continue
+
+        # ── Readable-encoding enforcement (count matrix -> grouped bar) ──
+        # A number grid whose smaller dimension has <=6 categories is a grouped
+        # bar waiting to happen (the planner's own default). Ask the brain ONCE
+        # for the redraw — the answer comes back as CODE, so the stored code and
+        # the chart stay in sync (per-message Refresh and dashboard tiles
+        # re-execute that code). Both gates must agree before spending the call:
+        # the rendered data must have the matrix shape AND the code must
+        # actually draw one. If the redraw fails, the chart is kept and the
+        # deterministic caveat names the alternative instead.
+        if (mx_retry < _MAX_MATRIX_REGEN and _MATRIX_CODE_RE.search(code or "")
+                and not _MATRIX_ASKED_RE.search(question or "")
+                and result_backstop.matrix_readability(plot_out.get("chart_data"))):
+            log_with_sid(sid, "info", f"MATRIX_REGEN attempt={mx_retry+1}")
+            retry_out = brain_client.retry(
+                sid=sid, question=question, schema_text=schema_str,
+                df_names=df_names, df_columns=df_columns, history_rows=history_rows,
+                error_msg=_MATRIX_REGEN_INSTRUCTION, failed_code=code,
+                use_pro=False, use_search=False, user_email=user_email,
+                dataset_profile=dataset_profile,
+            )
+            total_usage = _sum_usage(total_usage, retry_out.get("usage") or {})
+            new_code = retry_out.get("code") or ""
+            if new_code and retry_out.get("kind") == "PLOT_CODE":
+                work.appendleft((new_code, ma_retry, np_retry, mx_retry + 1))
+                continue
+            log_with_sid(sid, "info", "MATRIX_REGEN_KEPT_ORIGINAL")
 
         # ── Degenerate (zero-variance) chart skip ──
         # Drop a chart whose every numeric series is effectively constant (no

@@ -250,7 +250,10 @@ def _compact_profiles_for_transport(profiles: dict | None) -> dict | None:
         return None
 
 
-_CAVEAT_KINDS = ("constant_metric", "identical_series", "constant_table")
+_CAVEAT_KINDS = ("constant_metric", "identical_series", "constant_table",
+                 # Prompt 15: not a flat result — a readable-encoding finding
+                 # (a count matrix that should have been a grouped bar).
+                 "matrix_readability")
 
 
 def _compact_caveat_for_transport(caveat: dict | None) -> dict | None:

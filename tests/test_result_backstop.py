@@ -113,12 +113,17 @@ def test_matrix_chart_with_identical_columns_fires():
     assert "product_name" in det["facts"][0]
 
 
-def test_matrix_chart_with_real_variation_does_not_fire():
+def test_matrix_chart_with_real_variation_is_not_flat():
+    # Prompt 15 changed this case deliberately: the values genuinely vary, so
+    # NO flat finding — but a 2x2 count grid is still a grouped bar waiting to
+    # happen, and that readability finding now fires instead of nothing.
     rows = [{"product": "Milk", "city": "Tbilisi", "value": 4},
             {"product": "Cheese", "city": "Tbilisi", "value": 9},
             {"product": "Milk", "city": "Batumi", "value": 2},
             {"product": "Cheese", "city": "Batumi", "value": 7}]
-    assert inspect_chart(_chart(rows)) is None
+    det = inspect_chart(_chart(rows))
+    assert det["kind"] == "matrix_readability"
+    assert det["kind"] not in ("constant_metric", "identical_series")
 
 
 def test_matrix_needs_two_label_dimensions_and_a_grid():
@@ -137,6 +142,62 @@ def test_constant_metric_wins_over_identical_series():
     assert inspect_chart(_chart(rows))["kind"] == "constant_metric"
 
 
+# --- chart: matrix readability (Prompt 15) ----------------------------------
+
+def _matrix_rows(cities, products, value_of):
+    return [{"product_name": p, "city_name": c, "record_count": value_of(c, p)}
+            for c in cities for p in products]
+
+
+CITIES13 = [f"city{i}" for i in range(13)]
+PRODUCTS5 = ["Milk", "Cheese", "Butter", "Yoghurt", "Sour Cream"]
+
+
+def test_count_matrix_with_small_dimension_fires():
+    # The verified live case: 13 cities x 5 products of row counts, drawn as a
+    # number grid when a grouped bar was the planner's own default.
+    rows = _matrix_rows(CITIES13, PRODUCTS5, lambda c, p: CITIES13.index(c) % 3 + 1)
+    det = inspect_chart(_chart(rows))
+    assert det["kind"] == "identical_series"        # flat finding still wins...
+    assert det["matrix"] is True                    # ...and carries the alternative
+    assert any("grouped bar" in f for f in det["facts"])
+
+
+def test_matrix_readability_alone_when_values_vary_per_cell():
+    rows = _matrix_rows(CITIES13, PRODUCTS5,
+                        lambda c, p: CITIES13.index(c) + PRODUCTS5.index(p))
+    det = inspect_chart(_chart(rows))
+    assert det["kind"] == "matrix_readability"
+    assert "13x5" in det["facts"][0] and "grouped bar" in det["facts"][0]
+
+
+def test_matrix_readability_ignores_wide_second_dimension():
+    products = [f"p{i}" for i in range(7)]          # 7 > MATRIX_SMALL_DIM_MAX
+    rows = _matrix_rows(CITIES13, products,
+                        lambda c, p: CITIES13.index(c) + products.index(p))
+    assert inspect_chart(_chart(rows)) is None
+
+
+def test_matrix_readability_ignores_measured_quantities():
+    # Non-integer values are a measured metric, not counts — a heatmap of them
+    # is a legitimate choice and must not be second-guessed.
+    rows = _matrix_rows(CITIES13, PRODUCTS5,
+                        lambda c, p: 10.5 + CITIES13.index(c) + PRODUCTS5.index(p))
+    assert inspect_chart(_chart(rows)) is None
+
+
+def test_matrix_readability_ignores_multi_trace_charts():
+    # A `Series` column means the chart already IS a grouped/multi-line chart.
+    rows = [{"Series": p, "city": c, "n": CITIES13.index(c) + PRODUCTS5.index(p)}
+            for c in CITIES13 for p in PRODUCTS5]
+    assert inspect_chart(_chart(rows)) is None
+
+
+def test_matrix_readability_needs_a_real_grid():
+    rows = [{"a": "x", "b": "p", "v": 1}, {"a": "x", "b": "q", "v": 2}]
+    assert result_backstop.matrix_readability(_chart(rows)) is None
+
+
 # --- tables -----------------------------------------------------------------
 
 def test_constant_table_fires_ignoring_label_columns():
@@ -150,6 +211,33 @@ def test_constant_table_fires_ignoring_label_columns():
 
 def test_table_with_one_varying_value_column_does_not_fire():
     df = pd.DataFrame({"city": ["a", "b"], "qty": [1, 1], "revenue": [10, 99]})
+    assert inspect_table(df) is None
+
+
+def test_identical_value_columns_fire_as_identical_series():
+    # Prompt 15: the verified case — five product columns whose values vary by
+    # row but are identical TO EACH OTHER. Nothing is constant, yet the table
+    # says nothing about products.
+    per_city = [1, 1, 2, 3, 5]
+    df = pd.DataFrame({"city": ["a", "b", "c", "d", "e"],
+                       **{p: list(per_city) for p in
+                          ("Milk", "Cheese", "Butter", "Yoghurt", "Sour Cream")}})
+    det = inspect_table(df)
+    assert det["kind"] == "identical_series"
+    assert "identical" in det["facts"][0]
+    assert "Milk" in det["facts"][0]
+
+
+def test_one_altered_column_stops_the_identical_columns_finding():
+    per_city = [1, 1, 2, 3, 5]
+    df = pd.DataFrame({"city": ["a", "b", "c", "d", "e"],
+                       "Milk": list(per_city), "Cheese": list(per_city),
+                       "Butter": [1, 1, 2, 3, 6]})       # one value differs
+    assert inspect_table(df) is None
+
+
+def test_identical_columns_needs_two_value_columns():
+    df = pd.DataFrame({"city": ["a", "b"], "Milk": [3, 4]})
     assert inspect_table(df) is None
 
 
@@ -246,6 +334,18 @@ def test_fallback_sentences_localized_and_catalog_aware():
     assert "Примечание" in fallback_sentence("ru", catalog=False)
     # unknown language degrades to English, never raises
     assert fallback_sentence("de", catalog=False) == fallback_sentence("en", catalog=False)
+
+
+def test_fallback_sentence_carries_the_readable_alternative():
+    # flat AND badly encoded -> both clauses, flat one first
+    both = fallback_sentence("en", catalog=False, matrix=True)
+    assert both.startswith("Note: in this data the metric is the same")
+    assert "grouped bar" in both
+    # only badly encoded -> the alternative alone, no false "everything is equal"
+    only = fallback_sentence("en", catalog=False, matrix=True, flat=False)
+    assert "grouped bar" in only and "the same for every group" not in only
+    for lang in ("ka", "ru"):
+        assert fallback_sentence(lang, catalog=False, matrix=True, flat=False)
 
 
 def test_strip_marker():

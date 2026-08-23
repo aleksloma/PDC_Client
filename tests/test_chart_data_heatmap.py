@@ -58,8 +58,21 @@ def test_backstop_sees_identical_columns_in_a_heatmap(dfs):
     assert det and det["kind"] == "identical_series"
 
 
-def test_varying_heatmap_is_not_flagged(dfs):
+def test_varying_heatmap_is_not_flagged_as_flat(dfs):
+    # Prompt 15 changed this deliberately: the numbers vary, so no FLAT finding
+    # — but a small count grid is still reported as badly encoded (a grouped bar
+    # reads better), which is the whole point of the readability check.
     dfs["m.csv"].loc[1, "n"] = 8      # Cheese in Tbilisi differs now
+    out = plot_utils.render_plot_safe(HEATMAP_CODE, dfs, "t")
+    det = result_backstop.inspect_outputs(chart_data=out.get("chart_data"), sid="t")
+    assert det["kind"] == "matrix_readability"
+    assert det["kind"] not in ("constant_metric", "identical_series")
+
+
+def test_measured_quantity_heatmap_is_left_alone(dfs):
+    # Non-count cells (a mean, a revenue) — a heatmap is a legitimate encoding
+    # and nothing should fire.
+    dfs["m.csv"]["n"] = [1.5, 8.25, 2.5, 7.75]
     out = plot_utils.render_plot_safe(HEATMAP_CODE, dfs, "t")
     assert result_backstop.inspect_outputs(chart_data=out.get("chart_data"), sid="t") is None
 
