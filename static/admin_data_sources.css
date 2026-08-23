@@ -99,6 +99,11 @@ body.admin-ds-page {
   border: 1px solid transparent;
 }
 .adm-alert.warn { background: #fef3c7; border-color: #fcd34d; color: #92400e; }
+/* Schema-drift banner (Prompt 13): red alert with an inline Dismiss button */
+#driftBanner .adm-alert {
+  background: #fee2e2; border-color: #fca5a5; color: #7f1d1d;
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 14px;
+}
 
 .adm-hero {
   background: #fff; border: 1px solid #e2e8f0; border-radius: 12px;

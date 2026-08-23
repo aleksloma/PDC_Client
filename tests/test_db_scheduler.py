@@ -109,6 +109,133 @@ def test_refresh_failure_keeps_previous_profile(tmp_path):
     assert ppath.read_text(encoding="utf-8") == before   # previous profile kept
 
 
+# ---------------------------------------------------------------------------
+# Smart refresh (Part C): fingerprint skip / reload / force / fallback
+# ---------------------------------------------------------------------------
+
+def test_smart_refresh_skips_unchanged_then_reloads_on_change(tmp_path):
+    from sqlalchemy import create_engine, text
+    db, store, tid = _sqlite_setup(tmp_path)
+    assert db_scheduler.refresh_one_table(tid, actor="test", force=False)["ok"] is True
+    snap = local_store.db_snapshot_path(tid)
+    mtime = snap.stat().st_mtime_ns
+    refreshed = store.get_table(tid)["refreshed_at"]
+    checked = store.get_table(tid)["last_checked_at"]
+
+    res = db_scheduler.refresh_one_table(tid, actor="test", force=False)
+    assert res["ok"] is True and res["skipped"] is True
+    row = store.get_table(tid)
+    assert snap.stat().st_mtime_ns == mtime            # snapshot untouched
+    assert row["refreshed_at"] == refreshed            # not a refresh
+    assert row["last_checked_at"] >= checked           # but checked moved
+
+    eng = create_engine(f"sqlite+pysqlite:///{db}")
+    with eng.begin() as conn:
+        conn.execute(text("INSERT INTO t VALUES (99, 'new')"))
+    eng.dispose()
+    res2 = db_scheduler.refresh_one_table(tid, actor="test", force=False)
+    assert res2["ok"] is True and res2.get("skipped") is False
+    assert res2["rows"] == 4
+    assert snap.stat().st_mtime_ns > mtime
+
+
+def test_schema_only_change_reloads_and_records_drift(tmp_path):
+    from sqlalchemy import create_engine, text
+    db, store, tid = _sqlite_setup(tmp_path)
+    assert db_scheduler.refresh_one_table(tid, actor="test", force=False)["ok"] is True
+    eng = create_engine(f"sqlite+pysqlite:///{db}")
+    with eng.begin() as conn:
+        conn.execute(text("ALTER TABLE t ADD COLUMN c INTEGER"))  # no row change
+    eng.dispose()
+    res = db_scheduler.refresh_one_table(tid, actor="test", force=False)
+    assert res["ok"] is True and res.get("skipped") is False      # schema in hash
+    assert res["drift"]["added"] == ["c"]
+    drift = store.get_table(tid)["last_drift"]
+    assert drift["added"] == ["c"] and drift["dismissed"] is False
+
+
+def test_force_resnapshot_despite_matching_fingerprint(tmp_path):
+    _, store, tid = _sqlite_setup(tmp_path)
+    assert db_scheduler.refresh_one_table(tid, actor="test", force=False)["ok"] is True
+    snap = local_store.db_snapshot_path(tid)
+    mtime = snap.stat().st_mtime_ns
+    res = db_scheduler.refresh_one_table(tid, actor="test")   # default force=True
+    assert res["ok"] is True and res.get("skipped") is False
+    assert snap.stat().st_mtime_ns > mtime
+
+
+def test_fingerprint_failure_falls_through_to_full_snapshot(tmp_path, monkeypatch):
+    import db_connector
+    _, store, tid = _sqlite_setup(tmp_path)
+    assert db_scheduler.refresh_one_table(tid, actor="test", force=False)["ok"] is True
+    monkeypatch.setattr(db_connector, "fingerprint_table",
+                        lambda *a, **k: {"ok": False, "error": "boom"})
+    snap = local_store.db_snapshot_path(tid)
+    mtime = snap.stat().st_mtime_ns
+    res = db_scheduler.refresh_one_table(tid, actor="test", force=False)
+    assert res["ok"] is True and res.get("skipped") is False   # never blocks
+    assert snap.stat().st_mtime_ns > mtime
+    # stale hash cleared so a later run can never false-skip
+    assert store.get_table(tid)["last_fingerprint"] is None
+
+
+def test_dtype_change_detected_and_meta_resynced(tmp_path):
+    from sqlalchemy import create_engine, text
+    db, store, tid = _sqlite_setup(tmp_path)
+    assert db_scheduler.refresh_one_table(tid, actor="test", force=False)["ok"] is True
+    # chat meta referencing the table (the resync target)
+    chat = local_store.ChatDataStore("c_dtype")
+    chat.write_meta({"files": [{
+        "file_name": "test table", "source": "database",
+        "db": {"table_id": tid},
+        "schema": {"file_name": "test table", "fields": {}}}]})
+    # sqlite can't ALTER COLUMN TYPE → drop + re-add same name, different type
+    eng = create_engine(f"sqlite+pysqlite:///{db}")
+    with eng.begin() as conn:
+        conn.execute(text("ALTER TABLE t DROP COLUMN b"))
+        conn.execute(text("ALTER TABLE t ADD COLUMN b REAL"))
+    eng.dispose()
+    res = db_scheduler.refresh_one_table(tid, actor="test", force=False)
+    assert res["ok"] is True
+    assert res["drift"]["retyped"] == [{"col": "b", "from": "TEXT", "to": "REAL"}]
+    row = store.get_table(tid)
+    bcol = next(c for c in row["columns"] if c["name"] == "b")
+    assert bcol["dtype"] == "REAL"                      # registry dtype refreshed
+    assert bcol["description"] == "col b"               # admin description kept
+    assert row["last_drift"]["retyped"][0]["col"] == "b"
+    meta = chat.read_meta()
+    fields = meta["files"][0]["schema"]["fields"]
+    # Resync delivered the FRESH snapshot stats (the re-added column is all
+    # NULL → "0/3 filled" proves it's the new column, not the old TEXT one).
+    assert "0/3 filled" in fields["b"]["technical_description"]
+
+
+def test_run_all_due_table_filter_and_skipped_count(tmp_path):
+    _, store, tid = _sqlite_setup(tmp_path)
+    assert db_scheduler.refresh_one_table(tid, actor="test", force=False)["ok"] is True
+    out = db_scheduler.run_all_due(reason="test", table_ids=[tid])
+    assert len(out["results"]) == 1
+    assert out["results"][0]["skipped"] is True
+    assert out["skipped_count"] == 1
+    out2 = db_scheduler.run_all_due(reason="test", table_ids=[])
+    assert out2["results"] == []
+
+
+def test_compose_fingerprint_stable_and_sensitive():
+    fp = {"columns": [{"name": "a", "dtype": "INTEGER"}],
+          "agg": {"count": 3, "sums": {"a": "6"}, "avgs": {"a": "2.0"},
+                  "maxes": {}}}
+    h1 = db_scheduler.compose_fingerprint(fp)
+    h2 = db_scheduler.compose_fingerprint(json.loads(json.dumps(fp)))
+    assert h1 == h2 and h1.startswith("fp1:") and len(h1) == 4 + 64
+    changed = json.loads(json.dumps(fp))
+    changed["agg"]["count"] = 4
+    assert db_scheduler.compose_fingerprint(changed) != h1
+    retyped = json.loads(json.dumps(fp))
+    retyped["columns"][0]["dtype"] = "REAL"
+    assert db_scheduler.compose_fingerprint(retyped) != h1
+
+
 def test_refresh_failure_keeps_previous_snapshot_and_timestamp(tmp_path):
     db, store, tid = _sqlite_setup(tmp_path)
     assert db_scheduler.refresh_one_table(tid, actor="test")["ok"] is True

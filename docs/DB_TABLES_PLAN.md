@@ -159,7 +159,84 @@ normalizes to canonical 5-field cron:
   mode=daily (`schedule_from_settings`); POST /refresh_settings accepts
   both body shapes; legacy keys are mirrored on write for downgrade-compat.
 - Connection-level "Refresh now" (`POST /connections/{cid}/refresh`)
-  bypasses the run-lock by design (pre-existing behavior, unchanged).
+  bypasses the run-lock by design (pre-existing behavior, unchanged) and,
+  being admin-initiated, always forces a full snapshot.
+
+### Smart refresh — change detection (Prompt 13 Part C — implemented)
+
+Scheduled refreshes probe the source BEFORE snapshotting: ONE SQL aggregate
+query per table (`db_connector.fingerprint_table`) — `COUNT(*)`, `SUM`+`AVG`
+of up to 4 numeric columns and `MAX` of up to 2 date/timestamp columns
+(picked deterministically by registry column order), all wrapped around the
+same `_build_select` the snapshot uses so the WHERE filter / row cap compare
+like for like — plus the live column name+type list from introspection.
+Serialized canonically and hashed (`db_scheduler.compose_fingerprint`):
+
+```
+payload = {"v":1, "count":10432,
+           "sums":{"amount":"1234567.89"}, "avgs":{"amount":"118.36"},
+           "maxes":{"updated_at":"2026-08-21 23:59:12"},
+           "schema":[["id","INTEGER"],["amount","NUMERIC(12,2)"],...]}
+fingerprint = "fp1:" + sha256(canonical_json)      # e.g. fp1:9c2f0a…
+```
+
+- Scheduled run (`force=False`, only the scheduler passes it): fingerprint
+  equal to the stored one ⇒ SKIP — `last_checked_at` moves,
+  `DB_REFRESH_UNCHANGED` logged, snapshot/profile/chat metas untouched.
+  The schema list is inside the hash, so "unchanged AND schema identical"
+  is one compare. Otherwise the existing full snapshot runs and stores the
+  new fingerprint.
+- "Refresh now" / registration / rec-accept / connection refresh:
+  `refresh_one_table` defaults to `force=True` — always a full snapshot.
+- A fingerprint failure of ANY kind (permissions, exotic types, dialect
+  quirks) logs a warning and falls through to the full snapshot — the
+  optimization can never block a refresh (Article IV). The stored
+  fingerprint is cleared on such a round so a later run can never
+  false-skip on a stale hash.
+- **Accepted limitation:** offsetting edits could in theory cancel out in
+  SUM/AVG; combined with COUNT, MAX(date) and the schema hash this is
+  vanishingly unlikely and is the accepted trade for not hammering
+  customer DBs (chosen design).
+
+### Schema-drift policy (Prompt 13 Part C — implemented)
+
+Detection now covers dtype changes too: each full refresh updates every
+registry column's `dtype` from the fingerprint call's live introspection
+(they used to be frozen at registration); `retyped = [{col, from, to}]`
+where the normalized types differ.
+
+Policy — **apply source truth immediately, make every structural change
+visible, never pause-and-hold-stale-data**:
+
+- ADDED column: auto-included in snapshot and metas (unchanged), pandas
+  technical_description computed; the drift record doubles as the "new
+  column(s) need description review" flag until the admin edits the table
+  or dismisses the banner (descriptions are admin-confirmed by design — no
+  background LLM autofill).
+- REMOVED column: applied — a snapshot honestly mirrors the source; a
+  mirror must never retain phantom columns (Fivetran-style soft-delete
+  suits warehouses with history, not snapshots).
+- RETYPED column: applied, technical_description recomputed, and a
+  retype-only drift ALSO resyncs chat metas (their technical descriptions
+  changed).
+- RATIONALE: generated pandas code is written fresh per question from the
+  CURRENT schema, so new questions self-heal after any drift; the dangerous
+  failure is a silently stale or mismatched snapshot/meta — the same
+  silent-wrongness class as fabrication. Airbyte's pause/approve model
+  suits pipelines feeding fixed SQL, not an LLM that replans every
+  question.
+- SURFACING: `last_drift` on the table row
+  `{added, removed, retyped, at, dismissed}` (a new drift overwrites and
+  resets dismissal); the Data sources page shows a red banner per drifted
+  table (details incl. `col: from → to`) with an audited Dismiss, plus a
+  `schema drift` chip on the row; refresh history (`record_run`) carries
+  per-table `skipped`/`drift`. No new notification subsystem.
+- Dashboard tiles on a removed column (verified in code): a tile refresh
+  failure returns `200 {ok:false}` and the stored snapshot is only patched
+  on success (`routes/dashboards.py refresh_tile`); the viewer shows
+  "Refresh failed — showing saved version" and keeps the last rendered
+  state — the tile is never deleted. The drift banner is where the admin
+  learns why.
 
 ## Security invariants
 

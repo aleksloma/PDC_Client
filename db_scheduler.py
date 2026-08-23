@@ -54,9 +54,42 @@ def _parse_iso(value) -> Optional[datetime]:
 # One-table refresh (shared by nightly run + admin Refresh-now)
 # ---------------------------------------------------------------------------
 
-def refresh_one_table(table_id: str, *, actor: str = "scheduler") -> dict:
+def compose_fingerprint(fp: dict) -> str:
+    """Deterministic fingerprint string from a fingerprint_table result:
+    aggregates + the full column name+type list, canonical-JSON'd and hashed.
+    Any row-count change, MAX-date advance, SUM/AVG drift, column add/remove,
+    or dtype change alters it."""
+    import hashlib
+    agg = fp.get("agg") or {}
+    payload = {"v": 1,
+               "count": agg.get("count"),
+               "sums": agg.get("sums") or {},
+               "avgs": agg.get("avgs") or {},
+               "maxes": agg.get("maxes") or {},
+               "schema": [[c.get("name"), c.get("dtype")]
+                          for c in (fp.get("columns") or [])]}
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return "fp1:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _normalize_dtype(s) -> str:
+    return " ".join(str(s or "").split()).upper()
+
+
+def refresh_one_table(table_id: str, *, actor: str = "scheduler",
+                      force: bool = True) -> dict:
     """Re-snapshot one registered table and re-sync drifted chat metas.
-    Never raises. Returns {ok, rows?, bytes?, refreshed_at?, drift?, error?}."""
+    Never raises. Returns {ok, rows?, bytes?, refreshed_at?, drift?,
+    skipped?, error?}.
+
+    `force` defaults to True so every admin-initiated caller (Refresh-now,
+    registration save, rec-accept, connection refresh) keeps full-snapshot
+    semantics; ONLY the scheduler passes force=False, enabling the cheap
+    change-detection skip: one SQL aggregate fingerprint — if it matches the
+    stored one (schema list included, so "unchanged AND schema identical" is
+    one compare), the snapshot/profile/chat metas stay untouched and only
+    last_checked_at moves. A fingerprint failure of any kind falls through
+    to the full snapshot — the optimization can never block a refresh."""
     store = db_sources.DataSourceStore()
     row = store.get_table(table_id)
     if row is None:
@@ -73,6 +106,26 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler") -> dict:
 
     label = f"{row.get('schema') or ''}.{row.get('table_name') or ''}".strip(".")
     old_cols = [c.get("name") for c in (row.get("columns") or []) if c.get("name")]
+
+    # Change detection (Part C): fingerprint first — also the source of live
+    # dtypes for retype detection on the full path.
+    fp = db_connector.fingerprint_table(
+        conn, password or "",
+        row.get("schema") or None, row.get("table_name"),
+        where=row.get("where_filter") or None,
+        row_cap=row.get("row_cap") or None,
+        preferred_order=old_cols,
+        sid=f"refresh:{actor}")
+    new_fp = compose_fingerprint(fp) if fp.get("ok") else None
+    if not force and new_fp and new_fp == row.get("last_fingerprint"):
+        store.mark_checked(table_id)
+        log_with_sid("db_refresh", "info", f"DB_REFRESH_UNCHANGED table={label}")
+        db_sources.audit(actor, "table.refresh", target=table_id,
+                         detail={"table": label, "skipped": True, "ok": True})
+        return {"ok": True, "skipped": True, "rows": row.get("row_count"),
+                "refreshed_at": row.get("refreshed_at"),
+                "drift": {"added": [], "removed": [], "retyped": []}}
+
     dest = local_store.db_snapshot_path(table_id)
     res = db_connector.snapshot_table(
         conn, password or "",
@@ -91,16 +144,28 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler") -> dict:
     removed = [c for c in old_cols if c not in fresh_cols]
 
     # Column list for the registry: keep admin-confirmed descriptions and
-    # indexed flags for surviving columns; append new ones bare.
+    # indexed flags for surviving columns; append new ones bare. Dtypes are
+    # REFRESHED from the fingerprint call's live introspection (they used to
+    # be frozen at registration) — a changed type is recorded as drift.
+    live_dtypes = ({str(c.get("name")): c.get("dtype")
+                    for c in (fp.get("columns") or [])} if fp.get("ok") else {})
     old_by_name = {c.get("name"): c for c in (row.get("columns") or []) if c.get("name")}
     new_columns = []
+    retyped = []
     for name in fresh_cols:
         prev = old_by_name.get(name)
+        live = live_dtypes.get(str(name))
         if prev:
-            new_columns.append(dict(prev))
+            col = dict(prev)
+            old_dtype = col.get("dtype") or ""
+            if live and old_dtype and _normalize_dtype(live) != _normalize_dtype(old_dtype):
+                retyped.append({"col": name, "from": old_dtype, "to": live})
+            if live:
+                col["dtype"] = live
+            new_columns.append(col)
         else:
-            new_columns.append({"name": name, "dtype": "", "description": "",
-                                "indexed": False})
+            new_columns.append({"name": name, "dtype": live or "",
+                                "description": "", "indexed": False})
     # Technical descriptions + dataset profile from the fresh snapshot (one
     # parquet read, pandas stats, no LLM). Best-effort; tech descs flow into
     # chat metas via the resync below, the profile is a sidecar next to the
@@ -113,7 +178,8 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler") -> dict:
     store.mark_refreshed(table_id, rows=res.get("rows"),
                          snapshot_bytes=res.get("bytes"),
                          columns=new_columns,
-                         dtype_plan=res.get("dtype_plan"))
+                         dtype_plan=res.get("dtype_plan"),
+                         fingerprint=new_fp)
     if prof is not None:
         try:
             st = dest.stat()
@@ -124,10 +190,13 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler") -> dict:
             log_with_sid("db_refresh", "warning",
                          f"DB_PROFILE_WRITE_FAILED table={table_id}: {e}")
 
-    drift = {"added": added, "removed": removed}
-    if added or removed:
+    drift = {"added": added, "removed": removed, "retyped": retyped}
+    if added or removed or retyped:
         log_with_sid("db_refresh", "warning",
-                     f"DB_SCHEMA_DRIFT table={label} added={added} removed={removed}")
+                     f"DB_SCHEMA_DRIFT table={label} added={added} "
+                     f"removed={removed} retyped={[r['col'] for r in retyped]}")
+        store.mark_drift(table_id, drift)
+        # Retype-only drift ALSO resyncs — technical descriptions changed.
         resync_chats_for_table(table_id)
     else:
         # No structural drift — still refresh the per-chat refreshed_at cache.
@@ -136,7 +205,8 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler") -> dict:
     db_sources.audit(actor, "table.refresh", target=table_id,
                      detail={"table": label, "rows": res.get("rows"),
                              "drift": drift, "ok": True})
-    return {"ok": True, "rows": res.get("rows"), "bytes": res.get("bytes"),
+    return {"ok": True, "skipped": False, "rows": res.get("rows"),
+            "bytes": res.get("bytes"),
             "refreshed_at": (store.get_table(table_id) or {}).get("refreshed_at"),
             "drift": drift}
 
@@ -320,7 +390,8 @@ def _release_run_lock() -> None:
 
 
 def run_all_due(*, reason: str = "schedule",
-                table_ids: Optional[list] = None) -> dict:
+                table_ids: Optional[list] = None,
+                force: bool = False) -> dict:
     """Refresh registered tables SEQUENTIALLY (parallel snapshots would
     spike container RAM and hammer the customer DB at midnight). Each table
     individually try/except'd; _STOP checked between tables. The 'run once'
@@ -347,27 +418,35 @@ def run_all_due(*, reason: str = "schedule",
                 break
             tid = t.get("id")
             try:
-                res = refresh_one_table(tid, actor=f"scheduler:{reason}")
+                res = refresh_one_table(tid, actor=f"scheduler:{reason}",
+                                        force=force)
             except Exception as e:  # refresh_one_table never raises, but belt+braces
                 res = {"ok": False, "error": str(e)[:300]}
             label = f"{t.get('schema') or ''}.{t.get('table_name') or ''}".strip(".")
-            if res.get("ok"):
+            if res.get("skipped"):
+                log_with_sid("db_refresh", "info",
+                             f"DB_REFRESH_TABLE_SKIPPED table={label}")
+            elif res.get("ok"):
                 log_with_sid("db_refresh", "info",
                              f"DB_REFRESH_TABLE_OK table={label} rows={res.get('rows')}")
             else:
                 log_with_sid("db_refresh", "error",
                              f"DB_REFRESH_TABLE_FAILED table={label} err={res.get('error')}")
             results.append({"table_id": tid, "ok": bool(res.get("ok")),
-                            "rows": res.get("rows"), "error": res.get("error")})
+                            "rows": res.get("rows"), "error": res.get("error"),
+                            "skipped": bool(res.get("skipped")),
+                            "drift": res.get("drift")})
     finally:
         _release_run_lock()
     ok_n = sum(1 for r in results if r["ok"])
+    skipped_n = sum(1 for r in results if r.get("skipped"))
     summary = {"reason": reason, "ok_count": ok_n,
                "failed_count": len(results) - ok_n,
+               "skipped_count": skipped_n,
                "elapsed_s": round(time.monotonic() - t0, 1)}
     log_with_sid("db_refresh", "info",
                  f"DB_REFRESH_RUN_DONE ok={ok_n} failed={len(results) - ok_n} "
-                 f"elapsed_s={summary['elapsed_s']}")
+                 f"skipped={skipped_n} elapsed_s={summary['elapsed_s']}")
     store.record_run({**summary, "results": results})
     db_sources.audit("scheduler", "refresh.scheduled_run", detail=summary)
     return {"ok": True, "results": results, **summary}

@@ -308,3 +308,66 @@ def test_snapshot_failure_uses_the_snapshot_phrase(sqlite_cfg, tmp_path, monkeyp
         dest=tmp_path / "s.parquet", sid="t")
     assert res["ok"] is False
     assert res["error"] == "Database snapshot timed out."
+
+
+# ---------------------------------------------------------------------------
+# fingerprint_table (Prompt 13 Part C)
+# ---------------------------------------------------------------------------
+
+def test_fingerprint_values_and_determinism(sqlite_cfg):
+    fp = db_connector.fingerprint_table(
+        sqlite_cfg, "", None, "orders",
+        preferred_order=["order_id", "client_id", "amount", "segment"],
+        sid="t")
+    assert fp["ok"] is True
+    assert fp["agg"]["count"] == 7
+    # amounts: 0, 1.5, ..., 9.0 → sum 31.5
+    assert float(fp["agg"]["sums"]["amount"]) == pytest.approx(31.5)
+    assert float(fp["agg"]["avgs"]["amount"]) == pytest.approx(4.5)
+    names = [c["name"] for c in fp["columns"]]
+    assert names == ["order_id", "client_id", "amount", "segment"]
+    fp2 = db_connector.fingerprint_table(
+        sqlite_cfg, "", None, "orders",
+        preferred_order=["order_id", "client_id", "amount", "segment"],
+        sid="t")
+    assert fp == fp2                                     # deterministic
+
+
+def test_fingerprint_respects_where_and_row_cap(sqlite_cfg):
+    fp_all = db_connector.fingerprint_table(sqlite_cfg, "", None, "orders", sid="t")
+    fp_where = db_connector.fingerprint_table(
+        sqlite_cfg, "", None, "orders", where="client_id = 0", sid="t")
+    assert fp_where["ok"] and fp_where["agg"]["count"] == 3
+    assert fp_where["agg"]["count"] != fp_all["agg"]["count"]
+    fp_cap = db_connector.fingerprint_table(
+        sqlite_cfg, "", None, "orders", row_cap=2, sid="t")
+    assert fp_cap["ok"] and fp_cap["agg"]["count"] == 2  # cap INSIDE the subquery
+
+
+def test_fingerprint_column_pick_caps_and_order(sqlite_cfg, tmp_path):
+    # a table with 6 numerics + 3 timestamps → ≤4 numeric, ≤2 temporal,
+    # registry (preferred) order wins
+    db = tmp_path / "wide.db"
+    eng = create_engine(f"sqlite+pysqlite:///{db}")
+    with eng.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE w (n1 REAL, n2 REAL, n3 REAL, n4 REAL, n5 REAL, "
+            "n6 REAL, t1 TIMESTAMP, t2 TIMESTAMP, t3 TIMESTAMP, s TEXT)"))
+        conn.execute(text(
+            "INSERT INTO w VALUES (1,2,3,4,5,6,'2026-01-01','2026-02-01',"
+            "'2026-03-01','x')"))
+    eng.dispose()
+    cfg = {"db_type": "sqlite", "url_override": f"sqlite+pysqlite:///{db}"}
+    pref = ["n6", "n5", "n4", "n3", "t3", "t2", "n1", "n2", "t1", "s"]
+    fp = db_connector.fingerprint_table(cfg, "", None, "w",
+                                        preferred_order=pref, sid="t")
+    assert fp["ok"] is True
+    assert sorted(fp["agg"]["sums"]) == ["n3", "n4", "n5", "n6"]  # top 4 by pref
+    assert sorted(fp["agg"]["maxes"]) == ["t2", "t3"]             # top 2 by pref
+    assert "s" not in fp["agg"]["sums"]
+
+
+def test_fingerprint_failure_shape(sqlite_cfg):
+    fp = db_connector.fingerprint_table(sqlite_cfg, "", None, "no_such_table",
+                                        sid="t")
+    assert fp["ok"] is False and fp["error"]

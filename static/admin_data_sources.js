@@ -329,7 +329,44 @@
   }
 
   // ── Registered tables ──────────────────────────────────────────────────
+  // Schema-drift surfacing (Prompt 13 Part C): a refresh that saw columns
+  // added/removed/retyped records last_drift on the table row; the banner +
+  // per-row chip stay visible until the admin dismisses (audited) or edits
+  // the table. Policy: source truth is applied immediately (snapshot honestly
+  // mirrors the source) — surfacing is how the admin learns why.
+  function _driftBits(d) {
+    const bits = [];
+    (d.added || []).forEach((c) => bits.push(`+ ${c}`));
+    (d.removed || []).forEach((c) => bits.push(`− ${c}`));
+    (d.retyped || []).forEach((r) => bits.push(`${r.col}: ${r.from} → ${r.to}`));
+    return bits;
+  }
+
+  function renderDriftBanner() {
+    const box = $('driftBanner');
+    const drifted = TABLES.filter((t) => t.last_drift && !t.last_drift.dismissed);
+    if (!drifted.length) { box.innerHTML = ''; return; }
+    box.innerHTML = drifted.map((t) => `
+      <div class="adm-alert" data-tid="${esc(t.id)}">
+        <div><strong>Schema drift — ${esc(t.display_name)}</strong>
+          <span class="adm-muted">(${esc(t.last_drift.at || '')})</span><br/>
+          ${_driftBits(t.last_drift).map(esc).join(' · ')}<br/>
+          <span class="adm-muted">The snapshot and chat schemas already follow the source.
+          New columns keep empty descriptions until you edit the table.</span></div>
+        <button class="adm-btn ghost" data-act="dismiss-drift">Dismiss</button>
+      </div>`).join('');
+    box.querySelectorAll('[data-act="dismiss-drift"]').forEach((b) => {
+      b.addEventListener('click', async () => {
+        const tid = b.closest('.adm-alert').dataset.tid;
+        const r = await api(`/api/admin/tables/${tid}/dismiss_drift`, { method: 'POST', body: '{}' });
+        if (r.ok) { toast('Drift dismissed'); loadAll(); }
+        else toast(r.data.error || 'Dismiss failed', true);
+      });
+    });
+  }
+
   function renderTables() {
+    renderDriftBanner();
     const box = $('tablesList');
     if (!TABLES.length) {
       box.innerHTML = `<div class="adm-empty">
@@ -351,9 +388,11 @@
         <td class="adm-cell-mono">${esc(connName(t.connection_id))} · ${esc([t.schema, t.table_name].filter(Boolean).join('.'))}</td>
         <td>${t.row_count != null ? Number(t.row_count).toLocaleString() : '—'}</td>
         <td title="${esc(t.last_refresh_error || '')}">${t.refreshed_at ? esc(t.refreshed_at)
-          : (t.last_refresh_error ? '<span class="adm-chip bad">failed</span>' : '—')}</td>
+          : (t.last_refresh_error ? '<span class="adm-chip bad">failed</span>' : '—')}${
+          t.last_drift && !t.last_drift.dismissed
+            ? ` <span class="adm-chip bad" title="${esc(_driftBits(t.last_drift).join(' · '))}">schema drift</span>` : ''}</td>
         <td class="adm-actions-cell">
-          <button class="adm-icon-btn" data-act="refresh" title="Refresh snapshot now">⟳</button>
+          <button class="adm-icon-btn" data-act="refresh" title="Refresh snapshot now (always a full snapshot)">⟳</button>
           <button class="adm-icon-btn" data-act="schedule" title="Refresh schedule for this table">⏱</button>
           <button class="adm-icon-btn" data-act="edit" title="Edit descriptions / relations">✎</button>
           <button class="adm-icon-btn" data-act="delete" title="Delete registered table">🗑</button>
@@ -378,10 +417,16 @@
       try {
         r = await api(`/api/admin/tables/${tid}/refresh`, { method: 'POST', body: '{}' });
       } finally { _busyDone(); }
-      if (r.data.ok) {
+      if (r.data.ok && r.data.skipped) {
+        toast('No changes detected — snapshot already current');
+      } else if (r.data.ok) {
         const d = r.data.drift || {};
-        const driftNote = (d.added || []).length || (d.removed || []).length
-          ? ` (schema drift: +${(d.added || []).length}/-${(d.removed || []).length} columns — chats re-synced)` : '';
+        const parts = [];
+        if ((d.added || []).length) parts.push(`+${d.added.length}`);
+        if ((d.removed || []).length) parts.push(`-${d.removed.length}`);
+        if ((d.retyped || []).length) parts.push(`~${d.retyped.length} retyped`);
+        const driftNote = parts.length
+          ? ` (schema drift: ${parts.join('/')} columns — chats re-synced)` : '';
         toast(`Refreshed: ${Number(r.data.rows).toLocaleString()} rows${driftNote}`);
       } else {
         toast(r.data.error || 'Refresh failed', true);

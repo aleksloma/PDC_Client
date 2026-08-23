@@ -1536,11 +1536,25 @@ async def delete_table(request: Request, tid: str):
 
 @router.post("/tables/{tid}/refresh")
 async def refresh_table(request: Request, tid: str):
+    """Admin "Refresh now" — always a FULL snapshot (refresh_one_table's
+    force default), never the fingerprint skip."""
     email, err = _require_admin(request)
     if err:
         return err
     import db_scheduler
     return await _run(db_scheduler.refresh_one_table, tid, actor=email)
+
+
+@router.post("/tables/{tid}/dismiss_drift")
+async def dismiss_drift(request: Request, tid: str):
+    """Acknowledge the schema-drift banner for one table (audited)."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    if not db_sources.DataSourceStore().dismiss_drift(tid, actor=email):
+        return JSONResponse({"error": "Unknown table or no drift recorded."},
+                            status_code=404)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

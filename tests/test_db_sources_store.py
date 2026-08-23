@@ -183,6 +183,42 @@ def test_mark_fired_persists(store):
     assert store.get_refresh_settings()["last_fired_at"] == "2026-08-23T06:00:00"
 
 
+def test_drift_record_dismiss_and_reset(store):
+    masked = _mk_conn(store)
+    t = store.upsert_table({"connection_id": masked["id"], "schema": "s",
+                            "table_name": "t", "display_name": "t",
+                            "columns": []}, actor="ladmin")
+    tid = t["id"]
+    assert store.dismiss_drift(tid, actor="ladmin") is False   # nothing yet
+    store.mark_drift(tid, {"added": ["c"], "removed": [],
+                           "retyped": [{"col": "b", "from": "TEXT", "to": "REAL"}]})
+    d = store.get_table(tid)["last_drift"]
+    assert d["added"] == ["c"] and d["retyped"][0]["to"] == "REAL"
+    assert d["dismissed"] is False and d["at"]
+    assert store.dismiss_drift(tid, actor="ladmin") is True
+    d2 = store.get_table(tid)["last_drift"]
+    assert d2["dismissed"] is True and d2["dismissed_by"] == "ladmin"
+    # a NEW drift resets the dismissal
+    store.mark_drift(tid, {"added": [], "removed": ["c"], "retyped": []})
+    assert store.get_table(tid)["last_drift"]["dismissed"] is False
+    assert store.dismiss_drift("ff00ff00ff00ff00", actor="ladmin") is False
+
+
+def test_mark_refreshed_stores_and_clears_fingerprint(store):
+    masked = _mk_conn(store)
+    t = store.upsert_table({"connection_id": masked["id"], "schema": "s",
+                            "table_name": "t", "display_name": "t",
+                            "columns": []}, actor="ladmin")
+    tid = t["id"]
+    store.mark_refreshed(tid, rows=3, fingerprint="fp1:abc")
+    row = store.get_table(tid)
+    assert row["last_fingerprint"] == "fp1:abc" and row["last_checked_at"]
+    store.mark_checked(tid)
+    assert store.get_table(tid)["last_checked_at"] >= row["last_checked_at"]
+    store.mark_refreshed(tid, rows=3, fingerprint=None)   # failed-fp round clears
+    assert store.get_table(tid)["last_fingerprint"] is None
+
+
 def test_mark_refreshed_error_keeps_previous_refreshed_at(store):
     masked = _mk_conn(store)
     t = store.upsert_table({"connection_id": masked["id"], "schema": "s",

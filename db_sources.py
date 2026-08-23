@@ -484,9 +484,13 @@ class DataSourceStore:
                        snapshot_bytes: Optional[int] = None,
                        columns: Optional[list] = None,
                        dtype_plan: Optional[dict] = None,
+                       fingerprint: Optional[str] = None,
                        error: Optional[str] = None) -> None:
         """Update refresh bookkeeping on a table row. On error, refreshed_at is
-        left at its previous value (chats keep the last good snapshot)."""
+        left at its previous value (chats keep the last good snapshot).
+        `fingerprint` (Part C): the change-detection hash stored with the
+        successful snapshot — None clears it (a failed fingerprint round must
+        never leave a stale hash a later run could false-skip on)."""
         try:
             with _LOCK:
                 doc = self.read_doc()
@@ -495,6 +499,8 @@ class DataSourceStore:
                         if error is None:
                             t["refreshed_at"] = _now()
                             t["last_refresh_error"] = None
+                            t["last_fingerprint"] = fingerprint
+                            t["last_checked_at"] = _now()
                             if rows is not None:
                                 t["snapshot_rows"] = int(rows)
                                 t["row_count"] = int(rows)
@@ -510,6 +516,60 @@ class DataSourceStore:
                         return
         except Exception as e:
             log_with_sid("db_sources", "error", f"DB_MARK_REFRESHED_FAILED table={tid}: {e}")
+
+    def mark_checked(self, tid: str) -> None:
+        """Smart-refresh skip path: fingerprint matched, snapshot untouched —
+        only the last-checked stamp moves. Never raises."""
+        try:
+            with _LOCK:
+                doc = self.read_doc()
+                for t in doc["tables"]:
+                    if t.get("id") == tid:
+                        t["last_checked_at"] = _now()
+                        self._write_doc(doc)
+                        return
+        except Exception as e:
+            log_with_sid("db_sources", "warning",
+                         f"DB_MARK_CHECKED_FAILED table={tid}: {e}")
+
+    def mark_drift(self, tid: str, drift: dict) -> None:
+        """Persist the last schema-drift event on the table row (surfaced in
+        the admin UI until dismissed). A NEW drift overwrites the previous
+        event and resets any dismissal. Never raises."""
+        try:
+            with _LOCK:
+                doc = self.read_doc()
+                for t in doc["tables"]:
+                    if t.get("id") == tid:
+                        t["last_drift"] = {
+                            "added": list(drift.get("added") or []),
+                            "removed": list(drift.get("removed") or []),
+                            "retyped": [dict(r) for r in (drift.get("retyped") or [])],
+                            "at": _now(),
+                            "dismissed": False,
+                        }
+                        self._write_doc(doc)
+                        return
+        except Exception as e:
+            log_with_sid("db_sources", "warning",
+                         f"DB_MARK_DRIFT_FAILED table={tid}: {e}")
+
+    def dismiss_drift(self, tid: str, *, actor: str) -> bool:
+        """Admin acknowledged the drift banner. Audited. False = unknown table
+        or nothing to dismiss."""
+        with _LOCK:
+            doc = self.read_doc()
+            for t in doc["tables"]:
+                if t.get("id") == tid and isinstance(t.get("last_drift"), dict):
+                    t["last_drift"]["dismissed"] = True
+                    t["last_drift"]["dismissed_by"] = actor
+                    t["last_drift"]["dismissed_at"] = _now()
+                    self._write_doc(doc)
+                    break
+            else:
+                return False
+        audit(actor, "table.drift_dismiss", target=tid)
+        return True
 
     # ---- recommended tables (v4) -------------------------------------------
     def list_recommendations(self) -> list[dict]:

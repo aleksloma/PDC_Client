@@ -369,6 +369,24 @@ def test_table_schedule_override_endpoint(client, sqlite_conn):
         "mode": "interval", "every_minutes": 5, "enabled": True}}).status_code == 400
 
 
+def test_dismiss_drift_endpoint(client, sqlite_conn):
+    _, cid = sqlite_conn
+    saved = client.post("/api/admin/tables", json=_table_body(cid)).json()
+    tid = saved["table"]["id"]
+    # no drift yet → 404
+    assert client.post(f"/api/admin/tables/{tid}/dismiss_drift").status_code == 404
+    db_sources.DataSourceStore().mark_drift(tid, {"added": ["x"], "removed": [],
+                                                  "retyped": []})
+    ok = client.post(f"/api/admin/tables/{tid}/dismiss_drift")
+    assert ok.status_code == 200 and ok.json()["ok"] is True
+    row = db_sources.DataSourceStore().get_table(tid)
+    assert row["last_drift"]["dismissed"] is True
+    actions = {r["action"] for r in db_sources.read_audit_tail(500)}
+    assert "table.drift_dismiss" in actions
+    assert client.post("/api/admin/tables/aa11bb22cc33dd44/dismiss_drift"
+                       ).status_code == 404
+
+
 def test_delete_connection_conflict_then_cascade(client, sqlite_conn):
     _, cid = sqlite_conn
     client.post("/api/admin/tables", json=_table_body(cid))

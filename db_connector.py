@@ -606,6 +606,103 @@ def preview_rows(cfg: dict, password: str, schema: Optional[str], table: str,
                 pass
 
 
+FINGERPRINT_MAX_NUMERIC = 4
+FINGERPRINT_MAX_TEMPORAL = 2
+
+
+def _classify_fp_column(sa_type) -> str:
+    """"numeric" | "temporal" | "" from a SQLAlchemy column type. python_type
+    raises on exotic types — those simply don't join the fingerprint."""
+    import datetime as _dt
+    import decimal as _dec
+    try:
+        py = sa_type.python_type
+    except Exception:
+        return ""
+    if py is bool:
+        return ""
+    if py in (int, float, _dec.Decimal):
+        return "numeric"
+    if py in (_dt.date, _dt.datetime):
+        return "temporal"
+    return ""
+
+
+def fingerprint_table(cfg: dict, password: str, schema: Optional[str],
+                      table: str, *, where: Optional[str] = None,
+                      row_cap: Optional[int] = None,
+                      preferred_order: Optional[list] = None,
+                      sid: str) -> dict:
+    """Cheap change-detection probe (Prompt 13 Part C): ONE SQL aggregate
+    query — COUNT(*), SUM+AVG of up to 4 numeric columns, MAX of up to 2
+    date/timestamp columns (chosen deterministically: `preferred_order`, the
+    registry column order, wins; introspection order breaks ties) — plus the
+    live column name+type list from introspection. No data pull. The WHERE
+    filter / row cap are applied INSIDE a subquery so a filtered table
+    compares like for like with its snapshot. Values go into a hash, never
+    to the brain and never into logs.
+
+    Returns {ok, columns: [{name, dtype}], agg: {count, sums, avgs, maxes}}
+    or {ok: False, error}. Callers treat any failure as "cannot skip" and
+    fall through to the full snapshot (Article IV — the optimization can
+    never block a refresh)."""
+    from sqlalchemy import inspect as sa_inspect, text
+    d = get_dialect(cfg.get("db_type"))
+    engine = None
+    try:
+        engine = get_engine(cfg, password)
+        with engine.connect() as conn:
+            d.apply_stmt_timeout(conn, int(cfg.get("statement_timeout")
+                                           or settings.DB_STATEMENT_TIMEOUT))
+            insp = sa_inspect(conn)
+            cols_raw = insp.get_columns(table, schema=schema)
+            columns = [{"name": str(c.get("name")), "dtype": str(c.get("type"))}
+                       for c in cols_raw if c.get("name")]
+            kinds = {}
+            for c in cols_raw:
+                if c.get("name"):
+                    kinds[str(c["name"])] = _classify_fp_column(c.get("type"))
+            order = {str(n): i for i, n in enumerate(preferred_order or [])}
+            ranked = sorted((c["name"] for c in columns),
+                            key=lambda n: (order.get(n, len(order) + 1),))
+            numeric = [n for n in ranked if kinds.get(n) == "numeric"][:FINGERPRINT_MAX_NUMERIC]
+            temporal = [n for n in ranked if kinds.get(n) == "temporal"][:FINGERPRINT_MAX_TEMPORAL]
+
+            picked = numeric + temporal
+            inner = _build_select(d, schema, table, columns=picked or None,
+                                  where=where, row_cap=row_cap)
+            parts = ["COUNT(*) AS fp_count"]
+            for i, n in enumerate(numeric):
+                parts.append(f"SUM({d.q(n)}) AS fp_s{i}")
+                parts.append(f"AVG({d.q(n)}) AS fp_a{i}")
+            for i, n in enumerate(temporal):
+                parts.append(f"MAX({d.q(n)}) AS fp_m{i}")
+            sql = f"SELECT {', '.join(parts)} FROM ({inner}) fp_sub"
+            _assert_single_select(sql)
+            df = pd.read_sql(text(sql), conn)
+        row = df.iloc[0]
+
+        def _s(v):
+            return None if v is None or (isinstance(v, float) and pd.isna(v)) or pd.isna(v) else str(v)
+
+        agg = {"count": int(row["fp_count"]),
+               "sums": {n: _s(row[f"fp_s{i}"]) for i, n in enumerate(numeric)},
+               "avgs": {n: _s(row[f"fp_a{i}"]) for i, n in enumerate(numeric)},
+               "maxes": {n: _s(row[f"fp_m{i}"]) for i, n in enumerate(temporal)}}
+        return {"ok": True, "columns": columns, "agg": agg}
+    except Exception as e:
+        err = _friendly_db_error(e, "Database connection timed out.", password)
+        log_with_sid(sid, "warning",
+                     f"DB_FINGERPRINT_FAILED table={schema}.{table} err={err}")
+        return {"ok": False, "error": err}
+    finally:
+        if engine is not None:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Snapshot
 # ---------------------------------------------------------------------------
