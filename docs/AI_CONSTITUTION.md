@@ -41,6 +41,13 @@ The split is the whole product. Violating it defeats the on-prem promise.
 - Generated code (Python) and execution error text.
 - Findings for reports — `{question, answer_text, has_chart, has_table,
   table_columns (NAMES only), code_snippet}`.
+- The aggregate dataset profile (`dataset_profile` on `/v1/plan` /
+  `/v1/retry`) — row counts, duplicate counts, null rates, min/max,
+  constant/all-unique flags, detected grain, deterministic warnings, and
+  top-value hints truncated to 40 chars. Same class as the cardinality
+  hints `schema_text` already carries; never row data. The client's
+  `brain_client._compact_profiles_for_transport` is the boundary guard for
+  this field; the brain logs only `profile_tables=N`, never the body.
 - Operational events for `/v1/activity` — `event`, `user_email`, lightweight
   metadata.
 

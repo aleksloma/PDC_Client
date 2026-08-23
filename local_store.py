@@ -575,6 +575,104 @@ def db_snapshot_path(table_id: str) -> Path:
     return d / f"{table_id}.parquet"
 
 
+# ---------------------------------------------------------------------------
+# Dataset-profile sidecars (Prompt 13 Part A). One JSON per df key, holding
+# computed FACTS about the table (dataset_profile.compute_profile). Stored
+# OUTSIDE meta.json on purpose: merge_schema_entry would silently drop a
+# meta-embedded profile on any DB drift resync. A stored profile carries a
+# "src" staleness stamp; a mismatched/unreadable stamp means "missing" and
+# the backfill recomputes. Missing profiles always degrade silently (Art. IV).
+# ---------------------------------------------------------------------------
+_PROFILE_DIRNAME = ".profiles"
+
+
+def profile_path_for_file(files_dir: Path, df_key: str) -> Path:
+    """Sidecar profile location for an uploaded table's df key (which may be
+    "file.xlsx::Sheet 1" — same safe-name scheme as the parquet cache)."""
+    d = files_dir / _PROFILE_DIRNAME
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{_parquet_cache_safe_name(df_key)}.profile.json"
+
+
+def db_profile_path(table_id: str) -> Path:
+    """Sidecar profile next to the central DB snapshot parquet."""
+    if not (isinstance(table_id, str) and _DB_TABLE_ID_RE.match(table_id)):
+        raise ValueError("invalid table id")
+    d = _data_root() / _DB_SNAPSHOT_DIRNAME
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{table_id}.profile.json"
+
+
+def write_profile(path: Path, profile: dict, src_stamp: Optional[dict]) -> None:
+    """Atomically persist a profile with its staleness stamp. _json_safe is
+    applied inside _write_json_atomic (numpy scalars / Timestamps / NaN)."""
+    payload = dict(profile)
+    payload["src"] = src_stamp
+    _write_json_atomic(path, payload)
+
+
+def read_profile(path: Path, src_stamp: Optional[dict]) -> Optional[dict]:
+    """Stored profile, or None when missing/unparseable/stale/wrong-version.
+    Never raises."""
+    try:
+        import dataset_profile as _dp
+        prof = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(prof, dict):
+            return None
+        if prof.get("profile_version") != _dp.PROFILE_VERSION:
+            return None
+        if src_stamp is not None and prof.get("src") != _json_safe(src_stamp):
+            return None
+        return prof
+    except Exception:
+        return None
+
+
+def _profile_src_stamp_for_entry(store, entry: dict) -> tuple[Optional[Path], Optional[dict]]:
+    """(profile path, staleness stamp) for one meta entry; (None, None) when
+    unresolvable (e.g. missing snapshot/source file)."""
+    df_key = entry.get("file_name") or ""
+    if entry.get("source") == "database":
+        tid = (entry.get("db") or {}).get("table_id")
+        snap = db_snapshot_path(tid)
+        st = snap.stat()
+        return db_profile_path(tid), {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    src = store.files_dir / str(df_key).split("::")[0]
+    st = src.stat()
+    return (profile_path_for_file(store.files_dir, df_key),
+            {"size": st.st_size, "mtime_ns": st.st_mtime_ns,
+             "parser_version": _PARQUET_CACHE_PARSER_VERSION})
+
+
+def ensure_chat_profiles(store, dfs: dict) -> dict:
+    """Backfill funnel: per df key return the stored profile, computing and
+    persisting it once when missing or stale. Called only from the plan entry
+    points (chat handlers) — never from the hot load funnel. Per-key failure
+    omits the key; the transport copy never carries the "src" stamp."""
+    import dataset_profile as _dp
+    out: dict = {}
+    meta = store.read_meta()
+    by_name = {e.get("file_name"): e for e in (meta.get("files") or [])
+               if isinstance(e, dict)}
+    for df_key, df in (dfs or {}).items():
+        try:
+            entry = by_name.get(df_key) or {"file_name": df_key}
+            path, stamp = _profile_src_stamp_for_entry(store, entry)
+            prof = read_profile(path, stamp)
+            if prof is None:
+                prof = _dp.compute_profile(df)
+                write_profile(path, prof, stamp)
+                prof = dict(prof)
+            else:
+                prof = dict(prof)
+            prof.pop("src", None)
+            out[df_key] = _json_safe(prof)
+        except Exception as e:
+            log_with_sid(getattr(store, "chat_id", "profiles"), "warning",
+                         f"PROFILE_ENSURE_FAILED key={df_key}: {e}")
+    return out
+
+
 def db_entries_from_meta(meta) -> list[dict]:
     """The meta entries backed by a database snapshot. Absent `source` ⇒ file
     (every pre-feature meta.json keeps loading unchanged)."""
@@ -1330,6 +1428,16 @@ class ChatDataStore:
                                 dirs_exist_ok=True)
         except Exception as e:
             log_with_sid(self.chat_id, "warning", f"PARQUET_CACHE_CLONE_FAILED: {e}")
+        # Carry the dataset-profile sidecars too: the source files are copy2'd
+        # (mtime preserved) above, so the profiles' src stamps stay valid in
+        # the new chat store. Best-effort — a missing profile just backfills.
+        try:
+            src_profiles = user_store.files_dir / _PROFILE_DIRNAME
+            if src_profiles.is_dir():
+                shutil.copytree(src_profiles, self.files_dir / _PROFILE_DIRNAME,
+                                dirs_exist_ok=True)
+        except Exception as e:
+            log_with_sid(self.chat_id, "warning", f"PROFILE_CLONE_FAILED: {e}")
         # Copy meta wholesale (already contains schema entries)
         try:
             self.meta_path.write_text(user_store.meta_path.read_text(encoding="utf-8"), encoding="utf-8")

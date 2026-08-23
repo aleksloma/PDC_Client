@@ -36,6 +36,7 @@ lookup; revoked / suspended tenants get **HTTP 403** (the kill-switch).
 | `failed_code`       | the failed code block | client |
 | `preview` (summarize) | the `safe_preview` value the B2C code already restricts to scalars | client |
 | `qa_pairs` (report) | the `findings_for_llm` list the B2C `_generate_report_structure` already builds | client |
+| `dataset_profile` (plan/retry, **optional**) | enterprise-only (no B2C equivalent): `{df_key: profile}` of computed FACTS per loaded table — rows, duplicate count, per-column dtype/nunique/null rates/min-max/constant/all-unique flags, truncated top-value hints, detected grain, deterministic warnings. Aggregate metadata only, never row data (Article II — same class as the cardinality hints in `technical_description`). Absent field ⇒ pre-profile behavior everywhere | client (`dataset_profile.compute_profile`, stored as sidecar JSON, compacted by `brain_client._compact_profiles_for_transport`) |
 
 ---
 
@@ -59,9 +60,27 @@ the convenience `kind` + `code` from `_extract_code_kind`.
     { "role": "ai",    "content": "first answer...", "code": "df.groupby(...)..." }
   ],
   "common_fields": [],
-  "user_email": "alice@acme.com"
+  "user_email": "alice@acme.com",
+  "dataset_profile": {                     // OPTIONAL — omitted by pre-profile clients
+    "sales.csv": {
+      "profile_version": 1, "rows": 12480, "duplicate_row_count": 0,
+      "computed_at": "2026-08-23T09:14:02+00:00", "sampled": false,
+      "grain": { "columns": ["order_id"], "kind": "single", "text": "one row per (order_id)" },
+      "warnings": ["Quantity is constant: every value = 1"],
+      "columns": { "salary": { "dtype": "int64", "nunique": 240, "null_count": 0,
+                                "null_pct": 0.0, "min": 900, "max": 21000,
+                                "constant": false, "all_unique": false } }
+    }
+  }
 }
 ```
+
+The brain injects the profile LAZILY into the planner prompt: a one-line
+micro-summary per table (`PROFILE <name>: rows=N; warnings: ...`) ALWAYS,
+and the full block (capped ~15 lines/table) only when the query analyzer
+classifies the question as a data task (aggregation / visualization /
+statistical or complex analysis; classifier failure counts as a data task).
+Logs carry only `profile_tables=N`, never the profile body.
 
 ### Response
 
@@ -112,7 +131,10 @@ code" prompt and calls the simple (or complex, on later attempts) model.
   "failed_code": "df.groupby('Department')['salary'].mean()",
   "use_pro": false,                       // promotes to complex model on 2nd retry
   "use_search": false,                    // enables Google Search grounding on last retry
-  "user_email": "alice@acme.com"
+  "user_email": "alice@acme.com",
+  "dataset_profile": { ... }              // OPTIONAL — same shape as /v1/plan; retry
+                                          // injects the micro-summary lines only (no
+                                          // classifier runs on the retry path)
 }
 ```
 

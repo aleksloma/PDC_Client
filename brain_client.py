@@ -12,6 +12,7 @@ of a stack trace.
 from __future__ import annotations
 
 import atexit
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -202,9 +203,57 @@ def _sanitize_history_rows(history_rows: list | None) -> list[dict]:
     return out
 
 
+_PROFILE_TRANSPORT_MAX_CHARS = 150_000
+
+
+def _compact_profiles_for_transport(profiles: dict | None) -> dict | None:
+    """Boundary guard for the dataset_profile payload field (Article II class:
+    aggregate metadata only — counts, rates, flags, truncated top-value hints;
+    never row data). Strips the storage-only "src" stamp, enforces the caps,
+    and degrades deterministically when oversized: drop top_values first, then
+    drop the per-column block entirely (table-level + grain + warnings stay)."""
+    if not profiles:
+        return None
+    try:
+        out: dict = {}
+        for key, prof in profiles.items():
+            if not isinstance(prof, dict):
+                continue
+            p = dict(prof)
+            p.pop("src", None)
+            if isinstance(p.get("warnings"), list):
+                p["warnings"] = [str(w)[:200] for w in p["warnings"][:6]]
+            cols = p.get("columns")
+            if isinstance(cols, dict):
+                slim_cols = {}
+                for cname, cprof in cols.items():
+                    if not isinstance(cprof, dict):
+                        continue
+                    c = dict(cprof)
+                    tv = c.get("top_values")
+                    if isinstance(tv, list):
+                        c["top_values"] = [[str(v)[:40], n] for v, n in tv[:5]]
+                    slim_cols[str(cname)] = c
+                p["columns"] = slim_cols
+            out[str(key)] = p
+        if len(json.dumps(out, ensure_ascii=False, default=str)) > _PROFILE_TRANSPORT_MAX_CHARS:
+            for p in out.values():
+                for c in (p.get("columns") or {}).values():
+                    if isinstance(c, dict):
+                        c.pop("top_values", None)
+        if len(json.dumps(out, ensure_ascii=False, default=str)) > _PROFILE_TRANSPORT_MAX_CHARS:
+            for p in out.values():
+                p.pop("columns", None)
+        return out or None
+    except Exception as e:
+        log_with_sid("profile-transport", "warning", f"PROFILE_COMPACT_FAILED: {e}")
+        return None
+
+
 def plan(sid: str, question: str, schema_text: str, df_names: list[str],
          history_rows: list, common_fields: list | None = None,
-         user_email: str | None = None) -> dict:
+         user_email: str | None = None,
+         dataset_profile: dict | None = None) -> dict:
     return _post("/v1/plan", {
         "sid": sid,
         "question": question,
@@ -213,6 +262,7 @@ def plan(sid: str, question: str, schema_text: str, df_names: list[str],
         "history_rows": _sanitize_history_rows(history_rows),
         "common_fields": common_fields or [],
         "user_email": user_email,
+        "dataset_profile": _compact_profiles_for_transport(dataset_profile),
     }, sid)
 
 
@@ -220,7 +270,8 @@ def retry(sid: str, question: str, schema_text: str, df_names: list[str],
           df_columns: dict[str, list[str]], history_rows: list,
           error_msg: str, failed_code: str,
           use_pro: bool = False, use_search: bool = False,
-          user_email: str | None = None) -> dict:
+          user_email: str | None = None,
+          dataset_profile: dict | None = None) -> dict:
     return _post("/v1/retry", {
         "sid": sid,
         "question": question,
@@ -233,6 +284,7 @@ def retry(sid: str, question: str, schema_text: str, df_names: list[str],
         "use_pro": use_pro,
         "use_search": use_search,
         "user_email": user_email,
+        "dataset_profile": _compact_profiles_for_transport(dataset_profile),
     }, sid)
 
 

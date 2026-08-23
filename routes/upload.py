@@ -21,6 +21,8 @@ from fastapi import APIRouter, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 
 import brain_client
+import dataset_profile
+import local_store
 from brain_client import BrainError, TenantRevokedError
 from local_store import (AuthStore, UserStore, ChatDataStore,
                          db_entries_from_meta, merge_schema_entry, unique_df_key)
@@ -368,44 +370,10 @@ def _prepare_file_context(fname: str, df, entry: dict, notes_text: str) -> dict:
     }
 
 
-def _generate_technical_description(series, total: int) -> str:
-    """Verbatim port of global `_generate_technical_description`.
-
-    Pure-pandas; runs on the client. Stored alongside the LLM-generated
-    `description` so the prompt-builder can include both when the chat runs.
-    """
-    dtype = str(series.dtype)
-    non_null = int(series.count())
-    tech_parts = [dtype, f"{non_null}/{total} filled"]
-
-    is_text = dtype in ("object", "str", "string", "category") or series.dtype.kind == "O"
-
-    if is_text:
-        try:
-            uniq = series.dropna().unique()
-            n_unique = len(uniq)
-            if n_unique <= 20:
-                tech_parts.append(
-                    f"CATEGORICAL ({n_unique} unique: {', '.join(str(v) for v in uniq)})"
-                )
-            else:
-                sample = uniq[:5].tolist()
-                tech_parts.append(
-                    f"{n_unique} unique, sample: {', '.join(str(v) for v in sample)}"
-                )
-        except Exception:
-            pass
-    elif dtype == "bool":
-        tech_parts.append("boolean")
-    else:
-        try:
-            sample = series.dropna().head(3).tolist()
-            if sample:
-                tech_parts.append(f"sample: {', '.join(str(v) for v in sample)}")
-        except Exception:
-            pass
-
-    return ", ".join(tech_parts)
+# _generate_technical_description moved to dataset_profile.py (shared with
+# db_scheduler without a routes→scheduler inversion); re-exported here so
+# existing importers keep working.
+from dataset_profile import _generate_technical_description  # noqa: E402
 
 
 @router.post("/schema_autofill_full")
@@ -555,7 +523,8 @@ async def schema_autofill_full(request: Request):
         })
 
     # Step 4 — auto-generate technical_description for every column (no LLM;
-    # per-column pandas stats are CPU-heavy — off the event loop)
+    # per-column pandas stats are CPU-heavy — off the event loop). The same
+    # pass computes+stores the dataset profile sidecar per df key (Prompt 13).
     def _fill_technical_descriptions() -> None:
         for fname, df in dfs.items():
             entry = by_name.get(fname)
@@ -574,6 +543,17 @@ async def schema_autofill_full(request: Request):
                 except Exception as e:
                     log_with_sid(email, "warning",
                                  f"AUTOFILL_TECH_DESC_FAIL file={fname} col={col}: {e}")
+            try:
+                prof = dataset_profile.compute_profile(df)
+                src = store.files_dir / str(fname).split("::")[0]
+                st = src.stat()
+                local_store.write_profile(
+                    local_store.profile_path_for_file(store.files_dir, fname), prof,
+                    {"size": st.st_size, "mtime_ns": st.st_mtime_ns,
+                     "parser_version": local_store._PARQUET_CACHE_PARSER_VERSION})
+            except Exception as e:
+                log_with_sid(email, "warning",
+                             f"PROFILE_COMPUTE_FAILED file={fname}: {e}")
 
     await loop.run_in_executor(_EXEC, _fill_technical_descriptions)
 

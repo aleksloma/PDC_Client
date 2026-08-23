@@ -118,6 +118,17 @@ enterprise build keeps the same shape so the existing JS works unchanged:
    any single file falls back to leaving descriptions blank (just like global)
    and the technical_description step still runs.
 
+   **Dataset profiles (Prompt 13):** the same step 4 pass also computes a
+   per-table profile (`dataset_profile.compute_profile` — rows, duplicates,
+   per-column stats/flags, detected grain, ≤6 deterministic warnings) and
+   stores it at `<files_dir>/.profiles/<safe>.profile.json` with a staleness
+   stamp (source size + mtime_ns + parser_version). DB tables get theirs at
+   every actual re-snapshot (`db_snapshots/{tid}.profile.json`). The chat
+   handlers backfill any missing/stale profile once per table
+   (`local_store.ensure_chat_profiles`) and attach the compacted dict to
+   `/v1/plan` / `/v1/retry` as the optional `dataset_profile` field (see
+   `docs/PROTOCOL.md`); a missing profile always degrades silently.
+
 4. **`POST /generate_chatdata`** — clones the temp `UserStore` into a
    permanent `ChatDataStore` under `<DATA_ROOT>/chatdata/<chat_id>/`,
    records the chat in the user's `active_chats.jsonl`, and calls the

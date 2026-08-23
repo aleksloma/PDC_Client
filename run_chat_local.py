@@ -301,6 +301,7 @@ def run_chat(
     history_rows: list,
     user_email: str,
     common_fields: list | None = None,
+    dataset_profile: dict | None = None,
 ) -> dict:
     """Run one chat turn end-to-end. Returns:
         {
@@ -326,6 +327,7 @@ def run_chat(
         history_rows=history_rows,
         common_fields=common_fields,
         user_email=user_email,
+        dataset_profile=dataset_profile,
     )
     kind = plan_out.get("kind")
     code = plan_out.get("code") or ""
@@ -363,6 +365,7 @@ def run_chat(
             error_msg=error_msg, failed_code=code,
             use_pro=use_pro, use_search=use_search,
             user_email=user_email,
+            dataset_profile=dataset_profile,
         )
         new_code = retry_out.get("code") or ""
         new_kind = retry_out.get("kind")
@@ -415,6 +418,7 @@ def run_chat(
             df_names=df_names, df_columns=df_columns, history_rows=history_rows,
             error_msg=_PLOTLY_REGEN_INSTRUCTION, failed_code=code,
             use_pro=False, use_search=False, user_email=user_email,
+            dataset_profile=dataset_profile,
         )
         usage = _sum_usage(usage, retry_out.get("usage") or {})
         new_code = retry_out.get("code") or ""
@@ -925,6 +929,7 @@ def run_chat_multi_plot(
     history_rows: list,
     user_email: str,
     common_fields: list | None = None,
+    dataset_profile: dict | None = None,
 ):
     """Generator port of global `agent.run_chat_multi_plot`. Yields:
       - {"partial": True,  "answer", "image_base64", "chart_n", "chart_total", "usage", "code"}
@@ -943,6 +948,7 @@ def run_chat_multi_plot(
         sid=sid, question=question, schema_text=schema_str,
         df_names=df_names, history_rows=history_rows,
         common_fields=common_fields, user_email=user_email,
+        dataset_profile=dataset_profile,
     )
     raw_text = plan_out.get("raw_text") or ""
     plan_usage = plan_out.get("usage") or {}
@@ -1038,6 +1044,7 @@ def run_chat_multi_plot(
                 df_names=df_names, df_columns=df_columns, history_rows=history_rows,
                 error_msg=error_msg, failed_code=code,
                 use_pro=use_pro, use_search=use_search, user_email=user_email,
+                dataset_profile=dataset_profile,
             )
             new_code = retry_out.get("code") or ""
             new_kind = retry_out.get("kind")
@@ -1075,6 +1082,7 @@ def run_chat_multi_plot(
                     df_names=df_names, df_columns=df_columns, history_rows=history_rows,
                     error_msg=plot_out.get("error", ""), failed_code=code,
                     use_pro=True, use_search=False, user_email=user_email,
+                    dataset_profile=dataset_profile,
                 )
                 total_usage = _sum_usage(total_usage, retry_out.get("usage") or {})
                 new_code = retry_out.get("code") or ""
@@ -1138,6 +1146,7 @@ def run_chat_multi_plot(
                 df_names=df_names, df_columns=df_columns, history_rows=history_rows,
                 error_msg=_PLOTLY_REGEN_INSTRUCTION, failed_code=code,
                 use_pro=False, use_search=False, user_email=user_email,
+                dataset_profile=dataset_profile,
             )
             total_usage = _sum_usage(total_usage, retry_out.get("usage") or {})
             new_code = retry_out.get("code") or ""
@@ -1298,6 +1307,7 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
             error_msg=error_msg, failed_code=code,
             use_pro=use_pro, use_search=use_search,
             user_email=user_email,
+            dataset_profile=dataset_profile,
         )
         new_code = retry_out.get("code") or ""
         new_kind = retry_out.get("kind")

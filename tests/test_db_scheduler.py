@@ -81,6 +81,27 @@ def test_refresh_one_table_snapshots_and_marks(tmp_path):
     assert any(c.get("technical_description") for c in row["columns"])
 
 
+def test_refresh_writes_profile_sidecar(tmp_path):
+    _, store, tid = _sqlite_setup(tmp_path)
+    assert db_scheduler.refresh_one_table(tid, actor="test")["ok"] is True
+    ppath = local_store.db_profile_path(tid)
+    assert ppath.is_file()
+    prof = json.loads(ppath.read_text(encoding="utf-8"))
+    assert prof["rows"] == 3
+    st = local_store.db_snapshot_path(tid).stat()
+    assert prof["src"] == {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def test_refresh_failure_keeps_previous_profile(tmp_path):
+    db, store, tid = _sqlite_setup(tmp_path)
+    assert db_scheduler.refresh_one_table(tid, actor="test")["ok"] is True
+    ppath = local_store.db_profile_path(tid)
+    before = ppath.read_text(encoding="utf-8")
+    db.unlink()
+    assert db_scheduler.refresh_one_table(tid, actor="test")["ok"] is False
+    assert ppath.read_text(encoding="utf-8") == before   # previous profile kept
+
+
 def test_refresh_failure_keeps_previous_snapshot_and_timestamp(tmp_path):
     db, store, tid = _sqlite_setup(tmp_path)
     assert db_scheduler.refresh_one_table(tid, actor="test")["ok"] is True

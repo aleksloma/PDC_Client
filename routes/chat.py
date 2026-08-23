@@ -786,6 +786,13 @@ async def chat_stream(request: Request, chat_id: str):
     if not dfs:
         return JSONResponse({"error": "Chat dataset is empty."}, status_code=400)
     schema_docs = await loop.run_in_executor(_EXEC, store.schema_docs)
+    # Dataset profiles (computed facts for the planner). Backfilled from the
+    # stored frames when missing/stale; a failure never blocks the chat.
+    try:
+        dataset_profiles = await loop.run_in_executor(
+            _EXEC, local_store.ensure_chat_profiles, store, dfs)
+    except Exception:
+        dataset_profiles = {}
 
     sid = secrets.token_hex(8)
     if not conv_id:
@@ -834,7 +841,7 @@ async def chat_stream(request: Request, chat_id: str):
                 gen = run_chat_local.run_chat_multi_plot(
                     sid=sid, dfs=dfs, schema_docs=schema_docs,
                     question=question, history_rows=history_rows,
-                    user_email=email,
+                    user_email=email, dataset_profile=dataset_profiles,
                 )
                 for event in gen:
                     # Durable full-table persistence for a single-shot tabular
@@ -1163,6 +1170,11 @@ async def edit_regenerate(request: Request, chat_id: str):
         if not dfs:
             return JSONResponse({"error": "Chat dataset is empty."}, status_code=400)
         schema_docs = await loop.run_in_executor(_EXEC, store.schema_docs)
+        try:
+            dataset_profiles = await loop.run_in_executor(
+                _EXEC, local_store.ensure_chat_profiles, store, dfs)
+        except Exception:
+            dataset_profiles = {}
 
         sid = secrets.token_hex(8)
         history_rows = store.get_history(conv_id)
@@ -1175,7 +1187,7 @@ async def edit_regenerate(request: Request, chat_id: str):
             return list(run_chat_local.run_chat_multi_plot(
                 sid=sid, dfs=dfs, schema_docs=schema_docs,
                 question=edited_question, history_rows=history_rows,
-                user_email=email,
+                user_email=email, dataset_profile=dataset_profiles,
             ))
 
         events = await loop.run_in_executor(_EXEC, _run_blocking)

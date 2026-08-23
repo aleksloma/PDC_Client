@@ -105,10 +105,11 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler") -> dict:
         else:
             new_columns.append({"name": name, "dtype": "", "description": "",
                                 "indexed": False})
-    # Technical descriptions from the fresh snapshot (pandas stats, no LLM —
-    # same generator uploaded files use). Best-effort; flows into chat metas
-    # via the resync below.
-    tech = _tech_descs_from_snapshot(dest)
+    # Technical descriptions + dataset profile from the fresh snapshot (one
+    # parquet read, pandas stats, no LLM). Best-effort; tech descs flow into
+    # chat metas via the resync below, the profile is a sidecar next to the
+    # snapshot and reaches the brain lazily at plan time.
+    tech, prof = _stats_from_snapshot(dest)
     for col in new_columns:
         td = tech.get(str(col.get("name")))
         if td:
@@ -117,6 +118,15 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler") -> dict:
                          snapshot_bytes=res.get("bytes"),
                          columns=new_columns,
                          dtype_plan=res.get("dtype_plan"))
+    if prof is not None:
+        try:
+            st = dest.stat()
+            local_store.write_profile(
+                local_store.db_profile_path(table_id), prof,
+                {"size": st.st_size, "mtime_ns": st.st_mtime_ns})
+        except Exception as e:
+            log_with_sid("db_refresh", "warning",
+                         f"DB_PROFILE_WRITE_FAILED table={table_id}: {e}")
 
     drift = {"added": added, "removed": removed}
     if added or removed:
@@ -135,19 +145,29 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler") -> dict:
             "drift": drift}
 
 
-def _tech_descs_from_snapshot(dest: Path) -> dict:
-    """{column: technical_description} computed from the snapshot parquet with
-    the SAME pandas generator uploaded files use. Best-effort (Article IV)."""
+def _stats_from_snapshot(dest: Path) -> tuple[dict, Optional[dict]]:
+    """({column: technical_description}, dataset profile | None) from ONE read
+    of the snapshot parquet — the SAME pandas generators uploaded files use.
+    Each half individually best-effort (Article IV)."""
+    tech: dict = {}
+    prof = None
     try:
         import pandas as pd
-        from routes.upload import _generate_technical_description
+        from dataset_profile import _generate_technical_description, compute_profile
         df = pd.read_parquet(dest)
         total = len(df)
-        return {str(c): _generate_technical_description(df[c], total)
-                for c in df.columns}
+        try:
+            tech = {str(c): _generate_technical_description(df[c], total)
+                    for c in df.columns}
+        except Exception as e:
+            log_with_sid("db_refresh", "warning", f"DB_TECH_DESC_FAILED: {e}")
+        try:
+            prof = compute_profile(df)
+        except Exception as e:
+            log_with_sid("db_refresh", "warning", f"DB_PROFILE_COMPUTE_FAILED: {e}")
     except Exception as e:
         log_with_sid("db_refresh", "warning", f"DB_TECH_DESC_FAILED: {e}")
-        return {}
+    return tech, prof
 
 
 def _iter_chats_with_table(table_id: str):
