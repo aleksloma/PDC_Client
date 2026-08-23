@@ -628,6 +628,31 @@ def _plotly_traces_to_table(fig, traces, xref="x", yref="y"):
                 continue
             xs = getattr(tr, "x", None)
             ys = getattr(tr, "y", None)
+            # Matrix traces (px.imshow / go.Heatmap): the numbers live in `z`,
+            # a row-per-y list of x-length rows. Without this the rendered data
+            # is label-only — "Show data" showed no values at all, and the
+            # deterministic result check could not see a heatmap's metric.
+            zs = getattr(tr, "z", None)
+            if zs is not None and xs is not None and ys is not None:
+                z_title = (_plotly_axis_title(_plotly_layout_axis(fig, yref))
+                           or "value")
+                if z_title in (x_title, y_title):
+                    z_title = "value"
+                xs_list, ys_list = list(xs), list(ys)
+                for r_i, zrow in enumerate(list(zs)):
+                    if r_i >= len(ys_list):
+                        break
+                    try:
+                        zrow = list(zrow)
+                    except TypeError:
+                        continue
+                    for c_i, zv in enumerate(zrow):
+                        if c_i >= len(xs_list):
+                            break
+                        rows.append({x_title: _chart_scalar(xs_list[c_i]),
+                                     y_title: _chart_scalar(ys_list[r_i]),
+                                     z_title: _chart_scalar(zv)})
+                continue
             if xs is None and ys is None:
                 continue
             xs_list = list(xs) if xs is not None else []

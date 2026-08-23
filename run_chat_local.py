@@ -20,16 +20,19 @@ previews.
 from __future__ import annotations
 
 import hashlib
+import re
 import time as _time
 from typing import Any, Optional
 
 import pandas as pd
 
 import brain_client
+import result_backstop
 from code_exec import safe_execute
 from plot_utils import render_plot_safe, _is_noninteractive_standard_chart
 from logger_utils import log_with_sid
 from schema_builder import schema_text as build_schema_text
+from schema_builder import _detect_language as _detect_answer_language
 from settings import settings
 
 
@@ -389,7 +392,9 @@ def run_chat(
         split_out = render_plot_safe(code, dfs, sid, split_multi_axes=True)
         sub = [c for c in (split_out.get("multi_charts") or []) if c.get("image")]
         if sub:
-            d = brain_client.describe(sid=sid, question=question, code=code, user_email=user_email)
+            d = _describe_with_backstop(sid, question, code, user_email,
+                                        chart_data=sub[0].get("chart_data"),
+                                        dataset_profile=dataset_profile)
             log_with_sid(sid, "info", f"MULTI_AXES_SPLIT_SINGLE kept=1 of {len(sub)}")
             return {
                 "text": d.get("text", ""),
@@ -434,7 +439,9 @@ def run_chat(
         else:
             img_b64 = exec_out.get("image")
         # Describe from code (brain — no data leaves)
-        d = brain_client.describe(sid=sid, question=question, code=code, user_email=user_email)
+        d = _describe_with_backstop(sid, question, code, user_email,
+                                    chart_data=exec_out.get("chart_data"),
+                                    dataset_profile=dataset_profile)
         return {
             "text": d.get("text", ""),
             "image_base64": img_b64,
@@ -454,11 +461,13 @@ def run_chat(
     img_b64 = exec_out.get("image_base64")
 
     if img_b64:
-        d = brain_client.describe(sid=sid, question=question, code=code, user_email=user_email)
+        d = _describe_with_backstop(sid, question, code, user_email,
+                                    result_obj=result_obj, dataset_profile=dataset_profile)
         return {"text": d.get("text", ""), "image_base64": img_b64, "table": table, "tables": tables, "code": code, "usage": _sum_usage(usage, d.get("usage") or {})}
 
     if table or tables:
-        d = brain_client.describe(sid=sid, question=question, code=code, user_email=user_email)
+        d = _describe_with_backstop(sid, question, code, user_email,
+                                    result_obj=result_obj, dataset_profile=dataset_profile)
         return {"text": d.get("text", ""), "image_base64": None, "table": table, "tables": tables, "code": code, "usage": _sum_usage(usage, d.get("usage") or {})}
 
     # Scalar result — safe to forward to the summarizer
@@ -478,6 +487,90 @@ def _sum_usage(a: dict, b: dict) -> dict:
     for k in keys:
         out[k] = int((a.get(k) or 0) + (b.get(k) or 0))
     return out
+
+
+# ── Deterministic result backstop (Prompt 14 Part B) ─────────────────────────
+# CRITICAL RULE 7 asks the MODEL to detect a constant metric / identical series
+# and explain it. Verified live: it complies only sometimes. So every describe
+# call goes through this wrapper — the client inspects the executed result
+# itself (result_backstop, pure pandas), sends the findings to /v1/describe as a
+# mandatory caveat, and if the returned description does not carry the marker
+# the client prepends its OWN localized sentence. The note is never lost.
+_DF_KEY_RE = re.compile(r"dfs\[['\"]([^'\"]+)['\"]\]")
+
+
+def _profile_caveat_facts(code: str, dataset_profile: dict | None) -> tuple[list, bool]:
+    """Grain / catalog facts for the tables the executed CODE actually used.
+    Returns (grain_lines, catalog_flag). Never raises."""
+    grain: list = []
+    catalog = False
+    try:
+        if not dataset_profile:
+            return grain, catalog
+        used = set(_DF_KEY_RE.findall(code or ""))
+        for key, prof in dataset_profile.items():
+            if used and key not in used:
+                continue
+            if not isinstance(prof, dict):
+                continue
+            g = prof.get("grain") or {}
+            if isinstance(g, dict) and g.get("text"):
+                grain.append(f"{key}: {g['text']}")
+            for w in (prof.get("warnings") or []):
+                if "catalog/link table" in str(w):
+                    catalog = True
+                    if str(w) not in grain:
+                        grain.append(f"{key}: {w}")
+    except Exception:                                        # noqa: BLE001
+        return grain, catalog
+    return grain[:4], catalog
+
+
+def _describe_with_backstop(sid: str, question: str, code: str,
+                            user_email: str | None = None, *,
+                            chart_data=None, chart_data_list=None,
+                            result_obj=None,
+                            dataset_profile: dict | None = None) -> dict:
+    """brain_client.describe + the deterministic flat-result backstop.
+
+    No detection -> a plain describe call with unchanged behavior (errors
+    propagate exactly as before). Detection -> the facts ride along as
+    `data_caveat`, and the answer is guaranteed to carry the explanation."""
+    det = result_backstop.inspect_outputs(
+        chart_data=chart_data, chart_data_list=chart_data_list,
+        result_obj=result_obj, sid=sid)
+    if not det:
+        return brain_client.describe(sid=sid, question=question, code=code,
+                                     user_email=user_email)
+
+    grain, catalog = _profile_caveat_facts(code, dataset_profile)
+    caveat = {"kind": det["kind"], "facts": det.get("facts") or [],
+              "grain": grain, "catalog": catalog}
+    log_with_sid(sid, "info",
+                 f"RESULT_BACKSTOP_FIRED kind={det['kind']} "
+                 f"facts={len(caveat['facts'])} catalog={catalog}")
+    try:
+        d = brain_client.describe(sid=sid, question=question, code=code,
+                                  user_email=user_email, data_caveat=caveat)
+        reason = "missing_marker"
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid(sid, "warning", f"RESULT_BACKSTOP_DESCRIBE_FAILED: {e}")
+        d = {"text": "", "usage": {}}
+        reason = "describe_failed"
+
+    text = (d.get("text") or "").strip()
+    if result_backstop.DATA_NOTE_MARKER in text:
+        log_with_sid(sid, "info", "RESULT_BACKSTOP_MARKER_OK")
+        return {"text": result_backstop.strip_marker(text), "usage": d.get("usage") or {}}
+
+    # Hard fallback: the model dropped the note (or describe failed) — the
+    # client states it itself, FIRST, so the user can never see a flat result
+    # without the explanation.
+    lang = _detect_answer_language(question)
+    sentence = result_backstop.fallback_sentence(lang, catalog=catalog)
+    log_with_sid(sid, "info", f"RESULT_BACKSTOP_NOTE_PREPENDED reason={reason}")
+    combined = f"{sentence}\n\n{text}".strip() if text else sentence
+    return {"text": combined, "usage": d.get("usage") or {}}
 
 
 # ---------------------------------------------------------------------------
@@ -974,6 +1067,7 @@ def run_chat_multi_plot(
                 question=question, history_rows=history_rows, user_email=user_email,
                 kind=kind, code=code, usage=plan_usage,
                 context_decision=context_decision,
+                dataset_profile=dataset_profile,
             )
             yield {"single_response": True, "result": result}
             return
@@ -1104,7 +1198,10 @@ def run_chat_multi_plot(
                     log_with_sid(sid, "info", "MULTI_PLOT_DEDUP_SKIP split")
                     continue
                 produced_sigs.append(sig)
-                d = brain_client.describe(sid=sid, question=question, code=code, user_email=user_email)
+                d = _describe_with_backstop(
+                    sid, question, code, user_email,
+                    chart_data_list=[c.get("chart_data") for c in sub],
+                    dataset_profile=dataset_profile)
                 base_txt = d.get("text") or ""
                 total_usage = _sum_usage(total_usage, d.get("usage") or {})
                 log_with_sid(sid, "info", f"MULTI_AXES_SPLIT_EMIT charts={len(sub)}")
@@ -1199,7 +1296,9 @@ def run_chat_multi_plot(
         else:
             img_b64 = plot_out.get("image")
         # Describe from code (brain — no data leaves)
-        d = brain_client.describe(sid=sid, question=question, code=code, user_email=user_email)
+        d = _describe_with_backstop(sid, question, code, user_email,
+                                    chart_data=plot_out.get("chart_data"),
+                                    dataset_profile=dataset_profile)
         text = d.get("text") or ""
         total_usage = _sum_usage(total_usage, d.get("usage") or {})
 
@@ -1239,7 +1338,9 @@ def run_chat_multi_plot(
             emitted = ([t] if t else []) + (ts or [])
             if not emitted:
                 continue
-            d = brain_client.describe(sid=sid, question=question, code=tb, user_email=user_email)
+            d = _describe_with_backstop(sid, question, tb, user_email,
+                                        result_obj=result_obj,
+                                        dataset_profile=dataset_profile)
             total_usage = _sum_usage(total_usage, d.get("usage") or {})
             if d.get("text"):
                 combined_answers.append(d["text"])
@@ -1276,9 +1377,15 @@ def run_chat_multi_plot(
 
 def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
                            question, history_rows, user_email,
-                           kind, code, usage, context_decision) -> dict:
+                           kind, code, usage, context_decision,
+                           dataset_profile: dict | None = None) -> dict:
     """Execute one already-planned response (kind/code from a prior /v1/plan)
-    locally, reusing the same retry + describe/summarize flow as run_chat."""
+    locally, reusing the same retry + describe/summarize flow as run_chat.
+
+    `dataset_profile` feeds both the retry planner and the result backstop. It
+    was referenced by the retry call below without being a parameter (Prompt 13
+    oversight) — a failing first execution raised NameError instead of retrying.
+    """
     if kind in ("CLARIFICATION", "ANSWER", "MISSING_DATA"):
         return {"text": code, "image_base64": None, "table": None, "code": None, "usage": usage}
 
@@ -1331,7 +1438,9 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
 
     if kind == "PLOT_CODE":
         img_b64 = exec_out.get("plotly_html") if exec_out.get("is_plotly") else exec_out.get("image")
-        d = brain_client.describe(sid=sid, question=question, code=code, user_email=user_email)
+        d = _describe_with_backstop(sid, question, code, user_email,
+                                    chart_data=exec_out.get("chart_data"),
+                                    dataset_profile=dataset_profile)
         return {"text": d.get("text", ""), "image_base64": img_b64, "table": None,
                 "code": code, "chart_data": exec_out.get("chart_data"),
                 "usage": _sum_usage(usage, d.get("usage") or {})}
@@ -1345,11 +1454,13 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
     img_b64 = exec_out.get("image_base64")
 
     if img_b64:
-        d = brain_client.describe(sid=sid, question=question, code=code, user_email=user_email)
+        d = _describe_with_backstop(sid, question, code, user_email,
+                                    result_obj=result_obj, dataset_profile=dataset_profile)
         return {"text": d.get("text", ""), "image_base64": img_b64, "table": table,
                 "tables": tables, "code": code, "usage": _sum_usage(usage, d.get("usage") or {})}
     if table or tables:
-        d = brain_client.describe(sid=sid, question=question, code=code, user_email=user_email)
+        d = _describe_with_backstop(sid, question, code, user_email,
+                                    result_obj=result_obj, dataset_profile=dataset_profile)
         return {"text": d.get("text", ""), "image_base64": None, "table": table,
                 "tables": tables, "code": code, "usage": _sum_usage(usage, d.get("usage") or {})}
 

@@ -250,6 +250,35 @@ def _compact_profiles_for_transport(profiles: dict | None) -> dict | None:
         return None
 
 
+_CAVEAT_KINDS = ("constant_metric", "identical_series", "constant_table")
+
+
+def _compact_caveat_for_transport(caveat: dict | None) -> dict | None:
+    """Boundary guard for the describe `data_caveat` field. Same Article II
+    class as the profiles: aggregate findings, column NAMES, and truncated
+    constant-value hints — never rows. Unknown keys and unknown kinds are
+    dropped; anything malformed degrades to None (describe runs unchanged)."""
+    if not caveat:
+        return None
+    try:
+        kind = caveat.get("kind")
+        if kind not in _CAVEAT_KINDS:
+            return None
+        out: dict = {"kind": kind}
+        for key in ("facts", "grain"):
+            items = caveat.get(key)
+            if isinstance(items, list):
+                vals = [str(x)[:200] for x in items[:6] if str(x).strip()]
+                if vals:
+                    out[key] = vals
+        if caveat.get("catalog"):
+            out["catalog"] = True
+        return out if (out.get("facts") or out.get("grain")) else None
+    except Exception as e:
+        log_with_sid("caveat-transport", "warning", f"CAVEAT_COMPACT_FAILED: {e}")
+        return None
+
+
 def plan(sid: str, question: str, schema_text: str, df_names: list[str],
          history_rows: list, common_fields: list | None = None,
          user_email: str | None = None,
@@ -288,10 +317,15 @@ def retry(sid: str, question: str, schema_text: str, df_names: list[str],
     }, sid)
 
 
-def describe(sid: str, question: str, code: str, user_email: str | None = None) -> dict:
-    return _post("/v1/describe", {
-        "sid": sid, "question": question, "code": code, "user_email": user_email,
-    }, sid)
+def describe(sid: str, question: str, code: str, user_email: str | None = None,
+             data_caveat: dict | None = None) -> dict:
+    body = {"sid": sid, "question": question, "code": code, "user_email": user_email}
+    caveat = _compact_caveat_for_transport(data_caveat)
+    if caveat:
+        # Only sent when the client's deterministic inspection fired — an
+        # absent field leaves the brain's describe prompt byte-identical.
+        body["data_caveat"] = caveat
+    return _post("/v1/describe", body, sid)
 
 
 def greeting(sid: str, question: str, df_names: list[str], user_email: str | None = None) -> dict:

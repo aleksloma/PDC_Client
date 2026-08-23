@@ -37,6 +37,7 @@ lookup; revoked / suspended tenants get **HTTP 403** (the kill-switch).
 | `preview` (summarize) | the `safe_preview` value the B2C code already restricts to scalars | client |
 | `qa_pairs` (report) | the `findings_for_llm` list the B2C `_generate_report_structure` already builds | client |
 | `dataset_profile` (plan/retry, **optional**) | enterprise-only (no B2C equivalent): `{df_key: profile}` of computed FACTS per loaded table — rows, duplicate count, per-column dtype/nunique/null rates/min-max/constant/all-unique flags, truncated top-value hints, detected grain, deterministic warnings. Aggregate metadata only, never row data (Article II — same class as the cardinality hints in `technical_description`). Absent field ⇒ pre-profile behavior everywhere | client (`dataset_profile.compute_profile`, stored as sidecar JSON, compacted by `brain_client._compact_profiles_for_transport`) |
+| `data_caveat` (describe, **optional**) | enterprise-only: the client's DETERMINISTIC post-execution finding about the result it just rendered — `{kind: constant_metric\|identical_series\|constant_table, facts[], grain[], catalog}`. Aggregate findings + column names + truncated constant-value hints only (Article II, same class as `dataset_profile`). Makes the flat-result explanation mandatory instead of prompt-dependent; absent field ⇒ byte-identical describe prompt | client (`result_backstop.inspect_outputs`, compacted by `brain_client._compact_caveat_for_transport`) |
 
 ---
 
@@ -164,14 +165,34 @@ from **the code only**, never the result. No data values ever sent.
   "sid": "8af3d2e1",
   "question": "show me average salary by department",
   "code": "result = df.groupby('department')['salary'].mean()",
-  "user_email": "alice@acme.com"
+  "user_email": "alice@acme.com",
+
+  // OPTIONAL (Prompt 14). The client's DETERMINISTIC inspection of the executed
+  // result — pure pandas, no values. Sent only when a flat/degenerate result was
+  // detected; absent ⇒ the describe prompt is byte-identical to before.
+  "data_caveat": {
+    "kind": "constant_metric",          // | identical_series | constant_table
+    "facts": ["Quantity is the same for every group in the chart (= 1)"],
+    "grain": ["cl prod link: one row per (client_id, product_id)"],
+    "catalog": true                      // catalog/link grain, not measured quantities
+  }
 }
 ```
+
+`data_caveat` carries aggregate findings, column NAMES, and 40-char-truncated
+constant-value hints only — the same Article II class as `dataset_profile`
+(guarded client-side by `_compact_caveat_for_transport`: known keys, known
+`kind`, ≤6 items × ≤200 chars). The brain renders it as a MANDATORY DATA NOTE
+block and requires the description to START with the explanation, prefixed by
+the literal marker `[[DATA_NOTE]]`. The client strips that marker before
+display and, if it is absent (or the call failed), prepends its own localized
+sentence — so the explanation reaches the user even when the model omits it.
+Unknown/malformed caveats are ignored, never fatal.
 
 ### Response
 
 ```jsonc
-{ "text": "Below is the average salary for each department.", "usage": { ... } }
+{ "text": "[[DATA_NOTE]] Every product has the same value per city here — this is availability, not sold quantities. The table below lists them.", "usage": { ... } }
 ```
 
 ---
