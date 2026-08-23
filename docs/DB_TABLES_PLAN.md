@@ -196,7 +196,13 @@ fingerprint = "fp1:" + sha256(canonical_json)      # e.g. fp1:9c2f0a…
 - **Accepted limitation:** offsetting edits could in theory cancel out in
   SUM/AVG; combined with COUNT, MAX(date) and the schema hash this is
   vanishingly unlikely and is the accepted trade for not hammering
-  customer DBs (chosen design).
+  customer DBs (chosen design). The concrete corollary (observed live in
+  the Prompt 13 smoke): an in-place edit of a TEXT column with the row
+  count unchanged is invisible to the fingerprint — a table with no
+  numeric/temporal columns (e.g. a pure dictionary) only re-snapshots on
+  scheduled runs when its row count or schema changes. "Refresh now"
+  always forces the full snapshot, so any suspect table is one click from
+  fresh.
 
 ### Schema-drift policy (Prompt 13 Part C — implemented)
 
