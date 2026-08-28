@@ -1,8 +1,17 @@
-/* Admin "Data sources" page (ladmin only).
+/* Admin "Data sources" page (ladmin), also served in POWER-USER mode.
  *
  * Standalone admin panel: single IIFE, fetch + small render helpers, no
  * framework, no dashboard.js. Talks only to /api/admin/* and /auth/*.
  * Credentials never render — the API returns masked rows.
+ *
+ * Power mode (window.__MANAGER_MODE__ === 'power', set by the template for
+ * /power/data_sources): the template removes Users/Roles/Audit/global-
+ * schedule sections, the connection-mutation buttons and the wizard Access
+ * panel; this file mirrors that by trimming SECTIONS, skipping the ladmin-
+ * only fetches (they would 403), rendering connections read-only (browse
+ * only) and showing table Delete only on tables the power user registered
+ * themselves (registered_by === window.__MANAGER_EMAIL__ — the API enforces
+ * the same rule). Admin mode behavior is unchanged.
  *
  * Layout: sidebar nav switches five sections (connections / tables /
  * relations / schedule / audit); state is a full refetch after every
@@ -18,6 +27,9 @@
   'use strict';
 
   const $ = (id) => document.getElementById(id);
+
+  const POWER = window.__MANAGER_MODE__ === 'power';
+  const MANAGER_EMAIL = String(window.__MANAGER_EMAIL__ || '').toLowerCase();
 
   function toast(msg, isErr) {
     const t = document.createElement('div');
@@ -104,7 +116,9 @@
   let roleDeleteCtx = null;     // {id, name, member_count} for the delete confirm
 
   // ── Sidebar navigation ─────────────────────────────────────────────────
-  const SECTIONS = ['connections', 'tables', 'relations', 'users', 'roles', 'schedule', 'audit'];
+  const SECTIONS = POWER
+    ? ['connections', 'tables', 'relations']
+    : ['connections', 'tables', 'relations', 'users', 'roles', 'schedule', 'audit'];
 
   function showSection(name) {
     if (!SECTIONS.includes(name)) name = 'connections';
@@ -127,10 +141,14 @@
 
   // ── Bootstrap ──────────────────────────────────────────────────────────
   async function loadAll() {
+    // Power mode never fetches the ladmin-only endpoints (refresh_settings /
+    // roles would 403 and pile up admin.denied audit rows); it fetches the
+    // caller's HELD roles instead (19f "Share with your roles" panel).
     const [d, c, t, s, ro] = await Promise.all([
       api('/api/admin/dialects'), api('/api/admin/connections'),
-      api('/api/admin/tables'), api('/api/admin/refresh_settings'),
-      api('/api/admin/roles'),
+      api('/api/admin/tables'),
+      POWER ? Promise.resolve(null) : api('/api/admin/refresh_settings'),
+      POWER ? api('/api/admin/my_roles') : api('/api/admin/roles'),
     ]);
     DIALECTS = d.data.dialects || [];
     CONNECTIONS = c.data.connections || [];
@@ -139,6 +157,7 @@
     $('adsKeyWarning').classList.toggle('hidden', ENCRYPTION_READY);
     ['btnAddConnection', 'btnAddConnectionHero'].forEach((id) => {
       const b = $(id);
+      if (!b) return;                      // removed in power mode
       b.disabled = !ENCRYPTION_READY;
       b.title = ENCRYPTION_READY ? '' : 'Set CLIENT_ENCRYPTION_KEY first';
     });
@@ -146,14 +165,17 @@
     $('navTableCount').textContent = TABLES.length || '';
     $('navRelCount').textContent = confirmedRelCount() || '';
     ROLES = ro.ok ? (ro.data.roles || []) : ROLES;   // keep last good on failure
-    $('navRoleCount').textContent = ROLES.length || '';
-    renderRoles();
+    if (!POWER) {
+      const rc = $('navRoleCount');
+      if (rc) rc.textContent = ROLES.length || '';
+      renderRoles();
+    }
     // The zero-new explainer quotes a confirmed count — hide it once any
     // mutation refetches state, rather than showing a stale number.
     $('relNoNew').classList.add('hidden');
     renderConnections();
     renderTables();
-    renderSchedule(s.data);
+    if (!POWER) renderSchedule(s.data);
     renderRelDialects();
     renderRelOverview();
     loadRelRecommendations();                // persistent Recommended tables
@@ -172,16 +194,28 @@
 
   function renderConnections() {
     const box = $('connectionsList');
-    const hero = $('connOnboarding');
+    const hero = $('connOnboarding');           // removed in power mode
     if (!CONNECTIONS.length) {
-      hero.classList.remove('hidden');
-      box.innerHTML = '';
+      if (hero) hero.classList.remove('hidden');
+      box.innerHTML = POWER
+        ? '<div class="adm-card adm-muted">No connections are in your granted scope yet — ' +
+          'ask your administrator.</div>'
+        : '';
       return;
     }
-    hero.classList.add('hidden');
+    if (hero) hero.classList.add('hidden');
     const rows = CONNECTIONS.map((c) => {
       const where = c.db_type === 'sqlite' ? '(local file)' :
         `${esc(c.host)}:${esc(c.port ?? '')} / ${esc(c.database || c.service_name || '')}`;
+      // Power users: connections are READ-ONLY — registering tables from them
+      // is the one action; test/refresh/edit/delete stay ladmin's.
+      const actions = POWER
+        ? '<button class="adm-btn ghost small" data-act="browse">＋ Register table</button>'
+        : `<button class="adm-btn ghost small" data-act="browse">＋ Register table</button>
+          <button class="adm-icon-btn" data-act="test" title="Test connection">🔌</button>
+          <button class="adm-icon-btn" data-act="refresh" title="Refresh all snapshots on this connection">⟳</button>
+          <button class="adm-icon-btn" data-act="edit" title="Edit connection">✎</button>
+          <button class="adm-icon-btn" data-act="delete" title="Delete connection">🗑</button>`;
       return `
       <tr data-cid="${esc(c.id)}">
         <td><strong>${esc(c.name)}</strong><div class="adm-cell-sub">${esc(c.user)}</div></td>
@@ -189,13 +223,7 @@
         <td class="adm-cell-mono">${where}</td>
         <td>${c.table_count || 0}</td>
         <td>${connStatusChips(c)}</td>
-        <td class="adm-actions-cell">
-          <button class="adm-btn ghost small" data-act="browse">＋ Register table</button>
-          <button class="adm-icon-btn" data-act="test" title="Test connection">🔌</button>
-          <button class="adm-icon-btn" data-act="refresh" title="Refresh all snapshots on this connection">⟳</button>
-          <button class="adm-icon-btn" data-act="edit" title="Edit connection">✎</button>
-          <button class="adm-icon-btn" data-act="delete" title="Delete connection">🗑</button>
-        </td>
+        <td class="adm-actions-cell">${actions}</td>
       </tr>`;
     }).join('');
     box.innerHTML = `<div class="adm-card adm-table-scroll"><table class="adm-table">
@@ -273,15 +301,26 @@
     $('connSsl').checked = conn ? !!conn.ssl : false;
     $('connTrustCert').checked = conn ? !!conn.trust_server_certificate : false;
     $('connTestResult').classList.add('hidden');
+    _prevDialectKey = sel.value;   // fresh memo — a stored port is "custom"
     onDialectChange();
     $('connModal').classList.remove('hidden');
     $('connName').focus();
   }
 
+  let _prevDialectKey = null;   // last dialect the port was prefilled for
+
   function onDialectChange() {
     const d = DIALECTS.find((x) => x.key === $('connType').value);
     if (!d) return;
-    if (!$('connPort').value) $('connPort').value = d.default_port || '';
+    // Re-prefill when the field is empty OR still holds the PREVIOUS
+    // dialect's default (switching Type updates the port then) — a custom
+    // port is never overwritten.
+    const prev = DIALECTS.find((x) => x.key === _prevDialectKey);
+    const cur = String($('connPort').value || '').trim();
+    if (!cur || (prev && cur === String(prev.default_port || ''))) {
+      $('connPort').value = d.default_port || '';
+    }
+    _prevDialectKey = d.key;
     const needsService = (d.needs || []).includes('service_name');
     $('connServiceWrap').classList.toggle('hidden', !needsService);
     $('connDatabaseWrap').classList.toggle('hidden', needsService);
@@ -379,6 +418,10 @@
       return;
     }
     const connName = (cid) => (CONNECTIONS.find((c) => c.id === cid) || {}).name || '?';
+    // Power users may delete ONLY tables they registered themselves — the API
+    // enforces the same rule (NOT_OWNER); ladmin sees Delete everywhere.
+    const canDelete = (t) => !POWER ||
+      String(t.registered_by || '').toLowerCase() === MANAGER_EMAIL;
     const rows = TABLES.map((t) => `
       <tr data-tid="${esc(t.id)}">
         <td><strong>${esc(t.display_name)}</strong>${t.is_connector
@@ -387,7 +430,9 @@
             : ' <span class="adm-chip" title="Follows the global refresh schedule">inherits global</span>'}</td>
         <td class="adm-cell-mono">${esc(connName(t.connection_id))} · ${esc([t.schema, t.table_name].filter(Boolean).join('.'))}</td>
         <td>${t.row_count != null ? Number(t.row_count).toLocaleString() : '—'}</td>
-        <td title="${esc(t.last_refresh_error || '')}">${t.refreshed_at ? esc(t.refreshed_at)
+        <td title="${esc(t.last_refresh_error || '')}">${t.refreshed_at
+          ? esc(t.refreshed_at) + (t.last_refresh_error
+            ? ' <span class="adm-chip bad">refresh failed</span>' : '')
           : (t.last_refresh_error ? '<span class="adm-chip bad">failed</span>' : '—')}${
           t.last_drift && !t.last_drift.dismissed
             ? ` <span class="adm-chip bad" title="${esc(_driftBits(t.last_drift).join(' · '))}">schema drift</span>` : ''}</td>
@@ -395,7 +440,9 @@
           <button class="adm-icon-btn" data-act="refresh" title="Refresh snapshot now (always a full snapshot)">⟳</button>
           <button class="adm-icon-btn" data-act="schedule" title="Refresh schedule for this table">⏱</button>
           <button class="adm-icon-btn" data-act="edit" title="Edit descriptions / relations">✎</button>
-          <button class="adm-icon-btn" data-act="delete" title="Delete registered table">🗑</button>
+          ${canDelete(t)
+            ? '<button class="adm-icon-btn" data-act="delete" title="Delete registered table">🗑</button>'
+            : ''}
         </td>
       </tr>`).join('');
     box.innerHTML = `<div class="adm-card adm-table-scroll"><table class="adm-table">
@@ -439,7 +486,15 @@
     } else if (act === 'delete') {
       if (!window.confirm(`Delete registered table "${t.display_name}"? Chats that use it keep their history but the table stops loading.`)) return;
       const r = await api(`/api/admin/tables/${tid}/delete`, { method: 'POST', body: '{}' });
-      if (r.ok) toast('Table deleted'); else toast(r.data.error || 'Delete failed', true);
+      if (r.ok) {
+        toast('Table deleted');
+      } else if (r.data.code === 'NOT_OWNER') {
+        toast('Only tables you registered yourself can be deleted.', true);
+      } else if (r.data.code === 'OUT_OF_SCOPE') {
+        toast('This table is outside your managed scope.', true);
+      } else {
+        toast(r.data.error || 'Delete failed', true);
+      }
       loadAll();
     }
   }
@@ -450,7 +505,8 @@
   function registerTableEntry() {
     if (!CONNECTIONS.length) {
       showSection('connections');
-      toast('Add a database connection first', true);
+      toast(POWER ? 'No connections are in your granted scope — ask your administrator'
+                  : 'Add a database connection first', true);
       return;
     }
     if (CONNECTIONS.length === 1) { openTableWizard(CONNECTIONS[0].id); return; }
@@ -539,20 +595,55 @@
     }
   }
 
-  async function loadSchemas(existing) {
-    $('twPickStatus').textContent = 'Loading schemas…';
-    const r = await api(`/api/admin/connections/${wizardConnId}/schemas`);
-    const schemas = r.data.schemas || [];
+  // System schemas are UI-noise for table registration — hidden from the
+  // dropdown until "Show system schemas" is ticked. Server responses stay
+  // unfiltered; the denylist is fixed and case-insensitive.
+  const SYSTEM_SCHEMAS = new Set(['information_schema', 'pg_catalog',
+                                  'pg_toast', 'system']);
+  let _wizardSchemas = [];   // last fetched (unfiltered) list
+
+  function _fillSchemaSelect(preselect) {
     const sel = $('twSchema');
+    const showSys = !!$('twShowSystemSchemas')?.checked;
+    let list = showSys ? _wizardSchemas
+      : _wizardSchemas.filter((s) => !SYSTEM_SCHEMAS.has(String(s).toLowerCase()));
+    // A preselected system schema (edit of an existing table, or the server
+    // default) must stay selectable — auto-reveal instead of dropping it.
+    if (preselect && !list.includes(preselect) && _wizardSchemas.includes(preselect)) {
+      const cb = $('twShowSystemSchemas');
+      if (cb) cb.checked = true;
+      list = _wizardSchemas;
+    }
     sel.innerHTML = '';
-    (schemas.length ? schemas : ['']).forEach((s) => {
+    (list.length ? list : ['']).forEach((s) => {
       const o = document.createElement('option');
       o.value = s; o.textContent = s || '(default)';
       sel.appendChild(o);
     });
-    if (existing && existing.schema) sel.value = existing.schema;
-    else if (r.data.default_schema) sel.value = r.data.default_schema;
+    if (preselect && list.includes(preselect)) sel.value = preselect;
+  }
+
+  async function loadSchemas(existing) {
+    $('twPickStatus').textContent = 'Loading schemas…';
+    const r = await api(`/api/admin/connections/${wizardConnId}/schemas`);
+    _wizardSchemas = r.data.schemas || [];
+    const sel = $('twSchema');
+    const preselect = (existing && existing.schema)
+      || r.data.default_schema || '';
+    _fillSchemaSelect(preselect);
     sel.onchange = loadTableNames;
+    const sysCb = $('twShowSystemSchemas');
+    if (sysCb) {
+      sysCb.onchange = async () => {
+        // Unchecking while ON a system schema falls back to the first
+        // ordinary one (keeping it would just re-check the box).
+        const cur = $('twSchema').value;
+        const keep = sysCb.checked
+          || !SYSTEM_SCHEMAS.has(String(cur).toLowerCase());
+        _fillSchemaSelect(keep ? cur : null);
+        await loadTableNames();
+      };
+    }
     await loadTableNames();
     // `r.ok` too, not just the body flag: a transport failure carries no
     // body, and clearing the status there would leave an empty dropdown
@@ -2508,11 +2599,39 @@
   }
 
   // ── Users (role assignment) ────────────────────────────────────────────
+  let _userSearchTyped = false;   // set by the input listener — a value the
+                                  // user never typed is browser autofill
+
   async function loadUsers() {
+    // Chrome used to autofill the saved login email into the filter box and
+    // silently shrink the list to one user — clear any non-user-typed value.
+    const search = $('userSearch');
+    if (search && search.value && !_userSearchTyped) search.value = '';
     const r = await api('/api/admin/users');
     if (r.ok) USERS = r.data.users || [];
     $('navUserCount').textContent = USERS.length || '';
     renderUsers();
+  }
+
+  // 19c multi-role model: the role cell is a button + checkbox panel. A user
+  // holds SEVERAL roles (read access = union); checked = held, and every
+  // toggle POSTs the full id list immediately (same instant semantics the
+  // old single dropdown had). The PERMISSION level (19e: Standard / Power
+  // user / Local admin) is a per-row dropdown POSTing set_permission the
+  // same way; the picker stays enabled on admin rows too (19g: promoted
+  // admins hold roles like anyone — only the unlisted bootstrap account is
+  // roleless).
+  let _userRolesDocClose = false;   // one document-level close listener
+
+  function _userRolesLabel(u) {
+    const names = (u.role_names && u.role_names.length)
+      ? u.role_names : [u.role_name || 'Base'];
+    return names.join(' + ');
+  }
+
+  function closeUserRolePanels() {
+    document.querySelectorAll('.adm-user-roles-panel:not(.hidden)')
+      .forEach((p) => p.classList.add('hidden'));
   }
 
   function renderUsers() {
@@ -2525,36 +2644,108 @@
       </div></div>`;
       return;
     }
-    const options = (selected) => ROLES.map((ro) =>
-      `<option value="${esc(ro.id)}" ${ro.id === selected ? 'selected' : ''}>${esc(ro.name)}</option>`).join('');
     const fmt = (ts) => ts ? esc(String(ts).replace('T', ' ').slice(0, 16)) : '—';
+    const panel = (u) => {
+      const held = new Set(u.role_ids || [u.role_id]);
+      return ROLES.map((ro) => `
+        <label class="adm-check adm-user-role-opt">
+          <input type="checkbox" class="adm-user-role-check"
+            data-rid="${esc(ro.id)}" ${held.has(ro.id) ? 'checked' : ''}>
+          <span>${esc(ro.name)}${ro.id === 'base'
+            ? ' <span class="adm-label-note">(default)</span>' : ''}</span>
+        </label>`).join('');
+    };
+    const PERMS = [['standard', 'Standard'], ['power', 'Power user'],
+                   ['admin', 'Local admin']];
+    const permSel = (u) => `
+      <select class="adm-user-perm">
+        ${PERMS.map(([v, l]) => `<option value="${v}"
+          ${(u.permission || 'standard') === v ? 'selected' : ''}>${l}</option>`).join('')}
+      </select>`;
     box.innerHTML = `<div class="adm-card adm-table-scroll"><table class="adm-table">
-      <thead><tr><th>Email</th><th>Role</th><th>First login</th><th>Last login</th></tr></thead>
+      <thead><tr><th>Email</th><th>Roles</th><th>Permission</th><th>First login</th><th>Last login</th></tr></thead>
       <tbody>${rows.map((u) => `
         <tr data-email="${esc(u.email)}">
           <td>${esc(u.email)}</td>
-          <td><select class="adm-user-role" data-prev="${esc(u.role_id)}">${options(u.role_id)}</select></td>
+          <td><div class="adm-user-roles-wrap">
+            <button type="button" class="adm-btn ghost small adm-user-roles-btn">
+              ${esc(_userRolesLabel(u))} ▾</button>
+            <div class="adm-user-roles-panel adm-card hidden">${panel(u)}</div>
+          </div></td>
+          <td>${permSel(u)}</td>
           <td class="adm-cell-mono">${fmt(u.created_at)}</td>
           <td class="adm-cell-mono">${fmt(u.last_login_at)}</td>
         </tr>`).join('')}</tbody></table></div>`;
-    box.querySelectorAll('.adm-user-role').forEach((sel) => {
-      sel.addEventListener('change', async () => {
-        const email = sel.closest('tr').dataset.email;
+
+    box.querySelectorAll('.adm-user-roles-btn').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const p = btn.parentElement.querySelector('.adm-user-roles-panel');
+        const wasHidden = p.classList.contains('hidden');
+        closeUserRolePanels();          // one open panel at a time
+        p.classList.toggle('hidden', !wasHidden);
+      });
+    });
+    box.querySelectorAll('.adm-user-roles-panel').forEach((p) => {
+      p.addEventListener('click', (e) => e.stopPropagation());
+    });
+    box.querySelectorAll('.adm-user-role-check').forEach((cb) => {
+      cb.addEventListener('change', async () => {
+        const tr = cb.closest('tr');
+        const email = tr.dataset.email;
+        const p = cb.closest('.adm-user-roles-panel');
+        const role_ids = Array.from(p.querySelectorAll('.adm-user-role-check'))
+          .filter((x) => x.checked).map((x) => x.dataset.rid);
         const r = await api('/api/admin/users/set_role', {
-          method: 'POST',
-          body: JSON.stringify({ email, role_id: sel.value }),
+          method: 'POST', body: JSON.stringify({ email, role_ids }),
         });
-        if (r.ok) {
-          sel.dataset.prev = sel.value;
-          toast(`Role updated for ${email}`);
-          const u = USERS.find((x) => x.email === email);
-          if (u && r.data.user) Object.assign(u, r.data.user);
+        const u = USERS.find((x) => x.email === email);
+        if (r.ok && r.data.user && u) {
+          Object.assign(u, r.data.user);
+          toast(`Roles updated for ${email}`);
+          // Reconcile with the RESOLVED server answer (e.g. everything
+          // unchecked ⇒ Base is effective) without closing the panel.
+          const held = new Set(u.role_ids || []);
+          p.querySelectorAll('.adm-user-role-check').forEach((x) => {
+            x.checked = held.has(x.dataset.rid);
+          });
+          tr.querySelector('.adm-user-roles-btn').textContent =
+            `${_userRolesLabel(u)} ▾`;
         } else {
-          toast(r.data.error || 'Could not change the role', true);
-          sel.value = sel.dataset.prev;   // revert the dropdown
+          toast(r.data.error || 'Could not change the roles', true);
+          loadUsers();                  // refetch = revert
         }
       });
     });
+    box.querySelectorAll('.adm-user-perm').forEach((sel) => {
+      sel.addEventListener('change', async () => {
+        const email = sel.closest('tr').dataset.email;
+        const u = USERS.find((x) => x.email === email);
+        const prev = (u && u.permission) || 'standard';
+        const permission = sel.value;
+        if (permission === 'admin'
+            && !window.confirm('This user gets full Data-sources '
+              + 'administration. They keep their chats and roles.')) {
+          sel.value = prev;             // cancelled — revert the dropdown
+          return;
+        }
+        const r = await api('/api/admin/users/set_permission', {
+          method: 'POST', body: JSON.stringify({ email, permission }),
+        });
+        if (r.ok && r.data.user && u) {
+          Object.assign(u, r.data.user);
+          toast(`Permission updated for ${email}`);
+          renderUsers();                // re-render row (roles picker en/disable)
+        } else {
+          toast(r.data.error || 'Could not change the permission', true);
+          loadUsers();                  // refetch = revert
+        }
+      });
+    });
+    if (!_userRolesDocClose) {
+      _userRolesDocClose = true;
+      document.addEventListener('click', closeUserRolePanels);
+    }
   }
 
   // ── Roles (grants registry) ────────────────────────────────────────────
@@ -2565,6 +2756,8 @@
     if (conns) bits.push(`${conns} connection grant${conns > 1 ? 's' : ''}`);
     if (schemas) bits.push(`${schemas} schema grant${schemas > 1 ? 's' : ''}`);
     if ((ro.table_ids || []).length) bits.push(`${ro.table_ids.length} table${ro.table_ids.length > 1 ? 's' : ''}`);
+    const manage = (ro.manage_grants || []).length;
+    if (manage) bits.push(`${manage} manage grant${manage > 1 ? 's' : ''}`);
     return bits.join(' · ') || 'No table access';
   }
 
@@ -2579,7 +2772,7 @@
       <div class="adm-card adm-role-card" data-rid="${esc(ro.id)}">
         <div class="adm-role-main">
           <div class="adm-role-title">${esc(ro.name)}
-            ${ro.is_base ? '<span class="adm-chip">built-in</span>' : ''}
+            ${ro.is_builtin ? '<span class="adm-chip">built-in</span>' : ''}
             <span class="adm-chip">${ro.member_count || 0} member${ro.member_count === 1 ? '' : 's'}</span>
           </div>
           ${ro.description ? `<div class="adm-muted">${esc(ro.description)}</div>` : ''}
@@ -2587,7 +2780,7 @@
         </div>
         <div class="adm-role-actions">
           <button class="adm-icon-btn" data-act="edit" title="Edit role">✏️</button>
-          ${ro.is_base ? '' : '<button class="adm-icon-btn" data-act="delete" title="Delete role">🗑️</button>'}
+          ${ro.is_builtin ? '' : '<button class="adm-icon-btn" data-act="delete" title="Delete role">🗑️</button>'}
         </div>
       </div>`).join('');
     box.querySelectorAll('button').forEach((b) => {
@@ -2609,6 +2802,7 @@
     editingRoleId = role ? role.id : null;
     roleDraft = {
       isBase: !!(role && role.is_base),
+      isBuiltin: !!(role && role.is_builtin),
       tableIds: new Set(role ? role.table_ids || [] : []),
       connGrants: new Set((role ? role.scope_grants || [] : [])
         .filter((g) => g.schema == null).map((g) => g.connection_id)),
@@ -2616,11 +2810,20 @@
         .filter((g) => g.schema != null)
         .map((g) => [_schemaKey(g.connection_id, g.schema),
                      { connection_id: g.connection_id, schema: g.schema }])),
+      // 19f: the SEPARATE management axis (where power-permission members
+      // may register tables/relations/schedules).
+      manageConn: new Set((role ? role.manage_grants || [] : [])
+        .filter((g) => g.schema == null).map((g) => g.connection_id)),
+      manageSchema: new Map((role ? role.manage_grants || [] : [])
+        .filter((g) => g.schema != null)
+        .map((g) => [_schemaKey(g.connection_id, g.schema),
+                     { connection_id: g.connection_id, schema: g.schema }])),
     };
     $('roleModalTitle').textContent = role ? `Edit role — ${role.name}` : 'Add role';
     $('roleName').value = role ? role.name : '';
-    $('roleName').disabled = roleDraft.isBase;   // Base is unrenamable
-    $('roleName').title = roleDraft.isBase ? 'The built-in Base role cannot be renamed' : '';
+    const builtin = !!(role && role.is_builtin);
+    $('roleName').disabled = builtin;   // the built-in Base role is unrenamable
+    $('roleName').title = builtin ? 'Built-in roles cannot be renamed' : '';
     $('roleDesc').value = role ? role.description || '' : '';
     $('roleError').classList.add('hidden');
     renderRoleTree();
@@ -2636,8 +2839,12 @@
         + 'or grant a whole connection once one exists.</div>';
       if (!CONNECTIONS.length) return;
     }
+    // 19f two-column rows: left = the Chat-access checkbox + name (tri-state
+    // as before), right = the Manage checkbox (connection/schema rows only).
+    const manageCell = (inner) => `<span class="adm-tree-manage">${inner}</span>`;
     const html = CONNECTIONS.map((c) => {
       const connGranted = roleDraft.connGrants.has(c.id);
+      const connManaged = roleDraft.manageConn.has(c.id);
       const connTables = tables.filter((t) => t.connection_id === c.id);
       // Group by lower-cased schema, keep the first raw name as the label.
       const schemas = new Map();
@@ -2649,18 +2856,22 @@
       const schemaHtml = Array.from(schemas.values()).map((s) => {
         const sKey = _schemaKey(c.id, s.raw);
         const schemaGranted = roleDraft.schemaGrants.has(sKey);
+        const schemaManaged = roleDraft.manageSchema.has(sKey);
         const leaves = s.tables.map((t) => {
           const covered = connGranted || schemaGranted;
           const checked = covered || roleDraft.tableIds.has(t.id);
-          return `<label class="adm-tree-leaf adm-check">
+          return `<div class="adm-tree-row">
+            <label class="adm-tree-leaf adm-check">
             <input type="checkbox" class="rt-table" data-tid="${esc(t.id)}"
               ${checked ? 'checked' : ''} ${covered ? 'disabled' : ''}>
             <span>${esc(t.display_name || t.table_name)}
               ${covered ? `<span class="adm-label-note">${connGranted ? 'via connection' : 'via schema'}</span>` : ''}
             </span>
-          </label>`;
+            </label>${manageCell('')}
+          </div>`;
         }).join('');
         return `<div class="adm-tree-schema-block">
+          <div class="adm-tree-row">
           <label class="adm-tree-schema adm-check">
             <input type="checkbox" class="rt-schema" data-cid="${esc(c.id)}"
               data-schema="${esc(s.raw)}" ${connGranted || schemaGranted ? 'checked' : ''}
@@ -2669,18 +2880,28 @@
               <span class="adm-label-note">${connGranted ? 'via connection'
                 : 'schema grant — includes tables registered later'}</span>
             </span>
-          </label>
+          </label>${manageCell(`<input type="checkbox" class="rt-schema-m"
+            data-cid="${esc(c.id)}" data-schema="${esc(s.raw)}"
+            title="Power members may register tables in this schema"
+            ${connManaged || schemaManaged ? 'checked' : ''}
+            ${connManaged ? 'disabled' : ''}>`)}
+          </div>
           <div class="adm-tree-leaves">${leaves}</div>
         </div>`;
       }).join('');
       return `<div class="adm-tree-conn-block">
+        <div class="adm-tree-row">
         <label class="adm-tree-conn adm-check">
           <input type="checkbox" class="rt-conn" data-cid="${esc(c.id)}"
             ${connGranted ? 'checked' : ''}>
           <span><strong>${esc(c.name)}</strong>
             <span class="adm-label-note">whole connection — includes tables registered later</span>
           </span>
-        </label>
+        </label>${manageCell(`<input type="checkbox" class="rt-conn-m"
+          data-cid="${esc(c.id)}"
+          title="Power members may register tables anywhere on this connection"
+          ${connManaged ? 'checked' : ''}>`)}
+        </div>
         <div class="adm-tree-schemas">${schemaHtml
           || '<div class="adm-muted adm-tree-empty">No registered tables on this connection yet.</div>'}</div>
       </div>`;
@@ -2704,6 +2925,13 @@
       const n = boxes.filter((x) => x.checked).length;
       sch.indeterminate = n > 0 && n < boxes.length;
     });
+    box.querySelectorAll('.adm-tree-conn-block').forEach((cb) => {
+      const connM = cb.querySelector('.rt-conn-m');
+      if (!connM || connM.checked) return;
+      const boxes = Array.from(cb.querySelectorAll('.rt-schema-m'));
+      const n = boxes.filter((x) => x.checked).length;
+      connM.indeterminate = n > 0 && n < boxes.length;
+    });
     box.querySelectorAll('input[type="checkbox"]').forEach((el) => {
       el.addEventListener('change', () => {
         if (el.classList.contains('rt-conn')) {
@@ -2715,6 +2943,15 @@
             roleDraft.schemaGrants.set(key,
               { connection_id: el.dataset.cid, schema: el.dataset.schema });
           } else roleDraft.schemaGrants.delete(key);
+        } else if (el.classList.contains('rt-conn-m')) {
+          if (el.checked) roleDraft.manageConn.add(el.dataset.cid);
+          else roleDraft.manageConn.delete(el.dataset.cid);
+        } else if (el.classList.contains('rt-schema-m')) {
+          const key = _schemaKey(el.dataset.cid, el.dataset.schema);
+          if (el.checked) {
+            roleDraft.manageSchema.set(key,
+              { connection_id: el.dataset.cid, schema: el.dataset.schema });
+          } else roleDraft.manageSchema.delete(key);
         } else if (el.classList.contains('rt-table')) {
           if (el.checked) roleDraft.tableIds.add(el.dataset.tid);
           else roleDraft.tableIds.delete(el.dataset.tid);
@@ -2741,8 +2978,17 @@
       const t = tablesById.get(tid);
       return t && !covered(t);
     });
-    const body = { description: $('roleDesc').value.trim(), table_ids, scope_grants };
-    if (!roleDraft.isBase) body.name = $('roleName').value.trim();
+    const manage_grants = [
+      ...Array.from(roleDraft.manageConn).map((cid) => ({ connection_id: cid, schema: null })),
+      ...Array.from(roleDraft.manageSchema.values())
+        .filter((g) => !roleDraft.manageConn.has(g.connection_id)),
+    ];
+    const body = { description: $('roleDesc').value.trim(), table_ids,
+                   scope_grants, manage_grants };
+    // Omit `name` for built-ins — sending it made the rename guard 400
+    // every built-in edit, so its description/grants could never be saved
+    // from the UI (the 19c bug).
+    if (!roleDraft.isBuiltin) body.name = $('roleName').value.trim();
     const path = editingRoleId ? `/api/admin/roles/${editingRoleId}` : '/api/admin/roles';
     const r = await api(path, { method: 'POST', body: JSON.stringify(body) });
     if (!(r.status === 200 || r.status === 201)) {
@@ -2786,11 +3032,20 @@
   function renderWizardAccess() {
     const box = $('twAccessRoles');
     _wizAccessReady = false;
+    if (!box) return;
+    // 19f: in power mode ROLES holds the caller's HELD roles (my_roles) —
+    // "Share with your roles", all unchecked by default on a new
+    // registration; the server enforces the held-subset rule too.
     if (!ROLES.length) {
       // Roles fetch failed at load — sending [] would strip existing grants
       // on an edit, so the save omits the field entirely.
       box.className = 'adm-access-panel adm-muted';
-      box.textContent = 'Roles unavailable — manage access from the Roles section.';
+      // Power mode also lands here when the user holds no shareable roles
+      // (Base is excluded — sharing with everyone stays ladmin's).
+      box.textContent = POWER
+        ? 'You hold no shareable roles — the table stays visible only to '
+          + 'you. Ask your administrator to share it wider.'
+        : 'Roles unavailable — manage access from the Roles section.';
       return;
     }
     const schema = ($('twSchema').value || '').trim().toLowerCase();
@@ -2867,8 +3122,9 @@
     });
     showSection((location.hash || '').replace('#', ''));
 
-    $('btnAddConnection').addEventListener('click', () => openConnModal(null));
-    $('btnAddConnectionHero').addEventListener('click', () => openConnModal(null));
+    // ?. binds: these elements are removed by the template in power mode.
+    $('btnAddConnection')?.addEventListener('click', () => openConnModal(null));
+    $('btnAddConnectionHero')?.addEventListener('click', () => openConnModal(null));
     $('closeConnModal').addEventListener('click', () => $('connModal').classList.add('hidden'));
     $('btnCancelConn').addEventListener('click', () => $('connModal').classList.add('hidden'));
     $('btnTestConn').addEventListener('click', testConnDraft);
@@ -2899,8 +3155,11 @@
       if (cyInstance) { _hideGraphPopover(); cyInstance.fit(undefined, 30); }
     });
 
-    $('userSearch').addEventListener('input', renderUsers);
-    $('btnAddRole').addEventListener('click', () => openRoleModal(null));
+    $('userSearch')?.addEventListener('input', () => {
+      _userSearchTyped = true;   // real typing — never clear it again
+      renderUsers();
+    });
+    $('btnAddRole')?.addEventListener('click', () => openRoleModal(null));
     $('closeRoleModal').addEventListener('click', () => $('roleModal').classList.add('hidden'));
     $('btnCancelRole').addEventListener('click', () => $('roleModal').classList.add('hidden'));
     $('btnSaveRole').addEventListener('click', saveRole);
@@ -2908,7 +3167,7 @@
     $('btnRoleDeleteCancel').addEventListener('click', () => $('roleDeleteModal').classList.add('hidden'));
     $('btnRoleDeleteGo').addEventListener('click', runRoleDelete);
 
-    $('btnSaveSchedule').addEventListener('click', saveSchedule);
+    $('btnSaveSchedule')?.addEventListener('click', saveSchedule);
     $('btnTsmSave').addEventListener('click', saveTableSchedule);
     $('btnTsmCancel').addEventListener('click', () => $('tableScheduleModal').classList.add('hidden'));
     $('closeTsmModal').addEventListener('click', () => $('tableScheduleModal').classList.add('hidden'));
@@ -2921,7 +3180,7 @@
       $('tsmFields').classList.remove('hidden');
       schedulePreviewInto($('tsmFields'), $('tsmPreview'), true);
     });
-    $('btnReloadAudit').addEventListener('click', loadAudit);
+    $('btnReloadAudit')?.addEventListener('click', loadAudit);
 
     $('btnAdmLogout').addEventListener('click', logout);
     $('btnAdmChangePw').addEventListener('click', openPwModal);

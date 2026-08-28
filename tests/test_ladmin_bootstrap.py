@@ -157,4 +157,36 @@ def test_profile_exposes_is_local_admin_not_is_admin(client):
                 follow_redirects=False)
     prof = client.get("/auth/profile").json()
     assert prof["is_local_admin"] is True
+    assert prof["is_admin_user"] is False   # 19g: bootstrap is NOT a promoted admin
     assert "is_admin" not in prof   # guards the dashboard.js Publish-menu trap
+
+
+def test_is_bootstrap_admin_is_identity_not_permission(monkeypatch):
+    """19g: only the configured ladmin identity is bootstrap — a PROMOTED
+    admin (permission "admin" on a normal account) is not."""
+    store = local_store.AuthStore()
+    assert store.is_bootstrap_admin("ladmin") is True
+    assert store.is_bootstrap_admin("LADMIN ") is True     # normalized compare
+    store.ensure_user("promoted@x.com")
+    store.set_role("promoted@x.com", "admin")
+    assert store.is_admin("promoted@x.com") is True
+    assert store.is_bootstrap_admin("promoted@x.com") is False
+    assert store.is_bootstrap_admin("") is False
+    # Empty LOCAL_ADMIN_USERNAME ⇒ nobody is bootstrap (never matches "").
+    monkeypatch.setattr(settings, "LOCAL_ADMIN_USERNAME", "")
+    assert store.is_bootstrap_admin("ladmin") is False
+    assert store.is_bootstrap_admin("") is False
+
+
+def test_promoted_admin_login_lands_on_lab(client):
+    """19g: a promoted admin is a full analysis user — login targets /lab,
+    never the admin page (that stays bootstrap-only)."""
+    store = local_store.AuthStore()
+    store.ensure_user("promoted@x.com")
+    store.set_password("promoted@x.com", "admin-pw")
+    store.set_role("promoted@x.com", "admin")
+    r = client.post("/auth/login",
+                    data={"email": "promoted@x.com", "password": "admin-pw"},
+                    follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/lab"

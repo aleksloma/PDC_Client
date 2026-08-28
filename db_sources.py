@@ -153,12 +153,18 @@ def _scrub_detail(value, depth: int = 0):
 
 
 def audit(actor: str, action: str, *, target: str = "", ok: bool = True,
-          detail: Optional[dict] = None, ip: Optional[str] = None) -> None:
+          detail: Optional[dict] = None, ip: Optional[str] = None,
+          actor_kind: Optional[str] = None) -> None:
     """Append one admin-action row to DATA_ROOT/admin_audit.jsonl. Never
-    raises; a failed write is logged and swallowed (Article IV)."""
+    raises; a failed write is logged and swallowed (Article IV). actor_kind
+    (e.g. "power_user") is merged into detail so ladmin can tell delegated
+    writes apart in the audit tail; None keeps the row byte-identical."""
     try:
         row = {"ts": _now(), "actor": actor, "action": action, "target": target,
                "ok": bool(ok)}
+        if actor_kind:
+            detail = dict(detail or {})
+            detail["actor_kind"] = actor_kind
         if detail:
             row["detail"] = _scrub_detail(_json_safe(detail))
         if ip:
@@ -425,7 +431,8 @@ class DataSourceStore:
                 return dict(t)
         return None
 
-    def upsert_table(self, table_doc: dict, actor: str) -> dict:
+    def upsert_table(self, table_doc: dict, actor: str,
+                     actor_kind: Optional[str] = None) -> dict:
         """Insert (no/unknown id) or replace (existing id) a table doc. The
         caller (routes/admin_data.py) is responsible for the mandatory-confirm
         gate; this store never invents confirmation fields."""
@@ -455,10 +462,12 @@ class DataSourceStore:
                       "table_name": table_doc.get("table_name"),
                       "is_connector": bool(table_doc.get("is_connector")),
                       "confirmed": bool(table_doc.get("descriptions_confirmed_by")),
-                      "columns": len(table_doc.get("columns") or [])})
+                      "columns": len(table_doc.get("columns") or [])},
+              actor_kind=actor_kind)
         return dict(table_doc)
 
-    def delete_table(self, tid: str, actor: str, *, drop_snapshot: bool = True) -> bool:
+    def delete_table(self, tid: str, actor: str, *, drop_snapshot: bool = True,
+                     actor_kind: Optional[str] = None) -> bool:
         with _LOCK:
             doc = self.read_doc()
             before = len(doc["tables"])
@@ -469,7 +478,7 @@ class DataSourceStore:
                 self._write_doc(doc)
         if deleted and drop_snapshot:
             self._drop_snapshot(tid)
-        audit(actor, "table.delete", target=tid, ok=deleted)
+        audit(actor, "table.delete", target=tid, ok=deleted, actor_kind=actor_kind)
         return deleted
 
     def _drop_snapshot(self, tid: str) -> None:
@@ -554,7 +563,8 @@ class DataSourceStore:
             log_with_sid("db_sources", "warning",
                          f"DB_MARK_DRIFT_FAILED table={tid}: {e}")
 
-    def dismiss_drift(self, tid: str, *, actor: str) -> bool:
+    def dismiss_drift(self, tid: str, *, actor: str,
+                      actor_kind: Optional[str] = None) -> bool:
         """Admin acknowledged the drift banner. Audited. False = unknown table
         or nothing to dismiss."""
         with _LOCK:
@@ -568,14 +578,15 @@ class DataSourceStore:
                     break
             else:
                 return False
-        audit(actor, "table.drift_dismiss", target=tid)
+        audit(actor, "table.drift_dismiss", target=tid, actor_kind=actor_kind)
         return True
 
     # ---- recommended tables (v4) -------------------------------------------
     def list_recommendations(self) -> list[dict]:
         return [dict(r) for r in self.read_doc()["recommendations"]]
 
-    def upsert_recommendations(self, batch: list, actor: str) -> dict:
+    def upsert_recommendations(self, batch: list, actor: str,
+                               actor_kind: Optional[str] = None) -> dict:
         """Merge identifier-only evidence into the persistent "Recommended
         tables". Merge key = physical identity (connection + schema + table,
         case-insensitive). Frequencies accumulate; evidence entries union by
@@ -651,11 +662,13 @@ class DataSourceStore:
                 self._write_doc(doc)
         if created or updated:
             audit(actor, "relations.recommend",
-                  detail={"created": created, "updated": updated})
+                  detail={"created": created, "updated": updated},
+                  actor_kind=actor_kind)
         return {"created": created, "updated": updated}
 
     def set_recommendation_status(self, rec_id: str, status: str,
-                                  actor: str) -> Optional[dict]:
+                                  actor: str,
+                                  actor_kind: Optional[str] = None) -> Optional[dict]:
         """Persistent dismiss / restore. Only open<->dismissed; a registered
         rec is immutable here (the registry owns it)."""
         if status not in ("open", "dismissed"):
@@ -673,7 +686,7 @@ class DataSourceStore:
                     break
         if out is not None:
             audit(actor, "relations.rec_status", target=rec_id,
-                  detail={"status": status})
+                  detail={"status": status}, actor_kind=actor_kind)
         return out
 
     def sync_recommendations(self) -> None:
@@ -757,7 +770,7 @@ class DataSourceStore:
             log_with_sid("db_sources", "warning", f"DB_MARK_FIRED_FAILED: {e}")
 
     def set_table_schedule(self, tid: str, schedule: Optional[dict], *,
-                           actor: str) -> bool:
+                           actor: str, actor_kind: Optional[str] = None) -> bool:
         """Per-table schedule override (None ⇒ inherit global). Validates when
         not None (ValueError propagates for the route's 400); resets the
         table's own last-fired stamp. Returns False for an unknown table."""
@@ -776,7 +789,8 @@ class DataSourceStore:
             else:
                 return False
         audit(actor, "table.schedule", target=tid,
-              detail={"schedule": sched, "inherit": sched is None})
+              detail={"schedule": sched, "inherit": sched is None},
+              actor_kind=actor_kind)
         return True
 
     def mark_table_fired(self, tid: str, fired_at_iso: str) -> None:

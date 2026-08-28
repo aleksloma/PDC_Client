@@ -979,13 +979,17 @@ class AuthStore:
     # --- Roles (stored on profile.json — the identity record; auth.json is
     # credentials-only and is rewritten wholesale on password churn) ---------
     #
-    # Default "user"; the fixed local admin is "admin". The field lives on the
-    # local user record so roles can later be assigned from the brain side
-    # without a storage migration. Legacy profiles without the key read as
-    # "user" (stored-shape backward compatibility).
+    # The per-user PERMISSION level: "user" (standard, default) | "power" |
+    # "admin" (the config-only local admin). The field lives on the local user
+    # record so roles can later be assigned from the brain side without a
+    # storage migration. Legacy/unknown/absent values read as "user"
+    # (stored-shape backward compatibility).
+
+    _KNOWN_ROLES = ("user", "power", "admin")
 
     def get_role(self, email: str) -> str:
-        return (self.get_profile(email) or {}).get("role") or "user"
+        role = (self.get_profile(email) or {}).get("role")
+        return role if role in self._KNOWN_ROLES else "user"
 
     def set_role(self, email: str, role: str) -> None:
         email = _safe_email(email)
@@ -1002,27 +1006,65 @@ class AuthStore:
     def is_admin(self, email: str) -> bool:
         return self.get_role(email) == "admin"
 
-    # --- Data role (roles_store.py role id; gates DB-table access) ----------
+    def is_bootstrap_admin(self, email: str) -> bool:
+        """The fixed appliance account `ensure_local_admin` seeds
+        (settings.LOCAL_ADMIN_USERNAME) — an IDENTITY compare, never the
+        permission: only this account is config-only (no /lab, no chats, no
+        data roles, unlisted, permission immutable). A PROMOTED admin
+        (permission "admin" granted via User management, 19g) stays a full
+        analysis user. Empty LOCAL_ADMIN_USERNAME ⇒ nobody is bootstrap."""
+        uname = (settings.LOCAL_ADMIN_USERNAME or "").strip().lower()
+        return bool(uname) and (email or "").strip().lower() == uname
+
+    def is_power(self, email: str) -> bool:
+        """Power-user PERMISSION (per user, not per role). Admin is NOT power
+        — admins use the full admin page instead of /power (19e/19g)."""
+        return self.get_role(email) == "power"
+
+    # --- Data roles (roles_store.py role ids; gate DB-table access) ---------
     #
     # Same storage decision as `role` above: profile.json, not auth.json.
-    # Missing/dangling ids resolve to the built-in Base role dynamically
-    # (roles_store.role_for_email) — deleting a role needs no profile rewrites
-    # and an old-shape profile keeps loading (stored-shape backward compat).
+    # A user holds SEVERAL roles (19c): `data_roles: [ids]`, with the legacy
+    # single `data_role` mirrored to the FIRST id so an older build reading
+    # the same DATA_ROOT keeps working. Reads are tolerant: a legacy profile
+    # with only `data_role` reads as a one-element list. Missing/dangling ids
+    # resolve to the built-in Base role dynamically
+    # (roles_store.roles_for_email) — deleting a role needs no profile
+    # rewrites and an old-shape profile keeps loading (stored-shape compat).
 
-    def get_data_role(self, email: str) -> str:
-        return (self.get_profile(email) or {}).get("data_role") or "base"
+    def get_data_roles(self, email: str) -> list:
+        """The RAW held role-id list (tolerant read; [] when none). Dangling
+        ids are dropped later, at resolution time — never here."""
+        prof = self.get_profile(email) or {}
+        ids = prof.get("data_roles")
+        if isinstance(ids, list):
+            return [r for r in ids if isinstance(r, str) and r]
+        legacy = prof.get("data_role")
+        return [legacy] if isinstance(legacy, str) and legacy else []
 
-    def set_data_role(self, email: str, role_id: str) -> None:
+    def set_data_roles(self, email: str, role_ids: list) -> None:
         email = _safe_email(email)
+        ids = list(dict.fromkeys(r for r in (role_ids or [])
+                                 if isinstance(r, str) and r))
         with _LOCK:
             prof = self.get_profile(email) or {"email": email, "created_at": _now()}
-            if prof.get("data_role") == role_id:
+            if prof.get("data_roles") == ids and prof.get("data_role") == (
+                    ids[0] if ids else "base"):
                 return
-            prof["data_role"] = role_id
+            prof["data_roles"] = ids
+            prof["data_role"] = ids[0] if ids else "base"   # downgrade mirror
             p = _data_root() / "users" / email / "profile.json"
             p.parent.mkdir(parents=True, exist_ok=True)
             _write_json_atomic(p, prof)
-        log_with_sid(email, "info", f"USER_DATA_ROLE_SET role_id={role_id}")
+        log_with_sid(email, "info", f"USER_DATA_ROLES_SET role_ids={ids}")
+
+    # Single-role shims — many call sites/tests predate the multi-role model.
+    def get_data_role(self, email: str) -> str:
+        ids = self.get_data_roles(email)
+        return ids[0] if ids else "base"
+
+    def set_data_role(self, email: str, role_id: str) -> None:
+        self.set_data_roles(email, [role_id])
 
     def touch_last_login(self, email: str) -> None:
         """Stamp last_login_at on the profile. Best-effort — a failed stamp
@@ -1039,10 +1081,10 @@ class AuthStore:
             log_with_sid(email, "warning", f"LAST_LOGIN_STAMP_FAILED: {e}")
 
     def list_users(self) -> list:
-        """Every non-admin user with a readable profile.json, sorted by email.
-        Skips the config-only local admin (and any role=admin profile) — the
-        admin Users window manages regular users only. Unreadable profiles are
-        skipped, never fatal (Article IV)."""
+        """Every user with a readable profile.json, sorted by email —
+        INCLUDING admin-permission users (they must stay demotable from the
+        admin Users window); only the bootstrap local-admin account itself is
+        excluded. Unreadable profiles are skipped, never fatal (Article IV)."""
         users_dir = _data_root() / "users"
         if not users_dir.exists():
             return []
@@ -1056,12 +1098,21 @@ class AuthStore:
                 if not p.exists():
                     continue
                 prof = json.loads(p.read_text(encoding="utf-8"))
-                if not isinstance(prof, dict) or prof.get("role") == "admin":
+                if not isinstance(prof, dict):
                     continue
                 email = prof.get("email") or udir.name
+                role = prof.get("role")
+                raw = prof.get("data_roles")
+                if isinstance(raw, list):
+                    held = [r for r in raw if isinstance(r, str) and r]
+                else:
+                    legacy = prof.get("data_role")
+                    held = [legacy] if isinstance(legacy, str) and legacy else []
                 rows.append({
                     "email": email,
-                    "data_role": prof.get("data_role") or "base",
+                    "role": role if role in self._KNOWN_ROLES else "user",
+                    "data_role": (held[0] if held else "base"),   # legacy key
+                    "data_roles": held,
                     "created_at": prof.get("created_at"),
                     "last_login_at": prof.get("last_login_at"),
                 })

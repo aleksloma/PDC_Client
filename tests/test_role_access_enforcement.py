@@ -115,6 +115,19 @@ def test_api_db_tables_scope_grant_covers_connection(client, registry):
     assert names == {"clients information", "transactions"}
 
 
+def test_api_db_tables_union_across_multiple_roles(client, registry):
+    """19c: a user holding SEVERAL roles sees the UNION of their grants — the
+    route path (chat/upload gates ride the same allowed_table_ids_for)."""
+    store = roles_store.RolesStore()
+    a = store.create_role({"name": "A", "table_ids": [registry["cl_info"]]},
+                          actor=ADMIN)
+    b = store.create_role({"name": "B", "table_ids": [registry["tr_data"]]},
+                          actor=ADMIN)
+    local_store.AuthStore().set_data_roles(OWNER, [a["id"], b["id"]])
+    names = {t["display_name"] for t in client.get("/api/db_tables").json()["tables"]}
+    assert names == {"clients information", "transactions"}
+
+
 def test_new_table_under_granted_schema_visible_without_role_edit(client, registry):
     import pandas as pd
     _grant({"name": "R", "scope_grants": [

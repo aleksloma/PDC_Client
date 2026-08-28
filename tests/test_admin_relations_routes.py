@@ -849,7 +849,7 @@ def test_accept_snapshot_failure_rolls_back_completely(client, fk_setup, monkeyp
     rid = _recs()[0]["id"]
     import db_scheduler
     monkeypatch.setattr(db_scheduler, "refresh_one_table",
-                        lambda tid, actor: {"ok": False, "error": "disk full"})
+                        lambda tid, actor, **kw: {"ok": False, "error": "disk full"})
     tables_before = {t["id"] for t in db_sources.DataSourceStore().list_tables()}
     r = client.post("/api/admin/relations/recommendations/accept", json={"id": rid})
     assert r.status_code == 200
@@ -1285,8 +1285,8 @@ def test_accept_db_timeout_names_the_database_and_rolls_back(
     rid = _analyze_regions(client)
     import db_scheduler
     monkeypatch.setattr(db_scheduler, "refresh_one_table",
-                        lambda tid, actor: {"ok": False,
-                                            "error": "Database snapshot timed out."})
+                        lambda tid, actor, **kw: {"ok": False,
+                                                  "error": "Database snapshot timed out."})
     before = {t["id"] for t in db_sources.DataSourceStore().list_tables()}
     data = client.post("/api/admin/relations/recommendations/accept",
                        json={"id": rid}).json()

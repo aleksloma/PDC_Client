@@ -77,7 +77,7 @@ def _normalize_dtype(s) -> str:
 
 
 def refresh_one_table(table_id: str, *, actor: str = "scheduler",
-                      force: bool = True) -> dict:
+                      force: bool = True, actor_kind: str | None = None) -> dict:
     """Re-snapshot one registered table and re-sync drifted chat metas.
     Never raises. Returns {ok, rows?, bytes?, refreshed_at?, drift?,
     skipped?, error?}.
@@ -121,7 +121,8 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler",
         store.mark_checked(table_id)
         log_with_sid("db_refresh", "info", f"DB_REFRESH_UNCHANGED table={label}")
         db_sources.audit(actor, "table.refresh", target=table_id,
-                         detail={"table": label, "skipped": True, "ok": True})
+                         detail={"table": label, "skipped": True, "ok": True},
+                         actor_kind=actor_kind)
         return {"ok": True, "skipped": True, "rows": row.get("row_count"),
                 "refreshed_at": row.get("refreshed_at"),
                 "drift": {"added": [], "removed": [], "retyped": []}}
@@ -204,7 +205,8 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler",
 
     db_sources.audit(actor, "table.refresh", target=table_id,
                      detail={"table": label, "rows": res.get("rows"),
-                             "drift": drift, "ok": True})
+                             "drift": drift, "ok": True},
+                     actor_kind=actor_kind)
     return {"ok": True, "skipped": False, "rows": res.get("rows"),
             "bytes": res.get("bytes"),
             "refreshed_at": (store.get_table(table_id) or {}).get("refreshed_at"),

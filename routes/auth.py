@@ -56,23 +56,42 @@ def _valid_login_id(value: str) -> bool:
 def _public_profile(email: str) -> dict:
     """Shape the profile in the way dashboard.js expects.
 
-    NOTE: the admin flag is `is_local_admin`, deliberately NOT `is_admin` —
-    dashboard.js feeds `profile.is_admin` into the B2C Publish context-menu
-    items, whose routes return 400 by design on-prem."""
+    NOTE: the admin flags are `is_local_admin` (ANY admin permission —
+    bootstrap and promoted alike; no JS consumer, kept for shape stability)
+    and `is_admin_user` (19g: PROMOTED admin — permission "admin" but not
+    the bootstrap account), deliberately NEVER `is_admin` — dashboard.js
+    feeds `profile.is_admin` into the B2C Publish context-menu items, whose
+    routes return 400 by design on-prem."""
+    is_power = False
+    try:
+        import roles_store
+        is_power = roles_store.is_power_user(email)   # permission == "power" (19e)
+    except Exception as e:
+        log_with_sid(email, "warning", f"PROFILE_POWER_FLAG_FAILED: {e}")
+    is_admin_user = False
+    try:
+        store = AuthStore()
+        is_admin_user = store.is_admin(email) and not store.is_bootstrap_admin(email)
+    except Exception as e:
+        log_with_sid(email, "warning", f"PROFILE_ADMIN_FLAG_FAILED: {e}")
     return {
         "username": email,
         "email": email,
         "full_name": "",
         "subscription_plan": _FIXED_PLAN,
         "is_local_admin": AuthStore().is_admin(email),
+        "is_power_user": is_power,
+        "is_admin_user": is_admin_user,
     }
 
 
 def _post_login_target(email: str) -> str:
-    """Where a signed-in user lands. The local admin is config-only — it goes
-    straight to the Data-sources page, never the /lab chat UI (app.py's /lab
-    route mirrors this with a redirect guard)."""
-    return "/admin/data_sources" if AuthStore().is_admin(email) else "/lab"
+    """Where a signed-in user lands. Only the BOOTSTRAP ladmin account is
+    config-only — it goes straight to the Data-sources page, never the /lab
+    chat UI (app.py's /lab route mirrors this with a redirect guard). A
+    PROMOTED admin (19g) lands on /lab like everyone else."""
+    return ("/admin/data_sources"
+            if AuthStore().is_bootstrap_admin(email) else "/lab")
 
 
 # --- Auth landing + login ----------------------------------------------------

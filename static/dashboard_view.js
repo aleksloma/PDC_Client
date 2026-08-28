@@ -933,6 +933,15 @@
       });
       const changePw = document.getElementById('btnChangePassword');
       if (changePw) changePw.style.display = 'none';
+      // DB config (power users / promoted admins) — same navigation as
+      // dashboard.js; without this binding the shared partial's item was a
+      // dead button on this page.
+      const dbConfig = document.getElementById('btnDbConfig');
+      if (dbConfig) {
+        dbConfig.addEventListener('click', (e) => {
+          window.location.href = e.currentTarget.dataset.target || '/power/data_sources';
+        });
+      }
       const logout = document.getElementById('btnLogout');
       if (logout) {
         logout.addEventListener('click', async () => {

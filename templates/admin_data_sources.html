@@ -18,7 +18,7 @@
         {# logo_white.png — the white wordmark; the dark logo2.png is
            invisible on the navy sidebar #}
         <img src="/static/logo_white.png?v={{ ts }}" alt="PowerDataChat" class="adm-brand-logo" />
-        <span class="adm-brand-sub">Administration</span>
+        <span class="adm-brand-sub">{% if manager_mode == 'power' %}Data sources{% else %}Administration{% endif %}</span>
       </div>
 
       <nav class="adm-nav">
@@ -34,6 +34,7 @@
           <span class="adm-nav-ico">🔗</span> Relations
           <span class="adm-nav-count" id="navRelCount"></span>
         </button>
+        {% if manager_mode != 'power' %}
         <button class="adm-nav-item" data-section="users">
           <span class="adm-nav-ico">👥</span> Users
           <span class="adm-nav-count" id="navUserCount"></span>
@@ -48,6 +49,7 @@
         <button class="adm-nav-item" data-section="audit">
           <span class="adm-nav-ico">📜</span> Audit log
         </button>
+        {% endif %}
       </nav>
 
       <div class="adm-sidebar-footer">
@@ -55,6 +57,11 @@
           <span class="adm-user-avatar">{{ (username or 'A')[0]|upper }}</span>
           <span class="adm-user-name" title="{{ username }}">{{ username }}</span>
         </div>
+        {# 19g: promoted admins are full chat users too — the /admin route
+           passes back_to_chat for them (bootstrap ladmin gets false). #}
+        {% if manager_mode == 'power' or back_to_chat | default(false) %}
+        <a href="/lab" class="adm-footer-btn adm-back-link">← Back to chat</a>
+        {% endif %}
         <button id="btnAdmChangePw" class="adm-footer-btn">Change password</button>
         <button id="btnAdmLogout" class="adm-footer-btn">Sign out</button>
         <div class="adm-build-stamp" title="The running build — also served by /version">
@@ -70,10 +77,21 @@
         <header class="adm-page-head">
           <div>
             <h1>Database connections</h1>
-            <p class="adm-page-sub">Read-only credentials to your databases. Users never see these —
-               they only pick from the tables you register.</p>
+            <p class="adm-page-sub">{% if manager_mode == 'power' %}The connections your granted scope
+               covers — read-only here; your administrator manages them.{% else %}Read-only credentials
+               to your databases. Users never see these — they only pick from the tables you
+               register.{% endif %}</p>
+            {% if manager_mode == 'power' and manage_scope_summary %}
+            <p id="powerScopeSummary" class="adm-page-sub"><strong>{{ manage_scope_summary }}</strong></p>
+            {% if read_beyond_manage %}
+            <p class="adm-page-sub adm-muted">Read-only roles give chat access, not management —
+               ask your administrator for a manage grant.</p>
+            {% endif %}
+            {% endif %}
           </div>
+          {% if manager_mode != 'power' %}
           <button id="btnAddConnection" class="adm-btn primary">＋ Add connection</button>
+          {% endif %}
         </header>
 
         <!-- Encryption-key warning (shown when CLIENT_ENCRYPTION_KEY is unset/invalid) -->
@@ -83,6 +101,7 @@
           the container is restarted.
         </div>
 
+        {% if manager_mode != 'power' %}
         <!-- Onboarding hero: rendered by JS when there are zero connections -->
         <div id="connOnboarding" class="adm-hero hidden">
           <h2>Give your users live database tables in three steps</h2>
@@ -100,6 +119,7 @@
           </ol>
           <button id="btnAddConnectionHero" class="adm-btn primary big">＋ Add your first connection</button>
         </div>
+        {% endif %}
 
         <div id="connectionsList"></div>
       </section>
@@ -224,19 +244,24 @@
         </div>
       </section>
 
-      <!-- Users (role assignment; the local admin is config-only and never
-           listed here) -->
+      <!-- Users (role assignment + permission level; the bootstrap local
+           admin account is config-only and never listed here) -->
+      {% if manager_mode != 'power' %}
       <section id="secUsers" class="adm-section" hidden>
         <header class="adm-page-head">
           <div>
             <h1>Users</h1>
-            <p class="adm-page-sub">Everyone who has signed in. Each user has ONE role that
-               controls which registered database tables they can pick and refresh.
-               Existing chats always keep their saved data.</p>
+            <p class="adm-page-sub">Everyone who has signed in. Roles control which registered
+               database tables a user can pick and refresh (several roles combine); the
+               permission level (Standard / Power user / Local admin) controls whether they
+               may manage data sources. Existing chats always keep their saved data.</p>
           </div>
         </header>
         <div class="adm-users-toolbar">
-          <input type="search" id="userSearch" class="adm-search" placeholder="Search by email…" />
+          {# autocomplete=off + non-credential name: Chrome used to autofill the
+             saved login email here and silently filter the list to one user. #}
+          <input type="search" id="userSearch" class="adm-search" autocomplete="off"
+                 name="pdc-user-filter" placeholder="Filter users…" />
         </div>
         <div id="usersList"></div>
       </section>
@@ -256,8 +281,11 @@
         </header>
         <div id="rolesList"></div>
       </section>
+      {% endif %}
 
-      <!-- Refresh schedule -->
+      {% if manager_mode != 'power' %}
+      <!-- Refresh schedule (GLOBAL — ladmin-only; per-table overrides live in
+           the always-present #tableScheduleModal reached from the Tables list) -->
       <section id="secSchedule" class="adm-section" hidden>
         <header class="adm-page-head">
           <div>
@@ -280,6 +308,7 @@
           </div>
         </div>
       </section>
+      {% endif %}
 
       <!-- Per-table schedule override modal (narrow #pwModal chrome) -->
       <div id="tableScheduleModal" class="adm-modal-backdrop hidden">
@@ -308,6 +337,7 @@
         </div>
       </div>
 
+      {% if manager_mode != 'power' %}
       <!-- Audit log -->
       <section id="secAudit" class="adm-section" hidden>
         <header class="adm-page-head">
@@ -320,6 +350,7 @@
         </header>
         <div id="auditList" class="adm-card"></div>
       </section>
+      {% endif %}
 
     </main>
   </div>
@@ -403,6 +434,10 @@
               <select id="twTable"></select>
             </label>
           </div>
+          <label class="adm-check adm-sys-schema-toggle">
+            <input type="checkbox" id="twShowSystemSchemas" />
+            <span class="adm-label-note">Show system schemas</span>
+          </label>
           <div id="twPickStatus" class="adm-muted"></div>
         </div>
 
@@ -467,11 +502,22 @@
           </div>
           <div id="twRelations"></div>
 
-          <div class="adm-subhead">
-            <h4>Access <span class="adm-label-note">(roles whose members can pick this table —
-              roles already covering it via a schema/connection grant are shown locked)</span></h4>
+          {# 19f publish + share: power users get the panel too, limited to
+             their HELD roles (GET /api/admin/my_roles) — all unchecked by
+             default, so registering exposes the table to no one but the
+             registerer (the ownership read) until they opt in. #}
+          <div id="twAccessWrap">
+            <div class="adm-subhead">
+              {% if manager_mode == 'power' %}
+              <h4>Share with your roles <span class="adm-label-note">(unchecked = only you;
+                roles already covering it via a schema/connection grant are shown locked)</span></h4>
+              {% else %}
+              <h4>Access <span class="adm-label-note">(roles whose members can pick this table —
+                roles already covering it via a schema/connection grant are shown locked)</span></h4>
+              {% endif %}
+            </div>
+            <div id="twAccessRoles" class="adm-access-panel adm-muted">Loading roles…</div>
           </div>
-          <div id="twAccessRoles" class="adm-access-panel adm-muted">Loading roles…</div>
 
           <label class="adm-check adm-confirm">
             <input type="checkbox" id="twConfirm" />
@@ -570,9 +616,16 @@
           </label>
         </div>
         <div class="adm-subhead">
-          <h4>Table access <span class="adm-label-note">(checking a schema or connection grants
-            every table under it — including tables registered later)</span></h4>
+          <h4>Table access</h4>
         </div>
+        {# 19f two-axis grid: one tree, two checkbox columns (Metabase shape). #}
+        <div class="adm-tree-colhead">
+          <span class="adm-tree-col" title="Members can pick these tables in chat. Schema and connection checks include tables registered later.">Chat access</span>
+          <span class="adm-tree-col adm-tree-col-manage" title="Members with the Power user permission can register tables, relations and schedules here.">Manage</span>
+        </div>
+        <p class="adm-label-note adm-tree-legend">Chat access: schema and connection checks include
+          tables registered later. Manage: members with the Power user permission can register
+          tables, relations and schedules there.</p>
         <div id="roleAccessTree" class="adm-tree"></div>
         <div id="roleError" class="adm-test-result bad hidden"></div>
       </div>
@@ -613,6 +666,12 @@
     </div>
   </div>
 
+  <script>
+    window.__MANAGER_MODE__ = "{{ manager_mode | default('admin') }}";
+    {# tojson: autoescape would entity-escape '/& inside emails and break the
+       registered_by === MANAGER_EMAIL ownership compare in the JS #}
+    window.__MANAGER_EMAIL__ = {{ username | tojson }};
+  </script>
   <script src="/static/admin_data_sources.js?v={{ ts }}"></script>
 </body>
 </html>

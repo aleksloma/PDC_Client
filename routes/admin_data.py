@@ -1,10 +1,25 @@
-"""Admin "Data sources" API — ladmin-only management of database connections
-and registered tables.
+"""Admin "Data sources" API — management of database connections and
+registered tables by ladmin, plus scoped self-service by POWER USERS.
 
 Security model:
-  - Every route is behind `_require_admin` (role == "admin" on the local user
-    record; 403 while a forced password change is pending). Denials are
-    audited (`admin.denied`).
+  - Connection lifecycle (create/edit/delete/test/refresh-all), the GLOBAL
+    refresh schedule and the audit tail stay behind `_require_admin`
+    (role == "admin" on the local user record; 403 while a forced password
+    change is pending). Denials are audited (`admin.denied`).
+  - Everything a power user may reach is behind `_require_source_manager`:
+    ladmin passes unrestricted (scope None); a user whose PERMISSION is
+    "power" (AuthStore profile role, 19e) gets the union of their held
+    roles' manage_grants (roles_store.management_scope_for — 19f: the
+    SEPARATE management axis; scope_grants are read-only reach) as the
+    management scope — every referenced physical table (connection, schema)
+    must fall inside it (403 {"code": "OUT_OF_SCOPE"} otherwise), list
+    responses are filtered to it, `access_role_ids` must be a subset of the
+    power user's held roles minus Base (403 {"code": "ROLE_NOT_HELD"},
+    validated before anything registers; their reconcile also preserves
+    unheld roles' ladmin-granted membership), and table delete additionally
+    requires `registered_by == <the power user>` (403 {"code":
+    "NOT_OWNER"}). Power-user writes carry `actor_kind: "power_user"` in
+    their audit detail.
   - Connections leave the store ONLY masked (`db_sources._mask_connection`);
     passwords are decrypted into function-locals at the moment of use.
   - The AI description draft reuses `brain_client.schema_autofill` with the
@@ -56,6 +71,63 @@ def _require_admin(request: Request):
         log_with_sid(email, "warning", f"ADMIN_DENIED path={request.url.path}")
         return None, JSONResponse({"error": "Administrator access required"}, status_code=403)
     return email, None
+
+
+def _require_source_manager(request: Request):
+    """3-tuple guard for the endpoints POWER USERS may reach: (email, scope,
+    None) on success — scope is None for ladmin (unrestricted) or the power
+    user's management grants (roles_store.management_scope_for, fail-closed) —
+    else (None, None, JSONResponse). 401/403/forced-change semantics and the
+    `admin.denied` audit row match _require_admin exactly (the guard-coverage
+    test counts those rows 1:1), with detail {"reason": "not_power_user"}."""
+    email = request.session.get("email")
+    if not email:
+        return None, None, JSONResponse({"error": "Not authenticated"}, status_code=401)
+    email = email.strip().lower()
+    if request.session.get("must_change_password"):
+        return None, None, JSONResponse({"error": "Password change required"},
+                                        status_code=403)
+    if AuthStore().is_admin(email):
+        return email, None, None
+    import roles_store
+    scope = roles_store.management_scope_for(email)
+    if scope is None:
+        db_sources.audit(email, "admin.denied", target=str(request.url.path), ok=False,
+                         detail={"reason": "not_power_user"},
+                         ip=(request.client.host if request.client else None))
+        log_with_sid(email, "warning", f"ADMIN_DENIED path={request.url.path}")
+        return None, None, JSONResponse({"error": "Administrator access required"},
+                                        status_code=403)
+    return email, scope, None
+
+
+def _kind(scope):
+    """Audit actor_kind for this request: ladmin (scope None) keeps rows
+    byte-identical; a power user's writes are labeled."""
+    return "power_user" if scope is not None else None
+
+
+def _in_scope(scope, connection_id, schema) -> bool:
+    """scope None = ladmin, unrestricted. Otherwise the physical (connection,
+    schema) must be covered by a management grant (schema case-insensitive;
+    a None-schema grant covers the whole connection)."""
+    if scope is None:
+        return True
+    import roles_store
+    return roles_store.scope_covers(scope, connection_id, schema)
+
+
+def _scoped_tables(scope, tables: list) -> list:
+    """Registry rows (CONNECTORS INCLUDED — the management page lists them)
+    inside the management scope; everything for ladmin."""
+    if scope is None:
+        return tables
+    return [t for t in tables
+            if _in_scope(scope, t.get("connection_id"), t.get("schema"))]
+
+
+def _out_of_scope(msg: str = "Outside your managed scope."):
+    return JSONResponse({"error": msg, "code": "OUT_OF_SCOPE"}, status_code=403)
 
 
 async def _run(fn, *args, **kwargs):
@@ -110,7 +182,7 @@ def _conn_cfg_and_password(store: db_sources.DataSourceStore, body: dict):
 
 @router.get("/dialects")
 async def dialects(request: Request):
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     return {"dialects": db_connector.list_dialects()}
@@ -122,12 +194,17 @@ async def dialects(request: Request):
 
 @router.get("/connections")
 async def list_connections(request: Request):
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     store = db_sources.DataSourceStore()
     conns = store.list_connections()
-    tables = store.list_tables()
+    if scope is not None:
+        # A power user sees only connections their scope references (read-only
+        # in the UI), and table counts only for tables they can manage.
+        granted = {g.get("connection_id") for g in scope}
+        conns = [c for c in conns if c.get("id") in granted]
+    tables = _scoped_tables(scope, store.list_tables())
     counts: dict = {}
     for t in tables:
         counts[t.get("connection_id")] = counts.get(t.get("connection_id"), 0) + 1
@@ -233,21 +310,37 @@ async def delete_connection(request: Request, cid: str):
 
 @router.get("/connections/{cid}/schemas")
 async def connection_schemas(request: Request, cid: str):
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
+    if scope is not None and not any(g.get("connection_id") == cid for g in scope):
+        return _out_of_scope()
     store = db_sources.DataSourceStore()
     cfg, password, resp = _conn_cfg_and_password(store, {"connection_id": cid})
     if resp is not None:
         return resp
-    return await _run(db_connector.list_schemas, cfg, password, sid=f"admin:{email}")
+    res = await _run(db_connector.list_schemas, cfg, password, sid=f"admin:{email}")
+    if scope is not None and res.get("ok"):
+        # Schema-level grants narrow the browser to the granted schemas; any
+        # whole-connection grant (schema None) keeps the full list.
+        conn_grants = [g for g in scope if g.get("connection_id") == cid]
+        if all(g.get("schema") is not None for g in conn_grants):
+            granted = {str(g.get("schema")).lower() for g in conn_grants}
+            res["schemas"] = [s for s in (res.get("schemas") or [])
+                              if str(s).lower() in granted]
+            if str(res.get("default_schema") or "").lower() not in granted:
+                res["default_schema"] = (res["schemas"][0]
+                                         if res["schemas"] else None)
+    return res
 
 
 @router.get("/connections/{cid}/tables")
 async def connection_tables(request: Request, cid: str, schema: str = ""):
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
+    if not _in_scope(scope, cid, schema or None):
+        return _out_of_scope()
     store = db_sources.DataSourceStore()
     cfg, password, resp = _conn_cfg_and_password(store, {"connection_id": cid})
     if resp is not None:
@@ -339,16 +432,20 @@ def _collect_evidence_warnings(recs: list, tables: list, email: str) -> list:
 
 
 def _persist_sql_recommendations(store, tables: list, stats: dict,
-                                 email: str) -> dict:
+                                 email: str, scope=None, actor_kind=None) -> dict:
     """Turn extraction's unregistered-join evidence into persistent
     "Recommended tables". Only names resolvable to ONE connection (the same
     resolve_unknown_tables rule the register shortcut uses) become
     recommendations — the rest stay ephemeral unknown_tables strings.
     Identifiers and counts only; the SQL text never reaches this function.
-    Never raises — a store failure must not discard the already-computed
+    A power user's scope also bounds the WRITE: a resolved recommendation
+    whose physical (connection, schema) falls outside it is never persisted
+    (the read endpoints filter too, but an out-of-scope row must not exist at
+    all). Never raises — a store failure must not discard the already-computed
     candidates of the analyze response (Article IV)."""
     try:
-        return _persist_sql_recommendations_inner(store, tables, stats, email)
+        return _persist_sql_recommendations_inner(store, tables, stats, email,
+                                                  scope, actor_kind)
     except Exception as e:
         log_with_sid(email, "error",
                      f"REL_RECOMMEND_PERSIST_FAILED: {type(e).__name__}")
@@ -356,7 +453,8 @@ def _persist_sql_recommendations(store, tables: list, stats: dict,
 
 
 def _persist_sql_recommendations_inner(store, tables: list, stats: dict,
-                                       email: str) -> dict:
+                                       email: str, scope=None,
+                                       actor_kind=None) -> dict:
     joins = stats.get("unregistered_joins") or []
     if not joins:
         return {"created": 0, "updated": 0}
@@ -401,9 +499,12 @@ def _persist_sql_recommendations_inner(store, tables: list, stats: dict,
         item["evidence"].append({"origin": "sql", "other": oref,
                                  "pairs": j.get("pairs") or [],
                                  "count": int(j.get("count") or 0)})
-    if not batch:
+    items = [it for it in batch.values()
+             if _in_scope(scope, it.get("connection_id"), it.get("schema"))]
+    if not items:
         return {"created": 0, "updated": 0}
-    return store.upsert_recommendations(list(batch.values()), actor=email)
+    return store.upsert_recommendations(items, actor=email,
+                                        actor_kind=actor_kind)
 
 
 def _rel_matches(rel: dict, ref: str, jk: list) -> bool:
@@ -426,12 +527,14 @@ async def scan_relations(request: Request):
     """Run the FK + name/description discovery pipeline over ALL registered
     tables. FKs are fetched by LIVE introspection (they are not persisted in
     the registry); an unreachable connection degrades that source only —
-    name/description candidates still come back. Nothing is written."""
-    email, err = _require_admin(request)
+    name/description candidates still come back. Nothing is written. A power
+    user's scan runs over their manageable tables only — introspection,
+    candidates, recommendations and the confirmed count all stay in scope."""
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     store = db_sources.DataSourceStore()
-    tables = store.list_tables()
+    tables = _scoped_tables(scope, store.list_tables())
     degraded: list = []
     fk_map: dict = {}
 
@@ -492,8 +595,14 @@ async def scan_relations(request: Request):
         fk_batch.append({"connection_id": ref.get("connection_id"),
                          "schema": ref.get("schema"), "table": ref.get("table"),
                          "source": "fk", "frequency": 0, "evidence": evidence})
+    # A power user's scope bounds the WRITE too: an in-scope table's FK may
+    # point at a schema/connection outside a schema-limited grant — such refs
+    # still render in this response but must never persist a recommendation.
+    fk_batch = [b for b in fk_batch
+                if _in_scope(scope, b.get("connection_id"), b.get("schema"))]
     if fk_batch:
-        await _run(store.upsert_recommendations, fk_batch, email)
+        await _run(store.upsert_recommendations, fk_batch, email,
+                   actor_kind=_kind(scope))
 
     cands = await _run(relation_discovery.discover, tables, fk_map)
     # Close the loop for registrations made OUTSIDE instant-Accept (wizard,
@@ -503,7 +612,8 @@ async def scan_relations(request: Request):
     # validator and surfaced as warnings, never as bogus candidates.
     rec_cands: list = []
     registered_recs = [r for r in await _run(store.list_recommendations)
-                       if r.get("status") == "registered"]
+                       if r.get("status") == "registered"
+                       and _in_scope(scope, r.get("connection_id"), r.get("schema"))]
     evidence_warnings = _collect_evidence_warnings(registered_recs, tables, email)
     for rec in registered_recs:
         rec_cands.extend(
@@ -517,7 +627,8 @@ async def scan_relations(request: Request):
     db_sources.audit(email, "relations.scan",
                      detail={"tables": len(tables), "candidates": len(cands),
                              "degraded": len(degraded),
-                             "unregistered_refs": len(unregistered)})
+                             "unregistered_refs": len(unregistered)},
+                     actor_kind=_kind(scope))
     return {"ok": True, "candidates": cands, "degraded": degraded,
             "unregistered_refs": unregistered,
             "evidence_warnings": evidence_warnings,
@@ -532,7 +643,7 @@ async def analyze_sql(request: Request):
     only, and sqlglot's error text (it embeds the SQL) never leaves the
     parser. Only table/column IDENTIFIERS extracted from it persist, as the
     "Recommended tables" evidence for unregistered join endpoints."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     body = await _json_body(request)
@@ -542,20 +653,26 @@ async def analyze_sql(request: Request):
     dialect = relation_discovery.SQLGLOT_DIALECT.get(
         (body.get("db_type") or "").strip().lower())
     store = db_sources.DataSourceStore()
-    tables = store.list_tables()
+    tables = _scoped_tables(scope, store.list_tables())
     cands, stats = await _run(relation_discovery.extract_sql_joins,
                               sql_text, tables, dialect)
     cands = relation_discovery.filter_same_physical(cands, tables)
     cands = relation_discovery.filter_existing_physical(cands, tables)
     cands = relation_discovery.dedupe_physical_targets(cands, tables)
     cands = await _run(_verify_and_band, cands)
+    conns = store.list_connections()
+    if scope is not None:
+        granted = {g.get("connection_id") for g in scope}
+        conns = [c for c in conns if c.get("id") in granted]
     hints = relation_discovery.resolve_unknown_tables(
-        stats.get("unknown_tables") or [], tables, store.list_connections())
-    recs = await _run(_persist_sql_recommendations, store, tables, stats, email)
+        stats.get("unknown_tables") or [], tables, conns)
+    recs = await _run(_persist_sql_recommendations, store, tables, stats, email,
+                      scope, _kind(scope))
     db_sources.audit(email, "relations.analyze_sql",
                      detail={"statements": stats.get("statements"),
                              "failed": stats.get("failed"),
-                             "candidates": len(cands)})
+                             "candidates": len(cands)},
+                     actor_kind=_kind(scope))
     return {"ok": True, "candidates": cands, "stats": stats,
             "unknown_table_hints": hints,
             "recommendations": recs,
@@ -696,14 +813,24 @@ async def wizard_suggest(request: Request):
     FKs + preview sample + typed descriptions) plus registry metadata and
     parent snapshots — no live DB access, nothing written. Sample row values
     stay in-process; the audit row carries counts only (Article II)."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     body = await _json_body(request)
     table_name = (body.get("table_name") or "").strip()
     if not table_name:
         return JSONResponse({"error": "table_name is required."}, status_code=400)
-    registered = db_sources.DataSourceStore().list_tables()
+    if not _in_scope(scope, (body.get("connection_id") or "").strip(),
+                     (body.get("schema") or "").strip() or None):
+        return _out_of_scope()
+    store = db_sources.DataSourceStore()
+    editing_tid = (body.get("editing_tid") or "").strip()
+    if editing_tid and db_sources.DataSourceStore.valid_id(editing_tid):
+        own = store.get_table(editing_tid)
+        if own is not None and not _in_scope(scope, own.get("connection_id"),
+                                             own.get("schema")):
+            return _out_of_scope()
+    registered = _scoped_tables(scope, store.list_tables())
     try:
         cands = await _run(_wizard_suggest_candidates, body, registered)
     except Exception as e:
@@ -716,7 +843,8 @@ async def wizard_suggest(request: Request):
                      target=f"{(body.get('schema') or '').strip()}.{table_name}",
                      detail={"candidates": len(cands),
                              "fk": sum(1 for c in cands if "fk" in c["sources"]),
-                             "registered": len(registered)})
+                             "registered": len(registered)},
+                     actor_kind=_kind(scope))
     return {"ok": True, "candidates": cands}
 
 
@@ -732,17 +860,20 @@ async def accept_relations(request: Request):
     gate, NO SCHEMA_DRIFT check, and NO re-snapshot: those locks protect the
     column/description shape, which this endpoint cannot touch — it only
     edits `relations` on the child table's doc."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     body = await _json_body(request)
 
-    def _reject(msg: str):
+    def _reject(msg: str, status: int = 400, code: str | None = None):
         # A rejected write is an admin action too — leave an ok:false trace
         # (parity with admin.denied; previously a failed accept vanished).
         db_sources.audit(email, "relations.accept", ok=False,
-                         detail={"error": msg[:200]})
-        return JSONResponse({"error": msg}, status_code=400)
+                         detail={"error": msg[:200]}, actor_kind=_kind(scope))
+        payload = {"error": msg}
+        if code:
+            payload["code"] = code
+        return JSONResponse(payload, status_code=status)
 
     items = body.get("relations")
     if not isinstance(items, list) or not items:
@@ -757,6 +888,14 @@ async def accept_relations(request: Request):
         parent = store.get_table((item.get("related_table_id") or "").strip())
         if child is None or parent is None:
             return _reject(f"relations[{idx}]: unknown table id.")
+        # A power user may relate only tables inside their managed scope —
+        # BOTH sides (the child doc is the one mutated).
+        for side in (child, parent):
+            if not _in_scope(scope, side.get("connection_id"), side.get("schema")):
+                return _reject(
+                    f"'{side.get('display_name') or side.get('table_name')}' "
+                    "is outside your managed scope.",
+                    status=403, code="OUT_OF_SCOPE")
         jk = item.get("join_keys")
         ok_shape = (isinstance(jk, list) and jk and all(
             isinstance(p, (list, tuple)) and len(p) == 2
@@ -860,12 +999,14 @@ async def accept_relations(request: Request):
             changed = True
         if changed:
             doc["relations"] = existing
-            await _run(store.upsert_table, doc, actor=email)
+            await _run(store.upsert_table, doc, actor=email,
+                       actor_kind=_kind(scope))
 
     db_sources.audit(email, "relations.accept",
                      detail={"accepted": accepted, "skipped": skipped,
                              "replaced": replaced,
-                             "tables": sorted(by_child.keys())})
+                             "tables": sorted(by_child.keys())},
+                     actor_kind=_kind(scope))
     return {"ok": True, "accepted": accepted, "skipped": skipped,
             "replaced": replaced}
 
@@ -875,7 +1016,7 @@ async def dismiss_relation(request: Request):
     """Audit trail for a dismissed candidate. Dismissals are session-local by
     design (no persistence) — this endpoint exists so the action is on the
     record like every other ladmin decision."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     body = await _json_body(request)
@@ -884,6 +1025,13 @@ async def dismiss_relation(request: Request):
     if not (db_sources.DataSourceStore.valid_id(tid)
             and db_sources.DataSourceStore.valid_id(rid)):
         return JSONResponse({"error": "Unknown table id."}, status_code=400)
+    if scope is not None:
+        store = db_sources.DataSourceStore()
+        for ref in (tid, rid):
+            doc = store.get_table(ref)
+            if doc is not None and not _in_scope(scope, doc.get("connection_id"),
+                                                 doc.get("schema")):
+                return _out_of_scope()
     jk = body.get("join_keys")
     jk = [[str(p[0])[:128], str(p[1])[:128]] for p in jk
           if isinstance(p, (list, tuple)) and len(p) == 2] if isinstance(jk, list) else []
@@ -891,7 +1039,8 @@ async def dismiss_relation(request: Request):
     db_sources.audit(email, "relations.dismiss", target=f"{tid}->{rid}",
                      detail={"join_keys": jk,
                              "band": band if band in ("confirmed", "suggested",
-                                                      "attention") else None})
+                                                      "attention") else None},
+                     actor_kind=_kind(scope))
     return {"ok": True}
 
 
@@ -903,12 +1052,12 @@ async def relations_graph(request: Request):
     unioned with any body-passed last-scan refs (kept for compatibility —
     the graph never introspects). Dismissed recommendations never render.
     Read-only."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     body = await _json_body(request)
     store = db_sources.DataSourceStore()
-    tables = store.list_tables()
+    tables = _scoped_tables(scope, store.list_tables())
     refs: dict = {}
     for r in body.get("unregistered_refs") or []:
         if isinstance(r, dict) and r.get("table"):
@@ -918,6 +1067,8 @@ async def relations_graph(request: Request):
             refs.setdefault(key, dict(r))
     for rec in await _run(store.list_recommendations):
         if rec.get("status") != "open" or not rec.get("table"):
+            continue
+        if not _in_scope(scope, rec.get("connection_id"), rec.get("schema")):
             continue
         key = (str(rec.get("connection_id") or ""),
                str(rec.get("schema") or "").lower(),
@@ -939,13 +1090,15 @@ async def list_recommendations(request: Request):
     read time with the dynamic role and resolved join partners. Bridge rows
     rank above referenced rows; within a role, by frequency. Dismissed rows
     are included (flagged by status) so the UI can offer show/restore."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     store = db_sources.DataSourceStore()
-    tables = store.list_tables()
+    tables = _scoped_tables(scope, store.list_tables())
     out = []
     for rec in await _run(store.list_recommendations):
+        if not _in_scope(scope, rec.get("connection_id"), rec.get("schema")):
+            continue
         summary = relation_discovery.recommendation_summary(rec, tables)
         out.append({**rec, **summary})
     out.sort(key=lambda r: (0 if r.get("role") == "bridge" else 1,
@@ -960,7 +1113,7 @@ async def recommendation_status(request: Request):
     """Persistent dismiss / restore for one recommended table. A dismissed
     recommendation never reappears on later scans/analyzes until restored;
     registered ones are immutable here (the registry owns them)."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     body = await _json_body(request)
@@ -971,8 +1124,15 @@ async def recommendation_status(request: Request):
         return JSONResponse(
             {"error": "id and status (open|dismissed) are required."},
             status_code=400)
-    rec = await _run(db_sources.DataSourceStore().set_recommendation_status,
-                     rid, status, email)
+    store = db_sources.DataSourceStore()
+    if scope is not None:
+        target = next((r for r in await _run(store.list_recommendations)
+                       if r.get("id") == rid), None)
+        if target is not None and not _in_scope(scope, target.get("connection_id"),
+                                                target.get("schema")):
+            return _out_of_scope()
+    rec = await _run(store.set_recommendation_status,
+                     rid, status, email, actor_kind=_kind(scope))
     if rec is None:
         return JSONResponse(
             {"error": "Unknown recommendation (or already registered)."},
@@ -996,7 +1156,7 @@ async def classify_recommendation(request: Request):
     A SUGGESTION only — the admin confirms or flips it, and the registration
     uses their choice. Any failure degrades to the historical default rather
     than blocking Accept; the real error surfaces on the accept attempt."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     body = await _json_body(request)
@@ -1007,6 +1167,8 @@ async def classify_recommendation(request: Request):
     if rec is None:
         return JSONResponse({"error": "Unknown recommendation."},
                             status_code=404)
+    if not _in_scope(scope, rec.get("connection_id"), rec.get("schema")):
+        return _out_of_scope()
     cfg, password, resp = _conn_cfg_and_password(
         store, {"connection_id": str(rec.get("connection_id") or "")})
     if resp is not None:
@@ -1039,7 +1201,7 @@ async def accept_recommendation(request: Request):
     Any failure leaves NO half-registered state and the recommendation open;
     connectivity-style failures return 200 {ok:false} naming the dependency
     that failed. Every dependency on this path is time-bounded."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     body = await _json_body(request)
@@ -1065,6 +1227,8 @@ async def accept_recommendation(request: Request):
         return JSONResponse(
             {"error": f"Recommendation is {rec.get('status')}."},
             status_code=400)
+    if not _in_scope(scope, rec.get("connection_id"), rec.get("schema")):
+        return _out_of_scope()
     cid = str(rec.get("connection_id") or "")
     cfg, password, resp = _conn_cfg_and_password(store, {"connection_id": cid})
     if resp is not None:
@@ -1083,7 +1247,8 @@ async def accept_recommendation(request: Request):
                          detail={"table": f"{schema}.{table}" if schema else table,
                                  "note": "already_registered",
                                  "suggested_type": suggested_type,
-                                 "chosen_type": chosen_type})
+                                 "chosen_type": chosen_type},
+                         actor_kind=_kind(scope))
         return {"ok": True, "status": "registered",
                 "note": "This table is already registered.", "candidates": []}
 
@@ -1124,10 +1289,11 @@ async def accept_recommendation(request: Request):
             relations=[],
             intro=intro, where_filter=None, row_cap=None, email=email)
         _phase("register")
-        saved = store.upsert_table(doc, actor=email)
+        saved = store.upsert_table(doc, actor=email, actor_kind=_kind(scope))
         import db_scheduler
         _phase("snapshot")
-        snap = db_scheduler.refresh_one_table(saved["id"], actor=email)
+        snap = db_scheduler.refresh_one_table(saved["id"], actor=email,
+                                              actor_kind=_kind(scope))
         if not snap.get("ok"):
             # Accept is one atomic gesture: unlike the wizard save (which
             # keeps the registration for a manual "Refresh now"), roll the
@@ -1135,7 +1301,7 @@ async def accept_recommendation(request: Request):
             # store's reconcile hook restores the rec to open. A nightly-
             # scheduler race can at worst leave an orphan parquet, the same
             # window a plain table delete has today.
-            store.delete_table(saved["id"], actor=email)
+            store.delete_table(saved["id"], actor=email, actor_kind=_kind(scope))
             return {"ok": False,
                     "error": (snap.get("error") or "Snapshot failed")
                     + " — the table was not registered."}
@@ -1149,7 +1315,8 @@ async def accept_recommendation(request: Request):
     db_sources.audit(email, "relations.rec_accept", target=rid,
                      ok=bool(res.get("ok")),
                      detail={"table": phys, "suggested_type": suggested_type,
-                             "chosen_type": chosen_type})
+                             "chosen_type": chosen_type},
+                     actor_kind=_kind(scope))
     if not res.get("ok"):
         return {"ok": False, "error": res.get("error")}
 
@@ -1157,7 +1324,7 @@ async def accept_recommendation(request: Request):
     # (same chain as analyze_sql). FK evidence is not replayed — the next
     # scan's live introspection re-derives it as ground truth. v4.1: invalid
     # evidence pairs are excluded by the replay validator and surfaced.
-    tables = store.list_tables()
+    tables = _scoped_tables(scope, store.list_tables())
     warnings = _collect_evidence_warnings([rec], tables, email)
     cands = relation_discovery.recommendation_candidates(rec, tables)
     cands = relation_discovery.filter_same_physical(cands, tables)
@@ -1176,7 +1343,7 @@ async def delete_relation(request: Request):
     join_keys, and removes EVERY exact match — identical duplicates are
     indistinguishable in the overview UI. Distinct from /relations/dismiss,
     which is audit-only and never mutates the registry."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     body = await _json_body(request)
@@ -1196,6 +1363,13 @@ async def delete_relation(request: Request):
     doc = store.get_table(tid)
     if doc is None:
         return JSONResponse({"error": "Unknown table."}, status_code=404)
+    if not _in_scope(scope, doc.get("connection_id"), doc.get("schema")):
+        return _out_of_scope()
+    if db_sources.DataSourceStore.valid_id(ref):
+        parent = store.get_table(ref)
+        if parent is not None and not _in_scope(scope, parent.get("connection_id"),
+                                                parent.get("schema")):
+            return _out_of_scope()
     kept = [r for r in (doc.get("relations") or [])
             if not (isinstance(r, dict) and _rel_matches(r, ref, jk))]
     removed = len(doc.get("relations") or []) - len(kept)
@@ -1203,9 +1377,10 @@ async def delete_relation(request: Request):
         return JSONResponse({"error": "Relation not found on this table."},
                             status_code=404)
     doc["relations"] = kept
-    await _run(store.upsert_table, doc, actor=email)
+    await _run(store.upsert_table, doc, actor=email, actor_kind=_kind(scope))
     db_sources.audit(email, "relations.delete", target=f"{tid}->{ref}",
-                     detail={"join_keys": jk, "removed": removed})
+                     detail={"join_keys": jk, "removed": removed},
+                     actor_kind=_kind(scope))
     return {"ok": True, "removed": removed}
 
 
@@ -1215,20 +1390,48 @@ async def delete_relation(request: Request):
 
 @router.get("/tables")
 async def list_tables(request: Request):
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
-    return {"tables": db_sources.DataSourceStore().list_tables()}
+    return {"tables": _scoped_tables(scope,
+                                     db_sources.DataSourceStore().list_tables())}
+
+
+@router.get("/my_roles")
+async def my_roles(request: Request):
+    """The caller's HELD roles (19f) — what the power-mode wizard's "Share
+    with your roles" panel offers and locks against. Held roles only, never
+    the whole registry (that stays ladmin's GET /roles), and the built-in
+    Base role is excluded even when held: everyone is a member, so sharing
+    through it would publish to the whole platform — an administrator
+    action (save_table refuses it server-side too)."""
+    email, scope, err = _require_source_manager(request)
+    if err:
+        return err
+    import roles_store
+    rows = [{"id": r.get("id"), "name": r.get("name"),
+             "is_base": False,
+             "table_ids": r.get("table_ids") or [],
+             "scope_grants": r.get("scope_grants") or []}
+            for r in roles_store.roles_for_email(email)
+            if r.get("id") != roles_store.BASE_ROLE_ID]
+    return {"roles": rows}
 
 
 @router.post("/tables/introspect")
 async def introspect_table(request: Request):
     """Inspector introspection + first-rows preview for the registration
     wizard. Preview values go only to the admin's browser — never the brain."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     body = await _json_body(request)
+    # A power user may introspect only saved connections inside their scope —
+    # the unsaved-draft path (no connection_id) is inherently out of scope,
+    # since no grant can reference an unsaved connection.
+    if not _in_scope(scope, (body.get("connection_id") or "").strip(),
+                     (body.get("schema") or "").strip() or None):
+        return _out_of_scope()
     store = db_sources.DataSourceStore()
     cfg, password, resp = _conn_cfg_and_password(store, body)
     if resp is not None:
@@ -1246,7 +1449,8 @@ async def introspect_table(request: Request):
                          sid=f"admin:{email}")
     db_sources.audit(email, "table.introspect", target=f"{schema}.{table}",
                      detail={"columns": len(intro.get("columns") or []),
-                             "degraded": intro.get("degraded")})
+                             "degraded": intro.get("degraded")},
+                     actor_kind=_kind(scope))
     return {"ok": True, "introspection": intro, "preview": preview,
             "degraded": intro.get("degraded") or [],
             # Pre-ticks the wizard's connector box from the columns already in
@@ -1321,10 +1525,13 @@ async def draft_descriptions(request: Request):
     schema-autofill brain call. PERSISTS NOTHING — the ladmin must review,
     edit, and confirm in the save step; this endpoint has no write path at
     all (one of the four mandatory-confirm locks)."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     body = await _json_body(request)
+    if not _in_scope(scope, (body.get("connection_id") or "").strip(),
+                     (body.get("schema") or "").strip() or None):
+        return _out_of_scope()
     store = db_sources.DataSourceStore()
     cfg, password, resp = _conn_cfg_and_password(store, body)
     if resp is not None:
@@ -1335,7 +1542,8 @@ async def draft_descriptions(request: Request):
         return JSONResponse({"error": "table is required."}, status_code=400)
     res = await _run(_draft_table_descriptions, cfg, password, schema, table, email)
     db_sources.audit(email, "table.draft_descriptions",
-                     target=f"{schema}.{table}", ok=bool(res.get("ok")))
+                     target=f"{schema}.{table}", ok=bool(res.get("ok")),
+                     actor_kind=_kind(scope))
     return res
 
 
@@ -1348,7 +1556,11 @@ def _build_table_doc(*, tid: str, connection_id, schema, table: str,
     and the recommendation Accept, so the two can never drift. The confirm
     stamps come from the SESSION identity + server clock, never a body.
     `existing` carries fields upsert_table's whole-doc replace would drop:
-    the per-table schedule override + its fire stamp. Deliberately NOT
+    the per-table schedule override + its fire stamp, and `registered_by`
+    (ownership: stamped from the SESSION identity at FIRST save only and
+    carried through every edit-save — an edit never changes or introduces
+    it; a legacy doc without the field stays without it, meaning
+    ladmin-registered / not deletable by any power user). Deliberately NOT
     carried: `last_drift` / `last_fingerprint` — an edit-save is the admin
     reviewing the table (drift review resolved), and the post-save refresh
     stores a fresh fingerprint anyway."""
@@ -1358,6 +1570,10 @@ def _build_table_doc(*, tid: str, connection_id, schema, table: str,
         if isinstance(existing.get("schedule"), dict):
             carried["schedule"] = existing["schedule"]
             carried["schedule_last_fired_at"] = existing.get("schedule_last_fired_at")
+        if existing.get("registered_by"):
+            carried["registered_by"] = existing["registered_by"]
+    else:
+        carried["registered_by"] = email
     return {
         **carried,
         "id": tid if db_sources.DataSourceStore.valid_id(tid) else None,
@@ -1406,7 +1622,7 @@ async def save_table(request: Request, tid: str = ""):
     (3) descriptions_confirmed_by/at stamped from the SESSION + server clock,
     never the body; (4) a fresh introspection must match the posted column
     set (409 SCHEMA_DRIFT) so a stale wizard can't confirm the wrong shape."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     body = await _json_body(request)
@@ -1415,12 +1631,33 @@ async def save_table(request: Request, tid: str = ""):
     if verr is not None:
         return verr
 
+    # 19f publish+share: a power user may share their registration, but only
+    # with roles they HOLD — an outside id is rejected up-front (403, never
+    # silently dropped) BEFORE anything is registered or snapshotted. The
+    # built-in Base role is EXCLUDED even when held (everyone is a member —
+    # publishing to the whole platform stays ladmin's call).
+    access_role_ids = body.get("access_role_ids")
+    if isinstance(access_role_ids, list) and scope is not None:
+        import roles_store
+        held = ({r["id"] for r in roles_store.roles_for_email(email)}
+                - {roles_store.BASE_ROLE_ID})
+        outside = [r for r in access_role_ids
+                   if isinstance(r, str) and r not in held]
+        if outside:
+            return JSONResponse(
+                {"error": "You can only share a table with roles you hold "
+                          "(sharing with everyone via Base is an "
+                          "administrator action).",
+                 "code": "ROLE_NOT_HELD"}, status_code=403)
+
     cfg, password, resp = _conn_cfg_and_password(
         store, {"connection_id": body.get("connection_id")})
     if resp is not None:
         return resp
     schema = (body.get("schema") or "").strip() or None
     table = (body.get("table_name") or "").strip()
+    if not _in_scope(scope, (body.get("connection_id") or "").strip(), schema):
+        return _out_of_scope()
 
     # A physical table (connection + schema + table) may be registered only
     # ONCE — duplicate registrations are how meaningless self-relations were
@@ -1428,6 +1665,11 @@ async def save_table(request: Request, tid: str = ""):
     # duplicates in stored data keep loading, only NEW saves are blocked.
     own_id = tid if db_sources.DataSourceStore.valid_id(tid) else None
     own = store.get_table(own_id) if own_id else None
+    # An edit must also hold the EXISTING doc's physical key — a power user
+    # cannot retarget an out-of-scope registration into their scope.
+    if own is not None and not _in_scope(scope, own.get("connection_id"),
+                                         own.get("schema")):
+        return _out_of_scope()
     own_key = relation_discovery.physical_key(own) if own else None
     new_key = relation_discovery.physical_key(
         {"connection_id": body.get("connection_id"),
@@ -1488,26 +1730,39 @@ async def save_table(request: Request, tid: str = ""):
     except Exception as e:
         log_with_sid(email, "warning", f"REL_SAVE_COLCHECK_FAILED: {type(e).__name__}")
 
-    saved = store.upsert_table(doc, actor=email)
+    saved = store.upsert_table(doc, actor=email, actor_kind=_kind(scope))
 
     # Access panel (wizard step 3): canonical storage on the ROLE records,
     # never on the table doc. Absent field ⇒ no role writes (recommendation
-    # Accept + pre-feature API payloads). Best-effort: a role write failure
-    # never fails the save (Article IV).
-    access_role_ids = body.get("access_role_ids")
+    # Accept + pre-feature API payloads). 19f: a power user's list was
+    # validated up-front as a subset of their held roles ("Share with your
+    # roles" — the panel only offers held roles, and unchecked = only the
+    # registerer via the ownership read); their reconcile is limited to that
+    # held subset, so a role they do NOT hold keeps its ladmin-granted
+    # membership — set_table_roles' exact reconcile would otherwise let a PU
+    # edit-save silently strip other roles' read access. Best-effort: a role
+    # write failure never fails the save (Article IV).
     if isinstance(access_role_ids, list):
         try:
             import roles_store
+            wanted = [r for r in access_role_ids if isinstance(r, str)]
+            if scope is not None:
+                rs = roles_store.RolesStore()
+                held = ({r["id"] for r in roles_store.roles_for_email(email)}
+                        - {roles_store.BASE_ROLE_ID})
+                wanted += [ro["id"] for ro in rs.list_roles()
+                           if ro["id"] not in held
+                           and saved["id"] in (ro.get("table_ids") or [])]
             roles_store.RolesStore().set_table_roles(
-                saved["id"], [r for r in access_role_ids if isinstance(r, str)],
-                actor=email)
+                saved["id"], wanted, actor=email, actor_kind=_kind(scope))
         except Exception as e:
             log_with_sid(email, "warning", f"TABLE_ACCESS_ROLES_FAILED: {e}")
 
     # Snapshot (or re-snapshot). A failure keeps the registration saved with
     # last_refresh_error set — "Refresh now" retries.
     import db_scheduler
-    snap = await _run(db_scheduler.refresh_one_table, saved["id"], actor=email)
+    snap = await _run(db_scheduler.refresh_one_table, saved["id"], actor=email,
+                      actor_kind=_kind(scope))
     status = 201 if not db_sources.DataSourceStore.valid_id(tid) else 200
     return JSONResponse({"table": store.get_table(saved["id"]), "snapshot": snap},
                         status_code=status)
@@ -1515,12 +1770,30 @@ async def save_table(request: Request, tid: str = ""):
 
 @router.post("/tables/{tid}/delete")
 async def delete_table(request: Request, tid: str):
-    email, err = _require_admin(request)
+    """Ladmin deletes anything. A power user deletes a table ONLY when its
+    physical (connection, schema) is in their scope (403 OUT_OF_SCOPE) AND
+    they registered it themselves — `registered_by` equals their email; an
+    absent field means ladmin-registered (403 NOT_OWNER). The two codes are
+    distinct so the UI can say why."""
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     body = await _json_body(request)
-    ok = db_sources.DataSourceStore().delete_table(
-        tid, actor=email, drop_snapshot=body.get("drop_snapshot", True))
+    store = db_sources.DataSourceStore()
+    if scope is not None:
+        doc = store.get_table(tid)
+        if doc is None:
+            return JSONResponse({"error": "Unknown table."}, status_code=404)
+        if not _in_scope(scope, doc.get("connection_id"), doc.get("schema")):
+            return _out_of_scope()
+        # Case-insensitive like the ownership read and the UI's canDelete.
+        if str(doc.get("registered_by") or "").strip().lower() != email:
+            return JSONResponse(
+                {"error": "Only tables you registered yourself can be deleted.",
+                 "code": "NOT_OWNER"}, status_code=403)
+    ok = store.delete_table(
+        tid, actor=email, drop_snapshot=body.get("drop_snapshot", True),
+        actor_kind=_kind(scope))
     if not ok:
         return JSONResponse({"error": "Unknown table."}, status_code=404)
     # Best-effort prune from every role's table_ids (a stale id grants
@@ -1538,20 +1811,32 @@ async def delete_table(request: Request, tid: str):
 async def refresh_table(request: Request, tid: str):
     """Admin "Refresh now" — always a FULL snapshot (refresh_one_table's
     force default), never the fingerprint skip."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
+    if scope is not None:
+        doc = db_sources.DataSourceStore().get_table(tid)
+        if doc is None or not _in_scope(scope, doc.get("connection_id"),
+                                        doc.get("schema")):
+            return _out_of_scope()
     import db_scheduler
-    return await _run(db_scheduler.refresh_one_table, tid, actor=email)
+    return await _run(db_scheduler.refresh_one_table, tid, actor=email,
+                      actor_kind=_kind(scope))
 
 
 @router.post("/tables/{tid}/dismiss_drift")
 async def dismiss_drift(request: Request, tid: str):
     """Acknowledge the schema-drift banner for one table (audited)."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
-    if not db_sources.DataSourceStore().dismiss_drift(tid, actor=email):
+    store = db_sources.DataSourceStore()
+    if scope is not None:
+        doc = store.get_table(tid)
+        if doc is None or not _in_scope(scope, doc.get("connection_id"),
+                                        doc.get("schema")):
+            return _out_of_scope()
+    if not store.dismiss_drift(tid, actor=email, actor_kind=_kind(scope)):
         return JSONResponse({"error": "Unknown table or no drift recorded."},
                             status_code=404)
     return {"ok": True}
@@ -1624,7 +1909,7 @@ async def schedule_preview(request: Request):
     """Validate a schedule draft and echo it: canonical crons, human
     description, next 3 runs. No writes, no audit — serves the editors'
     live preview."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     import schedule_utils
@@ -1648,19 +1933,25 @@ async def schedule_preview(request: Request):
 async def set_table_schedule(request: Request, tid: str):
     """Per-table schedule override; {"schedule": null} (or absent) = inherit
     the global schedule."""
-    email, err = _require_admin(request)
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     import schedule_utils
     from datetime import datetime
     body = await _json_body(request)
     store = db_sources.DataSourceStore()
+    if scope is not None:
+        doc = store.get_table(tid)
+        if doc is None or not _in_scope(scope, doc.get("connection_id"),
+                                        doc.get("schema")):
+            return _out_of_scope()
     sched_body = body.get("schedule")
     if sched_body is not None and not isinstance(sched_body, dict):
         return JSONResponse({"error": "Unknown schedule mode.",
                              "code": "BAD_SCHEDULE"}, status_code=400)
     try:
-        found = store.set_table_schedule(tid, sched_body, actor=email)
+        found = store.set_table_schedule(tid, sched_body, actor=email,
+                                         actor_kind=_kind(scope))
     except ValueError as e:
         return JSONResponse({"error": str(e), "code": "BAD_SCHEDULE"},
                             status_code=400)

@@ -1,10 +1,15 @@
 {# Shared profile button + dropdown partial.
-   Used on dashboard.html (the /lab page).
+   Used on dashboard.html (the /lab page) and dashboard_view.html.
    Requires template context: logged_in, avatar_color, initials, display_name, subscription_plan, raw_username
+   Optional: is_power_user (defaulted false — dashboard_view passes it via
+   _profile_context too, but the default keeps any other includer safe).
 
-   ENTERPRISE: the dropdown carries exactly two actions — "Change Password"
-   (opens the small change-password modal, wired in dashboard.js) and
-   "Logout". The B2C profile/subscriptions modal entries don't exist here.
+   ENTERPRISE: the dropdown carries "Change Password" (opens the small
+   change-password modal, wired in dashboard.js) and "Logout"; a POWER USER
+   or PROMOTED ADMIN (19g) additionally gets "DB config" above them — the
+   audience-specific target (/power/data_sources vs /admin/data_sources) is
+   baked into data-target, bound in dashboard.js AND dashboard_view.js. The
+   B2C profile/subscriptions modal entries don't exist here.
 #}
 <div class="profile-dropdown-container">
   {% if logged_in %}
@@ -21,6 +26,13 @@
   {% endif %}
   <div id="profileDropdown" class="profile-dropdown hidden">
     {% if logged_in %}
+    {% if is_power_user | default(false) or is_admin_user | default(false) %}
+    {# 19g: promoted admins get the full admin page; power users keep /power.
+       The target rides a data attribute so dashboard.js stays flag-free. #}
+    <button class="dropdown-item" id="btnDbConfig" data-i18n="profile.db_config"
+      data-target="{% if is_admin_user | default(false) %}/admin/data_sources{% else %}/power/data_sources{% endif %}">DB config</button>
+    <div class="dropdown-divider"></div>
+    {% endif %}
     <button class="dropdown-item" id="btnChangePassword" data-i18n="profile.change_pw_btn">Change Password</button>
     <div class="dropdown-divider"></div>
     <button class="dropdown-item" id="btnLogout" data-i18n="profile.logout">Logout</button>

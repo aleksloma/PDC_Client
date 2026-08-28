@@ -97,7 +97,8 @@ def test_all_admin_routes_reject_non_admin(client):
         p = path.replace("{cid}", "aa11bb22cc33dd44").replace("{tid}", "aa11bb22cc33dd44")
         resp = client.request(method, p)
         assert resp.status_code == 401, (p, resp.status_code)
-    # Plain user → 403 everywhere + audit rows.
+    # Plain user (not admin, not power user) → 403 everywhere + audit rows —
+    # BOTH guards emit one admin.denied per denial, so the count stays 1:1.
     client.post(f"/_login/{USER}")
     for path, method in paths:
         p = path.replace("{cid}", "aa11bb22cc33dd44").replace("{tid}", "aa11bb22cc33dd44")
@@ -106,6 +107,70 @@ def test_all_admin_routes_reject_non_admin(client):
     denied = [r for r in db_sources.read_audit_tail(500)
               if r["action"] == "admin.denied"]
     assert len(denied) == len(paths)
+
+
+# The ladmin-only surface (prompt 19 spec C). Every other admin_data route is
+# behind _require_source_manager and reachable by a power user within scope.
+LADMIN_ONLY = {
+    ("POST", "/api/admin/connections"),
+    ("POST", "/api/admin/connections/test"),
+    ("POST", "/api/admin/connections/{cid}"),
+    ("POST", "/api/admin/connections/{cid}/delete"),
+    ("POST", "/api/admin/connections/{cid}/refresh"),
+    ("GET", "/api/admin/refresh_settings"),
+    ("POST", "/api/admin/refresh_settings"),
+    ("GET", "/api/admin/audit"),
+}
+
+POWER = "power@x.com"
+
+
+def _login_power_user(client, grants=None):
+    """19f: a user with the power PERMISSION holding a role whose MANAGE
+    grants are the given list."""
+    import roles_store
+    role = roles_store.RolesStore().create_role(
+        {"name": "PU", "manage_grants": grants or []}, actor=ADMIN)
+    auth = local_store.AuthStore()
+    auth.ensure_user(POWER)
+    auth.set_role(POWER, "power")
+    auth.set_data_role(POWER, role["id"])
+    client.post(f"/_login/{POWER}")
+    return role
+
+
+def test_power_user_guard_matrix(client):
+    """Every admin_data route is CLASSIFIED: LADMIN_ONLY keeps rejecting a
+    power user (403 + one admin.denied row each), while every other route
+    passes the guard for a power user — no admin.denied; downstream 4xx like
+    OUT_OF_SCOPE / validation errors are expected with an empty scope."""
+    import routes.admin_data as admin_mod
+    all_routes = {(sorted(r.methods - {"HEAD", "OPTIONS"})[0], r.path)
+                  for r in admin_mod.router.routes}
+    # The explicit set must stay a subset of the live router — a renamed or
+    # removed route breaks this instead of silently un-classifying itself.
+    assert LADMIN_ONLY <= all_routes
+    _login_power_user(client)
+
+    def denied_count():
+        return sum(1 for r in db_sources.read_audit_tail(1000)
+                   if r["action"] == "admin.denied")
+
+    for method, path in sorted(all_routes):
+        p = path.replace("{cid}", "aa11bb22cc33dd44").replace("{tid}", "aa11bb22cc33dd44")
+        before = denied_count()
+        resp = client.request(method, p)
+        if (method, path) in LADMIN_ONLY:
+            assert resp.status_code == 403, (p, resp.status_code)
+            assert denied_count() == before + 1, p
+        else:
+            assert resp.status_code != 401, (p, resp.status_code)
+            assert denied_count() == before, \
+                f"guard denied a power user on a source-manager route: {p}"
+            if resp.status_code == 403:
+                # Only scope/ownership rejections may 403 here — never the
+                # guard's "Administrator access required".
+                assert resp.json().get("code") in ("OUT_OF_SCOPE", "NOT_OWNER"), p
 
 
 def test_admin_blocked_while_must_change_password(client):

@@ -589,8 +589,10 @@ package) so users can analyze them in chats exactly like uploaded files.
 ClickHouse databases appear as schemas in the browser, and ClickHouse carries
 no FK metadata, so FK-based relation discovery yields nothing for its tables
 (name / description / pasted-SQL candidates still work). Spec: `docs/DB_TABLES_PLAN.md`.
-ladmin is **config-only**: login lands directly on the `/admin/data_sources`
-panel and `/lab` redirects it back there — the admin account has no chat UI.
+The BOOTSTRAP ladmin account is **config-only**: login lands directly on the
+`/admin/data_sources` panel and `/lab` redirects it back there — the appliance
+account has no chat UI. (A PROMOTED admin — the per-user "admin" permission,
+19g — is a full chat user; see §10b.)
 Users pick registered tables via a compact "Select from DB" checkbox dropdown
 in the Create-New / Add-Data wizard.
 
@@ -877,28 +879,59 @@ validates + executes). Per `docs/DB_TABLES_PLAN.md`.
 The role-based table-visibility follow-up to §10a. Entirely client-side — no
 brain involvement, no protocol change.
 
-**Model.** ONE role per user. Roles live in `DATA_ROOT/roles.json`
+**Model (19c: MULTIPLE roles per user; 19e: roles = ACCESS ONLY; 19f: read
+and manage are SEPARATE axes on the role).** A user holds a LIST of roles;
+read access is the UNION across them. Roles live in `DATA_ROOT/roles.json`
 (`roles_store.RolesStore`, DataSourceStore discipline: locked atomic writes,
 section-whitelisting reads, 16-hex ids): `{id, name, description,
-table_ids: [], scope_grants: [{connection_id, schema|null}]}`. A scope grant
-with `schema:null` covers the whole connection; schemas match
-case-insensitively; `schema:""` is a legal literal (sqlite). The built-in
-**Base** role (literal id `"base"`) is seeded at boot right after the ladmin
-bootstrap — undeletable, unrenamable, grants editable, empty by default. The
-user's role id is the additive `data_role` field on
-`users/{email}/profile.json` (default `"base"`; `last_login_at` is stamped
-there by the login funnel). Old-shape profiles and an absent roles.json keep
-loading — everything resolves to Base through `.get()` defaults.
+table_ids: [], scope_grants: [{connection_id, schema|null}],
+manage_grants: [{connection_id, schema|null}]}`. `scope_grants` are the
+READ axis — the deliberate opt-in "every table on this connection/schema,
+present AND future" choice; `manage_grants` are the MANAGEMENT axis (where
+power-permission members may register tables/relations/schedules) and never
+grant read. The split follows the industry pattern (Looker permission set ×
+model set, Metabase's tri-state grid): before 19f a schema grant meant both,
+so opening a schema for a power user force-exposed all of its tables to the
+whole role. A grant with `schema:null` covers the whole connection; schemas
+match case-insensitively; `schema:""` is a legal literal (sqlite).
+**Migration**: roles.json is versioned — `migrate_manage_grants()` at boot
+upgrades a v1 doc to v2 by copying each role's scope_grants into
+manage_grants ONCE (behavior preserved exactly on upgrade; afterwards the
+lists diverge freely; idempotent via the version stamp; fresh docs start at
+v2). Downgrade caveat: a 19e build's normalize drops `manage_grants` while
+the version stays 2, so a downgrade → role edit → upgrade cycle loses manage
+scopes (fail-closed — re-grant from the Roles UI); same lossy-edit class as
+the 19c `data_roles` caveat. The built-in **Base** role (literal id
+`"base"`) is seeded at boot right after the ladmin bootstrap — undeletable,
+unrenamable, grants editable, empty by default. The 19c-era `power_user`
+role flag and built-in "poweruser" role are GONE (the capability moved to
+the per-user permission, below): `_normalize_role` drops a stored
+`power_user` key silently so 19c-era roles.json docs keep loading, and
+`remove_poweruser_role()` at boot deletes a previously seeded "poweruser"
+doc (members holding its id go dangling and resolve like any deleted role).
+The user's held ids live in the additive `data_roles` list on
+`users/{email}/profile.json`, with the legacy single `data_role` MIRRORED to
+the first id on every write (an older build reading the same DATA_ROOT keeps
+working); reads are tolerant — a legacy profile with only `data_role` reads
+as a one-element list, missing/empty resolves to Base (`last_login_at` is
+stamped there by the login funnel). Old-shape profiles and an absent
+roles.json keep loading — everything resolves to Base through `.get()`
+defaults.
 
 **Effective access is computed at request time**, never frozen:
-`allowed_table_ids_for(email)` = explicit `table_ids` ∩ live registry ∪
-scope-grant matches. So a table registered later under a granted schema is
-covered without a role edit, grant changes propagate instantly, and deleting a
-role reverts its members to Base dynamically (a dangling `data_role` resolves
-to Base at read time — no profile rewrites, which is also why role deletion is
-safe against concurrent logins). **Connector tables are exempt** from role
-checks everywhere: they are invisible to users and auto-included through the
-relations closure — gating them would silently break allowed joins.
+`allowed_table_ids_for(email)` = the union over all held roles of
+(explicit `table_ids` ∩ live registry ∪ scope-grant matches), PLUS the
+**ownership read** (19f): non-connector tables whose `registered_by` equals
+the email (case-insensitive) — a power user always sees and can chat with
+what they registered, before any role share. So a table registered later
+under a granted schema is covered without a role edit, grant changes
+propagate instantly, and deleting a role drops out of its members' held
+lists dynamically (a dangling id is skipped at read time — no profile
+rewrites, which is also why role deletion is safe against concurrent logins;
+a user whose every held id dangles reverts to Base). **Connector tables are
+exempt** from role checks everywhere: they are invisible to users and
+auto-included through the relations closure — gating them would silently
+break allowed joins.
 
 **Enforcement points** (and, just as deliberately, non-enforcement):
 
@@ -926,13 +959,92 @@ relations closure — gating them would silently break allowed joins.
 **Canonical storage on the role record, never the table doc:** the register
 wizard's step-3 Access panel posts `access_role_ids`, which the save
 reconciles into the roles via `set_table_roles`; table deletion prunes the id
-from every role. Admin surface: `routes/admin_users.py` (`/api/admin/users*`,
-`/api/admin/roles*`, same `_require_admin` guard, audited `user.set_role` /
-`role.*`), plus the Users + Roles sections on the admin page (searchable user
-list with instant role dropdown; role cards + tri-state access tree
-connection → schema → tables). The ladmin account is config-only and is
-excluded from the Users window. `roles_store` is denied inside the code-exec
-sandbox (grant tampering = privilege escalation).
+from every role. 19f "registration = publish + share": POWER users get the
+panel too, retitled "Share with your roles" and limited to their HELD roles
+(fed by `GET /api/admin/my_roles`; the built-in Base is excluded even when
+held — everyone is a member, so sharing through it would publish to the
+whole platform, an administrator action), ALL UNCHECKED by default — a
+fresh registration is visible only to the registerer (the ownership read)
+until they opt in; the server enforces the held-subset rule
+(`403 ROLE_NOT_HELD` up-front, before anything is registered — never a
+silent drop) and limits the power user's reconcile to that held subset, so
+a role they do NOT hold keeps its ladmin-granted membership (ladmin's
+reconcile stays exact). Admin surface: `routes/admin_users.py` (`/api/admin/users*`,
+`/api/admin/roles*`, same `_require_admin` guard, audited `user.set_roles` /
+`user.set_permission` / `role.*`), plus the Users + Roles sections on the
+admin page (searchable user list with the 19c multi-role checkbox picker —
+every toggle POSTs the full held list — and the 19e per-row Permission
+dropdown; role cards + ONE tri-state access tree connection → schema →
+tables with TWO checkbox columns since 19f: "Chat access" on every level,
+"Manage" on connection/schema rows only — the Metabase-grid shape; note the
+tree derives schema rows from REGISTERED tables, so a schema-level manage
+grant on a still-empty schema takes a connection-level grant or the API).
+The bootstrap ladmin account is config-only and is excluded from the Users
+window; other admin-permission users ARE listed (they must stay demotable)
+with their roles picker ENABLED (19g — promoted admins hold roles like
+anyone).
+`roles_store` is denied inside the code-exec sandbox (grant tampering =
+privilege escalation). Downgrade caveat: an OLD build's `set_data_role`
+rewrites only the mirrored `data_role`, leaving `data_roles` stale — a
+downgrade → role change → upgrade cycle resurrects the pre-downgrade held
+list (read-compat holds in both directions; in-place role edits from an old
+build are the one lossy path).
+
+**Per-user PERMISSION + power users (prompts 19 + 19e + 19g) — delegated,
+scoped data-source management.** The permission is a property of the USER:
+the profile `role` field holds `"user"` (standard, the default —
+legacy/unknown values read as it) | `"power"` | `"admin"`.
+`AuthStore.get_role` normalizes; `is_admin` / `is_power` read it (admin is
+NOT power — admins use the full admin page instead of /power). The
+permission LADDER (19g) is standard ⊂ power ⊂ admin **for capabilities
+only** — READ access always comes from held roles (union + ownership read),
+with no implicit all-tables read at any level. A PROMOTED admin is a full
+analysis user (lands on /lab, keeps chats and roles — the picker follows
+their roles like any user) PLUS unrestricted Data-sources administration
+(the /lab dropdown's "DB config" targets `/admin/data_sources`, whose
+sidebar footer carries "← Back to chat" for them). Only the BOOTSTRAP
+ladmin account (`AuthStore.is_bootstrap_admin` — an IDENTITY compare
+against `LOCAL_ADMIN_USERNAME`, never the permission) keeps the config-only
+behavior: login → admin page, /lab redirects away, no data roles, unlisted,
+permission immutable. Ladmin sets the permission from the Users window via
+`POST /api/admin/users/set_permission` (`{email, permission:
+"standard"|"power"|"admin"}`, "standard" stored as "user"; refuses the
+bootstrap account and the caller's own account — no self-demotion; audited
+`user.set_permission` with old → new). Promote/demote never touches
+`data_roles` — a promoted admin's roles stay ACTIVE, and a demote
+round-trip preserves them.
+
+The POWER permission decides only WHETHER the user may manage data sources —
+register tables, define relations, set per-table refresh schedules,
+self-service on `/power/data_sources` (the SAME admin template in a stripped
+`"power"` mode, reached via the "DB config" item in the /lab profile
+dropdown; power users stay normal /lab users; the page header carries a
+server-computed scope summary — "You can manage: <connection> / <schema>,
+… — all schemas" — plus a muted "read-only roles give chat access, not
+management" hint when read access reaches beyond the manage scope,
+`app._power_scope_summary`). WHERE they may manage — the **management
+scope** — is the UNION of connection/schema `manage_grants` across ALL
+their held roles (deduped; 19f — `scope_grants` are the read axis and no
+longer contribute). Explicit `table_ids` grant READ access only, never
+management. Enforcement is the second guard in `routes/admin_data.py`,
+`_require_source_manager` (`(email, scope, err)`; scope `None` = ladmin,
+unrestricted): every referenced physical table must fall inside the scope
+(`403 OUT_OF_SCOPE`), list responses are filtered to it, `access_role_ids`
+from a power user must be a subset of their held roles
+(`403 ROLE_NOT_HELD`; the share panel above), and table DELETE additionally
+requires ownership — the doc's
+`registered_by` (stamped from the session at FIRST save by
+`_build_table_doc`, carried through edit-saves like the schedule override;
+absent = ladmin-registered/legacy) must equal the power user
+(`403 NOT_OWNER`). Connection lifecycle, the global refresh schedule,
+users/roles/permissions and the audit tail stay strictly ladmin-only
+(`_require_admin`). Power-user writes are labeled
+`actor_kind: "power_user"` in their audit detail so ladmin can tell them
+apart in the tail; helpers: `roles_store.is_power_user` (delegates to
+`AuthStore.is_power`) / `management_scope_for` (None unless the permission,
+else the union) / `can_manage_physical` / `manageable_table_ids_for`
+(connectors INCLUDED — management is about the registry, unlike read
+access) / `scope_covers`, all fail-closed.
 
 ---
 

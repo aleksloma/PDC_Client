@@ -83,7 +83,9 @@ async def lifespan(app: FastAPI):
     # pytest session (the local_store sweeper lesson).
     AuthStore().ensure_local_admin()
     import roles_store
+    roles_store.RolesStore().migrate_manage_grants()   # 19f doc v1 -> v2
     roles_store.RolesStore().ensure_base_role()
+    roles_store.RolesStore().remove_poweruser_role()   # 19e legacy cleanup
     import db_scheduler
     db_scheduler.start()
     yield
@@ -193,6 +195,37 @@ async def landing(request: Request):
 _AVATAR_COLORS = ["#0d9488", "#2563eb", "#7c3aed", "#db2777", "#ea580c", "#059669", "#4f46e5", "#0891b2"]
 
 
+def _is_power_user(email: str | None) -> bool:
+    """Whether the user's per-account PERMISSION is "power" (19e —
+    roles_store.is_power_user delegates to AuthStore) — gates the profile
+    dropdown's "DB config" item and /power/data_sources. Fail-closed on any
+    error (Article IV)."""
+    if not email:
+        return False
+    try:
+        import roles_store
+        return roles_store.is_power_user(email)
+    except Exception as e:
+        log_with_sid(email, "warning", f"POWER_FLAG_FAILED: {e}")
+        return False
+
+
+def _is_admin_user(email: str | None) -> bool:
+    """Whether the user is a PROMOTED admin (permission "admin", NOT the
+    bootstrap ladmin account) — gates the /lab dropdown's "DB config" item
+    pointing at the full /admin/data_sources page (19g). Deliberately named
+    is_admin_user, never is_admin: that template key feeds the B2C Publish
+    menu (400 by design on-prem). Fail-closed on any error (Article IV)."""
+    if not email:
+        return False
+    try:
+        store = AuthStore()
+        return store.is_admin(email) and not store.is_bootstrap_admin(email)
+    except Exception as e:
+        log_with_sid(email, "warning", f"ADMIN_FLAG_FAILED: {e}")
+        return False
+
+
 def _profile_context(email: str | None) -> dict:
     """Build the profile context the dashboard partial expects.
 
@@ -202,7 +235,8 @@ def _profile_context(email: str | None) -> dict:
     if not email:
         return {"logged_in": False, "display_name": "", "raw_username": "",
                 "subscription_plan": "Enterprise",
-                "avatar_color": _AVATAR_COLORS[0], "initials": ""}
+                "avatar_color": _AVATAR_COLORS[0], "initials": "",
+                "is_power_user": False, "is_admin_user": False}
     display_name = email
     parts = email.split("@")[0].replace(".", " ").replace("_", " ").split()
     if len(parts) >= 2:
@@ -224,6 +258,8 @@ def _profile_context(email: str | None) -> dict:
         "subscription_plan": "Enterprise",
         "avatar_color": avatar_color,
         "initials": initials,
+        "is_power_user": _is_power_user(email),
+        "is_admin_user": _is_admin_user(email),
     }
 
 
@@ -235,9 +271,10 @@ async def lab(request: Request):
         return RedirectResponse(url="/", status_code=302)
     if request.session.get("must_change_password"):
         return RedirectResponse(url="/auth/change_password", status_code=302)
-    if AuthStore().is_admin(email):
-        # The local admin is config-only: no chats, no /lab. Mirror of the
-        # non-admin guard on /admin/data_sources.
+    if AuthStore().is_bootstrap_admin(email):
+        # Only the BOOTSTRAP ladmin account is config-only: no chats, no /lab
+        # (mirror of the non-admin guard on /admin/data_sources). A PROMOTED
+        # admin (19g) renders /lab like any user.
         return RedirectResponse(url="/admin/data_sources", status_code=302)
     log_with_sid(email, "info", "OPEN_LAB_UI")
     ts = int(time.time())
@@ -249,9 +286,9 @@ async def lab(request: Request):
             "ts": ts,
             "default_days": settings.CHAT_ACTIVE_DEFAULT_DAYS,
             "max_days": settings.CHAT_ACTIVE_MAX_DAYS,
-            # is_admin stays False — it feeds the B2C Publish menu (400 by
-            # design on-prem). The local admin never reaches this page (the
-            # guard above sends it to /admin/data_sources).
+            # is_admin stays False for EVERYONE — promoted admins included —
+            # it feeds the B2C Publish menu (400 by design on-prem). The
+            # admin-capability flag is is_admin_user in _profile_context.
             "is_admin": False,
             "username": email,
             "subscription_plan": "Enterprise",
@@ -363,9 +400,75 @@ async def admin_data_sources_page(request: Request):
     return templates.TemplateResponse(
         "admin_data_sources.html",
         {"request": request, "ts": int(time.time()), "username": email,
-         "build_stamp": _build_stamp(),
+         "build_stamp": _build_stamp(), "manager_mode": "admin",
+         # 19g: a PROMOTED admin is a full chat user — the sidebar footer
+         # renders "← Back to chat" for them; the bootstrap account has no
+         # chat, so its page stays link-free.
+         "back_to_chat": not AuthStore().is_bootstrap_admin(email),
          "subscription_plan": "Enterprise", **_profile_context(email)},
     )
+
+
+@app.get("/power/data_sources", response_class=HTMLResponse)
+async def power_data_sources_page(request: Request):
+    """The POWER-USER variant of the Data-sources page: the same template in
+    "power" mode (Connections read-only; Tables/Relations/per-table schedule
+    only; no Users/Roles/Audit/global schedule). Same redirect-never-error
+    guard style: no session → /, forced change → change_password, ladmin →
+    its own page, non-power users → /lab."""
+    email = request.session.get("email")
+    if not email:
+        return RedirectResponse(url="/", status_code=302)
+    if request.session.get("must_change_password"):
+        return RedirectResponse(url="/auth/change_password", status_code=302)
+    if AuthStore().is_admin(email):
+        return RedirectResponse(url="/admin/data_sources", status_code=302)
+    if not _is_power_user(email):
+        log_with_sid(email, "warning", "POWER_PAGE_DENIED")
+        return RedirectResponse(url="/lab", status_code=302)
+    log_with_sid(email, "info", "OPEN_POWER_DATA_SOURCES")
+    summary, read_beyond = _power_scope_summary(email)
+    return templates.TemplateResponse(
+        "admin_data_sources.html",
+        {"request": request, "ts": int(time.time()), "username": email,
+         "build_stamp": _build_stamp(), "manager_mode": "power",
+         "manage_scope_summary": summary, "read_beyond_manage": read_beyond,
+         "subscription_plan": "Enterprise", **_profile_context(email)},
+    )
+
+
+def _power_scope_summary(email: str) -> tuple[str, bool]:
+    """(summary sentence, read-beyond-manage flag) for the /power header —
+    computed from manage_grants (19f) + connection names. Fail-soft: any
+    error yields an empty summary rather than a broken page (Article IV)."""
+    try:
+        import roles_store
+        from db_sources import DataSourceStore
+        store = DataSourceStore()
+        scope = roles_store.management_scope_for(email) or []
+        names = {c.get("id"): c.get("name") or "?"
+                 for c in store.list_connections()}
+        parts = []
+        for g in scope:
+            if g.get("connection_id") not in names:
+                continue          # grant on a deleted connection — nothing to say
+            label = names[g["connection_id"]]
+            parts.append(f"{label} — all schemas" if g.get("schema") is None
+                         else f"{label} / {g['schema']}")
+        summary = ("You can manage: " + ", ".join(parts) if parts else
+                   "You have no manage grants yet — ask your administrator.")
+        read_beyond = False
+        tables = {t.get("id"): t for t in store.list_tables()}
+        for tid in roles_store.allowed_table_ids_for(email):
+            t = tables.get(tid)
+            if t and not roles_store.scope_covers(
+                    scope, t.get("connection_id"), t.get("schema")):
+                read_beyond = True
+                break
+        return summary, read_beyond
+    except Exception as e:
+        log_with_sid(email, "warning", f"POWER_SCOPE_SUMMARY_FAILED: {e}")
+        return "", False
 
 
 @app.get("/health")

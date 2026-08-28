@@ -973,6 +973,14 @@ function setupEventListeners() {
     }, 100);
   });
 
+  // DB config (enterprise) — rendered only for power users and promoted
+  // admins (the partial conditions on is_power_user/is_admin_user and bakes
+  // the audience-specific target into data-target), so this binding is
+  // optional like the rest.
+  document.getElementById('btnDbConfig')?.addEventListener('click', (e) => {
+    window.location.href = e.currentTarget.dataset.target || '/power/data_sources';
+  });
+
   // Change Password (enterprise) — small dedicated modal
   const changePwModal = document.getElementById('changePwModal');
   document.getElementById('btnChangePassword')?.addEventListener('click', () => {

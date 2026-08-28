@@ -17,6 +17,41 @@ retry loop, and brain protocol need no changes in Phase 1.
 1. **Visibility:** Phase 1 — all users see all non-connector tables. Role-based
    table visibility (admin-defined roles with view permissions assigned to users)
    is a standalone follow-up task after this feature ships.
+   **Status: SHIPPED** — data roles + scope grants (`roles_store`, §10b of the
+   architecture doc), and **Prompt 19 (implemented)** extends them with
+   `power_user` roles: ladmin grants a management scope (connections/schemas)
+   and those users self-register tables, define in-scope relations and set
+   per-table refresh schedules on `/power/data_sources` (same admin template,
+   `manager_mode: "power"`; guard `_require_source_manager`; table ownership
+   via `registered_by`; power-user writes audited with
+   `actor_kind: "power_user"`). **Prompt 19c (implemented)** corrects the
+   model: users hold MULTIPLE roles (`data_roles`, legacy `data_role`
+   mirrored/read), read access = the union, and the management scope = the
+   union of scope_grants across ALL held roles; also fixes the built-in-role
+   edit bug (restated identical name no longer 400s). **Prompt 19e
+   (implemented)** moves the capability off roles onto a per-USER permission
+   (profile `role`: "user"/"power"/"admin", set via
+   `POST /api/admin/users/set_permission`, Standard/Power user/Local admin in
+   the Users UI; admins listed + demotable, `data_roles` kept inert through
+   an admin round-trip): roles are ACCESS-ONLY again — the `power_user` role
+   flag is dropped silently on read and the once-seeded built-in "poweruser"
+   role is removed at boot. **Prompt 19f (implemented)** splits READ from
+   MANAGE on the role (`manage_grants`, a separate axis; roles.json v1→v2
+   boot migration copies scope→manage once), stops schema grants
+   auto-exposing tables, adds the ownership read (`registered_by` always
+   readable to the registerer), turns power registration into
+   publish + opt-in share ("Share with your roles", held-subset enforced
+   with 403 ROLE_NOT_HELD), the two-column role-modal grid, the /power
+   scope-summary line, and the QA fixes (user-search autofill, system-schema
+   dropdown filter, port re-prefill, failed-refresh chip). **Prompt 19g
+   (implemented)** makes PROMOTED admins full analysis users again (permission
+   ladder standard ⊂ power ⊂ admin for capabilities; read always via roles):
+   they keep /lab, chats and roles (picker follows held roles, roles picker
+   enabled on admin rows, promote/demote round-trips lossless), and reach the
+   full admin page via the dropdown's "DB config" + a "← Back to chat" footer
+   link. Only the BOOTSTRAP ladmin account (`AuthStore.is_bootstrap_admin`,
+   identity compare) stays config-only: login → admin page, /lab redirects
+   away, roleless, unlisted, permission immutable.
 2. **DB set:** launched with PostgreSQL, MySQL/MariaDB, MS SQL Server, Oracle;
    **ClickHouse** added later through exactly that route (one `Dialect(...)`
    literal + pinned `clickhouse-sqlalchemy` / `clickhouse-driver`, native

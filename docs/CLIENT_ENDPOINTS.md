@@ -17,13 +17,14 @@ file documents the enterprise client's implementation of each one.
 | Method | Path | Behavior |
 |---|---|---|
 | `GET` | `/` | auth landing (email + password + "Remember me"); redirects to `/lab` if already signed in (or to `/auth/change_password` when a forced change is pending) |
-| `GET` | `/lab` | the dashboard page (no session → `/`; `must_change_password` pending → `/auth/change_password`; **local admin → `/admin/data_sources`** — ladmin is config-only and never sees the chat UI) |
+| `GET` | `/lab` | the dashboard page (no session → `/`; `must_change_password` pending → `/auth/change_password`; **bootstrap ladmin → `/admin/data_sources`** — only the appliance account is config-only; a PROMOTED admin renders /lab like any user with the B2C `is_admin` template flag still `false` for everyone, 19g) |
 | `GET` | `/c/{conv_id}` | deep-link / hard-refresh into one conversation. Resolves the conv's `chat_id` from the caller's conversations index and seeds `open_conv_id`/`open_chat_id` so `dashboard.js` auto-opens it. No session → `/`; forced change pending → `/auth/change_password`; unknown/foreign conv → `/lab` (never 404). |
 | `GET` | `/auth/change_password` | forced set-a-new-password page shown after a temp-password login (no session → `/`; no pending flag → `/lab`) |
 | `GET` | `/dashboards/{dash_id}` | the dashboard page (grid of pinned tiles, `dashboard_view.html` + `dashboard_view.js`). Resolves the dashboard via own-doc-or-shared-pointer; no session → `/`; forced change pending → `/auth/change_password`; unknown/unshared → `/lab` (never 404). |
 | `GET` | `/health` | liveness + `{brain_reachable, tenant_token_configured}`; v4.2 adds `build_commit` (additive) |
 | `GET` | `/version` | which build is running: `{commit, build_time, started_at}` — nulls on an unstamped image, never a fabricated identity. Unauthenticated like `/health`, carries no secrets. Exists because the static `?v=` parameter is `int(time.time())` at page render (per request) and therefore **cannot** identify a build — reading it as one misled release verification twice. Fed by the `BUILD_COMMIT`/`BUILD_TIME` Docker build args; the admin sidebar shows the same string |
-| `GET` | `/admin/data_sources` | the ladmin **Data sources** admin panel (`admin_data_sources.html` + `admin_data_sources.js`, standalone stylesheet — no dashboard.css): sidebar-navigated sections (DB connections, registered tables, relations — a confirmed-relations overview with per-row Edit/Delete above the discovery tools — refresh schedule, audit log), a 3-step register-table wizard (whose relations step auto-suggests relations from the table's own FKs + name/description similarity, FK rows pre-checked) (Source → Describe → Confirm & snapshot), onboarding hero when no connections exist, and sidebar account controls (change password via `POST /auth/password`, sign out). This is ladmin's landing page — login and forced-change both redirect here for admins. Redirect philosophy: no session → `/`; forced change → `/auth/change_password`; non-admin → `/lab` (never an error page). |
+| `GET` | `/admin/data_sources` | the ladmin **Data sources** admin panel (`admin_data_sources.html` + `admin_data_sources.js`, standalone stylesheet — no dashboard.css): sidebar-navigated sections (DB connections, registered tables, relations — a confirmed-relations overview with per-row Edit/Delete above the discovery tools — users, roles, refresh schedule, audit log), a 3-step register-table wizard (whose relations step auto-suggests relations from the table's own FKs + name/description similarity, FK rows pre-checked) (Source → Describe → Confirm & snapshot), onboarding hero when no connections exist, and sidebar account controls (change password via `POST /auth/password`, sign out). This is the BOOTSTRAP ladmin's landing page — its login and forced-change redirect here (a PROMOTED admin lands on /lab and reaches this page via the dropdown's "DB config", 19g). Redirect philosophy: no session → `/`; forced change → `/auth/change_password`; non-admin → `/lab` (never an error page). Renders with `manager_mode: "admin"` (→ `window.__MANAGER_MODE__`); 19g adds `back_to_chat` to the context — true for promoted admins, so the sidebar footer carries the "← Back to chat" link (absent for the bootstrap account, which has no chat). |
+| `GET` | `/power/data_sources` | the POWER-USER variant of the same page (prompt 19): the SAME `admin_data_sources.html` rendered with `manager_mode: "power"`. Sidebar shows only Connections (READ-ONLY list of in-scope connections — no Add/Edit/Delete/Test/Refresh; "＋ Register table" is the one action), Registered tables (Delete only on tables the power user registered themselves — `registered_by`), and Relations; the per-table ⏱ schedule modal stays, Users/Roles/Audit/global-schedule are not rendered; the wizard step-3 panel renders as "Share with your roles" (the caller's HELD roles from GET /api/admin/my_roles, all unchecked by default — 19f publish+share) and the page header carries the server-computed manage-scope summary ("You can manage: …", app._power_scope_summary) plus a muted read-beyond-manage hint; the sidebar footer gains a "← Back to chat" link to `/lab`. Redirects: no session → `/`; forced change → `/auth/change_password`; ladmin → `/admin/data_sources`; non-power users → `/lab` (`POWER_PAGE_DENIED` log). Power users reach it via the "DB config" item in the /lab profile dropdown (rendered when `is_power_user` — a promoted admin's "DB config" targets the full `/admin/data_sources` page instead, 19g). |
 
 ---
 
@@ -43,12 +44,12 @@ relay (`/v1/send_welcome_email`, `/v1/send_password_reset_email`).
 
 | Method | Path | Behavior |
 |---|---|---|
-| `POST` | `/auth/login` | form-encoded `email=`, `password=`, `remember?`. Genuinely NEW email (no user folder) → entered password becomes the password + welcome email (fire-and-forget). LEGACY email-only account (folder, no hash) → 403 with the "set your password via Reset password" notice (never adopts the typed password). Wrong password → landing re-rendered with red "Incorrect password" + Reset action (401). Temp password → session flagged and redirected to `/auth/change_password`. Success target: `/lab` for users, `/admin/data_sources` for the local admin (`_post_login_target`). `remember` → persistent ~30-day session cookie (RememberMeSessionMiddleware in app.py); otherwise browser-session cookie. |
+| `POST` | `/auth/login` | form-encoded `email=`, `password=`, `remember?`. Genuinely NEW email (no user folder) → entered password becomes the password + welcome email (fire-and-forget). LEGACY email-only account (folder, no hash) → 403 with the "set your password via Reset password" notice (never adopts the typed password). Wrong password → landing re-rendered with red "Incorrect password" + Reset action (401). Temp password → session flagged and redirected to `/auth/change_password`. Success target: `/lab` for everyone — promoted admins included — except the bootstrap ladmin account → `/admin/data_sources` (`_post_login_target`, keyed on `AuthStore.is_bootstrap_admin`, 19g). `remember` → persistent ~30-day session cookie (RememberMeSessionMiddleware in app.py); otherwise browser-session cookie. |
 | `POST` | `/auth/reset_password` | form-encoded `email=`. Unknown email → "This account does not exist." Known → generates a temp password locally, stores its hash + `must_change_password`, brain-relays it by mail; on relay failure the temp credential is rolled back and an error shown. The user's own password stays valid until the temp one is used (a stranger's reset request can't lock the real user out). |
 | `POST` | `/auth/change_password` | form-encoded `new_password=`, `confirm_password=` — the forced-change submit (session required) |
 | `POST` | `/auth/logout` | clears session, redirects to `/`. |
 | `GET`  | `/auth/me` | `{authenticated, email}` |
-| `GET`  | `/auth/profile` | `{username: email, email, full_name: "", subscription_plan: "Enterprise"}` — shape that dashboard.js expects |
+| `GET`  | `/auth/profile` | `{username: email, email, full_name: "", subscription_plan: "Enterprise", is_local_admin, is_power_user, is_admin_user}` — shape that dashboard.js expects. `is_local_admin` and `is_admin_user` (deliberately NEVER `is_admin` — that key feeds the B2C Publish menu, 400 by design on-prem); `is_power_user` = the user's per-account PERMISSION is "power" (AuthStore profile `role`, 19e — roles_store.is_power_user delegates to it; admin is NOT power; fail-closed false on any error); `is_admin_user` (19g) = a PROMOTED admin — permission "admin" AND not the bootstrap account (fail-closed false). Both feed the profile-dropdown "DB config" item: power → `/power/data_sources`, promoted admin → `/admin/data_sources` (the partial bakes the target into `data-target`) |
 | `POST` | `/auth/profile/update` | email is the identity; attempts to change it are silently ignored |
 | `POST` | `/auth/password` | JSON `{current_password, new_password}` — real change-password (verified server-side), used by the /lab profile-dropdown modal. 401 on wrong current password. |
 | `GET`  | `/auth/subscription` | constant `{plan: "Enterprise"}` |
@@ -282,15 +283,76 @@ the enforcement): dashboard.js / dashboard_view.js pre-freeze refresh buttons
 whose code references an `allowed:false` table with a role tooltip instead of
 letting the click fail.
 
-### Admin routes — `/api/admin/*` (role == "admin" only)
+### Admin routes — `/api/admin/*` (ladmin + scoped POWER USERS)
 
-Guarded by `_require_admin` (401 unauthenticated; 403 while
-`must_change_password` is pending; 403 + `admin.denied` audit row for
-non-admins). Connectivity/introspection failures return `200 {ok:false,
-error}` (the dashboards idiom). Every response masks credentials
-(`password_set`/`password_readable`/`password_masked` — never `password_enc`
-or `url_override`). Every admin action appends to the append-only audit JSONL
-`DATA_ROOT/admin_audit.jsonl` (secrets scrubbed).
+Two guards (prompt 19):
+
+- **`_require_admin`** (ladmin only — `role == "admin"`): connection lifecycle
+  (`POST /connections`, `/connections/test`, `/connections/{cid}`,
+  `/connections/{cid}/delete`, `/connections/{cid}/refresh`), the GLOBAL
+  refresh schedule (`GET/POST /refresh_settings`), `GET /audit`, and all of
+  `routes/admin_users.py`.
+- **`_require_source_manager`** (everything else): any admin permission
+  passes unrestricted (the bootstrap ladmin and 19g promoted admins alike);
+  a user whose per-account PERMISSION is `"power"` (19e — AuthStore profile
+  `role`, set via `POST /api/admin/users/set_permission`) gets the UNION of
+  `manage_grants` across ALL their held roles as their **management scope**
+  (19f — the SEPARATE management axis; `scope_grants` are the read axis and
+  no longer contribute, and explicit `table_ids` grant READ access only,
+  never management). Semantics for a power user:
+  - Every referenced physical table (connection, schema) must fall inside the
+    scope — schema match case-insensitive, a `schema:null` grant covers the
+    whole connection — else `403 {"code": "OUT_OF_SCOPE"}` (scope rejections
+    are ordinary validation, not audited as denials).
+  - List responses are FILTERED to the scope: `GET /connections` (only
+    granted connections, table counts over manageable tables),
+    `GET /connections/{cid}/schemas` (schema-level grants narrow the listing;
+    any whole-connection grant keeps it full), `GET /tables` (manageable
+    tables, CONNECTORS INCLUDED), relations scan/graph/recommendations
+    (candidates, recs and the confirmed count computed over the scoped set).
+    The recommendation WRITE is scope-bounded too: `analyze_sql`'s and
+    `scan`'s "Recommended tables" upserts drop any resolved physical
+    (connection, schema) outside the scope — an out-of-scope row must never
+    exist, not merely be hidden.
+  - `save_table`: the posted physical AND (on edit) the existing doc's
+    physical must be in scope; `access_role_ids` (19f "Share with your
+    roles") is accepted but must be a SUBSET of the power user's held roles
+    MINUS the built-in Base (everyone is a member — publishing to the whole
+    platform stays ladmin's; `my_roles` never offers it) — an outside id is
+    `403 {"code": "ROLE_NOT_HELD"}` validated UP-FRONT, before anything is
+    registered or snapshotted (never a silent drop). The power user's
+    reconcile is limited to that held subset: roles they do NOT hold keep
+    their ladmin-granted membership (ladmin's reconcile stays exact). A
+    fresh registration with the panel untouched is visible only to the
+    registerer via the ownership read. Everything else — confirm lock, drift
+    check, duplicate check, snapshot — is unchanged.
+  - `POST /tables/{tid}/delete`: in scope AND `registered_by == <the power
+    user>` — else `403 OUT_OF_SCOPE` / `403 {"code": "NOT_OWNER"}` (absent
+    `registered_by` = ladmin-registered/legacy → NOT_OWNER). Ladmin deletes
+    anything, unchanged.
+  - `/relations/accept|delete|dismiss`: EVERY referenced side (child AND
+    parent/related) must be manageable; recommendation status/classify/accept
+    check the rec's (connection, schema); `accept_recommendation` registers
+    with `registered_by` = the power user.
+  - Every power-user WRITE's audit row carries `actor_kind: "power_user"` in
+    its detail (threaded through the store/scheduler mutators too:
+    `table.save/delete/refresh/schedule/drift_dismiss`, `relations.*`);
+    ladmin rows stay byte-identical.
+
+Table docs carry **`registered_by`** (ownership): stamped from the SESSION
+identity at FIRST save only (wizard save and recommendation Accept, via
+`_build_table_doc`), carried through every edit-save like the schedule
+override — an edit never changes or introduces it; docs written before the
+field exist without it and read as ladmin-registered.
+
+Both guards: 401 unauthenticated; 403 while `must_change_password` is
+pending; 403 + one `admin.denied` audit row per denial (the source-manager
+guard adds detail `{"reason": "not_power_user"}`). Connectivity/introspection
+failures return `200 {ok:false, error}` (the dashboards idiom). Every
+response masks credentials (`password_set`/`password_readable`/
+`password_masked` — never `password_enc` or `url_override`). Every admin
+action appends to the append-only audit JSONL `DATA_ROOT/admin_audit.jsonl`
+(secrets scrubbed).
 
 | Method | Path | Behavior |
 |---|---|---|
@@ -303,7 +365,8 @@ or `url_override`). Every admin action appends to the append-only audit JSONL
 | `POST` | `/api/admin/connections/{cid}/refresh` | Refresh-now for every table on the connection (sequential) |
 | `POST` | `/api/admin/tables/introspect` | columns+dtypes / PK / FK / indexes / comment via SQLAlchemy Inspector + catalog-estimate row count & size (degraded gracefully on missing catalog privileges — never `COUNT(*)` on a customer table) + first-rows preview (admin's browser only). v4.2: additive `classification:{suggested_type, reason}` from the columns already in hand (no extra round-trip) — the wizard pre-ticks its connector box from it instead of assuming every recommended table is a connector; an explicit prefill and a registered table's stored type both win over it |
 | `POST` | `/api/admin/tables/draft_descriptions` | AI-drafted ENGLISH table+column descriptions via the existing `brain_client.schema_autofill` (same truncated sampled hints files send; payload carries no host/user/password/connection id). **Persists nothing** — one of the four mandatory-confirm locks |
-| `GET/POST` | `/api/admin/tables`, `POST /api/admin/tables/{tid}` | list / register / edit + snapshot. Optional body field `access_role_ids: [role ids]` (the wizard step-3 **Access** panel): after the save, the table id is reconciled into exactly those roles' `table_ids` via `roles_store.set_table_roles` (canonical storage on the ROLE record — the table doc never carries access; scope-covered roles are checked+disabled in the UI and excluded from the list). Field ABSENT ⇒ no role writes (recommendation-Accept + pre-feature payloads); a role write failure never fails the save. **One registration per physical table** (connection + schema + table, case-insensitive): a save creating a physical mapping another registration already covers → `400 DUPLICATE_TABLE` naming it; an edit that keeps its stored physical key always passes — including on a LEGACY duplicate (stored duplicates keep loading and working; only NEW saves are blocked, connector-vs-normal is toggled on the existing registration instead). **Mandatory confirm**: `confirm:true` required (`400 CONFIRM_REQUIRED`); `descriptions_confirmed_by/at` stamped from the session + server clock, never the body; a fresh introspection must match the posted column set (`409 SCHEMA_DRIFT`). Snapshot failure keeps the registration saved with `last_refresh_error` (Refresh retries); success = chunked SELECT → parquet, atomic `os.replace` |
+| `GET` | `/api/admin/my_roles` | 19f — the CALLER's held roles (`{roles:[{id, name, is_base, table_ids, scope_grants}]}`), what the power-mode wizard's "Share with your roles" panel offers and locks against. `_require_source_manager` (power users allowed); held roles only, never the whole registry (that stays ladmin's `GET /roles`), and the built-in Base is EXCLUDED even when held — sharing with everyone is an administrator action (save_table refuses `"base"` too) |
+| `GET/POST` | `/api/admin/tables`, `POST /api/admin/tables/{tid}` | list / register / edit + snapshot. Optional body field `access_role_ids: [role ids]` (the wizard step-3 **Access** panel; 19f: rendered for POWER users too as "Share with your roles" — held roles only, all unchecked by default, server-enforced subset `403 ROLE_NOT_HELD` before anything is registered): after the save, the table id is reconciled into exactly those roles' `table_ids` via `roles_store.set_table_roles` (canonical storage on the ROLE record — the table doc never carries access; scope-covered roles are checked+disabled in the UI and excluded from the list; power-user reconciles audited with `actor_kind`). Field ABSENT ⇒ no role writes (recommendation-Accept + pre-feature payloads); a role write failure never fails the save. **One registration per physical table** (connection + schema + table, case-insensitive): a save creating a physical mapping another registration already covers → `400 DUPLICATE_TABLE` naming it; an edit that keeps its stored physical key always passes — including on a LEGACY duplicate (stored duplicates keep loading and working; only NEW saves are blocked, connector-vs-normal is toggled on the existing registration instead). **Mandatory confirm**: `confirm:true` required (`400 CONFIRM_REQUIRED`); `descriptions_confirmed_by/at` stamped from the session + server clock, never the body; a fresh introspection must match the posted column set (`409 SCHEMA_DRIFT`). Snapshot failure keeps the registration saved with `last_refresh_error` (Refresh retries); success = chunked SELECT → parquet, atomic `os.replace` |
 | `POST` | `/api/admin/tables/{tid}/refresh` | Refresh-now (same `db_scheduler.refresh_one_table` the nightly run uses). Returns `{ok, rows, bytes, refreshed_at, drift:{added,removed}}`; on schema drift every chat meta referencing the table is re-synced with the `_resync_meta_after_add` carry-over rules (user edits survive, vanished columns deleted). A failed refresh keeps the previous snapshot AND `refreshed_at` — chats serve the last good data |
 | `POST` | `/api/admin/tables/{tid}/delete` | unregister (+ delete the snapshot by default). Best-effort prunes the id from every role's `table_ids` (a stale id grants nothing — effective access intersects the live registry — but would clutter the roles UI) |
 | `POST` | `/api/admin/relations/scan` | **relation discovery** (proposals only — nothing is applied without an explicit accept): live-introspects every registered table for declared FKs (FKs are not persisted in the registry; an unreachable connection lands in `degraded[]` and only skips FK evidence) + deterministic name/description-similarity candidates (ubiquity down-weighted, no LLM), verifies each candidate against the local snapshot parquets (cardinality with direction normalization, overlap %, orphan count; missing snapshot → `unverified`), excludes already-declared relations (either orientation), and bands `confirmed` / `suggested` / `attention`. PHYSICAL-IDENTITY PRECISION: candidates joining two registrations of ONE physical source (connection + schema + table) are never proposed; a relation confirmed to ANY registration of a physical target suppresses re-proposals to its duplicates; duplicate-registration fan-out collapses to ONE candidate targeting the preferred registration (connector first, then earliest-registered) carrying `alternate_targets:[{id,label}]`. Returns `{ok, candidates:[…], degraded:[…], confirmed_count, unregistered_refs:[{connection_id, schema, table, referenced_by, referenced_by_ids}]}` (`confirmed_count` = total confirmed relation entries, explains a zero-candidate scan — `analyze_sql` returns it too; `unregistered_refs` = FKs on registered tables pointing at UNREGISTERED physical tables, connection-scoped, each entry additively carrying `referenced_pairs` aligned with `referenced_by_ids` — missing-table column first, empty on a malformed FK, rendered with a "Register as connector" wizard-prefill shortcut) — aggregates only, never values. v4: the scan also UPSERTS these refs into the persistent "Recommended tables" (source `fk`), and replays the stored SQL evidence of `registered`-status recommendations through the same candidate pipeline (merge → verify → band), so a table registered via the wizard gets its SQL-derived relations proposed on the next scan without re-pasting anything. v4.1: replayed evidence passes `validate_rec_evidence` first — pairs naming columns the now-known registration lacks are excluded (never a bogus candidate; this is also how corrupted/stale stores are handled, no migration) and surfaced in the additive response key `evidence_warnings:[{table, column, source:"sql-evidence"}]` + a `REL_REPLAY_INVALID_COLUMN` log line per pair |
@@ -325,28 +388,46 @@ or `url_override`). Every admin action appends to the append-only audit JSONL
 
 ### Admin routes — Users & Roles (`routes/admin_users.py`, same `/api/admin` prefix + guard)
 
-User management for the DB-table role gate. One role per user (`data_role` on
-`users/{email}/profile.json`, default the built-in **Base** role, id `"base"`);
-roles live in `DATA_ROOT/roles.json` (`roles_store.RolesStore`) as
-`{id, name, description, table_ids:[], scope_grants:[{connection_id,
-schema|null}]}` — `schema:null` = the whole connection, grants cover tables
-**registered later** too (effective access is computed per request, never
-frozen). Deleting a role reverts its members to Base DYNAMICALLY — dangling
-`data_role` ids resolve to Base at read time, no profile rewrites. Emails are
-always body-carried (never path params); role ids are path params.
+User management for the DB-table role gate + the per-user permission. A user
+holds SEVERAL roles (19c: `data_roles` list on `users/{email}/profile.json`;
+the legacy single `data_role` is mirrored to the first id on write and still
+read; empty ⇒ the built-in **Base** role, id `"base"`). READ access is the
+UNION across held roles. Roles live in `DATA_ROOT/roles.json`
+(`roles_store.RolesStore`) as `{id, name, description, table_ids:[],
+scope_grants:[{connection_id, schema|null}], manage_grants:[same shape]}` —
+`schema:null` = the whole connection, grants cover tables **registered
+later** too (effective access is computed per request, never frozen). 19f
+two-axis model: `scope_grants` = READ ("all current and future tables
+here", an explicit ladmin opt-in), `manage_grants` = MANAGEMENT (where
+power-permission members register tables/relations/schedules — never read);
+the doc is versioned and a v1 store migrates once at boot (scope copied into
+manage, `migrate_manage_grants`). `allowed_table_ids_for` additionally
+includes the user's own registrations (`registered_by`, the ownership read).
+The POWER-USER CAPABILITY is the per-user PERMISSION (`profile.role`:
+"user"/"power"/"admin"); the MANAGEMENT scope on `/power/data_sources` is
+the union of `manage_grants` across ALL held roles (see the admin-routes
+guard section). The 19c-era `power_user` role flag is dropped silently on
+read and the once-seeded built-in "poweruser" role is removed at boot.
+Deleting a role drops it from its holders DYNAMICALLY — dangling ids are
+skipped at read time, no profile rewrites. Emails are always body-carried
+(never path params); role ids are path params.
 
 | Method | Path | Behavior |
 |---|---|---|
-| `GET` | `/api/admin/users` | Everyone with a readable profile, sorted by email: `{users:[{email, role_id (RESOLVED — dangling→"base"), role_name, created_at, last_login_at}]}`. The config-only local admin and any `role=="admin"` profile are excluded. `last_login_at` is stamped by `_start_session` on every login (both branches); `created_at` = first login |
-| `POST` | `/api/admin/users/set_role` | `{email, role_id}` → `{ok, user}`. 400 missing email / ladmin / admin account / unknown role; 404 unknown user. Audited `user.set_role` |
-| `GET` | `/api/admin/roles` | `{roles:[{…, is_base, member_count}]}` — Base first, then name order; `member_count` counts RESOLVED members |
-| `POST` | `/api/admin/roles` | create: `{name, description?, table_ids?, scope_grants?}` → 201 `{role}`. 400: empty/duplicate name (case-insensitive, "base" reserved), unknown table id, **connector table id** (exempt from role checks — ungrantable), unknown connection in a grant, malformed grant. Audited `role.create` |
-| `POST` | `/api/admin/roles/{rid}` | edit (fields present ⇒ replace, absent ⇒ keep). 404 unknown; 400 renaming Base (description/grants stay editable). Audited `role.update` |
-| `POST` | `/api/admin/roles/{rid}/delete` | → `{ok, reverted_members}` (a COUNT — the revert is dynamic, nothing rewritten). 400 Base; 404 unknown. Audited `role.delete` |
+| `GET` | `/api/admin/users` | Everyone with a readable profile, sorted by email: `{users:[{email, permission ("standard"\|"power"\|"admin"), role_ids (RESOLVED held list — dangling dropped, empty→["base"]), role_names, role_id/role_name (legacy = first entry), created_at, last_login_at}]}`. Only the bootstrap local-admin account is excluded — admin-permission users ARE listed (19e: they must stay demotable; their held roles stay visible/stored but inert). `member_count` on roles counts holders among these rows. `last_login_at` is stamped by `_start_session` on every login (both branches); `created_at` = first login |
+| `POST` | `/api/admin/users/set_role` | Sets the user's HELD ROLE LIST (19c): `{email, role_ids: [...]}` → `{ok, user}`; the legacy `{email, role_id}` shape is still accepted (→ one-element list); empty list reverts to Base. 400 missing email / the bootstrap ladmin account / any unknown role id (19g: PROMOTED admins take roles like anyone — only the bootstrap identity is refused); 404 unknown user. Audited `user.set_roles` with `{role_ids, role_names}` |
+| `POST` | `/api/admin/users/set_permission` | 19e — sets the per-user PERMISSION: `{email, permission: "standard"\|"power"\|"admin"}` ("standard" stored as "user") → `{ok, user}`. 400 missing email / invalid value / the bootstrap ladmin account / the CALLER's own account (no self-demotion); 404 unknown user. Never touches `data_roles` — and since 19g a promoted admin's roles stay ACTIVE (full analysis user), so promote/demote round-trips are lossless. Audited `user.set_permission` with `{old, new}` |
+| `GET` | `/api/admin/roles` | `{roles:[{…, is_base, is_builtin, member_count}]}` — Base first, the rest by name; `member_count` counts users HOLDING the role (a user with 3 roles counts in all 3) |
+| `POST` | `/api/admin/roles` | create: `{name, description?, table_ids?, scope_grants?, manage_grants?}` → 201 `{role}` (a stray 19c-era `power_user` key is silently ignored). 400: empty/duplicate name (case-insensitive, "base" reserved), unknown table id, **connector table id** (exempt from role checks — ungrantable), unknown connection / malformed entry in EITHER grant list (`manage_grants` validate exactly like `scope_grants`). Audited `role.create` (grant + manage counts) |
+| `POST` | `/api/admin/roles/{rid}` | edit (fields present ⇒ replace, absent ⇒ keep — `scope_grants` and `manage_grants` replace independently). 404 unknown; 400 renaming Base — but a RESTATED IDENTICAL name is ignored, not a 400 (19c fix: the UI save payload always carries the unchanged name, which used to make every built-in edit fail); description/grants stay editable. Audited `role.update` |
+| `POST` | `/api/admin/roles/{rid}/delete` | → `{ok, reverted_members}` (a COUNT of users who HELD the role — the revert is dynamic, nothing rewritten; multi-role holders keep their other roles). 400 Base; 404 unknown. Audited `role.delete` |
 
 The wizard save's `access_role_ids` writes through `roles_store.set_table_roles`
 (audited `role.set_tables`). Admin-page UI: **Users** section (searchable list,
-instant role dropdown) + **Roles** section (cards + a tri-state access tree
+19c multi-role checkbox picker — every toggle POSTs the full held list — and
+the 19e per-row Permission dropdown Standard / Power user / Local admin with a
+confirm dialog before promoting to admin; admin rows render the roles picker
+disabled) + **Roles** section (cards + a tri-state access tree
 connection → schema → tables; checking a schema/connection stores a scope
 grant and locks its descendants "via schema/connection").
 

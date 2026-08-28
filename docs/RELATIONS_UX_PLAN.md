@@ -5,6 +5,14 @@
 > Live-tested on the dev stack; the registry noise described below is real
 > stored state, kept as a regression fixture until manually cleaned.
 
+> **Prompt 19 (implemented):** the whole Relations surface (scan, Analyze SQL,
+> wizard suggestions, accept/edit/delete/dismiss, graph, Recommended tables)
+> is also reachable by POWER USERS on `/power/data_sources` — restricted to
+> their management scope: candidates/recommendations/graph/confirmed-count are
+> computed over the scoped table set only, and a relation whose either side
+> falls outside the scope is rejected with `403 OUT_OF_SCOPE`. Ladmin behavior
+> is unchanged (the guard passes scope `None`).
+
 ## Confirmed root-cause findings (live dev stack)
 
 1. **Same-physical-table noise (main precision bug).** `shop.city_dict` is

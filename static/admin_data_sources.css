@@ -450,3 +450,35 @@ body.admin-ds-page {
 }
 .tw-access-row { margin: 3px 0; }
 .tw-access-row input:disabled + span { color: #94a3b8; }
+
+/* 19c multi-role picker in the Users table */
+.adm-user-roles-wrap { position: relative; display: inline-block; }
+.adm-user-roles-panel {
+  position: absolute; top: calc(100% + 4px); left: 0; z-index: 40;
+  min-width: 230px; padding: 8px 12px;
+  box-shadow: 0 10px 30px rgba(2,6,23,0.18);
+}
+.adm-user-role-opt { display: block; margin: 4px 0; white-space: nowrap; }
+
+/* 19f role modal: one tree, two checkbox columns (chat access | manage) */
+.adm-tree-colhead {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 2px 4px 0; font-size: 12px; font-weight: 600; color: #475569;
+}
+.adm-tree-col-manage { width: 72px; text-align: center; flex: none; }
+.adm-tree-row {
+  display: flex; justify-content: space-between; align-items: center;
+}
+.adm-tree-row > label { flex: 1 1 auto; min-width: 0; }
+.adm-tree-manage { width: 72px; text-align: center; flex: none; }
+.adm-tree-legend { margin: 2px 4px 6px; }
+
+/* 19f wizard: system-schema reveal toggle */
+.adm-sys-schema-toggle { display: inline-flex; margin: 4px 0 0; }
+
+/* 19e per-user permission dropdown in the Users table */
+.adm-user-perm {
+  border: 1px solid #cbd5e1; border-radius: 6px; padding: 5px 8px;
+  font-size: 13px; background: #fff; color: inherit;
+}
+.adm-user-roles-btn:disabled { opacity: 0.55; cursor: not-allowed; }
