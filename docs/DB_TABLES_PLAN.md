@@ -17,10 +17,19 @@ retry loop, and brain protocol need no changes in Phase 1.
 1. **Visibility:** Phase 1 — all users see all non-connector tables. Role-based
    table visibility (admin-defined roles with view permissions assigned to users)
    is a standalone follow-up task after this feature ships.
-2. **DB set:** launch with PostgreSQL, MySQL/MariaDB, MS SQL Server, Oracle. Build
-   a dialect REGISTRY so adding a DB type later = one registry entry (SQLAlchemy
-   URL template, default port, quoting) + a driver package. Later candidates:
-   IBM DB2, SAP HANA, Snowflake, ClickHouse, SQLite.
+2. **DB set:** launched with PostgreSQL, MySQL/MariaDB, MS SQL Server, Oracle;
+   **ClickHouse** added later through exactly that route (one `Dialect(...)`
+   literal + pinned `clickhouse-sqlalchemy` / `clickhouse-driver`, native
+   protocol, default port 9000). Build a dialect REGISTRY so adding a DB type
+   later = one registry entry (SQLAlchemy URL template, default port, quoting)
+   + a driver package. Later candidates: IBM DB2, SAP HANA, Snowflake, SQLite.
+
+   ClickHouse specifics worth knowing: its **databases are exposed as schemas**,
+   so the schema browser lists them like any other dialect; and it has **no
+   foreign-key metadata**, so FK-based relation discovery yields nothing for
+   ClickHouse tables — name / description / pasted-SQL candidates still work.
+   Its bounds ride in the URL query rather than `connect_args` (the native
+   driver discards those); see the `db_connector.py` row of `CLAUDE.md`.
 3. **Descriptions:** English.
 4. **Sharing:** chats/dashboards on DB tables shareable freely in Phase 1 — the
    sharing user is responsible. Later (with roles): recipients without permission

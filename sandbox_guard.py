@@ -29,7 +29,8 @@ DENIED_MODULES = frozenset({
     # DB stack
     "sqlalchemy", "psycopg2", "psycopg", "pymysql", "MySQLdb", "mysql",
     "mariadb", "pyodbc", "pymssql", "oracledb", "cx_Oracle", "sqlite3",
-    "ibm_db", "hdbcli", "snowflake", "clickhouse_driver", "clickhouse_connect",
+    "ibm_db", "hdbcli", "snowflake", "clickhouse_driver",
+    "clickhouse_connect", "clickhouse_sqlalchemy",
     # this client's credential surface
     "db_connector", "db_sources", "db_scheduler", "local_store", "settings",
     "brain_client", "password_utils",

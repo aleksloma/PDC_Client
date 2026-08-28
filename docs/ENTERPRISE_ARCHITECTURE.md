@@ -583,9 +583,12 @@ The same boundary applies to the background "Auto Analytics" feature:
 
 A local admin (`ladmin`, the fixed role=admin account bootstrapped from
 `LOCAL_ADMIN_PASSWORD`) registers external database tables (PostgreSQL,
-MySQL/MariaDB, MSSQL, Oracle — a dialect REGISTRY in `client/db_connector.py`;
-adding a type = one registry entry + one driver package) so users can analyze
-them in chats exactly like uploaded files. Spec: `docs/DB_TABLES_PLAN.md`.
+MySQL/MariaDB, MSSQL, Oracle, ClickHouse — a dialect REGISTRY in
+`client/db_connector.py`; adding a type = one registry entry + one driver
+package) so users can analyze them in chats exactly like uploaded files.
+ClickHouse databases appear as schemas in the browser, and ClickHouse carries
+no FK metadata, so FK-based relation discovery yields nothing for its tables
+(name / description / pasted-SQL candidates still work). Spec: `docs/DB_TABLES_PLAN.md`.
 ladmin is **config-only**: login lands directly on the `/admin/data_sources`
 panel and `/lab` redirects it back there — the admin account has no chat UI.
 Users pick registered tables via a compact "Select from DB" checkbox dropdown

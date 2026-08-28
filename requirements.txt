@@ -36,12 +36,22 @@ reportlab==4.2.5
 # Connector is SELECT/introspection-only; drivers are DENIED inside the
 # code-exec sandbox (sandbox_guard.py). oracledb runs in thin mode (no
 # Instant Client); pyodbc needs unixodbc + msodbcsql18 from the Dockerfile.
+# ClickHouse speaks the NATIVE protocol (port 9000; 9440 with SSL) and needs
+# no system package. clickhouse-sqlalchemy ships sdist-only, so pip builds it —
+# pure Python, no compiler needed. It hard-depends on asynch (compiled, used
+# only by its `clickhouse+asynch` driver, which we never import) and requests;
+# asynch and its compiled dep ciso8601 are pinned here so an otherwise fully
+# pinned image cannot drift on a C extension. Both have amd64 + arm64 wheels.
 SQLAlchemy==2.0.36
 cryptography==43.0.3
 psycopg2-binary==2.9.10
 PyMySQL==1.1.1
 pyodbc==5.2.0
 oracledb==2.5.1
+clickhouse-sqlalchemy==0.3.2
+clickhouse-driver==0.2.11
+asynch==0.4.0
+ciso8601==2.3.3
 # Relation discovery: parses admin-pasted SQL locally (never sent to the
 # brain, never persisted). Pure Python, denied inside the exec sandbox.
 sqlglot==30.14.0

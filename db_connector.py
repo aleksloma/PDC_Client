@@ -3,8 +3,10 @@
 Dialect REGISTRY design: every DB-type-specific detail (URL drivername,
 default port, identifier quoting, SELECT-1 probe, statement-timeout mechanism,
 row-count / size catalog estimates, LIMIT syntax) lives in ONE `Dialect`
-entry. Adding a future DB type (DB2, HANA, Snowflake, ClickHouse, ...) is one
+entry. Adding a future DB type (DB2, HANA, Snowflake, ...) is one
 `Dialect(...)` literal plus one pinned driver package — nothing else changes.
+ClickHouse was added exactly that way; its one wrinkle is that the native
+driver discards `connect_args`, so its bounds ride in `query_args` instead.
 
 Security invariants (docs/AI_CONSTITUTION.md Article VII + DB_TABLES_PLAN):
   - This module only ever issues SELECT / introspection statements. There is
@@ -160,6 +162,34 @@ def _oracle_stmt_timeout(conn, seconds: int) -> None:
         pass
 
 
+def _clickhouse_query_args(cfg: dict) -> dict:
+    # Every bound rides in the URL QUERY, not connect_args: the native
+    # dialect's create_connect_args returns ((url_string,), {}) and
+    # Connection.__init__ does `Client.from_url(args[0])`, DISCARDING **kwargs
+    # — a connect_args timeout would look right and bound nothing (the Oracle
+    # gap again). clickhouse-driver's parse_url types the timeouts (float) and
+    # secure/verify (bool); every key it does not recognize becomes a server
+    # SETTING, which is how max_execution_time gets there.
+    stmt = int(cfg.get("statement_timeout") or settings.DB_STATEMENT_TIMEOUT)
+    args = {
+        "connect_timeout": str(int(cfg.get("connect_timeout")
+                                   or settings.DB_CONNECT_TIMEOUT)),
+        # The socket read bound must OUTLAST the server-side kill, or the
+        # two expire together and which error surfaces is a race. With the
+        # margin the admin reliably gets ClickHouse's own "Timeout exceeded"
+        # rather than a bare socket timeout.
+        "send_receive_timeout": str(stmt + 30),
+        # This IS the statement timeout for this dialect — a session-level
+        # SET cannot replace it (see the registry entry).
+        "max_execution_time": str(stmt),
+    }
+    if cfg.get("ssl"):
+        args["secure"] = "true"
+        if cfg.get("trust_server_certificate"):
+            args["verify"] = "false"      # self-signed; mirrors the mssql flag
+    return args
+
+
 DIALECTS: dict[str, Dialect] = {d.key: d for d in [
     Dialect(
         key="postgresql", label="PostgreSQL",
@@ -224,6 +254,27 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
                        "WHERE owner = :schema AND table_name = :table"),
         table_size_sql=("SELECT SUM(bytes) FROM all_segments "
                         "WHERE owner = :schema AND segment_name = :table"),
+    ),
+    Dialect(
+        key="clickhouse", label="ClickHouse",
+        drivername="clickhouse+native", driver_module="clickhouse_driver",
+        default_port=9000, quote=('`', '`'), needs=("database",),
+        # ClickHouse "databases" are what the SQLAlchemy dialect exposes as
+        # schemas, so the schema browser lists them like any other dialect.
+        supports_schemas=True, select1_sql="SELECT 1",
+        # connect_args deliberately left at its default — see
+        # _clickhouse_query_args for why the native driver ignores it. There
+        # is likewise NO apply_stmt_timeout (mssql is the same shape): a
+        # session `SET max_execution_time` does not survive over the native
+        # protocol, because clickhouse-driver re-sends its OWN settings with
+        # every query and they win. Measured: after `SET 7`,
+        # system.settings still reads the URL value. The bound is real, it
+        # just lives in the connection settings instead.
+        query_args=_clickhouse_query_args,
+        row_count_sql=("SELECT total_rows FROM system.tables "
+                       "WHERE database = :schema AND name = :table"),
+        table_size_sql=("SELECT total_bytes FROM system.tables "
+                        "WHERE database = :schema AND name = :table"),
     ),
     # Hidden test-only entry: the offline pytest suite drives the SAME code
     # path through in-process SQLite. Never offered in the admin UI.
@@ -290,8 +341,9 @@ _TIMEOUT_PAT = re.compile(
 def _friendly_db_error(exc: Exception, phrase: str, *secrets_: Optional[str]) -> str:
     """One clear sentence when a driver error is timeout-shaped, so the admin
     reads "the database did not answer" instead of a 300-char driver dump.
-    Each of the five drivers words it differently (psycopg2 "timeout expired",
-    pyodbc HYT00, oracledb DPY-6005, …), so the whole cause chain is checked.
+    Each of the six drivers words it differently (psycopg2 "timeout expired",
+    pyodbc HYT00, oracledb DPY-6005, clickhouse-driver SocketTimeoutError /
+    "Code: 159. … Timeout exceeded"), so the whole cause chain is checked.
     Anything not timeout-shaped keeps its scrubbed driver text — no error is
     ever replaced by a guess."""
     seen = 0

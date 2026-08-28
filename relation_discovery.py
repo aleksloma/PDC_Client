@@ -49,7 +49,8 @@ DESC_STOPWORDS = frozenset({
     "table", "column", "field", "value", "values", "unique", "identifier",
 })
 SQLGLOT_DIALECT = {"postgresql": "postgres", "mysql": "mysql", "mariadb": "mysql",
-                   "mssql": "tsql", "oracle": "oracle", "sqlite": "sqlite"}
+                   "mssql": "tsql", "oracle": "oracle", "sqlite": "sqlite",
+                   "clickhouse": "clickhouse"}
 CARDINALITY_LABEL = {"N:1": "many-to-one", "1:1": "one-to-one",
                      "1:N": "one-to-many", "N:M": "many-to-many"}
 SOURCE_PRECEDENCE = ("fk", "sql", "name", "description")

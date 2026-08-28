@@ -13,7 +13,8 @@ import sandbox_guard
     "sqlalchemy", "psycopg2", "pymysql", "pyodbc", "oracledb", "sqlite3",
     "db_connector", "db_sources", "db_scheduler", "local_store", "settings",
     "brain_client", "password_utils", "relation_discovery", "sqlglot",
-    "roles_store",
+    "roles_store", "clickhouse_driver", "clickhouse_sqlalchemy",
+    "clickhouse_connect",
 ])
 def test_denied_import_raises_in_safe_execute(mod):
     out = code_exec.safe_execute(f"import {mod}\nRESULT = 1", {}, sid="t")

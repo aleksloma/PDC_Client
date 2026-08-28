@@ -270,8 +270,8 @@ picked up within ~60 s without restarting the client.
 ## 4c. Registering database tables (client-admin runbook, "Data sources")
 
 The CLIENT-side local admin (`ladmin`) can register tables from the
-customer's own databases (PostgreSQL, MySQL/MariaDB, MSSQL, Oracle) so users
-analyze them in chats like uploaded files. Snapshot mode: each registered
+customer's own databases (PostgreSQL, MySQL/MariaDB, MSSQL, Oracle,
+ClickHouse) so users analyze them in chats like uploaded files. Snapshot mode: each registered
 table is copied to `DATA_ROOT/db_snapshots/{table_id}.parquet` and refreshed
 nightly. This runs entirely on the client — the brain is untouched.
 
@@ -295,8 +295,11 @@ Runbook:
    controls (change password / sign out) live at the bottom of the panel's
    sidebar.
 2. **Connections** section → **＋ Add connection** → fill
-   host/port/database/user/password (SSL toggle; MSSQL also has
-   Trust-server-certificate for self-signed certs) → **Test connection**
+   host/port/database/user/password (SSL toggle; MSSQL and ClickHouse also
+   use Trust-server-certificate for self-signed certs — on ClickHouse it maps
+   to the driver's `verify=false`). **ClickHouse + SSL also needs the port
+   changed to 9440** — the form pre-fills the plaintext native port 9000 and
+   does not adjust it when SSL is ticked. → **Test connection**
    (works on the unsaved draft) → Save. With zero connections the section
    shows a 3-step getting-started hero instead of an empty table.
 3. **＋ Register table** (from a connection row or the Registered-tables

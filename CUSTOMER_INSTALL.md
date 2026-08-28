@@ -51,7 +51,14 @@ Edit `client.env` and fill in:
 ### Connecting your own databases (optional)
 
 The `ladmin` account can register tables from your PostgreSQL, MySQL/MariaDB,
-SQL Server, or Oracle databases so your users analyze them in chats. Table
+SQL Server, Oracle, or ClickHouse databases so your users analyze them in
+chats. ClickHouse needs nothing extra installed; it is reached over its
+**native protocol — port 9000 plain, port 9440 when you tick SSL** (the form
+pre-fills 9000, so change it yourself for a TLS connection) — and its databases
+appear as "schemas" when your admin browses the connection. (SQL Server is the
+one type with an image-build dependency: the Microsoft ODBC driver is installed
+only on amd64/arm64 builds, and the admin panel greys the type out with a
+reason if it is missing.) Table
 data is snapshotted **inside your own `/data/client` volume** — like all raw
 data, it never leaves your network; only column names, types, and the
 descriptions your admin confirms are shared with the AI.

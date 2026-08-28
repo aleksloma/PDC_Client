@@ -531,7 +531,30 @@ not file hashes.
   so explicitly.
 - The oracle connect bound ships tested at the dict level only (kwarg
   `tcp_connect_timeout` verified against the pinned oracledb 2.5.1 in the
-  running image; no Oracle instance exists in the local stack).
+  running image; no Oracle instance exists in the local stack). The
+  CLICKHOUSE bounds, by contrast, were verified against a live ClickHouse
+  24.8: a blackhole host returned in 4.3s on a 4s bound (vs the ~127s OS
+  fallback), and a 2s `max_execution_time` killed a long query at 2.0s with
+  `Code: 159. … Timeout exceeded`, which `_friendly_db_error` maps. Both ride
+  in the URL QUERY — the native dialect discards `connect_args` outright, and
+  a session `SET max_execution_time` is a measured no-op there (the driver
+  re-sends its own settings per query), which is why the dialect deliberately
+  has no `apply_stmt_timeout`.
+- ClickHouse's `system.tables.total_rows` / `total_bytes` are NULL for View /
+  Distributed / Merge / Log engines (measured on 24.8: a MergeTree table
+  reports both, a View reports neither). `introspect` only records `degraded`
+  when the estimate query RAISES, so such a table shows a blank row count
+  rather than "unavailable" — the same behavior MySQL views already have, so
+  it is consistent rather than new, just more common here.
+- ClickHouse has no FK metadata, so FK-based relation discovery yields nothing
+  for its tables; name / description / pasted-SQL candidates still work
+  (`SQLGLOT_DIALECT` maps it to sqlglot's `clickhouse`). Relatedly,
+  `classify_table_type`'s short-varchar rule needs a DECLARED length and
+  ClickHouse `String` has none, so a ClickHouse dictionary table keyed on
+  `String` columns suggests "normal" rather than "connector" — integer keys
+  (`UInt64`, …) classify correctly via `py_type == "int"`, and the admin flips
+  the type in the Accept dialog either way. Not special-cased on purpose:
+  `_VARCHAR_DTYPE_RE` is shared with every other dialect.
 - Blocking store reads still run on the event loop at two spots in the accept
   route (`list_tables` before and after `_register`) — pre-existing, out of
   scope.

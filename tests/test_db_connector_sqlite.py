@@ -44,14 +44,16 @@ def sqlite_cfg(tmp_path):
 
 
 def test_registry_shape():
-    for key in ("postgresql", "mysql", "mariadb", "mssql", "oracle"):
+    for key in ("postgresql", "mysql", "mariadb", "mssql", "oracle",
+                "clickhouse"):
         d = db_connector.DIALECTS[key]
         assert d.drivername and d.select1_sql and d.quote
         assert not d.hidden
     # UI list is derived purely from the registry, hidden entries filtered.
     keys = {r["key"] for r in db_connector.list_dialects()}
     assert "sqlite" not in keys
-    assert {"postgresql", "mysql", "mariadb", "mssql", "oracle"} <= keys
+    assert {"postgresql", "mysql", "mariadb", "mssql", "oracle",
+            "clickhouse"} <= keys
     for r in db_connector.list_dialects():
         assert set(r) == {"key", "label", "default_port", "needs",
                           "supports_schemas", "available", "unavailable_reason"}
@@ -251,9 +253,23 @@ def test_friendly_error_maps_driver_specific_timeout_strings():
                 "('HYT00', '[HYT00] Login timeout expired')",
                 "Lost connection: read timed out",
                 "QueryCanceled: canceling statement due to statement timeout",
-                "TimeoutError raised by the pool"):
+                "TimeoutError raised by the pool",
+                # clickhouse-driver, verbatim off ClickHouse 24.8 (the
+                # clickhouse-sqlalchemy wrapper prefixes the server text).
+                "Orig exception: Code: 159. DB::Exception: Timeout exceeded: "
+                "elapsed 2.000478552 seconds, maximum: 2."):
         e = RuntimeError(msg)
         assert db_connector._friendly_db_error(e, phrase) == phrase, msg
+
+
+def test_friendly_error_maps_the_clickhouse_socket_timeout_class():
+    """clickhouse-driver reports a socket timeout as SocketTimeoutError whose
+    text is just `Code: 209.` — the CLASS NAME is what carries the meaning,
+    and _friendly_db_error matches against `type(e).__name__ + str(e)`."""
+    SocketTimeoutError = type("SocketTimeoutError", (Exception,), {})
+    e = SocketTimeoutError("Code: 209. (ch-host:9000)")
+    phrase = "Database connection timed out."
+    assert db_connector._friendly_db_error(e, phrase) == phrase
 
 
 def test_friendly_error_does_not_relabel_generic_connect_failures():
@@ -263,6 +279,12 @@ def test_friendly_error_does_not_relabel_generic_connect_failures():
     e = RuntimeError("DPY-6005: cannot connect to database")
     out = db_connector._friendly_db_error(e, "Database connection timed out.")
     assert "DPY-6005" in out and "timed out" not in out
+    # Same policy for clickhouse-driver's NetworkError (code 210).
+    NetworkError = type("NetworkError", (Exception,), {})
+    out = db_connector._friendly_db_error(
+        NetworkError("Code: 210. Connection refused (ch-host:9000)"),
+        "Database connection timed out.")
+    assert "Connection refused" in out and "timed out" not in out
 
 
 def test_friendly_error_ignores_the_word_timeout_inside_a_dsn_echo():
@@ -371,3 +393,138 @@ def test_fingerprint_failure_shape(sqlite_cfg):
     fp = db_connector.fingerprint_table(sqlite_cfg, "", None, "no_such_table",
                                         sid="t")
     assert fp["ok"] is False and fp["error"]
+
+
+# ---------------------------------------------------------------------------
+# ClickHouse — registry-only proofs (no live server; the dialect is exercised
+# through the same generic code paths as every other entry)
+# ---------------------------------------------------------------------------
+
+def test_clickhouse_registry_entry():
+    import importlib.util
+    d = db_connector.DIALECTS["clickhouse"]
+    assert d.label == "ClickHouse"
+    assert d.drivername == "clickhouse+native"
+    assert d.driver_module == "clickhouse_driver"
+    assert d.default_port == 9000
+    assert d.quote == ("`", "`")
+    assert d.needs == ("database",)
+    # ClickHouse databases are exposed as schemas, so the browser lists them.
+    assert d.supports_schemas is True
+    assert d.select1_sql == "SELECT 1"
+    # Columnar or not, never COUNT(*) a customer table: system.tables answers.
+    assert d.exact_count_fallback is False
+    assert d.hidden is False
+    assert d.allow_url_override is False
+    ok, reason = d.available()
+    assert ok is (importlib.util.find_spec("clickhouse_driver") is not None)
+    assert ok or "clickhouse_driver" in reason
+
+
+def test_clickhouse_build_url():
+    url = db_connector.build_url(
+        {"db_type": "clickhouse", "host": "ch", "database": "analytics",
+         "user": "reader"}, "p@ss/word")
+    assert url.drivername == "clickhouse+native"
+    assert url.port == 9000            # registry default when cfg omits it
+    assert url.database == "analytics"
+    assert "p@ss/word" not in str(url) and "***" in str(url)
+    assert url.password == "p@ss/word"
+
+
+def test_clickhouse_bounds_the_connect_via_the_url_query():
+    """clickhouse+native DISCARDS connect_args: create_connect_args returns
+    ((url_string,), {}) and Connection.__init__ does Client.from_url(args[0]),
+    ignoring **kwargs. A timeout put in connect_args would read as correct and
+    bound NOTHING — the Oracle ~127s gap all over again. Everything therefore
+    rides in the URL query, which clickhouse-driver's parse_url types."""
+    d = db_connector.DIALECTS["clickhouse"]
+    assert d.connect_args({}, 8) == {}
+    q = d.query_args({})
+    assert q["connect_timeout"] == "8"           # settings.DB_CONNECT_TIMEOUT
+    assert q["max_execution_time"] == "300"      # unknown key -> server setting
+    # The socket read bound outlasts the server kill so the two can't race.
+    assert q["send_receive_timeout"] == "330"
+    url = db_connector.build_url({"db_type": "clickhouse", "host": "ch"}, "")
+    assert url.query["connect_timeout"] == "8"
+
+
+def test_clickhouse_bounds_survive_into_the_dsn_the_driver_parses():
+    """The one that would actually catch a regression: putting a key in the
+    SQLAlchemy URL proves nothing unless the dialect RENDERS it into the DSN
+    it hands clickhouse-driver, and the driver types it back out. If a future
+    clickhouse-sqlalchemy changed that rendering, every other test here would
+    still pass while the bound silently disappeared — the Oracle failure mode.
+    Skipped where the driver is absent; it is installed in the image."""
+    pytest.importorskip("clickhouse_sqlalchemy")
+    from clickhouse_driver.util.helpers import parse_url
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool
+
+    url = db_connector.build_url(
+        {"db_type": "clickhouse", "host": "ch", "database": "analytics",
+         "user": "u", "ssl": True, "trust_server_certificate": True}, "pw")
+    engine = create_engine(url, poolclass=NullPool)   # no connection is opened
+    try:
+        args, kwargs = engine.dialect.create_connect_args(engine.url)
+        # The channel create_engine(connect_args=...) would have used.
+        assert kwargs == {}, "connect_args would NOT be discarded any more"
+        _host, client_kwargs = parse_url(args[0])
+    finally:
+        engine.dispose()
+
+    assert client_kwargs["connect_timeout"] == 8.0
+    assert client_kwargs["send_receive_timeout"] == 330.0
+    assert client_kwargs["secure"] is True
+    assert client_kwargs["verify"] is False
+    assert client_kwargs["settings"] == {"max_execution_time": "300"}
+    assert client_kwargs["database"] == "analytics"
+
+
+def test_clickhouse_query_args_ssl_flags():
+    d = db_connector.DIALECTS["clickhouse"]
+    plain = d.query_args({})
+    assert "secure" not in plain and "verify" not in plain
+    tls = d.query_args({"ssl": True})
+    assert tls["secure"] == "true" and "verify" not in tls
+    self_signed = d.query_args({"ssl": True, "trust_server_certificate": True})
+    assert self_signed["secure"] == "true" and self_signed["verify"] == "false"
+
+
+def test_clickhouse_query_args_honour_admin_overrides():
+    q = db_connector.DIALECTS["clickhouse"].query_args(
+        {"connect_timeout": 3, "statement_timeout": 30})
+    assert q["connect_timeout"] == "3"
+    assert q["max_execution_time"] == "30"
+    assert q["send_receive_timeout"] == "60"   # the kill + the 30s margin
+
+
+def test_clickhouse_issues_no_session_statement_timeout():
+    """The statement bound is max_execution_time in the URL query, NOT a
+    session SET: clickhouse-driver re-sends its own settings with every query
+    and they overwrite anything SET on the session (measured against
+    ClickHouse 24.8 — after `SET max_execution_time = 7`, system.settings
+    still read the URL value). Emitting the SET anyway would be dead weight
+    that reads like a working bound, so this dialect has no
+    apply_stmt_timeout — the same shape as mssql."""
+    class _Conn:
+        def execute(self, stmt):            # pragma: no cover - must not run
+            raise AssertionError("clickhouse must not issue a session SET")
+
+    db_connector.DIALECTS["clickhouse"].apply_stmt_timeout(_Conn(), 42)
+    assert db_connector.DIALECTS["clickhouse"].apply_stmt_timeout is         db_connector._no_op_timeout
+
+
+def test_clickhouse_build_select_quotes_and_limits():
+    d = db_connector.DIALECTS["clickhouse"]
+    assert (db_connector._build_select(d, "analytics", "events", row_cap=5)
+            == "SELECT * FROM `analytics`.`events` LIMIT 5")
+    assert (db_connector._build_select(d, None, "events", columns=["a`b"])
+            == "SELECT `a``b` FROM `events`")
+
+
+def test_clickhouse_catalog_estimates_are_bound_by_schema_and_table():
+    d = db_connector.DIALECTS["clickhouse"]
+    for sql in (d.row_count_sql, d.table_size_sql):
+        assert sql.startswith("SELECT ") and "system.tables" in sql
+        assert ":schema" in sql and ":table" in sql

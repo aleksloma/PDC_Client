@@ -294,7 +294,7 @@ or `url_override`). Every admin action appends to the append-only audit JSONL
 
 | Method | Path | Behavior |
 |---|---|---|
-| `GET` | `/api/admin/dialects` | dialect registry for the UI (`postgresql`, `mysql`, `mariadb`, `mssql`, `oracle`) with per-dialect `{available, unavailable_reason}` (e.g. msodbcsql18 not installed) |
+| `GET` | `/api/admin/dialects` | dialect registry for the UI (`postgresql`, `mysql`, `mariadb`, `mssql`, `oracle`, `clickhouse`) with per-dialect `{available, unavailable_reason}` (e.g. msodbcsql18 not installed). The connection form is built from this response alone — `label`, `default_port`, `needs`, `available` — so a new dialect needs no UI change unless it needs a form field beyond database / service_name |
 | `GET/POST` | `/api/admin/connections` | list (masked) / create. Create requires `CLIENT_ENCRYPTION_KEY` (else 503 — passwords are Fernet-encrypted at rest, never plaintext) |
 | `POST` | `/api/admin/connections/test` | SELECT-1 probe with a short connect timeout. Accepts `{connection_id}` OR a full unsaved draft incl. `password` (Test-before-Save). `{ok, error?, server_version?, elapsed_ms}` |
 | `POST` | `/api/admin/connections/{cid}` | edit; omitted/empty `password` keeps the stored credential |
