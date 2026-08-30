@@ -179,6 +179,7 @@ def append_line(path: Path, data: dict) -> None:
 | client | DB sources registry   | `data_sources.json` (connections Fernet-encrypted + registered tables) |
 | client | DB table snapshots    | `db_snapshots/{table_id}.parquet` (ONE central copy per table) |
 | client | Admin audit trail     | `admin_audit.jsonl` (append-only, secrets scrubbed) |
+| client | SSO configuration     | `sso_config.json` (Microsoft Entra ID; client secret Fernet-encrypted) |
 | brain  | Tenant registry       | `tenants/{tenant_id}/meta.json`                     |
 | brain  | Per-tenant config     | `tenants/{tenant_id}/config.json`                   |
 | brain  | Per-tenant usage      | `tenants/{tenant_id}/usage.jsonl`                   |
@@ -227,7 +228,9 @@ client must be closed on FastAPI lifespan shutdown.
    save, NEVER a plaintext fallback), masked in every API response, never
    logged, never included in any `brain_client` payload, and only ever
    decrypted into function-locals at the moment of use — never held in
-   cleartext at importable module scope.
+   cleartext at importable module scope. The Microsoft SSO client secret
+   (`sso_config.json`, `sso_store.py`) follows the same rule in full — and
+   the ID/access tokens from the OIDC flow are never logged either.
 9. **The code-exec sandbox never gets DB access.** Both exec sites
    (`code_exec.safe_execute`, `plot_utils.render_plot_safe`) install
    `sandbox_guard.SANDBOX_BUILTINS`, whose `__import__` DENIES SQLAlchemy,

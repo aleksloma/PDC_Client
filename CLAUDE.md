@@ -68,6 +68,7 @@ PDC_Client/
 ├── db_scheduler.py          # nightly snapshot refresh + drift resync (lifespan-scoped thread)
 ├── relation_discovery.py    # relation candidates (FK/name/description/pasted-SQL) + snapshot verification + banding (ladmin review, proposals only)
 ├── roles_store.py           # roles.json registry (access-only roles: built-in Base, scope grants) + dynamic effective-access AND management-scope helpers — the DB-table role gate; the power CAPABILITY is the per-user permission (AuthStore), 19e
+├── sso_store.py             # DATA_ROOT/sso_config.json — Microsoft Entra ID SSO config (secret Fernet-encrypted via db_sources helpers, load/load_masked/save, enable gate = last_test_hash over tenant+client+secret, redirect_uri w/ public_base_url override); file absent ⇒ SSO disabled
 ├── pptx_template_cache.py   # local cache of the brain-served tenant template/spec
 ├── settings.py
 ├── models.py
@@ -80,6 +81,7 @@ PDC_Client/
 │   ├── dashboards.py        # /api/dashboards/* — pinned-tile dashboards + sharing
 │   ├── admin_data.py        # /api/admin/* — "Data sources" (connections/tables/refresh); ladmin + scoped power users (_require_source_manager)
 │   ├── admin_users.py       # /api/admin/users* + /api/admin/roles* — ladmin "User management" (roles, grants)
+│   ├── sso.py               # Microsoft Entra ID SSO: /auth/microsoft + /callback (authlib OIDC, 404 while disabled, remember=False sessions, bootstrap-admin identity refused; the client is built FRESH per request — the module cache holds ONLY public discovery metadata+JWKS, never the secret, Art VII r8) AND /api/admin/sso* (_require_admin; save/test incl. POLICY_BLOCKED/enable-gate 409 TEST_REQUIRED/disable, all audited sso.*). sso_store is sandbox-DENIED
 │   └── report.py            # /download_report (PDF), /download_pptx
 ├── templates/
 │   ├── dashboard.html       # /lab page
@@ -175,6 +177,10 @@ It is NOT a customer topology.
 ## Differences from the B2C edition (intentional)
 
 - **Local email+password auth** — no Google OAuth, no B2C registration.
+  Optional **Microsoft Entra ID SSO** exists on top (ladmin-configured from
+  the admin panel's "Single sign-on" section, `sso_store.py` +
+  `routes/sso.py`, `docs/SSO_MICROSOFT.md`); the password form stays and is
+  always reachable at `/?local=1`.
   The password is set on first login for NEW accounts (hash-only, local
   disk); legacy email-only accounts must set theirs through the reset flow.
   The brain is involved only as a Gmail relay for welcome / password-reset mails

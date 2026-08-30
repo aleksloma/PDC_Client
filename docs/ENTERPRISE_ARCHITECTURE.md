@@ -1046,6 +1046,33 @@ else the union) / `can_manage_physical` / `manageable_table_ids_for`
 (connectors INCLUDED — management is about the registry, unlike read
 access) / `scope_covers`, all fail-closed.
 
+### 10c. Identity — Microsoft Entra ID SSO (optional, client-side only)
+
+The identity provider is the **customer's own Entra tenant**. The client
+speaks standard OIDC (authorization-code flow via authlib in
+`routes/sso.py`): PDC never sees a password, and the ONLY claim it reads
+from the validated ID token is the user's email (`preferred_username`,
+fallback `email`), which becomes the same local identity a password login
+would create (`ensure_user` auto-provisioning; who may sign in at all is
+decided in Entra via "Assignment required" — there is no client-side
+allow-list). Nothing about SSO crosses to the brain except the normal
+`login` activity event that password logins already post.
+
+Configuration is DATA, not env: `DATA_ROOT/sso_config.json`
+(`sso_store.py`), managed entirely from the ladmin "Single sign-on" panel —
+the client secret is Fernet-encrypted at rest with the SAME
+`CLIENT_ENCRYPTION_KEY` as DB credentials (no key ⇒ refuse to save, never
+plaintext), masked in every API response, never logged or audited in
+cleartext. Enabling requires a passed connection test for the currently
+saved values (hash-gated); enable/disable/edit take effect on the next
+request with no restart. While disabled, the `/auth/microsoft*` routes 404
+and the landing page is byte-identical to a pre-SSO build. SSO sessions are
+browser-session cookies (`remember=False` — Entra re-auth is silent on
+joined devices); logout is local-only (no Microsoft front-channel logout,
+documented). The bootstrap ladmin keeps password login (`/?local=1` is the
+always-on escape hatch when auto-redirect is enabled). Customer guide:
+`docs/SSO_MICROSOFT.md`.
+
 ---
 
 ## 11. Sharing restriction

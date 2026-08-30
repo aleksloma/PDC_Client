@@ -36,10 +36,12 @@ Edit `client.env` and fill in:
   once at tenant creation).
 - **`SECRET_KEY`** — generate once with `openssl rand -hex 32`; keep it stable so
   logins persist.
-- **`CLIENT_ENCRYPTION_KEY`** — only needed if you will connect your own
-  databases ("Data sources"). Generate once with
+- **`CLIENT_ENCRYPTION_KEY`** — **set this at install time.** It encrypts every
+  credential the admin panel stores at rest: database passwords ("Data
+  sources") AND the Microsoft SSO client secret — without it those Save/Test
+  buttons are disabled. Generate once with
   `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
-  and keep it stable — changing it makes stored database passwords unreadable
+  and keep it stable — changing it makes the stored secrets unreadable
   (they must be re-entered in the admin UI).
 - **`LOCAL_ADMIN_PASSWORD`** — one-time bootstrap password for the local admin
   account `ladmin` (manages database sources). Only a hash is stored and the
@@ -68,6 +70,13 @@ PowerDataChat with SELECT-only grants** (ideally on a read replica). The
 client only ever issues SELECT/introspection statements, and that grant is
 your hard guarantee. Set the nightly snapshot-refresh time in the admin UI
 (container-local time — set `TZ` in `client.env` if your server isn't UTC).
+
+### Single sign-on with Microsoft Entra ID (optional)
+
+After install, the `ladmin` account can connect your Microsoft Entra ID
+(Azure AD) tenant from the admin panel's **Single sign-on** page so employees
+sign in with their Microsoft 365 identity — see
+[`docs/SSO_MICROSOFT.md`](docs/SSO_MICROSOFT.md).
 
 ## 3. Run
 

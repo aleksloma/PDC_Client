@@ -16,14 +16,14 @@ file documents the enterprise client's implementation of each one.
 
 | Method | Path | Behavior |
 |---|---|---|
-| `GET` | `/` | auth landing (email + password + "Remember me"); redirects to `/lab` if already signed in (or to `/auth/change_password` when a forced change is pending) |
+| `GET` | `/` | auth landing (email + password + "Remember me"); redirects to `/lab` if already signed in (or to `/auth/change_password` when a forced change is pending). When Microsoft SSO is ENABLED (`sso_store.is_enabled()`), a "Sign in with Microsoft" link renders ABOVE the unchanged password form (i18n'd, EN/GEO/RU); with **auto-redirect** also on, an unauthenticated visitor is 302'd straight to `/auth/microsoft` — EXCEPT `/?local=1`, the always-available escape hatch that shows the password form (ladmin recovery). The authenticated-session redirect runs FIRST, so a signed-in user never bounces to Microsoft. SSO disabled ⇒ the page renders byte-identically to a pre-SSO build. |
 | `GET` | `/lab` | the dashboard page (no session → `/`; `must_change_password` pending → `/auth/change_password`; **bootstrap ladmin → `/admin/data_sources`** — only the appliance account is config-only; a PROMOTED admin renders /lab like any user with the B2C `is_admin` template flag still `false` for everyone, 19g) |
 | `GET` | `/c/{conv_id}` | deep-link / hard-refresh into one conversation. Resolves the conv's `chat_id` from the caller's conversations index and seeds `open_conv_id`/`open_chat_id` so `dashboard.js` auto-opens it. No session → `/`; forced change pending → `/auth/change_password`; unknown/foreign conv → `/lab` (never 404). |
 | `GET` | `/auth/change_password` | forced set-a-new-password page shown after a temp-password login (no session → `/`; no pending flag → `/lab`) |
 | `GET` | `/dashboards/{dash_id}` | the dashboard page (grid of pinned tiles, `dashboard_view.html` + `dashboard_view.js`). Resolves the dashboard via own-doc-or-shared-pointer; no session → `/`; forced change pending → `/auth/change_password`; unknown/unshared → `/lab` (never 404). |
 | `GET` | `/health` | liveness + `{brain_reachable, tenant_token_configured}`; v4.2 adds `build_commit` (additive) |
 | `GET` | `/version` | which build is running: `{commit, build_time, started_at}` — nulls on an unstamped image, never a fabricated identity. Unauthenticated like `/health`, carries no secrets. Exists because the static `?v=` parameter is `int(time.time())` at page render (per request) and therefore **cannot** identify a build — reading it as one misled release verification twice. Fed by the `BUILD_COMMIT`/`BUILD_TIME` Docker build args; the admin sidebar shows the same string |
-| `GET` | `/admin/data_sources` | the ladmin **Data sources** admin panel (`admin_data_sources.html` + `admin_data_sources.js`, standalone stylesheet — no dashboard.css): sidebar-navigated sections (DB connections, registered tables, relations — a confirmed-relations overview with per-row Edit/Delete above the discovery tools — users, roles, refresh schedule, audit log), a 3-step register-table wizard (whose relations step auto-suggests relations from the table's own FKs + name/description similarity, FK rows pre-checked) (Source → Describe → Confirm & snapshot), onboarding hero when no connections exist, and sidebar account controls (change password via `POST /auth/password`, sign out). This is the BOOTSTRAP ladmin's landing page — its login and forced-change redirect here (a PROMOTED admin lands on /lab and reaches this page via the dropdown's "DB config", 19g). Redirect philosophy: no session → `/`; forced change → `/auth/change_password`; non-admin → `/lab` (never an error page). Renders with `manager_mode: "admin"` (→ `window.__MANAGER_MODE__`); 19g adds `back_to_chat` to the context — true for promoted admins, so the sidebar footer carries the "← Back to chat" link (absent for the bootstrap account, which has no chat). |
+| `GET` | `/admin/data_sources` | the ladmin **Data sources** admin panel (`admin_data_sources.html` + `admin_data_sources.js`, standalone stylesheet — no dashboard.css): sidebar-navigated sections (DB connections, registered tables, relations — a confirmed-relations overview with per-row Edit/Delete above the discovery tools — users, roles, single sign-on (Microsoft Entra ID config — see the SSO admin-routes section + `docs/SSO_MICROSOFT.md`), refresh schedule, audit log), a 3-step register-table wizard (whose relations step auto-suggests relations from the table's own FKs + name/description similarity, FK rows pre-checked) (Source → Describe → Confirm & snapshot), onboarding hero when no connections exist, and sidebar account controls (change password via `POST /auth/password`, sign out). This is the BOOTSTRAP ladmin's landing page — its login and forced-change redirect here (a PROMOTED admin lands on /lab and reaches this page via the dropdown's "DB config", 19g). Redirect philosophy: no session → `/`; forced change → `/auth/change_password`; non-admin → `/lab` (never an error page). Renders with `manager_mode: "admin"` (→ `window.__MANAGER_MODE__`); 19g adds `back_to_chat` to the context — true for promoted admins, so the sidebar footer carries the "← Back to chat" link (absent for the bootstrap account, which has no chat). |
 | `GET` | `/power/data_sources` | the POWER-USER variant of the same page (prompt 19): the SAME `admin_data_sources.html` rendered with `manager_mode: "power"`. Sidebar shows only Connections (READ-ONLY list of in-scope connections — no Add/Edit/Delete/Test/Refresh; "＋ Register table" is the one action), Registered tables (Delete only on tables the power user registered themselves — `registered_by`), and Relations; the per-table ⏱ schedule modal stays, Users/Roles/Audit/global-schedule are not rendered; the wizard step-3 panel renders as "Share with your roles" (the caller's HELD roles from GET /api/admin/my_roles, all unchecked by default — 19f publish+share) and the page header carries the server-computed manage-scope summary ("You can manage: …", app._power_scope_summary) plus a muted read-beyond-manage hint; the sidebar footer gains a "← Back to chat" link to `/lab`. Redirects: no session → `/`; forced change → `/auth/change_password`; ladmin → `/admin/data_sources`; non-power users → `/lab` (`POWER_PAGE_DENIED` log). Power users reach it via the "DB config" item in the /lab profile dropdown (rendered when `is_power_user` — a promoted admin's "DB config" targets the full `/admin/data_sources` page instead, 19g). |
 
 ---
@@ -59,6 +59,23 @@ relay (`/v1/send_welcome_email`, `/v1/send_password_reset_email`).
 | `POST` | `/auth/active_chats/pin` | `{chat_id, pinned}` → `{ok, pinned}` — pin/unpin a chat; pinned chats sort FIRST in `/auth/active_chats` (then newest-first as before). Additive `pinned` flag on the user's own jsonl row; absent = unpinned (old rows unaffected) |
 | `POST` | `/auth/conversations/rename` | `{conv_id, title}` |
 | `POST` | `/auth/conversations/delete` | `{conv_id}` |
+
+### Microsoft Entra ID SSO (`routes/sso.py`, optional — ladmin-configured)
+
+OIDC authorization-code login against the customer's own Entra tenant,
+driven entirely by `DATA_ROOT/sso_config.json` (managed from the ladmin
+"Single sign-on" panel — no env vars, no restart; the client secret is
+Fernet-encrypted with the SAME `CLIENT_ENCRYPTION_KEY` the DB credentials
+use). Authlib does discovery/JWKS/ID-token validation and keeps state+nonce
+in the cookie session; PDC never sees a password and reads ONLY the email
+(`preferred_username`, fallback `email` claim) from the ID token. Logout
+stays local-only by design (no Microsoft front-channel logout). Customer
+guide: [`docs/SSO_MICROSOFT.md`](SSO_MICROSOFT.md).
+
+| Method | Path | Behavior |
+|---|---|---|
+| `GET` | `/auth/microsoft` | starts the flow: 302 to `login.microsoftonline.com` with state+nonce in the session. **404 while SSO is not enabled** (unconfigured installs look pre-SSO). Enabled but secret unreadable (encryption key rotated away) → landing with the generic failure message (503). |
+| `GET` | `/auth/microsoft/callback` | exchanges the code, validates the ID token (authlib — signature/issuer/audience/nonce), lower-cases the email claim, auto-provisions the local profile (`ensure_user` — access control is Entra's "Assignment required", no client-side allow-list), stamps `sso_provider`/`sso_last_login` on auth.json (`mark_sso_login` — merge-only, password hashes untouched), starts the session via the SAME `_start_session` as password login but with `remember=False` (browser-session cookie — Entra re-auth is silent) and never `must_change`, logs `USER_LOGIN_SSO`, posts the normal `login` activity event, 302 → `/lab`. Any failure (state mismatch, token error, missing email claim) → landing with "Microsoft sign-in failed…" (401/400), token contents never logged. 404 while disabled. |
 
 ---
 
@@ -447,6 +464,27 @@ modules are **denied inside the code-exec sandbox** (`sandbox_guard.SANDBOX_BUIL
 installed at both exec sites — defense in depth; the SELECT-only DB grant is
 the real guarantee); credentials are never logged, never in any brain payload,
 never at importable module scope in cleartext.
+
+### Admin routes — Single sign-on (`routes/sso.py` `admin_router`, same `/api/admin` prefix, `_require_admin` guard — ladmin + promoted admins)
+
+Configuration store: `DATA_ROOT/sso_config.json` (`sso_store.py` — atomic
+writes, secret Fernet-encrypted via the db_sources helpers, NO plaintext
+fallback: no `CLIENT_ENCRYPTION_KEY` ⇒ save/test answer 503). The masked
+shape mirrors `_mask_connection`: `client_secret_set` / `client_secret_readable`
+/ `client_secret_masked: "••••••••"`, secret material stripped. Every
+Save/Test/Enable/Disable writes an `sso.*` row to `admin_audit.jsonl`
+(tenant_id + client_id only — never the secret). The ENABLE GATE: enabling
+requires a successful Test for the CURRENTLY saved values (`last_test_hash`
+= sha256 over tenant_id+client_id+secret; any re-save of a credential field
+invalidates it). All changes take effect on the next request — no restart.
+
+| Method | Path | Behavior |
+|---|---|---|
+| `GET` | `/api/admin/sso` | the masked config + computed `redirect_uri` (`public_base_url` or the request base + `/auth/microsoft/callback`) + `test_current` + `encryption_ready` |
+| `POST` | `/api/admin/sso/save` | `{tenant_id, client_id, client_secret?, public_base_url?, auto_redirect?}`. 400: tenant_id not a GUID/domain, empty client_id, no secret when none stored, non-http(s) public_base_url. Empty secret keeps the stored one (the connection-password idiom). Deliberately never changes `enabled`. 503 `EncryptionUnavailable`. Audited `sso.save` (`secret_changed` boolean only) |
+| `POST` | `/api/admin/sso/test` | proves the triple against Microsoft without a browser: GET the tenant's OpenID discovery doc + a client-credentials token request (scope `graph.microsoft.com/.default`), 10s timeout. 200 `{ok, message}` outcomes (admin_data connectivity convention); failure message = Microsoft's `error_description` only. Success records the enable-gate hash. **POLICY_BLOCKED** (`AADSTS500011`/`AADSTS65001` — tenant blocks app-only tokens but the credentials are right): `{ok:false, code:"POLICY_BLOCKED", message:…}` yet the gate hash IS recorded (Enable not held hostage to tenant policy) and the audit row carries ok=true + the code. `AADSTS7000215`/`AADSTS700016`/`AADSTS90002` stay plain failures. 400 nothing saved; 503 no encryption key |
+| `POST` | `/api/admin/sso/enable` | 400 incomplete config; 409 `{code:"TEST_REQUIRED"}` unless the last successful test matches the saved values; else flips `enabled` on. Audited both ways |
+| `POST` | `/api/admin/sso/disable` | flips `enabled` off (absent-file safe) — the landing page returns to the plain password form on the next request. Audited |
 
 ---
 
