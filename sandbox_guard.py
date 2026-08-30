@@ -34,6 +34,10 @@ DENIED_MODULES = frozenset({
     # this client's credential surface
     "db_connector", "db_sources", "db_scheduler", "local_store", "settings",
     "brain_client", "password_utils",
+    # SSO config: sso_store.load() would hand back the DECRYPTED Entra
+    # client secret (and its module-level `import db_sources` runs under
+    # real builtins, so denying db_sources alone does not cover it)
+    "sso_store",
     # role grants: sandboxed code must not rewrite roles.json (privilege
     # escalation for the DB-table role gate)
     "roles_store",

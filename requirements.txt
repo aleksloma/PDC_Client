@@ -6,6 +6,12 @@ python-dotenv==1.0.1
 itsdangerous==2.2.0
 jinja2==3.1.4
 python-multipart==0.0.20
+# Microsoft Entra ID SSO (OIDC authorization-code flow, routes/sso.py).
+# Authlib's Starlette integration handles discovery, JWKS, ID-token
+# validation and state/nonce in the cookie session; it reuses the already
+# pinned httpx + cryptography. 1.6.x on purpose: 1.7+ pulls joserfc, which
+# forces cryptography>=45 and would break the cryptography==43.0.3 pin.
+Authlib==1.6.12
 
 # Data + execution (kept identical to the B2C app)
 pandas==2.2.3

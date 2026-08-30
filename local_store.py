@@ -963,6 +963,21 @@ class AuthStore:
     def has_password(self, email: str) -> bool:
         return bool(self.get_auth(email).get("password_hash"))
 
+    def mark_sso_login(self, email: str, provider: str) -> None:
+        """Stamp the SSO provenance on auth.json (sso_provider +
+        sso_last_login). MERGE-only: password_hash / temp_password_hash /
+        must_change_password stay untouched — a password user who also
+        signs in via SSO keeps the password. Never raises (Article IV; a
+        stamp failure must not block login)."""
+        try:
+            with _LOCK:
+                auth = self.get_auth(email)
+                auth["sso_provider"] = provider
+                auth["sso_last_login"] = _now()
+                self._write_auth(email, auth)
+        except Exception as e:
+            log_with_sid(email, "warning", f"SSO_MARK_LOGIN_FAILED: {e}")
+
     def set_password(self, email: str, password: str, *, force_change: bool = False) -> None:
         """Set the user's own password. Clears any outstanding temp password.
         force_change=True (used only by the ladmin bootstrap) keeps the

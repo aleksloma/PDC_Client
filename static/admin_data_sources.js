@@ -118,7 +118,7 @@
   // ── Sidebar navigation ─────────────────────────────────────────────────
   const SECTIONS = POWER
     ? ['connections', 'tables', 'relations']
-    : ['connections', 'tables', 'relations', 'users', 'roles', 'schedule', 'audit'];
+    : ['connections', 'tables', 'relations', 'users', 'roles', 'sso', 'schedule', 'audit'];
 
   function showSection(name) {
     if (!SECTIONS.includes(name)) name = 'connections';
@@ -136,6 +136,7 @@
     if (name === 'relations' && relView === 'graph') refreshRelGraph();
     if (name === 'users') loadUsers();     // lazy refetch, like the audit tail
     if (name === 'audit') loadAudit();
+    if (name === 'sso') loadSso();
     if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
   }
 
@@ -3075,6 +3076,140 @@
     return out;
   }
 
+  // ── Single sign-on (Microsoft Entra ID) ────────────────────────────────
+  let SSO = null;   // last GET /api/admin/sso payload
+
+  function renderSsoStatus() {
+    const el = $('ssoStatus');
+    if (!el || !SSO) return;
+    const pill = SSO.enabled
+      ? '<span class="adm-chip ok">ENABLED</span>'
+      : '<span class="adm-chip">DISABLED</span>';
+    const updated = SSO.updated_at
+      ? `Updated ${esc(String(SSO.updated_at).slice(0, 16).replace('T', ' '))}` +
+        (SSO.updated_by ? ` by ${esc(SSO.updated_by)}` : '')
+      : 'Not configured yet.';
+    let testLine;
+    if (SSO.test_current) {
+      testLine = '<span class="sso-test-ok">✓ Connection test passed for the saved values.</span>';
+    } else if (SSO.client_secret_set) {
+      testLine = '<span class="adm-muted">Run “Test connection” before enabling.</span>';
+    } else {
+      testLine = '<span class="adm-muted">Enter the Entra values below to get started.</span>';
+    }
+    el.innerHTML = `<div class="sso-status-row">Microsoft SSO is ${pill}
+        <span class="adm-muted">${updated}</span></div>
+      <div class="sso-status-row">${testLine}</div>`;
+  }
+
+  async function loadSso() {
+    const r = await api('/api/admin/sso');
+    if (!r.ok) {
+      toast(r.data.error || 'Could not load the SSO configuration', true);
+      return;
+    }
+    SSO = r.data;
+    $('ssoTenantId').value = SSO.tenant_id || '';
+    $('ssoClientId').value = SSO.client_id || '';
+    // Secret is never echoed back — same idiom as the connection password.
+    $('ssoClientSecret').value = '';
+    $('ssoClientSecret').placeholder =
+      SSO.client_secret_set ? '(unchanged)' : 'Client secret value';
+    $('ssoPublicBaseUrl').value = SSO.public_base_url || '';
+    $('ssoAutoRedirect').checked = !!SSO.auto_redirect;
+    $('ssoRedirectUri').textContent = SSO.redirect_uri || '';
+    $('btnSsoEnable').disabled = !!SSO.enabled || !SSO.test_current;
+    $('btnSsoEnable').title = (!SSO.enabled && !SSO.test_current)
+      ? 'Run a successful connection test first' : '';
+    $('btnSsoDisable').disabled = !SSO.enabled;
+    ['btnSsoSave', 'btnSsoTest'].forEach((id) => {
+      $(id).disabled = SSO.encryption_ready === false;
+      $(id).title = SSO.encryption_ready === false ? 'Set CLIENT_ENCRYPTION_KEY first' : '';
+    });
+    renderSsoStatus();
+  }
+
+  function _ssoResult(msg, cls) {
+    const el = $('ssoTestResult');
+    el.className = 'adm-test-result ' + cls;
+    el.textContent = msg;
+  }
+
+  async function saveSso() {
+    const body = {
+      tenant_id: $('ssoTenantId').value.trim(),
+      client_id: $('ssoClientId').value.trim(),
+      public_base_url: $('ssoPublicBaseUrl').value.trim(),
+      auto_redirect: $('ssoAutoRedirect').checked,
+    };
+    // Empty field keeps the stored secret (the connection-password idiom).
+    if ($('ssoClientSecret').value) body.client_secret = $('ssoClientSecret').value;
+    const r = await api('/api/admin/sso/save', { method: 'POST', body: JSON.stringify(body) });
+    if (r.ok) {
+      toast('Saved');
+      SSO = r.data;
+      loadSso();
+    } else {
+      toast(r.data.error || 'Save failed', true);
+    }
+  }
+
+  async function testSso() {
+    _busy('Testing the Microsoft connection…');
+    const r = await apiTimed('/api/admin/sso/test', { method: 'POST', body: '{}' }, 15000);
+    _busyDone();
+    if (r.status !== 200 || typeof r.data.ok === 'undefined') {
+      _ssoResult(r.data.error || 'Test failed', 'bad');
+      return;
+    }
+    if (r.data.ok) _ssoResult(r.data.message, 'ok');
+    else if (r.data.code === 'POLICY_BLOCKED') _ssoResult(r.data.message, 'sso-warn');
+    else _ssoResult(r.data.message || 'Test failed', 'bad');
+    loadSso();   // refreshes test_current → the Enable button
+  }
+
+  async function enableSso() {
+    const r = await api('/api/admin/sso/enable', { method: 'POST', body: '{}' });
+    if (r.ok) {
+      toast('Microsoft SSO enabled');
+      SSO = r.data;
+      loadSso();
+    } else {
+      toast(r.data.error || 'Enable failed', true);
+    }
+  }
+
+  async function disableSso() {
+    const r = await api('/api/admin/sso/disable', { method: 'POST', body: '{}' });
+    if (r.ok) {
+      toast('Microsoft SSO disabled');
+      SSO = r.data;
+      loadSso();
+    } else {
+      toast(r.data.error || 'Disable failed', true);
+    }
+  }
+
+  function copySsoRedirectUri() {
+    const text = $('ssoRedirectUri').textContent || '';
+    if (!text) return;
+    const done = () => toast('Copied');
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(() => _ssoCopyFallback(text, done));
+    } else {
+      _ssoCopyFallback(text, done);   // plain-HTTP appliances lack the async API
+    }
+  }
+
+  function _ssoCopyFallback(text, done) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); } catch (e) { /* ignore */ }
+    ta.remove();
+  }
+
   // ── Account (sidebar footer) ───────────────────────────────────────────
   async function logout() {
     try { await fetch('/auth/logout', { method: 'POST' }); } catch (e) { /* ignore */ }
@@ -3181,6 +3316,13 @@
       schedulePreviewInto($('tsmFields'), $('tsmPreview'), true);
     });
     $('btnReloadAudit')?.addEventListener('click', loadAudit);
+
+    // ?. binds: the whole SSO section is removed in power mode.
+    $('btnSsoSave')?.addEventListener('click', saveSso);
+    $('btnSsoTest')?.addEventListener('click', testSso);
+    $('btnSsoEnable')?.addEventListener('click', enableSso);
+    $('btnSsoDisable')?.addEventListener('click', disableSso);
+    $('btnSsoCopyUri')?.addEventListener('click', copySsoRedirectUri);
 
     $('btnAdmLogout').addEventListener('click', logout);
     $('btnAdmChangePw').addEventListener('click', openPwModal);

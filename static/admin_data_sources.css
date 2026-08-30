@@ -211,6 +211,17 @@ body.admin-ds-page {
 .adm-test-result { border-radius: 8px; padding: 9px 13px; font-size: 13px; margin-top: 12px; }
 .adm-test-result.ok { background: #dcfce7; color: #166534; }
 .adm-test-result.bad { background: #fee2e2; color: #991b1b; }
+.adm-test-result.sso-warn { background: #fef3c7; color: #92400e; }
+
+/* Single sign-on section */
+.sso-status-row { display: flex; align-items: center; gap: 10px; margin: 4px 0; }
+.sso-test-ok { color: #166534; font-size: 13px; }
+.sso-steps { margin: 6px 0 12px; padding-left: 22px; font-size: 13.5px; color: #334155; }
+.sso-steps li { margin: 7px 0; }
+.sso-uri { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sso-uri code { background: #eef2f7; border: 1px solid #d7dfe9; border-radius: 6px;
+                padding: 3px 8px; font-size: 12.5px; word-break: break-all; }
+.adm-card-actions .adm-btn + .adm-btn { margin-left: 8px; }
 
 /* ── Register-table wizard ─────────────────────────────────────────────── */
 .adm-stepper { display: flex; align-items: center; gap: 10px; padding: 14px 22px 2px; }
@@ -401,6 +412,7 @@ body.admin-ds-page {
 /* ── Users & Roles ─────────────────────────────────────────────────────── */
 .adm-btn.danger { background: #dc2626; color: #fff; }
 .adm-btn.danger:hover { background: #b91c1c; }
+.adm-btn.danger:disabled { background: #fca5a5; cursor: not-allowed; }
 .adm-users-toolbar { margin-bottom: 12px; }
 .adm-search {
   width: 320px; max-width: 100%; box-sizing: border-box;

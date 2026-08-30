@@ -14,7 +14,7 @@ import sandbox_guard
     "db_connector", "db_sources", "db_scheduler", "local_store", "settings",
     "brain_client", "password_utils", "relation_discovery", "sqlglot",
     "roles_store", "clickhouse_driver", "clickhouse_sqlalchemy",
-    "clickhouse_connect",
+    "clickhouse_connect", "sso_store",
 ])
 def test_denied_import_raises_in_safe_execute(mod):
     out = code_exec.safe_execute(f"import {mod}\nRESULT = 1", {}, sid="t")

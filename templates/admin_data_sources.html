@@ -43,6 +43,9 @@
           <span class="adm-nav-ico">🛡️</span> Roles
           <span class="adm-nav-count" id="navRoleCount"></span>
         </button>
+        <button class="adm-nav-item" data-section="sso">
+          <span class="adm-nav-ico">🔐</span> Single sign-on
+        </button>
         <button class="adm-nav-item" data-section="schedule">
           <span class="adm-nav-ico">⏱️</span> Refresh schedule
         </button>
@@ -284,6 +287,79 @@
       {% endif %}
 
       {% if manager_mode != 'power' %}
+      <!-- Single sign-on (Microsoft Entra ID) — ladmin-only -->
+      <section id="secSso" class="adm-section" hidden>
+        <header class="adm-page-head">
+          <div>
+            <h1>Single sign-on</h1>
+            <p class="adm-page-sub">Let users sign in with their Microsoft Entra ID (Azure AD)
+               work account. Configuration takes effect immediately — no restart.</p>
+          </div>
+        </header>
+
+        <div id="ssoStatus" class="adm-card sso-status"><!-- loadSso() --></div>
+
+        <div class="adm-card">
+          <div class="adm-subhead"><h4>Step 1 — Register PowerDataChat in your Microsoft Entra ID</h4></div>
+          <ol class="sso-steps">
+            <li>In the Microsoft Entra admin center open <b>App registrations</b> →
+                <b>New registration</b>. Supported account types:
+                <b>single tenant</b> (this organization only).</li>
+            <li>Add a <b>Web</b> redirect URI, exactly:
+                <span class="sso-uri"><code id="ssoRedirectUri"></code>
+                <button type="button" id="btnSsoCopyUri" class="adm-btn ghost small">Copy</button></span>
+                <div class="adm-muted">If users reach PowerDataChat on a different address
+                  than this page (reverse proxy, different hostname), set <b>Public base
+                  URL</b> below — the redirect URI must match it exactly. Microsoft requires
+                  HTTPS for redirect URIs (localhost excepted).</div></li>
+            <li>Permissions: <b>openid, profile, email</b> (delegated — granted by default).</li>
+            <li>Create a <b>client secret</b> and note its <b>Value</b> (not the ID) —
+                it is shown only once. Entra secrets expire; rotate them here before
+                the expiry date.</li>
+            <li>Copy the <b>Directory (tenant) ID</b> and <b>Application (client) ID</b>
+                into Step 2.</li>
+          </ol>
+          <div class="adm-alert">Restrict who can sign in by enabling
+            <b>“Assignment required”</b> on the enterprise application in Entra and
+            assigning users or groups. The password form always stays reachable at
+            <code>/?local=1</code>.</div>
+        </div>
+
+        <div class="adm-card">
+          <div class="adm-subhead"><h4>Step 2 — Connect</h4></div>
+          <div class="adm-form-grid">
+            <label>Tenant ID
+              <input type="text" id="ssoTenantId" placeholder="00000000-0000-0000-0000-000000000000" />
+            </label>
+            <label>Client ID
+              <input type="text" id="ssoClientId" placeholder="Application (client) ID" />
+            </label>
+            <label class="span2">Client secret
+              <input type="password" id="ssoClientSecret" autocomplete="off" />
+            </label>
+            <label class="span2">Public base URL (optional)
+              <input type="text" id="ssoPublicBaseUrl" placeholder="https://pdc.example.com" />
+              <span class="adm-muted">Only needed behind a reverse proxy or when users reach
+                the app on a different hostname than this page.</span>
+            </label>
+            <label class="adm-check span2">
+              <input type="checkbox" id="ssoAutoRedirect" />
+              <span>Auto-redirect to Microsoft — send visitors straight to Microsoft
+                sign-in instead of showing the login form
+                (<code>/?local=1</code> still shows the form)</span>
+            </label>
+          </div>
+          <div id="ssoTestResult" class="adm-test-result hidden"></div>
+          <div class="adm-card-actions">
+            <button id="btnSsoSave" class="adm-btn primary">Save</button>
+            <button id="btnSsoTest" class="adm-btn">Test connection</button>
+            <span class="adm-spacer"></span>
+            <button id="btnSsoEnable" class="adm-btn primary">Enable SSO</button>
+            <button id="btnSsoDisable" class="adm-btn danger">Disable SSO</button>
+          </div>
+        </div>
+      </section>
+
       <!-- Refresh schedule (GLOBAL — ladmin-only; per-table overrides live in
            the always-present #tableScheduleModal reached from the Tables list) -->
       <section id="secSchedule" class="adm-section" hidden>

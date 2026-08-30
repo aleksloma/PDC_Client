@@ -29,6 +29,7 @@ from starlette.datastructures import MutableHeaders
 from settings import settings
 from logger_utils import log_with_sid
 from local_store import AuthStore
+import sso_store
 
 from routes.auth import router as auth_router
 from routes.upload import router as upload_router
@@ -38,6 +39,8 @@ from routes.schema import router as schema_router
 from routes.dashboards import router as dashboards_router
 from routes.admin_data import router as admin_data_router
 from routes.admin_users import router as admin_users_router
+from routes.sso import router as sso_router
+from routes.sso import admin_router as sso_admin_router
 
 
 _HERE = Path(__file__).resolve().parent
@@ -176,19 +179,32 @@ app.include_router(report_router)
 app.include_router(dashboards_router)
 app.include_router(admin_data_router)
 app.include_router(admin_users_router)
+app.include_router(sso_router)
+app.include_router(sso_admin_router)
 
 
 @app.get("/", response_class=HTMLResponse)
 async def landing(request: Request):
-    """Auth landing — email + password (+ remember me)."""
+    """Auth landing — email + password (+ remember me), plus the Microsoft
+    SSO button / auto-redirect when the ladmin has enabled Entra ID SSO.
+    ?local=1 always shows the password form (the recovery escape hatch for
+    ladmin and for a broken SSO config)."""
     if request.session.get("email"):
         if request.session.get("must_change_password"):
             return RedirectResponse(url="/auth/change_password", status_code=302)
         return RedirectResponse(url="/lab", status_code=302)
+    try:
+        sso_enabled = sso_store.is_enabled()
+        sso_auto = sso_store.auto_redirect()
+    except Exception as e:
+        log_with_sid("sso", "warning", f"SSO_LANDING_CHECK_FAILED: {e}")
+        sso_enabled = sso_auto = False
+    if sso_enabled and sso_auto and request.query_params.get("local") != "1":
+        return RedirectResponse(url="/auth/microsoft", status_code=302)
     return templates.TemplateResponse(
         "auth_landing.html",
         {"request": request, "error": None, "password_error": None,
-         "info": None, "email": ""},
+         "info": None, "email": "", "sso_enabled": sso_enabled},
     )
 
 

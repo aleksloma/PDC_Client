@@ -106,11 +106,20 @@ def _landing(request: Request, *, error: str = None, password_error: str = None,
     `legacy_reset` renders the i18n-wrapped "set your password via reset"
     notice for pre-password accounts. `error` is the generic top message.
     """
+    # Function-local import ON PURPOSE: routes/sso.py imports this module, so
+    # a top-level sso_store import here would invite a future cycle. The flag
+    # keeps the Microsoft button visible on error re-renders too.
+    sso_enabled = False
+    try:
+        import sso_store
+        sso_enabled = sso_store.is_enabled()
+    except Exception as e:
+        log_with_sid("sso", "warning", f"SSO_LANDING_CHECK_FAILED: {e}")
     return _TEMPLATES.TemplateResponse(
         "auth_landing.html",
         {"request": request, "error": error, "password_error": password_error,
          "info": info, "email": email, "show_reset": show_reset,
-         "legacy_reset": legacy_reset},
+         "legacy_reset": legacy_reset, "sso_enabled": sso_enabled},
         status_code=status_code,
     )
 

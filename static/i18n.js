@@ -52,6 +52,7 @@ window.I18N_TRANSLATIONS = {
     'auth.or': 'OR',
     'auth.google_signin': 'Sign in with Google',
     'auth.google_signup': 'Sign up with Google',
+    'auth.sign_in_microsoft': 'Sign in with Microsoft',
     'auth.reset_password': 'Reset password',
     'auth.legacy_reset_required': 'This account existed before passwords were introduced. Please click “Reset password” — we will email you a temporary password to sign in and set your own.',
 
@@ -446,6 +447,7 @@ window.I18N_TRANSLATIONS = {
     'auth.or': 'ან',
     'auth.google_signin': 'შედით Google-ით',
     'auth.google_signup': 'დარეგისტრირდით Google-ით',
+    'auth.sign_in_microsoft': 'შედით Microsoft-ით',
     'auth.reset_password': 'პაროლის აღდგენა',
     'auth.legacy_reset_required': 'ეს ანგარიში პაროლების შემოღებამდე არსებობდა. დააჭირეთ „პაროლის აღდგენას“ — ელფოსტაზე დროებით პაროლს გამოგიგზავნით, რომლითაც შეხვალთ და საკუთარს დააყენებთ.',
 
@@ -840,6 +842,7 @@ window.I18N_TRANSLATIONS = {
     'auth.or': 'ИЛИ',
     'auth.google_signin': 'Войти через Google',
     'auth.google_signup': 'Зарегистрироваться через Google',
+    'auth.sign_in_microsoft': 'Войти через Microsoft',
     'auth.reset_password': 'Сбросить пароль',
     'auth.legacy_reset_required': 'Эта учётная запись существовала до введения паролей. Нажмите «Сбросить пароль» — мы отправим на вашу почту временный пароль, чтобы войти и задать свой собственный.',
 

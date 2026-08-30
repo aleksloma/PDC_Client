@@ -36,6 +36,15 @@
                color: #1276C2; font-size: 13px; text-decoration: underline;
                font-weight: 500; }
   .reset-btn:hover { background: none; color: #0d5d99; }
+  .ms-btn { display: flex; align-items: center; justify-content: center; gap: 10px;
+            width: 100%; padding: 11px; border: 1px solid #8c8c8c; border-radius: 7px;
+            background: #fff; color: #2f2f2f; font-size: 15px; font-weight: 500;
+            text-decoration: none; box-sizing: border-box; }
+  .ms-btn:hover { background: #f3f4f6; }
+  .or-divider { display: flex; align-items: center; gap: 10px; margin: 16px 0 18px;
+                color: #9ca3af; font-size: 12px; }
+  .or-divider::before, .or-divider::after { content: ""; flex: 1; height: 1px;
+                background: #e5e7eb; }
   .error { color: #b91c1c; font-size: 13px; margin-top: 10px; text-align: center; }
   .info { color: #047857; font-size: 13px; margin-top: 10px; text-align: center;
           background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 7px;
@@ -48,6 +57,21 @@
     <img src="/static/logo2.png" alt="PowerDataChat" class="logo" />
     <h1>PowerDataChat</h1>
     <p class="sub">Sign in with your work email</p>
+    {% if sso_enabled %}
+    {# An <a> (not a button) so it can never submit the surrounding form.
+       The label sits in its own span so the i18n text swap cannot clobber
+       the SVG logo. #}
+    <a class="ms-btn" href="/auth/microsoft">
+      <svg width="18" height="18" viewBox="0 0 21 21" aria-hidden="true">
+        <rect x="1" y="1" width="9" height="9" fill="#f25022"/>
+        <rect x="11" y="1" width="9" height="9" fill="#7fba00"/>
+        <rect x="1" y="11" width="9" height="9" fill="#00a4ef"/>
+        <rect x="11" y="11" width="9" height="9" fill="#ffb900"/>
+      </svg>
+      <span data-i18n="auth.sign_in_microsoft">Sign in with Microsoft</span>
+    </a>
+    <div class="or-divider"><span data-i18n="auth.or">or</span></div>
+    {% endif %}
     <div class="field">
       <label for="email">Email</label>
       {# type="text" (not "email"): the fixed local admin signs in with the
