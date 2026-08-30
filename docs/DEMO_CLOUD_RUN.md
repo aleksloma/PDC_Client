@@ -19,7 +19,7 @@
 | Data volume | GCS bucket `pdc-enterprise-client-demo-data` mounted at `/data/client` |
 | Brain | the production `pdcbrain` service (`BRAIN_URL` = its `status.url`) |
 | Tenant | a dedicated **demo tenant** created in the brain admin panel |
-| Secrets | `CLIENT_DEMO_TENANT_TOKEN` → `BRAIN_TENANT_TOKEN`, `CLIENT_DEMO_SECRET_KEY` → `SECRET_KEY` (Secret Manager) |
+| Secrets | `CLIENT_DEMO_TENANT_TOKEN` → `BRAIN_TENANT_TOKEN`, `CLIENT_DEMO_SECRET_KEY` → `SECRET_KEY`, `CLIENT_DEMO_LADMIN_PASSWORD` → `LOCAL_ADMIN_PASSWORD`, `CLIENT_DEMO_ENCRYPTION_KEY` → `CLIENT_ENCRYPTION_KEY` (all Secret Manager, pinned `:latest`; verified against the live service 2026-08-30 — the last two were mounted after this doc was first written) |
 | Service URL | `https://pdcclient-demo-873133613631.europe-west1.run.app` |
 | Custom domain | `https://client.powerdatachat.com` (Cloud Run domain mapping; the brain's admin panel is `admin.powerdatachat.com`) |
 
