@@ -2411,8 +2411,10 @@ function createImageWithFullscreen(base64Data, messageContext = '') {
 // Keep them in sync.
 function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
   // Mutable holder so the per-chart Refresh button can swap the chart in place;
-  // View Larger and Download always use the CURRENT html.
-  let currentHtml = htmlString;
+  // View Larger and Download always use the CURRENT html. Persisted chart HTML
+  // may reference cdn.plot.ly (pre-offline-fix records) — rewrite it to the
+  // locally served plotly.js so charts render on CDN-blocked/air-gapped LANs.
+  let currentHtml = PDCViewers.fixPlotlyOffline(htmlString);
 
   const plotlyContainer = document.createElement('div');
   plotlyContainer.className = 'plotly-container';
@@ -2428,7 +2430,7 @@ function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
   plotlyContainer.appendChild(iframe);
 
   // Used by the per-chart Refresh button to update the chart in place.
-  plotlyContainer._setChartHtml = (h) => { currentHtml = h; iframe.srcdoc = h; };
+  plotlyContainer._setChartHtml = (h) => { currentHtml = PDCViewers.fixPlotlyOffline(h); iframe.srcdoc = currentHtml; };
 
   const btnContainer = document.createElement('div');
   btnContainer.className = 'pdc-action-bar';

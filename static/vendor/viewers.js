@@ -8,6 +8,7 @@
  * same-origin script load.
  *
  * Public API (window.PDCViewers):
+ *   fixPlotlyOffline(html)    — rewrite a chart doc's cdn.plot.ly script tag to the local plotly.js asset.
  *   openCode(code)            — open a tab and render highlighted Python.
  *   openData(table)           — open a tab and render a {columns, rows} table.
  *   openBlankWindow(title)    — open a tab with a "Loading…" placeholder; returns the handle.
@@ -245,7 +246,29 @@
       "})();<\/script>";
   }
 
+  // Rewrite a chart HTML document's cdn.plot.ly script tag to the locally
+  // served plotly.js bundle so persisted charts (chat history, dashboard tile
+  // snapshots — generated before the offline fix, or by any older build) render
+  // on air-gapped / CDN-blocked LANs. A guard script keeps the ORIGINAL CDN url
+  // as a fallback: if the local asset is ever missing/404, online networks
+  // degrade to the pre-fix behavior instead of failing harder. Idempotent —
+  // rewritten HTML has no cdn.plot.ly script tag left, so it passes through.
+  var PLOTLY_LOCAL_SRC = "/static/vendor/plotly/plotly.min.js";
+  var PLOTLY_CDN_TAG_RE = /<script[^>]*\bsrc=["'](https:\/\/cdn\.plot\.ly\/plotly-[^"']*\.js)["'][^>]*>\s*<\/script>/g;
+  function fixPlotlyOffline(html) {
+    if (!html || typeof html !== "string" || html.indexOf("cdn.plot.ly") === -1) return html;
+    try {
+      return html.replace(PLOTLY_CDN_TAG_RE, function (_m, cdnUrl) {
+        return '<script src="' + PLOTLY_LOCAL_SRC + '"><\/script>' +
+          "<script>window.Plotly||document.write('<script src=\"" + cdnUrl + "\"><\\/script>')<\/script>";
+      });
+    } catch (e) {
+      return html; // never break a render over the rewrite
+    }
+  }
+
   window.PDCViewers = {
+    fixPlotlyOffline: fixPlotlyOffline,
     openCode: function (code) {
       var win = window.open("", "_blank");
       writeDoc(win, codeDocument(code));

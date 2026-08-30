@@ -532,6 +532,21 @@ data: {"done": true, "partial": false, "conv_id": "cv_...",
 contract (for multi-chart responses) — the on-prem build currently emits a
 single final event but the frontend handles both paths identically.
 
+**Chart HTML is offline-safe.** Interactive Plotly charts travel as a full HTML
+document in `image_base64` (the frontend sniffs the leading `<`). Generated
+HTML references the locally served `/static/vendor/plotly/plotly.min.js`
+(copied from the plotly pip package at image build + app startup —
+`plot_utils.ensure_plotly_js_asset`), never `cdn.plot.ly`: customer LANs may
+have no internet at all, and a CDN script src rendered chart iframes blank
+there. Legacy persisted chart HTML (history records / dashboard tile snapshots
+written by older builds) still carries the CDN src — the frontend rewrites it
+to the local asset at every iframe injection point (`PDCViewers.fixPlotlyOffline`
+in `static/vendor/viewers.js`), with a `window.Plotly||document.write(CDN)`
+guard so a missing local asset degrades to the old CDN behavior instead of
+failing harder. If the asset is missing server-side, `_plotly_js_include()`
+logs `PLOTLY_JS_ASSET_MISSING` once and falls back to the CDN src for new
+charts.
+
 On kill-switch (tenant revoked / suspended), the stream emits a single
 `{error: "Service unavailable. Please contact your administrator.", done: true}`
 event and the chat UI surfaces it to the user.

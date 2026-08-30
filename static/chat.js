@@ -492,6 +492,12 @@
   // NOTE: dashboard.js has a parallel copy of this function with the same
   // signature. Keep them in sync.
   function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
+    // Rewrite a persisted cdn.plot.ly script src to the locally served
+    // plotly.js (offline LANs) — guarded because this file may load without
+    // viewers.js. (keep in sync: dashboard.js)
+    if (window.PDCViewers && PDCViewers.fixPlotlyOffline) {
+      htmlString = PDCViewers.fixPlotlyOffline(htmlString);
+    }
     const plotlyContainer = document.createElement('div');
     plotlyContainer.className = 'plotly-container';
     plotlyContainer.style.cssText = 'margin-top: 10px; width: 100%; max-width: 900px;';

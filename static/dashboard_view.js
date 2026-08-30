@@ -141,7 +141,9 @@
       if (isPlotlySnapshot(tile)) {
         const iframe = document.createElement('iframe');
         iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
-        iframe.srcdoc = content;
+        // Stored tile snapshots may reference cdn.plot.ly (pre-offline-fix) —
+        // rewrite to the locally served plotly.js for CDN-blocked LANs.
+        iframe.srcdoc = PDCViewers.fixPlotlyOffline(content);
         bodyEl.appendChild(iframe);
       } else {
         const img = document.createElement('img');
@@ -392,7 +394,7 @@
     if (tile.kind === 'chart' && isPlotlySnapshot(tile)) {
       const iframe = document.createElement('iframe');
       iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
-      iframe.srcdoc = snap.image_base64 || '';
+      iframe.srcdoc = PDCViewers.fixPlotlyOffline(snap.image_base64 || '');
       modal.appendChild(iframe);
     } else if (tile.kind === 'chart') {
       const img = document.createElement('img');

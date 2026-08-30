@@ -85,6 +85,11 @@ async def lifespan(app: FastAPI):
     # lifespan-scoped on purpose: an import-time thread would leak into every
     # pytest session (the local_store sweeper lesson).
     AuthStore().ensure_local_admin()
+    # Offline plotly.js: materialize the pip package's bundle into static/vendor/
+    # so chart iframes never need cdn.plot.ly (air-gapped LANs). Idempotent —
+    # no-ops in the Docker image where the build already baked it.
+    import plot_utils
+    plot_utils.ensure_plotly_js_asset()
     import roles_store
     roles_store.RolesStore().migrate_manage_grants()   # 19f doc v1 -> v2
     roles_store.RolesStore().ensure_base_role()

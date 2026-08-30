@@ -35,6 +35,10 @@ brain_data_local/
 data/
 static/tmp/
 
+# Copied from the plotly pip package at build/startup — never committed
+# (see static/vendor/plotly/plotly.min.js.LICENSE.txt)
+static/vendor/plotly/plotly.min.js
+
 # Local users / auth store / per-chat data
 **/users.json
 **/users.jsonl

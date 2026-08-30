@@ -40,6 +40,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Offline plotly.js: bake the pip package's own plotly.min.js into static/vendor/
+# so chart iframes never load from cdn.plot.ly (customer LANs may be air-gapped).
+# The app lifespan runs the same idempotent copy as a self-heal for non-Docker runs.
+RUN python -c "import plotly, pathlib, shutil; d = pathlib.Path('static/vendor/plotly'); d.mkdir(parents=True, exist_ok=True); shutil.copyfile(str(pathlib.Path(plotly.__file__).parent / 'package_data' / 'plotly.min.js'), str(d / 'plotly.min.js'))"
+
 # Build identity, surfaced by GET /version and the admin sidebar. Build args
 # (NOT install-time config): `.git` is dockerignored, so the commit can only
 # arrive from the builder. Declared AFTER the pip layer so passing them never

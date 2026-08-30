@@ -77,6 +77,64 @@ if pio is not None:
     except Exception:
         pass
 
+# --- Offline plotly.js asset ---
+# Enterprise clients run inside customer LANs that may have no internet access,
+# so chart HTML must never depend on cdn.plot.ly at view time. The plotly pip
+# package ships the exact matching plotly.js build; it is materialized into
+# static/vendor/ (Docker build + app lifespan) and served by the /static mount.
+# The URL must end in ".js" (no query string) — plotly's to_html() emits a
+# string src verbatim only via its .endswith(".js") branch.
+_PLOTLY_JS_URL = "/static/vendor/plotly/plotly.min.js"
+_plotly_js_missing_logged = False
+
+
+def _plotly_js_asset_path() -> _Path:
+    """Local path of the served plotly.js bundle (monkeypatch point for tests)."""
+    return _Path(__file__).resolve().parent / "static" / "vendor" / "plotly" / "plotly.min.js"
+
+
+def ensure_plotly_js_asset() -> None:
+    """Copy the pip package's plotly.min.js into static/vendor/ (idempotent).
+
+    Called from the app lifespan (and baked at Docker build time). Never raises:
+    a copy failure only means new charts fall back to the CDN src, which is
+    logged loudly by _plotly_js_include().
+    """
+    import logging, os, shutil
+    try:
+        import plotly as _plotly
+        src = _Path(_plotly.__file__).resolve().parent / "package_data" / "plotly.min.js"
+        dst = _plotly_js_asset_path()
+        if not src.exists():
+            logging.error(f"PLOTLY_JS_ASSET_COPY_FAILED: package asset not found at {src}")
+            return
+        if dst.exists() and dst.stat().st_size == src.stat().st_size:
+            return  # already materialized (Docker build or a previous boot)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_suffix(".js.tmp")
+        shutil.copyfile(str(src), str(tmp))
+        os.replace(str(tmp), str(dst))
+        logging.info(f"PLOTLY_JS_ASSET_READY {dst} ({dst.stat().st_size} bytes)")
+    except Exception as e:
+        logging.error(f"PLOTLY_JS_ASSET_COPY_FAILED: {e}")
+
+
+def _plotly_js_include() -> str:
+    """include_plotlyjs value for fig.to_html(): local asset, CDN fallback."""
+    import logging
+    global _plotly_js_missing_logged
+    try:
+        if _plotly_js_asset_path().exists():
+            return _PLOTLY_JS_URL
+    except Exception:
+        pass
+    if not _plotly_js_missing_logged:
+        _plotly_js_missing_logged = True
+        logging.warning("PLOTLY_JS_ASSET_MISSING — falling back to cdn.plot.ly for "
+                        "generated chart HTML (offline/air-gapped viewers will see "
+                        "blank charts until the asset is restored)")
+    return 'cdn'
+
 # --- Extended visualization libraries ---
 
 # Venn diagrams
@@ -503,9 +561,11 @@ def _plotly_to_html(fig) -> str:
         # continuous/2nd-measure color scales and <= 10-group charts untouched.
         _widen_discrete_colors(fig)
 
-        # Generate standalone HTML with responsive sizing
+        # Generate standalone HTML with responsive sizing. plotly.js comes from
+        # the locally served asset (offline LANs — Article: never a CDN); the
+        # 'cdn' fallback only fires if the asset is missing, and is logged.
         html = fig.to_html(
-            include_plotlyjs='cdn',
+            include_plotlyjs=_plotly_js_include(),
             config={
                 'displayModeBar': True,
                 'displaylogo': False,

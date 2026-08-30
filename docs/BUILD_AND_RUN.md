@@ -60,7 +60,10 @@ marker: it is `int(time.time())` at page render, per request.
 
 The client image is heavier because it ships pandas, matplotlib, plotly,
 kaleido, scikit-learn, python-pptx — every library the user's generated
-code might run on the user's data.
+code might run on the user's data. The build also bakes the plotly pip
+package's own `plotly.min.js` into `static/vendor/plotly/` so interactive
+charts render with zero internet access (no `cdn.plot.ly` dependency at view
+time); the app lifespan re-materializes it idempotently for non-Docker runs.
 
 To run the client you need a **tenant token from the brain**. Create one
 through the brain's admin panel — when the token is created it is shown
