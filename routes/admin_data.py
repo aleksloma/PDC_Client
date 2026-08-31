@@ -1446,6 +1446,11 @@ async def introspect_table(request: Request):
         return intro
     preview = await _run(db_connector.preview_rows, cfg, password, schema, table,
                          limit=int(body.get("preview_rows") or settings.DB_PREVIEW_ROWS),
+                         # Explicit columns → the frame is keyed by the
+                         # INTROSPECTED names on every dialect (Oracle's cursor
+                         # reports them uppercase, which matches nothing else).
+                         columns=[c.get("name") for c in (intro.get("columns") or [])
+                                  if c.get("name")],
                          sid=f"admin:{email}")
     db_sources.audit(email, "table.introspect", target=f"{schema}.{table}",
                      detail={"columns": len(intro.get("columns") or []),
@@ -1477,7 +1482,13 @@ def _draft_table_descriptions(cfg: dict, password: str, schema, table: str,
     # A larger sample than the visual preview so unique_hints are honest
     # (still truncated by the same SCHEMA_AUTOFILL_* rules files use).
     prev = db_connector.preview_rows(cfg, password, schema, table,
-                                     limit=200, sid=f"admin:{email}")
+                                     limit=200,
+                                     # Keyed by the introspected names, so the
+                                     # drafted descriptions land on the columns
+                                     # the wizard rows actually carry.
+                                     columns=[c.get("name") for c in (intro.get("columns") or [])
+                                              if c.get("name")],
+                                     sid=f"admin:{email}")
     if not prev.get("ok"):
         return {"ok": False, "error": prev.get("error")}
     df = pd.DataFrame(prev.get("rows") or [], columns=prev.get("columns") or [])

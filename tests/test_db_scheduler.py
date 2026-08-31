@@ -369,3 +369,70 @@ def test_import_starts_no_thread():
                          cwd=str(Path(__file__).resolve().parent.parent))
     assert out.returncode == 0, out.stderr
     assert "clean" in out.stdout
+
+
+# ---------------------------------------------------------------------------
+# The snapshot column list — a failed fingerprint must never fall back to a
+# name-less SELECT *, whose keys come from the DRIVER's casing (UPPERCASE on
+# Oracle) and would read as "every column added AND removed".
+# ---------------------------------------------------------------------------
+
+def test_snapshot_names_columns_from_the_fingerprint(tmp_path, monkeypatch):
+    _, store, tid = _sqlite_setup(tmp_path)
+    seen = {}
+    real = db_scheduler.db_connector.snapshot_table
+
+    def spy(*a, **kw):
+        seen["columns"] = kw.get("columns")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(db_scheduler.db_connector, "snapshot_table", spy)
+    assert db_scheduler.refresh_one_table(tid, actor="test")["ok"] is True
+    assert seen["columns"] == ["a", "b"]
+
+
+def test_failed_fingerprint_falls_back_to_a_fresh_introspect(tmp_path, monkeypatch):
+    """The realistic failure: the fingerprint's aggregate SELECT dies (exotic
+    type, statement timeout) while the Inspector is perfectly healthy."""
+    _, store, tid = _sqlite_setup(tmp_path)
+    monkeypatch.setattr(db_scheduler.db_connector, "fingerprint_table",
+                        lambda *a, **kw: {"ok": False, "error": "boom"})
+    seen = {}
+    real = db_scheduler.db_connector.snapshot_table
+
+    def spy(*a, **kw):
+        seen["columns"] = kw.get("columns")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(db_scheduler.db_connector, "snapshot_table", spy)
+    res = db_scheduler.refresh_one_table(tid, actor="test")
+    assert res["ok"] is True and res["rows"] == 3
+    assert seen["columns"] == ["a", "b"]
+    # Names line up with the registry, so nothing reads as drift.
+    assert res["drift"] == {"added": [], "removed": [], "retyped": []}
+
+
+def test_both_probes_failing_aborts_and_keeps_the_last_snapshot(tmp_path, monkeypatch):
+    """Inspector unreachable → fail fast down the existing failed-refresh path
+    rather than snapshot with unnamed columns."""
+    _, store, tid = _sqlite_setup(tmp_path)
+    assert db_scheduler.refresh_one_table(tid, actor="test")["ok"] is True
+    dest = local_store.db_snapshot_path(tid)
+    before_mtime = dest.stat().st_mtime_ns
+    before_at = store.get_table(tid)["refreshed_at"]
+
+    monkeypatch.setattr(db_scheduler.db_connector, "fingerprint_table",
+                        lambda *a, **kw: {"ok": False, "error": "boom"})
+    monkeypatch.setattr(db_scheduler.db_connector, "introspect",
+                        lambda *a, **kw: {"ok": False, "error": "boom"})
+
+    def never(*a, **kw):                       # pragma: no cover - must not run
+        raise AssertionError("snapshot must not run without a column list")
+
+    monkeypatch.setattr(db_scheduler.db_connector, "snapshot_table", never)
+    res = db_scheduler.refresh_one_table(tid, actor="test")
+    assert res["ok"] is False and res["error"]
+    row = store.get_table(tid)
+    assert dest.stat().st_mtime_ns == before_mtime      # last good data kept
+    assert row["refreshed_at"] == before_at
+    assert [c["name"] for c in row["columns"]] == ["a", "b"]

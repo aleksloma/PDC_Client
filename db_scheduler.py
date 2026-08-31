@@ -127,11 +127,37 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler",
                 "refreshed_at": row.get("refreshed_at"),
                 "drift": {"added": [], "removed": [], "retyped": []}}
 
+    # The snapshot SELECT must name its columns: a bare SELECT * comes back
+    # keyed by the DRIVER's casing (UPPERCASE on Oracle), which would read as
+    # "every column added AND removed" below — wiping admin-confirmed
+    # descriptions on the unattended nightly run. Live introspection is the
+    # source: the fingerprint's list when it succeeded (already fetched), else
+    # a fresh introspect. Never the STORED list — that would freeze the column
+    # set and hide real drift.
+    snap_cols = ([c.get("name") for c in (fp.get("columns") or []) if c.get("name")]
+                 if fp.get("ok") else None)
+    if not snap_cols:
+        intro = db_connector.introspect(
+            conn, password or "", row.get("schema") or None,
+            row.get("table_name"), sid=f"refresh:{actor}")
+        snap_cols = ([c.get("name") for c in (intro.get("columns") or []) if c.get("name")]
+                     if intro.get("ok") else None)
+    if not snap_cols:
+        # Both probes failed: the Inspector is unreachable, so the snapshot's
+        # own SELECT would almost certainly fail too — and an unnamed one could
+        # corrupt the registry. Fail fast down the existing failed-refresh path
+        # (previous snapshot and refreshed_at kept, chats keep last-good data).
+        err = "Table columns could not be read from the database."
+        log_with_sid("db_refresh", "error", f"DB_REFRESH_NO_COLUMNS table={label}")
+        store.mark_refreshed(table_id, error=err)
+        return {"ok": False, "error": err}
+
     dest = local_store.db_snapshot_path(table_id)
     res = db_connector.snapshot_table(
         conn, password or "",
         schema=row.get("schema") or None,
         table=row.get("table_name"),
+        columns=snap_cols,
         where=row.get("where_filter") or None,
         row_cap=row.get("row_cap") or None,
         dtype_plan=row.get("dtype_plan") or None,

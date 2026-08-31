@@ -47,7 +47,7 @@ def test_registry_shape():
     for key in ("postgresql", "mysql", "mariadb", "mssql", "oracle",
                 "clickhouse"):
         d = db_connector.DIALECTS[key]
-        assert d.drivername and d.select1_sql and d.quote
+        assert d.drivername and d.select1_sql
         assert not d.hidden
     # UI list is derived purely from the registry, hidden entries filtered.
     keys = {r["key"] for r in db_connector.list_dialects()}
@@ -407,7 +407,6 @@ def test_clickhouse_registry_entry():
     assert d.drivername == "clickhouse+native"
     assert d.driver_module == "clickhouse_driver"
     assert d.default_port == 9000
-    assert d.quote == ("`", "`")
     assert d.needs == ("database",)
     # ClickHouse databases are exposed as schemas, so the browser lists them.
     assert d.supports_schemas is True
@@ -516,11 +515,20 @@ def test_clickhouse_issues_no_session_statement_timeout():
 
 
 def test_clickhouse_build_select_quotes_and_limits():
-    d = db_connector.DIALECTS["clickhouse"]
-    assert (db_connector._build_select(d, "analytics", "events", row_cap=5)
-            == "SELECT * FROM `analytics`.`events` LIMIT 5")
-    assert (db_connector._build_select(d, None, "events", columns=["a`b"])
-            == "SELECT `a``b` FROM `events`")
+    """Quoting and the row limit are the DIALECT's job now — compiled through
+    the real clickhouse dialect, not a hand-rolled backtick rule."""
+    pytest.importorskip("clickhouse_sqlalchemy")
+    from clickhouse_sqlalchemy.drivers.native.base import ClickHouseDialect_native
+    ch = ClickHouseDialect_native()
+    sql = db_connector._compiled_sql(
+        db_connector._select_stmt("analytics", "events", row_cap=5), ch)
+    assert " ".join(sql.split()) == "SELECT * FROM analytics.events LIMIT 5"
+    # A name that genuinely needs quoting still gets it. Note the dialect
+    # picks DOUBLE quotes, not the backticks the old registry hard-coded —
+    # ClickHouse accepts both, and the dialect is the authority now.
+    sql = db_connector._compiled_sql(
+        db_connector._select_stmt(None, "events", columns=["a b"]), ch)
+    assert '"a b"' in sql
 
 
 def test_clickhouse_catalog_estimates_are_bound_by_schema_and_table():

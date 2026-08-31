@@ -1,12 +1,20 @@
 """SQLAlchemy connector for admin-registered database sources.
 
 Dialect REGISTRY design: every DB-type-specific detail (URL drivername,
-default port, identifier quoting, SELECT-1 probe, statement-timeout mechanism,
-row-count / size catalog estimates, LIMIT syntax) lives in ONE `Dialect`
-entry. Adding a future DB type (DB2, HANA, Snowflake, ...) is one
-`Dialect(...)` literal plus one pinned driver package — nothing else changes.
-ClickHouse was added exactly that way; its one wrinkle is that the native
-driver discards `connect_args`, so its bounds ride in `query_args` instead.
+default port, SELECT-1 probe, statement-timeout mechanism, row-count / size
+catalog estimates) lives in ONE `Dialect` entry. Adding a future DB type
+(DB2, HANA, Snowflake, ...) is one `Dialect(...)` literal plus one pinned
+driver package — nothing else changes. ClickHouse was added exactly that
+way; its one wrinkle is that the native driver discards `connect_args`, so
+its bounds ride in `query_args` instead.
+
+Identifier quoting and row limiting are deliberately NOT in the registry:
+every statement this module builds from introspected names is a SQLAlchemy
+construct (`_select_stmt`), so the dialect itself decides quoting and
+LIMIT/TOP/FETCH FIRST syntax. Hand-quoting them broke Oracle — SQLAlchemy
+normalizes Oracle's folded identifiers to lowercase on the way out of the
+Inspector, and a lowercase name in double quotes is a DIFFERENT object than
+the uppercase one the server stores (ORA-00942).
 
 Security invariants (docs/AI_CONSTITUTION.md Article VII + DB_TABLES_PLAN):
   - This module only ever issues SELECT / introspection statements. There is
@@ -56,26 +64,17 @@ class Dialect:
     drivername: str
     driver_module: str
     default_port: Optional[int]
-    quote: tuple  # (open_char, close_char)
     needs: tuple  # extra connection fields the admin form must collect
     supports_schemas: bool
     select1_sql: str
     connect_args: Callable[[dict, int], dict] = field(default=lambda cfg, t: {})
     query_args: Callable[[dict], dict] = field(default=lambda cfg: {})
     apply_stmt_timeout: Callable = field(default=_no_op_timeout)
-    limit_clause: Callable[[str, int], str] = field(
-        default=lambda sql, n: f"{sql} LIMIT {int(n)}")
     row_count_sql: Optional[str] = None
     table_size_sql: Optional[str] = None
     exact_count_fallback: bool = False
     allow_url_override: bool = False
     hidden: bool = False
-
-    def q(self, ident: str) -> str:
-        """Quote an identifier verbatim (Inspector-returned names are used
-        as-is, so e.g. Oracle's UPPERCASE folding can never mis-case)."""
-        o, c = self.quote
-        return f"{o}{ident.replace(c, c + c)}{c}"
 
     def available(self) -> tuple[bool, Optional[str]]:
         if importlib.util.find_spec(self.driver_module) is None:
@@ -194,7 +193,7 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
     Dialect(
         key="postgresql", label="PostgreSQL",
         drivername="postgresql+psycopg2", driver_module="psycopg2",
-        default_port=5432, quote=('"', '"'), needs=("database",),
+        default_port=5432, needs=("database",),
         supports_schemas=True, select1_sql="SELECT 1",
         connect_args=_pg_connect_args, apply_stmt_timeout=_pg_stmt_timeout,
         row_count_sql=("SELECT c.reltuples::bigint FROM pg_class c "
@@ -206,7 +205,7 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
     Dialect(
         key="mysql", label="MySQL",
         drivername="mysql+pymysql", driver_module="pymysql",
-        default_port=3306, quote=('`', '`'), needs=("database",),
+        default_port=3306, needs=("database",),
         supports_schemas=False, select1_sql="SELECT 1",
         connect_args=_mysql_connect_args, apply_stmt_timeout=_mysql_stmt_timeout,
         row_count_sql=("SELECT table_rows FROM information_schema.tables "
@@ -217,7 +216,7 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
     Dialect(
         key="mariadb", label="MariaDB",
         drivername="mysql+pymysql", driver_module="pymysql",
-        default_port=3306, quote=('`', '`'), needs=("database",),
+        default_port=3306, needs=("database",),
         supports_schemas=False, select1_sql="SELECT 1",
         connect_args=_mysql_connect_args, apply_stmt_timeout=_mariadb_stmt_timeout,
         row_count_sql=("SELECT table_rows FROM information_schema.tables "
@@ -228,10 +227,9 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
     Dialect(
         key="mssql", label="Microsoft SQL Server",
         drivername="mssql+pyodbc", driver_module="pyodbc",
-        default_port=1433, quote=('[', ']'), needs=("database",),
+        default_port=1433, needs=("database",),
         supports_schemas=True, select1_sql="SELECT 1",
         connect_args=_mssql_connect_args, query_args=_mssql_query_args,
-        limit_clause=lambda sql, n: re.sub(r"^SELECT ", f"SELECT TOP {int(n)} ", sql, count=1),
         row_count_sql=("SELECT SUM(p.rows) FROM sys.partitions p "
                        "JOIN sys.objects o ON o.object_id = p.object_id "
                        "JOIN sys.schemas s ON s.schema_id = o.schema_id "
@@ -245,11 +243,10 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
     Dialect(
         key="oracle", label="Oracle",
         drivername="oracle+oracledb", driver_module="oracledb",
-        default_port=1521, quote=('"', '"'), needs=("service_name",),
+        default_port=1521, needs=("service_name",),
         supports_schemas=True, select1_sql="SELECT 1 FROM DUAL",
         connect_args=_oracle_connect_args, query_args=_oracle_query_args,
         apply_stmt_timeout=_oracle_stmt_timeout,
-        limit_clause=lambda sql, n: f"{sql} FETCH FIRST {int(n)} ROWS ONLY",
         row_count_sql=("SELECT num_rows FROM all_tables "
                        "WHERE owner = :schema AND table_name = :table"),
         table_size_sql=("SELECT SUM(bytes) FROM all_segments "
@@ -258,7 +255,7 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
     Dialect(
         key="clickhouse", label="ClickHouse",
         drivername="clickhouse+native", driver_module="clickhouse_driver",
-        default_port=9000, quote=('`', '`'), needs=("database",),
+        default_port=9000, needs=("database",),
         # ClickHouse "databases" are what the SQLAlchemy dialect exposes as
         # schemas, so the schema browser lists them like any other dialect.
         supports_schemas=True, select1_sql="SELECT 1",
@@ -281,7 +278,7 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
     Dialect(
         key="sqlite", label="SQLite (tests only)",
         drivername="sqlite+pysqlite", driver_module="sqlite3",
-        default_port=None, quote=('"', '"'), needs=(),
+        default_port=None, needs=(),
         supports_schemas=False, select1_sql="SELECT 1",
         row_count_sql=None, table_size_sql=None,
         exact_count_fallback=True, allow_url_override=True, hidden=True,
@@ -418,6 +415,65 @@ def get_engine(cfg: dict, password: str, *, connect_timeout: Optional[int] = Non
     return create_engine(url, **kwargs)
 
 
+def _catalog_name(dialect, name: Optional[str]) -> Optional[str]:
+    """Bind an introspected identifier into a catalog query the way the SERVER
+    stores it. SQLAlchemy normalizes Oracle's case-folded names to lowercase on
+    the way out of the Inspector, but `all_tables` / `all_segments` hold them
+    UPPERCASE — binding the normalized form matches no row, so the estimate
+    comes back NULL and is not even reported as degraded. Identity on every
+    dialect that does not normalize (all of them but Oracle); this is what
+    SQLAlchemy's own Oracle dialect does for its catalog lookups."""
+    if name is None or not getattr(dialect, "requires_name_normalize", False):
+        return name
+    return dialect.denormalize_name(name)
+
+
+def _select_stmt(schema: Optional[str], table: str,
+                 columns: Optional[list] = None, where: Optional[str] = None,
+                 row_cap: Optional[int] = None):
+    """The ONE SELECT builder — a SQLAlchemy construct, never a hand-quoted
+    string, so the DIALECT owns both identifier quoting and the row limit.
+
+    Quoting: an Inspector-normalized lowercase Oracle name renders UNQUOTED
+    and the server folds it back to OFFERING_ALL; a mixed-case, reserved or
+    otherwise case-sensitive name is still quoted, per dialect. Hand-quoting
+    the normalized name was the ORA-00942 bug.
+
+    Row limit: `.limit()` emits FETCH FIRST or a ROWNUM wrapper by the live
+    Oracle server version, TOP on mssql, LIMIT elsewhere.
+
+    `sqlalchemy.table()/column()` are the lightweight clause constructs — no
+    MetaData, no reflection round-trip (this runs inside `fingerprint_table`,
+    the cheap change-detection probe).
+
+    `where` is the admin-authored filter and stays raw text; the compiled
+    statement is what `_compiled_sql` gates."""
+    from sqlalchemy import (column as sa_column, literal_column, select,
+                            table as sa_table, text as sa_text)
+    cols = [str(c) for c in (columns or [])]
+    t = sa_table(table, *[sa_column(c) for c in cols], schema=schema or None)
+    if cols:
+        stmt = select(*[t.c[c] for c in cols])
+    else:
+        stmt = select(literal_column("*")).select_from(t)
+    if where:
+        stmt = stmt.where(sa_text(where))
+    if row_cap:
+        stmt = stmt.limit(int(row_cap))
+    return stmt
+
+
+def _compiled_sql(stmt, dialect) -> str:
+    """Render a construct through the SELECT-only gate and return the SQL.
+    Compiled against the LIVE dialect (post-connect, so Oracle's limit syntax
+    matches the real server version) with literal binds, so
+    `_assert_single_select` sees exactly what will run."""
+    sql = str(stmt.compile(dialect=dialect,
+                           compile_kwargs={"literal_binds": True}))
+    _assert_single_select(sql)
+    return sql
+
+
 # ---------------------------------------------------------------------------
 # test_connection / introspection / preview
 # ---------------------------------------------------------------------------
@@ -504,7 +560,8 @@ def introspect(cfg: dict, password: str, schema: Optional[str], table: str,
     catalog-estimate row count and size (never COUNT(*) on a customer table —
     the sqlite test entry's exact_count_fallback is the sole exception).
     Individually degraded on missing catalog privileges."""
-    from sqlalchemy import inspect as sa_inspect, text
+    from sqlalchemy import (func, inspect as sa_inspect,
+                            select as sa_select, table as sa_table, text)
     d = get_dialect(cfg.get("db_type"))
     engine = None
     degraded: list[str] = []
@@ -559,16 +616,19 @@ def introspect(cfg: dict, password: str, schema: Optional[str], table: str,
             if d.row_count_sql:
                 try:
                     row_count = conn.execute(
-                        text(d.row_count_sql), {"schema": schema, "table": table}
+                        text(d.row_count_sql),
+                        {"schema": _catalog_name(conn.dialect, schema),
+                         "table": _catalog_name(conn.dialect, table)}
                     ).scalar()
                     row_count = int(row_count) if row_count is not None and int(row_count) >= 0 else None
                 except Exception:
                     degraded.append("row_count")
             elif d.exact_count_fallback:
                 try:
-                    qname = f"{d.q(schema)}.{d.q(table)}" if schema else d.q(table)
-                    row_count = int(conn.execute(
-                        text(f"SELECT COUNT(*) FROM {qname}")).scalar() or 0)
+                    stmt = sa_select(func.count()).select_from(
+                        sa_table(table, schema=schema or None))
+                    _compiled_sql(stmt, conn.dialect)
+                    row_count = int(conn.execute(stmt).scalar() or 0)
                 except Exception:
                     degraded.append("row_count")
             else:
@@ -576,7 +636,9 @@ def introspect(cfg: dict, password: str, schema: Optional[str], table: str,
             if d.table_size_sql:
                 try:
                     size_bytes = conn.execute(
-                        text(d.table_size_sql), {"schema": schema, "table": table}
+                        text(d.table_size_sql),
+                        {"schema": _catalog_name(conn.dialect, schema),
+                         "table": _catalog_name(conn.dialect, table)}
                     ).scalar()
                     size_bytes = int(size_bytes) if size_bytes is not None else None
                 except Exception:
@@ -611,36 +673,27 @@ def introspect(cfg: dict, password: str, schema: Optional[str], table: str,
                 pass
 
 
-def _build_select(d: Dialect, schema: Optional[str], table: str,
-                  columns: Optional[list] = None, where: Optional[str] = None,
-                  row_cap: Optional[int] = None) -> str:
-    cols = ", ".join(d.q(c) for c in columns) if columns else "*"
-    qname = f"{d.q(schema)}.{d.q(table)}" if schema else d.q(table)
-    sql = f"SELECT {cols} FROM {qname}"
-    if where:
-        _assert_single_select(f"SELECT 1 FROM {qname} WHERE {where}")
-        sql += f" WHERE {where}"
-    if row_cap:
-        sql = d.limit_clause(sql, int(row_cap))
-    _assert_single_select(sql)
-    return sql
-
-
 def preview_rows(cfg: dict, password: str, schema: Optional[str], table: str,
                  *, limit: Optional[int] = None, where: Optional[str] = None,
-                 sid: str) -> dict:
+                 columns: Optional[list] = None, sid: str) -> dict:
     """First rows for the ladmin registration preview. Values go only to the
-    admin's browser — never to the brain, never into logs."""
-    from sqlalchemy import text
+    admin's browser — never to the brain, never into logs.
+
+    Pass `columns` (the introspected names) to make the SELECT explicit: the
+    frame then comes back keyed by THOSE names on every dialect. Without it the
+    keys are whatever the driver's cursor reports — UPPERCASE on Oracle, which
+    matches neither the registry nor the AI-draft column map."""
     d = get_dialect(cfg.get("db_type"))
     engine = None
     try:
         limit = int(limit or settings.DB_PREVIEW_ROWS)
-        sql = _build_select(d, schema, table, where=where, row_cap=limit)
+        stmt = _select_stmt(schema, table, columns=columns, where=where,
+                            row_cap=limit)
         engine = get_engine(cfg, password)
         with engine.connect() as conn:
             d.apply_stmt_timeout(conn, int(cfg.get("statement_timeout") or settings.DB_STATEMENT_TIMEOUT))
-            df = pd.read_sql(text(sql), conn)
+            _compiled_sql(stmt, conn.dialect)
+            df = pd.read_sql(stmt, conn)
         df = df.head(limit)
         raw_rows = df.astype(object).where(pd.notnull(df), None).values.tolist()
         json_rows = [[v if isinstance(v, (str, int, float, bool, type(None))) else str(v)
@@ -698,7 +751,7 @@ def fingerprint_table(cfg: dict, password: str, schema: Optional[str],
     or {ok: False, error}. Callers treat any failure as "cannot skip" and
     fall through to the full snapshot (Article IV — the optimization can
     never block a refresh)."""
-    from sqlalchemy import inspect as sa_inspect, text
+    from sqlalchemy import func, inspect as sa_inspect, select as sa_select
     d = get_dialect(cfg.get("db_type"))
     engine = None
     try:
@@ -721,17 +774,20 @@ def fingerprint_table(cfg: dict, password: str, schema: Optional[str],
             temporal = [n for n in ranked if kinds.get(n) == "temporal"][:FINGERPRINT_MAX_TEMPORAL]
 
             picked = numeric + temporal
-            inner = _build_select(d, schema, table, columns=picked or None,
-                                  where=where, row_cap=row_cap)
-            parts = ["COUNT(*) AS fp_count"]
+            inner = _select_stmt(schema, table, columns=picked or None,
+                                 where=where, row_cap=row_cap).subquery("fp_sub")
+            parts = [func.count().label("fp_count")]
             for i, n in enumerate(numeric):
-                parts.append(f"SUM({d.q(n)}) AS fp_s{i}")
-                parts.append(f"AVG({d.q(n)}) AS fp_a{i}")
+                parts.append(func.sum(inner.c[n]).label(f"fp_s{i}"))
+                parts.append(func.avg(inner.c[n]).label(f"fp_a{i}"))
             for i, n in enumerate(temporal):
-                parts.append(f"MAX({d.q(n)}) AS fp_m{i}")
-            sql = f"SELECT {', '.join(parts)} FROM ({inner}) fp_sub"
-            _assert_single_select(sql)
-            df = pd.read_sql(text(sql), conn)
+                parts.append(func.max(inner.c[n]).label(f"fp_m{i}"))
+            # Executed as a CONSTRUCT, not a string: an unquoted `fp_count`
+            # alias comes back as FP_COUNT from Oracle's cursor, and only
+            # SQLAlchemy's result mapping puts our own label back on it.
+            stmt = sa_select(*parts).select_from(inner)
+            _compiled_sql(stmt, conn.dialect)
+            df = pd.read_sql(stmt, conn)
         row = df.iloc[0]
 
         def _s(v):
@@ -819,7 +875,6 @@ def snapshot_table(cfg: dict, password: str, *, schema: Optional[str], table: st
     in place, so chats keep serving the last good data (Article IV)."""
     import pyarrow as pa
     import pyarrow.parquet as pq
-    from sqlalchemy import text
 
     d = get_dialect(cfg.get("db_type"))
     engine = None
@@ -830,14 +885,16 @@ def snapshot_table(cfg: dict, password: str, *, schema: Optional[str], table: st
     out_columns: list[str] = []
     plan = dict(dtype_plan or {})
     try:
-        sql = _build_select(d, schema, table, columns=columns, where=where, row_cap=row_cap)
+        stmt = _select_stmt(schema, table, columns=columns, where=where,
+                            row_cap=row_cap)
         chunk_size = int(chunk_rows or settings.DB_SNAPSHOT_CHUNK_ROWS)
         engine = get_engine(cfg, password)
         dest.parent.mkdir(parents=True, exist_ok=True)
         with engine.connect() as conn:
             d.apply_stmt_timeout(conn, int(cfg.get("statement_timeout") or settings.DB_STATEMENT_TIMEOUT))
+            _compiled_sql(stmt, conn.dialect)
             first = True
-            for chunk in pd.read_sql(text(sql), conn, chunksize=chunk_size):
+            for chunk in pd.read_sql(stmt, conn, chunksize=chunk_size):
                 chunk.columns = [str(c) for c in chunk.columns]
                 if first:
                     if not plan:
