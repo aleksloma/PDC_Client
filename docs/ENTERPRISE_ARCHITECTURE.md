@@ -586,6 +586,13 @@ A local admin (`ladmin`, the fixed role=admin account bootstrapped from
 MySQL/MariaDB, MSSQL, Oracle, ClickHouse — a dialect REGISTRY in
 `client/db_connector.py`; adding a type = one registry entry + one driver
 package) so users can analyze them in chats exactly like uploaded files.
+Identifier quoting and row limiting live in the SQLAlchemy dialect, not the
+registry: every statement built from introspected names is a construct
+(`_select_stmt`), and queries carry an explicit column list so the frame comes
+back keyed by the INTROSPECTED names. Both matter on Oracle, whose Inspector
+normalizes case-folded identifiers to lowercase while the server stores them
+uppercase — hand-quoted names raised ORA-00942, and driver-cased result
+columns would have made every refresh read as full schema drift.
 ClickHouse databases appear as schemas in the browser, and ClickHouse carries
 no FK metadata, so FK-based relation discovery yields nothing for its tables
 (name / description / pasted-SQL candidates still work). Spec: `docs/DB_TABLES_PLAN.md`.

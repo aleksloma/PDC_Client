@@ -56,8 +56,14 @@ retry loop, and brain protocol need no changes in Phase 1.
    **ClickHouse** added later through exactly that route (one `Dialect(...)`
    literal + pinned `clickhouse-sqlalchemy` / `clickhouse-driver`, native
    protocol, default port 9000). Build a dialect REGISTRY so adding a DB type
-   later = one registry entry (SQLAlchemy URL template, default port, quoting)
-   + a driver package. Later candidates: IBM DB2, SAP HANA, Snowflake, SQLite.
+   later = one registry entry (SQLAlchemy URL template, default port, catalog
+   estimate SQL, timeout mechanism) + a driver package. Identifier quoting and
+   row limiting are deliberately NOT registry entries — every statement built
+   from introspected names is a SQLAlchemy construct (`_select_stmt`), so the
+   dialect decides. Hand-quoting them broke Oracle: SQLAlchemy normalizes
+   Oracle's case-folded names to lowercase leaving the Inspector, and
+   `"bsrep"."offering_all"` is a different object than BSREP.OFFERING_ALL
+   (ORA-00942). Later candidates: IBM DB2, SAP HANA, Snowflake, SQLite.
 
    ClickHouse specifics worth knowing: its **databases are exposed as schemas**,
    so the schema browser lists them like any other dialect; and it has **no
@@ -212,8 +218,11 @@ Scheduled refreshes probe the source BEFORE snapshotting: ONE SQL aggregate
 query per table (`db_connector.fingerprint_table`) — `COUNT(*)`, `SUM`+`AVG`
 of up to 4 numeric columns and `MAX` of up to 2 date/timestamp columns
 (picked deterministically by registry column order), all wrapped around the
-same `_build_select` the snapshot uses so the WHERE filter / row cap compare
-like for like — plus the live column name+type list from introspection.
+same `_select_stmt` the snapshot uses so the WHERE filter / row cap compare
+like for like — plus the live column name+type list from introspection. The
+aggregate runs as a CONSTRUCT, not a SQL string: its `fp_count` / `fp_s0`
+aliases would come back UPPERCASE from a case-folding cursor, and only
+SQLAlchemy's result mapping puts the requested labels back.
 Serialized canonically and hashed (`db_scheduler.compose_fingerprint`):
 
 ```
