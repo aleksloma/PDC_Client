@@ -1444,7 +1444,11 @@ async def introspect_table(request: Request):
                        sid=f"admin:{email}")
     if not intro.get("ok"):
         return intro
-    preview = await _run(db_connector.preview_rows, cfg, password, schema, table,
+    # The RESOLVED identifiers from the introspection — in-process they carry
+    # the case-sensitivity flag (quoted_name), so a physically case-sensitive
+    # schema/table/column compiles quoted in the preview SELECT.
+    preview = await _run(db_connector.preview_rows, cfg, password,
+                         intro.get("schema"), intro.get("table") or table,
                          limit=int(body.get("preview_rows") or settings.DB_PREVIEW_ROWS),
                          # Explicit columns → the frame is keyed by the
                          # INTROSPECTED names on every dialect (Oracle's cursor
@@ -1479,6 +1483,11 @@ def _draft_table_descriptions(cfg: dict, password: str, schema, table: str,
                                         sid=f"admin:{email}")
     if not intro.get("ok"):
         return {"ok": False, "error": intro.get("error")}
+    # Resolved identifiers (quoted_name in-process) — a case-sensitive
+    # schema/table compiles quoted in the sample SELECT.
+    if "schema" in intro:
+        schema = intro.get("schema")
+    table = intro.get("table") or table
     # A larger sample than the visual preview so unique_hints are honest
     # (still truncated by the same SCHEMA_AUTOFILL_* rules files use).
     prev = db_connector.preview_rows(cfg, password, schema, table,
@@ -1585,21 +1594,45 @@ def _build_table_doc(*, tid: str, connection_id, schema, table: str,
             carried["registered_by"] = existing["registered_by"]
     else:
         carried["registered_by"] = email
+    # Case-sensitivity flags come from the FRESH introspection, never the
+    # posted body — the browser round-trips bare strings, and the plain name
+    # is ambiguous (physical lowercase vs folded UPPERCASE). Emitted only
+    # when true, so ordinary docs stay byte-identical.
+    quote_by_name = {}
+    for c in (intro.get("columns") or []):
+        nm = c.get("name")
+        if nm:
+            quote_by_name[str(nm)] = bool(c.get("quote")
+                                          or getattr(nm, "quote", None))
+    doc_columns = []
+    for c in (columns or []):
+        if not c.get("name"):
+            continue
+        entry = {
+            "name": c.get("name"),
+            "dtype": c.get("dtype") or "",
+            "description": (c.get("description") or "").strip(),
+            "indexed": bool(c.get("indexed")),
+            "pk": bool(c.get("pk")),
+        }
+        if quote_by_name.get(str(c.get("name"))):
+            entry["quote"] = True
+        doc_columns.append(entry)
+    idents = {}
+    if intro.get("schema_quote") or getattr(intro.get("schema"), "quote", None):
+        idents["schema_quote"] = True
+    if intro.get("table_quote") or getattr(intro.get("table"), "quote", None):
+        idents["table_quote"] = True
     return {
         **carried,
+        **idents,
         "id": tid if db_sources.DataSourceStore.valid_id(tid) else None,
         "connection_id": connection_id,
         "schema": schema or "",
         "table_name": table,
         "display_name": (display_name or "").strip(),
         "description": (description or "").strip(),
-        "columns": [{
-            "name": c.get("name"),
-            "dtype": c.get("dtype") or "",
-            "description": (c.get("description") or "").strip(),
-            "indexed": bool(c.get("indexed")),
-            "pk": bool(c.get("pk")),
-        } for c in (columns or []) if c.get("name")],
+        "columns": doc_columns,
         "is_connector": bool(is_connector),
         "relations": [r for r in (relations or []) if isinstance(r, dict)],
         "row_count": intro.get("row_count_estimate"),

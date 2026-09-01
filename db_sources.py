@@ -494,12 +494,21 @@ class DataSourceStore:
                        columns: Optional[list] = None,
                        dtype_plan: Optional[dict] = None,
                        fingerprint: Optional[str] = None,
+                       ident_quotes: Optional[dict] = None,
                        error: Optional[str] = None) -> None:
         """Update refresh bookkeeping on a table row. On error, refreshed_at is
-        left at its previous value (chats keep the last good snapshot).
+        left at its previous value (chats keep the last good snapshot), but
+        `dtype_plan` IS applied when passed — a failed snapshot prunes the
+        downcast a chunk outgrew from the plan, and persisting the pruned plan
+        is what lets the next run succeed at the wider canonical type.
         `fingerprint` (Part C): the change-detection hash stored with the
         successful snapshot — None clears it (a failed fingerprint round must
-        never leave a stale hash a later run could false-skip on)."""
+        never leave a stale hash a later run could false-skip on).
+        `ident_quotes` ({schema_quote, table_quote} of bools): the
+        case-sensitivity flags of the RESOLVED schema/table identifiers,
+        passed only when the refresh re-resolved them against the live catalog
+        — persisting them is what makes a legacy doc's case-sensitive table
+        name heal permanently instead of once per run."""
         try:
             with _LOCK:
                 doc = self.read_doc()
@@ -517,10 +526,16 @@ class DataSourceStore:
                                 t["snapshot_bytes"] = int(snapshot_bytes)
                             if columns is not None:
                                 t["columns"] = columns
-                            if dtype_plan is not None:
-                                t["dtype_plan"] = dtype_plan
+                            if ident_quotes is not None:
+                                for key in ("schema_quote", "table_quote"):
+                                    if ident_quotes.get(key):
+                                        t[key] = True
+                                    else:
+                                        t.pop(key, None)
                         else:
                             t["last_refresh_error"] = str(error)[:500]
+                        if dtype_plan is not None:
+                            t["dtype_plan"] = dtype_plan
                         self._write_doc(doc)
                         return
         except Exception as e:

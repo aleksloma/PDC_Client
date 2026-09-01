@@ -16,6 +16,20 @@ normalizes Oracle's folded identifiers to lowercase on the way out of the
 Inspector, and a lowercase name in double quotes is a DIFFERENT object than
 the uppercase one the server stores (ORA-00942).
 
+PHYSICALLY case-sensitive names (created quoted, e.g. by a pandas `to_sql`
+pipeline) are the mirror image: the Inspector returns them as
+`quoted_name(name, quote=True)`, and that flag is the ONLY thing
+distinguishing them from an ordinary fold-case name — the plain string is
+ambiguous by itself (`prediction` may be physical lowercase or folded
+UPPERCASE). `quoted_name` subclasses `str`, so the flag silently dies at
+every JSON hop and every `str()` coercion; compiling the bare string then
+renders unquoted, Oracle folds it back to uppercase, ORA-00904. The rule:
+the flag is PERSISTED from introspection (per-column `quote: true` and
+top-level `schema_quote`/`table_quote` on the registry doc, emitted only
+when true) and REBUILT via `qname`/`col_ident` at every query-construction
+point; the dialect decides at compile time what it means. Never inferred,
+never an Oracle-only branch.
+
 Security invariants (docs/AI_CONSTITUTION.md Article VII + DB_TABLES_PLAN):
   - This module only ever issues SELECT / introspection statements. There is
     no code path that accepts free-form SQL; `_assert_single_select` guards
@@ -428,6 +442,26 @@ def _catalog_name(dialect, name: Optional[str]) -> Optional[str]:
     return dialect.denormalize_name(name)
 
 
+def qname(name, quote=None):
+    """Rebuild a persisted identifier for query construction. `quote` truthy
+    marks a PHYSICALLY case-sensitive (created-quoted) name — the flag comes
+    from introspection and is persisted, never inferred, because the plain
+    string is ambiguous by itself. Falsy/None keeps today's behavior exactly:
+    a plain str gets dialect-default quoting, an in-process `quoted_name`
+    keeps its own flag."""
+    if name is None or not quote:
+        return name
+    from sqlalchemy.sql import quoted_name
+    return quoted_name(str(name), True)
+
+
+def col_ident(col: dict):
+    """Identifier from a stored/introspected column dict `{name, quote?}` —
+    the persisted `quote` key wins; an in-process `quoted_name` value keeps
+    its own flag through `qname`'s passthrough."""
+    return qname(col.get("name"), col.get("quote"))
+
+
 def _select_stmt(schema: Optional[str], table: str,
                  columns: Optional[list] = None, where: Optional[str] = None,
                  row_cap: Optional[int] = None):
@@ -437,7 +471,12 @@ def _select_stmt(schema: Optional[str], table: str,
     Quoting: an Inspector-normalized lowercase Oracle name renders UNQUOTED
     and the server folds it back to OFFERING_ALL; a mixed-case, reserved or
     otherwise case-sensitive name is still quoted, per dialect. Hand-quoting
-    the normalized name was the ORA-00942 bug.
+    the normalized name was the ORA-00942 bug. Identifiers arrive as plain
+    `str` OR `quoted_name` (rebuilt from the persisted flag via
+    `qname`/`col_ident`) and MUST pass through un-coerced — `str()` here was
+    the ORA-00904 bug: it silently stripped `quote=True` from physically
+    case-sensitive columns, so they compiled unquoted and Oracle folded them
+    to names that don't exist.
 
     Row limit: `.limit()` emits FETCH FIRST or a ROWNUM wrapper by the live
     Oracle server version, TOP on mssql, LIMIT elsewhere.
@@ -450,7 +489,7 @@ def _select_stmt(schema: Optional[str], table: str,
     statement is what `_compiled_sql` gates."""
     from sqlalchemy import (column as sa_column, literal_column, select,
                             table as sa_table, text as sa_text)
-    cols = [str(c) for c in (columns or [])]
+    cols = list(columns or [])
     t = sa_table(table, *[sa_column(c) for c in cols], schema=schema or None)
     if cols:
         stmt = select(*[t.c[c] for c in cols])
@@ -554,12 +593,76 @@ def list_tables(cfg: dict, password: str, schema: Optional[str], *, sid: str) ->
                 pass
 
 
+def _resolve_live_idents(insp, schema, table, *, sid: str = "db_introspect"):
+    """Match the caller's plain-string schema/table against the live Inspector
+    listings so they come back carrying the dialect's case-sensitivity flag
+    (`quoted_name` — equality with the plain string is plain str equality).
+    The live catalog is the only possible source once a name has crossed a
+    JSON boundary, and a physically case-sensitive table is otherwise
+    un-introspectable: the bare string gets denormalized (UPPERCASE on
+    Oracle) and the Inspector finds nothing. Best-effort — on any failure
+    the inputs pass through unchanged (Article IV)."""
+    try:
+        if schema:
+            for s in insp.get_schema_names():
+                if s == schema:
+                    schema = s
+                    break
+        if table:
+            names = list(insp.get_table_names(schema=schema))
+            try:
+                names += list(insp.get_view_names(schema=schema))
+            except Exception:
+                pass
+            for n in names:
+                if n == table:
+                    table = n
+                    break
+    except Exception as e:
+        log_with_sid(sid, "warning",
+                     f"DB_IDENT_RESOLVE_FAILED table={schema}.{table} "
+                     f"err={type(e).__name__}")
+    return schema, table
+
+
+def _column_type_info(sa_type) -> dict:
+    """Transportable summary of a live SQLAlchemy column type, feeding the
+    snapshot's canonical Arrow schema: {"py", "precision", "scale",
+    "timezone"}. Never raises — `python_type` raises on exotic types, which
+    map to py=None and fall back to chunk-1 inference downstream."""
+    info: dict = {"py": None, "precision": None, "scale": None, "timezone": False}
+    try:
+        info["py"] = sa_type.python_type.__name__
+    except Exception:
+        pass
+    try:
+        p = getattr(sa_type, "precision", None)
+        info["precision"] = int(p) if p is not None else None
+    except Exception:
+        pass
+    try:
+        s = getattr(sa_type, "scale", None)
+        info["scale"] = int(s) if s is not None else None
+    except Exception:
+        pass
+    try:
+        info["timezone"] = bool(getattr(sa_type, "timezone", False))
+    except Exception:
+        pass
+    return info
+
+
 def introspect(cfg: dict, password: str, schema: Optional[str], table: str,
                *, sid: str) -> dict:
     """Columns + dtypes / PK / FK / indexes / comment via Inspector, plus
     catalog-estimate row count and size (never COUNT(*) on a customer table —
     the sqlite test entry's exact_count_fallback is the sole exception).
-    Individually degraded on missing catalog privileges."""
+    Individually degraded on missing catalog privileges. Returned identifiers
+    carry the case-sensitivity flag: `schema`/`table` are resolved against the
+    live listings (in-process they are `quoted_name`; over JSON the flag rides
+    the additive `schema_quote`/`table_quote` keys) and each column dict gains
+    `quote: true` when physically case-sensitive — absent otherwise, so legacy
+    consumers see byte-identical shapes."""
     from sqlalchemy import (func, inspect as sa_inspect,
                             select as sa_select, table as sa_table, text)
     d = get_dialect(cfg.get("db_type"))
@@ -568,6 +671,7 @@ def introspect(cfg: dict, password: str, schema: Optional[str], table: str,
     try:
         engine = get_engine(cfg, password)
         insp = sa_inspect(engine)
+        schema, table = _resolve_live_idents(insp, schema, table, sid=sid)
         cols_raw = insp.get_columns(table, schema=schema)
         try:
             pk = insp.get_pk_constraint(table, schema=schema).get("constrained_columns") or []
@@ -594,15 +698,19 @@ def introspect(cfg: dict, password: str, schema: Optional[str], table: str,
                 py_type = c["type"].python_type.__name__
             except Exception:
                 py_type = None
-            columns.append({
+            entry = {
                 "name": c.get("name"),
                 "dtype": str(c.get("type")),
                 "py_type": py_type,
+                "type_info": _column_type_info(c.get("type")),
                 "nullable": bool(c.get("nullable", True)),
                 "comment": c.get("comment"),
                 "pk": c.get("name") in pk,
                 "indexed": c.get("name") in indexed_cols,
-            })
+            }
+            if getattr(c.get("name"), "quote", None):
+                entry["quote"] = True
+            columns.append(entry)
 
         row_count = None
         size_bytes = None
@@ -646,7 +754,7 @@ def introspect(cfg: dict, password: str, schema: Optional[str], table: str,
             else:
                 degraded.append("size")
 
-        return {"ok": True, "schema": schema, "table": table,
+        out = {"ok": True, "schema": schema, "table": table,
                 "columns": columns, "primary_key": pk,
                 "foreign_keys": [{
                     "constrained_columns": f.get("constrained_columns") or [],
@@ -661,6 +769,11 @@ def introspect(cfg: dict, password: str, schema: Optional[str], table: str,
                 "row_count_estimate": row_count,
                 "size_bytes_estimate": size_bytes,
                 "degraded": degraded}
+        if getattr(schema, "quote", None):
+            out["schema_quote"] = True
+        if getattr(table, "quote", None):
+            out["table_quote"] = True
+        return out
     except Exception as e:
         err = _friendly_db_error(e, "Database connection timed out.", password)
         log_with_sid(sid, "warning", f"DB_INTROSPECT_FAILED table={schema}.{table} err={err}")
@@ -761,8 +874,23 @@ def fingerprint_table(cfg: dict, password: str, schema: Optional[str],
                                            or settings.DB_STATEMENT_TIMEOUT))
             insp = sa_inspect(conn)
             cols_raw = insp.get_columns(table, schema=schema)
-            columns = [{"name": str(c.get("name")), "dtype": str(c.get("type"))}
-                       for c in cols_raw if c.get("name")]
+            # `idents` keeps the Inspector's OWN name objects (quoted_name for
+            # physically case-sensitive columns) for query construction; the
+            # returned `columns` entries stay plain-str `name`+`dtype` — the
+            # exact pair compose_fingerprint hashes, so the additive
+            # `quote`/`type_info` keys can never invalidate a stored hash.
+            idents = {}
+            columns = []
+            for c in cols_raw:
+                nm = c.get("name")
+                if not nm:
+                    continue
+                idents[str(nm)] = nm
+                entry = {"name": str(nm), "dtype": str(c.get("type")),
+                         "type_info": _column_type_info(c.get("type"))}
+                if getattr(nm, "quote", None):
+                    entry["quote"] = True
+                columns.append(entry)
             kinds = {}
             for c in cols_raw:
                 if c.get("name"):
@@ -774,7 +902,8 @@ def fingerprint_table(cfg: dict, password: str, schema: Optional[str],
             temporal = [n for n in ranked if kinds.get(n) == "temporal"][:FINGERPRINT_MAX_TEMPORAL]
 
             picked = numeric + temporal
-            inner = _select_stmt(schema, table, columns=picked or None,
+            inner = _select_stmt(schema, table,
+                                 columns=[idents[n] for n in picked] or None,
                                  where=where, row_cap=row_cap).subquery("fp_sub")
             parts = [func.count().label("fp_count")]
             for i, n in enumerate(numeric):
@@ -818,61 +947,279 @@ def fingerprint_table(cfg: dict, password: str, schema: Optional[str],
 _CATEGORY_MAX_UNIQUE = 100_000
 _CATEGORY_MAX_RATIO = 0.5
 
+_INT_DOWNCASTS = {"int8", "int16", "int32"}
+_FLOAT_DOWNCASTS = {"float32"}
 
-def _compute_dtype_plan(chunk: pd.DataFrame) -> dict:
-    """From the FIRST chunk, decide per-column optimization: numeric downcast
-    (applied on write — pins the Arrow schema across chunks) and 'category'
-    for low-cardinality strings. Category entries are RECORDED ONLY — neither
-    baked into the file (per-chunk categoricals destabilize the Arrow schema)
-    nor applied by the loader: categorical frames make generated groupby code
+
+class _SnapshotCastError(Exception):
+    """A chunk's values cannot be represented in the snapshot's canonical
+    Arrow schema without data loss (overflow / incompatible values)."""
+
+    def __init__(self, col: str, target, cause: Exception):
+        self.col = col
+        self.target = target
+        super().__init__(
+            f"Column '{col}' cannot be converted to {target} without data "
+            f"loss; snapshot aborted, previous snapshot kept.")
+
+
+def _normalize_arrow_type(t):
+    """Chunk-1-inference fallback normalization: strip the artifacts that vary
+    per chunk. `null` (an all-NULL column) -> string; any timestamp -> the
+    canonical microsecond resolution (tz kept); dictionary -> its normalized
+    value type (categorical parquet is forbidden downstream)."""
+    import pyarrow as pa
+    if pa.types.is_null(t):
+        return pa.string()
+    if pa.types.is_timestamp(t):
+        return pa.timestamp("us", tz=t.tz)
+    if pa.types.is_dictionary(t):
+        return _normalize_arrow_type(t.value_type)
+    return t
+
+
+def _base_arrow_type(info: Optional[dict], chunk_dtype):
+    """Canonical Arrow type for one column from its introspected `type_info`,
+    or None to fall back to normalized chunk-1 inference. The introspected
+    LOGICAL type decides — deterministic across runs, so NULL distribution
+    and chunk order can never flip it; the chunk-1 pandas DTYPE (never its
+    values) refines only the driver-representation cases: bool-as-int,
+    Decimal-vs-float, timestamp tz. Timestamps are `us`, not `ns` — year-9999
+    sentinel dates (common in bank DBs) overflow ns."""
+    import pyarrow as pa
+    py = (info or {}).get("py")
+    if py == "int":
+        return pa.int64()
+    if py == "float":
+        return pa.float64()
+    if py == "bool":
+        # MySQL tinyint(1) introspects as bool but the driver may hand back
+        # ints beyond 0/1 — keep those int64, no false cast failures.
+        if chunk_dtype is not None and pd.api.types.is_integer_dtype(chunk_dtype):
+            return pa.int64()
+        return pa.bool_()
+    if py == "str":
+        return pa.string()
+    if py == "bytes":
+        return pa.binary()
+    if py == "datetime":
+        tz = None
+        if isinstance(chunk_dtype, pd.DatetimeTZDtype):
+            tz = str(chunk_dtype.tz)
+        elif chunk_dtype is not None and pd.api.types.is_datetime64_any_dtype(chunk_dtype):
+            tz = None
+        elif (info or {}).get("timezone"):
+            tz = "UTC"
+        return pa.timestamp("us", tz=tz)
+    if py == "date":
+        return pa.date32()
+    if py == "time":
+        return pa.time64("us")
+    if py == "timedelta":
+        return pa.duration("us")
+    if py == "Decimal":
+        if chunk_dtype is not None and pd.api.types.is_float_dtype(chunk_dtype):
+            return pa.float64()  # the driver already hands back floats (oracledb)
+        prec = (info or {}).get("precision")
+        scale = (info or {}).get("scale")
+        try:
+            if prec and 1 <= int(prec) <= 38 and scale is not None and 0 <= int(scale) <= int(prec):
+                return pa.decimal128(int(prec), int(scale))
+        except Exception:
+            pass
+        # Bare NUMBER without precision: float64 via the pandas precast —
+        # per-chunk decimal precision inference was this bug's third face.
+        return pa.float64()
+    return None
+
+
+def _canonical_base_schema(names: list, column_types: Optional[dict],
+                           chunk: Optional[pd.DataFrame], sid: str):
+    """ONE Arrow schema per snapshot, fields in SELECT order. Introspection-
+    driven where the type maps (`_base_arrow_type`); normalized chunk-1
+    inference for exotics; `string` for a column that is both
+    un-introspectable AND all-NULL in chunk 1 (the doubly-unknown case —
+    logged, later real values get stringified rather than failing)."""
+    import pyarrow as pa
+    inferred = None
+    if chunk is not None:
+        try:
+            inferred = pa.Schema.from_pandas(chunk, preserve_index=False)
+        except Exception as e:
+            # Type name only — from_pandas error text can embed cell values.
+            log_with_sid(sid, "warning",
+                         f"DB_SNAPSHOT_INFER_FAILED err={type(e).__name__}")
+    fields = []
+    for name in names:
+        info = None
+        if column_types:
+            info = column_types.get(name)
+            if info is None:
+                # Oracle's cursor may case-fold the frame's keys — match the
+                # introspected map case-insensitively before giving up.
+                low = str(name).lower()
+                for k, v in column_types.items():
+                    if str(k).lower() == low:
+                        info = v
+                        break
+        chunk_dtype = None
+        if chunk is not None and name in chunk.columns:
+            chunk_dtype = chunk[name].dtype
+        t = _base_arrow_type(info, chunk_dtype)
+        if t is None:
+            if inferred is not None and inferred.get_field_index(name) >= 0:
+                t = _normalize_arrow_type(inferred.field(name).type)
+            else:
+                t = pa.string()
+                log_with_sid(sid, "warning",
+                             f"DB_SNAPSHOT_TYPE_UNKNOWN col={name} -> string")
+        fields.append(pa.field(name, t))
+    return pa.schema(fields)
+
+
+def _compute_dtype_plan(chunk: pd.DataFrame, base) -> dict:
+    """From the FIRST chunk, record 'category' markers for low-cardinality
+    string columns. Category entries are RECORDED ONLY — neither baked into
+    the file (per-chunk categoricals destabilize the Arrow schema) nor
+    applied by the loader: categorical frames make generated groupby code
     (pandas < 3.0 observed=False default) emit the full cartesian product of
-    ALL categories, which once put every city/product on a chart axis."""
+    ALL categories, which once put every city/product on a chart axis.
+
+    Value-derived NUMERIC downcasts are deliberately no longer recorded: a
+    plan computed from whichever values chunk 1 happened to hold made the
+    parquet schema depend on chunk size and NULL distribution — the schema
+    must be a function of the TABLE DEFINITION alone, so refresh comparison
+    and profiles stay stable across runs. Numeric entries in a STORED legacy
+    plan are still honored by `_refine_schema_with_plan` (same-family), so
+    existing snapshots keep their schema."""
+    import pyarrow as pa
     plan: dict[str, str] = {}
     n = max(1, len(chunk))
-    for col in chunk.columns:
-        s = chunk[col]
+    for f in base:
+        if f.name not in chunk.columns:
+            continue
+        s = chunk[f.name]
         try:
-            if pd.api.types.is_integer_dtype(s):
-                down = pd.to_numeric(s, downcast="integer")
-                if str(down.dtype) != str(s.dtype):
-                    plan[str(col)] = str(down.dtype)
-            elif pd.api.types.is_float_dtype(s):
-                down = pd.to_numeric(s, downcast="float")
-                if str(down.dtype) != str(s.dtype):
-                    plan[str(col)] = str(down.dtype)
-            elif pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
+            if pa.types.is_string(f.type) and (
+                    pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s)):
                 nunique = s.nunique(dropna=True)
                 # Ratio guards big chunks; the 1000-floor keeps the plan sane
                 # when chunk 1 is tiny (category on a small table is harmless).
                 if nunique <= _CATEGORY_MAX_UNIQUE and nunique <= max(1000, n * _CATEGORY_MAX_RATIO):
-                    plan[str(col)] = "category"
+                    plan[f.name] = "category"
         except Exception:
             continue
     return plan
 
 
-def _apply_numeric_plan(chunk: pd.DataFrame, plan: dict) -> pd.DataFrame:
-    """Cast the numeric entries of the plan onto a chunk; a failing cast (a
-    value outgrew the planned type on refresh) drops that column from the plan
-    for this snapshot and logs it — never aborts the snapshot."""
-    for col, dtype in list(plan.items()):
-        if dtype == "category" or col not in chunk.columns:
+def _refine_schema_with_plan(base, plan: dict, sid: str):
+    """Fold the numeric downcast plan into the canonical schema — the cast
+    then happens inside the single from_pandas conversion (the per-chunk
+    pandas astype with its later-chunk 'relax' path was one of the two
+    schema-mismatch root causes). Same-family entries only; a stale
+    mismatched entry (e.g. a float32 recorded for an int column by an older
+    build) is pruned from the plan IN PLACE — the caller persists the cleaned
+    plan, so the registry self-heals. Category entries stay recorded-only:
+    the schema keeps plain string."""
+    import pyarrow as pa
+    fields = []
+    for f in base:
+        dtype = plan.get(f.name)
+        if dtype and dtype != "category":
+            if ((dtype in _INT_DOWNCASTS and pa.types.is_integer(f.type)) or
+                    (dtype in _FLOAT_DOWNCASTS and pa.types.is_floating(f.type))):
+                f = pa.field(f.name, pa.type_for_alias(dtype))
+            else:
+                log_with_sid(sid, "warning", f"DB_SNAPSHOT_DTYPE_RELAXED col={f.name}")
+                plan.pop(f.name, None)
+        fields.append(f)
+    return pa.schema(fields)
+
+
+def _precast_chunk(chunk: pd.DataFrame, schema, *, warned: set, sid: str) -> pd.DataFrame:
+    """Pandas-side preparation for the canonical-schema conversion — the only
+    two casts Arrow refuses to do itself. (1) Sub-microsecond timestamps are
+    TRUNCATED to the canonical `us` resolution — deliberate: hard-failing
+    would brick Oracle TIMESTAMP(9) tables, and `us` (not `ns`) is canonical
+    because year-9999 sentinel dates overflow ns. Logged once per column.
+    (2) Object columns of Decimals headed for a float64 field are cast via
+    pandas (Arrow refuses Decimal->double); a failing precast is left for
+    the Arrow conversion to reject WITH the column named."""
+    import pyarrow as pa
+    for f in schema:
+        if f.name not in chunk.columns:
             continue
+        s = chunk[f.name]
         try:
-            chunk[col] = chunk[col].astype(dtype)
+            if pa.types.is_timestamp(f.type) and pd.api.types.is_datetime64_any_dtype(s):
+                if getattr(s.dt, "unit", "ns") == "ns":
+                    floored = s.dt.floor("us")
+                    if f.name not in warned and not floored.equals(s):
+                        warned.add(f.name)
+                        log_with_sid(sid, "warning",
+                                     f"DB_SNAPSHOT_TS_TRUNCATED col={f.name} ns->us")
+                    chunk[f.name] = floored
+            elif pa.types.is_floating(f.type) and pd.api.types.is_object_dtype(s):
+                chunk[f.name] = s.astype("float64")
         except Exception:
-            log_with_sid("db_snapshot", "warning", f"DB_SNAPSHOT_DTYPE_RELAXED col={col}")
-            plan.pop(col, None)
+            continue
     return chunk
+
+
+_CAST_COL_RE = re.compile(r"Conversion failed for column (.+?) with type")
+
+
+def _chunk_to_arrow(chunk: pd.DataFrame, schema, *, warned: set, sid: str):
+    """Convert one chunk against the canonical schema. from_pandas with an
+    explicit target schema is the mechanism on purpose: it treats NaN as null
+    for int targets and raises (naming the column) on genuinely lossy casts —
+    `.cast()` would reject NaN outright."""
+    import pyarrow as pa
+    chunk = _precast_chunk(chunk, schema, warned=warned, sid=sid)
+    try:
+        return pa.Table.from_pandas(chunk, schema=schema, preserve_index=False)
+    except Exception as e:
+        m = _CAST_COL_RE.search(str(e))
+        col = m.group(1).strip() if m else None
+        if col is None:
+            # Arrow didn't name the column — probe one field at a time.
+            for f in schema:
+                if f.name in chunk.columns:
+                    try:
+                        pa.Table.from_pandas(chunk[[f.name]],
+                                             schema=pa.schema([f]),
+                                             preserve_index=False)
+                    except Exception:
+                        col = f.name
+                        break
+        col = col or "?"
+        try:
+            target = schema.field(col).type
+        except Exception:
+            target = "?"
+        raise _SnapshotCastError(col, target, e) from e
 
 
 def snapshot_table(cfg: dict, password: str, *, schema: Optional[str], table: str,
                    columns: Optional[list] = None, where: Optional[str] = None,
                    row_cap: Optional[int] = None, dtype_plan: Optional[dict] = None,
+                   column_types: Optional[dict] = None,
                    dest: Path, sid: str, chunk_rows: Optional[int] = None) -> dict:
     """Chunked SELECT → parquet with an atomic os.replace. Never raises; on
     failure the tmp file is removed and the PREVIOUS snapshot (if any) stays
-    in place, so chats keep serving the last good data (Article IV)."""
+    in place, so chats keep serving the last good data (Article IV).
+
+    ONE canonical Arrow schema per snapshot (`_canonical_base_schema` from
+    the introspected `column_types` — pass `{name: type_info}` — refined by
+    the numeric downcast plan), and EVERY chunk is converted against it.
+    Pinning the writer to chunk-1 pandas inference was the production schema-
+    mismatch bug: pandas re-infers per chunk, so an all-NULL leading column,
+    an int growing NULLs, or a timestamp resolution flip made a later
+    `write_table` raise. Chunk order / NULL distribution can no longer change
+    the resulting schema; a genuinely lossy cast (overflow, incompatible
+    values) fails the snapshot naming the column instead of writing wrong
+    values, and prunes a stale downcast from the returned plan so the next
+    run self-heals."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -894,28 +1241,76 @@ def snapshot_table(cfg: dict, password: str, *, schema: Optional[str], table: st
             d.apply_stmt_timeout(conn, int(cfg.get("statement_timeout") or settings.DB_STATEMENT_TIMEOUT))
             _compiled_sql(stmt, conn.dialect)
             first = True
+            canonical = None
+            warned: set = set()
             for chunk in pd.read_sql(stmt, conn, chunksize=chunk_size):
                 chunk.columns = [str(c) for c in chunk.columns]
                 if first:
-                    if not plan:
-                        plan = _compute_dtype_plan(chunk)
                     out_columns = [str(c) for c in chunk.columns]
-                chunk = _apply_numeric_plan(chunk, plan)
-                arrow = pa.Table.from_pandas(chunk, preserve_index=False)
-                if first:
-                    writer = pq.ParquetWriter(str(tmp), arrow.schema,
+                    base = _canonical_base_schema(out_columns, column_types,
+                                                  chunk, sid)
+                    if not plan:
+                        plan = _compute_dtype_plan(chunk, base)
+                    canonical = _refine_schema_with_plan(base, plan, sid)
+                    # Chunk-1 conversion with repair: a mapping miss on an
+                    # exotic driver type must never brick a table inference
+                    # handled yesterday — swap the field for chunk-1's own
+                    # normalized inference, once per column (a field already
+                    # at its inferred type raises, bounding the loop).
+                    while True:
+                        try:
+                            arrow = _chunk_to_arrow(chunk, canonical,
+                                                    warned=warned, sid=sid)
+                            break
+                        except _SnapshotCastError as ce:
+                            fixed = None
+                            if ce.col in chunk.columns:
+                                try:
+                                    fixed = _normalize_arrow_type(
+                                        pa.Schema.from_pandas(
+                                            chunk[[ce.col]],
+                                            preserve_index=False).field(ce.col).type)
+                                except Exception:
+                                    fixed = None
+                            if fixed is None or fixed == ce.target:
+                                log_with_sid(sid, "error",
+                                             f"DB_SNAPSHOT_CAST_FAILED table={schema}.{table} "
+                                             f"col={ce.col} target={ce.target}")
+                                raise
+                            log_with_sid(sid, "warning",
+                                         f"DB_SNAPSHOT_TYPE_FALLBACK table={schema}.{table} "
+                                         f"col={ce.col} from={ce.target} to={fixed}")
+                            plan.pop(ce.col, None)
+                            canonical = pa.schema(
+                                [pa.field(f.name, fixed) if f.name == ce.col else f
+                                 for f in canonical])
+                    writer = pq.ParquetWriter(str(tmp), canonical,
                                               compression="snappy", use_dictionary=True)
                     first = False
+                else:
+                    try:
+                        arrow = _chunk_to_arrow(chunk, canonical,
+                                                warned=warned, sid=sid)
+                    except _SnapshotCastError as ce:
+                        # A planned downcast a later chunk outgrew: prune it
+                        # so the persisted plan lets the NEXT run succeed.
+                        plan.pop(ce.col, None)
+                        log_with_sid(sid, "error",
+                                     f"DB_SNAPSHOT_CAST_FAILED table={schema}.{table} "
+                                     f"col={ce.col} target={ce.target}")
+                        raise
                 writer.write_table(arrow)
                 rows_total += len(chunk)
             if first:
-                # Zero rows — write an empty parquet with the introspected shape.
-                empty = pd.DataFrame(columns=[c for c in (columns or [])])
-                arrow = pa.Table.from_pandas(empty, preserve_index=False)
-                writer = pq.ParquetWriter(str(tmp), arrow.schema,
+                # Zero rows — a TYPED empty parquet from the canonical schema
+                # (introspected types when known, string otherwise), never
+                # arrow-null columns.
+                out_columns = [str(c) for c in (columns or [])]
+                base = _canonical_base_schema(out_columns, column_types, None, sid)
+                canonical = _refine_schema_with_plan(base, plan, sid)
+                writer = pq.ParquetWriter(str(tmp), canonical,
                                           compression="snappy", use_dictionary=True)
-                writer.write_table(arrow)
-                out_columns = [str(c) for c in empty.columns]
+                writer.write_table(canonical.empty_table())
         writer.close()
         writer = None
         os.replace(tmp, dest)

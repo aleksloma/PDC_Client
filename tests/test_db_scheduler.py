@@ -179,6 +179,70 @@ def test_fingerprint_failure_falls_through_to_full_snapshot(tmp_path, monkeypatc
     assert store.get_table(tid)["last_fingerprint"] is None
 
 
+def test_refresh_multichunk_all_null_leading_column(tmp_path, monkeypatch):
+    """END-TO-END for the production snapshot bug: the scheduler passes the
+    fingerprint's introspected type_info into snapshot_table, so a column
+    that is all-NULL through chunk 1 still lands as int64 — pre-fix pandas
+    inferred it null/object and a later chunk's real values killed the
+    write with 'Table schema does not match schema used to create file'."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from sqlalchemy import create_engine, text
+    monkeypatch.setattr(settings, "DB_SNAPSHOT_CHUNK_ROWS", 2)
+    db = tmp_path / "src.db"
+    eng = create_engine(f"sqlite+pysqlite:///{db}")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE t (code INTEGER, b TEXT)"))
+        for i in range(6):
+            code = "NULL" if i < 4 else str(100 + i)
+            conn.execute(text(f"INSERT INTO t VALUES ({code}, 'x{i}')"))
+    eng.dispose()
+    store = db_sources.DataSourceStore()
+    c = store.create_connection(
+        {"name": "s", "db_type": "sqlite",
+         "url_override": f"sqlite+pysqlite:///{db}"}, "pw", actor="ladmin")
+    t = store.upsert_table({
+        "connection_id": c["id"], "schema": "", "table_name": "t",
+        "display_name": "nulls", "description": "d",
+        "columns": [{"name": "code", "dtype": "INTEGER", "description": ""},
+                    {"name": "b", "dtype": "TEXT", "description": ""}],
+    }, actor="ladmin")
+    res = db_scheduler.refresh_one_table(t["id"], actor="test")
+    assert res["ok"] is True and res["rows"] == 6
+    schema = pq.read_schema(local_store.db_snapshot_path(t["id"]))
+    assert schema.field("code").type == pa.int64()
+    assert schema.field("b").type == pa.string()
+
+
+def test_failed_cast_prunes_plan_and_next_refresh_self_heals(tmp_path, monkeypatch):
+    """A stored downcast a chunk outgrows fails THAT refresh loudly (previous
+    snapshot kept), but the pruned plan is persisted on the failure path —
+    the next run succeeds at the canonical width instead of failing nightly
+    forever."""
+    from sqlalchemy import create_engine, text
+    monkeypatch.setattr(settings, "DB_SNAPSHOT_CHUNK_ROWS", 2)
+    db, store, tid = _sqlite_setup(tmp_path)
+    assert db_scheduler.refresh_one_table(tid, actor="test")["ok"] is True
+    snap = local_store.db_snapshot_path(tid)
+    mtime = snap.stat().st_mtime_ns
+    # A legacy value-derived plan pinned int8; new data outgrows it in a
+    # later chunk.
+    doc = store.get_table(tid)
+    doc["dtype_plan"] = {"a": "int8"}
+    store.upsert_table(doc, actor="ladmin")
+    eng = create_engine(f"sqlite+pysqlite:///{db}")
+    with eng.begin() as conn:
+        conn.execute(text("INSERT INTO t VALUES (300, 'big')"))
+    eng.dispose()
+    res = db_scheduler.refresh_one_table(tid, actor="test")
+    assert res["ok"] is False
+    assert "'a'" in (res["error"] or "")
+    assert snap.stat().st_mtime_ns == mtime            # previous snapshot kept
+    assert "a" not in (store.get_table(tid).get("dtype_plan") or {})
+    res2 = db_scheduler.refresh_one_table(tid, actor="test")
+    assert res2["ok"] is True and res2["rows"] == 4    # self-healed
+
+
 def test_dtype_change_detected_and_meta_resynced(tmp_path):
     from sqlalchemy import create_engine, text
     db, store, tid = _sqlite_setup(tmp_path)

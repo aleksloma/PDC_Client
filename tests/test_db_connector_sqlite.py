@@ -129,18 +129,21 @@ def test_snapshot_table_chunked_writes_parquet(sqlite_cfg, tmp_path):
 
 
 def test_snapshot_dtype_plan_stable_across_chunks(sqlite_cfg, tmp_path):
-    """Chunk 1 pins the plan; later chunks reuse it → one consistent Arrow
-    schema (the naive per-chunk astype would raise on write_table)."""
+    """One canonical Arrow schema per snapshot (the naive per-chunk inference
+    used to raise on write_table). New plans record CATEGORY markers only —
+    value-derived numeric downcasts made the schema depend on chunk size /
+    NULL distribution, and the schema must be a function of the table
+    definition alone. A STORED legacy numeric entry is still honored."""
     dest = tmp_path / "snap.parquet"
     res = db_connector.snapshot_table(sqlite_cfg, "", schema=None, table="orders",
                                       dest=dest, sid="t", chunk_rows=2)
     assert res["ok"] is True
     plan = res["dtype_plan"]
     # Low-cardinality string column recorded as category (metadata only —
-    # never baked into the file, never applied by the loader);
-    # numerics downcast (writer-side).
+    # never baked into the file, never applied by the loader); numerics stay
+    # at their canonical width — no value-derived entries.
     assert plan.get("segment") == "category"
-    assert plan.get("order_id", "").startswith("int")
+    assert "order_id" not in plan
     df = pd.read_parquet(dest)
     assert str(df["segment"].dtype) != "category"  # not baked into the file
     # A refresh reusing the stored plan stays stable.
@@ -148,6 +151,15 @@ def test_snapshot_dtype_plan_stable_across_chunks(sqlite_cfg, tmp_path):
                                        dest=dest, sid="t", chunk_rows=2,
                                        dtype_plan=plan)
     assert res2["ok"] is True and res2["dtype_plan"] == plan
+    # A legacy stored plan with a same-family numeric downcast is applied to
+    # the file and carried through unchanged (upgrade compatibility).
+    legacy = dict(plan, order_id="int16")
+    res3 = db_connector.snapshot_table(sqlite_cfg, "", schema=None, table="orders",
+                                       dest=dest, sid="t", chunk_rows=2,
+                                       dtype_plan=legacy)
+    assert res3["ok"] is True and res3["dtype_plan"] == legacy
+    import pyarrow.parquet as _pq
+    assert str(_pq.read_schema(dest).field("order_id").type) == "int16"
 
 
 def test_snapshot_row_cap_and_where(sqlite_cfg, tmp_path):
@@ -211,6 +223,176 @@ def test_every_text_literal_is_select_or_set():
         assert m.group(1) in ("SELECT",)
     for m in re.finditer(r'text\(f?"([A-Za-z]+)[ _]', src):
         assert m.group(1).upper() in ("SELECT", "SET"), m.group(0)
+
+
+# ---------------------------------------------------------------------------
+# Canonical snapshot schema — the production "Table schema does not match
+# schema used to create file" bug. ONE Arrow schema per snapshot; every chunk
+# converts against it, so per-chunk pandas re-inference (all-NULL leads,
+# int→float on NULLs, timestamp resolution flips) can no longer mismatch.
+# ---------------------------------------------------------------------------
+
+import pyarrow as pa  # noqa: E402
+import pyarrow.parquet as pq  # noqa: E402
+
+
+def _fake_read_sql(chunks):
+    """Stand-in stream for shapes sqlite cannot produce (mixed timestamp
+    resolutions, driver Decimals) — the real loop/writer/canonical code runs
+    on production-shaped frames."""
+    def fake(stmt, conn, chunksize=None):
+        return iter([c.copy() for c in chunks])
+    return fake
+
+
+@pytest.fixture
+def nullable_cfg(tmp_path):
+    """Chunk 1 (chunk_rows=2) sees only NULLs in `code` and `note`; values
+    appear later — the exact shape that pinned the writer to the wrong
+    inferred schema."""
+    from sqlalchemy import create_engine, text
+    db = tmp_path / "n.db"
+    eng = create_engine(f"sqlite+pysqlite:///{db}")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE t (id INTEGER, code INTEGER, note TEXT)"))
+        for i in range(6):
+            code = "NULL" if i < 4 else str(100 + i)
+            conn.execute(text(f"INSERT INTO t VALUES ({i}, {code}, NULL)"))
+    eng.dispose()
+    return {"db_type": "sqlite", "url_override": f"sqlite+pysqlite:///{db}"}
+
+
+_NULLABLE_TYPES = {"id": {"py": "int"}, "code": {"py": "int"},
+                   "note": {"py": "str"}}
+
+
+def test_snapshot_all_null_leading_chunk_writes_the_introspected_types(
+        nullable_cfg, tmp_path):
+    """Pre-fix: chunk 1 inferred `code` as null/object, chunk 3's real ints
+    mismatched the writer schema and the snapshot died. The introspected
+    types now decide, NULL distribution never does."""
+    dest = tmp_path / "snap.parquet"
+    res = db_connector.snapshot_table(
+        nullable_cfg, "", schema=None, table="t",
+        column_types=_NULLABLE_TYPES, dest=dest, sid="t", chunk_rows=2)
+    assert res["ok"] is True and res["rows"] == 6
+    schema = pq.read_schema(dest)
+    assert schema.field("code").type == pa.int64()
+    assert schema.field("note").type == pa.string()
+    df = pd.read_parquet(dest)
+    assert df["code"].dropna().tolist() == [104.0, 105.0]
+    # Loader-facing dtypes stay standard (Article XIII).
+    from exec_sanitizer import _is_standard_dtype
+    assert all(_is_standard_dtype(t) for t in df.dtypes)
+
+
+def test_snapshot_schema_deterministic_across_chunk_sizes(nullable_cfg, tmp_path):
+    """Same table definition → identical parquet schema regardless of how the
+    stream happens to be chunked (refresh comparison / profile stability)."""
+    a, b = tmp_path / "a.parquet", tmp_path / "b.parquet"
+    for dest, rows in ((a, 2), (b, 50)):
+        res = db_connector.snapshot_table(
+            nullable_cfg, "", schema=None, table="t",
+            column_types=_NULLABLE_TYPES, dest=dest, sid="t", chunk_rows=rows)
+        assert res["ok"] is True
+    assert pq.read_schema(a).equals(pq.read_schema(b))
+
+
+def test_snapshot_mixed_timestamp_resolutions_unify_to_us(
+        sqlite_cfg, tmp_path, monkeypatch):
+    """The production error verbatim: brth_date timestamp[ns] vs timestamp[us]
+    across chunks. Canonical is us (year-9999 sentinel dates overflow ns);
+    sub-us digits are truncated with a log, never a failure."""
+    import numpy as np
+    c1 = pd.DataFrame({
+        # numpy construction — pd.to_datetime is ns-bound and year 9999
+        # overflows ns, which is exactly why the canonical unit is us.
+        "d": pd.Series(np.array(["2024-01-01", "9999-12-31"],
+                                dtype="datetime64[us]")),
+        "v": [1, 2]})
+    c2 = pd.DataFrame({
+        "d": pd.Series(pd.to_datetime(["2024-06-01 00:00:00.000000123"])).astype("datetime64[ns]"),
+        "v": [3]})
+    monkeypatch.setattr(db_connector.pd, "read_sql", _fake_read_sql([c1, c2]))
+    dest = tmp_path / "snap.parquet"
+    res = db_connector.snapshot_table(
+        sqlite_cfg, "", schema=None, table="orders",
+        column_types={"d": {"py": "datetime", "timezone": False},
+                      "v": {"py": "int"}},
+        dest=dest, sid="t", chunk_rows=2)
+    assert res["ok"] is True and res["rows"] == 3
+    assert pq.read_schema(dest).field("d").type == pa.timestamp("us")
+    df = pd.read_parquet(dest)
+    assert str(df["d"].dtype) == "datetime64[us]"
+    assert df["d"].iloc[1].year == 9999
+
+
+def test_snapshot_lossy_cast_fails_naming_the_column(sqlite_cfg, tmp_path,
+                                                     monkeypatch):
+    """A stored downcast a later chunk outgrows must FAIL the snapshot (never
+    write wrong values), name the column, keep the previous parquet, and
+    prune the plan so the next run self-heals at the canonical type."""
+    dest = tmp_path / "snap.parquet"
+    ok = db_connector.snapshot_table(sqlite_cfg, "", schema=None,
+                                     table="orders", dest=dest, sid="t")
+    assert ok["ok"] is True
+    before = dest.stat().st_mtime_ns
+
+    c1 = pd.DataFrame({"v": [1, 2]})
+    c2 = pd.DataFrame({"v": [300]})     # int8 overflow on chunk 2
+    monkeypatch.setattr(db_connector.pd, "read_sql", _fake_read_sql([c1, c2]))
+    res = db_connector.snapshot_table(
+        sqlite_cfg, "", schema=None, table="orders",
+        column_types={"v": {"py": "int"}}, dtype_plan={"v": "int8"},
+        dest=dest, sid="t", chunk_rows=2)
+    assert res["ok"] is False
+    assert "'v'" in (res["error"] or "")
+    assert dest.stat().st_mtime_ns == before          # previous snapshot kept
+    assert "v" not in (res["dtype_plan"] or {})       # plan pruned → self-heal
+
+
+def test_snapshot_zero_rows_writes_typed_columns(nullable_cfg, tmp_path):
+    """Empty snapshots used to carry arrow-null columns; the canonical schema
+    types them from introspection."""
+    dest = tmp_path / "snap.parquet"
+    res = db_connector.snapshot_table(
+        nullable_cfg, "", schema=None, table="t",
+        columns=["id", "code", "note"], column_types=_NULLABLE_TYPES,
+        where="id = 999", dest=dest, sid="t")
+    assert res["ok"] is True and res["rows"] == 0
+    schema = pq.read_schema(dest)
+    assert schema.field("code").type == pa.int64()
+    assert schema.field("note").type == pa.string()
+
+
+def test_snapshot_plan_records_no_value_derived_numerics(nullable_cfg, tmp_path):
+    """NULLs in chunk 1 turned an int column into float64 and recorded a FLOAT
+    downcast pre-fix; new plans record category markers only, so the file
+    stays at the canonical integer width whatever chunk 1 held."""
+    dest = tmp_path / "snap.parquet"
+    res = db_connector.snapshot_table(
+        nullable_cfg, "", schema=None, table="t",
+        column_types=_NULLABLE_TYPES, dest=dest, sid="t", chunk_rows=2)
+    assert res["ok"] is True
+    plan = res["dtype_plan"] or {}
+    assert all(v == "category" for v in plan.values())
+    assert pq.read_schema(dest).field("id").type == pa.int64()
+
+
+def test_snapshot_without_type_info_still_unifies_chunk_inference(
+        sqlite_cfg, tmp_path, monkeypatch):
+    """Legacy callers pass no column_types: the chunk-1 fallback still
+    normalizes the writer schema (timestamps → us), so mixed resolutions no
+    longer kill the write."""
+    c1 = pd.DataFrame({"d": pd.Series(pd.to_datetime(["2024-01-01"])).astype("datetime64[ns]")})
+    c2 = pd.DataFrame({"d": pd.Series(pd.to_datetime(["2024-02-01"])).astype("datetime64[us]")})
+    monkeypatch.setattr(db_connector.pd, "read_sql", _fake_read_sql([c1, c2]))
+    dest = tmp_path / "snap.parquet"
+    res = db_connector.snapshot_table(sqlite_cfg, "", schema=None,
+                                      table="orders", dest=dest, sid="t",
+                                      chunk_rows=1)
+    assert res["ok"] is True and res["rows"] == 2
+    assert pq.read_schema(dest).field("d").type == pa.timestamp("us")
 
 
 # ---------------------------------------------------------------------------

@@ -107,11 +107,17 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler",
     label = f"{row.get('schema') or ''}.{row.get('table_name') or ''}".strip(".")
     old_cols = [c.get("name") for c in (row.get("columns") or []) if c.get("name")]
 
+    # Rebuild the persisted identifiers with their case-sensitivity flags —
+    # a physically case-sensitive (created-quoted) name compiles quoted only
+    # when the stored quote flag rides along (ORA-00904 otherwise).
+    sch = db_connector.qname(row.get("schema") or None, row.get("schema_quote"))
+    tbl = db_connector.qname(row.get("table_name"), row.get("table_quote"))
+
     # Change detection (Part C): fingerprint first — also the source of live
     # dtypes for retype detection on the full path.
     fp = db_connector.fingerprint_table(
         conn, password or "",
-        row.get("schema") or None, row.get("table_name"),
+        sch, tbl,
         where=row.get("where_filter") or None,
         row_cap=row.get("row_cap") or None,
         preferred_order=old_cols,
@@ -134,14 +140,30 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler",
     # source: the fingerprint's list when it succeeded (already fetched), else
     # a fresh introspect. Never the STORED list — that would freeze the column
     # set and hide real drift.
-    snap_cols = ([c.get("name") for c in (fp.get("columns") or []) if c.get("name")]
-                 if fp.get("ok") else None)
-    if not snap_cols:
+    live_src = (fp.get("columns") or []) if fp.get("ok") else None
+    resolved_quotes = None
+    if not live_src:
         intro = db_connector.introspect(
-            conn, password or "", row.get("schema") or None,
-            row.get("table_name"), sid=f"refresh:{actor}")
-        snap_cols = ([c.get("name") for c in (intro.get("columns") or []) if c.get("name")]
-                     if intro.get("ok") else None)
+            conn, password or "", sch, tbl, sid=f"refresh:{actor}")
+        if intro.get("ok"):
+            live_src = intro.get("columns") or []
+            # Prefer the RESOLVED identifiers for this run's statements, and
+            # remember their flags for mark_refreshed — persisting them is
+            # what heals a legacy case-sensitive schema/table name for good
+            # (a healed name also un-breaks the fingerprint, so the smart-
+            # refresh skip starts working again from the next run).
+            sch = intro.get("schema")
+            tbl = intro.get("table") or tbl
+            resolved_quotes = {
+                "schema_quote": bool(intro.get("schema_quote")),
+                "table_quote": bool(intro.get("table_quote"))}
+    # `col_ident` rebuilds each column's quote flag for the snapshot SELECT;
+    # `column_types` feeds the snapshot's canonical Arrow schema from the
+    # same live introspection.
+    snap_cols = ([db_connector.col_ident(c) for c in live_src if c.get("name")]
+                 if live_src else None)
+    column_types = ({str(c.get("name")): c.get("type_info")
+                     for c in live_src if c.get("name")} if live_src else None)
     if not snap_cols:
         # Both probes failed: the Inspector is unreachable, so the snapshot's
         # own SELECT would almost certainly fail too — and an unnamed one could
@@ -155,15 +177,20 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler",
     dest = local_store.db_snapshot_path(table_id)
     res = db_connector.snapshot_table(
         conn, password or "",
-        schema=row.get("schema") or None,
-        table=row.get("table_name"),
+        schema=sch,
+        table=tbl,
         columns=snap_cols,
         where=row.get("where_filter") or None,
         row_cap=row.get("row_cap") or None,
         dtype_plan=row.get("dtype_plan") or None,
+        column_types=column_types,
         dest=dest, sid=f"refresh:{actor}")
     if not res.get("ok"):
-        store.mark_refreshed(table_id, error=res.get("error") or "snapshot failed")
+        # Persist the (possibly pruned) plan even on failure — a downcast a
+        # chunk outgrew is dropped there, so the NEXT run succeeds at the
+        # wider canonical type instead of failing every night.
+        store.mark_refreshed(table_id, dtype_plan=res.get("dtype_plan"),
+                             error=res.get("error") or "snapshot failed")
         return {"ok": False, "error": res.get("error") or "snapshot failed"}
 
     fresh_cols = res.get("columns") or []
@@ -174,8 +201,11 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler",
     # indexed flags for surviving columns; append new ones bare. Dtypes are
     # REFRESHED from the fingerprint call's live introspection (they used to
     # be frozen at registration) — a changed type is recorded as drift.
-    live_dtypes = ({str(c.get("name")): c.get("dtype")
-                    for c in (fp.get("columns") or [])} if fp.get("ok") else {})
+    live_dtypes = {str(c.get("name")): c.get("dtype") for c in (live_src or [])}
+    # Quote flags re-emitted from the SAME live introspection — mark_refreshed
+    # replaces the columns list wholesale, so a flag not re-emitted here would
+    # silently drop on every nightly run and re-break the quoted SELECT.
+    live_quote = {str(c.get("name")): bool(c.get("quote")) for c in (live_src or [])}
     old_by_name = {c.get("name"): c for c in (row.get("columns") or []) if c.get("name")}
     new_columns = []
     retyped = []
@@ -189,10 +219,14 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler",
                 retyped.append({"col": name, "from": old_dtype, "to": live})
             if live:
                 col["dtype"] = live
-            new_columns.append(col)
         else:
-            new_columns.append({"name": name, "dtype": live or "",
-                                "description": "", "indexed": False})
+            col = {"name": name, "dtype": live or "",
+                   "description": "", "indexed": False}
+        if live_quote.get(str(name)):
+            col["quote"] = True
+        elif str(name) in live_quote:
+            col.pop("quote", None)
+        new_columns.append(col)
     # Technical descriptions + dataset profile from the fresh snapshot (one
     # parquet read, pandas stats, no LLM). Best-effort; tech descs flow into
     # chat metas via the resync below, the profile is a sidecar next to the
@@ -206,7 +240,8 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler",
                          snapshot_bytes=res.get("bytes"),
                          columns=new_columns,
                          dtype_plan=res.get("dtype_plan"),
-                         fingerprint=new_fp)
+                         fingerprint=new_fp,
+                         ident_quotes=resolved_quotes)
     if prof is not None:
         try:
             st = dest.stat()
