@@ -593,6 +593,18 @@ back keyed by the INTROSPECTED names. Both matter on Oracle, whose Inspector
 normalizes case-folded identifiers to lowercase while the server stores them
 uppercase — hand-quoted names raised ORA-00942, and driver-cased result
 columns would have made every refresh read as full schema drift.
+PHYSICALLY case-sensitive names (created quoted, e.g. by a pandas `to_sql`
+pipeline) are the mirror image: the Inspector marks them
+`quoted_name(quote=True)`, and that flag is the ONLY bit distinguishing them
+from an ordinary fold-case name — the plain string is ambiguous, and losing
+the flag at a JSON hop compiled them unquoted (ORA-00904). The flag is
+therefore PERSISTED from introspection (per-column `quote: true` +
+`schema_quote`/`table_quote` on the registry doc, emitted only when true;
+derived server-side at save from a fresh introspection, never from browser
+payloads) and REBUILT at every query-construction point
+(`db_connector.qname`/`col_ident`); the dialect decides at compile time what
+it means — no per-dialect branches, never inferred. Legacy docs without the
+flag repair themselves on the next refresh, which re-introspects live.
 ClickHouse databases appear as schemas in the browser, and ClickHouse carries
 no FK metadata, so FK-based relation discovery yields nothing for its tables
 (name / description / pasted-SQL candidates still work). Spec: `docs/DB_TABLES_PLAN.md`.
@@ -624,9 +636,19 @@ introspect (Inspector + catalog-estimate row count/size; never `COUNT(*)` on
 a customer table) → preview → AI-draft English descriptions → **mandatory
 ladmin review/confirm** (server-enforced: `confirm:true`, session-stamped
 confirmation, re-introspection drift check; the draft endpoint has no write
-path) → save + chunked snapshot (per-query statement timeout, dtype
-optimization, atomic replace). Row count/size are stored as metadata only —
-**nothing routes on them** (no size thresholds in Phase 1).
+path) → save + chunked snapshot (per-query statement timeout, atomic
+replace). The chunked snapshot writes against **ONE canonical Arrow schema**
+derived from the introspected column types (chunk-1 inference only for
+exotic types, normalized), and every chunk is converted against it — pandas
+re-infers dtypes per chunk, so pinning the writer to chunk-1 inference made
+an all-NULL leading column, an int growing NULLs, or a timestamp resolution
+flip (`timestamp[ns]` vs `[us]`) kill a later `write_table`. Timestamps are
+canonically `us` (year-9999 sentinel dates overflow ns; sub-µs values are
+truncated with a log). A genuinely lossy cast (overflow/incompatible values)
+fails the snapshot naming the column — previous snapshot kept — and prunes
+the stale downcast from the stored plan so the next run self-heals. Row
+count/size are stored as metadata only — **nothing routes on them** (no size
+thresholds in Phase 1).
 
 **Connector tables** (`is_connector` — dictionaries/link tables) are hidden
 from the user picker and auto-included transitively through the relations

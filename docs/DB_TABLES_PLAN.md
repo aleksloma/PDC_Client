@@ -63,7 +63,16 @@ retry loop, and brain protocol need no changes in Phase 1.
    dialect decides. Hand-quoting them broke Oracle: SQLAlchemy normalizes
    Oracle's case-folded names to lowercase leaving the Inspector, and
    `"bsrep"."offering_all"` is a different object than BSREP.OFFERING_ALL
-   (ORA-00942). Later candidates: IBM DB2, SAP HANA, Snowflake, SQLite.
+   (ORA-00942). The mirror bug (ORA-00904): a PHYSICALLY case-sensitive
+   (created-quoted) name comes out of the Inspector as
+   `quoted_name(quote=True)`, and the flag — the only bit distinguishing it
+   from a fold-case name, since the plain string is ambiguous — silently died
+   at every `str()`/JSON hop, so the rebuilt name compiled unquoted. The flag
+   is now persisted from introspection (per-column `quote: true` +
+   `schema_quote`/`table_quote` on the table doc, present only when true) and
+   rebuilt via `db_connector.qname`/`col_ident` wherever statements are
+   constructed; legacy docs repair on the next refresh's live introspection.
+   Later candidates: IBM DB2, SAP HANA, Snowflake, SQLite.
 
    ClickHouse specifics worth knowing: its **databases are exposed as schemas**,
    so the schema browser lists them like any other dialect; and it has **no
@@ -126,10 +135,23 @@ action.
    (related table + join keys), per-column indexed flag (pre-filled from
    introspection, overridable). Row count + size auto-captured and shown.
 5. On save, snapshot the table to parquet (chunked `pd.read_sql`, statement
-   timeout, dtype optimization: downcast numerics on write; low-cardinality
-   string columns are recorded in the plan as `category` but served as plain
-   `object` — categorical frames break generated `groupby` code, which
-   defaults to `observed=False` on pandas < 3.0).
+   timeout, atomic replace) against **ONE canonical Arrow schema per
+   snapshot**, derived from the introspected column types (normalized chunk-1
+   inference only for unmappable exotics) with every chunk converted against
+   it. Pandas re-infers dtypes per chunk, so pinning the writer to chunk-1
+   inference broke large tables: an all-NULL leading column, an int growing
+   NULLs, or a `timestamp[ns]`-vs-`[us]` resolution flip made a later
+   `write_table` raise "Table schema does not match schema used to create
+   file". The canonical timestamp unit is `us` (year-9999 sentinel dates
+   overflow ns; sub-µs values are truncated with a log); a genuinely lossy
+   cast fails the snapshot naming the column — previous snapshot kept — and
+   prunes the stale entry from the stored `dtype_plan` so the next run
+   self-heals. New plans record only `category` markers for low-cardinality
+   string columns (value-derived numeric downcasts made the schema depend on
+   chunk size / NULL distribution; stored legacy numeric entries are still
+   honored). Category columns are served as plain `object` — categorical
+   frames break generated `groupby` code, which defaults to
+   `observed=False` on pandas < 3.0.
 
 ## Connector tables and relations
 
