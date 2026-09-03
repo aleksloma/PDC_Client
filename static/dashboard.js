@@ -51,68 +51,6 @@ function _t(key, fallback) {
   return fallback;
 }
 
-// Files larger than this go through the signed-URL flow (browser → GCS direct),
-// bypassing Cloud Run's 32 MiB request-body limit. Smaller files keep using the
-// legacy POST /upload path unchanged.
-const LARGE_UPLOAD_THRESHOLD_BYTES = 25 * 1024 * 1024;
-
-// Stream one file through the three-step direct-to-GCS flow.
-// Returns the parsed /upload/finalize JSON on success; throws on any failure.
-async function _directUploadFile(file, description) {
-  // 1. /upload/init — get a signed PUT URL
-  const initRes = await fetch('/upload/init', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      filename: file.name,
-      content_type: file.type || 'application/octet-stream',
-      size_bytes: file.size,
-    }),
-  });
-  let initData = null;
-  try { initData = await initRes.json(); } catch (e) { initData = null; }
-  if (!initRes.ok || !initData || !initData.signed_url || !initData.gcs_path) {
-    const msg = (initData && (initData.error || initData.detail)) || `Upload init failed (${initRes.status})`;
-    throw new Error(msg);
-  }
-
-  // 2. PUT the bytes straight to GCS via XHR (so upload.onprogress works)
-  await new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('PUT', initData.signed_url, true);
-    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
-    xhr.upload.onprogress = (evt) => {
-      if (!evt.lengthComputable) return;
-      const pct = Math.round((evt.loaded / evt.total) * 100);
-      const statusEl = document.getElementById('frictionlessStatus');
-      if (statusEl) statusEl.textContent = `Uploading ${file.name}: ${pct}%`;
-    };
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) resolve();
-      else reject(new Error(`Upload PUT failed (${xhr.status})`));
-    };
-    xhr.onerror = () => reject(new Error('Upload PUT network error'));
-    xhr.onabort = () => reject(new Error('Upload PUT aborted'));
-    xhr.send(file);
-  });
-
-  // 3. /upload/finalize — pull the GCS object into the user's store and run Steps 2-5
-  const finalizeBody = { gcs_path: initData.gcs_path };
-  if (description) finalizeBody.file_descriptions = { [file.name]: description };
-  const finRes = await fetch('/upload/finalize', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(finalizeBody),
-  });
-  let finData = null;
-  try { finData = await finRes.json(); } catch (e) { finData = null; }
-  if (!finRes.ok || !finData || finData.error) {
-    const msg = (finData && (finData.error || finData.detail)) || `Upload finalize failed (${finRes.status})`;
-    throw new Error(msg);
-  }
-  return finData;
-}
-
 // Frictionless flow progress overlay (separate from generic loadingOverlay so it can stay
 // up across upload → autofill → generate steps without flicker)
 function _showFrictionlessOverlay(statusKey) {
@@ -4055,43 +3993,30 @@ async function runFrictionlessFlow(files, opts) {
         try { await fetch('/new_session', { method: 'POST' }); } catch (e) { /* non-fatal */ }
       }
 
-      const hasLargeFile = filesArr.some(f => f.size > LARGE_UPLOAD_THRESHOLD_BYTES);
-      if (hasLargeFile) {
-        // Direct-to-GCS path: /new_session above already reset the session, so
-        // we just init→PUT→finalize sequentially for each file.
-        try {
-          for (const f of filesArr) {
-            await _directUploadFile(f, null);
-          }
-        } catch (err) {
-          _hideFrictionlessOverlay();
-          showToast((err && err.message) || 'Upload failed', true);
-          return;
-        }
-      } else {
-        const formData = new FormData();
-        // Third argument overrides the multipart filename — this is how a
-        // collision-renamed file (_pdcUploadName) flows through the WHOLE
-        // pipeline (/upload → autofill → add/generate) under its new name.
-        filesArr.forEach(f => formData.append('files', f, _uploadNameOf(f)));
-        // No `file_descriptions` field — backend now accepts upload without descriptions and the
-        // /schema_autofill_full step generates them.
+      // Every file, regardless of size, goes through the multipart /upload path —
+      // the on-prem build has no signed-URL (direct-to-GCS) branch.
+      const formData = new FormData();
+      // Third argument overrides the multipart filename — this is how a
+      // collision-renamed file (_pdcUploadName) flows through the WHOLE
+      // pipeline (/upload → autofill → add/generate) under its new name.
+      filesArr.forEach(f => formData.append('files', f, _uploadNameOf(f)));
+      // No `file_descriptions` field — backend now accepts upload without descriptions and the
+      // /schema_autofill_full step generates them.
 
-        const upRes = await fetch('/upload', { method: 'POST', body: formData });
-        let upData = {};
-        try { upData = await upRes.json(); } catch (e) { upData = {}; }
-        if (!upRes.ok || upData.error) {
-          const msg = upData.error || `Upload failed (${upRes.status})`;
-          _hideFrictionlessOverlay();
-          showToast(msg, true);
-          return;
-        }
-        // Per-file parse warnings (e.g. "N malformed row(s) skipped") — the
-        // upload succeeded but the user must know some rows were dropped.
-        (upData.files || []).filter(f => f && f.status === 'warning').forEach(f => {
-          showToast(`${f.file}: ${f.message || 'some rows were skipped'}`, 'warn');
-        });
+      const upRes = await fetch('/upload', { method: 'POST', body: formData });
+      let upData = {};
+      try { upData = await upRes.json(); } catch (e) { upData = {}; }
+      if (!upRes.ok || upData.error) {
+        const msg = upData.error || `Upload failed (${upRes.status})`;
+        _hideFrictionlessOverlay();
+        showToast(msg, true);
+        return;
       }
+      // Per-file parse warnings (e.g. "N malformed row(s) skipped") — the
+      // upload succeeded but the user must know some rows were dropped.
+      (upData.files || []).filter(f => f && f.status === 'warning').forEach(f => {
+        showToast(`${f.file}: ${f.message || 'some rows were skipped'}`, 'warn');
+      });
     }
 
     // Step 1b: record the database-table selection (AFTER /upload — its

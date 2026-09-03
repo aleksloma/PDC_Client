@@ -82,12 +82,15 @@ guide: [`docs/SSO_MICROSOFT.md`](SSO_MICROSOFT.md).
 ## Upload flow
 
 The dashboard's "frictionless drop" runs these four endpoints in order. The
-enterprise build keeps the same shape so the existing JS works unchanged:
+enterprise build keeps the same shape; the only frontend change is that the
+B2C large-file (direct-to-GCS) branch is gone, so step 2 handles every size:
 
 1. **`POST /new_session`** — resets the per-session temp `UserStore`.
    Returns `{ok: true}`. Issues a fresh SID into the session cookie.
 
-2. **`POST /upload`** (multipart, field `files`) — saves uploads to the
+2. **`POST /upload`** (multipart, field `files`; EVERY file regardless of
+   size — the frontend has no client-side size threshold and the server sets
+   no request-body limit) — saves uploads to the
    per-session temp area (under `<DATA_ROOT>/sessions/<sid>/files/`).
    Returns `{ok, saved, dataframes, files}` — the B2C keys unchanged, plus an
    additive per-file result list: `files: [{file, status: "ok"|"warning"|
@@ -157,7 +160,9 @@ enterprise build keeps the same shape so the existing JS works unchanged:
    `{ok, chat_id, name, welcome_message, suggested_questions}`.
 
 Direct-to-GCS paths (`/upload/init`, `/upload/finalize`, `/upload_from_url`)
-return `400` — the on-prem build uses the standard path for all sizes.
+return `400` — the on-prem frontend sends every file through `POST /upload`
+regardless of size: the B2C 25 MB signed-URL branch was removed from
+`static/dashboard.js` and `static/config.js`, so nothing calls `/upload/init`.
 
 ### Add Data to an existing chat
 
@@ -850,7 +855,7 @@ gracefully handles them:
 | Endpoint | Returns | Reason |
 |---|---|---|
 | `POST /api/chat/{id}/publish`, `/unpublish` | 400 | no public pages on-prem (architecture: sharing is OPEN, public publish is out of scope) |
-| `POST /upload/init`, `/upload/finalize` | 400 | direct-to-GCS path only |
+| `POST /upload/init`, `/upload/finalize` | 400 | the frontend never calls these any more — every file size goes through multipart `/upload`; the stubs stay only so a stale cached B2C page gets a clean 400 instead of a 404 |
 | `POST /upload_from_url` | 400 | Google Drive/Sheets are off-prem |
 | `GET /paddle/config` | 200 `{enabled:false, client_token:null}` | page-load Paddle bootstrap becomes a no-op (no 404 / console error) |
 | `POST /auth/subscription` | 400 | enterprise plan is constant |

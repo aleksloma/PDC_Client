@@ -43,6 +43,10 @@ touches this service, and vice versa.
   CPU the deck job stalls after the response is sent.
 - `--memory=4Gi --cpu=2` — pandas/plotly/kaleido (headless Chromium) plus the
   ~500 MB df cache (`DF_CACHE_MAX_MB`).
+- Upload size: the container itself sets no request-body limit (every file
+  goes through multipart `POST /upload`), but Cloud Run's ingress caps HTTP/1
+  request bodies at 32 MiB — a larger demo dataset fails with a Cloud Run 413
+  before reaching the app. Customer LAN installs have no such cap.
 - `--timeout=900` — long analyses (60 s exec windows + brain round-trips up to
   `BRAIN_REQUEST_TIMEOUT=180 s` each).
 - `--min-instances=0` — near-zero idle cost; first hit after idle cold-starts
