@@ -30,6 +30,7 @@ from settings import settings
 from logger_utils import log_with_sid
 from local_store import AuthStore
 import sso_store
+import gcs_upload
 
 from routes.auth import router as auth_router
 from routes.upload import router as upload_router
@@ -311,6 +312,10 @@ async def lab(request: Request):
             # it feeds the B2C Publish menu (400 by design on-prem). The
             # admin-capability flag is is_admin_user in _profile_context.
             "is_admin": False,
+            # Direct-to-GCS large-file branch in dashboard.js runs ONLY when
+            # GCS_UPLOAD_BUCKET is set (Cloud Run demo); false on every
+            # customer install => multipart /upload for all sizes.
+            "direct_upload_enabled": gcs_upload.enabled(),
             "username": email,
             "subscription_plan": "Enterprise",
             **prof,
@@ -359,6 +364,10 @@ async def open_conversation_deeplink(request: Request, conv_id: str):
             "default_days": settings.CHAT_ACTIVE_DEFAULT_DAYS,
             "max_days": settings.CHAT_ACTIVE_MAX_DAYS,
             "is_admin": False,
+            # Direct-to-GCS large-file branch in dashboard.js runs ONLY when
+            # GCS_UPLOAD_BUCKET is set (Cloud Run demo); false on every
+            # customer install => multipart /upload for all sizes.
+            "direct_upload_enabled": gcs_upload.enabled(),
             "username": email,
             "subscription_plan": "Enterprise",
             "open_conv_id": conv_id,

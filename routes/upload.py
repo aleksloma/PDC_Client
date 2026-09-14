@@ -15,13 +15,18 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+import unicodedata
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
 
 import brain_client
 import dataset_profile
+import gcs_upload
 import local_store
 from brain_client import BrainError, TenantRevokedError
 from local_store import (AuthStore, UserStore, ChatDataStore,
@@ -42,6 +47,22 @@ router = APIRouter(tags=["upload"])
 def _require_session(request: Request) -> tuple[Optional[str], Optional[str]]:
     """Return (email, sid). Either may be None on auth failure."""
     return request.session.get("email"), request.session.get("sid")
+
+
+def _session_or_issue(request: Request) -> tuple[Optional[str], Optional[str]]:
+    """(email, sid) for the upload endpoints; email None => caller answers 401.
+
+    A logged-in session without a sid gets one issued here (defensive — login
+    should have done this). Shared by /upload, /upload/init, /upload/finalize
+    so the direct path self-heals exactly like the multipart one.
+    """
+    email, sid = _require_session(request)
+    if not email:
+        return None, None
+    if not sid:
+        sid = "s_" + secrets.token_hex(8)
+        request.session["sid"] = sid
+    return email, sid
 
 
 # ---------------------------------------------------------------------------
@@ -70,13 +91,9 @@ async def new_session(request: Request):
 # ---------------------------------------------------------------------------
 @router.post("/upload")
 async def upload(request: Request, files: List[UploadFile] = File(...), file_descriptions: str = Form("")):
-    email, sid = _require_session(request)
+    email, sid = _session_or_issue(request)
     if not email:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
-    if not sid:
-        # Auto-issue if missing (defensive — login should have done this)
-        sid = "s_" + secrets.token_hex(8)
-        request.session["sid"] = sid
 
     if not files:
         return JSONResponse({"error": "No files"}, status_code=400)
@@ -116,6 +133,22 @@ async def upload(request: Request, files: List[UploadFile] = File(...), file_des
         log_with_sid(email, "error", f"UPLOAD_ERROR: {e}")
         return JSONResponse({"error": f"Upload failed: {e}"}, status_code=500)
 
+    payload, status = await _finish_upload(store, email, sid, saved, descriptions,
+                                           preserved_db, preserved_db_ids)
+    return JSONResponse(payload, status_code=status) if status != 200 else payload
+
+
+async def _finish_upload(store: UserStore, email: str, sid: str, saved: list[str],
+                         descriptions: dict, preserved_db=None, preserved_db_ids=None) -> tuple[dict, int]:
+    """Everything /upload does AFTER the bytes are on disk — shared with
+    /upload/finalize so the direct-to-GCS path runs the identical pipeline.
+
+    Returns (payload, http_status): 200 on success or partial failure (ok:false
+    with the error message), 400 when every saved file failed. ``preserved_db``
+    / ``preserved_db_ids`` are the database-table entries /upload captured
+    before its reset; None (finalize — no reset happened) leaves the meta's
+    DB entries and ``db_table_ids`` untouched.
+    """
     # Try loading them to detect parse failures and to populate the dataframe-key
     # list — off the event loop, the detection pipeline blocks it otherwise.
     # The report variant returns per-file parse warnings/errors so a saved file
@@ -234,8 +267,8 @@ async def upload(request: Request, files: List[UploadFile] = File(...), file_des
         }
         # every file failed → hard 400; partial failure → 200 with ok:false so
         # the frontend's existing error branch aborts the dialog with the message
-        return JSONResponse(payload, status_code=400) if len(failed) == len(saved) else payload
-    return {"ok": True, "saved": saved, "dataframes": df_names, "files": file_results}
+        return payload, (400 if len(failed) == len(saved) else 200)
+    return {"ok": True, "saved": saved, "dataframes": df_names, "files": file_results}, 200
 
 
 # ---------------------------------------------------------------------------
@@ -1102,19 +1135,226 @@ def _name_from_files(filenames: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Disabled-in-enterprise upload paths
+# Direct-to-GCS upload (OPTIONAL — only with GCS_UPLOAD_BUCKET set)
 # ---------------------------------------------------------------------------
+# Port of the B2C large-file flow: init (V4 signed PUT URL) → browser PUTs the
+# bytes to the bucket → finalize pulls the object into the session store, runs
+# the SAME post-save pipeline as /upload and deletes the object. Exists for the
+# ONE PowerDataChat-hosted Cloud Run demo, whose ingress caps HTTP/1 bodies at
+# 32 MiB. With the bucket unset (every customer install) both endpoints keep
+# answering the historical 400 and the frontend never calls them.
+
+_DIRECT_UPLOAD_MAX_BYTES = 500 * 1024 * 1024  # hard ceiling regardless of plan (B2C)
+_DIRECT_UPLOAD_EXTS = (".xlsx", ".xls", ".csv", ".tsv")  # the frontend's ALLOWED list
+_DIRECT_UPLOAD_EXPIRY_MIN = 15
+_DIRECT_UPLOAD_DISABLED_MSG = ("Direct-to-GCS upload is not available in the on-prem build. "
+                               "The standard /upload path is used for all sizes.")
+
+
+class _UploadInitRequest(BaseModel):
+    filename: str
+    content_type: str = "application/octet-stream"
+    size_bytes: int
+
+
+class _UploadFinalizeRequest(BaseModel):
+    gcs_path: str
+    file_descriptions: Optional[dict] = None
+
+
+def _safe_upload_filename(name: str) -> str:
+    """Basename only, control chars stripped, NFC — Unicode names KEPT.
+
+    Deliberate deviation from B2C's ASCII regex: it would turn every Georgian
+    filename into ``______.xlsx`` and make two such files collide. The
+    multipart /upload stores the browser's name as-is, so the direct path
+    keeps the same names. Rejects empty / dot-leading / ``..`` / >200 chars.
+    """
+    raw = (name or "").replace("\\", "/")
+    base = raw.rsplit("/", 1)[-1].strip()
+    base = "".join(ch for ch in base if ch >= " " and ch != "\x7f")
+    base = unicodedata.normalize("NFC", base)
+    if not base or base.startswith(".") or ".." in base or len(base) > 200:
+        return ""
+    return base
+
+
+def _has_direct_upload_ext(name: str) -> bool:
+    return name.lower().endswith(_DIRECT_UPLOAD_EXTS)
+
+
+def _session_upload_bases(store: UserStore) -> set[str]:
+    """Distinct uploaded SOURCE files already in the session meta (sheet keys
+    collapse to their workbook; database entries excluded) — the MAX_FILES
+    counter for a per-file finalize batch."""
+    meta = store.read_meta()
+    out: set[str] = set()
+    for entry in meta.get("files", []) or []:
+        if not isinstance(entry, dict) or entry.get("source") == "database":
+            continue
+        fn = str(entry.get("file_name") or "")
+        if fn:
+            out.add(fn.split("::")[0])
+    return out
+
+
+async def _json_body(request: Request, model, email: str):
+    """Parse + validate the JSON body by hand so a DISABLED call still answers
+    the historical 400 whatever the body looks like (a stale cached page).
+    None => the caller answers 400 "Invalid request."."""
+    try:
+        data = await request.json()
+    except Exception as e:
+        log_with_sid(email, "warning", f"UPLOAD_BODY_INVALID: {type(e).__name__}", model=model.__name__)
+        return None
+    try:
+        return model.model_validate(data)
+    except ValidationError as e:
+        log_with_sid(email, "warning", f"UPLOAD_BODY_INVALID: {e.error_count()} field error(s)", model=model.__name__)
+        return None
+
+
 @router.post("/upload/init")
-async def upload_init_disabled(request: Request):
-    return JSONResponse(
-        {"error": "Direct-to-GCS upload is not available in the on-prem build. The standard /upload path is used for all sizes."},
-        status_code=400,
-    )
+async def upload_init(request: Request):
+    """Issue a V4 signed PUT URL for one file (direct-to-GCS path).
+
+    The object key is namespaced under the caller's SESSION
+    (``tmp/{sid}/{uuid}/{name}``) so /upload/finalize can refuse any path
+    outside it. The signed URL is never logged.
+    """
+    if not gcs_upload.enabled():
+        return JSONResponse({"error": _DIRECT_UPLOAD_DISABLED_MSG}, status_code=400)
+    email, sid = _session_or_issue(request)
+    if not email:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    body = await _json_body(request, _UploadInitRequest, email)
+    if body is None:
+        return JSONResponse({"error": "Invalid request."}, status_code=400)
+
+    safe_name = _safe_upload_filename(body.filename)
+    if not safe_name:
+        log_with_sid(email, "warning", "UPLOAD_INIT_BAD_FILENAME")
+        return JSONResponse({"error": "Invalid filename."}, status_code=400)
+    if not _has_direct_upload_ext(safe_name):
+        log_with_sid(email, "warning", "UPLOAD_INIT_BAD_EXTENSION", file=safe_name)
+        return JSONResponse({"error": "Unsupported file type. Use .xlsx, .xls, .csv, or .tsv."},
+                            status_code=400)
+    if body.size_bytes <= 0 or body.size_bytes > _DIRECT_UPLOAD_MAX_BYTES:
+        log_with_sid(email, "warning", "UPLOAD_INIT_SIZE_REJECTED", file=safe_name, size=body.size_bytes)
+        return JSONResponse({"error": f"File too large. Maximum allowed is "
+                                      f"{_DIRECT_UPLOAD_MAX_BYTES // (1024 * 1024)} MB."},
+                            status_code=400)
+
+    loop = asyncio.get_running_loop()
+    try:
+        existing = await loop.run_in_executor(_EXEC, lambda: _session_upload_bases(UserStore(sid)))
+    except Exception as e:
+        log_with_sid(email, "warning", f"UPLOAD_INIT_META_READ_FAILED: {type(e).__name__}")
+        existing = set()
+    if len(existing) >= settings.MAX_FILES and safe_name not in existing:
+        return JSONResponse({"error": f"You can upload up to {settings.MAX_FILES} files."}, status_code=400)
+
+    content_type = (body.content_type or "").strip() or "application/octet-stream"
+    object_path = f"tmp/{sid}/{uuid.uuid4().hex}/{safe_name}"
+    try:
+        signed_url = await loop.run_in_executor(
+            _EXEC, lambda: gcs_upload.sign_put_url(object_path, content_type, _DIRECT_UPLOAD_EXPIRY_MIN))
+    except Exception as e:
+        # DefaultCredentialsError / RefreshError / no service-account email all
+        # land here. Fixed message: google errors embed request URLs.
+        log_with_sid(email, "error", f"UPLOAD_INIT_SIGN_FAILED: {type(e).__name__}: {str(e)[:200]}",
+                     file=safe_name)
+        return JSONResponse({"error": "Direct upload is not configured on this server."}, status_code=500)
+
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=_DIRECT_UPLOAD_EXPIRY_MIN)).isoformat()
+    log_with_sid(email, "info", "UPLOAD_INIT", file=safe_name, size=body.size_bytes, path=object_path)
+    return {"signed_url": signed_url, "gcs_path": object_path, "expires_at": expires_at}
 
 
 @router.post("/upload/finalize")
-async def upload_finalize_disabled(request: Request):
-    return JSONResponse({"error": "Disabled in the on-prem build."}, status_code=400)
+async def upload_finalize(request: Request):
+    """Pull the object the browser just PUT into the session store and run
+    the same processing /upload runs; same response shape as /upload.
+
+    Never resets the session (the browser POSTs /new_session first, so a
+    multi-file batch accumulates one finalize per file). A sid rotation
+    between init and finalize lands in the prefix rejection by design.
+    """
+    if not gcs_upload.enabled():
+        return JSONResponse({"error": "Disabled in the on-prem build."}, status_code=400)
+    email, sid = _session_or_issue(request)
+    if not email:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    body = await _json_body(request, _UploadFinalizeRequest, email)
+    if body is None:
+        return JSONResponse({"error": "Invalid request."}, status_code=400)
+
+    gcs_path = (body.gcs_path or "").strip().lstrip("/")
+    if not gcs_path.startswith(f"tmp/{sid}/") or ".." in gcs_path:
+        log_with_sid(email, "warning", "UPLOAD_FINALIZE_REJECTED_PREFIX", path=gcs_path[:120])
+        return JSONResponse({"error": "Invalid upload path."}, status_code=400)
+    filename = _safe_upload_filename(gcs_path.rsplit("/", 1)[-1])
+    if not filename or not _has_direct_upload_ext(filename):
+        log_with_sid(email, "warning", "UPLOAD_FINALIZE_BAD_FILENAME", path=gcs_path[:120])
+        return JSONResponse({"error": "Invalid filename in upload path."}, status_code=400)
+    descriptions = body.file_descriptions if isinstance(body.file_descriptions, dict) else {}
+
+    def _pull():
+        # One executor job: size check → store layout → download → delete.
+        size = gcs_upload.blob_size(gcs_path)
+        if size is None:
+            return "missing", None, None
+        if size > _DIRECT_UPLOAD_MAX_BYTES:
+            try:
+                gcs_upload.delete_blob(gcs_path)
+            except Exception as e_del:
+                log_with_sid(email, "warning", f"UPLOAD_FINALIZE_TMP_DELETE_FAILED: {type(e_del).__name__}")
+            return "too_large", size, None
+        store = UserStore(sid)  # constructor mkdirs — keep it off the loop too
+        dest = store.files_dir / filename
+        try:
+            got = gcs_upload.download_to(gcs_path, dest)
+        except Exception:
+            # A mid-transfer failure can leave a truncated file; finalize never
+            # resets the session, so a later finalize would load it. Remove it.
+            try:
+                dest.unlink(missing_ok=True)
+            except Exception as e_rm:
+                log_with_sid(email, "warning", f"UPLOAD_FINALIZE_PARTIAL_CLEANUP_FAILED: {type(e_rm).__name__}")
+            raise
+        finally:
+            # Best effort on success AND failure; the bucket lifecycle rule
+            # (delete after 1 day) is the backstop.
+            try:
+                gcs_upload.delete_blob(gcs_path)
+            except Exception as e_del:
+                log_with_sid(email, "warning", f"UPLOAD_FINALIZE_TMP_DELETE_FAILED: {type(e_del).__name__}")
+        return "ok", got, store
+
+    loop = asyncio.get_running_loop()
+    try:
+        state, size, store = await loop.run_in_executor(_EXEC, _pull)
+    except Exception as e:
+        log_with_sid(email, "error", f"UPLOAD_FINALIZE_TRANSFER_FAILED: {type(e).__name__}: {str(e)[:200]}",
+                     file=filename)
+        return JSONResponse({"error": "Failed to import the uploaded file. Please try again."}, status_code=500)
+    if state == "missing":
+        log_with_sid(email, "warning", "UPLOAD_FINALIZE_MISSING", path=gcs_path[:120])
+        return JSONResponse({"error": "Uploaded file not found. Please try again."}, status_code=404)
+    if state == "too_large":
+        log_with_sid(email, "warning", "UPLOAD_FINALIZE_SIZE_REJECTED", file=filename, size=size)
+        return JSONResponse({"error": f"File too large. Maximum allowed is "
+                                      f"{_DIRECT_UPLOAD_MAX_BYTES // (1024 * 1024)} MB."},
+                            status_code=400)
+
+    log_with_sid(email, "info", "FILE_SAVED", file=filename, size_kb=int((size or 0) / 1024), via="gcs")
+    try:
+        brain_client.post_activity("file_uploaded", email, {"filename": filename, "size_bytes": size})
+    except Exception:
+        pass
+
+    payload, status = await _finish_upload(store, email, sid, [filename], descriptions)
+    return JSONResponse(payload, status_code=status) if status != 200 else payload
 
 
 @router.post("/upload_from_url")

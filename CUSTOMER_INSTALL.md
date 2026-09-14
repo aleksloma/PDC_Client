@@ -48,6 +48,10 @@ Edit `client.env` and fill in:
   admin must change it on first login; once set, this variable is ignored.
 
 `BRAIN_URL` is pre-filled and `DATA_ROOT=/data/client` should stay as-is.
+`GCS_UPLOAD_BUCKET` is optional and should stay **unset**: it exists only for
+PowerDataChat's own cloud-hosted demo (an ingress with a request-body cap);
+on your installation every upload goes straight to the container, with no
+size threshold.
 **Never commit or share the filled-in `client.env`.**
 
 ### Connecting your own databases (optional)

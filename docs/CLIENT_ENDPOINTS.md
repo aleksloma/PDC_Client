@@ -82,15 +82,17 @@ guide: [`docs/SSO_MICROSOFT.md`](SSO_MICROSOFT.md).
 ## Upload flow
 
 The dashboard's "frictionless drop" runs these four endpoints in order. The
-enterprise build keeps the same shape; the only frontend change is that the
-B2C large-file (direct-to-GCS) branch is gone, so step 2 handles every size:
+enterprise build keeps the same shape. The B2C large-file (direct-to-GCS)
+branch is present but GATED on the server flag `window.__DIRECT_UPLOAD__`
+(true only when `GCS_UPLOAD_BUCKET` is set — the Cloud Run demo); on every
+customer install the flag is false and step 2 handles every size:
 
 1. **`POST /new_session`** — resets the per-session temp `UserStore`.
    Returns `{ok: true}`. Issues a fresh SID into the session cookie.
 
 2. **`POST /upload`** (multipart, field `files`; EVERY file regardless of
-   size — the frontend has no client-side size threshold and the server sets
-   no request-body limit) — saves uploads to the
+   size whenever direct upload is off — the server sets no request-body
+   limit) — saves uploads to the
    per-session temp area (under `<DATA_ROOT>/sessions/<sid>/files/`).
    Returns `{ok, saved, dataframes, files}` — the B2C keys unchanged, plus an
    additive per-file result list: `files: [{file, status: "ok"|"warning"|
@@ -159,10 +161,47 @@ B2C large-file (direct-to-GCS) branch is gone, so step 2 handles every size:
    — so the output is identical to the B2C app. Returns
    `{ok, chat_id, name, welcome_message, suggested_questions}`.
 
-Direct-to-GCS paths (`/upload/init`, `/upload/finalize`, `/upload_from_url`)
-return `400` — the on-prem frontend sends every file through `POST /upload`
-regardless of size: the B2C 25 MB signed-URL branch was removed from
-`static/dashboard.js` and `static/config.js`, so nothing calls `/upload/init`.
+### Direct-to-GCS large files (OPTIONAL — `GCS_UPLOAD_BUCKET`)
+
+Port of the B2C flow, for deployments behind an ingress with a request-body
+cap (the Cloud Run demo: 32 MiB on HTTP/1). **Off by default**: with
+`GCS_UPLOAD_BUCKET` unset (every customer install, the local Docker stack)
+`POST /upload/init` and `POST /upload/finalize` return `400`
+(`{"error": "Direct-to-GCS upload is not available in the on-prem build. …"}`
+/ `{"error": "Disabled in the on-prem build."}`) whatever the body or session,
+and `dashboard.html` renders `window.__DIRECT_UPLOAD__ = false`, so the
+frontend never calls them. `POST /upload_from_url` (Google Sheets/Drive import)
+returns `400` regardless of the flag.
+
+With the bucket set, `dashboard.js`'s `runFrictionlessFlow` — the ONE call
+site, covering page drop, the Create-New wizard and Add Data — routes a batch
+containing any file > 25 MiB (`LARGE_UPLOAD_THRESHOLD_BYTES`) through, per
+file, after the usual `POST /new_session`:
+
+- **`POST /upload/init`** — JSON `{filename, content_type, size_bytes}`
+  (session required → 401). Validates the basename (Unicode kept, control
+  chars stripped, no leading dot / `..` / >200 chars → 400 `Invalid
+  filename.`), the extension (`.xlsx .xls .csv .tsv` → 400 `Unsupported file
+  type…`), `0 < size_bytes ≤ 500 MB` (400 `File too large…`) and the session's
+  distinct source-file count vs `MAX_FILES` (400). Returns
+  `{signed_url, gcs_path, expires_at}`: a 15-minute V4 signed PUT URL bound
+  to `content_type`, signed with the runtime service account through IAM
+  `signBlob` (no key file), and the object key `tmp/{sid}/{uuid}/{name}` —
+  namespaced under the CALLER'S SESSION. A signing failure (no credentials,
+  no `iam.serviceAccountTokenCreator`) is a fixed 500 `Direct upload is not
+  configured on this server.`; the signed URL is never logged.
+- The browser PUTs the bytes to `signed_url` with the same `Content-Type`
+  (XHR, progress into `#frictionlessStatus`).
+- **`POST /upload/finalize`** — JSON `{gcs_path, file_descriptions?}`.
+  Rejects any path outside `tmp/{sid}/` (400 `Invalid upload path.`), checks
+  the REAL object size (404 when missing, 400 over 500 MB — a signed PUT does
+  not bind Content-Length), streams it into the session `files_dir`, deletes
+  the object (best effort, also on failure; the bucket's 1-day lifecycle rule
+  is the backstop) and runs the SAME post-save pipeline as `/upload`
+  (`_finish_upload`), returning the same `{ok, saved, dataframes, files}` shape
+  and the same `ok:false`/400 semantics. It never resets the session, so a
+  multi-file batch accumulates one finalize per file (DB-table selections
+  survive). Log lines: `UPLOAD_INIT`, `FILE_SAVED via=gcs`, `UPLOAD_OK`.
 
 ### Add Data to an existing chat
 
@@ -855,7 +894,7 @@ gracefully handles them:
 | Endpoint | Returns | Reason |
 |---|---|---|
 | `POST /api/chat/{id}/publish`, `/unpublish` | 400 | no public pages on-prem (architecture: sharing is OPEN, public publish is out of scope) |
-| `POST /upload/init`, `/upload/finalize` | 400 | the frontend never calls these any more — every file size goes through multipart `/upload`; the stubs stay only so a stale cached B2C page gets a clean 400 instead of a 404 |
+| `POST /upload/init`, `/upload/finalize` | 400 unless `GCS_UPLOAD_BUCKET` is set | the direct-to-GCS large-file path is OPTIONAL (Cloud Run demo only); off, the frontend never calls them and every size goes through multipart `/upload` — see "Direct-to-GCS large files" above |
 | `POST /upload_from_url` | 400 | Google Drive/Sheets are off-prem |
 | `GET /paddle/config` | 200 `{enabled:false, client_token:null}` | page-load Paddle bootstrap becomes a no-op (no 404 / console error) |
 | `POST /auth/subscription` | 400 | enterprise plan is constant |

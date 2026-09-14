@@ -17,6 +17,7 @@
 | Cloud Run service | `pdcclient-demo` (public via `--no-invoker-iam-check`) |
 | Image | `europe-west1-docker.pkg.dev/pdc-enterprise/client/pdcclient-demo:<git-sha>` |
 | Data volume | GCS bucket `pdc-enterprise-client-demo-data` mounted at `/data/client` |
+| Upload hop | GCS bucket `pdc-enterprise-demo-uploads` (`GCS_UPLOAD_BUCKET`) — transient home for files > 25 MB between the browser's signed PUT and `/upload/finalize`; objects deleted on finalize, 1-day lifecycle backstop; CORS for the two site origins; runtime SA has `objectAdmin` on it + `iam.serviceAccountTokenCreator` on itself (signBlob). NOT a customer setting |
 | Brain | the production `pdcbrain` service (`BRAIN_URL` = its `status.url`) |
 | Tenant | a dedicated **demo tenant** created in the brain admin panel |
 | Secrets | `CLIENT_DEMO_TENANT_TOKEN` → `BRAIN_TENANT_TOKEN`, `CLIENT_DEMO_SECRET_KEY` → `SECRET_KEY`, `CLIENT_DEMO_LADMIN_PASSWORD` → `LOCAL_ADMIN_PASSWORD`, `CLIENT_DEMO_ENCRYPTION_KEY` → `CLIENT_ENCRYPTION_KEY` (all Secret Manager, pinned `:latest`; verified against the live service 2026-08-30 — the last two were mounted after this doc was first written) |
@@ -43,10 +44,14 @@ touches this service, and vice versa.
   CPU the deck job stalls after the response is sent.
 - `--memory=4Gi --cpu=2` — pandas/plotly/kaleido (headless Chromium) plus the
   ~500 MB df cache (`DF_CACHE_MAX_MB`).
-- Upload size: the container itself sets no request-body limit (every file
-  goes through multipart `POST /upload`), but Cloud Run's ingress caps HTTP/1
-  request bodies at 32 MiB — a larger demo dataset fails with a Cloud Run 413
-  before reaching the app. Customer LAN installs have no such cap.
+- Upload size: the container itself sets no request-body limit, but Cloud
+  Run's ingress (Google Frontend) caps HTTP/1 request bodies at 32 MiB — a
+  multipart `POST /upload` above that gets an HTML 413 that never reaches the
+  app or its request log (verified 2026-09-03: 31 MiB → app 401, 34 MiB →
+  GFE 413). Hence `GCS_UPLOAD_BUCKET`: with it set, `dashboard.js` sends any
+  batch containing a file > 25 MB through `/upload/init` → signed PUT straight
+  to the bucket → `/upload/finalize` (500 MB cap). Customer LAN installs have
+  no such cap and leave the variable unset.
 - `--timeout=900` — long analyses (60 s exec windows + brain round-trips up to
   `BRAIN_REQUEST_TIMEOUT=180 s` each).
 - `--min-instances=0` — near-zero idle cost; first hit after idle cold-starts
@@ -64,6 +69,33 @@ gcloud artifacts repositories create client --repository-format=docker \
 
 gcloud storage buckets create gs://pdc-enterprise-client-demo-data \
   --location=europe-west1 --uniform-bucket-level-access --project=pdc-enterprise
+
+# Direct-upload hop bucket (2026-09-03). Transient only: objects are deleted by
+# /upload/finalize; the lifecycle rule is the backstop. `... set` REPLACES the
+# whole CORS/lifecycle config — `describe` first and merge if it ever grows.
+gcloud storage buckets create gs://pdc-enterprise-demo-uploads \
+  --location=europe-west1 --uniform-bucket-level-access --project=pdc-enterprise
+cat > /tmp/lifecycle.json <<'EOF'
+{"rule": [{"action": {"type": "Delete"}, "condition": {"age": 1}}]}
+EOF
+gcloud storage buckets update gs://pdc-enterprise-demo-uploads --lifecycle-file=/tmp/lifecycle.json
+cat > /tmp/cors.json <<'EOF'
+[{"origin": ["https://client.powerdatachat.com",
+             "https://pdcclient-demo-873133613631.europe-west1.run.app"],
+  "method": ["PUT", "GET", "HEAD", "OPTIONS"],
+  "responseHeader": ["Content-Type", "Content-Length"],
+  "maxAgeSeconds": 3600}]
+EOF
+gcloud storage buckets update gs://pdc-enterprise-demo-uploads --cors-file=/tmp/cors.json
+# Runtime SA: write/delete objects in THIS bucket only, and sign URLs via IAM
+# signBlob (no key file anywhere — token creator on ITSELF).
+gcloud storage buckets add-iam-policy-binding gs://pdc-enterprise-demo-uploads \
+  --member="serviceAccount:873133613631-compute@developer.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin"
+gcloud iam service-accounts add-iam-policy-binding \
+  873133613631-compute@developer.gserviceaccount.com \
+  --member="serviceAccount:873133613631-compute@developer.gserviceaccount.com" \
+  --role="roles/iam.serviceAccountTokenCreator" --project=pdc-enterprise
 
 # Secret values: tenant token copied one-time from the brain admin panel;
 # SECRET_KEY random (e.g. python -c "import secrets;print(secrets.token_urlsafe(48))").
@@ -130,6 +162,20 @@ gcloud run deploy pdcclient-demo --project=pdc-enterprise --region=europe-west1 
   --image=europe-west1-docker.pkg.dev/pdc-enterprise/client/pdcclient-demo:<new-git-sha>
 ```
 
+**Exception — the direct-upload release (first deploy of `GCS_UPLOAD_BUCKET`)
+is NOT image-only.** The new env var is added with `--update-env-vars`, which
+MERGES into the existing set (`--set-env-vars` would REPLACE it and drop
+`DATA_ROOT`/`BRAIN_URL`); secrets and the volume still carry over:
+
+```bash
+gcloud run deploy pdcclient-demo --project=pdc-enterprise --region=europe-west1 \
+  --image=europe-west1-docker.pkg.dev/pdc-enterprise/client/pdcclient-demo:<new-git-sha> \
+  --update-env-vars=GCS_UPLOAD_BUCKET=pdc-enterprise-demo-uploads
+```
+
+Every later release goes back to the image-only form (the variable persists
+on the service).
+
 Never delete or recreate the `pdc-enterprise-client-demo-data` bucket — it
 holds the demo accounts, uploaded demo datasets, chats, and rendered decks.
 
@@ -141,6 +187,12 @@ holds the demo accounts, uploaded demo datasets, chats, and rendered decks.
    renders a chart (proves brain round-trip + kaleido inside the container).
 3. Confirm `pdcbrain` gained no new revision:
    `gcloud run revisions list --service=pdcbrain --region=europe-west1 --project=pdc-enterprise`
+4. Direct upload: `GET /lab` HTML carries `window.__DIRECT_UPLOAD__ = true`;
+   a new chat from a > 32 MiB CSV shows, in the browser's network tab,
+   `POST /upload/init` 200 → `PUT storage.googleapis.com/...` 200 →
+   `POST /upload/finalize` 200 and no `/upload` multipart; a small CSV still
+   goes through `POST /upload`; afterwards
+   `gcloud storage ls gs://pdc-enterprise-demo-uploads/**` lists nothing.
 
 ## Security notes
 

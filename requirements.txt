@@ -61,6 +61,24 @@ ciso8601==2.3.3
 # Relation discovery: parses admin-pasted SQL locally (never sent to the
 # brain, never persisted). Pure Python, denied inside the exec sandbox.
 sqlglot==30.14.0
+# Optional direct-to-GCS upload transport (gcs_upload.py, routes/upload.py
+# /upload/init + /upload/finalize). Imported LAZILY inside functions and inert
+# unless GCS_UPLOAD_BUCKET is set — every customer image ships these cold. The
+# signer uses IAM signBlob through the runtime service account (no key file).
+# Fully pinned incl. transitive deps (google-crc32c + protobuf are compiled).
+google-cloud-storage==2.19.0
+google-auth==2.40.3
+google-api-core==2.34.0
+google-cloud-core==2.7.0
+google-resumable-media==2.10.2
+google-crc32c==1.8.0
+googleapis-common-protos==1.75.2
+proto-plus==1.28.4
+protobuf==7.36.1
+cachetools==5.5.2
+pyasn1==0.6.4
+pyasn1_modules==0.4.2
+rsa==4.9.1
 # Refresh scheduling: preset schedules (daily/weekly/monthly/interval/cron)
 # normalized to 5-field cron; croniter computes next runs (supports `l` =
 # last day of month — pinned by tests/test_schedule_utils.py). Pure Python.

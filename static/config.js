@@ -157,6 +157,71 @@ async function handleFileSelection(e) {
   e.target.value = '';
 }
 
+// Direct-to-GCS large-file path: ON only when the server set GCS_UPLOAD_BUCKET
+// (the Cloud Run demo, whose ingress caps HTTP/1 bodies at 32 MiB). On every
+// customer install the flag is false and this file never calls /upload/init.
+const directUploadEnabled = !!(window.__DIRECT_UPLOAD__);
+
+// Files larger than this go through the signed-URL flow (browser → GCS direct),
+// bypassing Cloud Run's 32 MiB request-body limit. Smaller files keep using the
+// legacy POST /upload path unchanged.
+const LARGE_UPLOAD_THRESHOLD_BYTES = 25 * 1024 * 1024;
+
+// Stream one file through the three-step direct-to-GCS flow.
+// Returns the parsed /upload/finalize JSON on success; throws on any failure.
+async function _directUploadFile(file, description) {
+  // 1. /upload/init — get a signed PUT URL
+  const initRes = await fetch('/upload/init', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      filename: file.name,
+      content_type: file.type || 'application/octet-stream',
+      size_bytes: file.size,
+    }),
+  });
+  const initData = await safeJson(initRes);
+  if (!initRes.ok || !initData || !initData.signed_url || !initData.gcs_path) {
+    const msg = (initData && (initData.error || initData.detail)) || `Upload init failed (${initRes.status})`;
+    throw new Error(msg);
+  }
+
+  // 2. PUT the bytes straight to GCS via XHR (so upload.onprogress works)
+  await new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', initData.signed_url, true);
+    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+    xhr.upload.onprogress = (evt) => {
+      if (!evt.lengthComputable) return;
+      const pct = Math.round((evt.loaded / evt.total) * 100);
+      const out = document.getElementById('uploadOut');
+      if (out) out.textContent = `Uploading ${file.name}: ${pct}%`;
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else reject(new Error(`Upload PUT failed (${xhr.status})`));
+    };
+    xhr.onerror = () => reject(new Error('Upload PUT network error'));
+    xhr.onabort = () => reject(new Error('Upload PUT aborted'));
+    xhr.send(file);
+  });
+
+  // 3. /upload/finalize — pull the GCS object into the user's store and run Steps 2-5
+  const finalizeBody = { gcs_path: initData.gcs_path };
+  if (description) finalizeBody.file_descriptions = { [file.name]: description };
+  const finRes = await fetch('/upload/finalize', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(finalizeBody),
+  });
+  const finData = await safeJson(finRes);
+  if (!finRes.ok || !finData || finData.error) {
+    const msg = (finData && (finData.error || finData.detail)) || `Upload finalize failed (${finRes.status})`;
+    throw new Error(msg);
+  }
+  return finData;
+}
+
 // Submit the upload form: POST /upload with selected files and descriptions
 async function upload(e){
   e.preventDefault();
@@ -207,29 +272,46 @@ async function upload(e){
     
     // Upload regular files if any
     if (regularFiles.length > 0) {
-      // Every file, regardless of size, goes through the multipart /upload path —
-      // the on-prem build has no signed-URL (direct-to-GCS) branch.
-      const formData = new FormData();
-      regularFiles.forEach(file => {
-        formData.append('files', file);
-      });
-      // Only include descriptions for regular files
-      const regularDescriptions = {};
-      regularFiles.forEach(f => {
-        if (descriptions[f.name]) regularDescriptions[f.name] = descriptions[f.name];
-      });
-      formData.append('file_descriptions', JSON.stringify(regularDescriptions));
-
-      const res = await fetch('/upload', { method: 'POST', body: formData });
-      const js = await safeJson(res);
-      // js.ok must be strictly true: a partial parse failure now answers
-      // 200 {ok:false, error, saved:[...]} — `saved` alone is not success
-      // and would list the FAILED files as uploaded (QA 2.1).
-      if (res.ok && js && js.ok === true) {
-        uploadedNames.push(...(js.saved || []));
+      // Direct-to-GCS only when the server enabled it (GCS_UPLOAD_BUCKET, the
+      // Cloud Run demo); with the flag false ALL files take multipart /upload.
+      const hasLargeFile = directUploadEnabled && regularFiles.some(f => f.size > LARGE_UPLOAD_THRESHOLD_BYTES);
+      if (hasLargeFile) {
+        // Direct-to-GCS path: reset the session up front (mirrors what /upload does
+        // internally for the legacy path), then init→PUT→finalize sequentially per file.
+        try { await fetch('/new_session', { method: 'POST' }); } catch (e) { /* non-fatal */ }
+        try {
+          for (const f of regularFiles) {
+            const desc = descriptions[f.name];
+            const finData = await _directUploadFile(f, desc);
+            if (Array.isArray(finData.saved)) uploadedNames.push(...finData.saved);
+          }
+        } catch (err) {
+          allSuccess = false;
+          out.textContent = (err && err.message) || 'Upload failed.';
+        }
       } else {
-        allSuccess = false;
-        out.textContent = (js && (js.error || js.message || js.detail)) || 'Upload failed.';
+        const formData = new FormData();
+        regularFiles.forEach(file => {
+          formData.append('files', file);
+        });
+        // Only include descriptions for regular files
+        const regularDescriptions = {};
+        regularFiles.forEach(f => {
+          if (descriptions[f.name]) regularDescriptions[f.name] = descriptions[f.name];
+        });
+        formData.append('file_descriptions', JSON.stringify(regularDescriptions));
+
+        const res = await fetch('/upload', { method: 'POST', body: formData });
+        const js = await safeJson(res);
+        // js.ok must be strictly true: a partial parse failure now answers
+        // 200 {ok:false, error, saved:[...]} — `saved` alone is not success
+        // and would list the FAILED files as uploaded (QA 2.1).
+        if (res.ok && js && js.ok === true) {
+          uploadedNames.push(...(js.saved || []));
+        } else {
+          allSuccess = false;
+          out.textContent = (js && (js.error || js.message || js.detail)) || 'Upload failed.';
+        }
       }
     }
     

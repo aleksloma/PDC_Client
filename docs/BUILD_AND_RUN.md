@@ -86,6 +86,7 @@ Diagnostic env flags (see `.env.example`):
 |---|---|
 | `CLIENT_LLM_DEBUG`   | Verbose brain-call debug logging to the LOCAL client log (default OFF; `1`/`true` to enable). Logs `BRAIN_REQUEST` / `BRAIN_RESPONSE` per call. Boundary-safe — brain payloads carry no row values (Art. II). Turn back OFF after diagnosing. |
 | `CLIENT_LLM_DEBUG_MAX_CHARS` | Per-field truncation for the debug logs (default `20000`). |
+| `GCS_UPLOAD_BUCKET` | OPTIONAL, leave UNSET on every customer install (the default). Only for a deployment behind an ingress that caps request bodies (the PowerDataChat Cloud Run demo, 32 MiB): names the GCS bucket used as a transient hop for files > 25 MB (`/upload/init` signed PUT → `/upload/finalize`, object deleted afterwards). Unset ⇒ those endpoints return 400 and every file goes through multipart `/upload`. See `docs/DEMO_CLOUD_RUN.md`. |
 
 A failed brain call always logs its HTTP status + body snippet (~2000 chars)
 regardless of `CLIENT_LLM_DEBUG` — an API rejection is never silently swallowed.

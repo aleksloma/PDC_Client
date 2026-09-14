@@ -157,9 +157,20 @@ multiplier  = settings.LLM_BACKOFF_MULTIPLIER # 2.0
 - Client storage root: `DATA_ROOT` (default `/data/client`).
 - Both default to bind-mounted Docker volumes (`pdc_brain_data`, `pdc_client_data`).
 
-There is no `GCSPath`, no Cloud Run, no signed-URL upload path. The
-`POST /upload/init`, `POST /upload/finalize`, `POST /upload_from_url`
-endpoints return 400 by design — see [`docs/CLIENT_ENDPOINTS.md`](CLIENT_ENDPOINTS.md).
+There is no `GCSPath` and no GCS storage adapter: the local filesystem is
+the default and the ONLY mode for customer installs. One optional, transient
+transport exists on top of it — the direct-to-GCS large-file upload path
+(`gcs_upload.py`, `POST /upload/init` + `POST /upload/finalize`), a port of the
+B2C flow used solely by the PowerDataChat-hosted Cloud Run demo, whose ingress
+caps HTTP/1 request bodies at 32 MiB. It is INERT unless `GCS_UPLOAD_BUCKET`
+is set: with the variable empty (every customer install) both endpoints
+return 400 and the frontend sends every file through multipart `POST /upload`.
+When set, the browser PUTs the file to the bucket with a V4 signed URL (signed
+through the runtime service account's IAM `signBlob` — no key file, Art. VII),
+`/upload/finalize` pulls it into the per-session store under `DATA_ROOT` and
+deletes the object; the bucket never holds data beyond that hop.
+`POST /upload_from_url` returns 400 regardless — see
+[`docs/CLIENT_ENDPOINTS.md`](CLIENT_ENDPOINTS.md).
 
 ### JSONL pattern (append-only)
 ```python
@@ -412,7 +423,7 @@ To modify this constitution:
 |--------------|---------------------------------------------------------------------------|
 | Data boundary| Raw values never cross to brain. `_safe_preview` is the guard.            |
 | LLM calls    | REST API only, no LangChain. Tier via `_eff()`.                            |
-| Storage      | Local filesystem. JSONL for history, JSON for metadata. No GCSPath.       |
+| Storage      | Local filesystem. JSONL for history, JSON for metadata. No GCSPath. Direct-to-GCS upload hop only with `GCS_UPLOAD_BUCKET` (demo). |
 | Errors       | Catch → log with sid → return fallback. Never crash silently.             |
 | Resources    | `atexit` for executors; close HTTP clients on lifespan shutdown.          |
 | Security     | Secrets in env only. Never commit `.env`. Brain holds the Gemini key.     |

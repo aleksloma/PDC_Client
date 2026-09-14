@@ -82,6 +82,16 @@ class Settings(BaseModel):
     CLIENT_ENCRYPTION_KEY: str = Field(default_factory=lambda: os.getenv("CLIENT_ENCRYPTION_KEY", ""))
     CLIENT_ENCRYPTION_KEY_OLD: str = Field(default_factory=lambda: os.getenv("CLIENT_ENCRYPTION_KEY_OLD", ""))
 
+    # --- Optional direct-to-GCS upload transport (Cloud Run demo only) ------
+    # Empty (the default, every customer install) => /upload/init and
+    # /upload/finalize answer 400 and the frontend sends every file through
+    # multipart POST /upload. Set to a bucket name ONLY where the container runs
+    # behind an ingress with a request-body cap (Cloud Run: 32 MiB on HTTP/1):
+    # the browser then PUTs files > 25 MB straight to the bucket with a V4
+    # signed URL and /upload/finalize pulls them into the session store. The
+    # object is deleted after finalize - raw data still lives on DATA_ROOT only.
+    GCS_UPLOAD_BUCKET: str = Field(default_factory=lambda: os.getenv("GCS_UPLOAD_BUCKET", ""))
+
     # Fixed local admin account (the only role=admin user in Phase 1).
     # LOCAL_ADMIN_PASSWORD bootstraps the account ONCE (hash-only on disk,
     # forced change on first login); an existing hash is never overwritten.

@@ -38,6 +38,11 @@ DENIED_MODULES = frozenset({
     # client secret (and its module-level `import db_sources` runs under
     # real builtins, so denying db_sources alone does not cover it)
     "sso_store",
+    # Optional direct-upload transport + the google namespace it imports:
+    # with a bucket configured, google.auth.default() would hand generated
+    # code the runtime credentials.
+    "gcs_upload",
+    "google",
     # role grants: sandboxed code must not rewrite roles.json (privilege
     # escalation for the DB-table role gate)
     "roles_store",
