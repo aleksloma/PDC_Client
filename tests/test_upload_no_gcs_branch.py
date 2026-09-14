@@ -124,10 +124,11 @@ class FakeGCS:
         return self.size
 
     def download_to(self, object_path, dest):
-        if self.download_raises:
-            raise RuntimeError("boom")
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
+        if self.download_raises:
+            dest.write_bytes(CSV[:5])  # truncated partial, like a dropped transfer
+            raise RuntimeError("boom")
         dest.write_bytes(CSV)
         self.downloaded.append((object_path, str(dest)))
         return len(CSV)
@@ -329,6 +330,7 @@ def test_finalize_deletes_object_even_when_download_fails(client, monkeypatch):
     assert r.status_code == 500
     assert r.json()["error"] == "Failed to import the uploaded file. Please try again."
     assert fake.deleted == [path]
+    assert not (local_store.UserStore(SID).files_dir / "data.csv").exists()  # partial file removed
 
 
 def test_finalize_keeps_database_entries_and_ids(client, monkeypatch):

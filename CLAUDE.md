@@ -194,7 +194,7 @@ It is NOT a customer topology.
 - **No public publishing** — `POST /publish`/`/unpublish` return 400.
   Sharing is recipient-list only.
 - **No GCS adapter** — local filesystem only. Direct-to-GCS upload
-  endpoints return 400.
+  endpoints return 400 unless `GCS_UPLOAD_BUCKET` is set (Cloud Run demo only).
 - **No Soro blog, Vlog, B2C marketing site, customer-analytics
   reporter** — those modules don't exist on-prem.
 
