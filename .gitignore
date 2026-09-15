@@ -137,3 +137,8 @@ temp/
 # .claude/ (settings, agents, skills) IS committed — shared project config.
 # Personal per-machine overrides are not.
 .claude/settings.local.json
+
+# ============================================================================
+# Security remediation working folder (temporary, local only, deleted after re-assessment). Never commit.
+# ============================================================================
+docs/security/
