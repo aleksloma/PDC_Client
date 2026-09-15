@@ -120,12 +120,15 @@ async def upload(request: Request, files: List[UploadFile] = File(...), file_des
     try:
         for f in files:
             content = await f.read()
-            store.save_upload(f.filename, content)
-            saved.append(f.filename)
-            log_with_sid(email, "info", "FILE_SAVED", file=f.filename, size_kb=int(len(content) / 1024))
+            # The multipart filename is attacker-controlled; save_upload
+            # sanitizes it, so everything downstream (meta, response, logs,
+            # activity) must use the name actually STORED on disk.
+            out = store.save_upload(f.filename, content)
+            saved.append(out.name)
+            log_with_sid(email, "info", "FILE_SAVED", file=out.name, size_kb=int(len(content) / 1024))
             try:
                 brain_client.post_activity("file_uploaded", email, {
-                    "filename": f.filename, "size_bytes": len(content),
+                    "filename": out.name, "size_bytes": len(content),
                 })
             except Exception:
                 pass
@@ -1166,9 +1169,12 @@ def _safe_upload_filename(name: str) -> str:
     """Basename only, control chars stripped, NFC — Unicode names KEPT.
 
     Deliberate deviation from B2C's ASCII regex: it would turn every Georgian
-    filename into ``______.xlsx`` and make two such files collide. The
-    multipart /upload stores the browser's name as-is, so the direct path
-    keeps the same names. Rejects empty / dot-leading / ``..`` / >200 chars.
+    filename into ``______.xlsx`` and make two such files collide. Rejects
+    empty / dot-leading / ``..`` / >200 chars, where the multipart path's
+    ``local_store.sanitize_upload_filename`` instead repairs such a name
+    (leading dots stripped, 200-byte cap, uuid fallback) — both reduce to a
+    separator-free basename, so an ordinary name is stored identically by
+    either path.
     """
     raw = (name or "").replace("\\", "/")
     base = raw.rsplit("/", 1)[-1].strip()

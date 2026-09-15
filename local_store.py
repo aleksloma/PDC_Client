@@ -24,6 +24,7 @@ import secrets
 import shutil
 import threading
 import time as _time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -1456,6 +1457,46 @@ class AuthStore:
 
 
 # ---------------------------------------------------------------------------
+# Upload filename sanitization
+# ---------------------------------------------------------------------------
+_UPLOAD_NAME_MAX_BYTES = 200
+# Extensions worth keeping when the whole name degenerates to a uuid fallback
+# (the parser-supported table formats; anything else is stored extension-less).
+_UPLOAD_FALLBACK_EXTS = {".csv", ".tsv", ".xlsx", ".xls", ".xlsm"}
+
+
+def sanitize_upload_filename(name: str) -> str:
+    """Reduce a client-supplied upload filename to a safe single basename.
+
+    The multipart filename is fully attacker-controlled: `files_dir / name`
+    resolves to an ABSOLUTE path for "/etc/x" and walks out of the session
+    folder for "../../x". Unicode is preserved verbatim (Georgian filenames
+    must survive) — only path components, NUL/control characters, leading dots
+    and surrounding whitespace are removed.
+    """
+    base = os.path.basename(str(name or "").replace("\\", "/"))
+    base = "".join(ch for ch in base if ch >= " " and ord(ch) != 0x7F)
+    if "/" in base or "\\" in base:
+        raise ValueError("unsafe upload filename")
+    # Split the extension off a sentinel-prefixed copy: os.path.splitext does
+    # not treat a LEADING dot as an extension separator (".csv" -> stem
+    # ".csv"), while "_.csv" splits into ("_", ".csv") — so a dot-prefixed name
+    # reads as the extension-only name it is and falls back below.
+    stem, ext = os.path.splitext("_" + base)
+    stem = stem[1:].lstrip(".").strip()
+    # Cap the WHOLE name at 200 bytes UTF-8 by trimming the stem; a cut that
+    # lands mid-codepoint drops that codepoint (errors="ignore").
+    budget = max(_UPLOAD_NAME_MAX_BYTES - len(ext.encode("utf-8")), 0)
+    stem_bytes = stem.encode("utf-8")
+    if len(stem_bytes) > budget:
+        stem = stem_bytes[:budget].decode("utf-8", errors="ignore")
+    if not stem:
+        keep = ext if ext.lower() in _UPLOAD_FALLBACK_EXTS else ""
+        return f"upload_{uuid.uuid4().hex[:8]}{keep}"
+    return stem + ext
+
+
+# ---------------------------------------------------------------------------
 # UserStore — per-session temp area (mirror of B2C UserStore)
 # ---------------------------------------------------------------------------
 class UserStore:
@@ -1485,11 +1526,19 @@ class UserStore:
         self._ensure_layout()
 
     def save_upload(self, filename: str, content: bytes) -> Path:
-        out = self.files_dir / filename
+        """Store one uploaded file under `files_dir`, returning its path.
+
+        The name is sanitized first and the resolved target re-checked against
+        `files_dir` — the stored name (not the client's) is what lands in meta.
+        """
+        safe_name = sanitize_upload_filename(filename)
+        out = self.files_dir / safe_name
+        if not out.resolve().is_relative_to(self.files_dir.resolve()):
+            raise ValueError("unsafe upload filename")
         out.write_bytes(content)
         meta = self.read_meta()
-        if filename not in [f.get("file_name") for f in meta.get("files", [])]:
-            meta.setdefault("files", []).append({"file_name": filename, "schema": {}})
+        if safe_name not in [f.get("file_name") for f in meta.get("files", [])]:
+            meta.setdefault("files", []).append({"file_name": safe_name, "schema": {}})
             self.write_meta(meta)
         return out
 
@@ -1528,6 +1577,22 @@ class UserStore:
         except Exception as e:
             log_with_sid(self.sid, "warning", f"UPLOAD_LOAD_REPORT_FAILED: {e}")
         return dfs, report
+
+
+# ---------------------------------------------------------------------------
+# Conversation ids
+# ---------------------------------------------------------------------------
+# `new_conversation` mints "cv_" + secrets.token_hex(8), so every stored
+# conversation file is exactly this shape. The id arrives from the HTTP request
+# and is joined into `conversations_dir / f"{conv_id}.jsonl"`, so it gets the
+# same guard every other id in this codebase has: readers fall back to an empty
+# history, writers no-op.
+_CONV_ID_RE = re.compile(r"^cv_[0-9a-f]{16}$")
+
+
+def valid_conv_id(value) -> bool:
+    """True only for a canonical `cv_<16 lowercase hex>` conversation id."""
+    return bool(isinstance(value, str) and _CONV_ID_RE.match(value))
 
 
 # ---------------------------------------------------------------------------
@@ -1694,6 +1759,10 @@ class ChatDataStore:
         return new
 
     def append_history(self, conv_id: str, message: dict) -> None:
+        if not valid_conv_id(conv_id):
+            log_with_sid(self.chat_id, "warning",
+                         f"CONV_ID_INVALID append_history conv_id={str(conv_id)[:40]}")
+            return
         p = self.conversations_dir / f"{conv_id}.jsonl"
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as fh:
@@ -1703,6 +1772,8 @@ class ChatDataStore:
             fh.write(json.dumps(_json_safe(message), ensure_ascii=False) + "\n")
 
     def get_history(self, conv_id: str) -> list[dict]:
+        if not valid_conv_id(conv_id):
+            return []
         p = self.conversations_dir / f"{conv_id}.jsonl"
         if not p.exists():
             return []
@@ -1721,6 +1792,8 @@ class ChatDataStore:
         it) before re-running with the edited question. Verbatim port of global
         `storage.ChatDataStore.truncate_conv_history`.
         """
+        if not valid_conv_id(conv_id):
+            return []
         history = self.get_history(conv_id)
         if keep_count >= len(history):
             return history

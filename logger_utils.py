@@ -1,6 +1,7 @@
 """Centralized logging setup writing both to file and console."""
 import io
 import logging
+import logging.handlers
 import sys
 from pathlib import Path
 from settings import settings
@@ -25,8 +26,14 @@ def get_logger():
             log_dir.mkdir(parents=True, exist_ok=True)
             log_path = log_dir / "datachat.log"
             
-            # Create file handler with explicit error handling
-            fh = logging.FileHandler(str(log_path), encoding="utf-8", mode='a')
+            # Rotating file handler: the log file is bounded, so it can never
+            # fill the container's disk (LOG_MAX_BYTES / LOG_BACKUP_COUNT).
+            fh = logging.handlers.RotatingFileHandler(
+                str(log_path),
+                maxBytes=settings.LOG_MAX_BYTES,
+                backupCount=settings.LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            )
             fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
             fh.setFormatter(fmt)
             logger.addHandler(fh)

@@ -42,6 +42,16 @@ class Settings(BaseModel):
     CLIENT_LLM_DEBUG: bool = Field(default_factory=lambda: os.getenv("CLIENT_LLM_DEBUG", "").strip().lower() in ("1", "true", "yes", "on"))
     CLIENT_LLM_DEBUG_MAX_CHARS: int = Field(default_factory=lambda: int(os.getenv("CLIENT_LLM_DEBUG_MAX_CHARS", "20000")))
 
+    # Session cookie hardening. ON by default: the signed session cookie must
+    # not travel over plain HTTP, where any network observer can replay it.
+    # Set false ONLY for plain-HTTP local development.
+    SESSION_HTTPS_ONLY: bool = Field(default_factory=lambda: os.getenv("SESSION_HTTPS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on"))
+
+    # Application log rotation (logs/datachat.log). Without it the file grows
+    # until it fills the container's disk.
+    LOG_MAX_BYTES: int = Field(default_factory=lambda: int(os.getenv("LOG_MAX_BYTES", str(50 * 1024 * 1024))))
+    LOG_BACKUP_COUNT: int = Field(default_factory=lambda: int(os.getenv("LOG_BACKUP_COUNT", "5")))
+
     # Same prompt-trim defaults as the B2C app (used by the client when it
     # builds schema text and history before posting to the brain).
     PROMPT_HISTORY_TRIM_CHARS: int = Field(default_factory=lambda: int(os.getenv("PROMPT_HISTORY_TRIM_CHARS", "800")))

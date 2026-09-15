@@ -37,7 +37,8 @@ def client(tmp_path, monkeypatch):
     role = roles_store.RolesStore().create_role(
         {"name": "PU", "scope_grants": []}, actor=ADMIN2)
     auth.set_data_role(POWER, role["id"])
-    return TestClient(app_mod.app)
+    # https base_url: the session cookie is Secure, so an http client never sends it back.
+    return TestClient(app_mod.app, base_url="https://testserver")
 
 
 def _login(client, email):

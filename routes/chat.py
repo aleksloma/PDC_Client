@@ -666,8 +666,9 @@ async def probe_columns(request: Request, chat_id: str,
     if err:
         return err
     try:
-        from pathlib import Path as _Path
-        fname = _Path(file.filename or "").name   # strip any path components
+        # Sanitized, never just `.name`: Path("..").name is "..", which made
+        # `files_dir / fname` point at the parent directory.
+        fname = local_store.sanitize_upload_filename(file.filename or "")
         if not fname:
             return {"ok": False}
         store = local_store.ChatDataStore(chat_id)

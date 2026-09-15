@@ -172,7 +172,8 @@ _REMEMBER_ME_MAX_AGE = 30 * 24 * 60 * 60   # ~30 days
 
 app = FastAPI(title="PowerDataChat Client (enterprise)", version="1.0", lifespan=lifespan)
 app.add_middleware(RememberMeSessionMiddleware, secret_key=settings.SECRET_KEY,
-                   same_site="lax", max_age=_REMEMBER_ME_MAX_AGE)
+                   same_site="lax", max_age=_REMEMBER_ME_MAX_AGE,
+                   https_only=settings.SESSION_HTTPS_ONLY)
 
 # Static assets (copied byte-for-byte from the B2C app)
 app.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static")

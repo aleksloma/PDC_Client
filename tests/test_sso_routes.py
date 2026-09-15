@@ -405,7 +405,8 @@ def real_app_client(tmp_path, monkeypatch):
     monkeypatch.setattr(brain_client, "post_activity", lambda *a, **k: None)
     monkeypatch.setattr(auth_mod, "_send_welcome_email_async", lambda email: None)
     import app as app_mod
-    return TestClient(app_mod.app)
+    # https base_url: the session cookie is Secure, so an http client never sends it back.
+    return TestClient(app_mod.app, base_url="https://testserver")
 
 
 def test_auto_redirect_and_local_escape(real_app_client):
