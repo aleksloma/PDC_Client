@@ -237,6 +237,8 @@ Agents (`.claude/agents/`):
 - **ui-tester** — Playwright against `http://localhost:8091/lab` only, with
   `tools/fixtures/` data and test accounts only; reports root cause with
   file:line (dashboard.js / routes / templates), never fixes.
+- **sec-test-writer / sec-coder / sec-checker / sec-recommender** — the
+  security-remediation team; see "Security remediation (temporary)" below.
 
 Skills:
 
@@ -260,6 +262,33 @@ Skills:
    named in the commit body and mirrored into the docs in the same commit.
 6. **No data loss on update** — see "Data safety" above; stored-shape changes
    carry an old-shape regression test.
+
+## Security remediation (temporary)
+
+`docs/security/` is a LOCAL-ONLY, git-ignored working folder for an external
+security re-assessment. It is never committed and never pushed.
+
+- Before any task that touches security findings, read
+  `docs/security/SECURITY_REMEDIATION_TASKS.md` and work on **exactly one
+  numbered task per session**. The per-task agent flow is in
+  `docs/security/WORKFLOW.md` (agents `sec-test-writer`, `sec-coder`,
+  `sec-checker`, `sec-recommender` in `.claude/agents/`).
+- **Outputs of remediation tasks split in two.** Everything written under
+  `docs/security/` (investigation reports, audit tables, isolation evidence,
+  Trivy reports, `RECOMMENDATIONS.md`, `ANALYSIS_STATUS.md`) is local-only
+  evidence: never committed, delivered to the assessor as a separate package
+  outside git, and deleted with the folder after re-assessment. Durable
+  documentation produced by the same tasks (`docs/ENTERPRISE_ARCHITECTURE.md`,
+  `docs/AI_CONSTITUTION.md`, `CLAUDE.md`, `CUSTOMER_INSTALL.md`,
+  `docs/BUILD_AND_RUN.md`, `docs/PROTOCOL.md`, `docs/DB_TABLES_PLAN.md`,
+  `docs/LIVE_TABLES_PLAN.md`) lives in `docs/` and IS committed as usual.
+- A session that depends on a `docs/security/` file produced by an earlier
+  task (e.g. `EXECUTOR_INVESTIGATION.md`) must check the file exists locally
+  first and stop with a clear message if it does not.
+- Never stage anything under `docs/security/`; verify with `git status`
+  before every commit.
+
+This folder and this section are removed when the re-assessment is accepted.
 
 ## Memory
 
