@@ -1,8 +1,9 @@
 # Customer install — PowerDataChat Client
 
 Run the PowerDataChat **client** on your own Docker server. The client holds all
-your raw data and runs entirely inside your network; only no-value metadata plus
-your per-tenant bearer token ever reach the PowerDataChat brain.
+your raw data and runs entirely inside your network. No uploaded file, result
+table, or rendered chart is ever transmitted to the PowerDataChat brain — see
+"What leaves your network" below for the exact list of what does.
 
 This is the short, operational quickstart. For build internals and the full
 endpoint contract see [`docs/BUILD_AND_RUN.md`](docs/BUILD_AND_RUN.md).
@@ -65,9 +66,9 @@ appear as "schemas" when your admin browses the connection. (SQL Server is the
 one type with an image-build dependency: the Microsoft ODBC driver is installed
 only on amd64/arm64 builds, and the admin panel greys the type out with a
 reason if it is missing.) Table
-data is snapshotted **inside your own `/data/client` volume** — like all raw
-data, it never leaves your network; only column names, types, and the
-descriptions your admin confirms are shared with the AI.
+data is snapshotted **inside your own `/data/client` volume**; no row of it is
+transmitted. Column names, types, and the descriptions your admin confirms are
+shared with the AI — see "What leaves your network" below.
 
 **Ask your DBA to create a dedicated read-only database login for
 PowerDataChat with SELECT-only grants** (ideally on a read replica). The
@@ -97,6 +98,17 @@ docker run -d --name pdc-client -p 8000:8000 \
 (Prefer Docker Compose? See [`docker-compose.yml`](docker-compose.yml) in this
 repo — `docker compose up -d`.)
 
+### Serve it over HTTPS
+
+The session cookie is marked `Secure`, so browsers return it only over HTTPS
+(`http://localhost` is exempt). Put the container behind your own TLS
+terminator — a reverse proxy or load balancer with your certificate — and
+publish that HTTPS address to your users.
+
+If you must run plain HTTP on the LAN, set `SESSION_HTTPS_ONLY=false` in
+`client.env`. Sessions then travel unencrypted and can be captured on your
+network; only do this on an isolated segment or for a short evaluation.
+
 ## 4. Verify
 
 - Open `http://<host>:8000` → enter your work email → you land in `/lab`.
@@ -116,13 +128,44 @@ repo — `docker compose up -d`.)
   `tenant_token_configured` is `false`, `BRAIN_TENANT_TOKEN` is empty in
   `client.env`.
 
+## What leaves your network
+
+No uploaded file, DataFrame, query result set, or rendered chart is ever
+transmitted. What does cross to the brain over HTTPS: the question text, schema
+and column names and descriptions, capped aggregate profile statistics (at most
+5 top values per column, 40 characters each), scalar result previews, and answer
+text truncated to 500 characters for reports. These can contain individual
+values derived from your data. User email is sent for tenant routing.
+
+### Data that leaves the container
+
+| What | Sent when | Shape |
+|---|---|---|
+| Question text | Every question | Verbatim, as typed |
+| Conversation history | Every question | Past turns: role, content, generated code |
+| Schema text and column metadata | Every question | Table/sheet names, column names, dtypes, the descriptions your admin confirms, cardinality and truncated unique-value hints |
+| Dataset profile | Every question | Row/duplicate counts, null rates, min/max, constant and all-unique flags, up to 5 top values per column truncated to 40 characters |
+| Generated code and execution errors | Every question and retry | Python source, traceback text |
+| Excel header text above a table | Upload, when a sheet has text above the table and no description | The extracted text VERBATIM, truncated to 2000 characters — it is read from your file, so treat it as content |
+| File and sheet names | Upload and every question | The name as STORED after sanitization, plus sheet names |
+| Share invitations | Sharing a chat or dashboard | Recipient addresses, the item title, and the note the sender types |
+| Scalar result previews | Summarize step | Single text/number/true-false values only — tables and DataFrames are dropped |
+| Answer text | Report generation | Question and answer truncated to 500 characters, code snippet to 300 |
+| Table column names | Report generation | Column NAMES only, first 10 — never rows |
+| User email | Every call | Tenant routing and per-user activity |
+| Activity events | Login, upload, chat, report | Event name, user email, lightweight counters |
+| Password-reset payload | Password reset only | The e-mail address and a temporary password, relayed through the brain's mail service (a tokenized reset link replaces this in a future release) |
+
+Never sent: uploaded files, DataFrames, query result sets, rendered charts or
+decks, and your branded templates.
+
 ## Notes
 
 - **One tenant token per customer.** If service stops with `403`, your token may
   have been revoked — contact PowerDataChat.
 - **Your data stays yours.** Raw uploads, chats, and rendered decks live only in
-  the `/data/client` volume on your server and never leave it. Only no-value
-  metadata and the bearer token reach the brain.
+  the `/data/client` volume on your server and are never transmitted. See
+  "What leaves your network" for exactly what does reach the brain.
 - **Upgrades:** pull/load the new image tag, then `docker rm -f pdc-client` and
   re-run step 3 with the new tag. The `pdc_client_data` volume (your data) is
   preserved across upgrades.

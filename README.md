@@ -3,7 +3,8 @@
 The **client** half of the PowerDataChat enterprise (on-prem) edition.
 Runs inside the customer's LAN. Holds raw data, runs generated Python
 locally, renders charts, generates reports, and serves the `/lab` chat
-dashboard. **Raw data values never leave this container.**
+dashboard. **No uploaded file, result table, or rendered chart is ever
+transmitted off this container.**
 
 ## What this repo is
 
@@ -22,20 +23,46 @@ the chat UI surfaces a single "service unavailable" error.
   `/lab` UI. All raw data + result tables + rendered files stay on
   this server.
 - **Brain** (a separate, hosted service operated by PowerDataChat) —
-  the LLM gateway. Receives only column names, schema
-  text, sampled metadata, generated code, error text, and findings
-  with no row values. Never receives DataFrames, rendered charts, or
-  the customer's templates.
+  the LLM gateway. Receives column names, schema text, sampled
+  metadata, generated code, error text, and findings — see the table
+  below for the exact list. Never receives uploaded files, DataFrames,
+  query result sets, rendered charts, or the customer's templates.
 
 ## Data boundary (the whole point)
 
-- **Raw data never leaves this container.** Only column names + schema
-  metadata + generated code + scalar previews + findings (no values)
-  cross to the brain.
+No uploaded file, DataFrame, query result set, or rendered chart is ever
+transmitted. What does cross to the brain over HTTPS: the question text, schema
+and column names and descriptions, capped aggregate profile statistics (at most
+5 top values per column, 40 characters each), scalar result previews, and answer
+text truncated to 500 characters for reports. These can contain individual
+values derived from your data. User email is sent for tenant routing.
+
 - The summarizer's `_safe_preview` helper in
   [`run_chat_local.py`](run_chat_local.py) is the hard guard: only
   `str | int | float | bool` pass through; dicts, lists, and
   DataFrames become `None`. Do not weaken it.
+
+### Data that leaves the container
+
+| What | Sent when | Shape |
+|---|---|---|
+| Question text | Every question | Verbatim, as typed |
+| Conversation history | Every question | Past turns: role, content, generated code |
+| Schema text and column metadata | Every question | Table/sheet names, column names, dtypes, descriptions, cardinality and truncated unique-value hints |
+| Dataset profile | Every question | Row/duplicate counts, null rates, min/max, constant and all-unique flags, up to 5 top values per column truncated to 40 characters |
+| Generated code and execution errors | Every question and retry | Python source, traceback text |
+| Excel header text above a table | Upload, when a sheet has text above the table and no description | The extracted text VERBATIM, truncated to 2000 characters — it is read from your file, so treat it as content |
+| File and sheet names | Upload and every question | The name as STORED after sanitization, plus sheet names |
+| Share invitations | Sharing a chat or dashboard | Recipient addresses, the item title, and the note the sender types |
+| Scalar result previews | Summarize step | Single `str`/`int`/`float`/`bool` values only — dicts, lists and DataFrames are dropped |
+| Answer text | Report generation | Question and answer truncated to 500 characters, code snippet to 300 |
+| Table column names | Report generation | Column NAMES only, first 10 — never rows |
+| User email | Every call | Tenant routing and per-user activity |
+| Activity events | Login, upload, chat, report | Event name, user email, lightweight counters |
+| Password-reset payload | Password reset only | The e-mail address and a temporary password, relayed through the brain's mail service (a tokenized reset link replaces this in a future release) |
+
+Never sent: uploaded files, DataFrames, query result sets, rendered charts or
+decks, and your branded templates.
 
 ## Repository layout
 
