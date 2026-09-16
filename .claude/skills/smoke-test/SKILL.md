@@ -26,6 +26,11 @@ upgrading the image against their existing data. Never native `uvicorn` runs.
    ```
    docker compose -f docker-compose.local.yml up -d --build
    ```
+   If anything from this run will be quoted later (`GET /version`, the admin
+   sidebar's build stamp), commit first or pass the sha: `BUILD_COMMIT` is read
+   from `git rev-parse HEAD` at build time, so an uncommitted tree stamps the
+   image with the PREVIOUS commit and the container then reports a commit that
+   lacks the change under test.
 4. **Health**: `curl -s http://localhost:8091/health` → 200 with
    `brain_reachable: true` and `tenant_token_configured: true`.
 5. **Pre-existing state intact** (the upgrade-safety check): open `/lab`,

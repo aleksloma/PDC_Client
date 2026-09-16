@@ -51,6 +51,14 @@ docker build -t powerdatachat-client:enterprise-<git-sha-or-date> \
 ```
 The build args are what `GET /version` and the admin sidebar report — omit
 them and the running image can only say when it started.
+
+**Build from the COMMITTED tree, or pass the sha explicitly.** `git rev-parse
+HEAD` is evaluated when the build command runs, so building with uncommitted
+changes stamps the image with the PREVIOUS commit — the running container then
+reports a commit that does not contain the code it is running, which is
+indistinguishable from having deployed the wrong image. Either commit first,
+or pass the intended sha (`--build-arg BUILD_COMMIT=<sha>`) and re-capture
+anything that quotes `/version` afterwards.
 (`:enterprise` stays a local/moving tag; customers get immutable tags so
 rollback is deterministic.)
 
