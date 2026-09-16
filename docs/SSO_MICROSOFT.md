@@ -135,7 +135,7 @@ ladmin page returns the landing page to the plain password form instantly.
 | `AADSTS90002` on Test | Tenant not found — wrong Tenant ID. |
 | `AADSTS7000215` on Test | Invalid client secret — you likely pasted the secret's *ID* instead of its *Value*, or the secret expired. Create a new one and rotate it here. |
 | `AADSTS500011` / `AADSTS65001` on Test (yellow) | Tenant policy blocks the app-only test token. Credentials are fine; Enable still works — try a real browser sign-in. |
-| "Microsoft sign-in failed" after the Microsoft page | Check the container log (`logs/datachat.log`, events `SSO_CALLBACK_FAILED` / `SSO_CALLBACK_NO_EMAIL`). A guest account without a usable `preferred_username`/`email` claim cannot sign in. |
+| "Microsoft sign-in failed" after the Microsoft page | Check the container log (`/data/client/logs/datachat.log`, events `SSO_CALLBACK_FAILED` / `SSO_CALLBACK_NO_EMAIL`). A guest account without a usable `preferred_username`/`email` claim cannot sign in. |
 | Token validation errors mentioning `iat`/`exp`/`nbf` | Clock skew — the container's clock must be NTP-accurate (JWT validation allows only small leeway). |
 | Everyone in the tenant can sign in | Enable **Assignment required** on the enterprise application (Step 1.6). |
 | SSO stopped working after a key rotation | Rotating `CLIENT_ENCRYPTION_KEY` without `CLIENT_ENCRYPTION_KEY_OLD` makes the stored secret unreadable — the ladmin page shows "re-enter it"; paste the secret again. |

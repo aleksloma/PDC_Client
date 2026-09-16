@@ -92,11 +92,53 @@ Mount a persistent volume there so nothing is lost on restart/upgrade:
 docker run -d --name pdc-client -p 8000:8000 \
   --env-file client.env \
   -v pdc_client_data:/data/client \
+  --read-only --tmpfs /tmp:size=512m,mode=1777 \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  --memory 4g --pids-limit 512 \
   powerdatachat-client:<tag>
 ```
 
 (Prefer Docker Compose? See [`docker-compose.yml`](docker-compose.yml) in this
-repo — `docker compose up -d`.)
+repo — `docker compose up -d`. It applies the same restrictions, so prefer it
+over a hand-written `docker run`.)
+
+### How the container is locked down
+
+The image ships hardened, and the flags above — or the equivalent lines in
+`docker-compose.yml` — are what enforce it at run time. Keep them.
+
+| Restriction | What it means |
+|---|---|
+| Runs as an unprivileged user | uid/gid **10001** (`pdc`), never root. |
+| Read-only container filesystem | The application cannot modify its own code or image. |
+| `/tmp` on a 512 MB RAM disk | The only writable scratch space: chart-rendering caches, and the temporary copy of every file being uploaded. Wiped on every restart. |
+| All Linux capabilities dropped | No raw sockets, no mounting, no privileged operations. |
+| `no-new-privileges` | A process inside can never gain more rights than it started with. |
+| Memory capped at 4 GB, 512 processes | A runaway analysis cannot exhaust the host. |
+| All state on the data volume | Uploads, chats, history, snapshots, rendered decks **and the application log** live under `/data/client` only. |
+
+Raise `--memory` if your users analyse very large files — and raise the
+`/tmp` size with it. An upload is written to `/tmp` before it is stored, so a
+single batch of uploaded files must fit in that 512 MB; users uploading larger
+files get an upload error. Both values are RAM, so raise them together and keep
+`/tmp` well below `--memory`.
+
+The log is at `/data/client/logs/datachat.log` on the volume, so it survives
+restarts and upgrades.
+
+### Restrict what the container can reach (recommended)
+
+The client needs outbound HTTPS to your `BRAIN_URL` and, if you register
+database tables, TCP to those database hosts. Nothing else. On a
+security-sensitive network apply a default-deny egress rule on the host or
+firewall and allow only:
+
+- `BRAIN_URL` on port 443,
+- each registered database host on its configured port,
+- your internal DNS and NTP servers.
+
+Inbound, only the port you publish needs to be reachable by your users — 8000,
+or the HTTPS port of the reverse proxy in front of it.
 
 ### Serve it over HTTPS
 
@@ -169,6 +211,23 @@ decks, and your branded templates.
 - **Upgrades:** pull/load the new image tag, then `docker rm -f pdc-client` and
   re-run step 3 with the new tag. The `pdc_client_data` volume (your data) is
   preserved across upgrades.
+- **ONE-TIME STEP when upgrading an install created before this release.** The
+  container now runs as user 10001 instead of root, and an existing data volume
+  is still owned by root, so the new container cannot write to it. Hand the
+  volume over ONCE, with the container stopped:
+
+  ```
+  docker run --rm -v pdc_client_data:/data alpine chown -R 10001:10001 /data
+  ```
+
+  Skip it and the container starts but fails on its first write: `docker logs
+  pdc-client` shows `Permission denied`, and users can neither sign in nor
+  upload. A volume created by this release or later already has the right
+  owner. Run it again after restoring a backup taken from an older install.
+- **The log moved onto your data volume.** It is now
+  `/data/client/logs/datachat.log` (it used to live inside the container),
+  because the container filesystem is read-only. Collect `datachat.log*` from
+  the volume.
 - **BREAKING on upgrade if you serve plain HTTP.** From this release the
   session cookie is marked `Secure`, so a browser will not send it back over
   `http://`. Users on an HTTP install see the login form again after signing in

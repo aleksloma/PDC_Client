@@ -124,17 +124,31 @@ tenant existing in the local brain volume, a STABLE `SECRET_KEY`).
 
 ### Data preservation (hard rules)
 
-- The volumes `pdc_brain_data`, `pdc_brain_logs`, `pdc_client_data`,
-  `pdc_client_logs` are declared **`external: true`** — compose never
-  creates or deletes them. All tenants, tokens, templates, users, and
-  history live there and MUST survive every rebuild.
+- The volumes `pdc_brain_data`, `pdc_brain_logs` and `pdc_client_data` are
+  declared **`external: true`** — compose never creates or deletes them. All
+  tenants, tokens, templates, users, and history live there and MUST survive
+  every rebuild. `pdc_client_logs` is NO LONGER MOUNTED by the client stack
+  (the client log lives at `/data/client/logs/datachat.log` on
+  `pdc_client_data`), but the volume still exists on the host, still holds the
+  older log history, and must not be deleted either.
+- **The client container runs as uid 10001 on a read-only filesystem.** A data
+  volume created by an older, root-running image must be handed over ONCE,
+  with the container stopped, or the app cannot write to it:
+
+  ```powershell
+  docker run --rm -v pdc_client_data:/data alpine chown -R 10001:10001 /data
+  ```
+
+  The same one-time step applies after restoring a backup taken before the
+  hardened image. Only `/tmp` (a tmpfs) and the data volume are writable, so
+  nothing the app writes can land inside the image any more.
 - **NEVER run `docker compose down -v`** or otherwise remove/recreate these
   volumes. `up -d --build` is the correct redeploy: it replaces the
   container, the data stays — exactly like production.
 - **Back up the volume contents before a rebuild**:
 
   ```powershell
-  # repeat for each of the four pdc_* volumes
+  # repeat for each pdc_* volume you keep
   docker run --rm -v pdc_brain_data:/src -v C:\tmp\pdc_backup\pdc_brain_data:/dest `
       alpine cp -a /src/. /dest/
   ```
@@ -480,7 +494,10 @@ The data comes from `tenants/{tenant_id}/users.jsonl` and
   text (during retry), and usage tokens. Per the architecture, the brain
   only ever sees no-raw-value data, so logging everything it receives is
   safe.
-- **Client logs** (in `logs/datachat.log`): upload events, code execution
+- **Client logs** (in `<DATA_ROOT>/logs/datachat.log` —
+  `/data/client/logs/datachat.log` in the container, on the data volume; the
+  container's own filesystem is read-only, so the log cannot live inside the
+  image): upload events, code execution
   errors (which contain raw data values, like KeyError row indices),
   and brain HTTP responses. These stay on the client server and never
   leave it. The file ROTATES: at `LOG_MAX_BYTES` (default 50 MB) it rolls

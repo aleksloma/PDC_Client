@@ -10,14 +10,19 @@ upgrading the image against their existing data. Never native `uvicorn` runs.
 
 ## Steps
 
-1. **Backup the volumes before a rebuild** (PowerShell, one per volume):
+1. **Backup the data volume before a rebuild** (PowerShell). It now carries
+   the log too (`/data/client/logs/datachat.log`); `pdc_client_logs` is no
+   longer mounted so it needs no backup — but never delete it, it holds the
+   older history:
    ```powershell
    docker run --rm -v pdc_client_data:/src -v C:\tmp\pdc_backup\pdc_client_data:/dest alpine cp -a /src/. /dest/
-   docker run --rm -v pdc_client_logs:/src -v C:\tmp\pdc_backup\pdc_client_logs:/dest alpine cp -a /src/. /dest/
    ```
 2. **Brain reachable**: either the local brain stack from `../PDC_Brain`
    (`:8090`) or whatever `BRAIN_URL` is configured in `client.local.env`.
-3. **Rebuild + start**:
+3. **Rebuild + start**. The container runs as uid 10001 on a read-only
+   rootfs; a volume that predates that image needs the one-time
+   `docker run --rm -v pdc_client_data:/data alpine chown -R 10001:10001 /data`
+   (see `docs/BUILD_AND_RUN.md` §3) or the app cannot write:
    ```
    docker compose -f docker-compose.local.yml up -d --build
    ```

@@ -7,8 +7,12 @@ Diagnose first, then report: root cause with `file:line`, evidence (log
 lines), and the minimal proposed fix. Do NOT apply the fix unless asked.
 
 Where to look, in order:
-1. Local stack: `docker logs pdc-client --tail 200`. Native pytest runs log
-   to `logs/datachat.log` (dev server history in `logs/uvicorn_dev.log`).
+1. Local stack: `docker logs pdc-client --tail 200`, or the file log on the
+   data volume:
+   `docker exec pdc-client tail -100 /data/client/logs/datachat.log`.
+   Native runs log to `<DATA_ROOT>/logs/datachat.log`, falling back to
+   `logs/datachat.log` next to the code when DATA_ROOT is not writable (dev
+   server history in `logs/uvicorn_dev.log`).
 2. Log format: `[sid] LEVEL message key=value ...` via `log_with_sid` —
    grep by `sid` (chat/session id) to follow one request.
 3. Health: `curl -s http://localhost:8091/health` — must show
