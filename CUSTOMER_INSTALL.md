@@ -230,6 +230,13 @@ decks, and your branded templates.
   release still works — it runs as root, which ignores file ownership. But
   everything it writes from then on belongs to root again, so if you later move
   forward to this release a second time, run the `chown` command again.
+- **Rolling back is also safe for the cached data files.** This release ships a
+  newer Parquet library, and the database snapshots and parse caches it writes
+  are read back correctly by the older library in the previous image (checked in
+  both directions before release). Even if a file were unreadable, nothing is
+  lost: a snapshot
+  is re-created by the next refresh and a parse cache is rebuilt from your
+  original upload.
 - **The log moved onto your data volume.** It is now
   `/data/client/logs/datachat.log` (it used to live inside the container),
   because the container filesystem is read-only. Collect `datachat.log*` from
@@ -241,3 +248,19 @@ decks, and your branded templates.
   installer's own laptop, because browsers exempt `http://localhost`. Before
   upgrading, either front the container with TLS (see "Serve it over HTTPS") or
   add `SESSION_HTTPS_ONLY=false` to `client.env`.
+- **Test single sign-on right after this upgrade if you use it.** The library
+  that validates the Microsoft identity token changed in this release. Sign-in
+  through Microsoft is exercised end to end for the first time on your own
+  tenant, so have an administrator complete one Microsoft sign-in immediately
+  after upgrading rather than discovering it on Monday morning. If it fails,
+  `https://<your-host>/?local=1` always shows the email-and-password form, so
+  administrators can still get in while you contact PowerDataChat. The log line
+  to quote is `SSO_CALLBACK_FAILED` in `/data/client/logs/datachat.log`.
+- **Security fixes in the Python layer arrive only as a new image tag.** The
+  container filesystem is read-only and it runs as an unprivileged user, so
+  nothing inside a running container can install or change a package — that is
+  by design, not an oversight. Every dependency is pinned to an exact version
+  and the whole set is scanned before a release, which is what makes an upgrade
+  reproducible. When you receive a CVE notice about a Python package, the fix is
+  a new tag from PowerDataChat plus the upgrade above; do not try to install
+  anything into the container.

@@ -26,10 +26,22 @@ but code — their users, chats, uploads, and history live on the volume.
   ```
   must print `pdc`. The compose files add the read-only rootfs and the limits,
   but the identity has to be in the image.
-- **Dependencies still clean**: `pip-audit` (throwaway venv, never the image)
-  against `docker run --rm <tag> pip list --format=freeze` reports no
-  vulnerabilities. The pinned set is the security deliverable, and transitives
-  that are not pinned can drift on any rebuild.
+- **Dependencies still clean**: run the audit in `docs/BUILD_AND_RUN.md` §8
+  (throwaway venv, the BUILT image's freeze as input, BOTH advisory services)
+  and get no vulnerabilities. The pinned set is the security deliverable, and
+  transitives that are not pinned can drift on any rebuild. The unit suite only
+  guards the floors already reached — this scan is the detector.
+- **The image ships what the pin file says**: nothing else verifies it, since
+  the image has no test runner, so the suite's installed-equals-pinned check
+  only ever covers the developer's venv.
+  ```
+  docker run --rm powerdatachat-client:enterprise-<tag> pip list --format=freeze > /tmp/image.txt
+  grep -E '^[A-Za-z0-9].*==' requirements.txt | sed 's/\[.*\]//' | while read -r pin; do
+    grep -qix "$pin" /tmp/image.txt || echo "MISMATCH: $pin"
+  done
+  ```
+  Any `MISMATCH` line means the image was built from a different pin file (or a
+  pin was edited after the build) — rebuild before shipping.
 
 ## 2. Build an immutable tag
 ```
@@ -61,7 +73,11 @@ Per `CUSTOMER_INSTALL.md` / `docker-compose.yml`: load/pull the new image,
 update the tag in their compose file, `docker compose up -d`. Their volume
 is untouched. **Rollback** = re-run compose with the previous tag — same
 volume, so it must also be data-compatible (that's why stored shapes only
-ever change backward-compatibly). Rolling back to an image older than the
+ever change backward-compatibly — including the Parquet writer: snapshots and
+parse caches written by the current pyarrow are read back by the version the
+previous image shipped, checked before release with the recipe in
+`tests/test_parquet_old_writer_compat.py`, and both artifacts regenerate
+anyway). Rolling back to an image older than the
 non-root release works (root ignores ownership), but everything that image
 writes afterwards is root-owned again, so rolling forward a second time needs
 the one-time `chown -R 10001:10001` repeated.

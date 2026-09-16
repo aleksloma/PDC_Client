@@ -518,3 +518,52 @@ The data comes from `tenants/{tenant_id}/users.jsonl` and
   (`52428800`, not `50MB` and not `50_000_000`); anything else falls back to
   the default instead of raising, and both are clamped to a minimum, so
   rotation cannot be switched off from the environment.
+
+---
+
+## 8. Dependency audit (release gate)
+
+Every runtime dependency in `requirements.txt` is pinned to an exact version,
+and the security-relevant transitives (`starlette` for fastapi, `joserfc` for
+Authlib, `pillow` for matplotlib) are pinned explicitly even though a parent
+pulls them — their parents' bounds are open-ended, so an unpinned rebuild of
+the same commit could ship a different, never-audited version.
+
+Scan before every customer release, and treat a finding as a release blocker
+until it is either fixed or written down as accepted:
+
+```bash
+# 1. a THROWAWAY venv — never the project venv, never inside the image
+python -m venv /tmp/audit && /tmp/audit/bin/pip install -q pip-audit
+
+# 2. the input is the BUILT IMAGE's installed set, not requirements.txt
+docker run --rm powerdatachat-client:enterprise-<tag> \
+  pip list --format=freeze > /tmp/audit/image.txt
+
+# 3. BOTH advisory services — they do not carry the same records
+/tmp/audit/bin/pip-audit --no-deps --disable-pip -r /tmp/audit/image.txt
+/tmp/audit/bin/pip-audit --no-deps --disable-pip -r /tmp/audit/image.txt -s osv
+```
+
+Why each detail matters:
+
+- **The image, not `requirements.txt`.** The freeze lists transitives that the
+  pin file never names, and `pip` itself. Auditing only the pin file misses
+  exactly the packages nobody chose deliberately.
+- **Both services.** The default (PyPI) and OSV databases overlap but neither
+  is a superset; a package can be clean in one and flagged in the other.
+- **`--no-deps --disable-pip`** keeps the scan a pure lookup over the versions
+  you actually ship, instead of resolving a fresh dependency tree.
+- **On Windows** set `PYTHONUTF8=1` first, or writing the report crashes on the
+  console codepage.
+- A **fix version** in the output is the version to pin to; bump the whole
+  affected family at once rather than one package at a time, then re-run the
+  suite, because a framework bump can change an API the app calls.
+- The unit suite is NOT a detector. `tests/test_dependency_pins.py` pins the
+  floors already reached, so it can only catch a downgrade; a newly published
+  advisory against a current pin leaves it green. This scan is the detector.
+
+This covers the Python layer only. The operating-system packages in the base
+image need their own scanner (the image is referenced by tag, so a rebuild can
+also move the base underneath you); that scan is not part of the release
+checklist yet.
