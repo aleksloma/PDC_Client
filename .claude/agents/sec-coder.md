@@ -35,8 +35,11 @@ Rules of engagement:
 - Stored-format changes stay backward compatible and carry an old-shape
   regression test. Nothing may delete or overwrite state under `DATA_ROOT`.
 - Run `.venv/Scripts/python.exe -m pytest tests/ -q --ignore=tests/test_export_plotly_png.py`
-  (the ignored file hangs on Windows; it runs inside the Linux container).
-  Never weaken or delete an existing test to get green.
+  (the ignored file hangs on this Windows box's kaleido, and it cannot run in
+  the container either — pytest is not in `requirements.txt`, so the image has
+  no test runner. Verify that path by driving `routes.report._plotly_html_to_png`
+  inside the container instead.) Never weaken or delete an existing test to get
+  green.
 - Finish with the `CLAUDE.md` per-file notes updated for the touched files
   and, where the task names them, the durable docs under `docs/`.
 

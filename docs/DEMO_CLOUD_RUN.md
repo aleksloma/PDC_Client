@@ -157,6 +157,15 @@ gcloud run deploy pdcclient-demo \
 ONLY the new image so env vars, secrets, and the volume mount carry over.
 Never use `--set-env-vars` / `--set-secrets` / `--clear-*` on the live service.
 
+> **Check before the next redeploy: the image now runs as a non-root user**
+> (uid/gid 10001, see the `Dockerfile`). The customer topology mounts a Docker
+> volume, whose ownership is handed over once with a `chown`; this service
+> mounts a Cloud Storage bucket at `/data/client` instead, and a gcsfuse mount
+> is not guaranteed to be writable by a non-root container user. That has not
+> been verified against this service. Deploy a new image to a revision with no
+> traffic first, sign in, and confirm a chat writes — a failure looks like a
+> HEALTHY service that returns 500 on login, not like a crash.
+
 ```bash
 gcloud run deploy pdcclient-demo --project=pdc-enterprise --region=europe-west1 \
   --image=europe-west1-docker.pkg.dev/pdc-enterprise/client/pdcclient-demo:<new-git-sha>

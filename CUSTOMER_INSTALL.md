@@ -226,6 +226,10 @@ decks, and your branded templates.
   when they try to sign in. Do not judge this upgrade by the health check. A
   volume created by this release or later already has the right owner. Run the
   command again after restoring a backup taken from an older install.
+- **Rolling back after that step.** Going back to an image from before this
+  release still works — it runs as root, which ignores file ownership. But
+  everything it writes from then on belongs to root again, so if you later move
+  forward to this release a second time, run the `chown` command again.
 - **The log moved onto your data volume.** It is now
   `/data/client/logs/datachat.log` (it used to live inside the container),
   because the container filesystem is read-only. Collect `datachat.log*` from

@@ -61,7 +61,7 @@ PDC_Client/
 ├── schema_builder.py        # _schema_text builder (memoized, 300s TTL)
 ├── excel_table_detector.py  # 6-stage Excel table detection
 ├── auto_analytics.py        # background job (brain planner → local exec → PPTX)
-├── code_exec.py             # safe_execute
+├── code_exec.py             # safe_execute — in the hardened container the rootfs is read-only and the process is uid 10001, so generated code can only write to /tmp (tmpfs, wiped on restart) and under DATA_ROOT: a relative `plt.savefig("x.png")` fails as a normal exec error instead of littering /app
 ├── plot_utils.py            # render_plot_safe
 ├── exec_sanitizer.py        # Article XIII pre-execution dtype sanitize gate (both exec sites)
 ├── outlier_utils.py         # deterministic outlier helpers (outlier_mask / drop_extreme_outliers), pre-imported at both exec sites

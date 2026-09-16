@@ -36,7 +36,11 @@ upgrading the image against their existing data. Never native `uvicorn` runs.
    upload → schema autofill populates → generate → ask a question → chart
    renders → reload page → chart persists → edit-regenerate → download PDF
    and PPTX. (Delegate to the ui-tester agent for a thorough pass.)
-7. **Clean boot**: `docker logs pdc-client --tail 50` — no tracebacks.
+7. **Clean boot + hardening intact**: `docker logs pdc-client --tail 50` — no
+   tracebacks, and no `Permission denied` / `Read-only file system` lines
+   (those mean the volume ownership or a write path regressed, and the app
+   degrades quietly rather than crashing). `docker exec pdc-client id` must
+   report uid 10001.
 8. **Unit tests**: `python -m pytest tests/ -q` — must be fully green.
 
 Any failing step blocks the commit. NEVER run `docker compose down -v` and

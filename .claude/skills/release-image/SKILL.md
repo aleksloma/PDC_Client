@@ -18,6 +18,18 @@ but code — their users, chats, uploads, and history live on the volume.
   regression tests (see `/write-tests`).
 - Docs current: `/sync-docs` clean; `CUSTOMER_INSTALL.md` still accurate for
   this version.
+- **Image runs as the non-root user** — nothing else in the repo checks the
+  shipped artifact, so a lost `USER` line would be invisible until a customer
+  ran it as root:
+  ```
+  docker image inspect --format '{{.Config.User}}' powerdatachat-client:enterprise-<tag>
+  ```
+  must print `pdc`. The compose files add the read-only rootfs and the limits,
+  but the identity has to be in the image.
+- **Dependencies still clean**: `pip-audit` (throwaway venv, never the image)
+  against `docker run --rm <tag> pip list --format=freeze` reports no
+  vulnerabilities. The pinned set is the security deliverable, and transitives
+  that are not pinned can drift on any rebuild.
 
 ## 2. Build an immutable tag
 ```
@@ -49,4 +61,7 @@ Per `CUSTOMER_INSTALL.md` / `docker-compose.yml`: load/pull the new image,
 update the tag in their compose file, `docker compose up -d`. Their volume
 is untouched. **Rollback** = re-run compose with the previous tag — same
 volume, so it must also be data-compatible (that's why stored shapes only
-ever change backward-compatibly).
+ever change backward-compatibly). Rolling back to an image older than the
+non-root release works (root ignores ownership), but everything that image
+writes afterwards is root-owned again, so rolling forward a second time needs
+the one-time `chown -R 10001:10001` repeated.
