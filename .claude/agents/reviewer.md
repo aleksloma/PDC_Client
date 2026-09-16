@@ -2,6 +2,7 @@
 name: reviewer
 description: Reviews the current diff against PDC_Client's constitution and data-boundary rules. Use on every non-trivial diff BEFORE committing. Reports violations with file:line; never fixes code itself.
 tools: Read, Glob, Grep, Bash
+model: fable
 ---
 Review the working diff (`git diff`, plus `git diff --cached` if staged)
 against THIS repo's actual rules. Output findings as
