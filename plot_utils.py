@@ -100,7 +100,7 @@ def ensure_plotly_js_asset() -> None:
     a copy failure only means new charts fall back to the CDN src, which is
     logged loudly by _plotly_js_include().
     """
-    import logging, os, shutil
+    import errno, logging, os, shutil
     try:
         import plotly as _plotly
         src = _Path(_plotly.__file__).resolve().parent / "package_data" / "plotly.min.js"
@@ -115,6 +115,18 @@ def ensure_plotly_js_asset() -> None:
         shutil.copyfile(str(src), str(tmp))
         os.replace(str(tmp), str(dst))
         logging.info(f"PLOTLY_JS_ASSET_READY {dst} ({dst.stat().st_size} bytes)")
+    except OSError as e:
+        # A read-only rootfs (or a directory not owned by the runtime user) is
+        # the EXPECTED state of the hardened container, not a failure: the
+        # asset is baked into static/vendor/ at image build time, so the
+        # size-match check above normally returns before any write and this
+        # branch only fires on a non-Docker run or an unbaked image. Info, not
+        # error. Anything else (ENOSPC, a genuinely broken copy) stays ERROR.
+        if e.errno in (errno.EROFS, errno.EACCES, errno.EPERM):
+            logging.info("PLOTLY_JS_ASSET_COPY_SKIPPED: read-only filesystem — "
+                         "the bundle baked at build time is served instead")
+            return
+        logging.error(f"PLOTLY_JS_ASSET_COPY_FAILED: {e}")
     except Exception as e:
         logging.error(f"PLOTLY_JS_ASSET_COPY_FAILED: {e}")
 

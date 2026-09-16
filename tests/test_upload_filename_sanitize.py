@@ -302,8 +302,14 @@ def test_log_rotation_defaults():
     assert backup_count == 5
 
 
-def test_get_logger_installs_rotating_file_handler_and_stdout():
+def test_get_logger_installs_rotating_file_handler_and_stdout(tmp_path, monkeypatch):
     import logger_utils
+    # Pin DATA_ROOT into tmp_path: settings.py calls load_dotenv(), so the
+    # live value is whatever the developer's .env says, and get_logger()
+    # would mkdir a logs/ directory there (CLAUDE.md: tests never touch
+    # ./client_data or the volume). Pinning also makes the path assertion
+    # below exact instead of environment-dependent.
+    monkeypatch.setattr(logger_utils.settings, "DATA_ROOT", str(tmp_path))
     logger = logging.getLogger("datachat")
     saved = list(logger.handlers)
     logger.handlers = []
@@ -316,7 +322,13 @@ def test_get_logger_installs_rotating_file_handler_and_stdout():
         assert fh.maxBytes == settings.LOG_MAX_BYTES
         assert fh.backupCount == settings.LOG_BACKUP_COUNT
         assert fh.encoding == "utf-8"
-        assert Path(fh.baseFilename).resolve() == (_ROOT / "logs" / "datachat.log").resolve()
+        # The log directory moved to DATA_ROOT/logs (2026-09-16): a read-only
+        # container rootfs cannot hold a log file, and the data volume is the
+        # only writable persistent location. <repo>/logs survives only as the
+        # non-container dev fallback, pinned in
+        # tests/test_log_dir_under_data_root.py.
+        assert Path(fh.baseFilename).resolve() == (
+            tmp_path / "logs" / "datachat.log").resolve()
         stdout_handlers = [h for h in lg.handlers
                            if type(h) is logging.StreamHandler and h.stream is sys.stdout]
         assert stdout_handlers, "stdout StreamHandler is gone"

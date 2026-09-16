@@ -125,12 +125,12 @@ def test_get_logger_rotates_and_keeps_only_backup_count_backups(
         tmp_path, monkeypatch, clean_datachat_logger):
     """Drive the REAL `logger_utils.get_logger()` at a tiny maxBytes.
 
-    The log directory is `Path(logger_utils.__file__).parent / "logs"`, so the
-    only way to redirect it without touching application code is to point the
-    module's own `__file__` at tmp_path (monkeypatch restores it).
+    The log directory is `Path(settings.DATA_ROOT) / "logs"` (Task 2 — the
+    log lives on the data volume, not in the image), so redirecting it is a
+    matter of pointing DATA_ROOT at tmp_path (monkeypatch restores it).
     """
     import logger_utils
-    monkeypatch.setattr(logger_utils, "__file__", str(tmp_path / "logger_utils.py"))
+    monkeypatch.setattr(logger_utils.settings, "DATA_ROOT", str(tmp_path))
     monkeypatch.setattr(logger_utils.settings, "LOG_MAX_BYTES", 2048, raising=False)
     monkeypatch.setattr(logger_utils.settings, "LOG_BACKUP_COUNT", 2, raising=False)
 

@@ -2,6 +2,7 @@
 import io
 import logging
 import logging.handlers
+import os
 import sys
 from pathlib import Path
 from settings import settings
@@ -16,14 +17,45 @@ class ScannerFilter(logging.Filter):
         msg = record.getMessage().lower()
         return not any(pattern in msg for pattern in scanner_patterns)
 
+def _log_dir() -> Path:
+    """The directory the log file lives in.
+
+    `<DATA_ROOT>/logs` — the log used to be written inside the image
+    (`<module dir>/logs` = `/app/logs`), which a read-only container rootfs
+    cannot hold; the mounted data volume is the only writable persistent
+    location. `settings.DATA_ROOT` and `__file__` are read at CALL time so
+    tests (and a relocated install) can redirect either.
+
+    Falls back to the old module-relative `logs/` when DATA_ROOT cannot be
+    created or is not writable — that is the non-container dev run, never the
+    container.
+    """
+    candidate = Path(settings.DATA_ROOT) / "logs"
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        if os.access(str(candidate), os.W_OK):
+            return candidate
+    except OSError as e:
+        # Any OSError subclass: a DATA_ROOT under a regular file raises
+        # FileNotFoundError / FileExistsError / NotADirectoryError depending
+        # on the platform, a read-only mount raises PermissionError. Say WHICH
+        # path failed before falling back — in a container the next failure is
+        # the read-only rootfs, and an operator reading `docker logs` would
+        # otherwise see only that second error and go looking in the image
+        # instead of at the data volume's ownership.
+        print(f"WARNING: log directory {candidate} is unusable ({e}); "
+              f"falling back to the module-relative logs directory")
+    fallback = Path(__file__).parent / "logs"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
 def get_logger():
-    """Return a configured logger writing to logs/datachat.log and stdout."""
+    """Return a configured logger writing to <DATA_ROOT>/logs/datachat.log and stdout."""
     logger = logging.getLogger("datachat")
     if not logger.handlers:
         try:
-            # Use absolute path to logs directory
-            log_dir = Path(__file__).parent / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
+            log_dir = _log_dir()
             log_path = log_dir / "datachat.log"
             
             # Rotating file handler: the log file is bounded, so it can never

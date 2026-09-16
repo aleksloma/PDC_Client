@@ -50,15 +50,41 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "8091:8000"
+    environment:
+      # The local stack is plain HTTP on a host port, so the Secure session
+      # cookie has to be off or the browser drops it.
+      - SESSION_HTTPS_ONLY=false
     volumes:
       - pdc_client_data:/data/client
-      - pdc_client_logs:/app/logs
+      # The log now lives at /data/client/logs on the data volume, so the old
+      # pdc_client_logs mount is gone. That host volume is LEFT IN PLACE (it
+      # still holds previous logs) and must never be deleted — it is simply
+      # unused from here on.
+    # Hardening, identical to the customer file: the container's own filesystem
+    # is READ-ONLY, all state lives on the data volume above, and /tmp is the
+    # only writable scratch space (matplotlib + fontconfig caches, kaleido's
+    # headless Chromium, temp files) on a tmpfs that a restart wipes. Every
+    # capability is dropped, privilege escalation is blocked, memory and
+    # process counts are bounded.
+    read_only: true
+    # NOTE ON SIZE: /tmp also carries multipart UPLOAD spooling — Starlette
+    # writes any upload part over 1 MiB to a temp file — so this cap is the
+    # ceiling on the bytes of one in-flight upload batch, not just on caches.
+    # It is RAM-backed and counted against mem_limit, so raise BOTH together
+    # for installs that ingest very large files.
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 4g
+    pids_limit: 512
+    # cpus: "2.0"   # uncomment to cap CPU
     restart: unless-stopped
 
 volumes:
-  # EXTERNAL — pre-existing volumes holding all user data + history. Compose
-  # must never create or delete these.
+  # EXTERNAL — pre-existing volume holding all user data + history. Compose
+  # must never create or delete it. (The former pdc_client_logs volume is no
+  # longer declared or mounted: logs live at /data/client/logs on this volume.
+  # The host volume is left in place and never deleted.)
   pdc_client_data:
-    external: true
-  pdc_client_logs:
     external: true

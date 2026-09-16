@@ -70,7 +70,7 @@ class Settings(BaseModel):
     # Set false ONLY for plain-HTTP local development.
     SESSION_HTTPS_ONLY: bool = Field(default_factory=lambda: os.getenv("SESSION_HTTPS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on"))
 
-    # Application log rotation (logs/datachat.log). PLAIN DIGITS only — see
+    # Application log rotation (<DATA_ROOT>/logs/datachat.log). PLAIN DIGITS only — see
     # _int_env. Without it the file grows
     # until it fills the container's disk. Both are clamped to a minimum so
     # rotation can never be switched off from the environment (maxBytes=0 means

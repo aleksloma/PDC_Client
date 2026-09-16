@@ -19,6 +19,25 @@ services:
       - "8000:8000"
     volumes:
       - pdc_client_data:/data/client          # persistent — your raw data stays here
+    # Hardening: the container's own filesystem is READ-ONLY. All state lives on
+    # the data volume above (logs included, at /data/client/logs); /tmp is the
+    # only writable scratch space (matplotlib + fontconfig caches, kaleido's
+    # headless Chromium, temp files) and it is a tmpfs, so nothing survives a
+    # restart. Every capability is dropped, privilege escalation is blocked, and
+    # memory / process counts are bounded.
+    read_only: true
+    # NOTE ON SIZE: /tmp also carries multipart UPLOAD spooling — Starlette
+    # writes any upload part over 1 MiB to a temp file — so this cap is the
+    # ceiling on the bytes of one in-flight upload batch, not just on caches.
+    # It is RAM-backed and counted against mem_limit, so raise BOTH together
+    # for installs that ingest very large files.
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 4g
+    pids_limit: 512
+    # cpus: "2.0"   # uncomment to cap CPU
     restart: unless-stopped
 
 volumes:

@@ -45,6 +45,12 @@ COPY . .
 # The app lifespan runs the same idempotent copy as a self-heal for non-Docker runs.
 RUN python -c "import plotly, pathlib, shutil; d = pathlib.Path('static/vendor/plotly'); d.mkdir(parents=True, exist_ok=True); shutil.copyfile(str(pathlib.Path(plotly.__file__).parent / 'package_data' / 'plotly.min.js'), str(d / 'plotly.min.js'))"
 
+# Non-root runtime identity. The container runs on a read-only rootfs (see the
+# compose files), so nothing may write inside the image: application state goes
+# to DATA_ROOT on the mounted data volume, caches go to the tmpfs /tmp. Fixed
+# uid/gid so a pre-existing data volume can be chowned to a known owner.
+RUN groupadd -g 10001 pdc && useradd -u 10001 -g pdc -M -s /usr/sbin/nologin pdc
+
 # Build identity, surfaced by GET /version and the admin sidebar. Build args
 # (NOT install-time config): `.git` is dockerignored, so the commit can only
 # arrive from the builder. Declared AFTER the pip layer so passing them never
@@ -54,7 +60,24 @@ ARG BUILD_TIME=""
 ENV BUILD_COMMIT=${BUILD_COMMIT} \
     BUILD_TIME=${BUILD_TIME}
 
-RUN mkdir -p /data/client /app/logs
+# Only the directories the app must write are created and handed to `pdc` —
+# never all of /app. A FRESH named volume inherits this ownership of
+# /data/client; a volume created by an earlier (root) image needs a one-time
+# chown (see CUSTOMER_INSTALL.md). /tmp/mpl matters only for a plain
+# `docker run` without --tmpfs: under compose the tmpfs hides it.
+RUN mkdir -p /data/client /tmp/mpl \
+    && chown -R pdc:pdc /data/client /tmp/mpl /app/static/vendor
+
+# Caches and the home directory are redirected to the tmpfs: matplotlib's font
+# cache, fontconfig, and kaleido's headless-Chromium profile all want a
+# writable HOME, which a read-only rootfs cannot provide. HOME is /tmp itself
+# (the tmpfs mounts over /tmp, so a subdirectory would never exist and a
+# missing HOME is a known headless-Chromium failure mode).
+ENV MPLCONFIGDIR=/tmp/mpl \
+    XDG_CACHE_HOME=/tmp/cache \
+    HOME=/tmp
+
+USER pdc
 
 EXPOSE 8000
 
