@@ -119,3 +119,60 @@ def test_valid_id_round_trips(tmp_path, store):
     assert (store.conversations_dir / f"{conv_id}.jsonl").is_file()
     for t in store._targets:
         assert t.read_bytes() == SEED
+
+
+# ---------------------------------------------------------------------------
+# C2 — the guard must be OBSERVABLE from all three methods
+# ---------------------------------------------------------------------------
+# `append_history` logs CONV_ID_INVALID; `get_history` and
+# `truncate_conv_history` return [] in silence, so a genuine bug (a route that
+# lost its conv_id, a stale frontend id) shows up as "the conversation is
+# empty" with nothing in the log to explain it. All three must log a warning
+# naming the method, still return the same safe fallback, and never raise.
+@pytest.fixture
+def logs(monkeypatch):
+    """Capture every log_with_sid call local_store makes."""
+    out = []
+    monkeypatch.setattr(local_store, "log_with_sid",
+                        lambda sid, level, message, **ctx: out.append((sid, level, message, ctx)))
+    return out
+
+
+def _invalid_warnings(logs, method: str) -> list[tuple]:
+    return [r for r in logs
+            if r[1] == "warning" and "CONV_ID_INVALID" in r[2] and method in r[2]]
+
+
+@pytest.mark.parametrize("method,call", [
+    ("append_history", lambda st, bad: st.append_history(bad, {"role": "user", "content": "x"})),
+    ("get_history", lambda st, bad: st.get_history(bad)),
+    ("truncate_conv_history", lambda st, bad: st.truncate_conv_history(bad, 0)),
+])
+def test_invalid_conv_id_is_logged_by_every_method(tmp_path, store, logs, method, call):
+    before = _files(tmp_path)
+    call(store, "../../evil")
+    hits = _invalid_warnings(logs, method)
+    assert len(hits) == 1, [r[2] for r in logs]
+    assert hits[0][0] == CHAT                       # tagged with the chat id
+    assert "evil" in hits[0][2]                     # the offending id is named
+    _assert_untouched(tmp_path, store, before)
+
+
+@pytest.mark.parametrize("bad", INVALID_IDS)
+def test_readers_still_return_the_safe_fallback_while_logging(tmp_path, store, logs, bad):
+    before = _files(tmp_path)
+    assert store.get_history(bad) == []
+    assert store.truncate_conv_history(bad, 0) == []
+    store.append_history(bad, {"role": "user", "content": "x"})
+    assert len(_invalid_warnings(logs, "get_history")) == 1
+    assert len(_invalid_warnings(logs, "truncate_conv_history")) == 1
+    assert len(_invalid_warnings(logs, "append_history")) == 1
+    _assert_untouched(tmp_path, store, before)
+
+
+def test_a_valid_id_logs_nothing(tmp_path, store, logs):
+    conv_id = store.new_conversation()
+    store.append_history(conv_id, {"role": "user", "content": "q1"})
+    assert [m["content"] for m in store.get_history(conv_id)] == ["q1"]
+    assert store.truncate_conv_history(conv_id, 1) == store.get_history(conv_id)
+    assert [r for r in logs if "CONV_ID_INVALID" in r[2]] == []

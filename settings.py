@@ -14,6 +14,29 @@ import os
 from pydantic import BaseModel, Field
 
 
+def _int_env(name: str, default: int, minimum: int) -> int:
+    """Read an int env var, falling back to `default` on ANY parse failure and
+    clamping to `minimum`.
+
+    A bad value must never raise inside a Field default_factory: `import
+    settings` happens before anything can report the failure, so a typo like
+    `LOG_MAX_BYTES=50MB` would crash-loop the container with nothing in the log
+    it just failed to configure (Article IV — safe fallback, never crash).
+    The fallback is deliberately SILENT: settings.py is imported by
+    logger_utils, so logging here would be circular.
+    """
+    raw = (os.getenv(name) or "").strip()
+    try:
+        # int() also accepts "1_000_000"; an operator writing that (or "1e6")
+        # means something we should not guess at — treat it as unparsable.
+        if not raw.lstrip("+-").isdigit():
+            raise ValueError(name)
+        value = int(raw)
+    except Exception:
+        value = default
+    return max(value, minimum)
+
+
 class Settings(BaseModel):
     DATA_ROOT: str = Field(default_factory=lambda: os.getenv("DATA_ROOT", "./client_data"))
     MAX_FILES: int = Field(default_factory=lambda: int(os.getenv("MAX_FILES", "5")))
@@ -47,10 +70,13 @@ class Settings(BaseModel):
     # Set false ONLY for plain-HTTP local development.
     SESSION_HTTPS_ONLY: bool = Field(default_factory=lambda: os.getenv("SESSION_HTTPS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on"))
 
-    # Application log rotation (logs/datachat.log). Without it the file grows
-    # until it fills the container's disk.
-    LOG_MAX_BYTES: int = Field(default_factory=lambda: int(os.getenv("LOG_MAX_BYTES", str(50 * 1024 * 1024))))
-    LOG_BACKUP_COUNT: int = Field(default_factory=lambda: int(os.getenv("LOG_BACKUP_COUNT", "5")))
+    # Application log rotation (logs/datachat.log). PLAIN DIGITS only — see
+    # _int_env. Without it the file grows
+    # until it fills the container's disk. Both are clamped to a minimum so
+    # rotation can never be switched off from the environment (maxBytes=0 means
+    # "never roll over" to RotatingFileHandler).
+    LOG_MAX_BYTES: int = Field(default_factory=lambda: _int_env("LOG_MAX_BYTES", 50 * 1024 * 1024, 1024 * 1024))
+    LOG_BACKUP_COUNT: int = Field(default_factory=lambda: _int_env("LOG_BACKUP_COUNT", 5, 1))
 
     # Same prompt-trim defaults as the B2C app (used by the client when it
     # builds schema text and history before posting to the brain).

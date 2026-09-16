@@ -1773,6 +1773,8 @@ class ChatDataStore:
 
     def get_history(self, conv_id: str) -> list[dict]:
         if not valid_conv_id(conv_id):
+            log_with_sid(self.chat_id, "warning",
+                         f"CONV_ID_INVALID get_history conv_id={str(conv_id)[:40]}")
             return []
         p = self.conversations_dir / f"{conv_id}.jsonl"
         if not p.exists():
@@ -1793,6 +1795,10 @@ class ChatDataStore:
         `storage.ChatDataStore.truncate_conv_history`.
         """
         if not valid_conv_id(conv_id):
+            # Logged and returned HERE, before delegating — otherwise the same
+            # bad id would emit a second line from get_history.
+            log_with_sid(self.chat_id, "warning",
+                         f"CONV_ID_INVALID truncate_conv_history conv_id={str(conv_id)[:40]}")
             return []
         history = self.get_history(conv_id)
         if keep_count >= len(history):

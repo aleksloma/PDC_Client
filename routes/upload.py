@@ -1318,6 +1318,16 @@ async def upload_finalize(request: Request):
             return "too_large", size, None
         store = UserStore(sid)  # constructor mkdirs — keep it off the loop too
         dest = store.files_dir / filename
+        # Defense in depth, the same containment check UserStore.save_upload
+        # makes at its write: the destination must resolve INSIDE files_dir even
+        # if _safe_upload_filename ever lets a separator (or an absolute path,
+        # which "/" would swallow the left side of) through.
+        try:
+            contained = dest.resolve().is_relative_to(store.files_dir.resolve())
+        except Exception:
+            contained = False
+        if not contained:
+            return "unsafe_dest", None, None
         try:
             got = gcs_upload.download_to(gcs_path, dest)
         except Exception:
@@ -1347,6 +1357,10 @@ async def upload_finalize(request: Request):
     if state == "missing":
         log_with_sid(email, "warning", "UPLOAD_FINALIZE_MISSING", path=gcs_path[:120])
         return JSONResponse({"error": "Uploaded file not found. Please try again."}, status_code=404)
+    if state == "unsafe_dest":
+        # Nothing was downloaded; the object stays for the bucket lifecycle rule.
+        log_with_sid(email, "warning", "UPLOAD_FINALIZE_UNSAFE_PATH", file=filename[:120])
+        return JSONResponse({"error": "Invalid filename in upload path."}, status_code=400)
     if state == "too_large":
         log_with_sid(email, "warning", "UPLOAD_FINALIZE_SIZE_REJECTED", file=filename, size=size)
         return JSONResponse({"error": f"File too large. Maximum allowed is "

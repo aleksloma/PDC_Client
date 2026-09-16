@@ -325,3 +325,73 @@ def test_get_logger_installs_rotating_file_handler_and_stdout():
             if h not in saved:
                 h.close()
         logger.handlers = saved
+
+
+# ---------------------------------------------------------------------------
+# Follow-up pins (T-unicode-truncate / T-collision / T-repair-visible).
+# These describe behavior that ALREADY exists — they are regression guards for
+# the sanitizer's user-visible side effects, not a wanted change.
+# ---------------------------------------------------------------------------
+def test_sanitizer_truncates_a_georgian_name_on_a_codepoint_boundary():
+    """The 200-byte cap cuts UTF-8 BYTES: a Georgian codepoint is 3 bytes, so
+    the cut lands mid-codepoint and `errors="ignore"` drops that partial
+    codepoint. The result must stay decodable and carry no U+FFFD."""
+    out = _sanitize("ა" * 300 + ".xlsx")
+    raw = out.encode("utf-8")
+    assert len(raw) <= 200, len(raw)
+    assert out.endswith(".xlsx")
+    assert raw.decode("utf-8") == out            # valid UTF-8, no lone bytes
+    assert "\ufffd" not in out                   # no replacement character
+    assert set(out[:-5]) == {"ა"}                # only whole Georgian letters survive
+
+
+def test_upload_reports_the_repaired_name_not_the_clients(tmp_path, upload_client):
+    """A leading-dot name is REPAIRED, not rejected and not uuid-renamed:
+    ".hidden.csv" is stored as "hidden.csv" (the leading dots are stripped and
+    the stem survives). The uuid fallback fires only when NOTHING is left of
+    the stem (".csv"), so the user sees "hidden.csv" everywhere — saved,
+    dataframes and the per-file result.
+
+    This matters beyond cosmetics: every loader in local_store skips files
+    whose name starts with "." (that is how .parquet_cache stays invisible),
+    so a stored ".hidden.csv" would never have produced a dataframe at all.
+    """
+    r = upload_client.post("/upload", files=[("files", (".hidden.csv", io.BytesIO(CSV), "text/csv"))])
+    assert r.status_code == 200, r.text
+    js = r.json()
+    assert js["ok"] is True
+    assert js["saved"] == ["hidden.csv"]
+    assert js["dataframes"] == ["hidden.csv"]
+    assert js["files"] == [{"file": "hidden.csv", "status": "ok"}]
+    files_dir = Path(settings.DATA_ROOT) / "sessions" / SID / "files"
+    assert (files_dir / "hidden.csv").read_bytes() == CSV
+    assert not (files_dir / ".hidden.csv").exists()
+    assert [p.name for p in files_dir.iterdir() if p.is_file()] == ["hidden.csv"]
+
+
+def test_upload_batch_names_that_collapse_to_one_stored_name_overwrite(tmp_path, upload_client):
+    """DATA-LOSS SHAPE, pinned deliberately.
+
+    ".a.csv" and "a.csv" in ONE batch both sanitize to "a.csv" (leading dots
+    are stripped), so the second file OVERWRITES the first on disk. The
+    response still lists BOTH uploads under the same stored name and meta
+    keeps ONE entry. Nothing today de-duplicates or re-keys them — if that
+    ever changes (e.g. an "_v2" suffix), this test must be updated on purpose,
+    not silently.
+    """
+    first, second = b"a,b\n1,2\n", b"a,b\n9,9\n"
+    r = upload_client.post("/upload", files=[
+        ("files", (".a.csv", io.BytesIO(first), "text/csv")),
+        ("files", ("a.csv", io.BytesIO(second), "text/csv")),
+    ])
+    assert r.status_code == 200, r.text
+    js = r.json()
+    assert js["saved"] == ["a.csv", "a.csv"], js["saved"]
+    assert js["dataframes"] == ["a.csv"]
+    assert js["files"] == [{"file": "a.csv", "status": "ok"}, {"file": "a.csv", "status": "ok"}]
+    files_dir = Path(settings.DATA_ROOT) / "sessions" / SID / "files"
+    on_disk = sorted(p.name for p in files_dir.iterdir() if p.is_file())
+    assert on_disk == ["a.csv"], on_disk
+    assert (files_dir / "a.csv").read_bytes() == second   # the LAST write wins
+    meta_names = [e["file_name"] for e in local_store.UserStore(SID).read_meta()["files"]]
+    assert meta_names == ["a.csv"]
