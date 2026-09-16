@@ -4,7 +4,7 @@ The client image ships a fully pinned `requirements.txt`, and several of those
 pins carried published advisories (cryptography, starlette via fastapi,
 python-multipart, jinja2, pyarrow, python-dotenv) while three security-relevant
 transitives (starlette, joserfc, pillow) were not pinned at all and floated at
-build time. The remediation bumps every audited pin to at least its highest fix
+build time. This pin set bumps every audited pin to at least its highest fix
 version, pins the three transitives explicitly, replaces the Authlib comment
 that justified the old `cryptography<45` constraint, upgrades pip inside the
 Dockerfile before the requirements install (pip itself had advisories), and
@@ -16,6 +16,13 @@ regression in any of them fails the suite without Docker.
 
 Every assertion binds the value to a LOCAL first so a failure prints that
 value, never a `Settings` repr — same rule as tests/test_container_hardening_config.py.
+
+Scope note: the `FIX_VERSIONS` floors are a REGRESSION GUARD, not a detector.
+They can only fail DOWNWARD (a pin lowered below a known fix); a NEW advisory
+whose fix version is above the current pin keeps this suite green. The
+detector is pip-audit against the built image at release
+(`.claude/skills/release-image/SKILL.md` §1) — when it reports a hit, raise
+the pin AND the floor here in the same change.
 """
 import importlib.metadata
 import re
@@ -27,9 +34,40 @@ from packaging.version import Version
 ROOT = Path(__file__).resolve().parent.parent
 REQUIREMENTS = ROOT / "requirements.txt"
 DOCKERFILE = ROOT / "Dockerfile"
-TEMPLATE_SOURCES = [ROOT / "app.py"] + sorted((ROOT / "routes").glob("*.py"))
+# Directories that hold no application code (or none of ours): pruned from
+# the template-signature scans so a vendored or test-only `TemplateResponse(`
+# can neither pass nor fail them.
+SOURCE_PRUNE_DIRS = {".venv", "venv", "env", "tests", "tools", "node_modules",
+                     ".git", "__pycache__", "client_data"}
+
+
+def _application_sources() -> list:
+    """Every `*.py` under the repo root except the pruned directories —
+    sorted, so an offender list is stable between runs."""
+    out = []
+    for path in ROOT.rglob("*.py"):
+        rel_parts = path.relative_to(ROOT).parts[:-1]
+        if any(part in SOURCE_PRUNE_DIRS for part in rel_parts):
+            continue
+        out.append(path)
+    return sorted(out)
+
+
+TEMPLATE_SOURCES = _application_sources()
+
+# The only two modules allowed to construct a template environment; every
+# other module renders through one of these (or does not render at all).
+JINJA_ENV_OWNERS = {"app.py", "routes/auth.py"}
 
 # Highest fix version per audited package (pip-audit, PyPI + OSV advisories).
+#
+# REGRESSION GUARD, NOT A DETECTOR. These floors can only fail DOWNWARD: they
+# catch a pin being lowered (or dropped) below a fix version that was already
+# known when the floor was written. A NEW advisory whose fix version is above
+# the current pin does NOT fail this suite — nothing here consults an advisory
+# database. The detector is pip-audit against the BUILT image at release time
+# (`.claude/skills/release-image/SKILL.md` §1); a hit there means: raise the
+# pin in requirements.txt AND raise the floor here in the same change.
 FIX_VERSIONS = {
     "cryptography": "49.0.0",
     "starlette": "1.3.1",
@@ -144,6 +182,35 @@ def test_audited_pins_meet_fix_versions(package, fix):
 
 
 # ---------------------------------------------------------------------------
+# (1b) every requirement line is an exact pin
+# ---------------------------------------------------------------------------
+_EXACT_PIN_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*(?:\[[^\]]*\])?)\s*==\s*([A-Za-z0-9.+!-]+)$")
+
+
+def test_every_requirement_line_is_pinned_exactly():
+    """Every non-comment, non-blank line of requirements.txt is
+    `name[extras]==version` — the same regex `_pins()` accepts. A `>=`, `~=`,
+    a bare name, an `-r`/`-e`/`--index-url` directive or a URL requirement
+    would let the resolver choose at build time, so the audited version and
+    the shipped version could differ; `_pins()` silently skips such lines,
+    which is why this check exists separately."""
+    unpinned = []
+    for idx, raw in enumerate(_requirements_text().splitlines(), start=1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if not _EXACT_PIN_RE.match(line):
+            unpinned.append((idx, line))
+    n_unpinned = len(unpinned)
+    assert n_unpinned == 0, (
+        "requirements.txt lines that are not exact `name==version` pins: "
+        + ", ".join(f"line {i}: {l!r}" for i, l in unpinned)
+    )
+    n_pins = len(_pins())
+    assert n_pins > 0, "no `==` pins parsed at all"
+
+
+# ---------------------------------------------------------------------------
 # (2) the priority transitives are pinned explicitly
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("package", PRIORITY_TRANSITIVES)
@@ -232,20 +299,60 @@ def test_dockerfile_upgrades_pip_before_requirements():
 # ---------------------------------------------------------------------------
 # (5) Starlette-1 TemplateResponse signature everywhere
 # ---------------------------------------------------------------------------
+_REQUEST_FIRST_RE = re.compile(r"^request\s*[,)]")
+
+
 def _template_response_offenders():
     """[(relative path, 1-based line)] of every `TemplateResponse(` whose first
-    non-whitespace argument starts with a quote, i.e. the removed
-    `TemplateResponse(name, context)` form."""
+    argument (ignoring whitespace/newlines) is anything other than the literal
+    `request`. That covers the removed `TemplateResponse(name, context)` form
+    (a string literal first) AND a variable first argument such as
+    `TemplateResponse(tpl, ctx)`, which the old quote-only check let through.
+    A definition site (`def TemplateResponse(`) never occurs in this repo's
+    application code, so every hit is a call."""
     offenders = []
     for path in TEMPLATE_SOURCES:
         text = path.read_text(encoding="utf-8")
         for m in re.finditer(r"TemplateResponse\(", text):
             rest = text[m.end():].lstrip()
-            first = rest[:1]
-            if first in ('"', "'"):
+            if not _REQUEST_FIRST_RE.match(rest):
                 line = text.count("\n", 0, m.start()) + 1
                 offenders.append((path.relative_to(ROOT).as_posix(), line))
     return offenders
+
+
+def _jinja_env_sites():
+    """[relative path] of every application module containing `Jinja2Templates(`."""
+    return sorted(
+        path.relative_to(ROOT).as_posix()
+        for path in TEMPLATE_SOURCES
+        if "Jinja2Templates(" in path.read_text(encoding="utf-8")
+    )
+
+
+def test_template_sources_cover_the_application_tree():
+    """The scan must see the whole application tree, not just app.py and
+    routes/: a pruned-away or empty source list would make the signature
+    tests pass vacuously. Both known template owners must be in it, and no
+    pruned directory may leak in."""
+    rel = [p.relative_to(ROOT).as_posix() for p in TEMPLATE_SOURCES]
+    n_sources = len(rel)
+    assert n_sources > 2, rel
+    assert "app.py" in rel, rel
+    assert "routes/auth.py" in rel, rel
+    leaked = [p for p in rel if any(part in SOURCE_PRUNE_DIRS for part in p.split("/")[:-1])]
+    assert leaked == [], leaked
+
+
+def test_jinja_environment_built_only_by_the_two_owners():
+    """`Jinja2Templates(` may appear ONLY in app.py and routes/auth.py. A third
+    environment is a third place the TemplateResponse signature can drift,
+    and a third `directory=` that can point outside `templates/`."""
+    sites = _jinja_env_sites()
+    offenders = sorted(set(sites) - JINJA_ENV_OWNERS)
+    assert offenders == [], f"Jinja2Templates( constructed outside the owners at: {offenders}"
+    missing = sorted(JINJA_ENV_OWNERS - set(sites))
+    assert missing == [], f"expected Jinja2Templates( in {missing}; found sites: {sites}"
 
 
 def test_template_response_uses_request_first():

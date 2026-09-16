@@ -6,6 +6,12 @@ fastapi==0.141.1
 # context) signature — app.py and routes/auth.py use the request-first form.
 starlette==1.6.0
 uvicorn[standard]==0.32.1
+# The only outbound HTTP client (brain_client, and the client Authlib
+# builds for OIDC discovery). Held at 0.27.2 deliberately — see the Authlib
+# block below for why its "use httpx2" warning is not a version bound.
+# REVISIT on either trigger: httpx 1.0 ships stable (Authlib's compat shim
+# then becomes the deprecated path), or the first advisory lands against
+# 0.27.x (nothing today).
 httpx==0.27.2
 pydantic==2.9.2
 # Only load_dotenv() is used (settings.py); pinned at/above the current fix
