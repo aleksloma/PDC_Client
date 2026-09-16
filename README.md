@@ -130,6 +130,17 @@ docker run --rm -p 8000:8000 \
 
 Open `http://localhost:8000` → enter your work email → land in `/lab`.
 
+The container runs as uid 10001, so a HOST BIND MOUNT like the one above must
+be writable by that uid (`chown -R 10001:10001 ./client_data`, or use a named
+volume, which inherits the image's ownership). Skip it and the container still
+starts and still reports healthy — but every write fails: `LADMIN_BOOTSTRAP_FAILED`
+/ `Permission denied` in the log, and users get a 500 when they try to sign in.
+Production installs should add the hardening flags from
+[`CUSTOMER_INSTALL.md`](CUSTOMER_INSTALL.md) (`--read-only`, `--tmpfs /tmp`,
+`--cap-drop ALL`, `--security-opt no-new-privileges:true`, `--memory`,
+`--pids-limit`); this bare form is for a quick local try-out.
+
+
 ## Key docs
 
 | Doc | Purpose |

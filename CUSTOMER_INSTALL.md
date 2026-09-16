@@ -220,10 +220,12 @@ decks, and your branded templates.
   docker run --rm -v pdc_client_data:/data alpine chown -R 10001:10001 /data
   ```
 
-  Skip it and the container starts but fails on its first write: `docker logs
-  pdc-client` shows `Permission denied`, and users can neither sign in nor
-  upload. A volume created by this release or later already has the right
-  owner. Run it again after restoring a backup taken from an older install.
+  Skip it and the container still starts AND still reports healthy — `GET
+  /health` returns 200 — while every write fails: `docker logs pdc-client`
+  shows `LADMIN_BOOTSTRAP_FAILED` and `Permission denied`, and users get a 500
+  when they try to sign in. Do not judge this upgrade by the health check. A
+  volume created by this release or later already has the right owner. Run the
+  command again after restoring a backup taken from an older install.
 - **The log moved onto your data volume.** It is now
   `/data/client/logs/datachat.log` (it used to live inside the container),
   because the container filesystem is read-only. Collect `datachat.log*` from
