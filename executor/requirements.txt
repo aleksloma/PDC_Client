@@ -1,0 +1,48 @@
+# pdc-executor runtime set — an identical-version SUBSET of the audited root
+# requirements.txt. THE RULE: every package here must be pinned to exactly the
+# version the root file pins (extras spelling included), and nothing else may
+# be added. `tests/test_executor_structure.py` enforces both halves plus the
+# forbidden list below, so a drift or an accidental addition fails the suite.
+#
+# Deliberately ABSENT (and forbidden): httpx (the executor makes no outbound
+# call), itsdangerous / python-multipart (no sessions, no forms),
+# Authlib / joserfc (no SSO), openpyxl / python-calamine (files are
+# parsed by the web service and handed over as parquet), the browser-based PNG
+# rasterizer (no headless browser in this image — plotly figures cross as HTML
+# and are rasterized by the web service), python-pptx / reportlab
+# (reports render in the web service), SQLAlchemy / cryptography /
+# every DB driver (no credentials and no DB access ever reach the sandbox),
+# sqlglot, google-* (no object storage), croniter (no scheduler).
+
+# HTTP surface
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn[standard]==0.32.1
+pydantic==2.9.2
+# Imported by settings.py (copied unchanged into this image); no .env is read.
+python-dotenv==1.2.2
+
+# Data + execution environment (code_exec / plot_utils scope)
+pandas==2.2.3
+numpy==1.26.4
+pyarrow==25.0.1
+matplotlib==3.9.2
+pillow==12.3.0
+# Present ONLY because pandas implements `DataFrame.style` with jinja2: a
+# Styler RESULT is rendered to `styled_html` HERE, so without it
+# any generated `df.style...` is an ImportError instead of a formatted table.
+# No templates are rendered in this image — `Jinja2Templates` appears nowhere
+# in the copied file set. Same nature as pillow (a matplotlib dependency).
+jinja2==3.1.6
+seaborn==0.13.2
+plotly==5.24.1
+scipy==1.14.1
+scikit-learn==1.5.2
+matplotlib-venn==1.1.1
+wordcloud==1.9.3
+networkx==3.3
+squarify==0.4.4
+missingno==0.5.2
+calplot==0.1.7.5
+upsetplot==0.9.0
+adjustText==1.2.0
