@@ -61,12 +61,15 @@ ENV BUILD_COMMIT=${BUILD_COMMIT} \
     BUILD_TIME=${BUILD_TIME}
 
 # Only the directories the app must write are created and handed to `pdc` —
-# never all of /app. A FRESH named volume inherits this ownership of
-# /data/client; a volume created by an earlier (root) image needs a one-time
-# chown (see CUSTOMER_INSTALL.md). /tmp/mpl matters only for a plain
-# `docker run` without --tmpfs: under compose the tmpfs hides it.
+# never all of /app, and deliberately NOT /app/static/vendor: the plotly
+# bundle is baked above, so the lifespan self-heal has nothing left to do,
+# and a browser-served file the runtime user could rewrite is a target for
+# no benefit. /tmp/mpl matters only for a plain `docker run` without
+# --tmpfs: under compose the tmpfs hides it. A FRESH named volume inherits
+# this ownership of /data/client; a volume created by an earlier (root)
+# image needs a one-time chown (see CUSTOMER_INSTALL.md).
 RUN mkdir -p /data/client /tmp/mpl \
-    && chown -R pdc:pdc /data/client /tmp/mpl /app/static/vendor
+    && chown -R pdc:pdc /data/client /tmp/mpl
 
 # Caches and the home directory are redirected to the tmpfs: matplotlib's font
 # cache, fontconfig, and kaleido's headless-Chromium profile all want a

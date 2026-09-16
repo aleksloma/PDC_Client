@@ -129,6 +129,24 @@ def test_dockerfile_chowns_data_root_to_pdc():
     ), joined
 
 
+def test_dockerfile_never_chowns_all_of_app():
+    """`chown -R pdc:pdc /app` would hand the runtime user its own code.
+
+    The read-only rootfs makes it inert under compose, but the image is also
+    run plainly (the Cloud Run demo, `docker run` without `--read-only`), and
+    a process that can rewrite the code it is about to execute is exactly what
+    the non-root user is meant to prevent. Only directories the app must write
+    may be chowned; /app/static/vendor is deliberately NOT one of them (the
+    plotly bundle is baked at build time and is served to browsers).
+    """
+    for run in _run_args():
+        if "chown" not in run:
+            continue
+        for target in re.findall(r"/app[\w./-]*", run):
+            assert target not in ("/app", "/app/"), run
+            assert not target.startswith("/app/static"), run
+
+
 def test_dockerfile_expose_healthcheck_and_cmd_unchanged():
     expose = _raw_instruction_block("EXPOSE")
     assert expose == EXPECTED_EXPOSE, expose
@@ -240,6 +258,28 @@ def test_compose_sets_memory_and_pid_limits(path):
     assert mem_limit, sorted(svc.keys())
     pids_limit = svc.get("pids_limit")
     assert isinstance(pids_limit, int) and pids_limit > 0, pids_limit
+
+
+@pytest.mark.parametrize("path", COMPOSE_FILES)
+def test_compose_limit_values_match_what_the_docs_promise(path):
+    """CUSTOMER_INSTALL.md states these numbers to the operator.
+
+    A limit that drifts from the documented one is worse than no limit: the
+    customer sizes their host from the doc. The /tmp size matters twice over —
+    Starlette spools every upload part above 1 MiB there, so it caps an
+    in-flight upload batch as well as the caches, and being RAM-backed it is
+    charged against mem_limit.
+    """
+    svc = _client_service(path)
+    mem_limit = svc.get("mem_limit")
+    assert mem_limit == "4g", mem_limit
+    pids_limit = svc.get("pids_limit")
+    assert pids_limit == 512, pids_limit
+    tmp = [str(e) for e in _tmpfs_entries(svc) if str(e).split(":")[0] == "/tmp"]
+    assert len(tmp) == 1, _tmpfs_entries(svc)
+    options = tmp[0].split(":", 1)[1] if ":" in tmp[0] else ""
+    assert "size=512m" in options, tmp
+    assert "mode=1777" in options, tmp
 
 
 @pytest.mark.parametrize("path", COMPOSE_FILES)

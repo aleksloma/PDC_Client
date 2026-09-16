@@ -35,6 +35,11 @@ def _log_dir() -> Path:
         candidate.mkdir(parents=True, exist_ok=True)
         if os.access(str(candidate), os.W_OK):
             return candidate
+        # Exists but is not writable — `mkdir(exist_ok=True)` raises nothing
+        # here, so this branch has to announce itself too. It is the skipped-
+        # chown upgrade case once the directory already exists.
+        print(f"WARNING: log directory {candidate} exists but is not writable; "
+              f"falling back to the module-relative logs directory")
     except OSError as e:
         # Any OSError subclass: a DATA_ROOT under a regular file raises
         # FileNotFoundError / FileExistsError / NotADirectoryError depending
