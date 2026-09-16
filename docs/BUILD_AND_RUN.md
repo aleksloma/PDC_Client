@@ -483,4 +483,10 @@ The data comes from `tenants/{tenant_id}/users.jsonl` and
 - **Client logs** (in `logs/datachat.log`): upload events, code execution
   errors (which contain raw data values, like KeyError row indices),
   and brain HTTP responses. These stay on the client server and never
-  leave it.
+  leave it. The file ROTATES: at `LOG_MAX_BYTES` (default 50 MB) it rolls
+  over to `datachat.log.1`, keeping `LOG_BACKUP_COUNT` (default 5) backups —
+  so collect `datachat.log*`, not just `datachat.log`, and expect the oldest
+  history to be discarded rather than to grow forever. Both settings take PLAIN DIGITS only
+  (`52428800`, not `50MB` and not `50_000_000`); anything else falls back to
+  the default instead of raising, and both are clamped to a minimum, so
+  rotation cannot be switched off from the environment.

@@ -94,6 +94,16 @@ customer install the flag is false and step 2 handles every size:
    size whenever direct upload is off — the server sets no request-body
    limit) — saves uploads to the
    per-session temp area (under `<DATA_ROOT>/sessions/<sid>/files/`).
+   **The multipart filename is SANITIZED before it touches the filesystem**
+   (`local_store.sanitize_upload_filename`, re-checked for containment inside
+   `files_dir` by `UserStore.save_upload`): path components, control
+   characters and leading dots are removed, the name is capped at 200 UTF-8
+   bytes keeping the extension, and a name with nothing left becomes
+   `upload_<8 hex>`. Unicode is preserved, so an ordinary name — Georgian
+   included — is stored byte-identically to what the browser sent.
+   `saved`, `dataframes` and `files[].file` all report the name **as stored**,
+   which for a repaired name differs from the one the client supplied. Two
+   names in one batch that sanitize to the same string overwrite each other.
    Returns `{ok, saved, dataframes, files}` — the B2C keys unchanged, plus an
    additive per-file result list: `files: [{file, status: "ok"|"warning"|
    "error", skipped_rows?, first_bad_line?, message?}]`. CSV parsing is
@@ -195,13 +205,16 @@ file, after the usual `POST /new_session`:
 - **`POST /upload/finalize`** — JSON `{gcs_path, file_descriptions?}`.
   Rejects any path outside `tmp/{sid}/` (400 `Invalid upload path.`), checks
   the REAL object size (404 when missing, 400 over 500 MB — a signed PUT does
-  not bind Content-Length), streams it into the session `files_dir`, deletes
+  not bind Content-Length), re-checks that the destination RESOLVES inside
+  `files_dir` before writing anything (400 `Invalid filename in upload path.`,
+  the same containment assert `UserStore.save_upload` makes), streams it into
+  the session `files_dir`, deletes
   the object (best effort, also on failure; the bucket's 1-day lifecycle rule
   is the backstop) and runs the SAME post-save pipeline as `/upload`
   (`_finish_upload`), returning the same `{ok, saved, dataframes, files}` shape
   and the same `ok:false`/400 semantics. It never resets the session, so a
   multi-file batch accumulates one finalize per file (DB-table selections
-  survive). Log lines: `UPLOAD_INIT`, `FILE_SAVED via=gcs`, `UPLOAD_OK`.
+  survive). Log lines: `UPLOAD_INIT`, `FILE_SAVED via=gcs`, `UPLOAD_OK`, `UPLOAD_FINALIZE_UNSAFE_PATH`.
 
 ### Add Data to an existing chat
 
@@ -217,7 +230,13 @@ of `/generate_chatdata`. It merges the temp session store into the existing
 - Raw files are copied into `chatdata/{chat_id}/files/`; a filename that
   already exists in the chat is **overwritten as a data update — never
   silently**: the frontend's name-collision dialog (below) has already made
-  the user choose Overwrite vs upload-as-`_vN`.
+  the user choose Overwrite vs upload-as-`_vN`. **Caveat:** that dialog
+  compares the BROWSER name against the STORED names from
+  `GET file_fingerprints`, so for the narrow set of names
+  `sanitize_upload_filename` alters (leading dots, control characters, >200
+  UTF-8 bytes, embedded path components) the two disagree, no dialog appears
+  and the add overwrites silently. Ordinary names are unchanged by the
+  sanitizer and unaffected.
 - meta.json merge: new keys get their autofilled entries appended. For an
   **overwritten** source file the entries are **re-synced**
   (`_resync_meta_after_add` in `routes/upload.py`): entries whose df key

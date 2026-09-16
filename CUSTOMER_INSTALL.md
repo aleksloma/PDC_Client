@@ -169,3 +169,10 @@ decks, and your branded templates.
 - **Upgrades:** pull/load the new image tag, then `docker rm -f pdc-client` and
   re-run step 3 with the new tag. The `pdc_client_data` volume (your data) is
   preserved across upgrades.
+- **BREAKING on upgrade if you serve plain HTTP.** From this release the
+  session cookie is marked `Secure`, so a browser will not send it back over
+  `http://`. Users on an HTTP install see the login form again after signing in
+  — an endless login loop with nothing in the log. It does NOT reproduce on the
+  installer's own laptop, because browsers exempt `http://localhost`. Before
+  upgrading, either front the container with TLS (see "Serve it over HTTPS") or
+  add `SESSION_HTTPS_ONLY=false` to `client.env`.
