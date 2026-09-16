@@ -156,3 +156,101 @@ def test_log_with_sid_line_lands_in_data_root_file(tmp_path, monkeypatch, clean_
     text = log_file.read_text(encoding="utf-8")
     assert "[sid=s_dr] DATA_ROOT_LOG_PROBE" in text
     assert "INFO" in text
+
+
+# ---------------------------------------------------------------------------
+# (4) DATA_ROOT/logs EXISTS but is not writable -> fallback + a warning line
+# ---------------------------------------------------------------------------
+def test_get_logger_warns_when_data_root_logs_exists_but_is_unwritable(
+        tmp_path, monkeypatch, capsys, clean_datachat_logger):
+    """The skipped-chown upgrade case: `<DATA_ROOT>/logs` already exists (made
+    by an earlier root-owned image) and the uid-10001 process cannot write
+    it. `mkdir(exist_ok=True)` raises nothing there, so `_log_dir` has to
+    check `os.access(..., W_OK)` itself, announce the fallback on stdout
+    ("... exists but is not writable ...") naming the directory, and build
+    the RotatingFileHandler under the module-relative `logs/` instead.
+
+    `os.access` is monkeypatched to say False for that ONE directory (real
+    `os.access` everywhere else — Windows reports every directory writable,
+    so a chmod would not do). This pins behavior the current code already
+    has; it is expected to pass first."""
+    root = tmp_path / "root"
+    logs_dir = root / "logs"
+    logs_dir.mkdir(parents=True)
+    monkeypatch.setattr(logger_utils.settings, "DATA_ROOT", str(root))
+    fake_repo = tmp_path / "repo"
+    monkeypatch.setattr(logger_utils, "__file__", str(fake_repo / "logger_utils.py"))
+
+    real_access = logger_utils.os.access
+    target = logs_dir.resolve()
+
+    def fake_access(path, mode, *args, **kwargs):
+        try:
+            if Path(path).resolve() == target:
+                return False
+        except (OSError, TypeError, ValueError):
+            pass
+        return real_access(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(logger_utils.os, "access", fake_access)
+
+    lg = logger_utils.get_logger()
+
+    rotating = _rotating_handlers(lg)
+    n_rotating = len(rotating)
+    assert n_rotating == 1, [type(h).__name__ for h in lg.handlers]
+    base = Path(rotating[0].baseFilename).resolve()
+    fallback_dir = (fake_repo / "logs").resolve()
+    assert base.parent == fallback_dir, base
+    assert base.parent != target, base
+    assert base.name == "datachat.log"
+    data_root_file_exists = (logs_dir / "datachat.log").exists()
+    assert not data_root_file_exists, sorted(p.name for p in logs_dir.iterdir())
+
+    out = capsys.readouterr().out
+    assert "not writable" in out, out
+    assert str(logs_dir) in out, out
+
+
+# ---------------------------------------------------------------------------
+# (5) BOTH locations unusable -> stdout-only logger, never an exception
+# ---------------------------------------------------------------------------
+def test_get_logger_survives_both_locations_unwritable(tmp_path, monkeypatch, clean_datachat_logger):
+    """DATA_ROOT under a regular FILE (its mkdir raises) AND the module
+    directory under ANOTHER regular file (so the fallback mkdir raises too).
+    `get_logger()` is called from every `log_with_sid`, including inside
+    exception handlers, so it must never raise: the outer try/except in
+    get_logger has to swallow the failure and hand back a stdout-only logger
+    (one plain StreamHandler, zero file handlers), and `log_with_sid` must
+    then work on it."""
+    blocker = tmp_path / "blocker.txt"
+    blocker.write_text("not a directory", encoding="utf-8")
+    root = blocker / "root"
+    monkeypatch.setattr(logger_utils.settings, "DATA_ROOT", str(root))
+    blocker2 = tmp_path / "blocker2.txt"
+    blocker2.write_text("not a directory either", encoding="utf-8")
+    monkeypatch.setattr(logger_utils, "__file__", str(blocker2 / "logger_utils.py"))
+    before = _dir_snapshot(REAL_MODULE_LOGS)
+
+    try:
+        lg = logger_utils.get_logger()
+    except Exception as e:  # noqa: BLE001 - the whole point is that it must not raise
+        pytest.fail(f"get_logger() raised with both log locations unusable: {type(e).__name__}: {e}")
+
+    n_file = len([h for h in lg.handlers if isinstance(h, logging.FileHandler)])
+    assert n_file == 0, [type(h).__name__ for h in lg.handlers]
+    n_stdout = len(_stdout_handlers(lg))
+    assert n_stdout >= 1, [type(h).__name__ for h in lg.handlers]
+
+    try:
+        logger_utils.log_with_sid("s", "info", "PROBE")
+    except Exception as e:  # noqa: BLE001
+        pytest.fail(f"log_with_sid raised on the stdout-only logger: {type(e).__name__}: {e}")
+
+    # nothing could have been created under either blocker, and the real
+    # module's logs/ directory is untouched
+    assert blocker.is_file()
+    assert blocker2.is_file()
+    assert not (root / "logs").exists()
+    after = _dir_snapshot(REAL_MODULE_LOGS)
+    assert after == before

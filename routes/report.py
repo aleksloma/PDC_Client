@@ -1198,6 +1198,17 @@ def _render_pptx_native(qa_pairs: list, report_structure: dict, sid: str,
 
 
 def _html_preview_dir():
+    """Where the QA-only HTML preview of a deck is written (never the
+    deliverable — that is the native .pptx).
+
+    Normally `<DATA_ROOT>/pptx_previews`. The `/tmp/pptx_previews` fallback is
+    only reached if importing `settings` raises, which cannot happen in
+    practice: this module's own top-level imports (brain_client, local_store,
+    logger_utils) already import settings, so a failing import would have
+    killed this module first. The branch is kept as a belt-and-braces default;
+    under the hardened container /tmp is a tmpfs, so anything that did land
+    there is wiped on restart.
+    """
     from pathlib import Path as _P
     try:
         from settings import settings as _s
