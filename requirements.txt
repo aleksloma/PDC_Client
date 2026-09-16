@@ -1,25 +1,47 @@
-fastapi==0.115.6
+fastapi==0.141.1
+# starlette is pinned explicitly even though fastapi pulls it: fastapi only
+# requires starlette>=0.46.0, so an unpinned transitive could float to any
+# release on any rebuild. 1.x is also where the form-limit and URL-parsing
+# fixes live. NOTE: Starlette 1.0 removed the old TemplateResponse(name,
+# context) signature — app.py and routes/auth.py use the request-first form.
+starlette==1.6.0
 uvicorn[standard]==0.32.1
 httpx==0.27.2
 pydantic==2.9.2
-python-dotenv==1.0.1
+# Only load_dotenv() is used (settings.py); pinned at/above the current fix
+# version anyway so the image never ships a flagged release.
+python-dotenv==1.2.2
 itsdangerous==2.2.0
-jinja2==3.1.4
-python-multipart==0.0.20
+# Templates are repository files and no SandboxedEnvironment exists here, but
+# the pin is kept at/above the current fix version.
+jinja2==3.1.6
+# Form parsing for /upload (multipart) and the login / reset forms
+# (urlencoded) — the unauthenticated path — so the pin is kept at/above the
+# current fix version.
+python-multipart==0.0.32
 # Microsoft Entra ID SSO (OIDC authorization-code flow, routes/sso.py).
-# Authlib's Starlette integration handles discovery, JWKS, ID-token
-# validation and state/nonce in the cookie session; it reuses the already
-# pinned httpx + cryptography. 1.6.x on purpose: 1.7+ pulls joserfc, which
-# forces cryptography>=45 and would break the cryptography==43.0.3 pin.
-Authlib==1.6.12
+# Authlib 1.8.x does the OIDC heavy lifting (discovery, JWKS, ID-token
+# validation, state/nonce in the cookie session) and since 1.7 delegates JOSE
+# to joserfc — which is why joserfc is pinned alongside it. Both require
+# cryptography>=45.0.1, which the cryptography pin below satisfies. Authlib
+# emits a deprecation warning steering to "httpx2": that is its own
+# forward-compat shim, not a version bound (its only requirements are
+# cryptography>=45.0.1 and joserfc>=1.6.1), so httpx stays at 0.27.2 until
+# httpx 1.0 ships.
+Authlib==1.8.0
+joserfc==1.7.5
 
-# Data + execution (kept identical to the B2C app)
+# Data + execution (mirrors the B2C app except where security pins move
+# ahead of it — pyarrow no longer matches, and pillow is pinned here).
 pandas==2.2.3
 numpy==1.26.4
 openpyxl==3.1.5
 python-calamine==0.6.1
-pyarrow==17.0.0
+pyarrow==25.0.1
 matplotlib==3.9.2
+# Compiled transitive of matplotlib / wordcloud / reportlab / python-pptx /
+# missingno; pinned explicitly so an image rebuild cannot float it.
+pillow==12.3.0
 seaborn==0.13.2
 plotly==5.24.1
 kaleido==0.2.1
@@ -49,7 +71,11 @@ reportlab==4.2.5
 # asynch and its compiled dep ciso8601 are pinned here so an otherwise fully
 # pinned image cannot drift on a C extension. Both have amd64 + arm64 wheels.
 SQLAlchemy==2.0.36
-cryptography==43.0.3
+# Fernet / MultiFernet for the DB passwords stored in data_sources.json
+# (db_sources.py) and the SSO client secret (sso_store.py); also the floor
+# Authlib declares. Kept current because it is the security-critical
+# compiled dependency in this image.
+cryptography==50.0.1
 psycopg2-binary==2.9.10
 PyMySQL==1.1.1
 pyodbc==5.2.0

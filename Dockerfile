@@ -36,6 +36,11 @@ RUN if [ "$INSTALL_MSSQL_ODBC" = "1" ] \
        fi
 
 COPY requirements.txt .
+# The image's bundled pip is a build-time tool, but it still shows up in any
+# dependency scan of the image, so it is kept current HERE rather than in
+# requirements.txt — that file is the application's runtime set. The upgrade
+# runs before the install, so the dependencies are installed by the fixed pip.
+RUN pip install --no-cache-dir --upgrade pip==26.2.1
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .

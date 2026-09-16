@@ -116,6 +116,7 @@ def _landing(request: Request, *, error: str = None, password_error: str = None,
     except Exception as e:
         log_with_sid("sso", "warning", f"SSO_LANDING_CHECK_FAILED: {e}")
     return _TEMPLATES.TemplateResponse(
+        request,
         "auth_landing.html",
         {"request": request, "error": error, "password_error": password_error,
          "info": info, "email": email, "show_reset": show_reset,
@@ -292,6 +293,7 @@ async def change_password_page(request: Request):
     if not request.session.get("must_change_password"):
         return RedirectResponse(url=_post_login_target(email), status_code=302)
     return _TEMPLATES.TemplateResponse(
+        request,
         "change_password.html",
         {"request": request, "email": email, "error": None},
     )
@@ -315,6 +317,7 @@ async def change_password_submit(request: Request):
 
     def _page(err: str, code: int = 400):
         return _TEMPLATES.TemplateResponse(
+            request,
             "change_password.html",
             {"request": request, "email": email, "error": err},
             status_code=code,

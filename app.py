@@ -209,6 +209,7 @@ async def landing(request: Request):
     if sso_enabled and sso_auto and request.query_params.get("local") != "1":
         return RedirectResponse(url="/auth/microsoft", status_code=302)
     return templates.TemplateResponse(
+        request,
         "auth_landing.html",
         {"request": request, "error": None, "password_error": None,
          "info": None, "email": "", "sso_enabled": sso_enabled},
@@ -303,6 +304,7 @@ async def lab(request: Request):
     ts = int(time.time())
     prof = _profile_context(email)
     return templates.TemplateResponse(
+        request,
         "dashboard.html",
         {
             "request": request,
@@ -358,6 +360,7 @@ async def open_conversation_deeplink(request: Request, conv_id: str):
     ts = int(time.time())
     prof = _profile_context(email)
     return templates.TemplateResponse(
+        request,
         "dashboard.html",
         {
             "request": request,
@@ -401,6 +404,7 @@ async def dashboard_view_page(request: Request, dash_id: str):
     ts = int(time.time())
     prof = _profile_context(email)
     return templates.TemplateResponse(
+        request,
         "dashboard_view.html",
         {
             "request": request,
@@ -429,6 +433,7 @@ async def admin_data_sources_page(request: Request):
         return RedirectResponse(url="/lab", status_code=302)
     log_with_sid(email, "info", "OPEN_ADMIN_DATA_SOURCES")
     return templates.TemplateResponse(
+        request,
         "admin_data_sources.html",
         {"request": request, "ts": int(time.time()), "username": email,
          "build_stamp": _build_stamp(), "manager_mode": "admin",
@@ -460,6 +465,7 @@ async def power_data_sources_page(request: Request):
     log_with_sid(email, "info", "OPEN_POWER_DATA_SOURCES")
     summary, read_beyond = _power_scope_summary(email)
     return templates.TemplateResponse(
+        request,
         "admin_data_sources.html",
         {"request": request, "ts": int(time.time()), "username": email,
          "build_stamp": _build_stamp(), "manager_mode": "power",
