@@ -402,9 +402,14 @@ def _dispatch(kind: str, code: str, dfs: dict, log_sid: str, sid, budget,
     """One dispatch, with the slot already held."""
     if _PENDING["handshake"]:
         # The startup greeting failed; spend the one retry it bought here so a
-        # service that came up late is still identified in the log.
-        _PENDING["handshake"] = False
+        # service that came up late is still identified in the log. The retry
+        # is spent whether or not it SUCCEEDS: `handshake()` re-arms the latch
+        # when it fails, which is what lets startup arm it, so clearing it
+        # only beforehand would re-arm it here for every dispatch — each one
+        # paying a connect timeout inside the held slot for as long as the
+        # service stays down, which is exactly when that hurts most.
         handshake()
+        _PENDING["handshake"] = False
 
     job_dir = None
     try:

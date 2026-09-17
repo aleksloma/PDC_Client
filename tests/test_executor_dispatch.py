@@ -603,6 +603,41 @@ def test_startup_never_raises_when_the_service_is_unreachable(dispatcher, exec_e
     assert dispatcher.startup() is None
 
 
+def test_a_failed_startup_greeting_is_retried_exactly_once_not_per_dispatch(
+        dispatcher, exec_env, monkeypatch):
+    """A greeting that failed at startup buys ONE retry, and spends it whether
+    or not it succeeds.
+
+    The retry runs inside the held dispatch slot and pays a connect timeout,
+    so retrying per dispatch would tax every question for as long as the
+    service stays down — which is precisely when it is least affordable. The
+    greeting itself re-arms the latch when it fails (that is how startup arms
+    it), so the dispatch path has to clear it afterwards, not before.
+    """
+    healthz_calls = []
+
+    def handler(request):
+        if request.url.path.endswith("/healthz"):
+            healthz_calls.append(request.url.path)
+            raise httpx.ConnectError("refused", request=request)
+        raise httpx.ConnectError("refused", request=request)
+
+    _install(monkeypatch, handler)
+
+    dispatcher.startup()
+    after_startup = len(healthz_calls)
+    assert after_startup == 1, healthz_calls
+
+    for _ in range(3):
+        out = dispatcher.execute("PYTHON", "RESULT = 1", _dfs(), sid="t", timeout_s=60)
+        assert out == {"error": dispatcher.UNAVAILABLE_TEXT}, out
+
+    retries = len(healthz_calls) - after_startup
+    assert retries == 1, f"the greeting was retried {retries} times, not once"
+    left = _job_dirs(exec_env)
+    assert left == [], left
+
+
 def test_sweep_orphans_removes_only_stale_job_shaped_directories(dispatcher, exec_env):
     stale = exec_transport.create_job_dir(exec_env, exec_transport.new_job_id())
     fresh = exec_transport.create_job_dir(exec_env, exec_transport.new_job_id())
