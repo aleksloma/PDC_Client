@@ -267,12 +267,22 @@ configuration file exists:
 |---|---|---|
 | `EXECUTOR_SHARED_DIR` | `/jobs` | the shared job volume |
 | `EXECUTOR_MEM_LIMIT_MB` | `2048` | address-space limit per job |
-| `EXECUTOR_MAX_CONCURRENT` | `1` | jobs in flight |
+| `EXECUTOR_MAX_CONCURRENT` | `1` | jobs in flight — **not an ordinary knob**, see below |
 | `EXECUTOR_MAX_TIMEOUT_S` | `600` | the largest `timeout_s` a request may ask for |
 | `EXECUTOR_GRACE_S` | `15` | how long past `timeout_s` the parent waits before killing |
 
 The port is fixed at **8090** by the image's own start command and is not
 configurable by environment; it is internal only and must never be published.
+
+**Raising `EXECUTOR_MAX_CONCURRENT` forfeits guarantees, it does not just add
+throughput.** Generated code keeps filesystem access and every job runs as the
+same user, so with two jobs in flight one can read the other's inputs during
+its load window, plant a symlink where the other's result will be written, or
+signal its process. The stray sweep, which is what catches a job that detaches
+itself, is also skipped while a sibling job is running — so a leaked pipe can
+additionally cost a job its response. Concurrency above one is only defensible
+with a separate identity per job, which this service does not do. Treat the
+default as part of the design.
 
 **It refuses to start** when any of `BRAIN_*`, `SECRET_KEY`,
 `CLIENT_ENCRYPTION_KEY`, `CLIENT_ENCRYPTION_KEY_OLD`, `LOCAL_ADMIN_PASSWORD`
@@ -333,11 +343,16 @@ part of the wiring task, not of this service.
 
 **Where each line actually lands.** The service's own lines (`EXECUTOR_START`,
 `EXEC_JOB_START` / `EXEC_JOB_END`, the sweeps, the startup refusal) go to
-stdout and so to `docker logs`. The RUNNER's lines — its own start/end and the
-`EXEC_OK` / `EXEC_ERROR` that `code_exec` emits inside the job — go to the
-pipe the parent reads, which is returned in the response rather than
-re-printed, so they reach `docker logs` only when the job died without a
-response. Do not expect a per-job `EXEC_OK` in the container log.
+stdout and so to `docker logs`. The RUNNER's own lines — its start and end
+records, and the `EXEC_OK` / `EXEC_ERROR` that the execution module emits
+inside the job — are written on its inherited stdout, which is a pipe the
+parent reads but keeps only when the job produced no usable response. On a
+normal job the runner's own response already carries `stdout` (the generated
+code's output, captured separately), so the pipe tail is dropped. Those lines
+therefore reach **neither** the response nor `docker logs`: they exist only in
+the runner's rotating file under its throwaway `DATA_ROOT`, readable with
+`docker exec` until the container restarts. Do not expect a per-job `EXEC_OK`
+in the container log, and do not treat the absence of one as a failure.
 
 ## 9. Image
 
