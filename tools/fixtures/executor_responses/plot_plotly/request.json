@@ -1,0 +1,1 @@
+{"job_id":"<job_id>","kind":"PLOT","code":"import plotly.express as px\ng = dfs['sales'].groupby('city', as_index=False)['revenue'].sum()\nfig = px.bar(g, x='city', y='revenue', title='revenue by city')","dataframes":[{"name":"sales","path":"in/0.parquet","format":"parquet"}],"timeout_s":120,"options":{"split_multi_axes":false}}

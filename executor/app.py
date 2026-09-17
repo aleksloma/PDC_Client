@@ -21,6 +21,7 @@ Nothing here reads a `.env` file.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import os
 import shutil
@@ -143,6 +144,28 @@ def _refuse_on_secret_env() -> None:
             raise SystemExit(1)
 
 
+def _refuse_on_unwritable_shared_dir(shared_dir: Path) -> None:
+    """Refuse to start when the shared job directory cannot be written.
+
+    A write-and-unlink probe, not a mode check: the directory arrives from a
+    volume mount whose ownership this process does not control, and only an
+    actual write proves the job output can be produced. Without it every job
+    would come back as a crash with the real cause buried in a runner
+    traceback — the same reason the secret self-check refuses loudly.
+    """
+    probe = Path(shared_dir) / f".write_probe.{os.getpid()}"
+    try:
+        with open(probe, "wb") as handle:
+            handle.write(b"ok")
+        os.unlink(probe)
+    except OSError as e:
+        log_with_sid("executor", "error",
+                     f"EXECUTOR_SHARED_DIR_NOT_WRITABLE dir={shared_dir} {e}")
+        with suppress(OSError):
+            os.unlink(probe)
+        raise SystemExit(1)
+
+
 def _library_versions() -> dict:
     if not _VERSIONS:
         for name in _VERSION_MODULES:
@@ -168,6 +191,12 @@ async def lifespan(app: FastAPI):
         log_with_sid("executor", "error",
                      f"EXECUTOR_SHARED_DIR_INVALID dir={config.shared_dir}")
         raise SystemExit(1)
+    _refuse_on_unwritable_shared_dir(config.shared_dir)
+    if config.max_concurrent > 1:
+        # More than one job at a time gives up the guarantee the stray-process
+        # sweep rests on (one runner per uid), so it must never be silent.
+        log_with_sid("executor", "warning",
+                     f"EXECUTOR_CONCURRENCY_UNSAFE max_concurrent={config.max_concurrent}")
     _STATE["config"] = config
     _STATE["semaphore"] = asyncio.Semaphore(config.max_concurrent)
     _STATE["pool"] = ThreadPoolExecutor(max_workers=config.max_concurrent + 1,
@@ -228,10 +257,34 @@ def _sweep_orphans(shared_dir: Path) -> None:
                 continue
             if now - info.st_mtime <= _ORPHAN_MAX_AGE_S:
                 continue
-            shutil.rmtree(child)
+            _rmtree_repairing_modes(child)
             log_with_sid(child.name, "info", "EXEC_ORPHAN_REMOVED")
         except OSError as e:
             log_with_sid(child.name, "warning", f"EXEC_ORPHAN_REMOVE_FAILED: {e}")
+
+
+def _repair_mode_and_retry(function, path, excinfo) -> None:
+    """`rmtree` error hook: make the path traversable, then try once more.
+
+    Generated code can `chmod 0500` a directory it created under `out/`, which
+    makes the removal fail for the identity that owns it — the job would then
+    be leaked forever. Only modes on what this uid owns can be repaired, which
+    is exactly that subtree.
+    """
+    try:
+        os.chmod(path, 0o770)
+        function(path)
+    except OSError as e:
+        log_with_sid(Path(path).name, "warning", f"EXEC_ORPHAN_MODE_REPAIR_FAILED: {e}")
+
+
+def _rmtree_repairing_modes(path: Path) -> None:
+    # Python 3.12 renamed rmtree's error callback `onerror` -> `onexc`; keep
+    # working if either is the one this interpreter offers.
+    try:
+        shutil.rmtree(path, onexc=_repair_mode_and_retry)
+    except TypeError:
+        shutil.rmtree(path, onerror=_repair_mode_and_retry)
 
 
 def _orphan_loop(shared_dir: Path, stop: threading.Event) -> None:
@@ -414,8 +467,11 @@ def _execute_job(config: Config, request: ExecuteRequest, job_dir: Path,
         os.chmod(job_json, 0o660)
 
     started = time.monotonic()
+    # The same hash the web side logs, so one answer can be followed across
+    # the two containers' logs after the main app removed `job.json`.
+    code_hash = hashlib.sha256(request.code.encode("utf-8", errors="ignore")).hexdigest()[:10]
     log_with_sid(job_id, "info",
-                 f"EXEC_JOB_START kind={request.kind} "
+                 f"EXEC_JOB_START kind={request.kind} code_hash={code_hash} "
                  f"timeout_s={exec_transport.normalize_timeout(request.timeout_s)} "
                  f"frames={len(request.dataframes)}")
     stdout_sink = [b""]
@@ -529,7 +585,8 @@ def _execute_job(config: Config, request: ExecuteRequest, job_dir: Path,
 
     level = "info" if response["status"] in ("ok", "error") else "warning"
     log_with_sid(job_id, level,
-                 f"EXEC_JOB_END status={response['status']} elapsed_ms={elapsed_ms} "
+                 f"EXEC_JOB_END status={response['status']} code_hash={code_hash} "
+                 f"elapsed_ms={elapsed_ms} "
                  f"exit_code={exit_code} reason={response.get('reason')}")
     if response["status"] in ("killed", "crashed"):
         log_with_sid(job_id, "warning", f"EXEC_JOB_STDERR {stderr_text[-2000:]}")

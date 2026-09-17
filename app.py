@@ -95,6 +95,15 @@ async def lifespan(app: FastAPI):
     roles_store.RolesStore().migrate_manage_grants()   # 19f doc v1 -> v2
     roles_store.RolesStore().ensure_base_role()
     roles_store.RolesStore().remove_poweruser_role()   # 19e legacy cleanup
+    # Generated Python runs in the analysis-sandbox container: prepare the
+    # shared job directory, greet the service and sweep the job directories a
+    # crashed worker left behind. Wrapped because a boot must not fail on the
+    # sandbox being slow to come up — the dispatcher reports it per call.
+    try:
+        import executor_client
+        executor_client.startup()
+    except Exception as e:
+        log_with_sid("startup", "error", f"EXECUTOR_STARTUP_FAILED {type(e).__name__}: {e}")
     import db_scheduler
     db_scheduler.start()
     yield

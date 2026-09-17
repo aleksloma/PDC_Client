@@ -1,0 +1,1 @@
+{"case":"python_frame","kind":"PYTHON","timeout_s":60,"code":"RESULT = dfs['sales'].groupby('city', as_index=False)['revenue'].sum()","note":"a DataFrame RESULT -> out/result.parquet","http_status":200,"status":"ok","payload_keys":["error","image_base64","preview","result"],"out_files":["result.parquet (2181B)"],"body_bytes":280}

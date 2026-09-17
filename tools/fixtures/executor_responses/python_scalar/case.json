@@ -1,0 +1,1 @@
+{"case":"python_scalar","kind":"PYTHON","timeout_s":60,"code":"RESULT = float(dfs['sales']['revenue'].sum())","note":"a scalar RESULT, inline","http_status":200,"status":"ok","payload_keys":["error","image_base64","preview","result"],"out_files":[],"body_bytes":253}

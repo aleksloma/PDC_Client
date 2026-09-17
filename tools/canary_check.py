@@ -10,6 +10,16 @@ wrong answers" regressions (e.g. exotic dtypes reaching generated code —
 the demo 3D-chart cartesian-groupby incident) that unit tests on individual
 layers can miss.
 
+THIS IS AN INTEGRATION CHECK: RUN IT INSIDE THE WEB CONTAINER OF A RUNNING
+STACK. `code_exec.safe_execute` hands every block to the analysis-sandbox
+service over HTTP, so the sandbox must be up and sharing the jobs directory
+or every exec check fails. It works unchanged because it overrides only
+DATA_ROOT (its own isolation, below) and INHERITS EXECUTOR_SHARED_DIR from
+the container environment. With that variable unset the jobs directory would
+resolve under the temp DATA_ROOT — a path the sandbox cannot see — and every
+check would come back as a rejected job. That is deliberate: it fails loudly
+instead of silently testing nothing.
+
 Usage:
     python tools/canary_check.py                     # CSV mode, default fixture
     python tools/canary_check.py --source my.csv
@@ -37,7 +47,7 @@ Checks (CSV mode — value expectations from tools/canary_expected.json):
 Snapshot mode (--snapshots-dir + --registry) runs per registered table:
     S1  parquet loads, post-gate dtypes all standard
     S2  observed-only groupby invariant on the lowest-cardinality string col
-    S3  exec smoke: len(dfs[key]) through safe_execute
+    S3  exec smoke: len(dfs[key]) through safe_execute (the sandbox hop)
 
 Exit code 0 on PASS-ALL, 1 otherwise.
 """

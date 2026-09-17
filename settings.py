@@ -37,6 +37,25 @@ def _int_env(name: str, default: int, minimum: int) -> int:
     return max(value, minimum)
 
 
+def _float_env(name: str, default: float, minimum: float) -> float:
+    """Read a float env var, falling back to `default` on ANY parse failure and
+    clamping to `minimum`.
+
+    The float sibling of `_int_env`, and for the same reason: these values are
+    read inside a Field default_factory, so a typo would raise during `import
+    settings` — before logging exists — and crash-loop the container with
+    nothing to explain why (Article IV). Silent for the same reason.
+    """
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = float(raw)
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError(name)
+    except Exception:
+        value = default
+    return max(value, minimum)
+
+
 class Settings(BaseModel):
     DATA_ROOT: str = Field(default_factory=lambda: os.getenv("DATA_ROOT", "./client_data"))
     MAX_FILES: int = Field(default_factory=lambda: int(os.getenv("MAX_FILES", "5")))
@@ -127,6 +146,33 @@ class Settings(BaseModel):
     # signed URL and /upload/finalize pulls them into the session store. The
     # object is deleted after finalize - raw data still lives on DATA_ROOT only.
     GCS_UPLOAD_BUCKET: str = Field(default_factory=lambda: os.getenv("GCS_UPLOAD_BUCKET", ""))
+
+    # --- Analysis sandbox (generated Python runs in its own container) ------
+    # The service that executes generated code. An internal-network name: the
+    # sandbox publishes no ports, so this is never reachable from outside.
+    EXECUTOR_URL: str = Field(default_factory=lambda: os.getenv("EXECUTOR_URL", "http://pdc-executor:8090"))
+    # The job directory both containers mount. EMPTY (the default) means
+    # "<DATA_ROOT>/exec_jobs, resolved at call time" — a path bound at import
+    # would ignore a DATA_ROOT that is set later. Whatever it points at must be
+    # the same storage the sandbox mounts, or every job is refused.
+    EXECUTOR_SHARED_DIR: str = Field(default_factory=lambda: os.getenv("EXECUTOR_SHARED_DIR", ""))
+    # Bounds the CONNECT to the sandbox only. Both containers start together,
+    # so an unanswered connect means it is down, not busy.
+    EXECUTOR_CONNECT_TIMEOUT: float = Field(default_factory=lambda: _float_env("EXECUTOR_CONNECT_TIMEOUT", 5.0, 0.5))
+    # Chart rendering never had a deadline while it ran in the web process;
+    # crossing a process boundary requires one, and a chart is allowed longer
+    # than an analysis block because plotting large frames legitimately is.
+    EXECUTOR_PLOT_TIMEOUT_S: int = Field(default_factory=lambda: _int_env("EXECUTOR_PLOT_TIMEOUT_S", 120, 1))
+    # Jobs dispatched at once. MUST never exceed the sandbox's own limit, and
+    # raising either forfeits the isolation the sandbox exists for (one job per
+    # container at a time is what makes "no other process shares this uid"
+    # true) — see docs/EXECUTOR_PROTOCOL.md §7.
+    EXECUTOR_MAX_CONCURRENT: int = Field(default_factory=lambda: _int_env("EXECUTOR_MAX_CONCURRENT", 1, 1))
+    # How long a job may wait for a dispatch slot before it is answered "busy".
+    # The wait is OUTSIDE the job's own budget on purpose: a caller that never
+    # ran must not be told its code was too slow, or the planner's retry would
+    # try to optimise a queue.
+    EXECUTOR_QUEUE_MAX_S: float = Field(default_factory=lambda: _float_env("EXECUTOR_QUEUE_MAX_S", 600.0, 1.0))
 
     # Fixed local admin account (the only role=admin user in Phase 1).
     # LOCAL_ADMIN_PASSWORD bootstraps the account ONCE (hash-only on disk,

@@ -112,12 +112,17 @@ def _is_error_payload(payload: dict, kind: str) -> bool:
 
 
 def _run_one(kind: str, code: str, dfs: dict, job_id: str, timeout_s, options: dict) -> dict:
-    """Call the main app's own execution functions, unchanged."""
+    """Call the main app's own execution bodies, unchanged.
+
+    The IN-PROCESS functions, never the public `safe_execute` /
+    `render_plot_safe`: those dispatch over HTTP, so calling one here would
+    make this container ask itself to run the job.
+    """
     if kind == "PLOT":
-        return plot_utils.render_plot_safe(
+        return plot_utils._render_in_process(
             code, dfs, job_id,
             split_multi_axes=bool(options.get("split_multi_axes")))
-    return code_exec.safe_execute(code, dfs, sid=job_id, timeout=timeout_s)
+    return code_exec._execute_in_process(code, dfs, sid=job_id, timeout=timeout_s)
 
 
 def _write_response(response: dict) -> None:

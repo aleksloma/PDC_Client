@@ -1,4 +1,12 @@
 # code_exec.py — v2.4 (adds plotly and seaborn to execution environment)
+"""Analysis-block execution.
+
+`safe_execute` is the public entry point every caller uses; it DISPATCHES the
+job to the analysis-sandbox container (`executor_client.execute`) and runs
+nothing in this process. `_execute_in_process` is the same body as before —
+the function the sandbox runner imports and the only place `exec()` is reached
+from here.
+"""
 import io, base64, traceback, hashlib, atexit
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import numpy as np
@@ -13,6 +21,7 @@ from logger_utils import log_with_sid
 from settings import settings
 from sandbox_guard import SANDBOX_BUILTINS
 from exec_sanitizer import sanitize_for_execution
+import exec_transport
 
 # --- Extended visualization libraries (safe imports) ---
 try:
@@ -170,7 +179,32 @@ def _execute_code_in_env(code: str, env: dict) -> dict:
 
 
 def safe_execute(code: str, dfs: dict, sid: str | None = None, timeout: float = None):
+    """Hand the analysis block to the sandbox container and return its answer.
+
+    Same signature and same return shape as when the body ran here: a dict
+    with possible keys error, result, preview, image_base64. A sandbox that is
+    unreachable, busy or refuses the job is reported through `error` — this
+    never raises and never falls back to executing locally.
+    """
+    # Lazy import: the sandbox image ships this module and has no httpx, and
+    # must never hold the client that dispatches to it.
+    from executor_client import execute
+
+    # `is None`, not `or`: a caller passing 0 asked for an immediate
+    # deadline and used to get one.
+    if timeout is None:
+        timeout = CODE_EXEC_TIMEOUT_SECONDS
+    timeout_s = exec_transport.normalize_timeout(timeout)
+    return execute("PYTHON", code, dfs, sid=sid, timeout_s=timeout_s)
+
+
+def _execute_in_process(code: str, dfs: dict, sid: str | None = None, timeout: float = None):
     """Execute trusted code with a constrained environment and extract outputs.
+
+    THE SANDBOX RUNNER'S ENTRY POINT — the main app reaches it only through
+    `safe_execute` above, which dispatches to the container this function runs
+    in. Body unchanged: the Article XIII sanitize gate and the guarded
+    builtins are installed here.
 
     Uses ThreadPoolExecutor for Windows-compatible timeout enforcement.
     If code exceeds the timeout, returns a timeout error without blocking.

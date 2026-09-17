@@ -627,8 +627,13 @@ def test_runner_carries_the_limit_and_exit_markers():
     text = _read(EXEC_RUNNER)
     for marker in ("RLIMIT_AS", "RLIMIT_NPROC", "RLIMIT_FSIZE", "RLIMIT_CORE", "setrlimit",
                    "os._exit", "flush()", "umask", "EXECUTOR_RESPONSE_FD", "sys.path.insert",
-                   "read_inputs", "serialize_result", "safe_execute", "render_plot_safe"):
+                   "read_inputs", "serialize_result",
+                   "_execute_in_process", "_render_in_process"):
         assert marker in text, f"executor/runner.py lacks {marker!r}"
+    # The PUBLIC names dispatch over HTTP; calling one from inside the sandbox
+    # would make the sandbox ask itself to run the job.
+    for public in (".safe_execute(", ".render_plot_safe("):
+        assert public not in text, f"executor/runner.py calls {public!r}"
     assert "timeout=None" not in text, "the runner must pass timeout=timeout_s, never None"
     # limits are set before the heavy imports
     limit_pos = text.find("setrlimit")

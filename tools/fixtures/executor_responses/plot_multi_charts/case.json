@@ -1,0 +1,1 @@
+{"case":"plot_multi_charts","kind":"PLOT","timeout_s":120,"code":"import matplotlib.pyplot as plt\nfig, ax = plt.subplots(1, 2)\nax[0].bar(['a','b'], [1,2])\nax[1].bar(['a','b'], [2,1])","note":"the same figure with split_multi_axes=True -> multi_charts of 2","http_status":200,"status":"ok","payload_keys":["is_plotly","multi_charts","ok"],"out_files":[],"body_bytes":42551}

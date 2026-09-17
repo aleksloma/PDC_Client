@@ -1,0 +1,1 @@
+{"case":"python_nan_preview","kind":"PYTHON","timeout_s":60,"code":"import numpy as np\nRESULT = float('nan')","note":"a NaN scalar: the preview must carry the literal NaN token","http_status":200,"status":"ok","payload_keys":["error","image_base64","preview","result"],"out_files":[],"body_bytes":247}

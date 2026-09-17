@@ -1,0 +1,1 @@
+{"status":"ok","kind":"PYTHON","payload":{"error":null,"result":{"kind":"frame","ref":"out/result.parquet"},"preview":{"__opaque__":"list"},"image_base64":null},"elapsed_ms":1311,"peak_rss_mb":255.4,"stdout":"","stderr":"","traceback":"","exit_code":0,"signal":null,"reason":null}

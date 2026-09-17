@@ -1,5 +1,12 @@
 # plot_utils.py — v2.0
-"""Helpers to execute plotting code (Matplotlib, Seaborn, Plotly) and capture figures as base64 images."""
+"""Helpers to execute plotting code (Matplotlib, Seaborn, Plotly) and capture figures as base64 images.
+
+`render_plot_safe` is the public entry point every caller uses; it DISPATCHES
+the chart job to the analysis-sandbox container (`executor_client.execute`)
+and runs nothing in this process. `_render_in_process` is the same body as
+before — the function the sandbox runner imports and the only place `exec()`
+is reached from here.
+"""
 import io, base64, re, traceback
 import matplotlib
 matplotlib.use("Agg")
@@ -375,8 +382,8 @@ GLOBAL_PLOT_SCOPE = {
     "calplot": calplot,
     "upset_plot_from_sets": upset_plot_from_sets,
     "adjust_text": adjust_text,
-    # Deterministic outlier helpers (QA 2.6) — must exist at BOTH exec sites
-    # (code_exec.safe_execute registers the same pair)
+    # Deterministic outlier helpers (QA 2.6) — must exist at BOTH exec
+    # sites (`code_exec._execute_in_process` registers the same pair)
     "outlier_mask": outlier_mask,
     "drop_extreme_outliers": drop_extreme_outliers,
     # Machine Learning
@@ -1541,7 +1548,32 @@ def _format_matplotlib_numeric(fig):
 
 
 def render_plot_safe(code: str, dfs: dict, sid_or_id: str, split_multi_axes: bool = False):
+    """Hand the chart job to the sandbox container and return its answer.
+
+    Same signature and same return shapes as when the body ran here. A sandbox
+    that is unreachable, busy or refuses the job is reported as
+    `{ok: False, error, trace: ""}` — this never raises and never falls back to
+    rendering locally.
+    """
+    # Lazy import: the sandbox image ships this module and has no httpx, and
+    # must never hold the client that dispatches to it. `settings` is imported
+    # here for the same reason the exec-site helpers below are — this module's
+    # import surface is the sandbox's too.
+    from executor_client import execute
+    from settings import settings
+
+    return execute("PLOT", code, dfs, sid=sid_or_id,
+                   timeout_s=settings.EXECUTOR_PLOT_TIMEOUT_S,
+                   split_multi_axes=split_multi_axes)
+
+
+def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: bool = False):
     """Execute plotting code in a limited scope and return {ok, image|error}.
+
+    THE SANDBOX RUNNER'S ENTRY POINT — the main app reaches it only through
+    `render_plot_safe` above, which dispatches to the container this function
+    runs in. Body unchanged: the Article XIII sanitize gate and the guarded
+    builtins are installed here.
 
     The environment exposes pd/np/plt/mpatches/sns/go/px and the loaded dataframes as `dfs`.
     Supports Matplotlib, Seaborn, and Plotly visualizations.
@@ -1563,8 +1595,8 @@ def render_plot_safe(code: str, dfs: dict, sid_or_id: str, split_multi_axes: boo
     from exec_sanitizer import sanitize_for_execution
     dfs = sanitize_for_execution(dfs, sid_or_id)
     env["dfs"] = dfs
-    # Same guarded builtins as code_exec.safe_execute — chart code must not be
-    # able to import DB drivers / credential modules either (Article VII).
+    # Same guarded builtins as `code_exec._execute_in_process` — chart code
+    # must not import DB drivers / credential modules either (Article VII).
     # dict(): per-call copy so one execution can't mutate the shared guard.
     from sandbox_guard import SANDBOX_BUILTINS
     env["__builtins__"] = dict(SANDBOX_BUILTINS)

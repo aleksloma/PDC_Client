@@ -1,0 +1,1 @@
+{"job_id":"<job_id>","kind":"PLOT","code":"import matplotlib.pyplot as plt\nfig, ax = plt.subplots(1, 2)\nax[0].bar(['a','b'], [1,2])\nax[1].bar(['a','b'], [2,1])","dataframes":[{"name":"sales","path":"in/0.parquet","format":"parquet"}],"timeout_s":120,"options":{"split_multi_axes":true}}

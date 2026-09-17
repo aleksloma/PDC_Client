@@ -1,0 +1,1 @@
+{"case":"python_timeout","kind":"PYTHON","timeout_s":3,"code":"while True:\n    pass","note":"the timeout path: status timeout, byte-identical error text","http_status":200,"status":"timeout","payload_keys":["error"],"out_files":[],"body_bytes":231}

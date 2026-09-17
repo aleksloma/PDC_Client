@@ -1,0 +1,1 @@
+{"case":"python_error","kind":"PYTHON","timeout_s":60,"code":"RESULT = dfs['sales']['nope'].sum()","note":"an ordinary execution error (KeyError)","http_status":200,"status":"error","payload_keys":["error"],"out_files":[],"body_bytes":191}

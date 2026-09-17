@@ -1248,3 +1248,66 @@ def test_dumps_loads_keep_nan_and_inf_and_unicode_compact():
     from_bytes = exec_transport.loads(text.encode("utf-8"))
     assert math.isnan(from_bytes["a"]) and from_bytes["u"] == "ქ", from_bytes
     assert exec_transport.loads(b'{"x":[1,2.5,null,true]}') == {"x": [1, 2.5, None, True]}
+
+
+# ---------------------------------------------------------------------------
+# descriptor hygiene and the both-formats-fail input branch
+# ---------------------------------------------------------------------------
+def _fd_count() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+@pytest.mark.skipif(not POSIX or not Path("/proc/self/fd").is_dir(),
+                    reason="counting descriptors needs /proc")
+def test_a_failing_fstat_while_opening_a_reference_leaks_no_descriptor(job_dir, monkeypatch):
+    """The checks that run while the reference is open sit under ONE guard: a
+    per-branch close left the descriptor open when `os.fstat` was the raiser,
+    so a hostile response could exhaust the web worker's descriptors."""
+    out = job_dir / "out"
+    out.mkdir(exist_ok=True)
+    _sales().to_parquet(out / "result.parquet", engine="pyarrow", compression=None)
+
+    def boom(fd):
+        raise OSError(9, "bad file descriptor")
+
+    monkeypatch.setattr(os, "fstat", boom)
+    before = _fd_count()
+    errors = []
+    for _ in range(25):
+        decoded = exec_transport.deserialize_result(
+            _response(_frame_payload("out/result.parquet")), job_dir, "PYTHON", 60)
+        errors.append(_error_text(decoded, "PYTHON"))
+    after = _fd_count()
+    monkeypatch.undo()
+
+    assert all(e.startswith("ExecutorResponseError:") for e in errors), errors[:2]
+    leaked = after - before
+    assert leaked <= 0, (before, after)
+
+
+def test_write_inputs_raises_when_neither_format_can_carry_the_frame(job_dir, monkeypatch):
+    """The dispatcher catches this `ValueError` and reports a preparation
+    error; it must name the key and leave the reason in the log."""
+    logged = []
+    monkeypatch.setattr(exec_transport, "log_with_sid",
+                        lambda sid, level, message, *a, **k: logged.append(message))
+
+    def no_parquet(self, *a, **k):
+        raise OSError("no parquet here")
+
+    def no_pickle(self, *a, **k):
+        raise OSError("no pickle here")
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", no_parquet)
+    monkeypatch.setattr(pd.DataFrame, "to_pickle", no_pickle)
+
+    with pytest.raises(ValueError) as excinfo:
+        exec_transport.write_inputs({"sales": _sales()}, job_dir, sid="t")
+
+    message = str(excinfo.value)
+    assert "cannot transport dataframe 'sales'" in message, message
+    failures = [m for m in logged if m.startswith("EXEC_INPUT_WRITE_FAILED")]
+    assert len(failures) == 1, logged
+    line = failures[0]
+    assert "key=sales" in line, line
+    assert "no parquet here" in line and "no pickle here" in line, line

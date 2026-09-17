@@ -915,3 +915,218 @@ def test_sweep_spares_the_uvicorn_process_and_its_parent(shared_dir, monkeypatch
                 proc.kill()
             proc.wait(timeout=10)
         log.close()
+
+
+# ---------------------------------------------------------------------------
+# startup write probe on the shared job volume
+# ---------------------------------------------------------------------------
+def _write_probe_guard():
+    """The startup guard that refuses an unwritable shared job directory.
+
+    Resolved by name so a missing implementation names itself; called with or
+    without the directory argument, whichever the guard declares.
+    """
+    import inspect
+
+    import executor.app as executor_app
+
+    guard = getattr(executor_app, "_refuse_on_unwritable_shared_dir", None)
+    assert callable(guard), ("executor/app.py must expose "
+                             "_refuse_on_unwritable_shared_dir(): a shared job "
+                             "directory it cannot write to means every job "
+                             "fails, so it must refuse to serve")
+    takes_argument = bool(inspect.signature(guard).parameters)
+    return guard, takes_argument
+
+
+def _run_write_probe(shared_dir: Path):
+    guard, takes_argument = _write_probe_guard()
+    return guard(shared_dir) if takes_argument else guard()
+
+
+def test_the_write_probe_accepts_a_writable_shared_dir(executor_env):
+    assert _run_write_probe(executor_env) is None
+    leftovers = sorted(p.name for p in executor_env.iterdir())
+    assert leftovers == [], f"the probe left files behind: {leftovers}"
+
+
+def test_startup_refuses_when_the_shared_dir_cannot_be_written(executor_env, monkeypatch):
+    """Root ignores mode bits, so this case removes the directory instead: the
+    probe's write fails the same way, and the refusal is what is under test."""
+    import executor.app as executor_app
+
+    logged: list = []
+    monkeypatch.setattr(executor_app, "log_with_sid",
+                        lambda sid, level, message, *a, **k: logged.append(message))
+    gone = executor_env / "not_there"
+
+    with pytest.raises(SystemExit) as excinfo:
+        _run_write_probe(gone)
+
+    code = excinfo.value.code
+    assert code not in (0, None), code
+    refusals = [m for m in logged if m.startswith("EXECUTOR_SHARED_DIR_NOT_WRITABLE")]
+    assert len(refusals) == 1, logged
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory mode bits")
+def test_startup_refuses_on_a_read_only_shared_dir(executor_env, monkeypatch):
+    import executor.app as executor_app
+
+    logged: list = []
+    monkeypatch.setattr(executor_app, "log_with_sid",
+                        lambda sid, level, message, *a, **k: logged.append(message))
+    read_only = executor_env / "ro"
+    read_only.mkdir()
+    os.chmod(read_only, 0o500)
+    try:
+        with pytest.raises(SystemExit):
+            _run_write_probe(read_only)
+    finally:
+        os.chmod(read_only, 0o700)
+    refusals = [m for m in logged if m.startswith("EXECUTOR_SHARED_DIR_NOT_WRITABLE")]
+    assert len(refusals) == 1, logged
+
+
+# ---------------------------------------------------------------------------
+# concurrency above one: loud, and the stray sweep stands down
+# ---------------------------------------------------------------------------
+def test_a_concurrency_setting_above_one_is_logged_as_unsafe(executor_env, monkeypatch):
+    """More than one job at a time gives up the one-process-per-uid guarantee
+    the stray sweep rests on, so it must never be silent."""
+    import executor.app as executor_app
+
+    monkeypatch.setenv("EXECUTOR_MAX_CONCURRENT", "2")
+    logged: list = []
+    monkeypatch.setattr(executor_app, "log_with_sid",
+                        lambda sid, level, message, *a, **k: logged.append(message))
+
+    with _client() as client:
+        assert client.get("/healthz").status_code == 200
+
+    unsafe = [m for m in logged if m.startswith("EXECUTOR_CONCURRENCY_UNSAFE")]
+    assert len(unsafe) == 1, logged
+    assert "max_concurrent=2" in unsafe[0], unsafe[0]
+
+
+def test_the_default_concurrency_is_not_reported_as_unsafe(executor_env, monkeypatch):
+    import executor.app as executor_app
+
+    logged: list = []
+    monkeypatch.setattr(executor_app, "log_with_sid",
+                        lambda sid, level, message, *a, **k: logged.append(message))
+
+    with _client() as client:
+        assert client.get("/healthz").status_code == 200
+
+    unsafe = [m for m in logged if m.startswith("EXECUTOR_CONCURRENCY_UNSAFE")]
+    assert unsafe == [], logged
+
+
+def test_two_jobs_at_once_both_answer_with_the_stray_sweep_skipped(executor_env, monkeypatch):
+    import executor.app as executor_app
+
+    monkeypatch.setenv("EXECUTOR_MAX_CONCURRENT", "2")
+    logged: list = []
+    monkeypatch.setattr(executor_app, "log_with_sid",
+                        lambda sid, level, message, *a, **k: logged.append(message))
+
+    job_a, dir_a, manifest_a = _new_job(executor_env)
+    job_b, dir_b, manifest_b = _new_job(executor_env)
+    code = "import time\ntime.sleep(3)\nRESULT = 'done'"
+    results: dict = {}
+
+    with _client() as client:
+        _submit(client, executor_env, "RESULT = 0")      # warm the runner imports
+
+        def _post(tag, job_id, manifest):
+            resp = client.post("/execute", json=_body(job_id, code, manifest, timeout_s=90))
+            results[tag] = (resp.status_code, exec_transport.loads(resp.content))
+
+        first = threading.Thread(target=_post, args=("a", job_a, manifest_a), daemon=True)
+        second = threading.Thread(target=_post, args=("b", job_b, manifest_b), daemon=True)
+        first.start()
+        time.sleep(0.3)
+        second.start()
+        first.join(timeout=180)
+        second.join(timeout=180)
+
+    for tag, job_dir in (("a", dir_a), ("b", dir_b)):
+        status_code, response = results.get(tag, (None, None))
+        assert status_code == 200, (tag, status_code, response)
+        assert response.get("status") == "ok", (tag, response)
+        decoded = _decode(response, job_dir)
+        assert decoded.get("result") == "done", (tag, decoded)
+
+    skipped = [m for m in logged if m.startswith("EXEC_STRAY_SWEEP_SKIPPED")]
+    assert skipped, "the stray sweep ran while a sibling job was in flight"
+
+
+# ---------------------------------------------------------------------------
+# the sweep repairs the modes generated code can leave behind
+# ---------------------------------------------------------------------------
+def test_the_sweep_removes_an_orphan_whose_output_dir_was_locked(executor_env):
+    """Generated code can `chmod 0500` a directory it created under `out/`,
+    which makes a plain `rmtree` fail for the identity that owns it — the
+    sweep must repair the mode and retry instead of leaking the job forever.
+    (As root the modes are advisory; the case is a pin for the runtime
+    identity, where they are not.)"""
+    shared = executor_env
+    orphan = exec_transport.create_job_dir(shared, exec_transport.new_job_id())
+    locked = orphan / "out" / "x"
+    locked.mkdir(parents=True)
+    (locked / "result.parquet").write_bytes(b"x")
+    os.chmod(locked, 0o500)
+    two_hours_ago = time.time() - 2 * 3600
+    os.utime(orphan, (two_hours_ago, two_hours_ago))
+
+    with _client() as client:
+        assert client.get("/healthz").status_code == 200
+
+    assert not orphan.exists(), "an orphan with a locked out/ subdirectory survived the sweep"
+
+
+# ---------------------------------------------------------------------------
+# the log join key between the two containers
+# ---------------------------------------------------------------------------
+def test_both_job_log_lines_carry_the_code_hash(executor_env, monkeypatch):
+    """The web side logs the same hash, so an operator can join the two logs
+    for one answer."""
+    import hashlib
+
+    import executor.app as executor_app
+
+    logged: list = []
+    monkeypatch.setattr(executor_app, "log_with_sid",
+                        lambda sid, level, message, *a, **k: logged.append(message))
+    code = "RESULT = 1 + 1"
+    expected = hashlib.sha256(code.encode("utf-8", errors="ignore")).hexdigest()[:10]
+
+    with _client() as client:
+        _submit(client, executor_env, code)
+
+    starts = [m for m in logged if m.startswith("EXEC_JOB_START")]
+    ends = [m for m in logged if m.startswith("EXEC_JOB_END")]
+    assert len(starts) == 1, logged
+    assert len(ends) == 1, logged
+    assert f"code_hash={expected}" in starts[0], starts[0]
+    assert f"code_hash={expected}" in ends[0], ends[0]
+
+
+# ---------------------------------------------------------------------------
+# the sandbox image never ships the HTTP dispatcher
+# ---------------------------------------------------------------------------
+def test_generated_code_cannot_import_the_dispatcher(executor_env):
+    """`executor_client` is main-app only: were it in the image's copy set,
+    the runner's public-name call would dispatch the sandbox to itself."""
+    code = ("try:\n"
+            "    import executor_client\n"
+            "    RESULT = 'importable'\n"
+            "except ImportError as e:\n"
+            "    RESULT = type(e).__name__")
+    with _client() as client:
+        job_dir, response, _ = _submit(client, executor_env, code)
+    decoded = _decode(response, job_dir)
+    result = decoded.get("result")
+    assert result != "importable", "the sandbox image ships the HTTP dispatcher"
+    assert result in ("ModuleNotFoundError", "ImportError"), decoded
