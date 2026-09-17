@@ -10,10 +10,14 @@ field-level contract — `docs/ENTERPRISE_ARCHITECTURE.md` covers the topology,
 `docs/AI_CONSTITUTION.md` Article VII the rules, and `docs/PROTOCOL.md` is a
 different thing entirely (the Brain's `/v1/*` surface).
 
-> Status: the executor service and the transport exist and are tested. The web
-> service still executes in-process until the rewiring task lands; when it
-> does, `code_exec.safe_execute` and `plot_utils.render_plot_safe` keep their
-> signatures and return shapes and dispatch here instead.
+> Status: implemented on both sides. `code_exec.safe_execute` and
+> `plot_utils.render_plot_safe` keep their signatures and return shapes and
+> dispatch here (`executor_client.py`); their former bodies are
+> `code_exec._execute_in_process` and `plot_utils._render_in_process`, which
+> only `executor/runner.py` calls. What is NOT yet in place is the compose
+> wiring: until the two services are declared together on an internal network
+> with the shared jobs volume, a stack has no executor to reach and every
+> question answers `ExecutorUnavailable`.
 
 ---
 
@@ -55,7 +59,7 @@ POST /execute ────────────────────▶   
                                         spawn: python -I -u executor/runner.py job.json
                                           ├─ set resource limits, then import
                                           ├─ read_inputs()
-                                          ├─ safe_execute / render_plot_safe   (UNCHANGED code)
+                                          ├─ _execute_in_process / _render_in_process   (the SAME code as before)
                                           └─ serialize_result() ──▶ response fd
                                         collect stdout/stderr, wait, kill group,
                                         sweep strays, read the response
@@ -221,7 +225,7 @@ matrix of scalars, numpy types, keys and container shapes.
 | `status` | What it means | The web service returns |
 |---|---|---|
 | `ok` / `error` | the job ran; `error` means the code raised or a guard refused | the payload, key for key as today |
-| `timeout` | the job exceeded `timeout_s`, including time spent queued | `TimeoutError: Code execution exceeded N seconds limit` — byte-identical to the in-process text |
+| `timeout` | the job exceeded `timeout_s`, including time spent queued INSIDE this service | `TimeoutError: Code execution exceeded N seconds limit` — byte-identical to the in-process text |
 | `killed` | a SIGKILL the executor did not send, i.e. the cgroup out-of-memory killer | `MemoryError: execution exceeded the memory limit` |
 | `crashed` | any other abnormal exit: a segfault, a failed import, or exit 0 with an unusable response | `ExecutorCrashError: the analysis process exited unexpectedly (…)` |
 
@@ -337,9 +341,11 @@ one `EXEC_JOB_START` and one `EXEC_JOB_END` line carrying the status, elapsed
 time and exit code, with the job id as the session id. The stray sweep logs
 `EXEC_STRAY_KILLED`, and the orphan sweep `EXEC_ORPHAN_REMOVED`.
 
-Once the web service dispatches here it will re-emit its own `EXEC_OK` /
-`EXEC_ERROR` / `EXEC_TIMEOUT` lines with the same code hash as today; that is
-part of the wiring task, not of this service.
+The web service re-emits its own `EXEC_OK` / `EXEC_ERROR` / `EXEC_TIMEOUT`
+lines with the same code hash as before, plus `EXEC_DISPATCH` when it hands a
+job over. Both sides carry the code hash and the job id — the job id is this
+service's session id — so one job can be followed across the two containers
+from either log.
 
 **Where each line actually lands.** The service's own lines (`EXECUTOR_START`,
 `EXEC_JOB_START` / `EXEC_JOB_END`, the sweeps, the startup refusal) go to
@@ -382,3 +388,65 @@ template is ever rendered in that image.
 The chart rasterizer and its headless browser are deliberately absent. Plotly
 figures cross as HTML; only the web service's report and export paths
 rasterize, so the sandbox image carries no browser.
+
+## 10. Web service side
+
+`executor_client.execute(kind, code, dfs, sid, timeout_s, split_multi_axes)`
+is the only caller of this protocol. `code_exec.safe_execute` and
+`plot_utils.render_plot_safe` are thin wrappers over it and keep their old
+signatures, so nothing upstream changed.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `EXECUTOR_URL` | `http://pdc-executor:8090` | where the sandbox answers; internal only |
+| `EXECUTOR_SHARED_DIR` | `<DATA_ROOT>/exec_jobs` | the job volume, resolved at call time. **It must be the same storage the sandbox mounts at its own `EXECUTOR_SHARED_DIR`**, or every job is refused as `JOB_DIR_INVALID` |
+| `EXECUTOR_CONNECT_TIMEOUT` | `5` s | bounds the connect only |
+| `EXECUTOR_PLOT_TIMEOUT_S` | `120` s | the budget for a chart; analysis blocks use `code_exec.CODE_EXEC_TIMEOUT_SECONDS` (60 s) |
+| `EXECUTOR_MAX_CONCURRENT` | `1` | jobs dispatched at once — must never exceed the sandbox's own limit (§7) |
+| `EXECUTOR_QUEUE_MAX_S` | `600` s | how long a job may wait for a slot before it is answered "busy" |
+
+Every one is read at call time, and a malformed value falls back to its
+default rather than raising during import — a settings module that throws
+crash-loops the container before any log exists.
+
+**The dispatch gate.** A job acquires a semaphore sized from
+`EXECUTOR_MAX_CONCURRENT` *before* anything is created, and its `timeout_s`
+starts on acquisition. Two consequences, both deliberate: the sandbox's own
+queue stays empty, and a job that waited still gets its full budget — it is
+never told its code was too slow because a sibling was slow. A wait that
+outlives `EXECUTOR_QUEUE_MAX_S` is answered `ExecutorBusy`, which is a
+distinct text precisely so it can never be read as a code overrun. Chart
+rendering is therefore serialized where it used to run four-ways parallel in
+the web process, and it has a deadline where it used to have none.
+
+**Failure vocabulary.** All five are ordinary execution errors in the
+caller's own shape, never exceptions, because every caller — the chat stream,
+the report renderers, dashboard refresh, Auto Analytics — treats a returned
+error as an answer it can handle:
+
+| Text | When |
+|---|---|
+| `ExecutorUnavailable: the analysis service is not reachable` | connect refused, DNS failure, read timeout, any transport error |
+| `ExecutorBusy: the analysis service is busy, try again` | no slot within `EXECUTOR_QUEUE_MAX_S` |
+| `ExecutorError: the analysis service rejected the job (<CODE>)` | any non-200; `<CODE>` is the sandbox's own code (§4), validated as a short token because the body is untrusted and this text reaches the planner's retry prompt |
+| `ExecutorError: cannot prepare the job (<Type>)` | the job directory or the input write failed before dispatch |
+| `ExecutorError: the analysis answer could not be read (<Type>)` | reconstruction itself raised. It is written never to raise, so this is the belt on top of the braces — and the caller still gets an answer it can handle |
+
+None of them carries a URL, a path or any data: the detail goes to the local
+log, the text goes upstream.
+
+**Job directory lifecycle.** The web service creates it, writes the inputs,
+and removes it in a `finally` — success, failure and refusal alike. A removal
+that fails is logged, not retried, because the sweeps cover it: this side
+sweeps job-id-shaped directories older than an hour at startup and
+opportunistically after a dispatch, and the sandbox does the same on its own
+schedule (§7). Only 32-hex directory names inside the shared directory are
+ever touched.
+
+**Version handshake.** At startup the web service calls `/healthz` and logs
+one warning per library whose version differs from its own, plus
+`EXECUTOR_HANDSHAKE_OK` when it answers at all. A mismatch is never fatal —
+the two images are versioned independently and a customer can upgrade one
+first — but it is the first thing to check when charts or reports come back
+subtly wrong, because the report path parses chart HTML that the plotting
+library's version decides.

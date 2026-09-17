@@ -524,8 +524,9 @@ the connector only ever issues SELECT/introspection statements
 (`_assert_single_select` guards the one assembled statement + the optional
 WHERE; no route accepts free SQL); DB drivers and the client's credential
 modules are **denied inside the code-exec sandbox** (`sandbox_guard.SANDBOX_BUILTINS`
-installed at both exec sites — defense in depth; the SELECT-only DB grant is
-the real guarantee); credentials are never logged, never in any brain payload,
+installed at both exec sites — defense in depth on top of their simple
+ABSENCE from the sandbox image, which is the real boundary; for database
+reach specifically the SELECT-only grant is the guarantee); credentials are never logged, never in any brain payload,
 never at importable module scope in cleartext.
 
 ### Admin routes — Single sign-on (`routes/sso.py` `admin_router`, same `/api/admin` prefix, `_require_admin` guard — ladmin + promoted admins)
@@ -553,9 +554,13 @@ invalidates it). All changes take effect on the next request — no restart.
 
 ## Execution sandbox namespace
 
-Generated code runs at two exec sites — `code_exec.safe_execute` (PYTHON
-blocks) and `plot_utils.render_plot_safe` (PLOT_CODE) — each with a
-pre-imported namespace. **Any helper the brain's AVAILABLE LIBRARIES prompt
+Generated code runs in the `pdc-executor` container, never in the web
+process: `code_exec.safe_execute` (PYTHON blocks) and
+`plot_utils.render_plot_safe` (PLOT_CODE) dispatch the job over HTTP
+(`executor_client.py`, contract in `docs/EXECUTOR_PROTOCOL.md`) and keep their
+return shapes. The code itself still executes at two exec sites — now
+`code_exec._execute_in_process` and `plot_utils._render_in_process`, which the
+sandbox's runner imports — each with a pre-imported namespace. **Any helper the brain's AVAILABLE LIBRARIES prompt
 promises must be registered at BOTH sites**, or plot code will NameError
 (`upset_plot_from_sets` set the precedent; `exec_sanitizer` and
 `sandbox_guard.SANDBOX_BUILTINS` are likewise installed at both).
@@ -675,7 +680,8 @@ The full enterprise split inside one turn:
 
 1. Client loads dfs from local disk + builds schema text (`_schema_text` port).
 2. POST → `/v1/plan` → brain returns code.
-3. Client executes code locally with `safe_execute` / `render_plot_safe`.
+3. Client executes code through `safe_execute` / `render_plot_safe`, which
+   dispatch it to the sandbox container; raw data never leaves the LAN.
 4. On execution error → POST `/v1/retry` → client re-executes. The orchestrator
    (`run_chat_local`) retries each failing unit up to **3 attempts**, escalating
    `use_pro` / `use_search` to `true` from the 2nd retry onward. A retry that
@@ -777,8 +783,9 @@ local re-execution.
 Every chart and table that carries its own stored `code` (live events and
 persisted history records both do) gets a small refresh icon button (double
 curved arrows) in its action bar. Clicking it re-runs ONLY that item's stored
-code against the chat's **current** dataframes — purely local re-execution via
-`render_plot_safe` / `safe_execute` (the same path `_reexecute_full_df` uses);
+code against the chat's **current** dataframes — re-execution via
+`render_plot_safe` / `safe_execute`, i.e. the sandbox container, the same path
+`_reexecute_full_df` uses;
 **no LLM/brain call** — and swaps the chart image / table content in place.
 Purpose: after updating a file via Add Data (overwrite), existing items can be
 refreshed to reflect the new data.

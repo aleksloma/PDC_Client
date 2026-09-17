@@ -1,9 +1,9 @@
 # PowerDataChat Enterprise — Client
 
 The **client** half of the PowerDataChat enterprise (on-prem) edition.
-Runs inside the customer's LAN. Holds raw data, runs generated Python
-locally, renders charts, generates reports, and serves the `/lab` chat
-dashboard. **No uploaded file, result table, or rendered chart is ever
+Runs inside the customer's LAN. Holds raw data, runs generated Python in a
+separate unprivileged sandbox container, renders charts, generates reports,
+and serves the `/lab` chat dashboard. **No uploaded file, result table, or rendered chart is ever
 transmitted off this container.**
 
 ## What this repo is
@@ -75,8 +75,10 @@ PDC_Client/
 ├── schema_builder.py        # _schema_text builder
 ├── excel_table_detector.py  # 6-stage Excel table detection
 ├── auto_analytics.py        # background job (brain planner → local exec → PPTX)
-├── code_exec.py             # safe_execute
-├── plot_utils.py            # render_plot_safe
+├── code_exec.py             # safe_execute (dispatches to the executor)
+├── plot_utils.py            # render_plot_safe (dispatches to the executor)
+├── executor_client.py       # the HTTP hop to the executor container
+├── executor/                # the executor service (generated Python runs HERE)
 ├── settings.py              # env-driven settings
 ├── models.py
 ├── logger_utils.py

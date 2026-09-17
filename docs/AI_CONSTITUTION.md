@@ -230,7 +230,12 @@ client must be closed on FastAPI lifespan shutdown.
 3. The client authenticates to the brain with `BRAIN_TENANT_TOKEN` (bearer).
    Per-tenant. Rotatable from the brain admin panel.
 4. Never log full tokens or API keys (`key[:8]…` is the most you may emit).
-5. User-supplied Python is executed only via `client/code_exec.safe_execute()`.
+5. User-supplied Python is executed only via
+   `client/code_exec.safe_execute()` / `plot_utils.render_plot_safe()`, which
+   dispatch it to the `pdc-executor` sandbox container. `exec()` exists ONLY
+   inside the in-process functions that container's runner imports
+   (`code_exec._execute_in_process`, `plot_utils._render_in_process`); the web
+   process never executes generated code and never falls back to doing so.
 6. Never commit `.env` files. Commit `.env.example` templates only.
 7. SMTP credentials live on the brain (per-tenant config). The client relays
    share emails through `POST /v1/send_share_email`.
@@ -243,17 +248,22 @@ client must be closed on FastAPI lifespan shutdown.
    (`sso_config.json`, `sso_store.py`) follows the same rule in full — and
    the ID/access tokens from the OIDC flow are never logged either.
 9. **The code-exec sandbox never gets DB access.** Both exec sites
-   (`code_exec.safe_execute`, `plot_utils.render_plot_safe`) install
+   (`code_exec._execute_in_process`, `plot_utils._render_in_process`, which
+   run inside the sandbox container) install
    `sandbox_guard.SANDBOX_BUILTINS`, whose `__import__` DENIES SQLAlchemy,
    every DB driver (psycopg2, pymysql, pyodbc, oracledb, sqlite3, …) and this
    client's credential modules (`db_connector`, `db_sources`, `db_scheduler`,
    `local_store`, `settings`, `brain_client`, `password_utils`). A denylist,
    deliberately not an allowlist — plotting stacks lazy-import transitively at
    call time, and an allowlist miss would fail-freeze historical stored code.
-   **Honest limit:** this is defense in depth, NOT a security boundary
+   **Honest limit:** the denylist is defense in depth, NOT the boundary
    (`open`/`eval` remain; already-imported modules stay reachable). The
-   load-bearing controls are the dedicated SELECT-only database login the
-   customer provisions (the grant is the real guarantee), plus rules 8 above
+   boundary is the sandbox container itself — a different unprivileged uid, a
+   read-only rootfs, no credentials in its environment, and no database
+   driver, HTTP client or credential module in its image at all, so the
+   denylist now guards what is mostly absent anyway. Alongside it: the
+   dedicated SELECT-only database login the customer provisions (the grant is
+   the real guarantee), plus rules 8 above
    and the connector's SELECT-only statement gate
    (`db_connector._assert_single_select`; no route accepts free SQL —
    relation discovery's "Analyze SQL" box PARSES pasted SQL, it never
@@ -397,10 +407,12 @@ numerics.**
   the sandbox is not).
 - Enforcement is in code, not in memory: the pre-execution sanitize gate
   (`exec_sanitizer.sanitize_for_execution` on the client) runs inside
-  BOTH exec sites — `code_exec.safe_execute` and
-  `plot_utils.render_plot_safe`, the same pair that installs
+  BOTH exec sites — `code_exec._execute_in_process` and
+  `plot_utils._render_in_process`, the same pair that installs
   `sandbox_guard.SANDBOX_BUILTINS` — so every execution path passes
-  through it. Do not add a third exec site without installing the gate.
+  through it. Both live in the sandbox container, and the frames reach it as
+  parquet written per job, so the gate runs on what the sandbox actually
+  loads. Do not add a third exec site without installing the gate.
 - The gate never mutates the caller's frames (they are shared across
   worklists and threads) and never raises (Article IV): a column that
   cannot be converted is logged and passed through unchanged.
@@ -430,3 +442,4 @@ To modify this constitution:
 | Deploy       | Brain → enterprise GCP. Client → customer LAN. Two independent images.    |
 | Docs         | Five required docs under `docs/`. Fix contradictions in the same PR.      |
 | Exec dtypes  | Sandbox sees standard dtypes only. `sanitize_for_execution` is the gate.  |
+| Exec location| Generated Python runs in `pdc-executor`, never in the web process. `exec()` only in the two in-process functions its runner imports. |
