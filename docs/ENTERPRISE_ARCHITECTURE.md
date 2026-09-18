@@ -27,15 +27,68 @@ enterprise design.
 
 ## 2. What lives where
 
-### Client container (company LAN — sensitive side)
+The customer's side is TWO containers, not one. Everything sensitive stays
+in the company's LAN either way; the split inside the LAN exists because the
+one thing the product must run — code written by a language model — is the
+one thing that must not run next to the data and the credentials.
+
+```
+        the company's LAN                                  PowerDataChat GCP
+ ┌──────────────────────────────────────────────┐
+ │  default network (browser + outbound)        │
+ │  ┌────────────────────────────────────────┐  │   HTTPS + tenant token
+ │  │ pdc-client            uid 10001        │──┼──────────────────────────▶  Brain
+ │  │  /lab, upload, storage, reports        │  │   question + metadata only
+ │  │  DATA_ROOT volume  (raw data, chats)   │  │
+ │  │  DB connections (SELECT-only login)    │──┼──▶ the company's databases
+ │  └───────────────┬────────────────────────┘  │
+ │                  │  jobs volume: frames in, result out
+ │  backend network │  (internal: true — no gateway)
+ │  ┌───────────────┴────────────────────────┐  │
+ │  │ pdc-executor          uid 10002        │  │      ✗ no route out at all
+ │  │  generated Python runs HERE, one job   │  │
+ │  │  at a time. No secrets, no DB driver,  │  │
+ │  │  no customer data mounted, no port.    │  │
+ │  └────────────────────────────────────────┘  │
+ └──────────────────────────────────────────────┘
+```
+
+### Client container — `pdc-client` (company LAN, uid 10001)
 - Data upload and storage. Raw data values never leave the LAN.
-- Python execution engine. Runs the generated code against the raw data
-  locally. Results stay local.
-- Chart rendering (kaleido) and final file rendering (python-pptx). These
-  are NOT LLM steps and they stay client-side because they touch raw data
-  and/or the company's template.
-- Frontend (the `/lab` dashboard, copied verbatim from B2C).
+- The `/lab` frontend, reports (PDF, PPTX) and chart rasterization
+  (kaleido). These are not LLM steps and they stay here because they touch
+  raw data and the company's template.
+- Database connections. The credentials live here, encrypted at rest, and
+  the SELECT-only login the customer provisions is the real guarantee.
+- It orchestrates execution but does not perform it: it writes each job's
+  input frames into the shared jobs directory, asks the sandbox to run the
+  code, and reads the result back.
 - Presentation templates (the company's branded templates / decks).
+
+### Analysis sandbox — `pdc-executor` (company LAN, uid 10002)
+- **The only place generated Python runs.** One job at a time, each in a
+  fresh subprocess with its own memory, process and file-size limits.
+- Holds no secret, no database driver, no credential-bearing module, and
+  refuses to start if a secret appears in its environment.
+- Joins ONE `internal: true` Docker network and publishes no port, so it has
+  no route to the LAN, to a database, or to the internet.
+- Mounts no customer data. The jobs directory is the only shared storage,
+  and each job's frames are written into it per job — which is what keeps
+  the per-role table permissions meaningful from inside generated code.
+- Answers are treated as untrusted input by the client, because the code
+  that produced them is untrusted by definition.
+
+`docs/AI_CONSTITUTION.md` Article XIV is the normative version of this
+boundary, and `docs/EXECUTOR_PROTOCOL.md` is the field-level contract between
+the two containers.
+
+### What crosses each boundary
+
+| Boundary | Out | In |
+|---|---|---|
+| client → brain | question text, schema and column metadata, aggregate profiles, generated code, error text, scalar previews. **Never rows, tables or charts.** | generated Python, narrative text |
+| client → sandbox | the code to run, and the input frames as parquet written per job | the result (parquet, chart HTML or PNG, a scalar preview), plus a capped tail of the sandbox's stderr and traceback for the local log. A job's stdout crosses in the same response but is NOT written to the web log; what a job printed lives only in the sandbox's own output |
+| sandbox → anywhere else | nothing. It has no network route and no credentials. | — |
 
 ### Brain (PowerDataChat GCP — enterprise only)
 - Skill engine + skill library (the IP).
@@ -93,8 +146,8 @@ by tenant ID. It is data, not code. Adding a new company should be adding
 configuration, NOT editing the skill engine.
 
 `welcome_language` sets the language of the auto-generated welcome message +
-suggested starter questions for that tenant (e.g. `"Georgian (ქართული)"` for
-the bank). The **client no longer forces a language** — it only sends the
+suggested starter questions for that tenant (e.g.
+`"Georgian (ქართული)"`). The **client no longer forces a language** — it only sends the
 detected language as a hint; the brain applies the tenant's
 `welcome_language` override on top (precedence: tenant config → client hint →
 English). Unset = today's behavior (client-detected → English). See
@@ -175,15 +228,21 @@ returns `403 {"detail": "Tenant <status>"}` before any LLM call when
    tenant's config.
 4. Brain generates Python code.
 5. Brain returns the code only to the client.
-6. Client executes the code against the raw data locally via
-   `code_exec.safe_execute`. The result stays local. Before EVERY
-   execution (both exec sites: `code_exec.safe_execute` and
-   `plot_utils.render_plot_safe`) the Article XIII sanitize gate
-   (`exec_sanitizer.sanitize_for_execution`) normalizes the dataframes to
-   plain standard dtypes — generated code must never observe category /
-   sparse / extension dtypes (a categorical dimension column once made a
-   two-key groupby emit the cartesian product of all categories and put
-   every category on a chart axis). Storage-layer optimizations (numeric
+6. Client runs the code against the raw data **inside the LAN but outside
+   its own process**: `code_exec.safe_execute` / `plot_utils.render_plot_safe`
+   write the referenced frames into the shared jobs directory and dispatch
+   the job to `pdc-executor`, which executes it as a different unprivileged
+   user in a container with no credentials and no network route, and answers
+   with the result. The result stays local; nothing about this step reaches
+   the brain. If the sandbox cannot be reached the client returns a plain
+   "the analysis service is not reachable" answer and never falls back to
+   executing the code itself. Before EVERY execution the Article XIII
+   sanitize gate (`exec_sanitizer.sanitize_for_execution`) normalizes the
+   dataframes to plain standard dtypes — it runs at both exec sites, which
+   now live inside the sandbox — because generated code must never observe
+   category / sparse / extension dtypes (a categorical dimension column once
+   made a two-key groupby emit the cartesian product of all categories and
+   put every category on a chart axis). Storage-layer optimizations (numeric
    downcasts in snapshot parquet) remain allowed because generated code
    cannot observe them.
 7. On execution error: client POSTs `{error, code, schema_text, ...}` to
@@ -568,9 +627,12 @@ The same boundary applies to the background "Auto Analytics" feature:
    near-duplicates, does ONE targeted re-ask if below the target (7), and caps
    at 15 plots (analyses/plots, NOT total slides). Returns the natural-language
    instruction list.
-2. Client executes each instruction locally via `run_chat_local.run_chat`
-   (bounded 4-worker pool). For each one the brain provides plan / retry
-   / describe LLM steps but never receives row values.
+2. Client works through the instructions via `run_chat_local.run_chat`
+   (bounded 4-worker pool), each one dispatched to the sandbox like any
+   other question — so a deck's worth of analyses is executed one job at a
+   time, and a saturated sandbox answers "busy" rather than failing a
+   finding that never ran. For each instruction the brain provides plan /
+   retry / describe LLM steps but never receives row values.
 3. Client builds the findings payload, POSTs to `/v1/report` for
    narrative, then renders the deck locally through the SAME renderer as
    manual export — the design-spec native path (§9a) when a usable

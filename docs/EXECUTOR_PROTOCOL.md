@@ -10,14 +10,15 @@ field-level contract — `docs/ENTERPRISE_ARCHITECTURE.md` covers the topology,
 `docs/AI_CONSTITUTION.md` Article VII the rules, and `docs/PROTOCOL.md` is a
 different thing entirely (the Brain's `/v1/*` surface).
 
-> Status: implemented on both sides. `code_exec.safe_execute` and
+> Status: implemented and wired. `code_exec.safe_execute` and
 > `plot_utils.render_plot_safe` keep their signatures and return shapes and
 > dispatch here (`executor_client.py`); their former bodies are
 > `code_exec._execute_in_process` and `plot_utils._render_in_process`, which
-> only `executor/runner.py` calls. What is NOT yet in place is the compose
-> wiring: until the two services are declared together on an internal network
-> with the shared jobs volume, a stack has no executor to reach and every
-> question answers `ExecutorUnavailable`.
+> only `executor/runner.py` calls. Both compose files declare the two
+> services together on an `internal: true` network with a shared jobs volume,
+> so a stack brought up from this repository answers questions. A stack that
+> starts only the web container answers every question
+> `ExecutorUnavailable` — that is a broken install, not a degraded mode.
 
 ---
 
@@ -29,21 +30,27 @@ that:
 - **It holds no secrets.** No brain token, no session key, no encryption key,
   no database credential. It refuses to start if any of them is in its
   environment (§7).
-- **It has no database access.** SQLAlchemy, every driver, and the
+- **It has no database access.** SQLAlchemy, every network driver, and the
   credential-bearing modules of the web service are absent from the image, so
   the sandbox denylist (`sandbox_guard.py`) is defence in depth on top of
-  their simple absence.
+  their simple absence. `sqlite3` is the one the denylist genuinely carries
+  on its own: it ships with Python and cannot be left out of the image. That
+  is not a route to the customer's data, which is what this property is
+  about, but the sentence would be wrong without it.
 - **`POST /execute` is unauthenticated.** This is deliberate and is a recorded
   risk acceptance, not an oversight. A shared secret would put a secret into
   the one container whose defining property is that it holds none, and it
   would protect nothing that the network does not already protect. **The
-  control is the network**: the executor must join an internal-only Docker
-  network, publish no ports, and be reachable only from the web container. Any
-  deployment that publishes the executor's port, or puts it on a routable
-  network, breaks the model. **Not yet enforced here:** the compose wiring is
-  the enforcement point, and until it lands this service is only as isolated
-  as whoever runs it makes it. A standalone run for development should bind to
-  loopback only.
+  control is the network**: the executor joins an internal-only Docker
+  network, publishes no ports, and is reachable only from the web container.
+  Any deployment that publishes the executor's port, or puts it on a routable
+  network, breaks the model. **Enforced by both compose files** (`backend`,
+  `internal: true`, no `ports`, pinned by a structural test), and because a
+  Docker network is bidirectional the web service additionally refuses any
+  request whose peer address falls inside that subnet — generated code cannot
+  call back into the unauthenticated login or reset endpoints. A standalone
+  run for development, outside compose, has neither protection and should
+  bind to loopback only.
 - **The web service treats every response as hostile** (§5). The executor can
   write anything into the shared job directory, including symlinks and FIFOs,
   and the web service reads it under a mount where customer data IS present.
@@ -171,8 +178,12 @@ error, `ok` never appears on the `safe_execute` shape, and `error: None` is
 present on success. Consumers distinguish the two producers by which keys
 exist, so the shape must not be normalized.
 
-`stdout`, `stderr` and `traceback` are for the local log only. **Nothing new
-crosses to the Brain**: the retry text stays exactly `payload["error"]`.
+`stdout`, `stderr` and `traceback` are for the local log only, and the web
+service now writes a truncated tail of the last two onto its own
+`EXEC_ERROR` / `EXEC_TIMEOUT` lines — in-process, a failing block's traceback
+landed in the client log, and the sandbox's own file log sits on a tmpfs that
+a restart wipes. **Nothing new crosses to the Brain**: the retry text stays
+exactly `payload["error"]`.
 
 ### Serialization matrix (`result`)
 
@@ -234,6 +245,15 @@ memory error tells the model to optimise memory after a crash it cannot fix,
 and burns every retry doing it. A `MemoryError` **raised inside** the code is
 an ordinary `error` carrying the interpreter's own message.
 
+The `crashed` text quotes the response's `reason`, so that field is checked
+against the executor's closed vocabulary (`spawn_failed`, `hard_timeout`,
+`sigkill`, `response_invalid`, `signal`, `exit`, `queued`, `executor_error`)
+and anything else becomes the literal `unknown`; an unrecognised `status` is
+likewise never echoed. The reason: this text reaches the Brain's retry
+prompt, and the response is written by the untrusted side — the same class of
+defect already closed for the rejection code, where an unbounded string could
+have carried arbitrary prose and newlines into a prompt.
+
 An integral `timeout_s` renders as an integer (`60`, not `60.0`) so the
 timeout text matches the in-process one character for character — that string
 reaches the Brain's retry prompt.
@@ -277,6 +297,41 @@ configuration file exists:
 
 The port is fixed at **8090** by the image's own start command and is not
 configurable by environment; it is internal only and must never be published.
+
+**What one job can leave for the next one.** Two places, both measured by
+running two separate jobs and reading the first one's file back from the
+second.
+
+`/tmp` is a single world-writable directory on a tmpfs; every job runs as the
+same user and only a restart clears it. The jobs volume's ROOT is
+group-writable — necessarily, since this service deletes its own finished job
+directories — so a job can write straight into it, and that volume is
+disk-backed, visible from the web container, and survives restarts and image
+upgrades. Both sweeps remove aged entries of the jobs root that are not job
+directories, which bounds a stash there to roughly an hour; `/tmp` has no
+such bound.
+
+The two sides decide differently, and the asymmetry is the point. The web
+service removes only what it did NOT write, because everything under its own
+data root belongs to it and that is what makes a misconfigured jobs
+directory harmless. This service removes every aged non-job entry whatever
+its owner, because ownership proves nothing here: the root is group-writable
+so that this service can clear an abandoned job directory, which also lets it
+RENAME one, and a rename keeps the original owner — generated code can
+therefore acquire a web-owned entry rather than create one (measured: it
+renamed its own live job directory, and both sweeps then skipped the result).
+Nothing of the customer's is mounted in this container, so removing a
+web-owned stray here costs nothing that the ownership rule protects on the
+other side. Neither sweep follows a symlink.
+
+The per-job input write bounds what a job is GIVEN, which is what makes the
+per-role table grants meaningful on the way in. It does not bound what a job
+can deposit on the way out, so read that property as applying to the input
+path and treat both locations as scratch space shared between consecutive
+analyses. Closing it properly needs a private scratch namespace or a distinct
+identity per job: redirecting the temporary directory would not, because
+generated code can name an absolute path, and the jobs root cannot be made
+unwritable without disabling this service's own cleanup.
 
 **Raising `EXECUTOR_MAX_CONCURRENT` forfeits guarantees, it does not just add
 throughput.** Generated code keeps filesystem access and every job runs as the
@@ -338,8 +393,15 @@ The executor logs to stdout and to a rotating file under a `DATA_ROOT` that is
 a throwaway tmpfs (5 MiB × 2) — it keeps no state, so **`docker logs
 pdc-executor` is the evidence path**, not a file on a volume. Each job logs
 one `EXEC_JOB_START` and one `EXEC_JOB_END` line carrying the status, elapsed
-time and exit code, with the job id as the session id. The stray sweep logs
-`EXEC_STRAY_KILLED`, and the orphan sweep `EXEC_ORPHAN_REMOVED`.
+time and exit code, with the job id as the session id. The process sweep logs
+`EXEC_STRAY_KILLED`, and the orphan sweep `EXEC_ORPHAN_REMOVED` for an
+abandoned job directory and `EXEC_STRAY_ENTRY_REMOVED kind=file|dir|link|other`
+for something generated code left in the jobs root (with
+`EXEC_STRAY_ENTRY_REMOVE_FAILED` when it cannot). The web service adds
+`EXEC_STRAY_SWEEP_REFUSED` on the one configuration where it declines to
+look at strays at all. A removal line is worth reading rather than
+filtering: it means a question wrote something outside its own job
+directory.
 
 The web service re-emits its own `EXEC_OK` / `EXEC_ERROR` / `EXEC_TIMEOUT`
 lines with the same code hash as before, plus `EXEC_DISPATCH` when it hands a
@@ -404,6 +466,7 @@ signatures, so nothing upstream changed.
 | `EXECUTOR_PLOT_TIMEOUT_S` | `120` s | the budget for a chart; analysis blocks use `code_exec.CODE_EXEC_TIMEOUT_SECONDS` (60 s) |
 | `EXECUTOR_MAX_CONCURRENT` | `1` | jobs dispatched at once — must never exceed the sandbox's own limit (§7) |
 | `EXECUTOR_QUEUE_MAX_S` | `600` s | how long a job may wait for a slot before it is answered "busy" |
+| `EXECUTOR_NETWORK_CIDR` | *(empty)* | the sandbox network's own subnet. Requests whose peer address falls inside it are answered 403: a Docker network is bidirectional, so this is what stops generated code calling the web service's unauthenticated endpoints. Compose sets it from the same variable that pins the network, so the two cannot drift. Empty disables the refusal (a single-container dev run) |
 
 Every one is read at call time, and a malformed value falls back to its
 default rather than raising during import — a settings module that throws
@@ -435,6 +498,37 @@ error as an answer it can handle:
 None of them carries a URL, a path or any data: the detail goes to the local
 log, the text goes upstream.
 
+**Which failures the brain should be asked to fix.**
+`executor_client.is_infrastructure_error(text)` is the public predicate the
+chat loops use to decide whether a failed execution is worth a retry. The
+five texts above are infrastructure: no prompt can fix a service that is
+down, busy, or refusing the job, and retrying one costs a planner call plus
+another wait for a slot. A `TimeoutError`, a `MemoryError` and a
+`ResultTooLarge` are NOT in that set on purpose — the planner can genuinely
+write cheaper code — and neither is a crash the generated code caused
+(`reason=exit` or `reason=signal`), for the same reason. Without this split
+one unreachable sandbox turned a single question into three pro-tier planner
+calls and three further waits.
+
+**Reported reachability.** `GET /health` on the web service carries
+`executor_reachable` and `executor_checked_at`. The value is a CACHED
+observation — the startup handshake, every dispatch outcome, and a
+short-lived background probe refresh it — never a live call made while the
+request waits. That is deliberate: a stopped sandbox drops out of Docker's
+DNS, the lookup then falls through to the host resolver and costs seconds
+before any HTTP timeout applies, which would block the event loop and fail
+the container's own health probe at the exact moment the field exists to
+report. `/health` therefore stays 200 with `executor_reachable: false`, and
+an operator must not read a healthy container as a working stack.
+
+**A job directory the sandbox locked.** Generated code can `chmod` a
+directory it created under `out/`. The sandbox's own sweep repairs the mode
+and removes it within the hour; the web service cannot, because it may not
+chmod what the sandbox uid owns. It therefore logs such a failure once per
+path per process rather than on every sweep. If the sandbox is stopped or
+removed, those directories stay until it returns — they hold one job's input
+frames, so the jobs volume is worth a glance after a failed upgrade.
+
 **Job directory lifecycle.** The web service creates it, writes the inputs,
 and removes it in a `finally` — success, failure and refusal alike. A removal
 that fails is logged, not retried, because the sweeps cover it: this side
@@ -447,6 +541,16 @@ ever touched.
 one warning per library whose version differs from its own, plus
 `EXECUTOR_HANDSHAKE_OK` when it answers at all. A mismatch is never fatal —
 the two images are versioned independently and a customer can upgrade one
-first — but it is the first thing to check when charts or reports come back
-subtly wrong, because the report path parses chart HTML that the plotting
-library's version decides.
+first — and it is worth checking when charts or reports come back subtly
+wrong, because the report path parses chart HTML that the plotting library's
+version decides.
+
+Be precise about what it does NOT tell you. It compares **five libraries**
+(pandas, numpy, pyarrow, matplotlib, plotly) out of the twenty-three that
+`executor/requirements.txt` pins, and it compares **no code at all**:
+`/healthz` reports the
+sandbox's build commit and the web service only logs it. Two images built
+from different commits — exactly the case where the wire grammar in
+`exec_transport.py` can differ, since it is copied into both — produce a
+silent handshake. So a quiet handshake means "these five libraries match",
+not "these images match". Build and ship the pair together.

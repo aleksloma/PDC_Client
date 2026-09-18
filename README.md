@@ -4,11 +4,11 @@ The **client** half of the PowerDataChat enterprise (on-prem) edition.
 Runs inside the customer's LAN. Holds raw data, runs generated Python in a
 separate unprivileged sandbox container, renders charts, generates reports,
 and serves the `/lab` chat dashboard. **No uploaded file, result table, or rendered chart is ever
-transmitted off this container.**
+transmitted off the customer's own server.**
 
 ## What this repo is
 
-The client container is deployed inside the customer's own network. It
+The client stack is deployed inside the customer's own network. It
 talks to a multi-tenant brain service (a separate, hosted service
 operated by PowerDataChat) over HTTPS using a per-tenant bearer
 token issued by the operator. Every request to the brain carries the
@@ -17,11 +17,15 @@ the chat UI surfaces a single "service unavailable" error.
 
 ## Architecture (at a glance)
 
-- **Client** (this repo, runs in customer LAN) — email+password auth (local, hash-only), file
-  upload + storage, schema autofill, data preprocessing, Python code
-  execution, chart rendering, report (PDF/PPTX) generation, the
-  `/lab` UI. All raw data + result tables + rendered files stay on
-  this server.
+- **Client** (this repo, runs in customer LAN) — TWO containers shipped as one
+  release. The **web application** (uid 10001) does email+password auth (local,
+  hash-only), file upload + storage, schema autofill, data preprocessing,
+  report (PDF/PPTX) generation and the `/lab` UI. The **analysis sandbox**
+  (`executor/`, uid 10002) is where the generated Python and the chart
+  rendering run, never in the web container. The sandbox has no data volume,
+  no credentials, no database driver and no network route out; the two share
+  one jobs directory, one directory per in-flight question. All raw data +
+  result tables + rendered files stay on this server.
 - **Brain** (a separate, hosted service operated by PowerDataChat) —
   the LLM gateway. Receives column names, schema text, sampled
   metadata, generated code, error text, and findings — see the table
@@ -41,6 +45,10 @@ values derived from your data. User email is sent for tenant routing.
   [`run_chat_local.py`](run_chat_local.py) is the hard guard: only
   `str | int | float | bool` pass through; dicts, lists, and
   DataFrames become `None`. Do not weaken it.
+- The `/lab` page loads **no third-party script** by default (no analytics, no
+  billing widget): `settings.ENABLE_THIRD_PARTY_SCRIPTS` is False, so the
+  browser talks only to this server. The analysis sandbox transmits nothing at
+  all: it has no route off its internal network.
 
 ### Data that leaves the container
 
@@ -60,6 +68,7 @@ values derived from your data. User email is sent for tenant routing.
 | User email | Every call | Tenant routing and per-user activity |
 | Activity events | Login, upload, chat, report | Event name, user email, lightweight counters |
 | Password-reset payload | Password reset only | The e-mail address and a temporary password, relayed through the brain's mail service (a tokenized reset link replaces this in a future release) |
+| Third-party browser scripts | Never, by default | `/lab` loads no analytics or billing script (`ENABLE_THIRD_PARTY_SCRIPTS=false`) |
 
 Never sent: uploaded files, DataFrames, query result sets, rendered charts or
 decks, and your branded templates.
@@ -83,7 +92,10 @@ PDC_Client/
 ├── models.py
 ├── logger_utils.py
 ├── requirements.txt
-├── Dockerfile
+├── Dockerfile               # the web image (uid 10001)
+├── executor/Dockerfile      # the sandbox image (uid 10002)
+├── docker-compose.yml       # customer stack: both services, two networks
+├── docker-compose.local.yml # local stack: both services, built from this repo
 ├── routes/
 │   ├── auth.py              # /auth/* — email+password login, reset, change
 │   ├── upload.py            # /upload, /schema_autofill_full, /generate_chatdata
@@ -105,9 +117,20 @@ PDC_Client/
 ## Install (customer-side)
 
 > **Quickstart:** see [`CUSTOMER_INSTALL.md`](CUSTOMER_INSTALL.md) for the
-> copy-paste handoff (pull/load image → configure `client.env` → run → verify).
+> copy-paste handoff (pull/load both images → configure `client.env` → run →
+> verify).
 
-Customers receive this image already built. To run it you need:
+Customers receive **two** images already built, `powerdatachat-client` (the
+web application) and `powerdatachat-executor` (the analysis sandbox), and run
+them with Docker Compose. Compose is the supported form, not a convenience: the
+generated Python runs only in the sandbox, so a stack with just the web image
+answers every question "The analysis service is not available right now."
+(the internal form, `ExecutorUnavailable:`, is what the log and the refresh /
+dashboard / report / Auto Analytics paths carry). It is also what creates the
+internal network that gives the sandbox no route out, and the one jobs
+directory the two containers share.
+
+To run the stack you need:
 
 | Variable | Purpose |
 |---|---|
@@ -116,31 +139,32 @@ Customers receive this image already built. To run it you need:
 | `SECRET_KEY` | Local session-cookie signing secret (`openssl rand -hex 32`). |
 | `DATA_ROOT` | Local-disk root for raw data + chats. Mount a volume. |
 
-See [`.env.example`](.env.example) for the full list and
+The `EXECUTOR_*` topology values are set by the compose file, not by the env
+file. See [`client.env.example`](client.env.example) for the full list and
 [`docs/BUILD_AND_RUN.md`](docs/BUILD_AND_RUN.md) for build + run.
 
 ```bash
+# both images, from this repo
 docker build -t powerdatachat-client:enterprise .
+docker build -f executor/Dockerfile -t powerdatachat-executor:enterprise .
 
-docker run --rm -p 8000:8000 \
-  -e BRAIN_URL="https://brain.your-domain.example.com" \
-  -e BRAIN_TENANT_TOKEN="<token-from-brain-admin>" \
-  -e SECRET_KEY="$(openssl rand -hex 32)" \
-  -v $(pwd)/client_data:/data/client \
-  powerdatachat-client:enterprise
+cp client.env.example client.env      # fill BRAIN_TENANT_TOKEN + SECRET_KEY
+docker compose up -d
 ```
 
 Open `http://localhost:8000` → enter your work email → land in `/lab`.
+`curl http://localhost:8000/health` must report `executor_reachable: true`;
+it stays 200 either way, so read the body.
 
-The container runs as uid 10001, so a HOST BIND MOUNT like the one above must
-be writable by that uid (`chown -R 10001:10001 ./client_data`, or use a named
-volume, which inherits the image's ownership). Skip it and the container still
-starts and still reports healthy — but every write fails: `LADMIN_BOOTSTRAP_FAILED`
-/ `Permission denied` in the log, and users get a 500 when they try to sign in.
-Production installs should add the hardening flags from
-[`CUSTOMER_INSTALL.md`](CUSTOMER_INSTALL.md) (`--read-only`, `--tmpfs /tmp`,
-`--cap-drop ALL`, `--security-opt no-new-privileges:true`, `--memory`,
-`--pids-limit`); this bare form is for a quick local try-out.
+The compose files carry the hardening both containers need (read-only rootfs,
+tmpfs `/tmp`, all capabilities dropped, `no-new-privileges`, memory and pid
+caps) and the jobs volume with the ownership both uids require. See
+[`CUSTOMER_INSTALL.md`](CUSTOMER_INSTALL.md) §3. A HOST BIND MOUNT for
+`/data/client` must be writable by uid 10001 (`chown -R 10001:10001
+./client_data`, or use a named volume, which inherits the image's ownership).
+Skip it and the container still starts and still reports healthy — but every
+write fails: `LADMIN_BOOTSTRAP_FAILED` / `Permission denied` in the log, and
+users get a 500 when they try to sign in.
 
 
 ## Key docs

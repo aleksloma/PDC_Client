@@ -1,10 +1,13 @@
 # Build & run
 
-Both containers are **independently buildable**. The brain is intended to run
-on GCP (PowerDataChat side); the client runs in the customer's LAN.
+The brain and the client are **independently buildable and independently
+deployed**. The brain is intended to run on GCP (PowerDataChat side); the
+client runs in the customer's LAN.
 
-For local development they are convenient to run together — see
-`docker-compose.yml` at the root of `/enterprise`.
+The client itself is **two containers**: the web application and the analysis
+sandbox where generated Python runs. Both are built from this repo and always
+run together, from one compose file: `docker-compose.local.yml` for local
+testing, `docker-compose.yml` for a customer install.
 
 ---
 
@@ -43,52 +46,76 @@ Open `http://localhost:8080/admin/login` and sign in as `admin` /
 
 ---
 
-## 2. Build the CLIENT container
+## 2. Build the CLIENT containers
+
+The client half is **two images of one release**: the web application, and the
+analysis sandbox where the generated Python runs. Build both, from the
+repository root, with the same build args:
 
 ```bash
 cd enterprise/client
 docker build -t powerdatachat-client:enterprise \
   --build-arg BUILD_COMMIT=$(git rev-parse --short HEAD) \
   --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%MZ) .
+
+docker build -f executor/Dockerfile -t powerdatachat-executor:enterprise \
+  --build-arg BUILD_COMMIT=$(git rev-parse --short HEAD) \
+  --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%MZ) .
 ```
 
-The two build args stamp the image: `GET /version` and the admin sidebar then
-name the exact commit running. They are optional — an unstamped image reports
-its start time instead. (`.git` is dockerignored, so the commit cannot be read
-from inside the build.) Never read the static `?v=` query parameter as a build
-marker: it is `int(time.time())` at page render, per request.
+The sandbox build reads from the repository root (it copies only the handful
+of modules the runner imports, never `COPY . .`), so run it from there and not
+from `executor/`. A plain build produces the hardened runtime image (uid
+10002, no pytest); `--target test` is the only way to get the root+pytest
+image, and it is never what ships.
+
+**The sandbox image needs a reasonably current Docker engine.** Its
+`HEALTHCHECK` uses `--start-interval`, which requires Engine 25 or newer.
+Older builders reject the flag outright; older runtimes simply ignore it, and
+the first probe then waits a full interval, which is only slower, not broken.
+
+The two build args stamp both images: `GET /version` and the admin sidebar
+name the exact commit running, and the sandbox reports its own build through
+`GET /healthz`, which is how the web application detects a mismatched pair.
+They are optional — an unstamped image reports its start time instead.
+(`.git` is dockerignored, so the commit cannot be read from inside the build.)
+Never read the static `?v=` query parameter as a build marker: it is
+`int(time.time())` at page render, per request.
 
 The client image is heavier because it ships pandas, matplotlib, plotly,
 kaleido, scikit-learn, python-pptx — every library the user's generated
-code might run on the user's data. The build also bakes the plotly pip
+code might run on the user's data. Both images bake the plotly pip
 package's own `plotly.min.js` into `static/vendor/plotly/` so interactive
 charts render with zero internet access (no `cdn.plot.ly` dependency at view
 time); the app lifespan re-materializes it idempotently for non-Docker runs.
+The sandbox's own requirements are an identical-version SUBSET of the root
+pins, with no kaleido, no database driver, no cryptography and no httpx.
 
 To run the client you need a **tenant token from the brain**. Create one
 through the brain's admin panel — when the token is created it is shown
 ONCE and never again. Save it.
 
-```bash
-docker run --rm -p 8000:8000 \
-  -e BRAIN_URL="https://brain.your-domain.example.com" \
-  -e BRAIN_TENANT_TOKEN="<token-from-brain-admin>" \
-  -e SECRET_KEY="$(openssl rand -hex 32)" \
-  -v $(pwd)/client_data:/data/client \
-  powerdatachat-client:enterprise
-```
+Run the two images with compose, never by hand: the sandbox is only isolated
+because compose gives it an internal network with no gateway, and the two
+containers must mount the same jobs directory. `docker-compose.local.yml` is
+the development stack (§3); `docker-compose.yml` is what customers get
+(`CUSTOMER_INSTALL.md` §3). A single container cannot answer a question: with
+no sandbox reachable, a chat turn is answered "The analysis service is not
+available right now." and the log carries the internal
+`ExecutorUnavailable: the analysis service is not reachable`.
 
-Open `http://localhost:8000` → sign in with your work email + password (first login sets the password) → land in `/lab`.
+Open `http://localhost:8091` (local stack) → sign in with your work email +
+password (first login sets the password) → land in `/lab`.
 
-The container runs as uid 10001, so a HOST BIND MOUNT like the one above must
-be writable by that uid (`chown -R 10001:10001 ./client_data`, or use a named
-volume, which inherits the image's ownership). Skip it and the container still
-starts and still reports healthy — but every write fails: `LADMIN_BOOTSTRAP_FAILED`
-/ `Permission denied` in the log, and users get a 500 when they try to sign in.
-Production installs should add the hardening flags from
-[`CUSTOMER_INSTALL.md`](CUSTOMER_INSTALL.md) (`--read-only`, `--tmpfs /tmp`,
-`--cap-drop ALL`, `--security-opt no-new-privileges:true`, `--memory`,
-`--pids-limit`); this bare form is for a quick local try-out.
+The web container runs as uid 10001 and the sandbox as uid 10002 in gid 10001,
+so a HOST BIND MOUNT for `/data/client` must be writable by uid 10001
+(`chown -R 10001:10001 ./client_data`, or use a named volume, which inherits
+the image's ownership). Skip it and the container still starts and still
+reports healthy — but every write fails: `LADMIN_BOOTSTRAP_FAILED` /
+`Permission denied` in the log, and users get a 500 when they try to sign in.
+The shared jobs volume has its own ownership rule (`root:10001`, mode `2770`)
+and its own one-line repair. See `CUSTOMER_INSTALL.md` §3, "The shared jobs
+volume".
 
 
 Diagnostic env flags (see `.env.example`):
@@ -116,7 +143,8 @@ about migrations or data compatibility.
 
 Each split repo carries its own local compose file — the brain and the client
 are built and run as SEPARATE compose projects, mirroring production where
-they are never deployed together:
+they are never deployed together. The client's file builds and starts BOTH of
+its services, `client` and `executor`, from this repo in one command:
 
 ```powershell
 # Brain — from the PDC_Brain repo (listens on http://localhost:8090)
@@ -124,8 +152,15 @@ docker compose -f docker-compose.local.yml up -d --build
 
 # Client — from the PDC_Client repo (listens on http://localhost:8091)
 #   one-time: cp client.local.env.example client.local.env  (fill it in)
+#   builds both images, starts both services, `client` waits for `executor`
 docker compose -f docker-compose.local.yml up -d --build
+docker compose -f docker-compose.local.yml ps
 ```
+
+`docker compose ps` must show both services, with `executor` healthy. Never
+start only one: the generated Python runs in the sandbox, so a lone web
+container answers every chat question "The analysis service is not available
+right now." and logs `ExecutorUnavailable` behind it.
 
 Configuration comes from gitignored env files at runtime — secrets are never
 baked into images: the brain reads `.env` (`GOOGLE_API_KEY`, `SECRET_KEY`,
@@ -150,6 +185,12 @@ tenant existing in the local brain volume, a STABLE `SECRET_KEY`).
   docker run --rm -v pdc_client_data:/data alpine chown -R 10001:10001 /data
   ```
 
+  The local stack declares that volume EXTERNAL, so the bare name is
+  right here. On a customer install compose prefixes it with the project
+  name, and a `docker run` against the unprefixed name silently creates
+  and repairs an empty volume instead — `CUSTOMER_INSTALL.md` says so at
+  the upgrade step.
+
   The same one-time step applies after restoring a backup taken before the
   hardened image. Only `/tmp` (a tmpfs) and the data volume are writable, so
   nothing the app writes can land inside the image any more.
@@ -166,7 +207,9 @@ tenant existing in the local brain volume, a STABLE `SECRET_KEY`).
 
 After `up`, verify `GET http://localhost:8090/health` and
 `GET http://localhost:8091/health` return 200 and that pre-existing tenants /
-users / chats are still visible before testing the change at hand.
+users / chats are still visible before testing the change at hand. The client
+health body must also show `executor_reachable: true`. It stays 200 when the
+sandbox is down, so the status code alone proves nothing.
 
 ---
 
@@ -185,7 +228,7 @@ users / chats are still visible before testing the change at hand.
 7. (Optional) Set the **welcome language** for this tenant — the language of
    the auto-generated welcome message + suggested starter questions. In the
    per-tenant page → **Application Settings** → **Welcome language**, enter a
-   language instruction string, e.g. `Georgian (ქართული)` for the bank
+   language instruction string, e.g. `Georgian (ქართული)`
    (`English`, `Russian (Русский)`, … also work). **Empty = brain default**
    (the client-detected language, then English — i.e. unchanged behavior).
 
@@ -518,10 +561,29 @@ The data comes from `tenants/{tenant_id}/users.jsonl` and
   (`52428800`, not `50MB` and not `50_000_000`); anything else falls back to
   the default instead of raising, and both are clamped to a minimum, so
   rotation cannot be switched off from the environment.
+- **Sandbox logs** (`docker logs pdc-executor`): one `EXEC_JOB_START` and one
+  `EXEC_JOB_END` line per job with the status and elapsed time, the traceback
+  of a failing analysis block, and anything the generated code printed. The
+  two containers' lines join on `code_hash`, so one answer can be followed
+  across both.
+
+  The sandbox writes a rotating file log too, but its `DATA_ROOT` is a
+  throwaway tmpfs (5 MiB × 2). It keeps no state and mounts no data volume, so
+  **that file is lost on restart and is on no volume**. `docker logs
+  pdc-executor` is the evidence path. Capture it before restarting anything;
+  a traceback from generated code exists nowhere else.
+
+Diagnosing a failed question therefore means collecting BOTH: the web log for
+the request, the brain call and the dispatch, and the sandbox output for what
+the code actually did.
 
 ---
 
 ## 8. Dependency audit (release gate)
+
+This gate applies to **both** images. `executor/requirements.txt` is an
+identical-version subset of the root pins, so run every step below a second
+time against the built sandbox image and its own pin file.
 
 Every runtime dependency in `requirements.txt` is pinned to an exact version,
 and the security-relevant transitives (`starlette` for fastapi, `joserfc` for
@@ -564,6 +626,20 @@ Why each detail matters:
   advisory against a current pin leaves it green. This scan is the detector.
 
 This covers the Python layer only. The operating-system packages in the base
-image need their own scanner (the image is referenced by tag, so a rebuild can
-also move the base underneath you); that scan is not part of the release
-checklist yet.
+image are scanned separately, and that scan IS a release gate now (see
+`/release-image`): run it against both built images at HIGH and CRITICAL.
+Trivy does not have to be installed locally — it runs from its own image:
+
+```bash
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock   aquasec/trivy:latest image --scanners vuln --severity HIGH,CRITICAL   powerdatachat-client:enterprise
+```
+
+Two things about the result are worth knowing before you read it. Findings
+Debian has already fixed are closed by the `apt-get upgrade` step in both
+Dockerfiles, so a rebuild is the fix and a fixable finding surviving one means
+the build did not run that layer. Findings with no available fix cannot be
+closed here at all; record each one with a one-line reason rather than
+carrying a silently failing gate. And because the base image is referenced by
+tag rather than by digest, a rebuild moves the operating system underneath you
+on purpose: that is how OS patches arrive, and it is why the scan belongs to
+the release rather than to the commit.

@@ -4,8 +4,8 @@
 > enterprise (on-prem) edition. Adapted from the original B2C constitution
 > for the brain/client split.
 
-**Version:** 1.1 (enterprise)
-**Last Updated:** 2026-07-29
+**Version:** 1.2 (enterprise)
+**Last Updated:** 2026-09-17
 
 ---
 
@@ -146,6 +146,26 @@ multiplier  = settings.LLM_BACKOFF_MULTIPLIER # 2.0
 - Always include `sid` (session ID / tenant ID) for traceability.
 - Levels: `info`, `warning`, `error`.
 - Context: `tenant=`, `chat_id=`, `endpoint=`. Never log raw payloads.
+- **The log file is newline-delimited, so any text you did not write must be
+  escaped before it reaches a line.** Pass it through
+  `exec_transport.log_safe_text`, which escapes CR/LF and caps the length.
+  This applies to the message AND to every context value AND to the `sid`
+  field itself, and it applies to text from any origin you do not control:
+  the request body (a question, a conversation id from a path segment), a
+  customer's data (a column label, a cell value), an executor response, a
+  brain response, and — the case most often missed — a LIBRARY's own
+  exception, because a library quotes the value it choked on, so a poisoned
+  column name arrives wrapped in what reads like pandas's own words.
+  Otherwise one embedded newline forges a complete, plausible, backdated
+  record in the file an operator reads to reconstruct what happened. This
+  rule exists because that defect was found open at eleven sites across four
+  modules over four review rounds, every time by someone reading the code
+  rather than by a test failing.
+- **A value never goes on a log line even escaped.** An exception message
+  that embeds a cell value (openpyxl's illegal-character error is the known
+  one) must be reduced to its type plus a fixed, value-free reason before it
+  is logged. Article II governs what leaves the container; this governs what
+  lands on disk inside it.
 
 ---
 
@@ -236,6 +256,9 @@ client must be closed on FastAPI lifespan shutdown.
    inside the in-process functions that container's runner imports
    (`code_exec._execute_in_process`, `plot_utils._render_in_process`); the web
    process never executes generated code and never falls back to doing so.
+   The sandbox holds no secret, no database driver and no customer data, and
+   reaches no network but the internal one it shares with the web service —
+   see Article XIV, which owns this boundary in full.
 6. Never commit `.env` files. Commit `.env.example` templates only.
 7. SMTP credentials live on the brain (per-tenant config). The client relays
    share emails through `POST /v1/send_share_email`.
@@ -419,6 +442,153 @@ numerics.**
 
 ---
 
+## Article XIV: The Executor Boundary
+
+**Generated Python runs in the `pdc-executor` container and nowhere else.
+The container IS the boundary; everything else is defence on top of it.**
+
+### The five properties that make it a boundary
+1. **A different unprivileged identity.** The web service is uid 10001, the
+   sandbox uid 10002, sharing one group only so they can exchange files in
+   the job directory. Neither is ever root.
+2. **No secrets.** No brain token, no session key, no encryption key, no
+   database credential. The service REFUSES TO START if any of them is in
+   its environment, and the runner's environment is an allowlist built from
+   scratch, so even a container wrongly handed the web service's
+   environment passes none of it to generated code.
+3. **No database access of any kind.** SQLAlchemy, every NETWORK driver, and
+   this client's credential-bearing modules are absent from the image.
+   `sqlite3` is the exception worth naming: it ships with Python, so only the
+   import denylist covers it — and a local database file is not a route to
+   the customer's data, which is what this property is about.
+   `sandbox_guard`'s import denylist is defence in depth on top of that
+   absence, never the guarantee — `open` and `eval` remain reachable by
+   design, and the real guarantees are the missing image contents and the
+   SELECT-only database login the customer provisions.
+4. **No route off its own network.** The sandbox joins ONE Docker network
+   declared `internal: true` and publishes no port: no gateway, so no path
+   to the LAN, to a database host, or to the internet. `POST /execute` is
+   unauthenticated by decision, and **the network is what protects it** — a
+   shared secret would put a secret into the one container defined by
+   holding none. Any deployment that publishes that port or attaches the
+   sandbox to a routable network has broken this article, not merely
+   weakened it.
+5. **No customer data mounted.** Nothing under `DATA_ROOT` is mounted into
+   the sandbox — not uploads, chats, snapshots, the credential store or the
+   log. The only shared storage is the job directory, and each job's input
+   frames are written into it per job rather than mounted wholesale, which is
+   what stops generated code reading a table the requesting user's role does
+   not grant.
+   **What that does NOT give you, measured:** a job can leave data for the
+   next one, in TWO places. The container's `/tmp` is one mode-1777 directory
+   that only a restart clears. The jobs volume's ROOT is group-writable —
+   it has to be, because the sandbox deletes its own finished job
+   directories — so code can also write straight into it, and that volume is
+   on disk and survives restarts and image upgrades. Both were verified by
+   running two separate jobs and reading the first one's file back from the
+   second. The sweeps on both sides remove aged entries of the jobs root
+   that are not job directories, so a stash there lasts about an hour rather
+   than forever; nothing bounds the scratch directory at all.
+
+   Be exact about what that bound rests on, because the obvious reasoning is
+   wrong and was MEASURED to be wrong. The web sweep deliberately skips what
+   it OWNS — that is what stands between a misconfigured
+   `EXECUTOR_SHARED_DIR` and the customer's own state, since everything
+   under `DATA_ROOT` belongs to the web identity. Ownership is therefore
+   useless as a test of who WROTE something: the root must be
+   group-writable so the sandbox can clear an abandoned job directory, which
+   also lets it RENAME one, and a rename preserves the owner. Generated code
+   can hand itself a web-owned entry instead of creating one — verified by
+   renaming its own live job directory, which left a writable directory
+   holding that question's input frames that BOTH sweeps then skipped, each
+   believing the other owned it. The sandbox sweep therefore removes every
+   aged non-job entry regardless of owner: it has no customer data mounted,
+   so the protection ownership buys on the web side buys nothing there,
+   while the gap it left was the whole problem.
+
+   So the per-job frame write bounds what a job is GIVEN, not what a job can
+   leave behind, and the role-permission sentence above is true of the input
+   path only. Closing it properly is a design decision of the same kind as
+   the concurrency limit: a private scratch namespace per job, or a distinct
+   identity per job. A redirected temporary directory would not do it,
+   because code can name an absolute path, and the jobs root cannot simply be
+   made unwritable without taking the sandbox's own cleanup with it.
+
+### Rules
+- `exec()` may exist ONLY on the two code paths the sandbox's runner enters
+  — `plot_utils._render_in_process`, which calls it directly, and
+  `code_exec._execute_in_process`, which reaches it through its private
+  `_execute_code_in_env`. Be exact about the second one: the call is in the
+  CALLEE, and the structural test pins the function that contains the call,
+  not the function the runner imports. The public entry points dispatch over
+  HTTP and must never fall back to executing locally on any error path. A
+  structural test pins both the call sites and the absence of a fallback.
+- The dispatcher never raises: every failure is the caller's own error
+  shape. Its own five failure texts carry no URL, no path and no datum —
+  the detail stays in the local log — because a text the chat loops hand to
+  the brain must say what happened without describing this installation.
+  The infrastructure predicate now stops most of them reaching the brain at
+  all, which narrows the exposure but is not the reason for the rule: a
+  string that names the storage layout is worth avoiding wherever it goes.
+- **Everything in an executor response is untrusted input**, including the
+  fields that look like protocol metadata. The response is read under a
+  mount where customer data IS present, so references are resolved through
+  a no-follow chain, and pickle is never read inbound. Every field that
+  DESCRIBES the outcome is constrained before it reaches a prompt or a log —
+  an enumerated vocabulary where one exists (`status`, `reason`), a bounded
+  grammar where the value is the sandbox's own token (`code`), a numeric
+  bound where it is a number (`exit_code`, `signal`, the timing fields).
+  None of those may arrive as free text.
+
+  The one field that IS free text is the exception message, and it is free
+  text on purpose: the planner has to read the real error to rewrite the
+  code, so it crosses verbatim under a length cap and nothing else. That
+  makes it the field to be careful with rather than the exception to the
+  rule: **every site that writes it to a log must escape it first**, because
+  the log is newline-delimited and a message the sandbox chose could
+  otherwise forge a whole record in the file an operator reads to
+  reconstruct what happened. That is an obligation on every writer, not a
+  property of the text — it was found open at eight sites in two rounds, in
+  three different modules, each time by looking again rather than by a test
+  failing. The same obligation covers any string DERIVED from the response
+  or from a customer frame: a library's own exception quotes the value it
+  choked on, so a poisoned field arrives inside an error message that looks
+  like the library's.
+
+  The PLOT shape carries a second free-text field, `trace`. No product code
+  reads it today, which is the only reason it is not a third paragraph here.
+
+  Any new field follows the first paragraph; any new use of the message, or
+  of anything derived from the response, follows the second.
+- Because a Docker network is bidirectional, the web application refuses
+  any request whose peer address falls inside the sandbox's subnet. A
+  reverse proxy must never be trusted to rewrite that address from a header
+  for arbitrary peers.
+- SQL never executes in the sandbox. Database results reach it only as
+  frames the web service already fetched and gated.
+- One job at a time per sandbox. The limit is part of the design, not a
+  throughput knob: properties 1 and 5 hold BETWEEN the two containers at any
+  setting, but they only hold between two JOBS while there is one. With two
+  in flight they share a single uid, so one job can read another's input
+  frames during its load window, plant a symlink where its result will be
+  written, or signal its process — and writing frames per job stops being a
+  per-job guarantee. Concurrency above one is defensible only with a separate
+  identity per job, which this service does not do.
+
+**Honest limits, stated because a boundary described better than it is
+becomes a liability:** generated code can still consume CPU and memory up to
+the container's limits, can read anything the image itself contains, and can
+write into `/tmp`, into its own job directory AND into the jobs volume's
+root — the last two both shared, as property 5 records, so they are channels
+between consecutive jobs rather than private space, the volume one bounded
+to about an hour by the sweeps and the scratch directory not bounded at all.
+A job can also RENAME an entry in that root, which is why the sandbox sweep
+cannot use ownership to decide what to remove. What it cannot do is
+reach the customer's network, its data at rest, or its credentials:
+everything it is handed was selected for the job it is running.
+
+---
+
 ## Amendment process
 
 To modify this constitution:
@@ -437,9 +607,11 @@ To modify this constitution:
 | LLM calls    | REST API only, no LangChain. Tier via `_eff()`.                            |
 | Storage      | Local filesystem. JSONL for history, JSON for metadata. No GCSPath. Direct-to-GCS upload hop only with `GCS_UPLOAD_BUCKET` (demo). |
 | Errors       | Catch → log with sid → return fallback. Never crash silently.             |
+| Logging      | Escape any text you did not write (`log_safe_text`) — message, context values and the sid. Never log a data value at all. |
 | Resources    | `atexit` for executors; close HTTP clients on lifespan shutdown.          |
 | Security     | Secrets in env only. Never commit `.env`. Brain holds the Gemini key.     |
 | Deploy       | Brain → enterprise GCP. Client → customer LAN. Two independent images.    |
 | Docs         | Five required docs under `docs/`. Fix contradictions in the same PR.      |
 | Exec dtypes  | Sandbox sees standard dtypes only. `sanitize_for_execution` is the gate.  |
-| Exec location| Generated Python runs in `pdc-executor`, never in the web process. `exec()` only in the two in-process functions its runner imports. |
+| Exec location| Generated Python runs in `pdc-executor`, never in the web process. `exec()` only on the two paths its runner enters (one of them a private callee). |
+| Exec boundary| Art. XIV: the sandbox container is the boundary — separate uid, no secrets, no DB, no network route, no customer data mounted. Its responses are untrusted input. |

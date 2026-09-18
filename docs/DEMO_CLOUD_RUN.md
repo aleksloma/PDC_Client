@@ -165,6 +165,24 @@ Never use `--set-env-vars` / `--set-secrets` / `--clear-*` on the live service.
 > been verified against this service. Deploy a new image to a revision with no
 > traffic first, sign in, and confirm a chat writes — a failure looks like a
 > HEALTHY service that returns 500 on login, not like a crash.
+>
+> **OPEN ITEM: this demo has no analysis sandbox.** From this release the
+> generated Python runs only in the `pdc-executor` container, and a customer
+> install is two containers on a private network (`CUSTOMER_INSTALL.md` §3).
+> This service is a SINGLE Cloud Run container, so a redeploy of the current
+> image boots with no sandbox reachable: the service comes up, `/health`
+> answers 200 with `executor_reachable: false`, and every question is answered
+> "the analysis service is not reachable". Charts, reports and Auto Analytics
+> all go the same way. That is a demo that looks alive and answers nothing, in
+> front of an audience.
+>
+> There is no fix in this document. Closing it needs a decision: either the
+> revision runs a second container in the same service (Cloud Run supports
+> multi-container revisions, and the two would share the jobs directory over
+> an in-memory volume rather than the Docker volume a LAN install uses), or the
+> demo is accepted as an explicit exception and this section records why. Do
+> NOT redeploy this service from a build of this release until that decision
+> is made. The previous revision keeps serving, so there is no hurry.
 
 ```bash
 gcloud run deploy pdcclient-demo --project=pdc-enterprise --region=europe-west1 \
@@ -191,9 +209,14 @@ holds the demo accounts, uploaded demo datasets, chats, and rendered decks.
 ## Verify after deploy
 
 1. `GET <service-url>/health` → `brain_reachable: true`,
-   `tenant_token_configured: true`.
+   `tenant_token_configured: true`. It also reports `executor_reachable`,
+   which is `false` on this single-container service until the open item above
+   is resolved. The endpoint answers 200 either way, so the body is the only
+   thing that tells you.
 2. Sign in with the demo account, open an existing chat, ask a question that
    renders a chart (proves brain round-trip + kaleido inside the container).
+   This is the step the missing sandbox breaks, so it is the one that matters
+   on the first redeploy of a release that has one.
 3. Confirm `pdcbrain` gained no new revision:
    `gcloud run revisions list --service=pdcbrain --region=europe-west1 --project=pdc-enterprise`
 4. Direct upload: `GET /lab` HTML carries `window.__DIRECT_UPLOAD__ = true`;
