@@ -27,9 +27,11 @@ from typing import Any, Optional
 import pandas as pd
 
 import brain_client
+import executor_client
 import result_backstop
 from code_exec import safe_execute
 from plot_utils import render_plot_safe, _is_noninteractive_standard_chart
+from exec_transport import log_safe_text
 from logger_utils import log_with_sid
 from schema_builder import schema_text as build_schema_text
 from schema_builder import _detect_language as _detect_answer_language
@@ -43,6 +45,35 @@ from settings import settings
 _STYLED_MAX_ROWS = 200
 _STYLED_MAX_COLS = 40
 _STYLED_MAX_CHARS = 500_000
+
+# What the user is told when the analysis sandbox itself failed. Never the
+# "try rephrasing" sentence: that blames the question for an outage.
+_INFRA_BUSY_TEXT = ("The analysis service is busy right now. "
+                    "Please try again in a moment.")
+_INFRA_DOWN_TEXT = ("The analysis service is not available right now. "
+                    "Please try again in a moment or contact your "
+                    "administrator.")
+
+
+def _infrastructure_answer(sid, error_text) -> Optional[str]:
+    """The sentence for an infrastructure failure, or None to keep retrying.
+
+    The retry loops below were written when generated code ran in this
+    process, where every `error` string was the code's fault. The same channel
+    now also carries the sandbox hop's own conditions, and asking the brain to
+    REWRITE the code three times spends three brain calls and three
+    round-trips on something no code change can fix — ending in "try
+    rephrasing" for an outage. `executor_client.is_infrastructure_error` owns
+    which failures those are (a timeout, an out-of-memory run and an oversized
+    result still retry: cheaper code is a real fix).
+    """
+    if not executor_client.is_infrastructure_error(error_text):
+        return None
+    log_with_sid(sid, "error",
+                 f"EXEC_INFRA_ERROR {log_safe_text(str(error_text), 200)}")
+    if str(error_text).startswith("ExecutorBusy"):
+        return _INFRA_BUSY_TEXT
+    return _INFRA_DOWN_TEXT
 
 
 def _styler_to_html(result_obj) -> Optional[str]:
@@ -122,7 +153,14 @@ def _normalize_df_for_table(df: pd.DataFrame) -> pd.DataFrame:
             out.columns = cols
         return out
     except Exception as e:
-        log_with_sid("table", "warning", f"TABLE_NORMALIZE_FAILED: {e}")
+        # pandas quotes the LABEL it choked on and does NOT `repr` it: a result
+        # frame whose index name equals a column name makes `reset_index()`
+        # raise "cannot insert <name>, already exists", and that name — like
+        # every label here — is the executed code's choice and survives the
+        # parquet round trip. So this `{e}` is an untrusted string wearing a
+        # library's error text, and the durable log is newline-delimited.
+        log_with_sid("table", "warning",
+                     f"TABLE_NORMALIZE_FAILED: {log_safe_text(str(e), 200)}")
         return df
 
 
@@ -181,7 +219,13 @@ def _build_tables_from_result(result_obj) -> Optional[list]:
                 t["title"] = str(key)
                 tables.append(t)
         except Exception as e:
-            log_with_sid(str(key), "warning", f"MULTI_TABLE_BUILD_FAILED: {e}")
+            # `key` is a RESULT-dict key the executed code chose, and
+            # `log_with_sid` interpolates the sid and every context value RAW
+            # — an untrusted string must never be used as an identifier field
+            # unescaped, or it forges a record from the sid position just as
+            # readily as from the message. Both halves are escaped and capped.
+            log_with_sid(log_safe_text(str(key), 120), "warning",
+                         f"MULTI_TABLE_BUILD_FAILED: {log_safe_text(str(e), 200)}")
     return tables or None
 
 
@@ -259,7 +303,10 @@ def _other_registered_tables(schema_docs, dfs, user_email) -> list:
         out.sort(key=lambda r: r["display_name"])
         return out[:20]
     except Exception as e:
-        log_with_sid(str(user_email or "?"), "warning", f"OTHER_TABLES_FAILED: {e}")
+        # The failure is raised ABOUT registry metadata (table display names,
+        # introspected column names), so the message can quote one.
+        log_with_sid(str(user_email or "?"), "warning",
+                     f"OTHER_TABLES_FAILED: {log_safe_text(str(e), 200)}")
         return []
 
 
@@ -336,7 +383,13 @@ def run_chat(
     code = plan_out.get("code") or ""
     usage = plan_out.get("usage") or {}
     context_decision = plan_out.get("context_decision") or {}
-    log_with_sid(sid, "info", f"PLAN kind={kind} model={plan_out.get('model_used')}")
+    # Both fields are lifted VERBATIM out of the plan response and neither is
+    # validated before this line: `kind` is only compared against a known set
+    # afterwards, and `model_used` is free text. Escaped and capped like every
+    # other field whose origin is not local.
+    log_with_sid(sid, "info",
+                 f"PLAN kind={log_safe_text(str(kind), 40)} "
+                 f"model={log_safe_text(str(plan_out.get('model_used')), 80)}")
 
     # Clarification / text answer — return as text
     if kind in ("CLARIFICATION", "ANSWER", "MISSING_DATA"):
@@ -358,7 +411,14 @@ def run_chat(
     max_retries = 3  # up to 3 retry attempts; escalate to pro/search from the 2nd
     while exec_out.get("error") and retry_count < max_retries:
         error_msg = exec_out.get("error", "Unknown")
-        log_with_sid(sid, "warning", f"EXEC_ERROR attempt {retry_count+1}: {error_msg[:200]}")
+        # The sandbox itself failed: no rewrite of this code can help, so
+        # answer once instead of spending three brain calls on an outage.
+        infra_text = _infrastructure_answer(sid, error_msg)
+        if infra_text:
+            return {"text": infra_text, "image_base64": None, "table": None,
+                    "code": code, "usage": usage}
+        log_with_sid(sid, "warning",
+                     f"EXEC_ERROR attempt {retry_count+1}: {log_safe_text(error_msg, 200)}")
         use_pro = retry_count >= 1
         use_search = retry_count >= 1
         retry_out = brain_client.retry(
@@ -554,7 +614,11 @@ def _describe_with_backstop(sid: str, question: str, code: str,
                                   user_email=user_email, data_caveat=caveat)
         reason = "missing_marker"
     except Exception as e:                                   # noqa: BLE001
-        log_with_sid(sid, "warning", f"RESULT_BACKSTOP_DESCRIBE_FAILED: {e}")
+        # The caveat's facts embed COLUMN NAMES taken from the executed
+        # result, so a failure raised while compacting them for transport can
+        # quote one — same class as any other label on a log line.
+        log_with_sid(sid, "warning",
+                     f"RESULT_BACKSTOP_DESCRIBE_FAILED: {log_safe_text(str(e), 200)}")
         d = {"text": "", "usage": {}}
         reason = "describe_failed"
 
@@ -1135,6 +1199,11 @@ def run_chat_multi_plot(
     from collections import deque
     work = deque((blk, 0, 0, 0) for blk in plot_blocks)
     produced = 0
+    # The sentence recorded once the analysis sandbox itself proved to be down
+    # — it stops the chart worklist below AND the table blocks after it, which
+    # dispatch through the same hop and would each wait the same queue for the
+    # same answer.
+    service_down_text: Optional[str] = None
     log_with_sid(sid, "info", f"MULTI_PLOT_START blocks={len(work)}")
 
     while work:
@@ -1155,9 +1224,14 @@ def run_chat_multi_plot(
 
         # Standard execution-error retry (skip when it's the multi-axes signal).
         retry_count = 0
+        infra_text = None
         while plot_out.get("error") and not plot_out.get("multi_axes") and retry_count < 3:
             error_msg = plot_out.get("error", "Unknown")
-            log_with_sid(sid, "warning", f"MULTI_PLOT_ERROR attempt={retry_count+1}: {error_msg[:200]}")
+            infra_text = _infrastructure_answer(sid, error_msg)
+            if infra_text:
+                break
+            log_with_sid(sid, "warning",
+                         f"MULTI_PLOT_ERROR attempt={retry_count+1}: {log_safe_text(error_msg, 200)}")
             use_pro = retry_count >= 1
             use_search = retry_count >= 1
             retry_out = brain_client.retry(
@@ -1188,10 +1262,27 @@ def run_chat_multi_plot(
                     code = new_code
                     plot_out = py_out
                     break
+                # This branch dispatches too, so the sandbox can fail here as
+                # well — without the check it would burn the remaining
+                # round-trips after the render already failed for that reason.
+                infra_text = _infrastructure_answer(sid, py_out.get("error"))
+                if infra_text:
+                    break
                 continue
             # Any other kind (CLARIFICATION, ANSWER, MISSING_DATA, …) → failed
             # attempt; keep retrying.
             continue
+
+        # The sandbox itself failed: STOP the whole worklist. The remaining
+        # blocks would each wait the same dispatch queue for the same answer,
+        # so the user would wait one timeout per block for one outage. The
+        # sentence rides `combined_answers`, which is what builds
+        # `combined_answer` on the done event — so it appears exactly once and
+        # the zero-charts fallback ("Something went wrong…") never fires.
+        if infra_text:
+            combined_answers.append(infra_text)
+            service_down_text = infra_text
+            break
 
         # ── One-figure-per-chart enforcement ──
         if plot_out.get("multi_axes"):
@@ -1376,11 +1467,32 @@ def run_chat_multi_plot(
     table_codes: list = []
     table_result_keys: list = []
     for tb in table_blocks if table_blocks else []:
+        # The chart loop already established that the sandbox is down, and
+        # these blocks dispatch through the SAME hop: each would wait the full
+        # dispatch queue (ten minutes by default) to be told the same thing,
+        # which is precisely the per-block wait the chart loop's `break`
+        # exists to avoid. Stopping here loses nothing — the tables emitted
+        # before the outage are already on `combined_tables` and still ride
+        # the done event, and the sentence is already in `combined_answers`.
+        if service_down_text:
+            log_with_sid(sid, "warning", "MIXED_TABLE_BLOCKS_SKIPPED service_down")
+            break
         try:
             exec_out = safe_execute(tb, dfs, sid)
             if exec_out.get("error"):
+                infra_text = _infrastructure_answer(sid, exec_out.get("error"))
+                if infra_text:
+                    # Same reasoning, for an outage that starts HERE (a run
+                    # whose chart blocks all succeeded, or one that had none
+                    # left after the extraction above).
+                    service_down_text = infra_text
+                    if infra_text not in combined_answers:
+                        combined_answers.append(infra_text)
+                    log_with_sid(sid, "warning", "MIXED_TABLE_BLOCKS_SKIPPED service_down")
+                    break
                 log_with_sid(sid, "warning",
-                             f"MIXED_TABLE_BLOCK_ERROR: {str(exec_out['error'])[:200]}")
+                             f"MIXED_TABLE_BLOCK_ERROR: "
+                             f"{log_safe_text(str(exec_out['error']), 200)}")
                 continue
             result_obj = exec_out.get("result")
             t = _build_table_from_result(result_obj)
@@ -1404,7 +1516,10 @@ def run_chat_multi_plot(
                 table_result_keys.append(entry.get("title") if ts else None)
             log_with_sid(sid, "info", f"MIXED_TABLE_EMIT tables={len(emitted)}")
         except Exception as e:
-            log_with_sid(sid, "warning", f"MIXED_TABLE_BLOCK_FAILED: {e}")
+            # Raised while building the table from the executed RESULT, so the
+            # message can carry a label or dict key the sandbox chose.
+            log_with_sid(sid, "warning",
+                         f"MIXED_TABLE_BLOCK_FAILED: {log_safe_text(str(e), 200)}")
 
     # If every block failed all its retries we rendered ZERO charts — surface a
     # clear failure rather than the misleading bare "Analysis complete." (a run
@@ -1458,7 +1573,14 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
     max_retries = 3  # up to 3 retry attempts; escalate to pro/search from the 2nd
     while exec_out.get("error") and retry_count < max_retries:
         error_msg = exec_out.get("error", "Unknown")
-        log_with_sid(sid, "warning", f"EXEC_ERROR attempt {retry_count+1}: {error_msg[:200]}")
+        # The sandbox itself failed: no rewrite of this code can help, so
+        # answer once instead of spending three brain calls on an outage.
+        infra_text = _infrastructure_answer(sid, error_msg)
+        if infra_text:
+            return {"text": infra_text, "image_base64": None, "table": None,
+                    "code": code, "usage": usage}
+        log_with_sid(sid, "warning",
+                     f"EXEC_ERROR attempt {retry_count+1}: {log_safe_text(error_msg, 200)}")
         use_pro = retry_count >= 1
         use_search = retry_count >= 1
         retry_out = brain_client.retry(

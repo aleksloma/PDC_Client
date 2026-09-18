@@ -13,6 +13,7 @@ Backend:
 """
 from __future__ import annotations
 
+import ipaddress
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -177,12 +178,138 @@ class RememberMeSessionMiddleware(SessionMiddleware):
         await self.app(scope, receive, send_wrapper)
 
 
+# Source addresses the backend-network guard has already refused, and CIDR
+# values it could not parse — one log line each per process, so a loop inside
+# the sandbox cannot flood the log.
+_BACKEND_REFUSED: set = set()
+_BACKEND_BAD_CIDRS: set = set()
+# How much of a refused request's path the log line repeats.
+_REFUSED_PATH_MAX_CHARS = 120
+
+
+def _refused_path(path) -> str:
+    """A request path safe to put on ONE log line. Never raises.
+
+    `repr` of a truncated value: the ASGI server percent-decodes the path, so
+    without it a request for `/x%0a…` writes whatever line it likes into the
+    durable log, which is a file operators grep and trust.
+    """
+    try:
+        return repr(str(path or "")[:_REFUSED_PATH_MAX_CHARS])
+    except Exception:
+        return "''"
+
+
+class BackendNetworkGuard:
+    """Refuse every request whose socket peer sits in the sandbox's network.
+
+    WHY this exists: the analysis sandbox shares an internal Docker network
+    with this service so the dispatcher can reach it — and a Docker network is
+    BIDIRECTIONAL. Nothing in the topology stops generated Python inside the
+    sandbox from opening `http://pdc-client:8000/auth/login` or the password
+    reset flow, neither of which needs a session. "One direction only" cannot
+    be expressed in compose, so the app refuses the range itself.
+
+    The peer address is the one thing code inside the sandbox cannot choose:
+    it is the socket's, not a header's. There is no allowlisted path — the
+    sandbox never needs to call this app at all, and the container's own
+    healthcheck runs over loopback.
+
+    HONEST LIMITATION: a TRUSTED reverse proxy can rewrite the peer. uvicorn's
+    `ProxyHeadersMiddleware` sets `scope["client"]` from `X-Forwarded-For` for
+    every peer listed in `FORWARDED_ALLOW_IPS`, and it wraps OUTSIDE this app —
+    so with `FORWARDED_ALLOW_IPS=*` the sandbox can present any address it
+    likes. Never set the wildcard, and never a range that contains the backend
+    subnet.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    @staticmethod
+    def _network():
+        """The configured range, read at REQUEST time.
+
+        A malformed value disables the guard and logs once (Article IV): one
+        typo in one env var must never turn every request into a 500, and a
+        boot must never fail on it.
+        """
+        raw = str(getattr(settings, "EXECUTOR_NETWORK_CIDR", "") or "").strip()
+        if not raw:
+            return None
+        try:
+            return ipaddress.ip_network(raw, strict=False)
+        except Exception as e:
+            if raw not in _BACKEND_BAD_CIDRS:
+                _BACKEND_BAD_CIDRS.add(raw)
+                log_with_sid("startup", "error",
+                             f"BACKEND_CIDR_INVALID {type(e).__name__}: {e}")
+            return None
+
+    @staticmethod
+    def _inside(host, network) -> bool:
+        try:
+            addr = ipaddress.ip_address(host)
+        except ValueError:
+            # `None`, a hostname, or Starlette's TestClient default peer
+            # ("testclient") — none of them is an address in the range.
+            return False
+        # An IPv6 listener reports an IPv4 peer as `::ffff:192.168.255.242`,
+        # and that object is NOT `in` an IPv4 network — the guard would stand
+        # down for the whole range. Inert while the server binds IPv4 only, so
+        # mapping it here is what keeps one `--host ::` from silently turning
+        # the guard off.
+        addr = getattr(addr, "ipv4_mapped", None) or addr
+        return addr in network
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        network = self._network()
+        client = scope.get("client") or None
+        host = client[0] if client else None
+        if network is None or host is None or not self._inside(host, network):
+            await self.app(scope, receive, send)
+            return
+        if host not in _BACKEND_REFUSED:
+            _BACKEND_REFUSED.add(host)
+            # The path is logged through `repr` and truncated: the server
+            # percent-DECODES it, so a request for `/x%0a…` would otherwise
+            # write a forged line into the durable log — and the caller this
+            # guard exists for is the one the design assumes hostile. `repr`
+            # escapes CR/LF and every other control character; the peer
+            # address needs no such treatment, it came from the socket.
+            log_with_sid("security", "warning",
+                         f"BACKEND_REQUEST_REFUSED client={host} "
+                         f"path={_refused_path(scope.get('path'))}")
+        if scope["type"] == "websocket":
+            # A websocket scope cannot be answered with an HTTP response
+            # message; the refusal is a close instead. (This app serves no
+            # websocket route today — the branch exists so the guard cannot
+            # become the thing that raises.)
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        # Raw ASGI messages rather than a Response class: the body must stay
+        # exactly this, naming neither the path, the range, nor the caller.
+        await send({
+            "type": "http.response.start",
+            "status": 403,
+            "headers": [(b"content-type", b"application/json")],
+        })
+        await send({"type": "http.response.body", "body": b'{"error": "forbidden"}'})
+
+
 _REMEMBER_ME_MAX_AGE = 30 * 24 * 60 * 60   # ~30 days
 
 app = FastAPI(title="PowerDataChat Client (enterprise)", version="1.0", lifespan=lifespan)
 app.add_middleware(RememberMeSessionMiddleware, secret_key=settings.SECRET_KEY,
                    same_site="lax", max_age=_REMEMBER_ME_MAX_AGE,
                    https_only=settings.SESSION_HTTPS_ONLY)
+# LAST registered = OUTERMOST layer (Starlette inserts each at index 0 and
+# builds the stack from the front), which is what the guard needs: a request
+# from the sandbox's range must be refused before a session is even unsigned.
+app.add_middleware(BackendNetworkGuard)
 
 # Static assets (copied byte-for-byte from the B2C app)
 app.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static")
@@ -328,6 +455,9 @@ async def lab(request: Request):
             # GCS_UPLOAD_BUCKET is set (Cloud Run demo); false on every
             # customer install => multipart /upload for all sizes.
             "direct_upload_enabled": gcs_upload.enabled(),
+            # Google Analytics + the Paddle widget. False on every customer
+            # install => the page loads nothing from a third-party origin.
+            "third_party_scripts": settings.ENABLE_THIRD_PARTY_SCRIPTS,
             "username": email,
             "subscription_plan": "Enterprise",
             **prof,
@@ -381,6 +511,9 @@ async def open_conversation_deeplink(request: Request, conv_id: str):
             # GCS_UPLOAD_BUCKET is set (Cloud Run demo); false on every
             # customer install => multipart /upload for all sizes.
             "direct_upload_enabled": gcs_upload.enabled(),
+            # Google Analytics + the Paddle widget. False on every customer
+            # install => the page loads nothing from a third-party origin.
+            "third_party_scripts": settings.ENABLE_THIRD_PARTY_SCRIPTS,
             "username": email,
             "subscription_plan": "Enterprise",
             "open_conv_id": conv_id,
@@ -519,13 +652,29 @@ def _power_scope_summary(email: str) -> tuple[str, bool]:
 
 @app.get("/health")
 async def health():
+    """Still 200 when the analysis sandbox is down — that is the point.
+
+    `executor_reachable` is the CACHED verdict of the last conversation with
+    the sandbox (startup handshake, every dispatch, a short background
+    refresh), never a live call: an unresolvable sandbox name costs ~8 s in
+    `getaddrinfo` before any HTTP timeout applies, this handler is async while
+    the clients are sync, and the container's healthcheck allows 5 s — so a
+    probe here would mark the web container unhealthy exactly when an operator
+    needs the page to say which half is down. `None` means nobody has checked
+    yet, which is not the same answer as "down".
+    """
+    import executor_client
     from brain_client import health as brain_health
+
+    executor_ok, executor_checked_at = executor_client.reachable()
     return {
         "status": "ok",
         "service": "client",
         "brain_reachable": brain_health() if settings.BRAIN_TENANT_TOKEN else None,
         "tenant_token_configured": bool(settings.BRAIN_TENANT_TOKEN),
         "build_commit": settings.BUILD_COMMIT or None,
+        "executor_reachable": executor_ok,
+        "executor_checked_at": executor_checked_at or None,
     }
 
 

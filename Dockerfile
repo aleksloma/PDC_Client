@@ -8,8 +8,13 @@ ENV PYTHONUNBUFFERED=1 \
     DATA_ROOT=/data/client \
     BRAIN_URL=http://brain:8080
 
-# Native libs for matplotlib / kaleido / pandas + unixodbc for pyodbc (MSSQL)
+# Native libs for matplotlib / kaleido / pandas + unixodbc for pyodbc (MSSQL).
+# `apt-get upgrade` patches the base image's own OS packages in the same layer:
+# the base tag is rebuilt less often than its security fixes ship, so without it
+# a fresh build inherits OS vulnerabilities that already have a fix. The release
+# image scan is the detector for whatever is left (docs/BUILD_AND_RUN.md §8).
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
         curl ca-certificates gnupg \
         libxml2 libgomp1 fontconfig \

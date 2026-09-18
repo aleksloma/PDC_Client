@@ -31,6 +31,7 @@ import local_store
 import run_chat_local
 import brain_client
 from brain_client import TenantRevokedError, BrainError, BrainTimeoutError
+from exec_transport import log_safe_text
 from logger_utils import log_with_sid
 from schema_builder import _detect_language as _detect_lang_for_title
 
@@ -96,8 +97,11 @@ def _persist_full_table(store, table: dict, code: str | None,
             _FULL_TABLE_CACHE.pop(old, None)
         return key
     except Exception as e:
+        # Raised ABOUT the result table being written (its labels, its cells),
+        # so the message can quote one of them; the durable log is
+        # newline-delimited and must stay one record per event.
         log_with_sid(getattr(store, "chat_id", ""), "warning",
-                     f"PERSIST_FULL_TABLE_FAILED: {e}")
+                     f"PERSIST_FULL_TABLE_FAILED: {log_safe_text(str(e), 200)}")
         return None
 
 
@@ -113,8 +117,9 @@ def _load_full_table_record(store, key: str) -> dict | None:
         if p.exists():
             return json.loads(p.read_text(encoding="utf-8"))
     except Exception as e:
+        # Same class: the decoder's own message can quote the stored content.
         log_with_sid(getattr(store, "chat_id", ""), "warning",
-                     f"FULL_TABLE_READ_FAILED: {e}")
+                     f"FULL_TABLE_READ_FAILED: {log_safe_text(str(e), 200)}")
     return _FULL_TABLE_CACHE.get(key)
 
 
@@ -167,17 +172,25 @@ async def _reexecute_full_df(chat_id: str, code: str | None, result_key: str | N
             return _normalize_df_for_table(obj.data)
         return None
     except Exception as e:
-        log_with_sid(chat_id, "warning", f"DOWNLOAD_REEXEC_FAILED: {e}")
+        # The re-executed RESULT is normalized here (`_normalize_df_for_table`),
+        # and pandas quotes the label it choked on WITHOUT `repr` — a label the
+        # sandbox chose. Escape before it reaches the log line.
+        log_with_sid(chat_id, "warning",
+                     f"DOWNLOAD_REEXEC_FAILED: {log_safe_text(str(e), 200)}")
         return None
 
 
 def _auto_analysis_busy_response(store, email: str, chat_id: str):
-    """409 when Auto Analytics is running for this chat, else None (QA 2.3).
+    """409 when Auto Analytics is running for THIS chat, else None (QA 2.3).
 
-    While the job runs, its 4 workers occupy the single code-exec worker and
-    the shared brain connection pool, so an interactive question times out
-    ~90s later with a misleading "temporarily unavailable" error. Telling the
-    user honestly and immediately — BEFORE any history append — is the fix.
+    While the job runs, its 4 workers occupy the dispatch gate to the analysis
+    sandbox (`executor_client`, one job at a time by default) and the shared
+    brain connection pool, so an interactive question waits the queue and then
+    fails with a misleading "temporarily unavailable" error. Telling the user
+    honestly and immediately — BEFORE any history append — is the fix.
+    HONEST LIMIT: the gate is process-wide while this guard is per-chat, so a
+    question in a DIFFERENT chat still queues behind the job — answered late
+    rather than wrongly, since the queue wait is outside the job's own budget.
     Fail-open: a corrupt meta must never block chat (Article IV)."""
     try:
         import auto_analytics as aa
@@ -190,7 +203,9 @@ def _auto_analysis_busy_response(store, email: str, chat_id: str):
                 "busy": "auto_analysis",
             }, status_code=409)
     except Exception as e:
-        log_with_sid(email, "warning", f"AUTO_BUSY_CHECK_FAILED chat={chat_id}: {e}")
+        log_with_sid(email, "warning",
+                     f"AUTO_BUSY_CHECK_FAILED chat={chat_id}: "
+                     f"{log_safe_text(str(e), 200)}")
     return None
 
 
@@ -480,9 +495,12 @@ def _empty_dataset_response(store, chat_id: str) -> JSONResponse:
     if missing:
         body["code"] = "DB_TABLES_MISSING"
         body["missing_tables"] = missing
+        # The display name is registry metadata, not a constant — escape and
+        # cap each one; `reason` is this module's own fixed vocabulary.
         log_with_sid(chat_id, "warning",
                      "CHAT_DB_TABLES_MISSING " + ", ".join(
-                         f"{m['display_name']}({m['reason']})" for m in missing))
+                         f"{log_safe_text(str(m['display_name']), 120)}({m['reason']})"
+                         for m in missing))
     return JSONResponse(body, status_code=400)
 
 
@@ -516,14 +534,16 @@ async def get_schema(request: Request, chat_id: str):
             import roles_store
             allowed_ids = roles_store.allowed_table_ids_for(email)
         except Exception as e:
-            log_with_sid(email, "warning", f"SCHEMA_ROLE_PROBE_FAILED: {e}",
+            log_with_sid(email, "warning",
+                         f"SCHEMA_ROLE_PROBE_FAILED: {log_safe_text(str(e), 200)}",
                          chat_id=chat_id)
         # ONE classifier for "this table can no longer be loaded" (also used by
         # the empty-dataset message, which needs the REASON as well).
         try:
             missing_by_id = {m["table_id"]: m for m in local_store.missing_db_tables(meta)}
         except Exception as e:
-            log_with_sid(email, "warning", f"DB_TABLE_MISSING_PROBE_FAILED: {e}",
+            log_with_sid(email, "warning",
+                         f"DB_TABLE_MISSING_PROBE_FAILED: {log_safe_text(str(e), 200)}",
                          chat_id=chat_id)
             missing_by_id = {}
         for entry in db_entries:
@@ -588,8 +608,12 @@ async def file_fingerprints(request: Request, chat_id: str):
                         h.update(chunk)
                 entry["sha256"] = h.hexdigest()
             except Exception as e:
+                # `fp.name` is read back from the files directory, so its
+                # newline-freedom rests on another module's sanitizer rather
+                # than on anything visible here; the OSError quotes it too.
                 log_with_sid(chat_id, "warning",
-                             f"FINGERPRINT_FAILED {fp.name}: {e}")
+                             f"FINGERPRINT_FAILED {log_safe_text(fp.name, 200)}: "
+                             f"{log_safe_text(str(e), 200)}")
             out[fp.name] = entry
         return out
 
@@ -597,7 +621,8 @@ async def file_fingerprints(request: Request, chat_id: str):
         loop = asyncio.get_running_loop()
         files = await loop.run_in_executor(_EXEC, _compute)
     except Exception as e:
-        log_with_sid(chat_id, "error", f"FINGERPRINTS_ERROR: {e}")
+        log_with_sid(chat_id, "error",
+                     f"FINGERPRINTS_ERROR: {log_safe_text(str(e), 200)}")
         files = {}
     return {"files": files}
 
@@ -686,7 +711,11 @@ async def probe_columns(request: Request, chat_id: str,
         log_with_sid(chat_id, "info", f"PROBE_COLUMNS file={fname} match={match}")
         return {"ok": True, "match": match, "uploaded": uploaded, "existing": existing}
     except Exception as e:
-        log_with_sid(chat_id, "warning", f"PROBE_COLUMNS_FAILED: {e}")
+        # openpyxl/csv raise ABOUT the file's contents and quote the cell they
+        # choked on, so this message is a customer value wearing a library's
+        # error text — the route's contract is that values are never logged.
+        log_with_sid(chat_id, "warning",
+                     f"PROBE_COLUMNS_FAILED: {log_safe_text(str(e), 200)}")
         return {"ok": False}
 
 
@@ -748,8 +777,13 @@ async def conversation_stop(request: Request, chat_id: str, conv_id: str):
     if err:
         return err
     _request_cancel(conv_id)
+    # `conv_id` is request-controlled at every one of these log sites (a path
+    # segment here, a JSON body field in the stream) and is NOT validated
+    # before the line is written — `valid_conv_id` guards the STORE, which
+    # returns empty rather than refusing the request. Every context value is
+    # rendered raw, so escape it; the escape is the identity for a real id.
     log_with_sid("stop", "info", "CHAT_STOP_REQUESTED", user=email,
-                 chat_id=chat_id, conv_id=conv_id)
+                 chat_id=chat_id, conv_id=log_safe_text(str(conv_id), 80))
     return {"ok": True, "stopping": True}
 
 
@@ -825,7 +859,11 @@ async def chat_stream(request: Request, chat_id: str):
     history_rows = store.get_history(conv_id)
     store.append_history(conv_id, {"role": "human", "content": question, "ts": time.time()})
 
-    log_with_sid(sid, "info", "CHAT_STREAM_REQ", user=email, chat_id=chat_id, conv_id=conv_id, q=question[:120])
+    # `q` is the user's own free text and `log_with_sid` renders every context
+    # value RAW, so a pasted newline forges a whole record with one request.
+    log_with_sid(sid, "info", "CHAT_STREAM_REQ", user=email, chat_id=chat_id,
+                 conv_id=log_safe_text(str(conv_id), 80),
+                 q=log_safe_text(question, 120))
 
     async def _sse_generator():
         loop = asyncio.get_running_loop()
@@ -964,7 +1002,12 @@ async def chat_stream(request: Request, chat_id: str):
                 err_msg = "Analysis service is temporarily unavailable."
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", err_msg))
             except Exception as e:
-                log_with_sid(sid, "error", f"CHAT_THREAD_ERROR: {type(e).__name__}: {e}")
+                # `e` comes out of the analysis pipeline: pandas raising about
+                # a customer frame quotes its labels, and the sandbox's own
+                # error text arrives here too.
+                log_with_sid(sid, "error",
+                             f"CHAT_THREAD_ERROR: {log_safe_text(type(e).__name__, 80)}: "
+                             f"{log_safe_text(str(e), 200)}")
                 err_msg = "Something went wrong while processing your request."
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", err_msg))
 
@@ -998,7 +1041,11 @@ async def chat_stream(request: Request, chat_id: str):
                         except Exception:
                             pass
             except Exception as e:
-                log_with_sid(sid, "error", f"CHAT_PERSIST_ERROR: {type(e).__name__}: {e}")
+                # Raised while persisting the answer record — its tables and
+                # their labels are what the message can quote.
+                log_with_sid(sid, "error",
+                             f"CHAT_PERSIST_ERROR: {log_safe_text(type(e).__name__, 80)}: "
+                             f"{log_safe_text(str(e), 200)}")
             finally:
                 # Unmark only after persistence above has completed, so a status
                 # poll that now sees generating=false will find the AI turn saved.
@@ -1181,7 +1228,9 @@ async def edit_regenerate(request: Request, chat_id: str):
 
     store.truncate_conv_history(conv_id, last_human_idx)
     log_with_sid(chat_id, "info",
-                 f"EDIT_REGENERATE user={email} conv_id={conv_id} truncated_to={last_human_idx}")
+                 f"EDIT_REGENERATE user={email} "
+                 f"conv_id={log_safe_text(str(conv_id), 80)} "
+                 f"truncated_to={last_human_idx}")
 
     try:
         loop = asyncio.get_running_loop()
@@ -1217,16 +1266,25 @@ async def edit_regenerate(request: Request, chat_id: str):
     except BrainTimeoutError as e:
         # subclass of BrainError — caught first; see the chat_stream worker (QA 2.3)
         msg = "The analysis service is busy right now. Please try again in a moment."
-        log_with_sid(chat_id, "warning", f"EDIT_REGENERATE_BRAIN_TIMEOUT: {e}")
+        # No field reaches a log as free text, and the escaping obligation is
+        # on the writer. The brain is our own service but not the author of
+        # everything it returns — it relays model output — so its error text
+        # is escaped like any other string whose origin is not local.
+        log_with_sid(chat_id, "warning",
+                     f"EDIT_REGENERATE_BRAIN_TIMEOUT: {log_safe_text(str(e), 200)}")
         store.append_history(conv_id, {"role": "ai", "content": msg, "ts": time.time()})
         return JSONResponse({"error": msg, "conv_id": conv_id}, status_code=503)
     except BrainError as e:
         msg = "Analysis service is temporarily unavailable."
-        log_with_sid(chat_id, "warning", f"EDIT_REGENERATE_BRAIN_ERROR: {e}")
+        log_with_sid(chat_id, "warning",
+                     f"EDIT_REGENERATE_BRAIN_ERROR: {log_safe_text(str(e), 200)}")
         store.append_history(conv_id, {"role": "ai", "content": msg, "ts": time.time()})
         return JSONResponse({"error": msg, "conv_id": conv_id}, status_code=503)
     except Exception as e:
-        log_with_sid(chat_id, "error", f"EDIT_REGENERATE_ERROR: {type(e).__name__}: {e}")
+        # Same pipeline as CHAT_THREAD_ERROR above, same untrusted text.
+        log_with_sid(chat_id, "error",
+                     f"EDIT_REGENERATE_ERROR: {log_safe_text(type(e).__name__, 80)}: "
+                     f"{log_safe_text(str(e), 200)}")
         return JSONResponse(
             {"error": "Something went wrong while processing your request."},
             status_code=500,
@@ -1392,9 +1450,17 @@ def _start_title_generation(email: str, chat_id: str, conv_id: str,
             new_title = (rsp.get("title") or "").strip()
             if new_title:
                 local_store.AuthStore().rename_conversation(email, conv_id, new_title)
-                log_with_sid(email, "info", f"CONV_TITLE_UPDATED conv_id={conv_id} title={new_title!r}")
+                # `title` is `!r` (repr escapes CR/LF); conv_id is not.
+                log_with_sid(email, "info",
+                             f"CONV_TITLE_UPDATED "
+                             f"conv_id={log_safe_text(str(conv_id), 80)} "
+                             f"title={new_title!r}")
         except Exception as e:
-            log_with_sid(email, "warning", f"TITLE_GEN_FAILED: {e}")
+            # The guarded block carries the question, the answer and the
+            # returned title, so this message can quote any of the three on
+            # top of the brain's own error text.
+            log_with_sid(email, "warning",
+                         f"TITLE_GEN_FAILED: {log_safe_text(str(e), 200)}")
     threading.Thread(target=_worker, daemon=True).start()
 
 
@@ -1461,9 +1527,13 @@ async def share_post(request: Request, chat_id: str):
                 sender_email=email, chat_title=chat_title, message=message_text,
             ) or smtp_result
         except (TenantRevokedError, BrainError) as e:
-            log_with_sid(email, "warning", f"SHARE_EMAIL_BRAIN_ERROR: {e}")
+            log_with_sid(email, "warning",
+                         f"SHARE_EMAIL_BRAIN_ERROR: {log_safe_text(str(e), 200)}")
         except Exception as e:
-            log_with_sid(email, "warning", f"SHARE_EMAIL_ERROR: {e}")
+            # The relayed payload holds the chat title and the sharer's own
+            # comment, so a failure building it quotes user text.
+            log_with_sid(email, "warning",
+                         f"SHARE_EMAIL_ERROR: {log_safe_text(str(e), 200)}")
 
     return {
         "ok": True,
@@ -1633,7 +1703,10 @@ def _role_refresh_block(email: str, chat_id: str, code: str):
         referenced = set(_DF_KEY_RE.findall(code or ""))
         return frozenset(denied), sorted(denied[k] for k in referenced if k in denied)
     except Exception as e:
-        log_with_sid(email, "warning", f"ROLE_GATE_FAILED chat={chat_id}: {e}")
+        # The gate reads chat meta and the roles registry; a failure there is
+        # raised about table names and df keys.
+        log_with_sid(email, "warning",
+                     f"ROLE_GATE_FAILED chat={chat_id}: {log_safe_text(str(e), 200)}")
         return frozenset(), []
 
 
@@ -1671,7 +1744,8 @@ async def run_item_refresh(chat_id: str, code: str, kind: str, sid: str,
                 _EXEC, lambda: safe_execute(code, dfs, sid=sid))
             if not isinstance(exec_out, dict) or exec_out.get("error"):
                 emsg = (exec_out or {}).get("error", "unknown") if isinstance(exec_out, dict) else "unknown"
-                log_with_sid(sid, "warning", f"REFRESH_ITEM_TABLE_EXEC_ERROR: {str(emsg)[:200]}",
+                log_with_sid(sid, "warning",
+                             f"REFRESH_ITEM_TABLE_EXEC_ERROR: {log_safe_text(str(emsg), 200)}",
                              chat_id=chat_id)
                 return {"ok": False, "error": "Could not re-run this table with the current data."}
             table = _build_table_from_result(exec_out.get("result"))
@@ -1692,7 +1766,8 @@ async def run_item_refresh(chat_id: str, code: str, kind: str, sid: str,
         if (not isinstance(plot_out, dict) or plot_out.get("error")
                 or plot_out.get("multi_axes")):
             emsg = (plot_out or {}).get("error", "unknown") if isinstance(plot_out, dict) else "unknown"
-            log_with_sid(sid, "warning", f"REFRESH_ITEM_CHART_EXEC_ERROR: {str(emsg)[:200]}",
+            log_with_sid(sid, "warning",
+                         f"REFRESH_ITEM_CHART_EXEC_ERROR: {log_safe_text(str(emsg), 200)}",
                          chat_id=chat_id)
             return {"ok": False, "error": "Could not re-run this chart with the current data."}
         img = plot_out.get("plotly_html") if plot_out.get("is_plotly") else plot_out.get("image")
@@ -1709,7 +1784,11 @@ async def run_item_refresh(chat_id: str, code: str, kind: str, sid: str,
                      chat_id=chat_id, plotly=bool(plot_out.get("is_plotly")))
         return _json_safe(payload)
     except Exception as e:
-        log_with_sid(sid, "error", f"REFRESH_ITEM_ERROR: {type(e).__name__}: {e}",
+        # Re-execution + table normalization run under this guard, so the
+        # message can carry a label the sandbox chose.
+        log_with_sid(sid, "error",
+                     f"REFRESH_ITEM_ERROR: {log_safe_text(type(e).__name__, 80)}: "
+                     f"{log_safe_text(str(e), 200)}",
                      chat_id=chat_id)
         return {"ok": False, "error": "Refresh failed."}
 
@@ -1779,6 +1858,32 @@ def _df_to_xlsx_bytes(df) -> bytes:
 
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
+# What an operator can act on, per Excel-build failure type. The table itself
+# is never described.
+_XLSX_FAILURE_REASONS = {
+    "IllegalCharacterError": "a cell holds a character xlsx cannot store",
+}
+
+
+def _xlsx_failure_reason(exc: BaseException) -> str:
+    """A VALUE-FREE description of an Excel-build failure, for the log.
+
+    The exception's own text is deliberately DROPPED here rather than escaped:
+    openpyxl's `IllegalCharacterError` quotes the offending CELL VALUE in its
+    message, and `/export_excel` takes its rows straight from the request
+    body, so logging that text would let any authenticated caller write a
+    chosen string — newline included — into the operator's log, and the
+    download path would log a value the sandbox produced. No log line in this
+    client carries a row value. An operator needs to know that an export
+    failed on an illegal character, not which character in whose row; the
+    exception TYPE plus this sentence says that much. Never raises
+    (Article IV): an unknown type falls back to the generic sentence."""
+    try:
+        return _XLSX_FAILURE_REASONS.get(type(exc).__name__,
+                                         "the table could not be written")
+    except Exception:
+        return "the table could not be written"
+
 
 @router.post("/{chat_id}/export_plotly_png")
 async def export_plotly_png(request: Request, chat_id: str):
@@ -1799,7 +1904,11 @@ async def export_plotly_png(request: Request, chat_id: str):
         from routes.report import _plotly_html_to_png
         png = _plotly_html_to_png(html, email)
     except Exception as e:
-        log_with_sid(email, "error", f"EXPORT_PLOTLY_PNG_FAILED: {e}", chat_id=chat_id)
+        # `html` is the chart document the sandbox produced and the browser
+        # posted back, so kaleido/plotly failures quote parts of it.
+        log_with_sid(email, "error",
+                     f"EXPORT_PLOTLY_PNG_FAILED: {log_safe_text(str(e), 200)}",
+                     chat_id=chat_id)
         png = None
     if not png:
         return JSONResponse({"error": "Could not render chart image."}, status_code=502)
@@ -1838,7 +1947,12 @@ async def download_excel(request: Request, chat_id: str, key: str):
         else:
             xlsx = _table_to_xlsx_bytes(rec.get("columns"), rec.get("rows"))
     except Exception as e:
-        log_with_sid(email, "error", f"DOWNLOAD_EXCEL_FAILED: {e}", chat_id=chat_id)
+        # Type + a value-free reason only — see `_xlsx_failure_reason`. The
+        # type name is escaped and capped for the same reason every other
+        # untrusted field on a log line is.
+        log_with_sid(email, "error",
+                     f"DOWNLOAD_EXCEL_FAILED type={log_safe_text(type(e).__name__, 80)} "
+                     f"reason={_xlsx_failure_reason(e)}", chat_id=chat_id)
         return JSONResponse({"error": "Could not build Excel file."}, status_code=502)
     return Response(
         content=xlsx,
@@ -1866,7 +1980,11 @@ async def export_excel(request: Request, chat_id: str):
     try:
         xlsx = _table_to_xlsx_bytes(columns, rows)
     except Exception as e:
-        log_with_sid(email, "error", f"EXPORT_EXCEL_FAILED: {e}", chat_id=chat_id)
+        # `rows` came straight off the request body, so the exception text is
+        # a caller-chosen value — dropped, never escaped-and-logged.
+        log_with_sid(email, "error",
+                     f"EXPORT_EXCEL_FAILED type={log_safe_text(type(e).__name__, 80)} "
+                     f"reason={_xlsx_failure_reason(e)}", chat_id=chat_id)
         return JSONResponse({"error": "Could not build Excel file."}, status_code=502)
     return Response(
         content=xlsx,

@@ -7,3 +7,18 @@ logs/
 *.env
 !*.env.example
 .claude/
+# The image is built with `COPY . .` from the repository root, so whatever
+# sits in the working tree ends up inside /app and is handed to a customer.
+# Git-ignoring a file keeps it out of the REPOSITORY, which is not the same
+# thing as keeping it out of the ARTIFACT — this list is what does that.
+# Anything describing the product's own security posture belongs here.
+docs/security/
+# Note on the pattern below: Docker's `*` does not cross `/`, so this excludes
+# a TOP-LEVEL document only. A document inside a directory is covered by that
+# directory's own entry (the line above), not by this one. Read it as a floor,
+# not as a guarantee that no document anywhere can ship.
+*.docx
+# Editor and tool state. Neither is needed at run time and both are whatever
+# the last person to open the repository happened to have.
+.pytest_cache/
+.vscode/

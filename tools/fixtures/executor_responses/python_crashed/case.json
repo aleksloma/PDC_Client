@@ -1,0 +1,14 @@
+{
+  "body_bytes": 641,
+  "captured": "2026-09-17, real two-uid HTTP path (client image as uid 10001 -> standalone executor image, shared jobs volume)",
+  "case": "python_crashed",
+  "code": "import os\nos._exit(1)",
+  "http_status": 200,
+  "kind": "PYTHON",
+  "normalized": "the per-run job id was replaced by the literal <job_id> in response.json's stdout/stderr/traceback, the same placeholder request.json uses -- the body is otherwise verbatim",
+  "note": "the crash path: generated code exits the runner before it answers, so the response carries status=crashed with reason=exit and an exit_code. Captured because the crash detail was otherwise pinned only by test-authored payloads, and a rename of reason/exit_code on the sandbox side would stay green while production lost the detail",
+  "out_files": [],
+  "payload_keys": [],
+  "status": "crashed",
+  "timeout_s": 60
+}

@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+{% if third_party_scripts %}
 <!-- Google tag (gtag.js) -->
 <script async src="https://www.googletagmanager.com/gtag/js?id=G-DPQTG64LRY"></script>
 <script>
@@ -9,6 +10,7 @@
   gtag('js', new Date());
   gtag('config', 'G-DPQTG64LRY');
 </script>
+{% endif %}
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Lab - PowerDataChat</title>
@@ -477,6 +479,7 @@
     window.OPEN_CONV_ID = "{{ open_conv_id | default('') }}";
     window.OPEN_CHAT_ID = "{{ open_chat_id | default('') }}";
   </script>
+  {% if third_party_scripts %}
   <!-- Paddle.js Checkout -->
   <script src="https://cdn.paddle.com/paddle/v2/paddle.js"></script>
   <script>
@@ -508,6 +511,7 @@
     }
   })();
   </script>
+  {% endif %}
   <!-- Subscription Change Modal -->
   <div id="subscriptionModal" class="modal hidden">
     <div class="modal-content sub-modal-content">

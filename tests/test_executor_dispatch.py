@@ -540,12 +540,31 @@ def test_a_killed_status_maps_to_the_memory_error_text(dispatcher, exec_env, mon
 @pytest.mark.parametrize("kind", ["PYTHON", "PLOT"])
 def test_a_crashed_status_maps_to_the_crash_text_with_its_details(dispatcher, exec_env,
                                                                   monkeypatch, kind):
+    """The details of a REAL segfault, as `executor/app.py` reports one.
+
+    A runner killed by SIGSEGV returns `exit_code=-11`, from which the app
+    derives `signal=11`; it wrote no response, so `response_sink` is empty and
+    `signal_no` is truthy, and the crashed branch picks `reason="signal"` (the
+    token `test_executor_infra_short_circuit` documents as "a provoked
+    segfault"). `"segfault"` itself is not a value any assignment in
+    `executor/app.py` or `executor/runner.py` can produce, so the fixture used
+    to describe a response the sandbox cannot send.
+    """
+    # `reason` is inlined into the sentence the planner's retry prompt reads,
+    # so only the closed vocabulary survives; a fixture outside it would make
+    # the assertion below pass on the `unknown` fallback instead of on echoing.
+    assert "signal" in exec_transport.CRASH_REASONS, exec_transport.CRASH_REASONS
     calls = []
     _install(monkeypatch, _body_handler(
         _synthetic_response(None, kind=kind, status="crashed",
-                            exit_code=-11, signal=11, reason="segfault"), calls))
+                            exit_code=-11, signal=11, reason="signal"), calls))
     out = dispatcher.execute(kind, "RESULT = 1", _dfs(), sid="t", timeout_s=60)
-    _assert_error_shape(out, kind, exec_transport.crash_error_text(-11, 11, "segfault"))
+    _assert_error_shape(out, kind, exec_transport.crash_error_text(-11, 11, "signal"))
+    # Pinned literally as well: `crash_error_text` is imported from the
+    # product, so an equality against it alone would stay green if the crash
+    # text stopped carrying the details at all.
+    assert "exit=-11" in out["error"] and "signal=11" in out["error"], out
+    assert "reason=signal" in out["error"], out
 
 
 @pytest.mark.parametrize("kind", ["PYTHON", "PLOT"])
@@ -638,20 +657,36 @@ def test_a_failed_startup_greeting_is_retried_exactly_once_not_per_dispatch(
     assert left == [], left
 
 
-def test_sweep_orphans_removes_only_stale_job_shaped_directories(dispatcher, exec_env):
+def test_sweep_orphans_removes_stale_job_dirs_and_stale_strays(dispatcher, exec_env):
+    """INVERTED on purpose: an aged non-job entry is now REMOVED.
+
+    The previous version of this test asserted that `keep_me` SURVIVED, and
+    that expectation was wrong. The jobs root is group-writable — the sandbox
+    has to be able to clear an abandoned job directory in it — so generated
+    code can create files and directories directly in that root, and while
+    both sweeps skipped every name that was not job-id shaped, nothing ever
+    removed them. The volume is named and disk-backed, so a stash outlived
+    restarts, an image upgrade and any number of intervening jobs, and a later
+    job run for a DIFFERENT user could read it back. The root is supposed to
+    hold nothing but job directories, so an aged entry that is not one is
+    debris or a deliberate stash, and both go.
+
+    The age threshold is unchanged, which is what keeps a job mid-creation
+    (and a fresh stray) out of it.
+    """
     stale = exec_transport.create_job_dir(exec_env, exec_transport.new_job_id())
     fresh = exec_transport.create_job_dir(exec_env, exec_transport.new_job_id())
-    keep = exec_env / "keep_me"
-    keep.mkdir()
+    stray = exec_env / "keep_me"
+    stray.mkdir()
     two_hours_ago = time.time() - 2 * 3600
-    for path in (stale, keep):
+    for path in (stale, stray):
         os.utime(path, (two_hours_ago, two_hours_ago))
 
     dispatcher.sweep_orphans()
 
     assert not stale.exists(), "a job directory older than an hour survived the sweep"
     assert fresh.is_dir(), "a fresh job directory was swept"
-    assert keep.is_dir(), "a directory that is not job-id shaped was swept"
+    assert not stray.exists(), "an aged entry that is not a job directory survived"
 
 
 # ===========================================================================
@@ -788,8 +823,65 @@ def test_every_captured_case_reconstructs_exactly_its_own_key_set(exec_env, monk
 
     assert len(calls) >= 1, "the captured response was never requested"
     keys = sorted(out)
-    expected = sorted(case["payload_keys"]) if case["status"] != "timeout" else ["error"]
+    # A status the sandbox answers with `payload: null` carries no keys of its
+    # own: the dispatcher synthesizes the caller's error shape from the
+    # envelope (reason/exit_code/signal). The captured `python_crashed` body is
+    # what pins that -- `payload_keys` is empty there, and `["error"]` is the
+    # contract the caller sees.
+    if case["status"] in ("timeout", "crashed", "killed"):
+        expected = ["error"]
+    else:
+        expected = sorted(case["payload_keys"])
     assert keys == expected, (keys, expected)
+
+
+@pytest.mark.real_executor_dispatch
+def test_the_captured_crash_pins_the_envelope_field_names(exec_env, monkeypatch):
+    """The crash detail was previously asserted only against test-authored
+    payloads, so renaming `reason`, `exit_code` or `signal` on the sandbox side
+    stayed green here while production lost the detail. This replays the body a
+    real `os._exit(1)` produced, so a rename fails.
+    """
+    case = _case("python_crashed")
+    envelope = json.loads(case["body"].decode("utf-8"))
+    # What the sandbox actually sent -- read from the captured bytes, not retyped.
+    assert envelope["status"] == "crashed"
+    assert envelope["payload"] is None
+    assert (envelope["exit_code"], envelope["signal"], envelope["reason"]) == (1, None, "exit")
+
+    calls = []
+    _install(monkeypatch, _replay_handler(case, calls))
+    out = _run_public(case)
+
+    assert len(calls) >= 1, "the captured response was never requested"
+    _assert_error_shape(out, "PYTHON", exec_transport.crash_error_text(1, None, "exit"))
+
+
+@pytest.mark.real_executor_dispatch
+def test_the_captured_memory_case_keeps_retrying_rather_than_short_circuiting(
+        exec_env, monkeypatch):
+    """An allocation past RLIMIT_AS is an ORDINARY execution error, not an
+    infrastructure failure: the runner survives and reports `MemoryError`. That
+    is what makes D7-9's split correct -- the planner can write cheaper code, so
+    this must NOT be treated as "the service is down". Pinned against the real
+    body because the distinction was argued from the limit's behaviour.
+    """
+    case = _case("python_memory")
+    envelope = json.loads(case["body"].decode("utf-8"))
+    assert envelope["status"] == "error"
+    assert envelope["reason"] is None
+    assert envelope["payload"]["error"].startswith("MemoryError:")
+
+    calls = []
+    _install(monkeypatch, _replay_handler(case, calls))
+    out = _run_public(case)
+
+    assert len(calls) >= 1, "the captured response was never requested"
+    error = out["error"]
+    assert error.startswith("MemoryError:")
+    assert not executor_client.is_infrastructure_error(error), (
+        "a MemoryError must keep its retries -- short-circuiting it would tell "
+        "the user the service is down when the code was simply too greedy")
 
 
 @pytest.mark.real_executor_dispatch
@@ -1358,3 +1450,815 @@ def test_the_env_examples_document_the_sandbox_url(filename):
     assert path.is_file(), f"missing {filename}"
     text = path.read_text(encoding="utf-8")
     assert "EXECUTOR_URL" in text, f"{filename} does not mention EXECUTOR_URL"
+
+
+# ===========================================================================
+# 4. reachability cache, /health, the mismatch warning, the log tails
+#    (the cached /health answer, the once-per-path warnings, the log tails)
+# ===========================================================================
+HEALTH_BASE_KEYS = ("status", "service", "brain_reachable",
+                    "tenant_token_configured", "build_commit")
+HEALTH_NEW_KEYS = ("executor_reachable", "executor_checked_at")
+
+LOG_TAIL_MAX = 2000
+NOT_GROUP_WRITABLE = "EXECUTOR_SHARED_DIR_NOT_GROUP_WRITABLE"
+REMOVE_FAILED = "EXEC_JOB_DIR_REMOVE_FAILED"
+
+
+def _log_recorder(monkeypatch, module) -> list:
+    """Capture `log_with_sid(sid, level, message, **kwargs)` calls.
+
+    The name is imported into each module's own namespace, so patching the
+    module attribute is the seam.
+    """
+    lines = []
+
+    def record(sid, level, message, *args, **kwargs):
+        lines.append({"sid": sid, "level": level, "message": message,
+                      "kwargs": kwargs})
+
+    monkeypatch.setattr(module, "log_with_sid", record)
+    return lines
+
+
+def _messages(lines, needle) -> list:
+    return [row for row in lines if needle in str(row["message"])]
+
+
+def _reset_reach(dispatcher):
+    """Put the reachability cache back to "never checked".
+
+    The implementer must expose `_REACH` (the cached state `/health` reads)
+    and `reachable()`: `/health` may not make a live call — a stopped sandbox
+    costs 8 s in `getaddrinfo` alone, measured inside the running web
+    container, which would stall the event loop and fail the container own
+    5 s healthcheck exactly when the operator needs the answer.
+    """
+    state = getattr(dispatcher, "_REACH", None)
+    assert isinstance(state, dict), (
+        "executor_client must expose the cached reachability state _REACH "
+        "with the keys ok (None initially) and checked_at (0.0 initially)")
+    reach = getattr(dispatcher, "reachable", None)
+    assert callable(reach), (
+        "executor_client must expose reachable() -> (ok, checked_at) — the "
+        "cached tuple /health reports, never a live blocking call")
+    state["ok"] = None
+    state["checked_at"] = 0.0
+    dispatcher._PENDING["handshake"] = False
+    return state
+
+
+def _healthz_with(versions: dict) -> httpx.Response:
+    body = {"ok": True, "version": "captured", "build_time": "",
+            "versions": versions}
+    return httpx.Response(200, content=exec_transport.dumps(body),
+                          headers=JSON_HEADERS)
+
+
+def test_reachability_starts_unknown(dispatcher, exec_env):
+    """Unknown is NOT False: a boot that has not greeted the sandbox yet must
+    not report an outage."""
+    _reset_reach(dispatcher)
+    ok, checked_at = dispatcher.reachable()
+    assert ok is None, ok
+    assert checked_at == 0.0, checked_at
+
+
+def test_a_successful_handshake_marks_the_sandbox_reachable(dispatcher, exec_env,
+                                                            monkeypatch):
+    _reset_reach(dispatcher)
+    calls = []
+    _install(monkeypatch, _body_handler(_synthetic_response({"error": None}), calls))
+
+    greeted = dispatcher.handshake()
+
+    assert greeted is True, greeted
+    ok, checked_at = dispatcher.reachable()
+    assert ok is True, ok
+    assert checked_at > 0.0, checked_at
+
+
+def test_a_failed_handshake_marks_the_sandbox_unreachable(dispatcher, exec_env,
+                                                          monkeypatch):
+    _reset_reach(dispatcher)
+    calls = []
+    _install(monkeypatch, _raising_handler(
+        lambda request: httpx.ConnectError("refused", request=request), calls))
+
+    greeted = dispatcher.handshake()
+
+    assert greeted is False, greeted
+    ok, _ = dispatcher.reachable()
+    assert ok is False, ok
+
+
+def test_a_dispatch_transport_failure_marks_the_sandbox_unreachable(dispatcher,
+                                                                    exec_env,
+                                                                    monkeypatch):
+    """Every dispatch is a free probe — the state must not depend on a 30 s
+    timer when a question already proved the answer."""
+    _reset_reach(dispatcher)
+    dispatcher._REACH["ok"] = True
+    calls = []
+    _install(monkeypatch, _raising_handler(
+        lambda request: httpx.ConnectError("refused", request=request), calls))
+
+    out = dispatcher.execute("PYTHON", "RESULT = 1", _dfs(), sid="t", timeout_s=60)
+
+    assert out == {"error": dispatcher.UNAVAILABLE_TEXT}, out
+    ok, _ = dispatcher.reachable()
+    assert ok is False, ok
+
+
+@pytest.mark.parametrize("status", [200, 400, 503])
+def test_any_http_answer_marks_the_sandbox_reachable(dispatcher, exec_env,
+                                                     monkeypatch, status):
+    """A rejection is still a conversation: the service is up."""
+    _reset_reach(dispatcher)
+    calls = []
+    body = (_synthetic_response({"error": None}) if status == 200
+            else {"error": "no", "code": "BAD_KIND"})
+    _install(monkeypatch, _body_handler(body, calls, status=status))
+
+    dispatcher.execute("PYTHON", "RESULT = 1", _dfs(), sid="t", timeout_s=60)
+
+    ok, _ = dispatcher.reachable()
+    assert ok is True, ok
+
+
+@pytest.mark.executor_probe
+def test_reachable_never_waits_for_its_own_probe(dispatcher, exec_env, monkeypatch):
+    """The refresh runs on a short-lived daemon thread for the NEXT caller.
+
+    A stale cache must not turn `reachable()` into the blocking call the whole
+    design exists to avoid, so the probe here blocks until the assertions are
+    done and the call still has to return immediately.
+    """
+    _reset_reach(dispatcher)
+    dispatcher._REACH["ok"] = True
+    dispatcher._REACH["checked_at"] = 1.0        # stale by decades
+    probe = getattr(dispatcher, "probe", None)
+    assert callable(probe), (
+        "executor_client must expose probe() — the /healthz GET the "
+        "short-lived refresh thread runs")
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_probe(*args, **kwargs):
+        started.set()
+        release.wait(10)
+        return False
+
+    monkeypatch.setattr(dispatcher, "probe", blocking_probe, raising=False)
+    try:
+        began = time.monotonic()
+        ok, checked_at = dispatcher.reachable()
+        elapsed = time.monotonic() - began
+        assert elapsed < 1.0, elapsed
+        assert ok is True, ok            # the CACHED value, not the probe result
+        assert started.wait(2) is True, "the refresh probe never started"
+        assert release.is_set() is False, "reachable() waited for the probe"
+    finally:
+        release.set()
+
+
+@pytest.fixture
+def health_client(dispatcher, tmp_path, monkeypatch):
+    """The real app, TestClient WITHOUT the context manager (the lifespan
+    starts the db_scheduler thread — see tests/test_version_endpoint.py)."""
+    from starlette.testclient import TestClient
+
+    import app as app_mod
+
+    monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "BRAIN_TENANT_TOKEN", "")
+    return TestClient(app_mod.app)
+
+
+def test_health_reports_the_cached_sandbox_state_additively(dispatcher, health_client):
+    """Additive only: the smoke-test skill and the operator docs assert on the
+    older keys."""
+    _reset_reach(dispatcher)
+    dispatcher._REACH["ok"] = True
+    dispatcher._REACH["checked_at"] = time.time()
+
+    response = health_client.get("/health")
+    status = response.status_code
+    assert status == 200, (status, response.text[:300])
+    body = response.json()
+    missing = [key for key in HEALTH_BASE_KEYS + HEALTH_NEW_KEYS if key not in body]
+    assert missing == [], (missing, sorted(body))
+    assert body["executor_reachable"] is True, body
+    checked_at = body["executor_checked_at"]
+    assert isinstance(checked_at, float), (type(checked_at).__name__, checked_at)
+
+
+def test_health_stays_200_when_the_sandbox_is_known_down(dispatcher, health_client):
+    """The web container must NOT go unhealthy because the sandbox is down —
+    an operator needs a reachable page that says so."""
+    _reset_reach(dispatcher)
+    dispatcher._REACH["ok"] = False
+    dispatcher._REACH["checked_at"] = time.time()
+
+    response = health_client.get("/health")
+    status = response.status_code
+    assert status == 200, (status, response.text[:300])
+    body = response.json()
+    assert body["status"] == "ok", body
+    assert body["executor_reachable"] is False, body
+
+
+def test_health_is_honest_before_the_first_check(dispatcher, health_client):
+    _reset_reach(dispatcher)
+
+    body = health_client.get("/health").json()
+    reachable = body.get("executor_reachable")
+    checked_at = body.get("executor_checked_at")
+    assert reachable is None, reachable
+    assert checked_at is None, checked_at
+
+
+def test_a_version_difference_warns_once_and_names_the_module(dispatcher, exec_env,
+                                                              monkeypatch):
+    """The mismatch warning had never been CONSTRUCTED by a test: the
+    shared `/healthz` fixture builds its versions from the app own imports,
+    so the two sides always agreed. A chart that silently renders differently
+    between the two independently upgraded images is the whole point."""
+    module = dispatcher._VERSION_MODULES[0]
+    ours = dispatcher._app_version(module)
+    assert ours, f"the app cannot report its own {module} version"
+    versions = {name: dispatcher._app_version(name)
+                for name in dispatcher._VERSION_MODULES}
+    theirs = "0.0.0+drift"
+    versions[module] = theirs
+
+    def handler(request):
+        assert request.url.path.endswith("/healthz"), str(request.url)
+        return _healthz_with(versions)
+
+    _install(monkeypatch, handler)
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    greeted = dispatcher.handshake()
+
+    assert greeted is True, greeted
+    hits = _messages(lines, "EXECUTOR_VERSION_MISMATCH")
+    assert len(hits) == 1, [row["message"] for row in lines]
+    message = hits[0]["message"]
+    assert f"module={module}" in message, message
+    assert f"app={ours}" in message, message
+    assert f"executor={theirs}" in message, message
+
+
+def test_matching_versions_warn_about_nothing(dispatcher, exec_env, monkeypatch):
+    versions = {name: dispatcher._app_version(name)
+                for name in dispatcher._VERSION_MODULES}
+
+    def handler(request):
+        return _healthz_with(versions)
+
+    _install(monkeypatch, handler)
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    dispatcher.handshake()
+
+    hits = _messages(lines, "EXECUTOR_VERSION_MISMATCH")
+    assert hits == [], [row["message"] for row in hits]
+
+
+def test_an_execution_error_logs_the_traceback_and_stderr_tails(dispatcher, exec_env,
+                                                                monkeypatch):
+    """The generated code traceback used to land in the web container own
+    log when `exec()` ran there. After the rewire it lives only in the
+    sandbox tmpfs log, which is wiped on restart, so the one durable copy is
+    a capped tail on the dispatcher own error line."""
+    error_text = "KeyError: city"
+    traceback_text = "T" * (LOG_TAIL_MAX + 5000)
+    stderr_text = "S" * (LOG_TAIL_MAX + 5000)
+    calls = []
+    _install(monkeypatch, _body_handler(
+        _synthetic_response({"error": error_text}, status="error",
+                            traceback=traceback_text, stderr=stderr_text), calls))
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    out = dispatcher.execute("PYTHON", "RESULT = df[0]", _dfs(), sid="t",
+                             timeout_s=60)
+
+    assert out == {"error": error_text}, out          # the tails never RETURN
+    hits = _messages(lines, "EXEC_ERROR")
+    assert len(hits) == 1, [row["message"] for row in lines]
+    kwargs = hits[0]["kwargs"]
+    logged_traceback = kwargs.get("traceback")
+    logged_stderr = kwargs.get("stderr")
+    assert isinstance(logged_traceback, str), kwargs
+    assert isinstance(logged_stderr, str), kwargs
+    assert len(logged_traceback) <= LOG_TAIL_MAX, len(logged_traceback)
+    assert len(logged_stderr) <= LOG_TAIL_MAX, len(logged_stderr)
+    assert set(logged_traceback) == {"T"}, logged_traceback[:50]
+    assert set(logged_stderr) == {"S"}, logged_stderr[:50]
+
+
+def test_a_timeout_logs_the_traceback_and_stderr_tails(dispatcher, exec_env,
+                                                       monkeypatch):
+    """A killed run partial stderr is often the only clue to WHICH loop hung."""
+    traceback_text = "T" * (LOG_TAIL_MAX + 5000)
+    stderr_text = "S" * (LOG_TAIL_MAX + 5000)
+    calls = []
+    _install(monkeypatch, _body_handler(
+        _synthetic_response(None, status="timeout", reason="hard_timeout",
+                            traceback=traceback_text, stderr=stderr_text), calls))
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    out = dispatcher.execute("PYTHON", "while True: pass", _dfs(), sid="t",
+                             timeout_s=60)
+
+    expected = {"error": exec_transport.timeout_error_text(60)}
+    assert out == expected, out                      # the tails never RETURN
+    hits = _messages(lines, "EXEC_TIMEOUT")
+    assert len(hits) == 1, [row["message"] for row in lines]
+    kwargs = hits[0]["kwargs"]
+    logged_traceback = kwargs.get("traceback")
+    logged_stderr = kwargs.get("stderr")
+    assert isinstance(logged_traceback, str), kwargs
+    assert isinstance(logged_stderr, str), kwargs
+    assert len(logged_traceback) <= LOG_TAIL_MAX, len(logged_traceback)
+    assert len(logged_stderr) <= LOG_TAIL_MAX, len(logged_stderr)
+    assert kwargs.get("reason") == "hard_timeout", kwargs
+
+
+def test_a_removal_failure_warns_once_per_path_not_once_per_dispatch(dispatcher,
+                                                                     exec_env,
+                                                                     monkeypatch):
+    """Generated code can chmod 0500 a directory it created under
+    `out/`, and only the SANDBOX uid can then clear it (within the hour, by
+    its own sweep). The web side cannot fix it, so warning on every pass turns
+    one unfixable directory into an unbounded log stream."""
+    fixed_job_id = "a" * 32
+    assert exec_transport.valid_job_id(fixed_job_id), fixed_job_id
+    monkeypatch.setattr(exec_transport, "new_job_id", lambda: fixed_job_id)
+
+    def refuse(path, *args, **kwargs):
+        raise PermissionError(f"cannot remove {path}")
+
+    monkeypatch.setattr(dispatcher.shutil, "rmtree", refuse)
+    calls = []
+    _install(monkeypatch, _body_handler(_synthetic_response({"error": None}), calls))
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    for _ in range(2):
+        dispatcher.execute("PYTHON", "RESULT = 1", _dfs(), sid="t", timeout_s=60)
+
+    assert len(calls) == 2, calls
+    hits = _messages(lines, REMOVE_FAILED)
+    assert len(hits) == 1, [row["message"] for row in hits]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits only")
+def test_an_existing_shared_dir_without_group_write_is_reported_not_repaired(
+        dispatcher, exec_env, tmp_path, monkeypatch):
+    """The production shape is a volume root owned by ANOTHER uid with
+    the mode already set, and a process cannot chmod what it does not own:
+    attempting it would warn on every boot of a healthy stack. Missing group
+    write, on the other hand, means the sandbox uid cannot create `out/` and
+    every job comes back crashed — worth exactly one line."""
+    shared = tmp_path / "locked_jobs"
+    shared.mkdir(mode=0o2700)
+    os.chmod(shared, 0o2700)
+    monkeypatch.setattr(settings, "EXECUTOR_SHARED_DIR", str(shared))
+    chmods = []
+    monkeypatch.setattr(dispatcher.os, "chmod",
+                        lambda path, mode, *a, **k: chmods.append((str(path), mode)))
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    resolved = dispatcher.ensure_shared_dir()
+
+    assert Path(resolved) == shared, resolved
+    hits = _messages(lines, NOT_GROUP_WRITABLE)
+    assert len(hits) == 1, [row["message"] for row in lines]
+    assert chmods == [], chmods
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits only")
+def test_a_shared_dir_the_call_creates_is_never_reported(dispatcher, exec_env,
+                                                         tmp_path, monkeypatch):
+    fresh = tmp_path / "fresh_jobs"
+    monkeypatch.setattr(settings, "EXECUTOR_SHARED_DIR", str(fresh))
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    resolved = dispatcher.ensure_shared_dir()
+
+    assert Path(resolved) == fresh, resolved
+    assert fresh.is_dir(), fresh
+    hits = _messages(lines, NOT_GROUP_WRITABLE)
+    assert hits == [], [row["message"] for row in hits]
+
+
+# ---------------------------------------------------------------------------
+# the outcome LINES themselves are a destination for untrusted input
+#
+# Every field below is written by the sandbox and ends up in
+# `<DATA_ROOT>/logs/datachat.log` — a newline-delimited file operators grep
+# and, during an incident, trust. So a log line gets the same treatment as a
+# prompt: bounded length, a closed vocabulary where one exists, and CR/LF
+# escaped so nothing can forge a second line.
+# ---------------------------------------------------------------------------
+# What a forged line would look like if a newline survived: the sandbox picks
+# the timestamp, the level, the sid and the event name.
+FORGED_LINE = "2026-09-17 00:00:00,000 | INFO | [sid=security] EXEC_OK forged=1"
+FORGED_MARKER = "forged=1"
+
+HOSTILE_TIMEOUT_REASONS = [
+    f"hard_timeout\n{FORGED_LINE}",        # a real token, then a whole new line
+    "the job was slow, nothing to see",    # a plausible-looking sentence
+    FORGED_LINE,
+]
+
+HOSTILE_METRICS = ["M" * 40000, {"elapsed_ms": 11}, 10 ** 4000 - 1]
+HOSTILE_METRIC_IDS = ["long_string", "dict", "huge_number"]
+
+
+def _kwarg_strings(kwargs: dict) -> str:
+    """Every kwarg value as one string — what the formatter will write."""
+    return " ".join(f"{key}={value!r}" for key, value in kwargs.items())
+
+
+@pytest.mark.parametrize("reason", HOSTILE_TIMEOUT_REASONS,
+                         ids=range(len(HOSTILE_TIMEOUT_REASONS)))
+def test_a_hostile_timeout_reason_is_logged_as_unknown(dispatcher, exec_env,
+                                                       monkeypatch, reason):
+    """`reason` tells a real overrun apart from an expired queue slot, so it
+    IS logged — which means it has to pass the same closed vocabulary the
+    crash sentence uses. The happy-path value alone proves nothing: it is the
+    values outside the vocabulary that had to stop being repeated."""
+    calls = []
+    _install(monkeypatch, _body_handler(
+        _synthetic_response(None, status="timeout", reason=reason), calls))
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    dispatcher.execute("PYTHON", "while True: pass", _dfs(), sid="t", timeout_s=60)
+
+    hits = _messages(lines, "EXEC_TIMEOUT")
+    assert len(hits) == 1, [row["message"] for row in lines]
+    kwargs = hits[0]["kwargs"]
+    logged_reason = kwargs.get("reason")
+    assert logged_reason == "unknown", logged_reason
+    rendered = hits[0]["message"] + " " + _kwarg_strings(kwargs)
+    assert FORGED_MARKER not in rendered, rendered[:400]
+    assert "nothing to see" not in rendered, rendered[:400]
+
+
+def test_a_legitimate_timeout_reason_still_survives(dispatcher, exec_env, monkeypatch):
+    """The vocabulary must not cost the operator the one distinction the field
+    exists for: a slot that expired never ran the code."""
+    calls = []
+    _install(monkeypatch, _body_handler(
+        _synthetic_response(None, status="timeout", reason="queued"), calls))
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    dispatcher.execute("PYTHON", "while True: pass", _dfs(), sid="t", timeout_s=60)
+
+    hits = _messages(lines, "EXEC_TIMEOUT")
+    assert len(hits) == 1, [row["message"] for row in lines]
+    logged_reason = hits[0]["kwargs"].get("reason")
+    assert logged_reason == "queued", logged_reason
+
+
+@pytest.mark.parametrize("value", HOSTILE_METRICS, ids=HOSTILE_METRIC_IDS)
+@pytest.mark.parametrize("field", ["elapsed_ms", "peak_rss_mb"])
+def test_a_hostile_measurement_lands_as_none_on_the_success_line(dispatcher, exec_env,
+                                                                 monkeypatch, field,
+                                                                 value):
+    """`elapsed_ms` / `peak_rss_mb` ride EVERY successful answer, so an
+    unbounded value here is 40 000 characters of the sandbox's choosing on
+    every line of a healthy day's log."""
+    overrides = {field: value}
+    calls = []
+    _install(monkeypatch, _body_handler(
+        _synthetic_response({"error": None}, **overrides), calls))
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    dispatcher.execute("PYTHON", "RESULT = 1", _dfs(), sid="t", timeout_s=60)
+
+    hits = _messages(lines, "EXEC_OK")
+    assert len(hits) == 1, [row["message"] for row in lines]
+    kwargs = hits[0]["kwargs"]
+    assert kwargs.get(field) is None, type(kwargs.get(field)).__name__
+    rendered = _kwarg_strings(kwargs)
+    assert "MMMM" not in rendered, rendered[:400]
+    assert len(rendered) < 1000, len(rendered)
+
+
+def test_legitimate_measurements_survive_as_numbers(dispatcher, exec_env, monkeypatch):
+    """A memory reading is fractional on purpose, so the bound keeps floats."""
+    calls = []
+    _install(monkeypatch, _body_handler(
+        _synthetic_response({"error": None}, elapsed_ms=11, peak_rss_mb=99.5), calls))
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    dispatcher.execute("PYTHON", "RESULT = 1", _dfs(), sid="t", timeout_s=60)
+
+    kwargs = _messages(lines, "EXEC_OK")[0]["kwargs"]
+    elapsed = kwargs.get("elapsed_ms")
+    peak = kwargs.get("peak_rss_mb")
+    assert elapsed == 11, (type(elapsed).__name__, elapsed)
+    assert peak == 99.5, (type(peak).__name__, peak)
+
+
+def test_the_error_text_is_escaped_in_the_log_and_verbatim_to_the_caller(dispatcher,
+                                                                        exec_env,
+                                                                        monkeypatch):
+    """BOTH halves, because the whole value of the fix is that only ONE of the
+    two copies is escaped.
+
+    The error text must reach the caller byte-for-byte: the planner has to see
+    the real exception to rewrite the code, and the user may see it. The LOG
+    copy must not, because the sandbox writes that string and the log file is
+    newline-delimited — an embedded newline forges a complete, plausible
+    second line into the file an operator greps during an incident.
+    """
+    forged_error = f"ValueError: x\n{FORGED_LINE}"
+    calls = []
+    _install(monkeypatch, _body_handler(
+        _synthetic_response({"error": forged_error}, status="error"), calls))
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    out = dispatcher.execute("PYTHON", "raise ValueError", _dfs(), sid="t",
+                             timeout_s=60)
+
+    # (1) the CALLER's copy is untouched.
+    returned = out.get("error")
+    assert returned == forged_error, returned
+    assert "\n" in returned, repr(returned)
+
+    # (2) the LOG copy is one line.
+    hits = _messages(lines, "EXEC_ERROR")
+    assert len(hits) == 1, [row["message"] for row in lines]
+    message = hits[0]["message"]
+    assert "\n" not in message, repr(message[:400])
+    assert "\r" not in message, repr(message[:400])
+    assert "\\n" in message, message[:400]
+    # (3) and no second record was fabricated: the forged text claims to be an
+    # EXEC_OK line, and there must be no such line in this dispatch.
+    forged_records = [row for row in lines
+                      if str(row["message"]).startswith("EXEC_OK")]
+    assert forged_records == [], [row["message"] for row in forged_records]
+
+
+@pytest.mark.parametrize("field", ["traceback", "stderr"])
+def test_the_log_tails_are_escaped_too(dispatcher, exec_env, monkeypatch, field):
+    """Same reasoning, same helper — pinned per field so a future tail added
+    without the escape fails here."""
+    overrides = {field: f"line one\n{FORGED_LINE}"}
+    calls = []
+    _install(monkeypatch, _body_handler(
+        _synthetic_response({"error": "ValueError: x"}, status="error",
+                            **overrides), calls))
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    dispatcher.execute("PYTHON", "raise ValueError", _dfs(), sid="t", timeout_s=60)
+
+    kwargs = _messages(lines, "EXEC_ERROR")[0]["kwargs"]
+    logged = kwargs.get(field)
+    assert isinstance(logged, str), kwargs
+    assert "\n" not in logged, repr(logged[:400])
+    assert "\r" not in logged, repr(logged[:400])
+    assert "\\n" in logged, logged[:400]
+
+
+# ---------------------------------------------------------------------------
+# the stray pass of the jobs root
+#
+# The root is group-writable so the sandbox can clear an abandoned job
+# directory in it; the same permission lets generated code create entries
+# directly in the root, which nothing removed while both sweeps only ever
+# looked at 32-hex names. These pin the widened behaviour, the bounds that
+# keep it from becoming a general-purpose delete, and the ONE thing the two
+# sides do in OPPOSITE directions.
+# ---------------------------------------------------------------------------
+STRAY_REMOVED = "EXEC_STRAY_ENTRY_REMOVED"
+STRAY_REFUSED = "EXEC_STRAY_SWEEP_REFUSED"
+TWO_HOURS_S = 2 * 3600
+
+
+def _age(path, seconds: float = TWO_HOURS_S) -> None:
+    """Back-date an entry past the sweep's age threshold.
+
+    `follow_symlinks=False` matters for the symlink case (the LINK has to be
+    aged, not its target) and is unavailable on Windows, where that case is
+    skipped anyway — hence the fallback rather than a hard requirement.
+    """
+    stamp = time.time() - seconds
+    try:
+        os.utime(path, (stamp, stamp), follow_symlinks=False)
+    except (NotImplementedError, OSError):
+        os.utime(path, (stamp, stamp))
+
+
+@pytest.fixture(autouse=True)
+def _reset_stray_latch(dispatcher):
+    """The refusal line is latched once per process; these tests assert on it
+    more than once."""
+    saved = dict(getattr(dispatcher, "_STRAY_REFUSED", {}) or {})
+    if hasattr(dispatcher, "_STRAY_REFUSED"):
+        dispatcher._STRAY_REFUSED["logged"] = False
+    yield
+    if hasattr(dispatcher, "_STRAY_REFUSED") and saved:
+        dispatcher._STRAY_REFUSED.update(saved)
+
+
+def test_an_aged_stray_file_is_removed(dispatcher, exec_env, monkeypatch):
+    """The commonest shape: generated code writing `open("/jobs/x", "w")`."""
+    stray = exec_env / "stash.txt"
+    stray.write_text("exfiltrated", encoding="utf-8")
+    _age(stray)
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    dispatcher.sweep_orphans()
+
+    assert not stray.exists(), "an aged stray file survived"
+    hits = _messages(lines, STRAY_REMOVED)
+    assert len(hits) == 1, [row["message"] for row in lines]
+    assert "kind=file" in hits[0]["message"], hits[0]["message"]
+
+
+def test_an_aged_stray_directory_is_removed_with_its_contents(dispatcher, exec_env,
+                                                              monkeypatch):
+    stray = exec_env / "stash_dir"
+    stray.mkdir()
+    (stray / "inner.txt").write_text("x", encoding="utf-8")
+    _age(stray)
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    dispatcher.sweep_orphans()
+
+    assert not stray.exists(), "an aged stray directory survived"
+    hits = _messages(lines, STRAY_REMOVED)
+    assert len(hits) == 1, [row["message"] for row in lines]
+    assert "kind=dir" in hits[0]["message"], hits[0]["message"]
+
+
+def test_a_job_id_shaped_stray_file_is_removed(dispatcher, exec_env):
+    """The case the widening would otherwise have missed.
+
+    `create_job_dir` only ever makes DIRECTORIES, so a 32-hex name that is a
+    file was never a job — it is a stash wearing a job id, and the old
+    name-shape test would have waved it through.
+    """
+    disguised = exec_env / ("a" * 32)
+    assert exec_transport.valid_job_id(disguised.name), disguised.name
+    disguised.write_text("hiding", encoding="utf-8")
+    _age(disguised)
+
+    dispatcher.sweep_orphans()
+
+    assert not disguised.exists(), "a stash wearing a job-id name survived"
+
+
+def test_a_fresh_stray_is_kept(dispatcher, exec_env):
+    """The age threshold still bounds everything: a job being prepared right
+    now must not have its neighbours deleted underneath it."""
+    stray = exec_env / "just_written.txt"
+    stray.write_text("x", encoding="utf-8")
+
+    dispatcher.sweep_orphans()
+
+    assert stray.is_file(), "a fresh stray was swept"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_an_aged_stray_symlink_is_unlinked_and_never_followed(dispatcher, exec_env,
+                                                              tmp_path):
+    """Generated code chooses where a symlink points, and this sweep runs in
+    the container where `DATA_ROOT` IS mounted — so the link is UNLINKED and
+    its target is left untouched. Following it would turn a cleanup into an
+    arbitrary delete."""
+    target = tmp_path / "precious"
+    target.mkdir()
+    (target / "keep.txt").write_text("customer data", encoding="utf-8")
+    link = exec_env / "shortcut"
+    link.symlink_to(target, target_is_directory=True)
+    _age(link)
+
+    dispatcher.sweep_orphans()
+
+    assert not link.exists(), "an aged stray symlink survived"
+    assert not link.is_symlink(), "the link itself was left behind"
+    assert target.is_dir(), "the sweep followed the link and removed its target"
+    assert (target / "keep.txt").is_file(), "the link's target lost content"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership")
+def test_the_web_sweep_leaves_what_it_owns(dispatcher, exec_env, monkeypatch):
+    """OPPOSITE to the sandbox's rule, and deliberately so.
+
+    This side removes only what it does NOT own. Everything under `DATA_ROOT`
+    was written by this uid, so a jobs directory misconfigured to point at
+    customer state cannot be swept by this pass, while a stash written by
+    generated code — which carries the SANDBOX uid — can. The sandbox's copy
+    inverts it (only what it DOES own): there, its own uid is exactly the set
+    generated code could have created, and removing what it does not own
+    would let it clear entries the web side put on the volume.
+    """
+    mine = exec_env / "written_by_me.txt"
+    mine.write_text("x", encoding="utf-8")
+    _age(mine)
+    own_uid = dispatcher._own_euid()
+    assert own_uid is not None, "POSIX should report an euid"
+
+    dispatcher.sweep_orphans()
+
+    assert mine.is_file(), "the web sweep removed an entry it owns"
+
+    # And with the ownership check reporting a DIFFERENT identity, the same
+    # entry goes — the rule is the owner, not the name.
+    monkeypatch.setattr(dispatcher, "_own_euid", lambda: own_uid + 1)
+    dispatcher.sweep_orphans()
+    assert not mine.exists(), "an entry owned by another identity survived"
+
+
+@pytest.mark.parametrize("relation", ["equal", "parent"])
+def test_the_stray_pass_stands_down_when_the_jobs_dir_encloses_the_data_root(
+        dispatcher, exec_env, tmp_path, monkeypatch, relation):
+    """The bound that holds on every platform.
+
+    Until the widening, this sweep only ever touched 32-hex names, and that
+    was its whole protection against `EXECUTOR_SHARED_DIR` — an
+    operator-supplied path — pointing at something real. A stray is defined
+    by its name saying nothing, so the one shape in which the mistake would
+    be unrecoverable is refused outright: a jobs directory that IS the data
+    root, or contains it, is a misconfigured install and not a jobs volume.
+    Job directories are still swept; only the stray pass stands down.
+    """
+    data_root = tmp_path / "data_root"
+    (data_root / "users").mkdir(parents=True)
+    jobs = data_root if relation == "equal" else tmp_path
+    monkeypatch.setattr(settings, "DATA_ROOT", str(data_root))
+    monkeypatch.setattr(settings, "EXECUTOR_SHARED_DIR", str(jobs))
+    precious = jobs / "users"
+    if relation == "parent":
+        precious = data_root
+    _age(precious)
+    stale_job = exec_transport.create_job_dir(jobs, exec_transport.new_job_id())
+    _age(stale_job)
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    dispatcher.sweep_orphans()
+
+    assert precious.exists(), "the stray pass ran against the data root"
+    assert not stale_job.exists(), "job directories must still be swept"
+    hits = _messages(lines, STRAY_REFUSED)
+    assert len(hits) == 1, [row["message"] for row in lines]
+    assert "encloses_data_root" in hits[0]["message"], hits[0]["message"]
+
+
+def test_an_unresolvable_jobs_dir_fails_closed(dispatcher, exec_env, monkeypatch):
+    """A path that will not resolve is never a directory to widen a delete
+    on, so the stray pass stands down with the same one line."""
+    stray = exec_env / "stash.txt"
+    stray.write_text("x", encoding="utf-8")
+    _age(stray)
+
+    def refuse(self, *args, **kwargs):
+        raise OSError("cannot resolve")
+
+    monkeypatch.setattr(Path, "resolve", refuse)
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    dispatcher.sweep_orphans()
+
+    assert stray.is_file(), "the stray pass ran with an unresolvable jobs dir"
+    hits = _messages(lines, STRAY_REFUSED)
+    assert len(hits) == 1, [row["message"] for row in lines]
+    assert "unresolved" in hits[0]["message"], hits[0]["message"]
+
+
+def test_a_stray_name_carrying_a_newline_is_logged_on_one_line(dispatcher, exec_env,
+                                                               monkeypatch):
+    """The name of anything that is not a job directory was chosen by
+    generated code, so it is untrusted text on a newline-delimited line —
+    escaped and capped like every other field the sandbox writes."""
+    if os.name == "nt":
+        pytest.skip("Windows filenames cannot contain a newline")
+    forged = "stash\n2026-09-17 00:00:00,000 | INFO | [sid=x] EXEC_OK job_id=forged"
+    # Padding chosen to exceed the 200-char log cap while staying under the
+    # filesystem's 255-BYTE name limit, which a longer name hits first.
+    stray = exec_env / (forged + "A" * 150)
+    stray.write_text("x", encoding="utf-8")
+    _age(stray)
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    dispatcher.sweep_orphans()
+
+    hits = _messages(lines, STRAY_REMOVED)
+    assert len(hits) == 1, [row["message"] for row in lines]
+    rendered = hits[0]["message"] + " " + " ".join(
+        f"{key}={value}" for key, value in hits[0]["kwargs"].items())
+    assert "\n" not in rendered, repr(rendered[:300])
+    assert "\r" not in rendered, repr(rendered[:300])
+    assert "\\n" in rendered, rendered[:300]
+    name_field = hits[0]["kwargs"].get("name")
+    assert isinstance(name_field, str), hits[0]["kwargs"]
+    assert len(name_field) <= 200, len(name_field)
+    impostors = [row for row in lines if str(row["message"]).startswith("EXEC_OK")]
+    assert impostors == [], [row["message"] for row in impostors]

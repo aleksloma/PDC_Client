@@ -2,8 +2,12 @@
 #
 # This file is for PowerDataChat's LOCAL testing only. Customers use the
 # plain docker-compose.yml (image-only, client.env) — that file is untouched
-# by local development. Here the image is BUILT from this repo, mirroring a
-# production client upgrade: new image, same data.
+# by local development. Here the images are BUILT from this repo, mirroring a
+# production client upgrade: new images, same data.
+#
+# Two services, the same split as a customer install: `client` is the web
+# application (data, users, /lab), `executor` is the analysis sandbox where
+# generated Python runs. Both are built from this repo.
 #
 # STANDING RULE (see docs/BUILD_AND_RUN.md §3): local testing always runs
 # through this Docker stack against the PERSISTENT `pdc_client_*` volumes,
@@ -50,12 +54,37 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "8091:8000"
+    # `default` carries the browser and the calls out to the brain; `backend`
+    # is the only way to reach the sandbox.
+    networks: [default, backend]
+    # Start order matters: the sandbox image creates the shared jobs directory
+    # with the ownership both containers need, so it must come up first.
+    depends_on:
+      executor:
+        condition: service_healthy
     environment:
       # The local stack is plain HTTP on a host port, so the Secure session
       # cookie has to be off or the browser drops it.
       - SESSION_HTTPS_ONLY=false
+      # Topology, set HERE rather than in client.local.env on purpose: compose
+      # `environment` overrides `env_file`, so the wiring of the two containers
+      # cannot be broken by an edit to an env file. Timeouts stay tunable there.
+      - EXECUTOR_URL=http://pdc-executor:8090
+      - EXECUTOR_SHARED_DIR=/jobs
+      # One analysis job at a time. This must stay 1 on BOTH services —
+      # raising it forfeits the isolation the sandbox exists for
+      # (docs/EXECUTOR_PROTOCOL.md §7).
+      - EXECUTOR_MAX_CONCURRENT=1
+      # The app refuses any request that arrives from the sandbox network. It
+      # reads the SAME variable as the subnet below, so the two can never
+      # disagree.
+      - EXECUTOR_NETWORK_CIDR=${PDC_BACKEND_SUBNET:-192.168.255.240/28}
     volumes:
       - pdc_client_data:/data/client
+      # The ONLY thing the two containers share: one directory per in-flight
+      # job (the input tables and the result). Nothing under /data/client is
+      # ever mounted into the sandbox.
+      - exec_jobs:/jobs
       # The log now lives at /data/client/logs on the data volume, so the old
       # pdc_client_logs mount is gone. That host volume is LEFT IN PLACE (it
       # still holds previous logs) and must never be deleted — it is simply
@@ -81,6 +110,66 @@ services:
     # cpus: "2.0"   # uncomment to cap CPU
     restart: unless-stopped
 
+  # The analysis sandbox. Generated Python runs here and nowhere else, so this
+  # container is deliberately poor: no published port, no env_file (it must
+  # never see the brain token, session key, encryption key or admin password —
+  # it refuses to start if it finds any of them), no data volume, and only the
+  # `backend` network, which has no route out.
+  executor:
+    build:
+      context: .
+      dockerfile: executor/Dockerfile
+      args:
+        BUILD_COMMIT: "${BUILD_COMMIT:-}"
+        BUILD_TIME: "${BUILD_TIME:-}"
+    image: powerdatachat-executor:enterprise
+    container_name: pdc-executor
+    networks: [backend]
+    read_only: true
+    # Scratch space for generated code. RAM-backed, so it is charged against
+    # mem_limit below, and wiped on every restart. It is NOT the only place
+    # generated code can write: the jobs volume below is shared, and both are
+    # visible to every job rather than private to one.
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # mem_limit is the container wall around EXECUTOR_MEM_LIMIT_MB, which the
+    # sandbox applies to the job process itself; a job that asks for more fails
+    # as an ordinary analysis error instead of pressuring the host.
+    mem_limit: 3g
+    pids_limit: 256
+    # cpus: "2.0"   # uncomment to cap CPU
+    restart: unless-stopped
+    environment:
+      EXECUTOR_SHARED_DIR: /jobs
+      EXECUTOR_MEM_LIMIT_MB: "2048"
+      # Keep at 1, together with the client's setting above.
+      EXECUTOR_MAX_CONCURRENT: "1"
+    volumes:
+      - exec_jobs:/jobs
+    # No healthcheck here: the image carries its own probe, so "healthy" means
+    # the same thing however the stack is started.
+
+networks:
+  # The normal network: browser access on the published port, and the client's
+  # calls out to the local brain.
+  default: {}
+  # The sandbox network. `internal: true` means Docker gives it no gateway, so
+  # code running in the sandbox has NO route to the LAN, to any database or to
+  # the internet — this is the containment, not a convenience. Publishing the
+  # sandbox's port or attaching it to another network breaks it.
+  #
+  # The subnet is pinned rather than left to Docker because the web application
+  # refuses requests that arrive from it (one variable feeds both, see
+  # EXECUTOR_NETWORK_CIDR above). Override PDC_BACKEND_SUBNET if this range
+  # collides with something on the host network.
+  backend:
+    internal: true
+    ipam:
+      config:
+        - subnet: "${PDC_BACKEND_SUBNET:-192.168.255.240/28}"
+
 volumes:
   # EXTERNAL — pre-existing volume holding all user data + history. Compose
   # must never create or delete it. (The former pdc_client_logs volume is no
@@ -88,3 +177,22 @@ volumes:
   # The host volume is left in place and never deleted.)
   pdc_client_data:
     external: true
+  # In-flight jobs: one directory per question, removed as soon as its answer
+  # has been read, so nothing the PRODUCT writes here outlives a question and
+  # compose may recreate the volume freely.
+  #
+  # What that does not say: the directory is group-writable because the
+  # sandbox has to delete its own job directories, so generated code can also
+  # write straight into the root. The two sweeps now remove such strays on the
+  # same schedule as abandoned job directories, but between a job and the next
+  # sweep this volume can hold a file a question left behind, and it is
+  # disk-backed rather than RAM-backed. Treat it as scratch space shared
+  # between consecutive questions, not as private per-question storage.
+  #
+  # The real volume name is PINNED rather than left to the project prefix, so
+  # this stack and a customer stack both use `pdc_client_exec_jobs` — the one
+  # name the ownership-repair command in the install guide targets. Relying on
+  # the prefix made the name depend on the directory the stack was started
+  # from.
+  exec_jobs:
+    name: pdc_client_exec_jobs

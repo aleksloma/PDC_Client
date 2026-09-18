@@ -38,6 +38,13 @@ it.
 | `plot_matplotlib` | a base64 PNG travels inline |
 | `plot_multi_axes_error` | the matplotlib refusal has NO `is_plotly` key — the ABSENCE is the contract, since callers tell the two producers apart by which keys exist |
 | `plot_multi_charts` | `split_multi_axes` yields `multi_charts` with one entry per axis |
+| `python_crashed` | `status: crashed` with `payload: null` and the crash detail in the ENVELOPE (`exit_code`, `signal`, `reason`) — the caller sees `error` alone, so a rename of any of those three field names must fail here rather than quietly drop the detail in production |
+| `python_memory` | an allocation past `RLIMIT_AS` is an ORDINARY error (`status: error`, `reason: null`, a plain `MemoryError`), NOT a kill — which is why the retry short-circuit lets it keep retrying instead of reporting the service down |
+
+Two cases carry a disclosed substitution: `python_crashed`'s stdout/stderr
+carry the runner's own log lines, whose per-run job id is replaced by the
+literal `<job_id>` — the same placeholder `request.json` uses. `case.json`
+records the substitution in a `normalized` field; everything else is verbatim.
 
 ## Re-capturing
 
@@ -65,8 +72,11 @@ docker run --rm --network pdc_client_default --user 10001:10001 \
   powerdatachat-client:enterprise python /capture.py
 
 # 4. copy the captures out, then remove the container and the volume
+# (`cp -a` overwrites each captured case in place; do NOT `rm -rf` the
+#  directory first -- this README lives in it, and any case you did not
+#  re-capture in this run would be lost with it)
 docker run --rm -v sandbox_capture_jobs:/jobs -v "$PWD/tools/fixtures:/dest" alpine \
-  sh -c "rm -rf /dest/executor_responses/* && cp -a /jobs/_captures/. /dest/executor_responses/"
+  sh -c "cp -a /jobs/_captures/. /dest/executor_responses/"
 docker rm -f pdc-sandbox-capture
 ```
 

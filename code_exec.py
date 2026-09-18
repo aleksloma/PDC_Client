@@ -109,9 +109,13 @@ CODE_EXEC_TIMEOUT_SECONDS = 60
 # Module-level executor for code execution (reused across calls).
 # max_workers MUST stay 1: `_figure_to_base64_if_any` reads and closes the
 # process-global pyplot current figure (plt.gcf()), so parallel exec threads
-# would capture/close each other's figures. The queue-wait this serialization
-# causes under Auto Analytics load is handled upstream by the chat busy guard
-# (routes/chat._auto_analysis_busy_response), not by widening this pool.
+# would capture/close each other's figures. This pool now serves ONLY
+# `_execute_in_process` — the body the sandbox runner imports — so it is no
+# longer where concurrent questions queue: that is the dispatch gate in
+# `executor_client` (a bounded semaphore sized from EXECUTOR_MAX_CONCURRENT),
+# and the wait it imposes sits outside each job's own timeout budget. Widening
+# either is not the fix for a queue; raising the gate forfeits the isolation
+# the sandbox exists for.
 _EXEC_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="code_exec")
 
 

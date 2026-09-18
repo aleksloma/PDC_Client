@@ -1,0 +1,15 @@
+{
+  "body_bytes": 275,
+  "captured": "2026-09-17, real two-uid HTTP path (client image as uid 10001 -> standalone executor image, shared jobs volume)",
+  "case": "python_memory",
+  "code": "import numpy as np\nRESULT = np.ones((1 << 30,), dtype='float64')",
+  "http_status": 200,
+  "kind": "PYTHON",
+  "note": "an allocation past RLIMIT_AS: captures what the limit ACTUALLY produces (an ordinary MemoryError inside the runner, not a kill), which is what makes the retry-vs-short-circuit split in is_infrastructure_error correct",
+  "out_files": [],
+  "payload_keys": [
+    "error"
+  ],
+  "status": "error",
+  "timeout_s": 60
+}

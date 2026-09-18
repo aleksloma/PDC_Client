@@ -173,6 +173,20 @@ class Settings(BaseModel):
     # ran must not be told its code was too slow, or the planner's retry would
     # try to optimise a queue.
     EXECUTOR_QUEUE_MAX_S: float = Field(default_factory=lambda: _float_env("EXECUTOR_QUEUE_MAX_S", 600.0, 1.0))
+    # The sandbox's OWN network, pinned in compose by PDC_BACKEND_SUBNET (the
+    # same variable feeds the network's ipam block, so the two can never
+    # disagree). A Docker network is bidirectional and the sandbox runs
+    # untrusted code, so any request whose peer address falls inside this range
+    # is refused — the sandbox never needs to call this app. EMPTY (the
+    # default) means no refusal: a single-container dev run has no such network.
+    EXECUTOR_NETWORK_CIDR: str = Field(default_factory=lambda: os.getenv("EXECUTOR_NETWORK_CIDR", ""))
+
+    # Third-party browser scripts on the /lab page (Google Analytics, the
+    # Paddle billing widget). OFF by default: the enterprise build loads no
+    # third-party script, so an analyst's browser never calls out of the LAN
+    # and there is no billing backend here anyway. Set it only if you
+    # deliberately want browser analytics and the billing widget.
+    ENABLE_THIRD_PARTY_SCRIPTS: bool = Field(default_factory=lambda: os.getenv("ENABLE_THIRD_PARTY_SCRIPTS", "").strip().lower() in ("1", "true", "yes", "on"))
 
     # Fixed local admin account (the only role=admin user in Phase 1).
     # LOCAL_ADMIN_PASSWORD bootstraps the account ONCE (hash-only on disk,

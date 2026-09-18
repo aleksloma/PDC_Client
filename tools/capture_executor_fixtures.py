@@ -76,6 +76,18 @@ CASES = [
      "fig, ax = plt.subplots(1, 2)\n"
      "ax[0].bar(['a','b'], [1,2])\nax[1].bar(['a','b'], [2,1])",
      "the same figure with split_multi_axes=True -> multi_charts of 2"),
+    ("python_crashed", "PYTHON", 60,
+     "import os\nos._exit(1)",
+     "the crash path: generated code exits the runner before it answers, so "
+     "the response carries status=crashed with reason=exit and an exit_code. "
+     "Captured because the crash detail was otherwise pinned only by "
+     "test-authored payloads, and a rename of reason/exit_code on the sandbox "
+     "side would stay green while production lost the detail"),
+    ("python_memory", "PYTHON", 60,
+     "import numpy as np\nRESULT = np.ones((1 << 30,), dtype='float64')",
+     "an allocation past RLIMIT_AS: captures what the limit ACTUALLY produces "
+     "(an ordinary MemoryError inside the runner, not a kill), which is what "
+     "makes the retry-vs-short-circuit split in is_infrastructure_error correct"),
 ]
 
 

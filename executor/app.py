@@ -236,11 +236,13 @@ def _json(body: dict, status_code: int = 200) -> Response:
 # orphan sweep
 # ---------------------------------------------------------------------------
 def _sweep_orphans(shared_dir: Path) -> None:
-    """Remove job-id-shaped directories older than an hour, nothing else.
+    """Remove aged job directories, and the strays generated code leaves.
 
     The main app removes its own job directory in a `finally`; this only
     catches the ones a crashed web worker left behind. Possible at all because
-    `create_job_dir` gives the shared group write access.
+    `create_job_dir` gives the shared group write access — which is also what
+    lets generated code create files and directories in the ROOT of the
+    volume, so this sweep owns those too (`_remove_stray_entry`).
     """
     try:
         entries = list(Path(shared_dir).iterdir())
@@ -250,10 +252,15 @@ def _sweep_orphans(shared_dir: Path) -> None:
     now = time.time()
     for child in entries:
         if not exec_transport.valid_job_id(child.name):
+            _remove_stray_entry(child, now)
             continue
         try:
             info = os.lstat(child)
             if not stat.S_ISDIR(info.st_mode):
+                # A job-id-shaped name that is not a directory was never
+                # created by `create_job_dir`, which only makes directories —
+                # so it is a stash wearing a job id, not a job.
+                _remove_stray_entry(child, now)
                 continue
             if now - info.st_mtime <= _ORPHAN_MAX_AGE_S:
                 continue
@@ -261,6 +268,74 @@ def _sweep_orphans(shared_dir: Path) -> None:
             log_with_sid(child.name, "info", "EXEC_ORPHAN_REMOVED")
         except OSError as e:
             log_with_sid(child.name, "warning", f"EXEC_ORPHAN_REMOVE_FAILED: {e}")
+
+
+def _remove_stray_entry(child, now: float) -> None:
+    """Remove one aged entry of the jobs root that is not a job directory.
+
+    Generated code runs as this uid with the jobs root group-writable, so it
+    can create files and directories directly in that root — and until now
+    nothing ever removed them, since both sweeps skipped every name that is
+    not job-id shaped. The volume is named and disk-backed, so a stash
+    outlived restarts, image upgrades and any number of intervening jobs, was
+    readable by a later job run for a different user, and was visible from the
+    web container. The root is supposed to hold nothing but job directories,
+    so anything else is debris or a deliberate stash, and both go.
+
+    OWNERSHIP IS DELIBERATELY NOT CHECKED HERE, and that is the one rule this
+    side does not share with the main app's copy. It used to remove only what
+    THIS uid owns, on the reasoning that its own uid is exactly the set
+    generated code can have created. It is not: the root is group-writable, so
+    generated code does not have to CREATE a web-owned entry, it can ACQUIRE
+    one — `os.rename` of its own live job directory to a name that is not
+    job-id shaped keeps `st_uid` at the web identity while the content becomes
+    a stash. The two sweeps then disagreed by construction and both skipped
+    it: the web side because the entry's uid IS its own, this side because it
+    is not. Authorship and ownership are different things on a group-writable
+    directory, so ownership classifies nothing useful here — the only entry
+    that legitimately exists in this root is a 32-hex job directory created by
+    the web service, and that shape never reaches this function.
+
+    The rule the main app keeps is not portable to this side either: it exists
+    to protect a misconfigured `EXECUTOR_SHARED_DIR` pointed at customer state,
+    where every file belongs to the web uid. Nothing of the customer's is
+    mounted in this container at all — the jobs volume is its only mount — so
+    that direction buys no protection here while leaving the hole above. And
+    deleting a web-owned entry is not a new capability on this side: clearing
+    an abandoned, web-created job directory is what the group write is for.
+
+    Still bounded two ways: the age threshold a job directory gets, so nothing
+    mid-creation is taken; and a symlink is UNLINKED, never followed —
+    generated code chooses where it points, and the same volume is read by the
+    container where the customer's data IS mounted.
+
+    Never raises (Article IV) — best effort, like the job-directory path.
+    """
+    try:
+        info = os.lstat(child)
+        if now - info.st_mtime <= _ORPHAN_MAX_AGE_S:
+            return
+        mode = info.st_mode
+        if stat.S_ISLNK(mode):
+            kind = "link"
+            os.unlink(child)
+        elif stat.S_ISDIR(mode):
+            kind = "dir"
+            _rmtree_repairing_modes(child)
+        else:
+            kind = "file" if stat.S_ISREG(mode) else "other"
+            os.unlink(child)
+        log_with_sid("executor", "info",
+                     f"EXEC_STRAY_ENTRY_REMOVED kind={kind} "
+                     f"name={exec_transport.log_safe_text(Path(child).name, 200)}")
+    except FileNotFoundError:
+        # The main app's sweep got there first; that is the success case.
+        return
+    except OSError as e:
+        log_with_sid("executor", "warning",
+                     f"EXEC_STRAY_ENTRY_REMOVE_FAILED "
+                     f"name={exec_transport.log_safe_text(Path(child).name, 200)}: "
+                     f"{exec_transport.log_safe_text(str(e))}")
 
 
 def _repair_mode_and_retry(function, path, excinfo) -> None:

@@ -630,13 +630,30 @@ def test_app_starts_with_an_empty_secret_value(executor_env, monkeypatch):
 # ---------------------------------------------------------------------------
 # orphan sweep
 # ---------------------------------------------------------------------------
-def test_orphan_sweep_removes_old_job_dirs_only(executor_env):
+def test_orphan_sweep_removes_old_job_dirs_and_old_strays(executor_env):
+    """INVERTED on purpose: an aged non-job entry is now REMOVED.
+
+    The previous version asserted that `keep_me` SURVIVED, and that
+    expectation was wrong. `create_job_dir` gives the shared root group
+    write — which is what lets this service clear an abandoned job directory
+    in it — and the same permission lets GENERATED CODE create files and
+    directories directly in that root. While both sweeps skipped every name
+    that was not job-id shaped, nothing ever removed those: the volume is
+    named and disk-backed, so a stash outlived restarts, an image upgrade and
+    any number of intervening jobs, and a later job run for a different user
+    read it back. The root is supposed to hold nothing but job directories,
+    so an aged entry that is not one is debris or a deliberate stash.
+
+    The age threshold is unchanged, and the ownership rule here is the
+    mirror of the main app's — see
+    `test_the_sandbox_sweep_ignores_ownership`.
+    """
     shared = executor_env
     old = exec_transport.create_job_dir(shared, exec_transport.new_job_id())
     (old / "in" / "0.parquet").write_bytes(b"x")
     fresh = exec_transport.create_job_dir(shared, exec_transport.new_job_id())
     (fresh / "in" / "0.parquet").write_bytes(b"x")
-    keep = shared / "keep_me"
+    keep = shared / "keep_me"        # a stray, not a job — now swept
     keep.mkdir()
     old_uid = None
     if os.geteuid() == 0:
@@ -653,7 +670,7 @@ def test_orphan_sweep_removes_old_job_dirs_only(executor_env):
         assert client.get("/healthz").status_code == 200
     assert not old.exists(), "old job dir survived the startup sweep"
     assert fresh.is_dir(), "fresh job dir was swept"
-    assert keep.is_dir(), "a non-job-id directory was swept"
+    assert not keep.exists(), "an aged entry that is not a job directory survived"
     if old_uid is not None:
         assert not old_uid.exists(), "old job dir with uid-10001 inputs survived the sweep"
 
@@ -1130,3 +1147,234 @@ def test_generated_code_cannot_import_the_dispatcher(executor_env):
     result = decoded.get("result")
     assert result != "importable", "the sandbox image ships the HTTP dispatcher"
     assert result in ("ModuleNotFoundError", "ImportError"), decoded
+
+
+# ---------------------------------------------------------------------------
+# the stray pass of the jobs root (this side)
+#
+# `create_job_dir` gives the root group write so this service can clear an
+# abandoned job directory; the same permission is what lets generated code —
+# which runs as THIS uid — create entries directly in the root. Nothing
+# removed them while both sweeps only looked at 32-hex names. These pin the
+# widened behaviour and the ONE rule that is deliberately INVERTED between
+# the two sides.
+# ---------------------------------------------------------------------------
+STRAY_REMOVED = "EXEC_STRAY_ENTRY_REMOVED"
+TWO_HOURS_S = 2 * 3600
+
+
+def _age_entry(path, seconds: float = TWO_HOURS_S) -> None:
+    """Back-date an entry past the sweep's threshold; the LINK, not its
+    target, for a symlink."""
+    stamp = time.time() - seconds
+    os.utime(path, (stamp, stamp), follow_symlinks=False)
+
+
+def _sweep(shared_dir) -> None:
+    """Run the sweep the way the lifespan does."""
+    from executor.app import _sweep_orphans
+
+    _sweep_orphans(Path(shared_dir))
+
+
+def test_an_aged_stray_file_is_removed(executor_env):
+    """The commonest shape: generated code writing `open("/jobs/x", "w")`."""
+    stray = executor_env / "stash.txt"
+    stray.write_text("exfiltrated", encoding="utf-8")
+    _age_entry(stray)
+
+    _sweep(executor_env)
+
+    assert not stray.exists(), "an aged stray file survived"
+
+
+def test_an_aged_stray_directory_is_removed_with_its_contents(executor_env):
+    stray = executor_env / "stash_dir"
+    stray.mkdir()
+    (stray / "inner.txt").write_text("x", encoding="utf-8")
+    _age_entry(stray)
+
+    _sweep(executor_env)
+
+    assert not stray.exists(), "an aged stray directory survived"
+
+
+def test_a_job_id_shaped_stray_file_is_removed(executor_env):
+    """The case the widening would otherwise have missed: `create_job_dir`
+    only ever makes DIRECTORIES, so a 32-hex name that is a file was never a
+    job — it is a stash wearing a job id."""
+    disguised = executor_env / ("b" * 32)
+    assert exec_transport.valid_job_id(disguised.name), disguised.name
+    disguised.write_text("hiding", encoding="utf-8")
+    _age_entry(disguised)
+
+    _sweep(executor_env)
+
+    assert not disguised.exists(), "a stash wearing a job-id name survived"
+
+
+def test_a_fresh_stray_is_kept(executor_env):
+    """The age threshold bounds everything: a job being prepared right now
+    must not have its neighbours deleted underneath it."""
+    stray = executor_env / "just_written.txt"
+    stray.write_text("x", encoding="utf-8")
+
+    _sweep(executor_env)
+
+    assert stray.is_file(), "a fresh stray was swept"
+
+
+def test_an_aged_stray_symlink_is_unlinked_and_never_followed(executor_env, tmp_path):
+    """Generated code chooses where a symlink points, and the SAME volume is
+    read by the container where the customer's data IS mounted — so the link
+    is unlinked and its target is left intact."""
+    target = tmp_path / "precious"
+    target.mkdir()
+    (target / "keep.txt").write_text("customer data", encoding="utf-8")
+    link = executor_env / "shortcut"
+    link.symlink_to(target, target_is_directory=True)
+    _age_entry(link)
+
+    _sweep(executor_env)
+
+    assert not link.is_symlink(), "an aged stray symlink survived"
+    assert target.is_dir(), "the sweep followed the link and removed its target"
+    assert (target / "keep.txt").is_file(), "the link's target lost content"
+
+
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: -1)() != 0,
+                    reason="needs root to chown an entry to the web uid")
+def test_the_sandbox_sweep_ignores_ownership(executor_env):
+    """INVERTED on purpose: this side no longer classifies strays by owner.
+
+    The earlier version of this test asserted that an entry owned by the WEB
+    uid survived, on the reasoning that this sweep should only touch what
+    generated code could have created — i.e. what it owns. That reasoning is
+    wrong, and `test_a_laundered_job_directory_is_still_swept` below is the
+    reason: on a group-writable root, generated code does not have to CREATE
+    a web-owned entry, it can ACQUIRE one with a single `os.rename`, and
+    ownership survives it. So ownership classified nothing useful and the two
+    sweeps disagreed by construction, each skipping the laundered directory
+    because of the other's rule.
+
+    The asymmetry is deliberate and is NOT a drift: the main app keeps its
+    ownership rule, because there it is what protects a misconfigured
+    `EXECUTOR_SHARED_DIR` pointed at customer state, where every file belongs
+    to the web uid. Nothing of the customer's is mounted in this container —
+    the jobs volume is its only mount — so that direction buys nothing here
+    while leaving the hole open.
+    """
+    mine = executor_env / "written_by_me.txt"
+    mine.write_text("x", encoding="utf-8")
+    _age_entry(mine)
+    theirs = executor_env / "written_by_the_web.txt"
+    theirs.write_text("x", encoding="utf-8")
+    os.chown(theirs, WEB_UID, SHARED_GID)
+    _age_entry(theirs)
+
+    _sweep(executor_env)
+
+    assert not mine.exists(), "an aged stray this uid owns survived"
+    assert not theirs.exists(), "an aged stray owned by the web uid survived"
+
+
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: -1)() != 0,
+                    reason="needs root to chown the job directory to the web uid")
+def test_a_laundered_job_directory_is_still_swept(executor_env, caplog):
+    """THE REGRESSION TEST FOR THE DEFEAT OF THE FIRST FIX.
+
+    The attack, in full. The jobs root must be group-writable so this service
+    can clear an abandoned job directory in it. That same permission lets
+    generated code RENAME one — and a rename preserves `st_uid`:
+
+        root = '/jobs'
+        mine = [n for n in os.listdir(root) if len(n) == 32]
+        os.rename(os.path.join(root, mine[0]), os.path.join(root, 'zz_launder'))
+        open('/jobs/zz_launder/stash.csv', 'w').write('cross-job stash')
+
+    What is left is a directory with an ordinary name, owner uid 10001 — the
+    WEB identity — mode 2770, still holding that question's `in/0.parquet`,
+    i.e. the customer's frames. The first version of this sweep classified
+    strays by ownership, and both sides then skipped it FOREVER: the web side
+    because the owner WAS its own, this side because it was NOT. On a named
+    disk-backed volume it outlived restarts and image upgrades and was
+    readable by every later job, for any user.
+
+    OWNERSHIP IS NOT AUTHORSHIP on a group-writable directory. This test
+    exists because the first fix was defeated by one call, so the property is
+    pinned rather than reasoned about: the entry goes, whoever owns it.
+
+    Correct only on THIS side — see `test_the_sandbox_sweep_ignores_ownership`
+    for why the main app must keep the opposite rule.
+    """
+    import logging
+
+    laundered_name = "zz_launder"
+    job_dir = exec_transport.create_job_dir(executor_env, exec_transport.new_job_id())
+    (job_dir / "in" / "0.parquet").write_bytes(b"customer frames")
+    for path in (job_dir / "in" / "0.parquet", job_dir / "in", job_dir):
+        os.chown(path, WEB_UID, SHARED_GID)
+    owner_uid = os.lstat(job_dir).st_uid
+    assert owner_uid == WEB_UID, owner_uid
+    assert owner_uid != os.geteuid(), (owner_uid, os.geteuid())
+
+    # The attack: one rename, and the name stops being job-id shaped while
+    # the owner stays the web identity.
+    laundered = executor_env / laundered_name
+    os.rename(job_dir, laundered)
+    (laundered / "stash.csv").write_text("cross-job stash", encoding="utf-8")
+    assert not exec_transport.valid_job_id(laundered.name), laundered.name
+    assert os.lstat(laundered).st_uid == WEB_UID, os.lstat(laundered).st_uid
+    _age_entry(laundered)
+
+    # A SECOND laundered entry, left fresh: the test must not be able to pass
+    # because the sweep deletes everything it sees.
+    fresh_job = exec_transport.create_job_dir(executor_env, exec_transport.new_job_id())
+    (fresh_job / "in" / "0.parquet").write_bytes(b"x")
+    for path in (fresh_job / "in" / "0.parquet", fresh_job / "in", fresh_job):
+        os.chown(path, WEB_UID, SHARED_GID)
+    fresh_laundered = executor_env / "zz_launder_fresh"
+    os.rename(fresh_job, fresh_laundered)
+
+    with caplog.at_level(logging.INFO):
+        _sweep(executor_env)
+
+    assert not laundered.exists(), (
+        "a laundered job directory survived the sweep — the stash is readable "
+        "by every later job on the volume")
+    assert fresh_laundered.is_dir(), "a FRESH laundered entry was swept"
+
+    hits = [record.getMessage() for record in caplog.records
+            if STRAY_REMOVED in record.getMessage()]
+    assert len(hits) == 1, [record.getMessage() for record in caplog.records]
+    message = hits[0]
+    assert "kind=dir" in message, message
+    assert f"name={laundered_name}" in message, message
+
+
+def test_a_stray_name_carrying_a_newline_is_logged_on_one_line(executor_env, caplog):
+    """The name of anything that is not a job directory was chosen by
+    generated code, so it is untrusted text on a newline-delimited line."""
+    import logging
+
+    forged = "stash\n2026-09-17 00:00:00,000 | INFO | [sid=x] EXEC_OK job_id=forged"
+    # Padding chosen to exceed the 200-char log cap while staying under the
+    # filesystem's 255-BYTE name limit, which a longer name hits first.
+    stray = executor_env / (forged + "A" * 150)
+    stray.write_text("x", encoding="utf-8")
+    _age_entry(stray)
+
+    with caplog.at_level(logging.INFO):
+        _sweep(executor_env)
+
+    hits = [record.getMessage() for record in caplog.records
+            if STRAY_REMOVED in record.getMessage()]
+    assert len(hits) == 1, [record.getMessage() for record in caplog.records]
+    message = hits[0]
+    assert "\n" not in message, repr(message[:300])
+    assert "\r" not in message, repr(message[:300])
+    assert "\\n" in message, message[:300]
+    assert len(message) < 400, len(message)
+    impostors = [record.getMessage() for record in caplog.records
+                 if record.getMessage().startswith("EXEC_OK")]
+    assert impostors == [], impostors

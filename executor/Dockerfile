@@ -31,7 +31,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 # Native libs matplotlib / scikit-learn need. No curl (the HEALTHCHECK uses
 # python), no unixodbc / MSSQL driver: this image has no database access at all.
+# `apt-get upgrade` patches the base image's own OS packages in the same layer:
+# the base tag is rebuilt less often than its security fixes ship, so without it
+# a fresh build inherits OS vulnerabilities that already have a fix. The release
+# image scan is the detector for whatever is left (docs/BUILD_AND_RUN.md §8).
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
         fontconfig libgomp1 \
     && rm -rf /var/lib/apt/lists/*
@@ -75,7 +80,11 @@ USER pdcexec
 
 EXPOSE 8090
 
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+# The web service waits for `service_healthy` before it starts, so the FIRST
+# probe decides how long every `up` takes: without a start interval Docker asks
+# again only after the full 30 s interval. --start-interval needs Engine 25+; an
+# older engine ignores the flag and behaves exactly as it did before.
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=15s --start-interval=2s \
     CMD python -c "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=4).status == 200 else 1)"
 
 CMD ["uvicorn", "executor.app:app", "--host", "0.0.0.0", "--port", "8090", "--workers", "1"]

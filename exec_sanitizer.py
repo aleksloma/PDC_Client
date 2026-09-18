@@ -13,7 +13,10 @@ execution path — chat, retries, refresh, dashboards, Auto Analytics, full
 table re-execution — passes through it.
 
 Leaf module: imports only pandas/numpy/warnings + ``logger_utils`` — it must
-never import ``code_exec``/``plot_utils``/``local_store`` (import cycles).
+never import ``code_exec``/``plot_utils``/``local_store`` (import cycles). The
+one exception is the log-escaping helper ``exec_transport.log_safe_text``,
+which ``_log_safe`` imports INSIDE the call because ``exec_transport`` imports
+this module at its own module scope.
 
 Copy discipline (pandas 2.2.x, Copy-on-Write not enabled): the caller's dfs
 dict may be shared across a multi-plot worklist and across parallel Auto
@@ -30,6 +33,30 @@ import numpy as np
 import pandas as pd
 
 from logger_utils import log_with_sid
+
+
+def _log_safe(value, max_chars: int = 200) -> str:
+    """ONE escaped, capped log field for an untrusted string.
+
+    Every identifier this module puts on a log line — a df key, a column
+    label, a dtype repr, a library exception raised ABOUT a customer frame —
+    comes from data, and this gate also runs in the WEB process, where a
+    quoted CSV/Excel header may legally contain a newline. The durable log is
+    newline-delimited, so one embedded newline forges a complete extra record
+    in the file operators grep.
+
+    The implementation is the shared `exec_transport.log_safe_text`, imported
+    LAZILY: `exec_transport` imports THIS module at module scope, so a
+    module-level import here would be an import cycle. Never raises
+    (Article IV) — a field that cannot be rendered costs its own text, never
+    the caller's log line.
+    """
+    try:
+        from exec_transport import log_safe_text
+        return log_safe_text(value if isinstance(value, str) else str(value),
+                             max_chars)
+    except Exception:
+        return ""
 
 
 def _is_standard_dtype(dt) -> bool:
@@ -134,16 +161,20 @@ def _sanitize_frame(df: pd.DataFrame, key, sid: str) -> pd.DataFrame:
                 converted.append(f"{col}:{dt}->{conv.dtype}")
         except Exception as e:
             log_with_sid(sid, "warning",
-                         f"EXEC_SANITIZE_SKIP df={key} col={col} dtype={dt}: {e}")
+                         f"EXEC_SANITIZE_SKIP df={_log_safe(key, 120)} "
+                         f"col={_log_safe(col, 120)} dtype={_log_safe(dt, 80)}: "
+                         f"{_log_safe(e)}")
     if bad_index:
         try:
             new_df.index = df.index.astype(df.index.dtype.categories.dtype)
         except Exception as e:
             log_with_sid(sid, "warning",
-                         f"EXEC_SANITIZE_SKIP df={key} index dtype={df.index.dtype}: {e}")
+                         f"EXEC_SANITIZE_SKIP df={_log_safe(key, 120)} index "
+                         f"dtype={_log_safe(df.index.dtype, 80)}: {_log_safe(e)}")
     if converted:
         log_with_sid(sid, "info",
-                     f"EXEC_SANITIZE df={key} converted=[{', '.join(converted)}]")
+                     f"EXEC_SANITIZE df={_log_safe(key, 120)} "
+                     f"converted=[{_log_safe(', '.join(converted), 800)}]")
     return new_df
 
 
@@ -168,7 +199,7 @@ def sanitize_for_execution(dfs: dict, sid: str) -> dict:
         return out if out is not None else dfs
     except Exception as e:
         try:
-            log_with_sid(sid, "warning", f"EXEC_SANITIZE_FAILED: {e}")
+            log_with_sid(sid, "warning", f"EXEC_SANITIZE_FAILED: {_log_safe(e)}")
         except Exception:
             pass
         return dfs

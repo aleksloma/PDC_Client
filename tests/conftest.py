@@ -8,6 +8,18 @@ test has; an autouse fixture rebinds them — and the two names
 imports, so every existing test behaves exactly as it did when the bodies
 were still inline. A test that wants the real dispatching function carries
 `@pytest.mark.real_executor_dispatch` and opts out.
+
+A second autouse fixture keeps the suite OFFLINE around the sandbox
+reachability cache. `executor_client.reachable()` is what `/health` reads,
+and when the cache is stale it starts a short-lived daemon thread that does a
+real `GET http://pdc-executor:8090/healthz` — a live DNS lookup from whatever
+machine runs pytest. Two reasons that cannot be left on: the suite may make no
+network attempt at all, and the thread lands SECONDS LATER and writes the
+cached state, so it can race a later test that asserts the cache is still
+untouched into an intermittent failure. The fixture therefore stops the
+refresh from being claimed and restores the cache after every test; a test
+that deliberately exercises the probe carries
+`@pytest.mark.executor_probe`.
 """
 import os
 import sys
@@ -27,10 +39,14 @@ import pytest  # noqa: E402
 # transport. Importing all three up front makes the binding happen once, with
 # the production functions in place.
 import code_exec  # noqa: E402
+import executor_client  # noqa: E402
 import plot_utils  # noqa: E402
 import run_chat_local  # noqa: E402
 
 REAL_DISPATCH_MARKER = "real_executor_dispatch"
+INTEGRATION_MARKER = "integration"
+NEEDS_BRAIN_MARKER = "needs_brain"
+EXECUTOR_PROBE_MARKER = "executor_probe"
 
 
 def pytest_configure(config):
@@ -42,6 +58,48 @@ def pytest_configure(config):
         "functions instead of the in-process rebinding (the test provides a "
         "transport of its own)",
     )
+    # tests/integration/ drives a RUNNING compose stack over HTTP; its own
+    # conftest skips every item unless PDC_STACK_URL (and, for needs_brain,
+    # PDC_STACK_BRAIN) is set, so the default run stays fully offline.
+    config.addinivalue_line(
+        "markers",
+        f"{INTEGRATION_MARKER}: runs against the live docker-compose stack "
+        "(skipped unless PDC_STACK_URL is set)",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"{NEEDS_BRAIN_MARKER}: additionally needs a reachable brain "
+        "(skipped unless PDC_STACK_BRAIN is set)",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"{EXECUTOR_PROBE_MARKER}: let the sandbox reachability refresh start "
+        "(the test drives the probe itself and supplies its own stub)",
+    )
+
+
+@pytest.fixture(autouse=True)
+def no_sandbox_reachability_probe(request, monkeypatch):
+    """Keep the reachability refresh thread from ever starting.
+
+    `reachable()` is called by `/health`, so any test that touches that route
+    — directly or through a page — would otherwise spawn a daemon thread
+    resolving `pdc-executor` on the real network. Patching the claim function
+    is enough: the cache stays byte-identical, so a test asserting "nothing
+    has been checked yet" still sees exactly that, and nothing is left running
+    after the test returns.
+
+    The cache is a module-level dict, so it is snapshotted and restored too —
+    a test that writes into it must not leak that state into the next one.
+    """
+    saved = dict(executor_client._REACH)
+    if not request.node.get_closest_marker(EXECUTOR_PROBE_MARKER):
+        monkeypatch.setattr(executor_client, "_claim_refresh", lambda: False)
+    try:
+        yield
+    finally:
+        executor_client._REACH.clear()
+        executor_client._REACH.update(saved)
 
 
 @pytest.fixture(autouse=True)

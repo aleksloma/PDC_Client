@@ -647,3 +647,154 @@ def test_runner_and_app_never_read_a_dotenv_or_touch_data_root_stores():
         assert "load_dotenv" not in text, path.name
         assert "db_snapshots" not in text, path.name
         assert "chatdata" not in text, path.name
+
+
+# ---------------------------------------------------------------------------
+# (13) the healthcheck flags and the two shared vocabularies
+# ---------------------------------------------------------------------------
+EXECUTOR_CLIENT = ROOT / "executor_client.py"
+
+# Every flag the HEALTHCHECK must carry. `--start-period` + a 2 s
+# `--start-interval` are what keep `depends_on: service_healthy` from holding
+# the web container back a full 30 s interval on every `up`.
+# `--start-interval` needs Engine 25+ AT BUILD TIME: an older builder REJECTS
+# it as an unknown HEALTHCHECK flag and the build fails (an older engine merely
+# RUNNING a pre-built image just ignores the field). So this flag also states
+# the minimum engine for building the images from source.
+EXPECTED_HEALTHCHECK_FLAGS = (
+    "--interval=30s", "--timeout=5s", "--retries=3",
+    "--start-period=15s", "--start-interval=2s",
+)
+
+# Every `reason` token `executor/app.py` can put on a response. The vocabulary
+# is CLOSED because `reason` comes back through the hostile response body and
+# reaches the planner's retry prompt via `crash_error_text`; an unlisted token
+# must be dropped, not forwarded.
+EXPECTED_CRASH_REASONS = {
+    "spawn_failed", "hard_timeout", "sigkill", "response_invalid", "signal",
+    "exit", "queued", "executor_error",
+}
+
+
+def _module_level_assignment(path: Path, name: str):
+    """The value node of a module-level `name = ...` (or `name: T = ...`)."""
+    tree = ast.parse(_read(path), filename=str(path))
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+                return node.value
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == name:
+                return node.value
+    return None
+
+
+def _string_constants(node) -> set:
+    return {n.value for n in ast.walk(node)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+
+
+def _reason_tokens_in_executor_app():
+    """(tokens, allows_none, unresolved) over every `"reason"` the app assigns.
+
+    Collected from the response dicts (`{..., "reason": "sigkill"}`), from the
+    `response.setdefault("reason", None)` default, and — for the crashed
+    branch, whose value is the local `reason` of a conditional expression —
+    from the string constants assigned to that name. `unresolved` carries any
+    `"reason"` value this reader could not resolve to a string, so the pin can
+    never pass by silently missing a token.
+    """
+    tree = ast.parse(_read(EXEC_APP), filename=str(EXEC_APP))
+    assigned = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                strings = _string_constants(node.value)
+                if strings:
+                    assigned.setdefault(target.id, set()).update(strings)
+
+    value_nodes = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values):
+                if isinstance(key, ast.Constant) and key.value == "reason":
+                    value_nodes.append(value)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "setdefault" and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "reason"):
+            value_nodes.extend(node.args[1:2])
+
+    tokens, unresolved, allows_none = set(), [], False
+    for value in value_nodes:
+        if isinstance(value, ast.Constant):
+            if value.value is None:
+                allows_none = True
+            elif isinstance(value.value, str):
+                tokens.add(value.value)
+            else:
+                unresolved.append(repr(value.value))
+            continue
+        strings = assigned.get(value.id, set()) if isinstance(value, ast.Name) else set()
+        strings |= _string_constants(value)
+        if not strings:
+            unresolved.append(ast.dump(value))
+        tokens |= strings
+    return tokens, allows_none, unresolved
+
+
+def test_dockerfile_healthcheck_carries_every_flag_including_the_start_probe():
+    """A dropped flag must fail here, not surface as a slow `up`.
+
+    `depends_on: {executor: {condition: service_healthy}}` gates the web
+    container on this probe, so the flags are startup behaviour of the whole
+    stack, not a detail of one image. The probe itself stays the python
+    one-liner: there is no curl in this image (and adding one to pass a
+    healthcheck would put an HTTP client in the sandbox).
+    """
+    block = _raw_instruction_block(_read(EXEC_DOCKERFILE), "HEALTHCHECK")
+    missing = [flag for flag in EXPECTED_HEALTHCHECK_FLAGS if flag not in block]
+    assert missing == [], f"HEALTHCHECK lacks {missing}: {block}"
+    assert "/healthz" in block, block
+    assert "127.0.0.1:8090" in block, block
+    assert "python" in block and "urllib" in block, block
+    assert "curl" not in block, block
+
+
+def test_version_modules_tuples_agree_on_both_sides():
+    """A DRIFT GUARD, green today.
+
+    The web side warns per library on a version mismatch; a module the two
+    tuples disagree about is simply never compared, so the handshake would
+    silently stop covering it. Both are
+    `("matplotlib", "numpy", "pandas", "plotly", "pyarrow")` today.
+    """
+    app_node = _module_level_assignment(EXEC_APP, "_VERSION_MODULES")
+    client_node = _module_level_assignment(EXECUTOR_CLIENT, "_VERSION_MODULES")
+    assert app_node is not None, "executor/app.py has no module-level _VERSION_MODULES"
+    assert client_node is not None, "executor_client.py has no module-level _VERSION_MODULES"
+    theirs = ast.literal_eval(app_node)
+    ours = ast.literal_eval(client_node)
+    assert tuple(ours) == tuple(theirs), (ours, theirs)
+
+
+def test_exec_transport_crash_reason_allowlist_matches_the_executor_vocabulary():
+    """`reason` is untrusted text that reaches the retry prompt.
+
+    The sandbox's response body is hostile input, and `reason`/`status` are
+    inlined into the error sentence the planner sees on retry. So the accepted
+    vocabulary is CLOSED and lives in the SHARED transport (both images import
+    it), pinned here against what `executor/app.py` actually assigns — a new
+    token on the sandbox side must be added to the allowlist in the same
+    change or this test names it.
+    """
+    tokens, allows_none, unresolved = _reason_tokens_in_executor_app()
+    assert unresolved == [], f"unreadable `reason` values in executor/app.py: {unresolved}"
+    assert tokens == EXPECTED_CRASH_REASONS, tokens
+    assert allows_none is True, "executor/app.py no longer defaults `reason` to None"
+    node = _module_level_assignment(EXEC_TRANSPORT, "CRASH_REASONS")
+    assert node is not None, "exec_transport.py has no module-level CRASH_REASONS allowlist"
+    allowed = _string_constants(node)
+    assert allowed == EXPECTED_CRASH_REASONS, allowed

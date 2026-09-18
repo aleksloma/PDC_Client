@@ -74,6 +74,11 @@ RESULT_FILE_MAX_BYTES = 256 * 1024 * 1024
 RESULT_MAX_DECODED_BYTES = 512 * 1024 * 1024
 # Captured stdout/stderr per job.
 STDIO_MAX_CHARS = 65536
+
+# The widest slice of a string the untrusted side wrote that a log line will
+# repeat by default (`log_safe_text`); callers with a narrower field pass their
+# own cap.
+LOG_TEXT_MAX_CHARS = 2000
 # Error / traceback strings (they reach the brain's retry prompt).
 ERROR_MAX_CHARS = 20000
 # `chart_data` is display-only; a pathological one is dropped, not fatal.
@@ -95,6 +100,26 @@ KINDS = ("PYTHON", "PLOT")
 
 MEMORY_ERROR_TEXT = "MemoryError: execution exceeded the memory limit"
 
+# The executor's CLOSED `reason` vocabulary, shared by both images so the two
+# sides cannot drift (a structural test pins it against `executor/app.py`'s own
+# literals). It is an allowlist because `reason` arrives in the response body —
+# the untrusted side — and is inlined into the error TEXT that
+# `brain_client.retry` forwards into the planner's retry prompt. The same
+# defect was already fixed for the rejection code: 40 000 characters or an
+# embedded newline of the sandbox's choosing must never reach a prompt.
+# The widest `exit_code` / `signal` the crash sentence will repeat: a process
+# exit status is -NSIG..255 and a signal number is smaller still.
+EXIT_VALUE_MAX = 65535
+# The widest `elapsed_ms` / `peak_rss_mb` a LOG LINE will repeat. They are a
+# job duration in milliseconds and a resident-set size in MB, so a billion
+# bounds either at ten characters without ever rejecting a real reading.
+METRIC_VALUE_MAX = 10 ** 9
+
+CRASH_REASONS = frozenset({
+    "spawn_failed", "hard_timeout", "sigkill", "response_invalid",
+    "signal", "exit", "queued", "executor_error",
+})
+
 
 def dumps(obj: Any) -> str:
     """The wire dialect: compact, Unicode-literal, NaN/Infinity preserved."""
@@ -104,6 +129,45 @@ def dumps(obj: Any) -> str:
 def loads(payload: Any) -> Any:
     """Parse the wire dialect from `str` or `bytes`."""
     return json.loads(payload)
+
+
+def log_safe_text(value: Any, max_chars: int = LOG_TEXT_MAX_CHARS, *,
+                  tail: bool = False) -> str:
+    """ONE line of an untrusted string, length-capped, for a log field.
+
+    The execution error text, the traceback and the stderr tail are written by
+    the UNTRUSTED side: generated code failing in the sandbox produces the
+    message, which `code_exec` renders as `f"{type(e).__name__}: {e}"`, so
+    every character of it is that code's choice. So is an exception this hop
+    RAISES ABOUT that side: pyarrow quotes the result file's own metadata
+    strings back when it refuses to read it, and pandas quotes a customer
+    column name, so an `{e}` in a log MESSAGE is the same untrusted string
+    wearing a library's error text. The durable client log is
+    NEWLINE-DELIMITED, so an embedded newline forges a complete, plausible
+    extra record into the file operators grep — it can claim any other event's
+    shape and any other job's id. Truncation does not help: a newline at
+    character 10 still splits the line. CR and LF are therefore escaped at
+    EVERY site that puts such a string on a log line, which is why this helper
+    lives in the module both containers already share instead of in one
+    caller.
+
+    `tail=True` keeps the LAST `max_chars` (where an exception's own message
+    sits, after a long class path); the default keeps the first, matching the
+    `[:N]` slices the callers wrote. Escaping before the second cut keeps the
+    field bounded by the cap either way, since an escape doubles a character.
+    Never raises (Article IV): an unrenderable field is logged as empty rather
+    than costing the caller its whole log line.
+    """
+    try:
+        if not isinstance(value, str) or not value:
+            return ""
+        limit = (max_chars if isinstance(max_chars, int) and max_chars > 0
+                 else LOG_TEXT_MAX_CHARS)
+        cut = value[-limit:] if tail else value[:limit]
+        cut = cut.replace("\r", "\\r").replace("\n", "\\n")
+        return cut[-limit:] if tail else cut[:limit]
+    except Exception:
+        return ""
 
 
 def normalize_timeout(value):
@@ -137,6 +201,77 @@ def timeout_error_text(timeout) -> str:
 def crash_error_text(exit_code, signal_no, reason) -> str:
     return ("ExecutorCrashError: the analysis process exited unexpectedly "
             f"(exit={exit_code}, signal={signal_no}, reason={reason})")
+
+
+def known_number(value, maximum, allow_float: bool = False):
+    """A BOUNDED number from the response, or None. Never raises.
+
+    PUBLIC and the ONE implementation for every numeric field the untrusted
+    side sends into a text or a log line — the crash sentence's `exit_code` /
+    `signal`, and the dispatcher's `elapsed_ms` / `peak_rss_mb`. JSON puts no
+    limit on what type a field holds nor on the digits of a number, so without
+    this a 40 000-character string or a 40 000-digit int would be repeated
+    verbatim into a prompt the brain reads or a file an operator greps.
+
+    An int passes; a float that is exactly an integer passes AS AN INT; a
+    string, a dict, a non-finite float and `True` all become None, as does any
+    magnitude past `maximum`. `None` itself stays None — that is what a normal
+    crash already reports for the field that does not apply. With
+    `allow_float` a fractional value keeps its fraction (a memory reading);
+    without it, only an integral one passes.
+
+    `bool` is rejected before `int` on purpose: it IS an int in Python, and
+    `exit=True` is not an exit code.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        if value.is_integer():
+            value = int(value)
+        elif not allow_float:
+            return None
+    if not isinstance(value, (int, float)):
+        return None
+    if abs(value) > maximum:
+        return None
+    return value
+
+
+def _known_exit_value(value):
+    """An `exit_code` / `signal` for the crash sentence, or None.
+
+    The crash sentence interpolates three fields, and ALL THREE come from the
+    response body — which the untrusted side writes — into a text that
+    `brain_client.retry` forwards to the brain verbatim. Validating only the
+    field that was noticed first would leave the same injection route open
+    through the other two, so a small process number is all either of these
+    may be. Real values are a process exit status (-NSIG..255) or a signal
+    number, so the bound never rejects one and the field can add at most six
+    characters.
+    """
+    return known_number(value, EXIT_VALUE_MAX)
+
+
+def known_reason(reason):
+    """A `reason` from the response, or the literal `unknown`.
+
+    PUBLIC because the dispatcher logs the same field on its `EXEC_TIMEOUT`
+    line and must apply the same closed vocabulary — a second copy of this
+    idea is how the two would drift.
+
+    `None` is part of the vocabulary (the executor's own
+    `setdefault("reason", None)`), so a plain crash keeps reading as one.
+    Everything else the response chose collapses to one token, because this
+    value ends up inside the sentence the planner's retry prompt reads and on
+    a durable log line.
+    """
+    if reason is None:
+        return None
+    if isinstance(reason, str) and reason in CRASH_REASONS:
+        return reason
+    return "unknown"
 
 
 class Opaque:
@@ -185,7 +320,22 @@ class StyledFrame:
 
 
 class _Violation(Exception):
-    """A hostile / malformed executor response (mapped to an exec error)."""
+    """A hostile / malformed executor response (mapped to an exec error).
+
+    `str(...)` is the RETURNED half: it becomes the caller's error text, which
+    `brain_client.retry` forwards into the planner's retry prompt, so it may
+    name the failure and the reference but never a URL, a path or a datum.
+    `detail` is the operator-only half — an OSError repr carries the absolute
+    path it failed on, which an operator needs and a returned string must not
+    disclose (the storage layout is not the sandbox's to learn, and the
+    sandbox can provoke this raise: it holds group write on the job directory,
+    so it can replace a component with a symlink). Only `deserialize_result`
+    reads it, straight onto the local log line.
+    """
+
+    def __init__(self, message: str, detail: Any = None):
+        super().__init__(message)
+        self.detail = detail
 
 
 class _TooLarge(Exception):
@@ -231,7 +381,9 @@ def create_job_dir(shared_dir, job_id: str) -> Path:
             os.chmod(path, _DIR_MODE)
         except OSError as e:
             # Windows has no setgid bit; a dev run must not fail on it.
-            log_with_sid(job_id, "warning", f"JOB_DIR_CHMOD_FAILED {path.name}: {e}")
+            log_with_sid(job_id, "warning",
+                         f"JOB_DIR_CHMOD_FAILED {path.name}: "
+                         f"{log_safe_text(str(e))}")
     return job_dir
 
 
@@ -245,7 +397,8 @@ def ensure_out_dir(job_dir) -> Path:
         # Windows has no setgid bit; a dev run must not fail on it. Mirrors
         # `create_job_dir`'s JOB_DIR_CHMOD_FAILED so a REAL permission problem
         # on the shared volume is visible instead of silent.
-        log_with_sid(Path(job_dir).name, "warning", f"OUT_DIR_CHMOD_FAILED: {e}")
+        log_with_sid(Path(job_dir).name, "warning",
+                     f"OUT_DIR_CHMOD_FAILED: {log_safe_text(str(e))}")
     return out_dir
 
 
@@ -325,11 +478,14 @@ def write_inputs(dfs: dict, job_dir, sid: Optional[str] = None) -> list:
                 raise ValueError("pickle round-trip altered the dataframe")
         except Exception as e_pkl:
             log_with_sid(sid or "exec", "error",
-                         f"EXEC_INPUT_WRITE_FAILED key={name}: "
-                         f"parquet: {parquet_error}; pickle: {e_pkl}")
+                         f"EXEC_INPUT_WRITE_FAILED key={log_safe_text(str(name), 200)}: "
+                         f"parquet: {log_safe_text(parquet_error)}; "
+                         f"pickle: {log_safe_text(str(e_pkl))}")
             raise ValueError(f"cannot transport dataframe {name!r}: {e_pkl}") from e_pkl
         log_with_sid(sid or "exec", "info",
-                     f"EXEC_INPUT_PICKLE_FALLBACK key={name}: {parquet_error}")
+                     f"EXEC_INPUT_PICKLE_FALLBACK "
+                     f"key={log_safe_text(str(name), 200)}: "
+                     f"{log_safe_text(parquet_error)}")
         manifest.append({"name": str(name), "path": rel, "format": "pickle"})
     return manifest
 
@@ -413,7 +569,8 @@ def encode_preview(preview: Any) -> Any:
             return safe
         return _opaque_preview(preview)
     except Exception as e:
-        log_with_sid("exec", "warning", f"EXEC_PREVIEW_ENCODE_FAILED: {e}")
+        log_with_sid("exec", "warning",
+                     f"EXEC_PREVIEW_ENCODE_FAILED: {log_safe_text(str(e))}")
         return _opaque_preview(preview)
 
 
@@ -462,7 +619,8 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
             out.columns = flat
         return out
     except Exception as e:
-        log_with_sid("exec", "warning", f"EXEC_DEDUPE_COLUMNS_FAILED: {e}")
+        log_with_sid("exec", "warning",
+                     f"EXEC_DEDUPE_COLUMNS_FAILED: {log_safe_text(str(e))}")
         return df
 
 
@@ -486,7 +644,8 @@ def _cast_mixed_labels(df: pd.DataFrame) -> pd.DataFrame:
         out.columns = [str(c) for c in cols]
         return out
     except Exception as e:
-        log_with_sid("exec", "warning", f"EXEC_LABEL_CAST_FAILED: {e}")
+        log_with_sid("exec", "warning",
+                     f"EXEC_LABEL_CAST_FAILED: {log_safe_text(str(e))}")
         return df
 
 
@@ -512,7 +671,8 @@ def _fix_unwritable_object_columns(df: pd.DataFrame) -> pd.DataFrame:
             # embeds a CELL VALUE, and this module never logs values (and a
             # column NAME is user data too).
             log_with_sid("exec", "warning",
-                         f"EXEC_PARQUET_PROBE_FAILED pos={pos} {type(e).__name__}")
+                         f"EXEC_PARQUET_PROBE_FAILED pos={pos} "
+                         f"{log_safe_text(type(e).__name__, 200)}")
         if out is df:
             out = df.copy(deep=False)
         out.isetitem(pos, col.where(col.isna(), col.astype(str)))
@@ -613,7 +773,8 @@ def _styled_html(styler) -> Optional[str]:
             return None
         return html
     except Exception as e:
-        log_with_sid("exec", "warning", f"EXEC_STYLER_HTML_FAILED: {e}")
+        log_with_sid("exec", "warning",
+                     f"EXEC_STYLER_HTML_FAILED: {log_safe_text(str(e))}")
         return None
 
 
@@ -704,7 +865,8 @@ def serialize_result(exec_return: dict, job_dir) -> dict:
         return payload
     except Exception as e:
         text = f"ResultSerializationError: {type(e).__name__}: {e}"
-        log_with_sid("exec", "error", f"EXEC_SERIALIZE_FAILED {text}")
+        log_with_sid("exec", "error",
+                     f"EXEC_SERIALIZE_FAILED {log_safe_text(text)}")
         if isinstance(exec_return, dict) and ("ok" in exec_return or "trace" in exec_return):
             return {"ok": False, "error": text[:ERROR_MAX_CHARS], "trace": ""}
         return {"error": text[:ERROR_MAX_CHARS]}
@@ -749,12 +911,19 @@ def _exec_error(kind: str, text: str) -> dict:
     return {"error": text}
 
 
-def deserialize_result(response: Any, job_dir, kind: str, timeout_s=60) -> dict:
+def deserialize_result(response: Any, job_dir, kind: str, timeout_s=60,
+                       sid: Optional[str] = None) -> dict:
     """Rebuild the dict the in-process callers expect, for EVERY status.
 
     Never raises (Article IV): a malformed, hostile or absent response is a
     failed execution, reported through the same `error` channel the callers
     already handle.
+
+    `sid` is LOG-ONLY and optional: the two failure lines this function writes
+    are the operator's record of a response it refused, and without it they
+    read `sid=exec` — unattributable to the chat whose question produced the
+    job. The dispatcher passes the one it was called with; a caller that has
+    no session (a test, a script) keeps the old tag.
     """
     try:
         if not isinstance(response, dict):
@@ -765,20 +934,42 @@ def deserialize_result(response: Any, job_dir, kind: str, timeout_s=60) -> dict:
         if status == "killed":
             return _exec_error(kind, MEMORY_ERROR_TEXT)
         if status == "crashed":
-            return _exec_error(kind, crash_error_text(response.get("exit_code"),
-                                                      response.get("signal"),
-                                                      response.get("reason")))
+            # EVERY interpolated field is validated, not just `reason`.
+            return _exec_error(kind, crash_error_text(
+                _known_exit_value(response.get("exit_code")),
+                _known_exit_value(response.get("signal")),
+                known_reason(response.get("reason"))))
         if status not in ("ok", "error"):
-            raise _Violation(f"unknown status {status!r}")
+            # The received value is NOT interpolated: it is the response's own
+            # choice of text and this sentence reaches the planner's retry
+            # prompt, where 40 000 characters or an embedded newline would be
+            # an injection channel.
+            raise _Violation("unknown status")
         payload = response.get("payload")
         if not isinstance(payload, dict):
             raise _Violation("the executor response carries no payload object")
         return _reconstruct(payload, Path(job_dir), kind)
     except _TooLarge as e:
-        log_with_sid("exec", "error", f"EXEC_RESPONSE_TOO_LARGE {e}")
+        log_with_sid(sid or "exec", "error",
+                     f"EXEC_RESPONSE_TOO_LARGE {log_safe_text(str(e))}")
         return _exec_error(kind, f"ResultTooLarge: {e}")
     except Exception as e:
-        log_with_sid("exec", "error", f"EXEC_RESPONSE_INVALID {type(e).__name__}: {e}")
+        # `detail` exists only on this side of the boundary: the log keeps the
+        # path an operator needs, the returned text (which reaches a prompt)
+        # never gets it. Escaped because a filesystem error message is not
+        # this process's own text and the log file is newline-delimited.
+        detail = log_safe_text(getattr(e, "detail", None))
+        # The MESSAGE is escaped for the same reason as `detail`, and it is
+        # the one that matters most: these violation texts interpolate a raw
+        # pyarrow/pandas exception (`result parquet is unreadable: ...`), and
+        # pyarrow quotes the file's own metadata strings back — which the
+        # sandbox wrote. A newline there forged a COMPLETE extra record,
+        # timestamp, level, sid and event name included, into the file an
+        # operator greps to reconstruct what happened.
+        log_with_sid(sid or "exec", "error",
+                     f"EXEC_RESPONSE_INVALID "
+                     f"{log_safe_text(f'{type(e).__name__}: {e}')}",
+                     detail=detail)
         return _exec_error(kind, f"ExecutorResponseError: {e}"
                            if isinstance(e, _Violation)
                            else f"ExecutorResponseError: {type(e).__name__}: {e}")
@@ -969,13 +1160,16 @@ def _open_ref(job_dir: Path, rel: Any, suffixes: tuple, max_bytes: Optional[int]
     binary = getattr(os, "O_BINARY", 0)
 
     if directory and os.open in getattr(os, "supports_dir_fd", set()):
-        job_fd = _os_open(str(job_dir), os.O_RDONLY | directory | nofollow | cloexec)
+        job_fd = _os_open(str(job_dir), os.O_RDONLY | directory | nofollow | cloexec,
+                          what=f"{rel!r} (job directory)")
         try:
-            out_fd = _os_open("out", os.O_RDONLY | directory | nofollow | cloexec, dir_fd=job_fd)
+            out_fd = _os_open("out", os.O_RDONLY | directory | nofollow | cloexec,
+                              dir_fd=job_fd, what=f"{rel!r} (out directory)")
         finally:
             os.close(job_fd)
         try:
-            fd = _os_open(name, os.O_RDONLY | nofollow | nonblock | cloexec | binary, dir_fd=out_fd)
+            fd = _os_open(name, os.O_RDONLY | nofollow | nonblock | cloexec | binary,
+                          dir_fd=out_fd, what=repr(rel))
         finally:
             os.close(out_fd)
         # ONE guard over everything that can raise while the descriptor is
@@ -1000,7 +1194,8 @@ def _open_ref(job_dir: Path, rel: Any, suffixes: tuple, max_bytes: Optional[int]
         try:
             st = os.lstat(component)
         except OSError as e:
-            raise _Violation(f"reference not readable: {rel!r}: {e}") from e
+            raise _Violation(f"reference not readable: {rel!r}: {type(e).__name__}",
+                             detail=f"{component}: {e}") from e
         if stat.S_ISLNK(st.st_mode):
             raise _Violation(f"reference component is a symlink: {component.name}")
     if not stat.S_ISREG(st.st_mode):
@@ -1010,11 +1205,19 @@ def _open_ref(job_dir: Path, rel: Any, suffixes: tuple, max_bytes: Optional[int]
     return open(target, "rb"), st
 
 
-def _os_open(path, flags, dir_fd=None):
+def _os_open(path, flags, dir_fd=None, what: Optional[str] = None):
+    """`os.open`, with the failure reported WITHOUT the path it failed on.
+
+    `what` names the reference and the stage of the chain (its own short
+    `out/...` name is the sandbox's own token and safe to repeat); the
+    absolute path and the OSError text go to `_Violation.detail`, i.e. to the
+    log line only, because the message becomes the returned error text.
+    """
     try:
         return os.open(path, flags, dir_fd=dir_fd)
     except OSError as e:
-        raise _Violation(f"cannot open {path!r}: {e}") from e
+        raise _Violation(f"cannot open {what or 'the reference'}: {type(e).__name__}",
+                         detail=f"{path!r}: {e}") from e
 
 
 def _read_result_frame(job_dir: Path, rel: Any) -> pd.DataFrame:
