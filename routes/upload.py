@@ -996,7 +996,7 @@ async def add_data_to_chat(request: Request):
     schema_text is rebuilt from all loaded dataframes on every question, so
     the added files are picked up with no further work.
     """
-    from routes.chat import _require_chat
+    from routes.chat import _require_chat_owner
 
     body = {}
     try:
@@ -1007,7 +1007,9 @@ async def add_data_to_chat(request: Request):
     if not chat_id:
         return JSONResponse({"error": "chat_id is required."}, status_code=400)
 
-    email, err = _require_chat(request, chat_id)
+    # Owner-only: Add Data overwrites the chat's files and rewrites its
+    # schema entries; a share recipient reads the chat but does not change it.
+    email, err = _require_chat_owner(request, chat_id)
     if err:
         return err
     sid = request.session.get("sid")

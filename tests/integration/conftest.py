@@ -13,11 +13,21 @@ The gate is `pytest_collection_modifyitems`, NOT a module-level
 would leave the tests collected WITHOUT their fixtures and red for the wrong
 reason.
 
+Code the deterministic probes run is SEEDED first: `refresh_item` executes
+only code the chat's history already holds, so `seed_code` appends an AI
+history row through the app's OWN store inside the web container
+(`docker exec pdc-client python -c ...`, uid 10001, `DATA_ROOT` from the
+image). Without docker on PATH those probes skip with a reason — the LLM
+matrix, whose code the product persists itself, is unaffected.
+
 Everything the tests create is thrown away, and that sentence is
 load-bearing: these tests run against a PERSISTENT customer-shaped volume, so
 anything not removed accumulates there forever. Three kinds of directory are
-created — the account `integration-<hex>@example.invalid` (by the real login
-route, which sets the password a genuinely new email arrives with), the chats
+created — the account `integration-<hex>@example.invalid` (pre-created with
+its password through the app's own store inside the container, so the login
+is a RETURNING sign-in and the brain never receives a welcome mail or a
+first-login activity for a synthetic address; only without docker does the
+real login route's new-account branch create it), the chats
 `/generate_chatdata` promotes, and the UPLOAD SESSION directory `/new_session`
 opens, which holds the uploaded fixture file and its parquet cache. The app
 has no delete endpoint for any of them, so teardown removes all three with
@@ -27,6 +37,7 @@ exactly what it left behind.
 import base64
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -104,6 +115,65 @@ def docker_exec(container: str, *argv: str, check: bool = False):
         capture_output=True, text=True, timeout=120, check=check)
 
 
+def _b64(text: str) -> str:
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+# Runs INSIDE pdc-client. Every value arrives base64-encoded on argv, so no
+# quoting of the probe's code (quotes, newlines, backslashes) can break the
+# command line, and the script itself is one argv element — no shell anywhere.
+_SEED_SCRIPT = (
+    "import base64, sys, time\n"
+    "import local_store\n"
+    "chat_id = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
+    "code = base64.b64decode(sys.argv[2]).decode('utf-8')\n"
+    "store = local_store.ChatDataStore(chat_id)\n"
+    "conv_id = store.new_conversation('integration probe')\n"
+    "store.append_history(conv_id, {'role': 'ai', 'content': '',\n"
+    "                               'code': code, 'ts': time.time()})\n"
+    "print(conv_id)\n"
+)
+
+_ACCOUNT_SCRIPT = (
+    "import base64, sys\n"
+    "import local_store\n"
+    "email = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
+    "password = base64.b64decode(sys.argv[2]).decode('utf-8')\n"
+    "store = local_store.AuthStore()\n"
+    "store.ensure_user(email)\n"
+    "store.set_password(email, password)\n"
+    "print('ok')\n"
+)
+
+
+def seed_code(chat_id: str, code: str) -> str:
+    """Persist `code` as an AI answer of `chat_id` inside the web container
+    and return the new conversation id. Skips the calling test when docker
+    is not on PATH (the route refuses unseeded code by design)."""
+    if not docker_available():
+        pytest.skip("docker is not on PATH: probe code cannot be seeded into "
+                    "the chat history, and refresh_item runs stored code only")
+    result = docker_exec(WEB_CONTAINER, "python", "-c", _SEED_SCRIPT,
+                         _b64(chat_id), _b64(code))
+    assert result.returncode == 0, (result.stdout[-300:], result.stderr[-500:])
+    # The app's logger also writes to stdout, so pick the id out by shape
+    # rather than trusting the last line.
+    ids = re.findall(r"cv_[0-9a-f]{16}", result.stdout or "")
+    assert ids, result.stdout[-300:]
+    return ids[-1]
+
+
+def precreate_account(email: str, password: str) -> bool:
+    """Create the throwaway account WITH its password through the app's own
+    store. Returns False (nothing done) when docker is unavailable."""
+    if not docker_available():
+        return False
+    result = docker_exec(WEB_CONTAINER, "python", "-c", _ACCOUNT_SCRIPT,
+                         _b64(email), _b64(password))
+    assert result.returncode == 0, (result.stdout[-300:], result.stderr[-500:])
+    return True
+
+
 @pytest.fixture(scope="session")
 def base_url() -> str:
     url = (os.environ.get(STACK_URL_ENV) or "").strip().rstrip("/")
@@ -129,9 +199,12 @@ def account() -> dict:
 def session(base_url, account):
     """A logged-in HTTP session against the stack.
 
-    The login route sets the password for a genuinely new email, so no
-    out-of-band account creation is needed.
+    The account is pre-created inside the container first, so this is a
+    returning sign-in: the new-account branch (brain welcome mail + a login
+    activity for a synthetic address) never fires. Without docker the login
+    route's own new-account branch creates it, as before.
     """
+    precreate_account(account["email"], account["password"])
     client = httpx.Client(base_url=base_url, follow_redirects=True,
                           timeout=REQUEST_TIMEOUT_S)
     response = client.post("/auth/login",

@@ -1217,7 +1217,6 @@ function setupEventListeners() {
   });
   
   // Save share settings
-  document.getElementById('btnSaveShare')?.addEventListener('click', saveShareSettings);
 }
 
 // Store welcome message for new chats
@@ -1386,6 +1385,19 @@ const AutoAnalytics = (function () {
   return { init, refresh, setState, stopPolling };
 })();
 
+// Edit Descriptions, Add Data and Auto Analytics change the chat itself, so
+// the server answers them for the chat's OWNER only. `/schema` reports
+// `is_owner`; on a chat shared with the user the three buttons are hidden
+// rather than failing late. null = not known yet → leave them as they are.
+let currentChatIsOwner = null;
+
+function _applyOwnerOnlyActions() {
+  if (currentChatIsOwner !== false) return;
+  document.getElementById('btnSchema')?.classList.add('hidden');
+  document.getElementById('btnAddData')?.classList.add('hidden');
+  document.getElementById('btnAutoAnalytics')?.classList.add('hidden');
+}
+
 // Show/hide top bar action buttons
 function showTopBarActions(show) {
   const btnSchema = document.getElementById('btnSchema');
@@ -1395,6 +1407,7 @@ function showTopBarActions(show) {
     btnSchema?.classList.remove('hidden');
     btnAddData?.classList.remove('hidden');
     btnAuto?.classList.remove('hidden');
+    _applyOwnerOnlyActions();
   } else {
     btnSchema?.classList.add('hidden');
     btnAddData?.classList.add('hidden');
@@ -1968,10 +1981,15 @@ let currentChatDfKeys = null;   // Set of df keys for the open chat; null = unkn
 let currentChatBlockedKeys = null;
 
 async function _loadCurrentDfKeys(chatId) {
+  currentChatIsOwner = null;
   try {
     const res = await fetch(`/api/chat/${chatId}/schema`);
     if (!res.ok) { currentChatDfKeys = null; currentChatBlockedKeys = null; _updateDataAsOfBadge(null); return; }
     const data = await res.json();
+    if (chatId === currentChatId && typeof data.is_owner === 'boolean') {
+      currentChatIsOwner = data.is_owner;
+      _applyOwnerOnlyActions();
+    }
     currentChatDfKeys = new Set((data.files || []).map(f => f.file_name).filter(Boolean));
     currentChatBlockedKeys = new Set((data.db_tables || [])
       .filter(t => t.allowed === false).map(t => t.df_key).filter(Boolean));
@@ -4632,54 +4650,6 @@ function _openPaddleCheckout(plan) {
     console.error('Paddle.Checkout.open error:', e);
     showToast('Failed to open checkout', true);
   }
-}
-
-// Share functions
-async function openShareModal() {
-  if (!currentChatId) return;
-  
-  showLoading('Loading share info...');
-  
-  try {
-    const res = await fetch(`/api/chat/${currentChatId}/share`);
-    const data = await res.json();
-    
-    document.getElementById('shareLink').value = data.absolute_url || '';
-    document.getElementById('shareEmails').value = (data.allowed_emails || []).join(', ');
-    
-    document.getElementById('shareModal').classList.remove('hidden');
-  } catch (e) {
-    console.error('Failed to load share info:', e);
-  }
-  
-  hideLoading();
-}
-
-async function saveShareSettings() {
-  if (!currentChatId) return;
-  
-  const emailsStr = document.getElementById('shareEmails').value;
-  const emails = emailsStr.split(',').map(e => e.trim()).filter(e => e);
-
-  showLoading('Saving...');
-
-  try {
-    // Share with emails if any
-    if (emails.length > 0) {
-      await fetch(`/api/chat/${currentChatId}/share`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ emails })
-      });
-    }
-    
-    showToast('Sharing settings saved');
-    document.getElementById('shareModal').classList.add('hidden');
-  } catch (e) {
-    showToast('Failed to save sharing settings', true);
-  }
-  
-  hideLoading();
 }
 
 // View / Edit Descriptions modal — chat-scoped, editable

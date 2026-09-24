@@ -5,7 +5,11 @@ shared recipients, the dashboard tile refresh blocked on BOTH branches
 (run_item_refresh + _reexecute_full_df) with the caller-specific role_denied
 reason never persisted, /schema's additive per-table `allowed` flag, file-only
 chats performing zero role reads, and drop_df_keys hiding denied frames from
-the exec namespace. Offline — table-kind refreshes only (no chart rendering)."""
+the exec namespace. Offline — table-kind refreshes only (no chart rendering).
+
+Every refreshed snippet is first seeded as a real AI history row
+(`conftest.seed_history`): refresh_item accepts only code the chat's history
+holds, and that check runs BEFORE the role gate these tests exercise."""
 import pytest
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, Request
@@ -15,6 +19,7 @@ from starlette.testclient import TestClient
 import db_sources
 import local_store
 import roles_store
+from conftest import seed_history
 from settings import settings
 
 ADMIN = "ladmin"
@@ -107,6 +112,7 @@ def _grant(email, table_ids):
 
 
 def _refresh(client, code):
+    seed_history(CHAT, code)
     return client.post(f"/api/chat/{CHAT}/refresh_item",
                        json={"code": code, "kind": "table"}).json()
 
@@ -182,6 +188,7 @@ def test_file_only_chat_performs_zero_role_reads(client, monkeypatch, tmp_path):
     def _boom(email):
         raise AssertionError("role resolver must not run for file-only chats")
     monkeypatch.setattr(roles_store, "allowed_table_ids_for", _boom)
+    seed_history("c_files1", "RESULT = dfs['old.csv']")
     out = client.post("/api/chat/c_files1/refresh_item",
                       json={"code": "RESULT = dfs['old.csv']",
                             "kind": "table"}).json()

@@ -4,6 +4,11 @@ Everything is offline and client-local: DATA_ROOT is isolated to tmp_path,
 chat auth is stubbed via local_store.chat_exists / get_chat_meta_owner, the
 brain share-email relay is stubbed, and tile re-execution is stubbed at the
 routes.dashboards.run_item_refresh seam.
+
+Every test that pins or refreshes POSTED code first seeds that code as a real
+AI history row (`conftest.seed_history`): the pin and refresh routes accept
+only code the chat's history holds, which is what the product's own answer
+persistence guarantees for every button the UI renders.
 """
 import json
 
@@ -15,6 +20,7 @@ from starlette.middleware.sessions import SessionMiddleware
 import local_store
 import routes.chat as chat_mod
 import routes.dashboards as dash_mod
+from conftest import seed_history
 from settings import settings
 
 OWNER = "alice@acme.com"
@@ -57,6 +63,14 @@ def _mk_dash(client, name="Sales"):
     resp = client.post("/api/dashboards", json={"name": name})
     assert resp.status_code == 200
     return resp.json()["dash_id"]
+
+
+PIN_CHART_CODE = "import plotly.express as px"
+
+
+def _seed_chart_code(chat_id="chat123", code=PIN_CHART_CODE):
+    """The code `_pin_chart` posts, persisted in the chat's history."""
+    return seed_history(chat_id, code)
 
 
 def _pin_chart(client, dash_id, chat_id="chat123", **extra):
@@ -133,6 +147,7 @@ def test_rename_and_delete_idempotent(client):
 def test_add_tile_chart_ok_and_shape(client, monkeypatch):
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    _seed_chart_code()
     dash = _mk_dash(client)
     resp = _pin_chart(client, dash)
     assert resp.status_code == 200
@@ -162,6 +177,7 @@ def test_add_tile_requires_chat_access(client, monkeypatch):
 def test_add_tile_validation(client, monkeypatch):
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    seed_history("chat123", "plot1 ###NEXT_PLOT### plot2")
     dash = _mk_dash(client)
     # bad kind
     assert client.post(f"/api/dashboards/{dash}/tiles",
@@ -201,6 +217,7 @@ def test_add_tile_table_caps_rows_keeps_total(client, monkeypatch):
 def test_add_tile_inlines_chart_data_key(client, monkeypatch):
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    _seed_chart_code()
     dash = _mk_dash(client)
     key = "deadbeefcafef00d"
     chat_mod._FULL_TABLE_CACHE[key] = {"columns": ["x"], "rows": [{"x": 1}]}
@@ -214,6 +231,7 @@ def test_add_tile_inlines_chart_data_key(client, monkeypatch):
 def test_layout_update_persists_and_ignores_unknown(client, monkeypatch):
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    _seed_chart_code()
     dash = _mk_dash(client)
     tile = _pin_chart(client, dash).json()["tile"]
     resp = client.post(f"/api/dashboards/{dash}/layout", json={"tiles": [
@@ -228,6 +246,7 @@ def test_layout_update_persists_and_ignores_unknown(client, monkeypatch):
 def test_remove_tile(client, monkeypatch):
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    _seed_chart_code()
     dash = _mk_dash(client)
     tile = _pin_chart(client, dash).json()["tile"]
     assert client.post(f"/api/dashboards/{dash}/tiles/{tile['tile_id']}/remove",
@@ -248,6 +267,7 @@ def _stub_refresh(monkeypatch, result):
 def test_refresh_chart_updates_snapshot_on_disk(client, monkeypatch):
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    _seed_chart_code()
     dash = _mk_dash(client)
     tile = _pin_chart(client, dash).json()["tile"]
     _stub_refresh(monkeypatch, {"ok": True, "kind": "chart",
@@ -264,6 +284,7 @@ def test_refresh_chart_updates_snapshot_on_disk(client, monkeypatch):
 def test_refresh_table_persists_new_full_key(client, monkeypatch):
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    seed_history("c1", "RESULT = dfs")
     dash = _mk_dash(client)
     tile = client.post(f"/api/dashboards/{dash}/tiles",
                        json={"chat_id": "c1", "kind": "table", "code": "RESULT = dfs",
@@ -283,6 +304,7 @@ def test_refresh_table_persists_new_full_key(client, monkeypatch):
 def test_refresh_failure_keeps_old_snapshot(client, monkeypatch):
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    _seed_chart_code()
     dash = _mk_dash(client)
     tile = _pin_chart(client, dash).json()["tile"]
     _stub_refresh(monkeypatch, {"ok": False, "error": "boom"})
@@ -296,6 +318,7 @@ def test_refresh_failure_keeps_old_snapshot(client, monkeypatch):
 def test_refresh_deleted_chat_freezes_then_success_clears(client, monkeypatch):
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    _seed_chart_code()
     dash = _mk_dash(client)
     tile = _pin_chart(client, dash).json()["tile"]
     _stub_chat(monkeypatch, exists=False)
@@ -362,6 +385,7 @@ def test_add_tile_table_code_resolved_from_full_record(client, monkeypatch):
     """The durable record's code overrides the client-sent (chart) code."""
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    seed_history("c1", "fig = make_subplots()")
     dash = _mk_dash(client)
     key = "aaaabbbbccccdddd"
     chat_mod._FULL_TABLE_CACHE[key] = {"columns": ["a"], "rows": [{"a": 1}],
@@ -385,6 +409,7 @@ def test_refresh_self_heals_wrong_table_code(client, monkeypatch):
     time from the durable record, and the corrected code is persisted."""
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    seed_history("c1", "fig = make_subplots()")
     dash = _mk_dash(client)
     key = "1111222233334444"
     # Record unknown at pin time → the wrong client code is stored (old tile).
@@ -454,6 +479,7 @@ def test_refresh_table_with_result_key_uses_reexecute(client, monkeypatch):
 def test_refresh_patch_keeps_styled_html(client, monkeypatch):
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    seed_history("c1", "RESULT = dfs")
     dash = _mk_dash(client)
     tile = client.post(f"/api/dashboards/{dash}/tiles",
                        json={"chat_id": "c1", "kind": "table", "code": "RESULT = dfs",
@@ -476,6 +502,7 @@ def test_refresh_patch_keeps_styled_html(client, monkeypatch):
 def test_refresh_item_endpoint_contract_after_extraction(client, monkeypatch):
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    seed_history("c1", "print(1)")
     # Validation errors stay HTTP 400.
     assert client.post("/api/chat/c1/refresh_item",
                        json={"code": "", "kind": "chart"}).status_code == 400
@@ -504,6 +531,7 @@ def test_share_flow_recipient_sees_and_reads(client, monkeypatch, tmp_path):
     _stub_chat(monkeypatch)
     calls = _stub_share_email(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    _seed_chart_code()
     dash = _mk_dash(client, "Team KPIs")
     _pin_chart(client, dash)
     resp = _share(client, dash)
@@ -525,6 +553,7 @@ def test_share_grants_source_chat_access(client, monkeypatch, tmp_path):
     _stub_chat(monkeypatch)
     _stub_share_email(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    _seed_chart_code("chat42")
     dash = _mk_dash(client)
     _pin_chart(client, dash, chat_id="chat42")
     _share(client, dash)
@@ -536,6 +565,7 @@ def test_share_recipient_mutations_403(client, monkeypatch):
     _stub_chat(monkeypatch)
     _stub_share_email(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    _seed_chart_code()
     dash = _mk_dash(client)
     tile = _pin_chart(client, dash).json()["tile"]
     _share(client, dash)
@@ -569,6 +599,7 @@ def test_share_recipient_refresh_ok_and_access_gate(client, monkeypatch):
     _stub_chat(monkeypatch)
     _stub_share_email(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    _seed_chart_code()
     dash = _mk_dash(client)
     tile = _pin_chart(client, dash).json()["tile"]
     _share(client, dash)
@@ -648,6 +679,7 @@ def _pin_table(client, dash_id, chat_id="chat123"):
 def test_table_tile_defaults_full_width(client, monkeypatch):
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    _seed_chart_code()
     dash = _mk_dash(client)
     chart = _pin_chart(client, dash).json()["tile"]
     assert chart["layout"]["w"] == 6
@@ -789,6 +821,7 @@ def test_text_tile_update_and_remove(client):
 def test_text_tile_update_rejected_for_chart(client, monkeypatch):
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
+    _seed_chart_code()
     dash = _mk_dash(client)
     tile = _pin_chart(client, dash).json()["tile"]
     assert client.post(f"/api/dashboards/{dash}/tiles/{tile['tile_id']}/update",

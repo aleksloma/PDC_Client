@@ -437,10 +437,17 @@ def _build_stopped_record(combined_answer, combined_codes, usage, charts):
     }
 
 
+# Chat ids are generated as `c_` + 16 hex; anything outside this charset is
+# not a chat id, whatever directory happens to exist under chatdata/.
+_CHAT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
 def _require_chat(request: Request, chat_id: str):
     email = request.session.get("email")
     if not email:
         return None, JSONResponse({"error": "Not authenticated"}, status_code=401)
+    if not (isinstance(chat_id, str) and _CHAT_ID_RE.fullmatch(chat_id)):
+        return None, JSONResponse({"error": "Chat not found"}, status_code=404)
     if not local_store.chat_exists(chat_id):
         return None, JSONResponse({"error": "Chat not found"}, status_code=404)
     owner = local_store.get_chat_meta_owner(chat_id)
@@ -456,6 +463,227 @@ def _require_chat(request: Request, chat_id: str):
     except Exception:
         pass
     return None, JSONResponse({"error": "Access denied"}, status_code=403)
+
+
+def _access_denied() -> JSONResponse:
+    return JSONResponse({"error": "Access denied"}, status_code=403)
+
+
+def _is_chat_owner(chat_id: str, email: str) -> bool:
+    """True only when `email` is the chat's recorded owner. A share recipient
+    passes `_require_chat` but is not the owner. Fails closed."""
+    try:
+        return bool(email) and local_store.get_chat_meta_owner(chat_id) == email
+    except Exception as e:
+        log_with_sid(chat_id, "warning",
+                     f"CHAT_OWNER_CHECK_FAILED {log_safe_text(type(e).__name__, 80)}")
+        return False
+
+
+def _require_chat_owner(request: Request, chat_id: str):
+    """`_require_chat`, then owner-only: a share recipient gets 403. Used by
+    the mutations that change what the owner's chat IS (descriptions, files,
+    who it is shared with, the Auto Analytics deck)."""
+    email, err = _require_chat(request, chat_id)
+    if err:
+        return None, err
+    if not _is_chat_owner(chat_id, email):
+        return None, _access_denied()
+    return email, None
+
+
+def _conv_in_index(email: str, chat_id: str, conv_id: str) -> bool:
+    """True when `conv_id` is a conversation of `chat_id` recorded in the
+    caller's OWN conversation index (their own conversations in a shared chat
+    and the snapshot copies shared with them). Fails closed."""
+    if not conv_id:
+        return False
+    try:
+        return any(row.get("conv_id") == conv_id and row.get("chat_id") == chat_id
+                   for row in local_store.AuthStore().list_conversations(email))
+    except Exception as e:
+        log_with_sid(chat_id, "warning",
+                     f"CONV_INDEX_CHECK_FAILED {log_safe_text(type(e).__name__, 80)}")
+        return False
+
+
+def _may_use_conversation(email: str, chat_id: str, conv_id: str) -> bool:
+    """The owner may act on any conversation of their chat; anyone else only
+    on conversations in their own index."""
+    return _is_chat_owner(chat_id, email) or _conv_in_index(email, chat_id, conv_id)
+
+
+def _conv_of_chat(chat_id: str, conv_id) -> bool:
+    """The conversation file exists under THIS chat. Stop and status are keyed
+    by conversation id alone, so the chat in the path must be related to it."""
+    try:
+        if not local_store.valid_conv_id(conv_id):
+            return False
+        return (local_store._data_root() / "chatdata" / chat_id / "conversations"
+                / f"{conv_id}.jsonl").is_file()
+    except Exception as e:
+        log_with_sid(chat_id, "warning",
+                     f"CONV_LOOKUP_FAILED {log_safe_text(type(e).__name__, 80)}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Stored-code binding for the re-run routes
+# ---------------------------------------------------------------------------
+# `refresh_item` and the dashboard pin execute / store code the browser posts.
+# They accept only code the chat already holds: an AI history row's `code`
+# (whole, or one `###NEXT_PLOT###` segment of a joined multi-chart row), the
+# code of the turn being generated right now, or the `code` of a durable
+# full-table record. Comparison is after CRLF->LF and `strip()` — the browser
+# trims with JS `trim()`, which agrees with `str.strip()` except on U+FEFF.
+_NEXT_PLOT_MARKER = "###NEXT_PLOT###"
+
+# In-flight codes: {chat_id: {normalized code: count}}. The generating worker
+# registers each code BEFORE the event carrying it is queued to the browser and
+# removes it after the turn is persisted, so a chart streamed on a `partial`
+# event (or shown right after Stop) is refreshable and pinnable before its
+# history row exists. A count, not a set: two turns in one chat may carry the
+# same code, and one finishing must not unregister the other's.
+_INFLIGHT_CODES: dict[str, dict[str, int]] = {}
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def _normalize_code(code) -> str:
+    if not isinstance(code, str):
+        return ""
+    return code.replace("\r\n", "\n").strip()
+
+
+def _code_segments(code) -> list[str]:
+    """The normalized code, and each non-empty `###NEXT_PLOT###` segment."""
+    whole = _normalize_code(code)
+    if not whole:
+        return []
+    out = [whole]
+    if _NEXT_PLOT_MARKER in whole:
+        out.extend(s for s in (_normalize_code(p) for p in whole.split(_NEXT_PLOT_MARKER))
+                   if s)
+    return out
+
+
+def _inflight_add(chat_id: str, code) -> None:
+    try:
+        with _INFLIGHT_LOCK:
+            bucket = _INFLIGHT_CODES.setdefault(chat_id, {})
+            for seg in _code_segments(code):
+                bucket[seg] = bucket.get(seg, 0) + 1
+    except Exception as e:
+        log_with_sid(chat_id, "warning",
+                     f"INFLIGHT_ADD_FAILED {log_safe_text(type(e).__name__, 80)}")
+
+
+def _inflight_discard(chat_id: str, codes) -> None:
+    try:
+        with _INFLIGHT_LOCK:
+            bucket = _INFLIGHT_CODES.get(chat_id)
+            if not bucket:
+                return
+            for code in codes or []:
+                for seg in _code_segments(code):
+                    left = bucket.get(seg, 0) - 1
+                    if left > 0:
+                        bucket[seg] = left
+                    else:
+                        bucket.pop(seg, None)
+            if not bucket:
+                _INFLIGHT_CODES.pop(chat_id, None)
+    except Exception as e:
+        log_with_sid(chat_id, "warning",
+                     f"INFLIGHT_DISCARD_FAILED {log_safe_text(type(e).__name__, 80)}")
+
+
+def _inflight_has(chat_id: str, normalized: str) -> bool:
+    with _INFLIGHT_LOCK:
+        return normalized in (_INFLIGHT_CODES.get(chat_id) or {})
+
+
+def code_is_stored(chat_id: str, code) -> bool:
+    """True when `code` is code this chat already holds (see the block
+    comment above). Order: the in-flight turn (in memory, O(1)), then
+    history rows, then the durable full-table records (a new one is written on every table refresh
+    and nothing prunes them, so they are read only on a miss). Blocking file
+    I/O — call it off the event loop. Never raises; an unexpected failure
+    answers False, i.e. the code is not run."""
+    try:
+        wanted = _normalize_code(code)
+        if not wanted:
+            return False
+        if _inflight_has(chat_id, wanted):
+            return True
+        conv_dir = local_store._data_root() / "chatdata" / chat_id / "conversations"
+        if conv_dir.is_dir():
+            for path in conv_dir.glob("*.jsonl"):
+                try:
+                    lines = path.read_text(encoding="utf-8").splitlines()
+                except Exception as e:
+                    log_with_sid(chat_id, "warning",
+                                 f"CODE_LOOKUP_READ_FAILED "
+                                 f"{log_safe_text(type(e).__name__, 80)}")
+                    continue
+                unreadable = 0
+                for line in lines:
+                    if '"code"' not in line:
+                        continue             # human/welcome rows carry no code
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        unreadable += 1      # logged once per file below
+                        continue
+                    if isinstance(row, dict) and row.get("role") == "ai" \
+                            and wanted in _code_segments(row.get("code")):
+                        return True
+                if unreadable:
+                    log_with_sid(chat_id, "warning",
+                                 f"CODE_LOOKUP_ROWS_SKIPPED count={int(unreadable)}")
+        full_dir = conv_dir / "full"
+        if full_dir.is_dir():
+            for path in full_dir.glob("*.json"):
+                try:
+                    rec = json.loads(path.read_text(encoding="utf-8"))
+                except Exception as e:
+                    log_with_sid(chat_id, "warning",
+                                 f"CODE_LOOKUP_RECORD_FAILED "
+                                 f"{log_safe_text(type(e).__name__, 80)}")
+                    continue
+                if isinstance(rec, dict) and wanted in _code_segments(rec.get("code")):
+                    return True
+        return False
+    except Exception as e:
+        log_with_sid(chat_id, "error",
+                     f"CODE_LOOKUP_FAILED {log_safe_text(type(e).__name__, 80)}")
+        return False
+
+
+async def code_is_stored_async(chat_id: str, code) -> bool:
+    """`code_is_stored` on the worker pool, like the frame load."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_EXEC, code_is_stored, chat_id, code)
+
+
+def _code_not_stored(status_code: int) -> JSONResponse:
+    return JSONResponse({"error": "This item's code is not part of the chat's history.",
+                         "code": "CODE_NOT_STORED"}, status_code=status_code)
+
+
+def _event_codes(event) -> list:
+    """The codes a generator event shows the browser: a streamed chart's
+    `code`, a multi-chart done's `combined_codes`, a single answer's code."""
+    if not isinstance(event, dict):
+        return []
+    if event.get("single_response"):
+        codes = [(event.get("result") or {}).get("code")]
+    elif event.get("partial"):
+        codes = [event.get("code")]
+    elif event.get("done"):
+        codes = list(event.get("combined_codes") or [])
+    else:
+        codes = []
+    return [c for c in codes if isinstance(c, str) and c.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +800,9 @@ async def get_schema(request: Request, chat_id: str):
         "common_fields": meta.get("common_fields", []),
         "db_tables": db_tables,
         "data_as_of": data_as_of,
+        # The page hides the owner-only actions (descriptions, Add Data,
+        # Auto Analytics) for a share recipient instead of letting them 403.
+        "is_owner": _is_chat_owner(chat_id, email),
     }
 
 
@@ -721,7 +952,7 @@ async def probe_columns(request: Request, chat_id: str,
 
 @router.post("/{chat_id}/schema")
 async def save_schema(request: Request, chat_id: str):
-    email, err = _require_chat(request, chat_id)
+    email, err = _require_chat_owner(request, chat_id)
     if err:
         return err
     body = await request.json()
@@ -746,6 +977,8 @@ async def history(request: Request, chat_id: str, conv_id: str):
     email, err = _require_chat(request, chat_id)
     if err:
         return err
+    if not _may_use_conversation(email, chat_id, conv_id):
+        return _access_denied()
     store = local_store.ChatDataStore(chat_id)
     return {"history": store.get_history(conv_id)}
 
@@ -757,10 +990,13 @@ async def conversation_status(request: Request, chat_id: str, conv_id: str):
     Registry lookup only (no I/O). Lets a page reloaded/reopened mid-generation
     show the working indicator and block new questions until the worker has
     persisted the AI turn. Mirrors the Auto Analytics status-poll pattern.
+    Open to every reader of the chat, for conversations of THIS chat only.
     """
     email, err = _require_chat(request, chat_id)
     if err:
         return err
+    if not _conv_of_chat(chat_id, conv_id):
+        return _access_denied()
     return {"generating": _is_generating(conv_id)}
 
 
@@ -772,10 +1008,15 @@ async def conversation_stop(request: Request, chat_id: str, conv_id: str):
     chart still finishes), persists the partial AI turn (the charts produced so
     far, same shape as a normal turn), and emits a normal `done`. Idempotent —
     setting the flag when nothing is running is a harmless no-op.
+    The conversation must belong to THIS chat, and a non-owner may stop only
+    a conversation in their own index.
     """
     email, err = _require_chat(request, chat_id)
     if err:
         return err
+    if not (_conv_of_chat(chat_id, conv_id)
+            and _may_use_conversation(email, chat_id, conv_id)):
+        return _access_denied()
     _request_cancel(conv_id)
     # `conv_id` is request-controlled at every one of these log sites (a path
     # segment here, a JSON body field in the stream) and is NOT validated
@@ -789,10 +1030,13 @@ async def conversation_stop(request: Request, chat_id: str, conv_id: str):
 
 @router.get("/{chat_id}/history")
 async def chat_history(request: Request, chat_id: str):
-    """Legacy single-conversation history — return the most recent conv."""
+    """Legacy single-conversation history — return the most recent conv.
+    The newest conversation may be anyone's, so a non-owner gets none."""
     email, err = _require_chat(request, chat_id)
     if err:
         return err
+    if not _is_chat_owner(chat_id, email):
+        return {"history": []}
     store = local_store.ChatDataStore(chat_id)
     # Pick the newest conversation file
     try:
@@ -827,6 +1071,11 @@ async def chat_stream(request: Request, chat_id: str):
     conv_id = body.get("conv_id")
     if not question:
         return JSONResponse({"error": "Question cannot be empty."}, status_code=400)
+    # A supplied conversation is read into the prompt and appended to: a
+    # non-owner may continue only a conversation in their own index. Checked
+    # before any history is read or written.
+    if conv_id and not _may_use_conversation(email, chat_id, conv_id):
+        return _access_denied()
 
     store = local_store.ChatDataStore(chat_id)
     busy = _auto_analysis_busy_response(store, email, chat_id)
@@ -885,6 +1134,7 @@ async def chat_stream(request: Request, chat_id: str):
             w_combined_tables = None        # tables of a mixed charts+tables answer
             err_msg = None
             cancelled = False               # STOP requested mid-generation
+            w_inflight: list = []           # codes registered for refresh/pin
             # Clear any stale cancel flag from a prior attempt, then mark this
             # conv in-progress for the duration of the worker so a page reloaded
             # mid-generation sees generating=true. Both flags are cleared in
@@ -942,6 +1192,12 @@ async def chat_stream(request: Request, chat_id: str):
                                 _codes[_i] if _i < len(_codes) else None,
                                 result_key=_rkeys[_i] if _i < len(_rkeys) else None))
                         event["full_table_keys"] = _keys
+                    # Register the codes this event shows BEFORE the browser can
+                    # see it: its refresh / pin buttons work while the turn is
+                    # still being generated. Removed after persistence below.
+                    for _c in _event_codes(event):
+                        _inflight_add(chat_id, _c)
+                        w_inflight.append(_c)
                     # Stream live first (UX identical to before), then accumulate.
                     loop.call_soon_threadsafe(queue.put_nowait, ("event", event))
                     try:
@@ -1050,6 +1306,8 @@ async def chat_stream(request: Request, chat_id: str):
                 # Unmark only after persistence above has completed, so a status
                 # poll that now sees generating=false will find the AI turn saved.
                 # Clear the cancel flag too (paired with the start-of-worker clear).
+                # The in-flight codes go with it: they are in the history now.
+                _inflight_discard(chat_id, w_inflight)
                 _unmark_generating(conv_id)
                 _clear_cancel(conv_id)
                 loop.call_soon_threadsafe(queue.put_nowait, None)
@@ -1202,6 +1460,10 @@ async def edit_regenerate(request: Request, chat_id: str):
         return JSONResponse({"error": "Question cannot be empty."}, status_code=400)
     if not conv_id:
         return JSONResponse({"error": "Conversation ID is required."}, status_code=400)
+    # Truncates the conversation: a non-owner may edit only one in their own
+    # index. Checked before anything is read or written.
+    if not _may_use_conversation(email, chat_id, conv_id):
+        return _access_denied()
 
     store = local_store.ChatDataStore(chat_id)
     if not store.root.exists():
@@ -1298,114 +1560,122 @@ async def edit_regenerate(request: Request, chat_id: str):
     combined_codes: list[str] = []
     final_usage: dict = {}
 
-    for ev in events:
-        if ev.get("partial"):
-            img = ev.get("image_base64")
-            if img:
-                all_images.append(img)
-                all_answers.append(ev.get("answer", ""))
-            continue
-        if ev.get("done") and not ev.get("single_response"):
-            combined_codes = ev.get("combined_codes") or []
-            final_usage = ev.get("total_usage") or {}
-            combined_answer = ev.get("combined_answer", "")
-            history_obj: dict = {
-                "role": "ai", "content": combined_answer,
-                "image_base64": None, "table": None,
-                "code": "\n\n###NEXT_PLOT###\n\n".join(combined_codes),
-                "usage": final_usage, "ts": time.time(),
-            }
-            if len(all_images) >= 2:
-                history_obj["images"] = [
-                    {"image_base64": img, "answer": ans}
-                    for img, ans in zip(all_images, all_answers) if img
-                ]
-            elif len(all_images) == 1:
-                history_obj["image_base64"] = all_images[0]
-            # Mixed dashboard answer: persist the KPI/table blocks' tables with
-            # per-table durable keys (same as chat_stream's worker).
-            tbls = ev.get("tables") or []
-            if tbls:
-                codes_per = ev.get("table_codes") or []
-                rkeys = ev.get("table_result_keys") or []
-                keys = [
-                    _persist_full_table(store, t,
-                                        codes_per[i] if i < len(codes_per) else None,
-                                        result_key=rkeys[i] if i < len(rkeys) else None)
-                    for i, t in enumerate(tbls)
-                ]
-                history_obj["tables"] = tbls
-                history_obj["full_table_keys"] = keys
-            store.append_history(conv_id, history_obj)
-            out: dict = {
-                "ok": True, "done": True, "conv_id": conv_id,
-                "answer": combined_answer,
-                "image_base64": None, "table": None,
-                "code": "\n\n###NEXT_PLOT###\n\n".join(combined_codes),
-                "tokens": final_usage,
-            }
-            if "images" in history_obj:
-                out["images"] = history_obj["images"]
-            elif history_obj.get("image_base64"):
-                out["image_base64"] = history_obj["image_base64"]
-            if tbls:
-                out["tables"] = tbls
-                out["full_table_keys"] = history_obj.get("full_table_keys")
-            return JSONResponse(_json_safe(out))
+    # The answer is persisted inside this loop; its codes count as stored
+    # until then (same registry the streaming worker uses).
+    inflight = [c for ev in events for c in _event_codes(ev)]
+    for c in inflight:
+        _inflight_add(chat_id, c)
+    try:
+        for ev in events:
+            if ev.get("partial"):
+                img = ev.get("image_base64")
+                if img:
+                    all_images.append(img)
+                    all_answers.append(ev.get("answer", ""))
+                continue
+            if ev.get("done") and not ev.get("single_response"):
+                combined_codes = ev.get("combined_codes") or []
+                final_usage = ev.get("total_usage") or {}
+                combined_answer = ev.get("combined_answer", "")
+                history_obj: dict = {
+                    "role": "ai", "content": combined_answer,
+                    "image_base64": None, "table": None,
+                    "code": "\n\n###NEXT_PLOT###\n\n".join(combined_codes),
+                    "usage": final_usage, "ts": time.time(),
+                }
+                if len(all_images) >= 2:
+                    history_obj["images"] = [
+                        {"image_base64": img, "answer": ans}
+                        for img, ans in zip(all_images, all_answers) if img
+                    ]
+                elif len(all_images) == 1:
+                    history_obj["image_base64"] = all_images[0]
+                # Mixed dashboard answer: persist the KPI/table blocks' tables with
+                # per-table durable keys (same as chat_stream's worker).
+                tbls = ev.get("tables") or []
+                if tbls:
+                    codes_per = ev.get("table_codes") or []
+                    rkeys = ev.get("table_result_keys") or []
+                    keys = [
+                        _persist_full_table(store, t,
+                                            codes_per[i] if i < len(codes_per) else None,
+                                            result_key=rkeys[i] if i < len(rkeys) else None)
+                        for i, t in enumerate(tbls)
+                    ]
+                    history_obj["tables"] = tbls
+                    history_obj["full_table_keys"] = keys
+                store.append_history(conv_id, history_obj)
+                out: dict = {
+                    "ok": True, "done": True, "conv_id": conv_id,
+                    "answer": combined_answer,
+                    "image_base64": None, "table": None,
+                    "code": "\n\n###NEXT_PLOT###\n\n".join(combined_codes),
+                    "tokens": final_usage,
+                }
+                if "images" in history_obj:
+                    out["images"] = history_obj["images"]
+                elif history_obj.get("image_base64"):
+                    out["image_base64"] = history_obj["image_base64"]
+                if tbls:
+                    out["tables"] = tbls
+                    out["full_table_keys"] = history_obj.get("full_table_keys")
+                return JSONResponse(_json_safe(out))
 
-        # Single-shot path
-        if ev.get("single_response"):
-            single_result = ev.get("result") or {}
-            # Persist the tabular result durably (with code) BEFORE the history
-            # record, so the key can be embedded → a reloaded conversation
-            # re-executes for the FULL Download Excel / Show full table.
-            full_table_key = None
-            tbl = single_result.get("table")
-            if isinstance(tbl, dict) and tbl.get("rows"):
-                full_table_key = _persist_full_table(
-                    store, tbl, single_result.get("code"))
-            # Multi-table answer: one durable key per table (see chat_stream).
-            full_table_keys = None
-            tbls = single_result.get("tables")
-            if isinstance(tbls, list) and tbls:
-                full_table_keys = [
-                    _persist_full_table(store, t, single_result.get("code"),
-                                        result_key=t.get("title"))
-                    for t in tbls
-                ]
-            ai_record = {
-                "role": "ai",
-                "content": single_result.get("text", ""),
-                "image_base64": single_result.get("image_base64"),
-                "table": single_result.get("table"),
-                "code": single_result.get("code"),
-                "usage": single_result.get("usage"),
-                "ts": time.time(),
-            }
-            if full_table_key:
-                ai_record["full_table_key"] = full_table_key
-            if tbls:
-                ai_record["tables"] = tbls
-                if full_table_keys:
-                    ai_record["full_table_keys"] = full_table_keys
-            store.append_history(conv_id, ai_record)
-            chart_data_key = None
-            cd = single_result.get("chart_data")
-            if isinstance(cd, dict) and (cd.get("rows") or cd.get("tables")):
-                chart_data_key = _cache_full_table(cd)
-            out = {
-                "ok": True, "done": True, "conv_id": conv_id,
-                "answer": single_result.get("text", ""),
-                "image_base64": single_result.get("image_base64"),
-                "table": single_result.get("table"),
-                "tables": single_result.get("tables"),
-                "full_table_key": full_table_key,
-                "full_table_keys": full_table_keys,
-                "chart_data_key": chart_data_key,
-                "code": single_result.get("code"),
-                "tokens": single_result.get("usage") or {},
-            }
-            return JSONResponse(_json_safe(out))
+            # Single-shot path
+            if ev.get("single_response"):
+                single_result = ev.get("result") or {}
+                # Persist the tabular result durably (with code) BEFORE the history
+                # record, so the key can be embedded → a reloaded conversation
+                # re-executes for the FULL Download Excel / Show full table.
+                full_table_key = None
+                tbl = single_result.get("table")
+                if isinstance(tbl, dict) and tbl.get("rows"):
+                    full_table_key = _persist_full_table(
+                        store, tbl, single_result.get("code"))
+                # Multi-table answer: one durable key per table (see chat_stream).
+                full_table_keys = None
+                tbls = single_result.get("tables")
+                if isinstance(tbls, list) and tbls:
+                    full_table_keys = [
+                        _persist_full_table(store, t, single_result.get("code"),
+                                            result_key=t.get("title"))
+                        for t in tbls
+                    ]
+                ai_record = {
+                    "role": "ai",
+                    "content": single_result.get("text", ""),
+                    "image_base64": single_result.get("image_base64"),
+                    "table": single_result.get("table"),
+                    "code": single_result.get("code"),
+                    "usage": single_result.get("usage"),
+                    "ts": time.time(),
+                }
+                if full_table_key:
+                    ai_record["full_table_key"] = full_table_key
+                if tbls:
+                    ai_record["tables"] = tbls
+                    if full_table_keys:
+                        ai_record["full_table_keys"] = full_table_keys
+                store.append_history(conv_id, ai_record)
+                chart_data_key = None
+                cd = single_result.get("chart_data")
+                if isinstance(cd, dict) and (cd.get("rows") or cd.get("tables")):
+                    chart_data_key = _cache_full_table(cd)
+                out = {
+                    "ok": True, "done": True, "conv_id": conv_id,
+                    "answer": single_result.get("text", ""),
+                    "image_base64": single_result.get("image_base64"),
+                    "table": single_result.get("table"),
+                    "tables": single_result.get("tables"),
+                    "full_table_key": full_table_key,
+                    "full_table_keys": full_table_keys,
+                    "chart_data_key": chart_data_key,
+                    "code": single_result.get("code"),
+                    "tokens": single_result.get("usage") or {},
+                }
+                return JSONResponse(_json_safe(out))
+    finally:
+        _inflight_discard(chat_id, inflight)
 
     # Should not reach here, but degrade safely.
     return JSONResponse(
@@ -1489,8 +1759,9 @@ async def share_post(request: Request, chat_id: str):
     Adds the recipients to this chat's sharing list and asks the brain to
     SMTP-relay an invite email to each. The brain's SMTP relay uses this
     tenant's smtp_* config (set in the per-tenant admin page).
+    Owner-only: a recipient cannot hand the chat on.
     """
-    email, err = _require_chat(request, chat_id)
+    email, err = _require_chat_owner(request, chat_id)
     if err:
         return err
     body = await request.json()
@@ -1517,6 +1788,11 @@ async def share_post(request: Request, chat_id: str):
     sharing["shared_with"] = sorted(existing)
     meta["sharing"] = sharing
     store.write_meta(meta)
+    # An address that has never signed in gets a password-less placeholder,
+    # so whoever types it first at the sign-in page cannot claim the share.
+    auth = local_store.AuthStore()
+    for rec in recipients:
+        auth.ensure_invited_user(rec, email)
 
     chat_title = meta.get("title", "")
     smtp_result = {"smtp_configured": False, "sent": [], "failed": []}
@@ -1567,8 +1843,9 @@ async def publish_status_disabled(request: Request, chat_id: str):
 async def auto_analysis_start(request: Request, chat_id: str):
     """Kick off the auto-analysis background job. Returns immediately; poll
     `/auto_analysis/status` for state and finally fetch the PPTX from
-    `/auto_analysis/download` when status is `done`."""
-    email, err = _require_chat(request, chat_id)
+    `/auto_analysis/download` when status is `done`. Owner-only: the job
+    writes its deck and state into the chat."""
+    email, err = _require_chat_owner(request, chat_id)
     if err:
         return err
     import auto_analytics as aa
@@ -1809,6 +2086,11 @@ async def refresh_item(request: Request, chat_id: str):
     if "###NEXT_PLOT###" in code:
         # Legacy joined multi-chart record — not a single executable block.
         return JSONResponse({"error": "This item cannot be refreshed."}, status_code=400)
+    # Only code the chat already holds is re-run — decided before the role
+    # gate, so unstored code never reaches it.
+    if not await code_is_stored_async(chat_id, code):
+        log_with_sid(email, "warning", "REFRESH_CODE_NOT_STORED", chat_id=chat_id)
+        return _code_not_stored(403)
     drop, blocked = _role_refresh_block(email, chat_id, code)
     if blocked:
         # Role denial follows the EXECUTION-failure contract (200 {ok:false})

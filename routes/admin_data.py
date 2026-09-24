@@ -507,6 +507,73 @@ def _persist_sql_recommendations_inner(store, tables: list, stats: dict,
                                         actor_kind=actor_kind)
 
 
+def _rel_ref_in_scope(scope, store, ref: str, tables=None) -> bool:
+    """A stored or posted relation's RELATED side is inside the management
+    scope. The ref is a table id, or a legacy `related_table` display name —
+    a name counts as out of scope when ANY registration of that name is.
+    An unknown ref resolves to nothing and passes (it relates nothing)."""
+    if scope is None or not ref:
+        return True
+    if db_sources.DataSourceStore.valid_id(ref):
+        parent = store.get_table(ref)
+        return parent is None or _in_scope(scope, parent.get("connection_id"),
+                                           parent.get("schema"))
+    wanted = ref.strip().lower()
+    for t in (tables if tables is not None else store.list_tables()):
+        names = {str(t.get("display_name") or "").strip().lower(),
+                 str(t.get("table_name") or "").strip().lower()}
+        if wanted in names and not _in_scope(scope, t.get("connection_id"),
+                                             t.get("schema")):
+            return False
+    return True
+
+
+def _scoped_relations(scope, store, posted: list, existing: list):
+    """Apply the both-sides-in-scope rule to a table save's `relations`.
+
+    For a power user, a posted relation whose related table is OUTSIDE the
+    scope is accepted only when it is an unchanged copy of a stored one (the
+    wizard posts the stored relations back on every edit); a new or changed
+    one is refused. A stored out-of-scope relation the post omits is KEPT —
+    the power user cannot remove it any more than add it. Returns
+    (relations, None) or (None, the out-of-scope error)."""
+    if scope is None:
+        return posted, None
+    tables = store.list_tables()
+
+    def ref_of(rel):
+        return str(rel.get("related_table_id") or rel.get("related_table") or "").strip()
+
+    def pairs_of(rel):
+        try:
+            return [[str(p[0]), str(p[1])] for p in (rel.get("join_keys") or [])]
+        except Exception as e:
+            log_with_sid("admin", "warning",
+                         f"REL_SCOPE_MALFORMED_ENTRY: {type(e).__name__}")
+            return None
+
+    def stored_copy(rel):
+        pairs = pairs_of(rel)
+        return pairs is not None and any(
+            isinstance(r, dict) and _rel_matches(r, ref_of(rel), pairs)
+            for r in existing)
+
+    for rel in posted:
+        if (not _rel_ref_in_scope(scope, store, ref_of(rel), tables)
+                and not stored_copy(rel)):
+            return None, _out_of_scope(
+                "A relation to a table outside your managed scope cannot be "
+                "added or changed.")
+    kept = list(posted)
+    for r in existing:
+        if not isinstance(r, dict) or _rel_ref_in_scope(scope, store, ref_of(r), tables):
+            continue
+        pairs = pairs_of(r)
+        if pairs is not None and not any(_rel_matches(p, ref_of(r), pairs) for p in posted):
+            kept.append(r)
+    return kept, None
+
+
 def _rel_matches(rel: dict, ref: str, jk: list) -> bool:
     """Exact match of a stored relation entry: same related ref (id or legacy
     name) AND join_keys equal as ordered [[child, parent], ...] lists."""
@@ -934,6 +1001,12 @@ async def accept_relations(request: Request):
                 isinstance(p, (list, tuple)) and len(p) == 2 for p in rep_jk))
             if not ok_rep:
                 return _reject(f"relations[{idx}]: invalid replaces.")
+            # The relation being REPLACED is removed: its related table must
+            # be in scope as well, like both sides of the new one.
+            if not _rel_ref_in_scope(scope, store, rep_ref):
+                return _reject("The relation being replaced relates a table "
+                               "outside your managed scope.",
+                               status=403, code="OUT_OF_SCOPE")
             # No truncation: the ref is compared against stored values, never
             # stored itself — a shortened ref could silently stop matching.
             replaces = {"ref": rep_ref,
@@ -1714,6 +1787,14 @@ async def save_table(request: Request, tid: str = ""):
     if own is not None and not _in_scope(scope, own.get("connection_id"),
                                          own.get("schema")):
         return _out_of_scope()
+    # Relations saved with the table follow the relation-accept rule: both
+    # sides inside the power user's scope (ladmin unrestricted).
+    posted_rels = [r for r in (body.get("relations") or []) if isinstance(r, dict)]
+    relations, rel_err = _scoped_relations(
+        scope, store, posted_rels,
+        [r for r in ((own or {}).get("relations") or []) if isinstance(r, dict)])
+    if rel_err is not None:
+        return rel_err
     own_key = relation_discovery.physical_key(own) if own else None
     new_key = relation_discovery.physical_key(
         {"connection_id": body.get("connection_id"),
@@ -1749,7 +1830,7 @@ async def save_table(request: Request, tid: str = ""):
         description=body.get("description") or "",
         columns=body.get("columns") or [],
         is_connector=bool(body.get("is_connector")),
-        relations=body.get("relations") or [], intro=intro,
+        relations=relations, intro=intro,
         where_filter=body.get("where_filter"), row_cap=body.get("row_cap"),
         email=email, existing=own)
     # Relations are stored verbatim here (frozen contract — rejecting would

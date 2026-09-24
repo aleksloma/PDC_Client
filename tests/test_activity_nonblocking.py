@@ -6,7 +6,14 @@ the underlying post still happens, and its failure is swallowed with a log."""
 import threading
 import time
 
+import pytest
+
 import brain_client
+
+# tests/conftest.py stubs post_activity for the whole suite (no test may
+# reach BRAIN_URL); this module IS the test of the real worker, so it opts
+# out and supplies its own `_post` stub instead.
+pytestmark = pytest.mark.real_activity_worker
 
 
 def test_post_activity_returns_immediately_even_when_brain_is_slow(monkeypatch):

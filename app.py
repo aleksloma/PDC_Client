@@ -29,6 +29,7 @@ from starlette.datastructures import MutableHeaders
 
 from settings import settings
 from logger_utils import log_with_sid
+from exec_transport import log_safe_text
 from local_store import AuthStore
 import sso_store
 import gcs_upload
@@ -71,17 +72,19 @@ async def lifespan(app: FastAPI):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+    # Configuration comes from the environment, which this code did not
+    # write: escaped like any other outside text.
     log_with_sid("startup", "info", "CLIENT_STARTED",
-                 data_root=settings.DATA_ROOT,
-                 brain_url=settings.BRAIN_URL,
+                 data_root=log_safe_text(str(settings.DATA_ROOT), 200),
+                 brain_url=log_safe_text(str(settings.BRAIN_URL), 200),
                  token_set=bool(settings.BRAIN_TENANT_TOKEN))
     # Build marker — lets an operator confirm from the logs WHICH image is
     # running (a stale image is the classic "my fix isn't live" cause). Fed by
     # the Docker build args; also served by GET /version.
     log_with_sid("startup", "info", "CLIENT_BUILD",
-                 commit=settings.BUILD_COMMIT or "dev",
-                 build_time=settings.BUILD_TIME or "unstamped",
-                 started_at=_STARTED_AT.isoformat(timespec="seconds"))
+                 commit=log_safe_text(str(settings.BUILD_COMMIT or "dev"), 80),
+                 build_time=log_safe_text(str(settings.BUILD_TIME or "unstamped"), 80),
+                 started_at=log_safe_text(_STARTED_AT.isoformat(timespec="seconds"), 40))
     # Fixed local admin bootstrap (idempotent; never overwrites an existing
     # password) + the nightly database-snapshot refresh scheduler. Both are
     # lifespan-scoped on purpose: an import-time thread would leak into every
@@ -104,7 +107,9 @@ async def lifespan(app: FastAPI):
         import executor_client
         executor_client.startup()
     except Exception as e:
-        log_with_sid("startup", "error", f"EXECUTOR_STARTUP_FAILED {type(e).__name__}: {e}")
+        log_with_sid("startup", "error",
+                     f"EXECUTOR_STARTUP_FAILED {log_safe_text(type(e).__name__, 80)}: "
+                     f"{log_safe_text(str(e), 200)}")
     import db_scheduler
     db_scheduler.start()
     yield
@@ -243,7 +248,8 @@ class BackendNetworkGuard:
             if raw not in _BACKEND_BAD_CIDRS:
                 _BACKEND_BAD_CIDRS.add(raw)
                 log_with_sid("startup", "error",
-                             f"BACKEND_CIDR_INVALID {type(e).__name__}: {e}")
+                             f"BACKEND_CIDR_INVALID {log_safe_text(type(e).__name__, 80)}: "
+                             f"{log_safe_text(str(e), 200)}")
             return None
 
     @staticmethod
@@ -278,11 +284,13 @@ class BackendNetworkGuard:
             # percent-DECODES it, so a request for `/x%0a…` would otherwise
             # write a forged line into the durable log — and the caller this
             # guard exists for is the one the design assumes hostile. `repr`
-            # escapes CR/LF and every other control character; the peer
-            # address needs no such treatment, it came from the socket.
+            # escapes CR/LF and every other control character. Both values
+            # still pass the shared helper, which is the identity for them;
+            # its cap is repr's worst case (`􏿿` = 10 characters per
+            # character, plus the quotes), so it never cuts the rendering.
             log_with_sid("security", "warning",
-                         f"BACKEND_REQUEST_REFUSED client={host} "
-                         f"path={_refused_path(scope.get('path'))}")
+                         f"BACKEND_REQUEST_REFUSED client={log_safe_text(str(host), 64)} "
+                         f"path={log_safe_text(_refused_path(scope.get('path')), _REFUSED_PATH_MAX_CHARS * 10 + 2)}")
         if scope["type"] == "websocket":
             # A websocket scope cannot be answered with an HTTP response
             # message; the refusal is a close instead. (This app serves no
@@ -300,9 +308,64 @@ class BackendNetworkGuard:
         await send({"type": "http.response.body", "body": b'{"error": "forbidden"}'})
 
 
+# Paths a session that must change its password may still reach: the page
+# routes (each redirects to the change form itself), static files, the two
+# unauthenticated probes, and the sign-in / sign-out / reset / change / SSO
+# flows. `/auth/me` answers "who is signed in" and carries nothing else.
+_PASSWORD_CHANGE_OPEN_PATHS = frozenset({
+    "/", "/lab", "/admin/data_sources", "/power/data_sources",
+    "/health", "/version",
+    "/auth/login", "/auth/logout", "/auth/change_password",
+    "/auth/reset_password", "/auth/me",
+})
+_PASSWORD_CHANGE_OPEN_PREFIXES = ("/static/", "/c/", "/dashboards/",
+                                  "/auth/microsoft")
+
+
+def _open_during_password_change(path) -> bool:
+    path = str(path or "")
+    return (path in _PASSWORD_CHANGE_OPEN_PATHS
+            or path.startswith(_PASSWORD_CHANGE_OPEN_PREFIXES))
+
+
+class PasswordChangeGate:
+    """Refuse the API to a session that must change its password first.
+
+    Signing in with a temporary password (a reset, or the administrator's
+    bootstrap password) marks the session `must_change_password`. The page
+    routes redirect such a session to the change form, but the JSON APIs used
+    to ignore the flag, so the forced change could be skipped by calling them
+    directly. Every path outside `_open_during_password_change` answers
+    `403 {"error": "Password change required", "code":
+    "PASSWORD_CHANGE_REQUIRED"}` until the change is made.
+
+    Pure ASGI and registered INSIDE the session middleware, which is what
+    fills `scope["session"]` before this layer reads it.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        session = scope.get("session") or {}
+        if (not (session.get("email") and session.get("must_change_password"))
+                or _open_during_password_change(scope.get("path"))):
+            await self.app(scope, receive, send)
+            return
+        response = JSONResponse({"error": "Password change required",
+                                 "code": "PASSWORD_CHANGE_REQUIRED"}, status_code=403)
+        await response(scope, receive, send)
+
+
 _REMEMBER_ME_MAX_AGE = 30 * 24 * 60 * 60   # ~30 days
 
 app = FastAPI(title="PowerDataChat Client (enterprise)", version="1.0", lifespan=lifespan)
+# Registered FIRST, so it sits INSIDE the session middleware below and sees
+# the unsigned session.
+app.add_middleware(PasswordChangeGate)
 app.add_middleware(RememberMeSessionMiddleware, secret_key=settings.SECRET_KEY,
                    same_site="lax", max_age=_REMEMBER_ME_MAX_AGE,
                    https_only=settings.SESSION_HTTPS_ONLY)
@@ -340,7 +403,8 @@ async def landing(request: Request):
         sso_enabled = sso_store.is_enabled()
         sso_auto = sso_store.auto_redirect()
     except Exception as e:
-        log_with_sid("sso", "warning", f"SSO_LANDING_CHECK_FAILED: {e}")
+        log_with_sid("sso", "warning",
+                     f"SSO_LANDING_CHECK_FAILED: {log_safe_text(str(e), 200)}")
         sso_enabled = sso_auto = False
     if sso_enabled and sso_auto and request.query_params.get("local") != "1":
         return RedirectResponse(url="/auth/microsoft", status_code=302)
@@ -366,7 +430,7 @@ def _is_power_user(email: str | None) -> bool:
         import roles_store
         return roles_store.is_power_user(email)
     except Exception as e:
-        log_with_sid(email, "warning", f"POWER_FLAG_FAILED: {e}")
+        log_with_sid(email, "warning", f"POWER_FLAG_FAILED: {log_safe_text(str(e), 200)}")
         return False
 
 
@@ -382,7 +446,7 @@ def _is_admin_user(email: str | None) -> bool:
         store = AuthStore()
         return store.is_admin(email) and not store.is_bootstrap_admin(email)
     except Exception as e:
-        log_with_sid(email, "warning", f"ADMIN_FLAG_FAILED: {e}")
+        log_with_sid(email, "warning", f"ADMIN_FLAG_FAILED: {log_safe_text(str(e), 200)}")
         return False
 
 
@@ -490,12 +554,17 @@ async def open_conversation_deeplink(request: Request, conv_id: str):
                 chat_id = row.get("chat_id")
                 break
     except Exception as e:
-        log_with_sid(email, "error", f"DEEPLINK_LOOKUP_FAILED: {e}", conv_id=conv_id)
+        log_with_sid(email, "error",
+                     f"DEEPLINK_LOOKUP_FAILED: {log_safe_text(str(e), 200)}",
+                     conv_id=log_safe_text(str(conv_id), 80))
         return RedirectResponse(url="/lab", status_code=302)
     if not chat_id:
-        log_with_sid(email, "info", "DEEPLINK_CONV_NOT_FOUND", conv_id=conv_id)
+        # `conv_id` is a path segment: escaped on every line.
+        log_with_sid(email, "info", "DEEPLINK_CONV_NOT_FOUND",
+                     conv_id=log_safe_text(str(conv_id), 80))
         return RedirectResponse(url="/lab", status_code=302)
-    log_with_sid(email, "info", "OPEN_CONV_DEEPLINK", conv_id=conv_id, chat_id=chat_id)
+    log_with_sid(email, "info", "OPEN_CONV_DEEPLINK",
+                 conv_id=log_safe_text(str(conv_id), 80), chat_id=chat_id)
     ts = int(time.time())
     prof = _profile_context(email)
     return templates.TemplateResponse(
@@ -537,12 +606,17 @@ async def dashboard_view_page(request: Request, dash_id: str):
         from local_store import DashboardStore
         doc, is_owner = DashboardStore().resolve_dashboard(email, dash_id)
     except Exception as e:
-        log_with_sid(email, "error", f"DASH_PAGE_LOOKUP_FAILED: {e}", dash_id=dash_id)
+        log_with_sid(email, "error",
+                     f"DASH_PAGE_LOOKUP_FAILED: {log_safe_text(str(e), 200)}",
+                     dash_id=log_safe_text(str(dash_id), 80))
         return RedirectResponse(url="/lab", status_code=302)
     if doc is None:
-        log_with_sid(email, "info", "DASH_PAGE_NOT_FOUND", dash_id=dash_id)
+        # `dash_id` is a path segment: escaped on every line.
+        log_with_sid(email, "info", "DASH_PAGE_NOT_FOUND",
+                     dash_id=log_safe_text(str(dash_id), 80))
         return RedirectResponse(url="/lab", status_code=302)
-    log_with_sid(email, "info", "OPEN_DASHBOARD_UI", dash_id=dash_id)
+    log_with_sid(email, "info", "OPEN_DASHBOARD_UI",
+                 dash_id=log_safe_text(str(dash_id), 80))
     ts = int(time.time())
     prof = _profile_context(email)
     return templates.TemplateResponse(
@@ -646,7 +720,8 @@ def _power_scope_summary(email: str) -> tuple[str, bool]:
                 break
         return summary, read_beyond
     except Exception as e:
-        log_with_sid(email, "warning", f"POWER_SCOPE_SUMMARY_FAILED: {e}")
+        log_with_sid(email, "warning",
+                     f"POWER_SCOPE_SUMMARY_FAILED: {log_safe_text(str(e), 200)}")
         return "", False
 
 

@@ -324,6 +324,109 @@ def test_relation_accept_with_one_side_out_of_scope_403(client, two_conns):
     assert ok.status_code == 200 and ok.json()["accepted"] == 1
 
 
+def _three_tables_with_out_of_scope_relation(client, two_conns):
+    """Ladmin registers a (cid1, t), c (cid1, u) and b (cid2, v), and stores
+    the relation a -> b. POWER then manages cid1 only: a and c are in scope,
+    b and the stored relation's parent are not."""
+    cid1, cid2 = two_conns
+    client.post(f"/_login/{ADMIN}")
+    a = client.post("/api/admin/tables",
+                    json=_table_body(cid1)).json()["table"]["id"]
+    c = client.post("/api/admin/tables",
+                    json=_table_body(cid1, table="u",
+                                     display="u table")).json()["table"]["id"]
+    b = client.post("/api/admin/tables",
+                    json=_table_body(cid2, table="v",
+                                     display="v table")).json()["table"]["id"]
+    ok = client.post("/api/admin/relations/accept", json={"relations": [
+        {"table_id": a, "related_table_id": b, "join_keys": [["a", "a"]]}]})
+    assert ok.status_code == 200 and ok.json()["accepted"] == 1, ok.json()
+    _grant_power(POWER, [{"connection_id": cid1}])
+    return a, b, c
+
+
+def _relations_of(tid):
+    return db_sources.DataSourceStore().get_table(tid).get("relations") or []
+
+
+def test_relation_accept_replaces_out_of_scope_relation_403(client, two_conns):
+    """Both sides must be in scope for the relation REMOVED by `replaces`
+    too: a power user may not swap out a join an administrator configured to
+    a table outside their scope."""
+    a, b, c = _three_tables_with_out_of_scope_relation(client, two_conns)
+    before = _relations_of(a)
+    client.post(f"/_login/{POWER}")
+    r = client.post("/api/admin/relations/accept", json={"relations": [
+        {"table_id": a, "related_table_id": c, "join_keys": [["a", "a"]],
+         "replaces": {"related_table_id": b, "join_keys": [["a", "a"]]}}]})
+    assert r.status_code == 403, r.json()
+    assert r.json()["code"] == "OUT_OF_SCOPE"
+    assert _relations_of(a) == before
+
+
+def test_relation_accept_replaces_in_scope_relation_still_works(client, two_conns):
+    """The in-scope edit keeps working: replacing a -> c with a -> c on
+    other keys."""
+    a, b, c = _three_tables_with_out_of_scope_relation(client, two_conns)
+    client.post(f"/_login/{POWER}")
+    r = client.post("/api/admin/relations/accept", json={"relations": [
+        {"table_id": a, "related_table_id": c, "join_keys": [["a", "a"]]}]})
+    assert r.status_code == 200, r.json()
+    r = client.post("/api/admin/relations/accept", json={"relations": [
+        {"table_id": a, "related_table_id": c, "join_keys": [["b", "b"]],
+         "replaces": {"related_table_id": c, "join_keys": [["a", "a"]]}}]})
+    assert r.status_code == 200, r.json()
+    assert r.json().get("replaced") == 1, r.json()
+
+
+def test_save_table_with_relation_to_out_of_scope_table_403(client, two_conns):
+    """A registration's `relations` array is a relation write: a parent
+    outside the power user's scope is refused and nothing is saved."""
+    cid1, _ = two_conns
+    a, b, c = _three_tables_with_out_of_scope_relation(client, two_conns)
+    client.post(f"/_login/{POWER}")
+    before = {t["id"] for t in db_sources.DataSourceStore().list_tables()}
+
+    # The CREATE branch: free up physical table `u` (ladmin's `c`) so the
+    # power user registers it anew; the edit branch has its own test below.
+    store = db_sources.DataSourceStore()
+    store.delete_table(c, actor=ADMIN)
+    r = client.post("/api/admin/tables", json=_table_body(
+        cid1, table="u", display="u table",
+        relations=[{"related_table_id": b, "join_keys": [["a", "a"]]}]))
+    assert r.status_code == 403, r.json()
+    assert r.json()["code"] == "OUT_OF_SCOPE"
+    assert {t["id"] for t in store.list_tables()} == before - {c}
+
+
+def test_edit_table_with_relation_to_out_of_scope_table_403(client, two_conns):
+    cid1, _ = two_conns
+    a, b, c = _three_tables_with_out_of_scope_relation(client, two_conns)
+    doc_before = db_sources.DataSourceStore().get_table(c)
+    client.post(f"/_login/{POWER}")
+    r = client.post(f"/api/admin/tables/{c}", json=_table_body(
+        cid1, table="u", display="u table",
+        relations=[{"related_table_id": b, "join_keys": [["a", "a"]]}]))
+    assert r.status_code == 403, r.json()
+    assert r.json()["code"] == "OUT_OF_SCOPE"
+    assert db_sources.DataSourceStore().get_table(c)["relations"] ==         (doc_before.get("relations") or [])
+
+
+def test_ladmin_relation_writes_are_not_scope_checked(client, two_conns):
+    """Ladmin (scope None) keeps saving cross-connection relations."""
+    cid1, _ = two_conns
+    a, b, c = _three_tables_with_out_of_scope_relation(client, two_conns)
+    client.post(f"/_login/{ADMIN}")
+    r = client.post(f"/api/admin/tables/{c}", json=_table_body(
+        cid1, table="u", display="u table",
+        relations=[{"related_table_id": b, "join_keys": [["a", "a"]]}]))
+    assert r.status_code == 200, r.json()
+    r = client.post("/api/admin/relations/accept", json={"relations": [
+        {"table_id": a, "related_table_id": c, "join_keys": [["a", "a"]],
+         "replaces": {"related_table_id": b, "join_keys": [["a", "a"]]}}]})
+    assert r.status_code == 200, r.json()
+
+
 def test_pu_analyze_sql_never_persists_out_of_scope_recommendations(
         client, tmp_path):
     """The WRITE is scope-bounded too (reviewer finding): a power user's

@@ -18,6 +18,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.testclient import TestClient
 
 import local_store
+from conftest import seed_history
 from settings import settings
 
 OWNER = "alice@acme.com"
@@ -100,6 +101,8 @@ def test_refresh_item_reports_the_reason(client):
     # that check runs before any data is loaded), so this pins the dataset
     # branch with code that references no gated key.
     _chat([_db_entry("transactions", TID)])
+    # refresh_item re-runs only code the chat's history holds — persist it.
+    seed_history(CHAT, "RESULT = 1")
     r = client.post(f"/api/chat/{CHAT}/refresh_item",
                     json={"code": "RESULT = 1", "kind": "table"})
     body = r.json()

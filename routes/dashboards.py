@@ -27,10 +27,11 @@ import local_store
 import brain_client
 from brain_client import TenantRevokedError, BrainError
 from logger_utils import log_with_sid
-from routes.chat import (_FULL_KEY_RE, _json_safe, _load_full_table_record,
-                         _persist_full_table, _persistable_chart_data,
-                         _reexecute_full_df, _require_chat, _role_refresh_block,
-                         run_item_refresh)
+from routes.chat import (_FULL_KEY_RE, _code_not_stored, _json_safe,
+                         _load_full_table_record, _persist_full_table,
+                         _persistable_chart_data, _reexecute_full_df,
+                         _require_chat, _role_refresh_block,
+                         code_is_stored_async, run_item_refresh)
 
 router = APIRouter(prefix="/api/dashboards", tags=["client-dashboards"])
 
@@ -343,6 +344,11 @@ async def add_tile(request: Request, dash_id: str):
             log_with_sid(email, "warning", f"DASH_TILE_SNAPSHOT_TOO_BIG chat={chat_id} "
                                            f"chars={len(image)}")
             return JSONResponse({"error": "Chart snapshot is too large to pin."}, status_code=400)
+        # The tile's code is re-run by every later tile refresh: only code
+        # the source chat already holds may be stored on it.
+        if code and not await code_is_stored_async(chat_id, code):
+            log_with_sid(email, "warning", f"DASH_PIN_CODE_NOT_STORED chat={chat_id}")
+            return _code_not_stored(400)
         snapshot["image_base64"] = image
         snapshot["is_plotly"] = bool(body.get("is_plotly"))
         # Resolve the volatile "Show data" cache key into durable inline data
@@ -367,6 +373,10 @@ async def add_tile(request: Request, dash_id: str):
         if rec_code:
             code = rec_code
             result_key = rec_result_key
+        elif code and not await code_is_stored_async(chat_id, code):
+            # No durable record vouches for the code: it must be stored code.
+            log_with_sid(email, "warning", f"DASH_PIN_CODE_NOT_STORED chat={chat_id}")
+            return _code_not_stored(400)
 
     tile = {
         "chat_id": chat_id,
@@ -569,7 +579,9 @@ async def share_dashboard(request: Request, dash_id: str):
     dashboard lists, AND adds them to every tile's source chat sharing (same
     grant conversation-level sharing performs) so their Show-data / refresh
     work. Only dashboard name + comment go to the brain's SMTP relay — never
-    tile content (Article II)."""
+    tile content (Article II). Only the source chats the dashboard OWNER owns
+    are granted: a tile pinned from a chat the owner merely received stays a
+    snapshot for the recipients (its refresh answers `access_revoked`)."""
     email, err = _require_email(request)
     if err:
         return err
@@ -597,13 +609,20 @@ async def share_dashboard(request: Request, dash_id: str):
     message_text = (body.get("message") or "").strip()
 
     new_recipients = _dash_store.add_dashboard_share(email, dash_id, recipients)
+    # An address that has never signed in gets a password-less placeholder,
+    # so whoever types it first at the sign-in page cannot claim the share.
+    auth = local_store.AuthStore()
+    for rec in recipients:
+        auth.ensure_invited_user(rec, email)
 
-    # Grant the recipients access to every tile's source chat so tiles are
-    # live for them, not just the stored snapshots. Best-effort per chat.
+    # Grant the recipients access to every tile's source chat that the
+    # dashboard owner OWNS, so those tiles are live for them, not just the
+    # stored snapshots. Best-effort per chat.
     chat_ids = {t.get("chat_id") for t in (doc.get("tiles") or []) if t.get("chat_id")}
     for cid in chat_ids:
         try:
-            if local_store.chat_exists(cid):
+            if (local_store.chat_exists(cid)
+                    and local_store.get_chat_meta_owner(cid) == email):
                 local_store.ChatDataStore(cid).add_share_recipients(recipients)
         except Exception as e:
             log_with_sid(email, "warning", f"DASH_SHARE_CHAT_GRANT_FAILED chat={cid}: {e}")

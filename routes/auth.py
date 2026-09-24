@@ -190,10 +190,23 @@ async def login(request: Request):
                                 "Set LOCAL_ADMIN_PASSWORD in the server "
                                 "environment and restart the container."))
         if store.user_exists(email):
-            # LEGACY account from the email-only build (folder exists, no
-            # hash): the typed password must NOT silently become theirs —
-            # ownership of the mailbox is proven through the reset flow
-            # (temp password emailed via the brain + forced change).
+            # An account without a password: a LEGACY account from the
+            # email-only build, or a placeholder created when something was
+            # shared with this address before it ever signed in. Either way
+            # the typed password must NOT silently become theirs — ownership
+            # of the mailbox is proven through the reset flow (temp password
+            # emailed via the brain + forced change).
+            invited = bool((store.get_profile(email) or {}).get("invited_by"))
+            if invited:
+                log_with_sid(email, "info", "USER_LOGIN_INVITED_RESET_REQUIRED")
+                return _landing(
+                    request, email=email, status_code=403,
+                    password_error=("Something was shared with this address. "
+                                    "Please click “Reset password” — we will "
+                                    "email you a temporary password to sign "
+                                    "in and set your own."),
+                    show_reset=True,
+                )
             log_with_sid(email, "info", "USER_LOGIN_LEGACY_RESET_REQUIRED")
             return _landing(
                 request, email=email, status_code=403,
@@ -603,6 +616,10 @@ async def share_conversation(request: Request, conv_id: str):
     chat_id = conv.get("chat_id")
     if not chat_id or not _ls.chat_exists(chat_id):
         return JSONResponse({"error": "Invalid conversation"}, status_code=400)
+    # Sharing a conversation also grants access to its chat, so only the
+    # chat's owner may do it — the same rule as the chat-level share.
+    if _ls.get_chat_meta_owner(chat_id) != email:
+        return JSONResponse({"error": "Access denied"}, status_code=403)
 
     store = _ls.ChatDataStore(chat_id)
     meta = store.read_meta()
@@ -612,6 +629,10 @@ async def share_conversation(request: Request, conv_id: str):
 
     # Add recipients to chat's sharing list (so /_require_chat lets them in)
     added = store.add_share_recipients(recipients)
+    # An address that has never signed in gets a password-less placeholder,
+    # so whoever types it first at the sign-in page cannot claim the share.
+    for rec in recipients:
+        AuthStore().ensure_invited_user(rec, email)
 
     snapshot_conv_ids: dict[str, str] = {}
     for rec in recipients:

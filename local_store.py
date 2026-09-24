@@ -50,7 +50,13 @@ def _now() -> str:
 
 
 def _safe_email(email: str) -> str:
-    return email.strip().lower().replace("/", "_").replace("\\", "_")
+    """The email as ONE directory name under users/. Slashes cannot split it,
+    and a result of `.`, `..` or nothing — which would name the users/
+    directory itself or its parent — is prefixed so it stays a plain child."""
+    out = email.strip().lower().replace("/", "_").replace("\\", "_")
+    if out in ("", ".", ".."):
+        return "_" + out
+    return out
 
 
 def _json_safe(value):
@@ -939,6 +945,37 @@ class AuthStore:
 
     def _auth_path(self, email: str) -> Path:
         return _data_root() / "users" / _safe_email(email) / "auth.json"
+
+    def ensure_invited_user(self, email: str, invited_by: str) -> bool:
+        """Create a PASSWORD-LESS placeholder profile for an address that was
+        shared something before it ever signed in (`invited_by`/`invited_at`
+        recorded). Its first sign-in is then refused like any existing account
+        without a password, and the mailed reset proves the mailbox instead.
+        Never touches an existing account: the profile is created exclusively,
+        so a concurrent sign-in or share cannot be overwritten. Returns True
+        when a placeholder was created; never raises (Article IV)."""
+        try:
+            with _LOCK:
+                if self.user_exists(email):
+                    return False
+                safe = _safe_email(email)
+                udir = _data_root() / "users" / safe
+                udir.mkdir(parents=True, exist_ok=True)
+                now = _now()
+                profile = {"email": safe, "created_at": now,
+                           "invited_by": (invited_by or "").strip().lower(),
+                           "invited_at": now}
+                try:
+                    with (udir / "profile.json").open("x", encoding="utf-8") as fh:
+                        fh.write(json.dumps(profile, indent=2, ensure_ascii=False))
+                except FileExistsError:
+                    return False
+            log_with_sid(invited_by or "share", "info", "USER_PLACEHOLDER_CREATED")
+            return True
+        except Exception as e:
+            log_with_sid(invited_by or "share", "warning",
+                         f"USER_PLACEHOLDER_FAILED {type(e).__name__}")
+            return False
 
     def user_exists(self, email: str) -> bool:
         """True when this email has a local profile (any prior login)."""

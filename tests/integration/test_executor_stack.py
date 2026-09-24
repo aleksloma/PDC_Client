@@ -9,9 +9,13 @@ Python function. A unit test with a mocked transport cannot falsify a missing
 because they ask the running sandbox to describe itself.
 
 The deterministic group needs no LLM: `POST /api/chat/{id}/refresh_item` with
-`kind: "table"` executes POSTED code against the chat frames in the sandbox
-and returns the resulting one-row table (`routes/chat.run_item_refresh`). So
-each probe is a normal product request, not a back door.
+`kind: "table"` re-runs a STORED item's code against the chat frames in the
+sandbox and returns the resulting one-row table
+(`routes/chat.run_item_refresh`). The route executes only code the chat's
+history holds, so every probe is first seeded as an AI history row through
+the app's own store inside the web container (`conftest.seed_code`, docker
+required) — then posted like the product's own refresh button posts it. A
+FORGED refresh (code nobody seeded) is pinned as refused.
 
 Every test is marked `integration` (skipped unless `PDC_STACK_URL` is set);
 the LLM matrix is additionally `needs_brain`. Each probe gets its OWN test and
@@ -20,17 +24,22 @@ a cold sandbox plus a Brain round trip is slow, and a flaky timeout here would
 train people to ignore the file.
 """
 import base64
+import hashlib
 import json
+import os
+import re
+import secrets
 import struct
 import subprocess
 import threading
 import time
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
 
 from .conftest import (EXECUTOR_CONTAINER, WEB_CONTAINER, docker_available,
-                       docker_exec)
+                       docker_exec, seed_code, session_id)
 
 pytestmark = pytest.mark.integration
 
@@ -77,6 +86,21 @@ ax.set_title('Revenue by region')
 
 DOCKER_REASON = "docker is not on PATH"
 
+# A REAL outage (the sandbox container stopped for the length of one
+# question) is disruptive to anyone else using the stack, so it runs only when
+# asked for explicitly — on top of PDC_STACK_BRAIN, because the planner has to
+# produce the code whose execution then finds no sandbox.
+STACK_OUTAGE_ENV = "PDC_STACK_OUTAGE"
+OUTAGE_REASON = f"set {STACK_OUTAGE_ENV}=1 to stop pdc-executor for one question"
+OUTAGE_PHRASE = "not available"
+RECOVERY_WAIT_S = 180
+
+APP_SOURCE = "/app/app.py"
+WEB_LOG = "/data/client/logs/datachat.log"
+JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+WEB_SERVICE_URL = "http://pdc-client:8000"
+CODE_NOT_STORED = "CODE_NOT_STORED"
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -92,6 +116,7 @@ def _probe(session, chat_id: str, body_code: str, timeout: float = 180.0) -> dic
         f"{body_code}\n"
         "RESULT = pd.DataFrame([values])\n"
     )
+    seed_code(chat_id, code)
     response = session.post(f"/api/chat/{chat_id}/refresh_item",
                             json={"kind": "table", "code": code},
                             timeout=timeout)
@@ -106,12 +131,53 @@ def _probe(session, chat_id: str, body_code: str, timeout: float = 180.0) -> dic
 
 
 def _refresh_raw(session, chat_id: str, code: str, timeout: float) -> dict:
+    seed_code(chat_id, code)
     response = session.post(f"/api/chat/{chat_id}/refresh_item",
                             json={"kind": "table", "code": code},
                             timeout=timeout)
     status = response.status_code
     assert status == 200, (status, response.text[:500])
     return response.json()
+
+
+def _jobs_root_entries() -> list:
+    """What the shared jobs root holds right now, read from inside the sandbox
+    (the root is `root:pdc 2770`, readable by its group)."""
+    result = docker_exec(EXECUTOR_CONTAINER, "sh", "-c", f"ls -A {JOBS_ROOT}")
+    assert result.returncode == 0, result.stderr[:300]
+    return [line for line in (result.stdout or "").split() if line]
+
+
+def _assert_jobs_root_clean():
+    """No job directory outlives the request that created it: the web side
+    removes it in a `finally` BEFORE the HTTP response is written, so by the
+    time the caller has the answer the root must be empty. Nothing else is
+    ever created in the root by a healthy stack, so no entry is tolerated —
+    a job-id-shaped one is named separately to make the finding obvious."""
+    entries = _jobs_root_entries()
+    leftovers = [name for name in entries if JOB_ID_RE.match(name)]
+    assert leftovers == [], leftovers
+    assert entries == [], entries
+
+
+def _web_sha256(path: str) -> str:
+    result = docker_exec(WEB_CONTAINER, "sha256sum", path)
+    assert result.returncode == 0, (path, result.stderr[:300])
+    return (result.stdout or "").split()[0]
+
+
+def _brain_endpoint() -> tuple:
+    """(host, port) of the stack's own BRAIN_URL, read from the web container
+    — the one destination the sandbox would most want to reach."""
+    result = docker_exec(WEB_CONTAINER, "printenv", "BRAIN_URL")
+    url = (result.stdout or "").strip()
+    if result.returncode != 0 or not url:
+        pytest.skip("BRAIN_URL is not set in pdc-client")
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    assert host, url
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    return host, port
 
 
 def _stream_events(session, chat_id: str, question: str,
@@ -186,6 +252,7 @@ def _has_fixture_region(haystack) -> bool:
 def _refresh_chart(session, chat_id: str, code: str, timeout: float = 240.0) -> dict:
     """Render ONE posted chart in the sandbox (`kind: "chart"` →
     `plot_utils.render_plot_safe`) and return the route payload."""
+    seed_code(chat_id, code)
     response = session.post(f"/api/chat/{chat_id}/refresh_item",
                             json={"kind": "chart", "code": code},
                             timeout=timeout)
@@ -284,6 +351,102 @@ def test_the_sandbox_cannot_call_back_into_the_web_app(session, chat):
     assert refused, row
 
 
+def test_the_sandbox_is_refused_by_the_session_less_sign_in_routes(session, chat):
+    """The routes that need NO session are the ones worth attacking from the
+    sandbox: a password guess at `/auth/login`, a reset that locks a user
+    behind a temporary password. The web app refuses both by the caller's
+    source address, before any handler runs — so both answer exactly 403."""
+    row = _probe(session, chat,
+                 "import urllib.error, urllib.parse, urllib.request\n"
+                 "def post(path, fields):\n"
+                 "    data = urllib.parse.urlencode(fields).encode()\n"
+                 f"    req = urllib.request.Request('{WEB_SERVICE_URL}' + path,\n"
+                 "                                 data=data, method='POST')\n"
+                 "    try:\n"
+                 "        return 'HTTP_%d' % urllib.request.urlopen(req, timeout=5).status\n"
+                 "    except urllib.error.HTTPError as exc:\n"
+                 "        return 'HTTP_%d' % exc.code\n"
+                 "    except Exception as exc:\n"
+                 "        return type(exc).__name__\n"
+                 "values = {\n"
+                 "    'login': post('/auth/login', {'email': 'nobody@example.invalid',\n"
+                 "                                  'password': 'guess'}),\n"
+                 "    'reset': post('/auth/reset_password',\n"
+                 "                  {'email': 'nobody@example.invalid'}),\n"
+                 "}",
+                 timeout=240.0)
+    assert str(row["login"]) == "HTTP_403", row
+    assert str(row["reset"]) == "HTTP_403", row
+
+
+_EGRESS_TARGETS = [("brain", None, None),
+                   ("test-db", "pdc-test-db", 5432),
+                   ("host-db", "host.docker.internal", 5433)]
+
+
+@pytest.mark.parametrize("label,host,port", _EGRESS_TARGETS,
+                         ids=[t[0] for t in _EGRESS_TARGETS])
+def test_the_sandbox_cannot_reach_named_destinations(session, chat, label, host, port):
+    """Egress by NAME, not by a public IP: the stack's own brain (the host in
+    BRAIN_URL), the test database container and the host-published database
+    port. Name resolution may or may not succeed on an internal network —
+    the CONNECT is what must fail."""
+    if host is None:
+        if not docker_available():
+            pytest.skip(DOCKER_REASON)
+        host, port = _brain_endpoint()
+    row = _probe(session, chat,
+                 "import socket\n"
+                 f"host, port = {host!r}, {int(port)}\n"
+                 "try:\n"
+                 "    socket.getaddrinfo(host, port)\n"
+                 "    resolved = True\n"
+                 "except Exception:\n"
+                 "    resolved = False\n"
+                 "try:\n"
+                 "    socket.create_connection((host, port), 3).close()\n"
+                 "    outcome = 'CONNECTED'\n"
+                 "except Exception as exc:\n"
+                 "    outcome = type(exc).__name__\n"
+                 "values = {'outcome': outcome, 'resolved': resolved}",
+                 timeout=240.0)
+    assert str(row["outcome"]) != "CONNECTED", (label, host, port, row)
+
+
+def test_a_forged_refresh_is_refused(session, chat):
+    """Code no answer of the chat ever produced — never seeded — is refused
+    before it reaches the sandbox."""
+    code = f"RESULT = __import__('pandas').DataFrame([{{'forged': '{secrets.token_hex(6)}'}}])"
+    response = session.post(f"/api/chat/{chat}/refresh_item",
+                            json={"kind": "table", "code": code}, timeout=60.0)
+    assert response.status_code == 403, (response.status_code, response.text[:300])
+    assert response.json().get("code") == CODE_NOT_STORED, response.text[:300]
+
+
+def test_a_forged_pin_is_refused(session, chat):
+    """The same binding on the dashboard pin, whose stored code the tile
+    refresh would later execute."""
+    created = session.post("/api/dashboards", json={"name": "integration forged pin"})
+    assert created.status_code in (200, 201), (created.status_code, created.text[:300])
+    dash_id = created.json().get("dash_id") or created.json().get("id")
+    assert dash_id, created.json()
+    try:
+        pinned = session.post(f"/api/dashboards/{dash_id}/tiles", json={
+            "chat_id": chat, "kind": "chart", "image_base64": "iVBORfake",
+            "code": f"fig = forged_{secrets.token_hex(6)}()"})
+        assert pinned.status_code == 400, (pinned.status_code, pinned.text[:300])
+        assert pinned.json().get("code") == CODE_NOT_STORED, pinned.text[:300]
+    finally:
+        session.post(f"/api/dashboards/{dash_id}/delete", json={})
+
+
+@pytest.mark.skipif(not docker_available(), reason=DOCKER_REASON)
+def test_the_jobs_root_is_empty_after_a_job(session, chat):
+    row = _probe(session, chat, "values = {'ok': 1}")
+    assert int(row["ok"]) == 1, row
+    _assert_jobs_root_clean()
+
+
 def test_the_sandbox_cannot_see_the_customer_data_volume(session, chat):
     """The jobs volume is the ONLY shared storage: no users, auth hashes,
     chats, data_sources, roles, sso config or logs."""
@@ -379,6 +542,9 @@ def test_an_infinite_loop_is_killed_and_health_keeps_answering(session, chat,
     error = str(body.get("error") or "")
     assert error, body
     assert set(health_results) == {200}, health_results
+    # The killed job's directory went with it (docker is present: the seeded
+    # refresh above needed it).
+    _assert_jobs_root_clean()
 
     row = _probe(session, chat, "values = {'alive': 1}")
     assert int(row["alive"]) == 1, row
@@ -433,8 +599,100 @@ def test_the_executor_publishes_no_port_and_joins_only_the_internal_network():
     assert "backend" in networks[0], networks
 
 
+@pytest.mark.skipif(not docker_available(), reason=DOCKER_REASON)
+def test_the_web_container_runs_as_10001():
+    result = docker_exec(WEB_CONTAINER, "id", "-u")
+    assert result.returncode == 0, result.stderr[:300]
+    assert (result.stdout or "").strip() == str(WEB_UID), result.stdout
+
+
+@pytest.mark.skipif(not docker_available(), reason=DOCKER_REASON)
+def test_the_web_rootfs_is_read_only():
+    result = docker_exec(WEB_CONTAINER, "touch", "/app/x")
+    assert result.returncode != 0, (result.stdout, result.stderr)
+
+
+@pytest.mark.skipif(not docker_available(), reason=DOCKER_REASON)
+def test_the_web_log_lives_on_the_data_volume():
+    """The rootfs is read-only, so the log can only be on the data volume."""
+    result = docker_exec(WEB_CONTAINER, "test", "-f", WEB_LOG)
+    assert result.returncode == 0, (WEB_LOG, result.stderr[:300])
+
+
+@pytest.mark.skipif(not docker_available(), reason=DOCKER_REASON)
+def test_an_upload_named_like_the_app_source_lands_in_the_session(
+        session, session_scoped_upload_sids):
+    """A multipart filename of `/app/app.py` is sanitized to its basename and
+    written under the caller's upload session — the application source is
+    byte-identical afterwards, and the bytes are where they belong."""
+    before = _web_sha256(APP_SOURCE)
+    reset = session.post("/new_session")
+    assert reset.status_code == 200, (reset.status_code, reset.text[:300])
+    session_scoped_upload_sids.add(session_id(session))
+
+    payload = f"a,b\n1,{secrets.token_hex(8)}\n".encode()
+    response = session.post("/upload",
+                            files={"files": (APP_SOURCE, payload, "text/csv")})
+    sid = session_id(session)
+    session_scoped_upload_sids.add(sid)
+    # The parse verdict on a ".py" name is not the point; the save is.
+    assert response.status_code in (200, 400), (response.status_code,
+                                                response.text[:300])
+    if response.status_code == 200:
+        assert response.json().get("saved") == ["app.py"], response.text[:300]
+    assert sid, "the upload-session id could not be read from the cookie"
+
+    assert _web_sha256(APP_SOURCE) == before
+    landed = f"/data/client/sessions/{sid}/files/app.py"
+    assert _web_sha256(landed) == hashlib.sha256(payload).hexdigest()
+
+
 # ===========================================================================
-# 4. the LLM matrix (needs the brain)
+# 4. a real sandbox outage (opt-in: disruptive)
+# ===========================================================================
+def _wait_until_executor_reachable(base_url: str) -> bool:
+    deadline = time.monotonic() + RECOVERY_WAIT_S
+    with httpx.Client(base_url=base_url, timeout=10.0) as probe:
+        while time.monotonic() < deadline:
+            try:
+                if probe.get("/health").json().get("executor_reachable") is True:
+                    return True
+            except Exception:
+                pass
+            time.sleep(3)
+    return False
+
+
+@pytest.mark.needs_brain
+@pytest.mark.skipif(not (os.environ.get(STACK_OUTAGE_ENV) or "").strip(),
+                    reason=OUTAGE_REASON)
+@pytest.mark.skipif(not docker_available(), reason=DOCKER_REASON)
+def test_a_real_sandbox_outage_is_answered_once_in_plain_words(session, chat,
+                                                              base_url):
+    """With pdc-executor STOPPED, a question ends in ONE plain sentence that
+    names the outage — not three brain rewrites of code that is not the
+    problem, and not "try rephrasing". The sandbox is started again whatever
+    happens, and the test waits until /health sees it back."""
+    stopped = subprocess.run(["docker", "stop", EXECUTOR_CONTAINER],
+                             capture_output=True, text=True, timeout=120)
+    assert stopped.returncode == 0, stopped.stderr[:300]
+    recovered = False
+    try:
+        events = _stream_events(session, chat, TABLE_QUESTION)
+        done = [event for event in events if event.get("done")][0]
+        text = " ".join(str(done.get(key) or "")
+                        for key in ("answer", "combined_answer", "error"))
+        assert text.count(OUTAGE_PHRASE) == 1, text[:400]
+        assert TRACEBACK_MARKER not in text, text[:400]
+    finally:
+        subprocess.run(["docker", "start", EXECUTOR_CONTAINER],
+                       capture_output=True, text=True, timeout=120)
+        recovered = _wait_until_executor_reachable(base_url)
+    assert recovered, "pdc-executor did not come back within the wait"
+
+
+# ===========================================================================
+# 5. the LLM matrix (needs the brain)
 # ===========================================================================
 @pytest.mark.needs_brain
 def test_a_scalar_question_answers(session, chat):

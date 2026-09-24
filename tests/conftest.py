@@ -20,6 +20,19 @@ untouched into an intermittent failure. The fixture therefore stops the
 refresh from being claimed and restores the cache after every test; a test
 that deliberately exercises the probe carries
 `@pytest.mark.executor_probe`.
+
+A third autouse fixture stubs `brain_client.post_activity`. The real function
+queues the event onto a single background worker that POSTs to `BRAIN_URL` —
+from whatever machine runs pytest, seconds after the test that triggered it
+has returned. Login, upload, chat and report routes all call it, so without
+the stub the suite resolves the brain's hostname on every run. The one module
+that tests the worker itself carries `@pytest.mark.real_activity_worker`.
+
+`seed_history(chat_id, code)` writes a REAL AI history row through the app's
+own store, under whatever `settings.DATA_ROOT` the test has monkeypatched.
+The re-run routes (`refresh_item`, the dashboard pin) accept only code the
+chat's history already holds, so a test that posts code seeds it first —
+the same thing the product does when an answer is persisted.
 """
 import os
 import sys
@@ -47,6 +60,7 @@ REAL_DISPATCH_MARKER = "real_executor_dispatch"
 INTEGRATION_MARKER = "integration"
 NEEDS_BRAIN_MARKER = "needs_brain"
 EXECUTOR_PROBE_MARKER = "executor_probe"
+REAL_ACTIVITY_MARKER = "real_activity_worker"
 
 
 def pytest_configure(config):
@@ -76,6 +90,50 @@ def pytest_configure(config):
         f"{EXECUTOR_PROBE_MARKER}: let the sandbox reachability refresh start "
         "(the test drives the probe itself and supplies its own stub)",
     )
+    config.addinivalue_line(
+        "markers",
+        f"{REAL_ACTIVITY_MARKER}: keep the real brain_client.post_activity "
+        "(the test supplies its own `_post` stub and exercises the worker)",
+    )
+
+
+def seed_history(chat_id: str, code: str, *, conv_id: str | None = None) -> str:
+    """Persist `code` as an AI answer of chat `chat_id` and return the conv id.
+
+    Goes through `local_store.ChatDataStore` — the real on-disk shape
+    (`chatdata/<chat_id>/conversations/<conv_id>.jsonl`) under the CURRENT
+    `settings.DATA_ROOT`, so it must be called after the test has pointed
+    DATA_ROOT at its tmp_path. Creating the store also creates the chat's
+    directory and an owner-less `meta.json` when none exists; tests that stub
+    `local_store.chat_exists` / `get_chat_meta_owner` are unaffected by it.
+
+    With `conv_id` given the row is appended to that conversation (the file is
+    created when missing), otherwise a fresh conversation is opened.
+    """
+    import local_store
+
+    store = local_store.ChatDataStore(chat_id)
+    if conv_id is None:
+        conv_id = store.new_conversation("seeded")
+    store.append_history(conv_id, {"role": "ai", "content": "", "code": code})
+    return conv_id
+
+
+@pytest.fixture(autouse=True)
+def no_brain_activity_worker(request, monkeypatch):
+    """Replace `brain_client.post_activity` with a no-op for every test.
+
+    Every call site uses the module attribute (`brain_client.post_activity`),
+    so one rebinding covers them all; a test that installs its own stub still
+    wins because the `monkeypatch` fixture is shared and undone in reverse.
+    The return value mirrors the real queued answer.
+    """
+    if request.node.get_closest_marker(REAL_ACTIVITY_MARKER):
+        return
+    import brain_client
+
+    monkeypatch.setattr(brain_client, "post_activity",
+                        lambda *args, **kwargs: {"ok": True, "queued": True})
 
 
 @pytest.fixture(autouse=True)
