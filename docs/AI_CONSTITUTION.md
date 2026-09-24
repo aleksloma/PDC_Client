@@ -4,8 +4,8 @@
 > enterprise (on-prem) edition. Adapted from the original B2C constitution
 > for the brain/client split.
 
-**Version:** 1.2 (enterprise)
-**Last Updated:** 2026-09-17
+**Version:** 1.3 (enterprise)
+**Last Updated:** 2026-09-25
 
 ---
 
@@ -148,7 +148,8 @@ multiplier  = settings.LLM_BACKOFF_MULTIPLIER # 2.0
 - Context: `tenant=`, `chat_id=`, `endpoint=`. Never log raw payloads.
 - **The log file is newline-delimited, so any text you did not write must be
   escaped before it reaches a line.** Pass it through
-  `exec_transport.log_safe_text`, which escapes CR/LF and caps the length.
+  `exec_transport.log_safe_text`, which escapes every line break and ESC
+  (see Article XIV for the exact set) and caps the length.
   This applies to the message AND to every context value AND to the `sid`
   field itself, and it applies to text from any origin you do not control:
   the request body (a question, a conversation id from a path segment), a
@@ -447,6 +448,14 @@ numerics.**
 **Generated Python runs in the `pdc-executor` container and nowhere else.
 The container IS the boundary; everything else is defence on top of it.**
 
+Who chooses the bytes the sandbox runs: the planner's generated code, plus the
+per-item refresh and dashboard paths, which may only re-run code the chat
+already holds (an answer's stored code, a segment of it, a durable full-table
+record, or the answer being generated) — the server refuses any other posted
+code with `CODE_NOT_STORED` — so a signed-in user cannot submit arbitrary code
+of their choice through those routes; generated code itself still runs
+arbitrary Python inside the boundary, which is why the boundary exists.
+
 ### The five properties that make it a boundary
 1. **A different unprivileged identity.** The web service is uid 10001, the
    sandbox uid 10002, sharing one group only so they can exchange files in
@@ -547,7 +556,10 @@ The container IS the boundary; everything else is defence on top of it.**
   rule: **every site that writes it to a log must escape it first**, because
   the log is newline-delimited and a message the sandbox chose could
   otherwise forge a whole record in the file an operator reads to
-  reconstruct what happened. That is an obligation on every writer, not a
+  reconstruct what happened. "Escape" means `exec_transport.log_safe_text`:
+  it replaces CR, LF and every other character Python treats as a line break
+  (VT, FF, FS, GS, RS, NEL, U+2028, U+2029) plus ESC with a visible
+  backslash escape, and caps the length. That is an obligation on every writer, not a
   property of the text — it was found open at eight sites in two rounds, in
   three different modules, each time by looking again rather than by a test
   failing. The same obligation covers any string DERIVED from the response

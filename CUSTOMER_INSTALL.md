@@ -101,9 +101,13 @@ and sizes stay tunable; `client.env.example` marks which is which.
 The `ladmin` account can register tables from your PostgreSQL, MySQL/MariaDB,
 SQL Server, Oracle, or ClickHouse databases so your users analyze them in
 chats. ClickHouse needs nothing extra installed; it is reached over its
-**native protocol — port 9000 plain, port 9440 when you tick SSL** (the form
-pre-fills 9000, so change it yourself for a TLS connection) — and its databases
-appear as "schemas" when your admin browses the connection. (SQL Server is the
+**native protocol — port 9440 with SSL, port 9000 plain** — and its databases
+appear as "schemas" when your admin browses the connection. For a NEW ClickHouse
+connection the form pre-fills 9440 with **SSL / Encrypt** ticked, and it shows a
+warning when port 9000 is entered or SSL is off. A stored connection keeps the
+port it has; a stored connection saved without a port keeps reaching 9000
+unless SSL is on, and the form shows it the same way when you open it.
+(SQL Server is the
 one type with an image-build dependency: the Microsoft ODBC driver is installed
 only on amd64/arm64 builds, and the admin panel greys the type out with a
 reason if it is missing.) Table
@@ -116,6 +120,34 @@ PowerDataChat with SELECT-only grants** (ideally on a read replica). The
 client only ever issues SELECT/introspection statements, and that grant is
 your hard guarantee. Set the nightly snapshot-refresh time in the admin UI
 (container-local time — set `TZ` in `client.env` if your server isn't UTC).
+
+**What the "SSL / Encrypt" box enforces.** Ticked:
+
+| Database | Ticked | Server identity |
+|---|---|---|
+| PostgreSQL | `sslmode=require`: a server that does not offer TLS is refused | Not verified. (The PostgreSQL client library upgrades `require` to certificate verification if a `root.crt` exists in the container user's `~/.postgresql`; this image does not ship one.) |
+| MySQL / MariaDB | The connection is refused if the server did not negotiate TLS — the driver would otherwise carry on in plaintext | Not verified |
+| SQL Server | `Encrypt=yes` | Certificate verified, unless "Trust server certificate" is ticked |
+| Oracle | TCPS (TLS) instead of plain TCP | Server certificate DN is matched, unless "Trust server certificate" is ticked |
+| ClickHouse | Secure native protocol on port 9440 | Certificate verified, unless "Trust server certificate" is ticked |
+
+Unticked, no database requires encryption and the connection normally runs in
+plaintext. PostgreSQL alone still tries TLS first (`sslmode=prefer`) and falls
+back to plaintext when the server does not offer it, without verifying
+anything.
+
+The form has no field for your own CA certificate today, so a verified
+connection needs a server certificate issued by a CA the container already
+trusts. If the database server's identity matters to you, ask your DBA for such
+a certificate.
+
+**Upgrade note for stored connections.** Two kinds of connection behave
+differently from their next refresh on: a MySQL/MariaDB connection with SSL
+ticked against a server that does not offer TLS now FAILS instead of silently
+running in plaintext, and an Oracle connection with SSL ticked now switches to
+TCPS (the server must offer TCPS on the configured port). A failed refresh
+keeps the previous snapshot, so chats keep answering from it while you fix the
+connection.
 
 ### Single sign-on with Microsoft Entra ID (optional)
 
@@ -152,11 +184,11 @@ enforce it at run time. Keep them.
 |---|---|---|
 | Unprivileged user | uid/gid **10001** (`pdc`), never root | uid **10002** (`pdcexec`) in gid 10001, never root |
 | Read-only container filesystem | Yes: it cannot modify its own code or image | Yes |
-| Writable scratch | `/tmp` on a 512 MB RAM disk: chart-rendering caches and the temporary copy of every file being uploaded | `/tmp` on a 1 GB RAM disk, the only place generated code can write |
+| Writable scratch | `/tmp` on a 512 MB RAM disk: chart-rendering caches and the temporary copy of every file being uploaded | `/tmp` on a 1 GB RAM disk, plus the shared jobs volume at `/jobs` — the two places generated code can write (see "The shared jobs volume") |
 | All Linux capabilities dropped | Yes | Yes |
 | `no-new-privileges` | Yes | Yes |
 | Memory and process caps | 4 GB, 512 processes | 3 GB, 256 processes; each job's own address space is capped at `EXECUTOR_MEM_LIMIT_MB` (2048) |
-| Persistent state | Uploads, chats, history, snapshots, rendered decks **and the application log** under `/data/client` only | None. No data volume at all |
+| Persistent state | Uploads, chats, history, snapshots, rendered decks **and the application log** under `/data/client` only | No data volume. Its only mount is the shared jobs volume at `/jobs`, which holds work in flight (see "The shared jobs volume") |
 | Network | The published port, outbound HTTPS to the brain, TCP to your databases | The private sandbox network only, which has no gateway |
 
 Both `/tmp` filesystems are RAM-backed and charged against the container's own
@@ -186,6 +218,11 @@ The web container joins two networks. The sandbox joins only one:
   any database, or to the internet. That is the containment, not a
   convenience. Do not publish the sandbox's port, and do not attach it to
   another network.
+
+Nothing but these two services may join the internal sandbox network
+(`backend` in `docker-compose.yml`). Point monitoring at `/health` over the
+normal network: a monitoring sidecar attached to `backend` gets HTTP 403, like
+anything else in that range.
 
 `PDC_BACKEND_SUBNET` pins the sandbox network's address range
 (`192.168.255.240/28` by default) and the same value reaches the web
@@ -222,6 +259,13 @@ shared working space for questions in flight: **do not** include it in a
 backup you intend to restore elsewhere, because it can contain fragments of
 the tables a question was analysing, and do not put anything of your own in
 it.
+
+The volume can also hold one question's input tables for a while after the
+question ends — for example a job directory the sandbox locked, which its own
+sweep removes within about an hour. So exclude `pdc_client_exec_jobs` from host
+backups, and remove it with `docker volume rm pdc_client_exec_jobs` (stack
+stopped) after a failed upgrade or when decommissioning the install; it is
+recreated empty on the next start (check the ownership note below).
 
 **Nothing under `/data/client` is mounted into the sandbox**: not your users,
 not chats, not the database snapshots, not the credential store, not the log.
@@ -437,6 +481,21 @@ decks, and your branded templates.
 - **Your data stays yours.** Raw uploads, chats, and rendered decks live only in
   the `/data/client` volume on your server and are never transmitted. See
   "What leaves your network" for exactly what does reach the brain.
+- **Sharing rules your users will meet.**
+  - Sharing with a colleague who has never signed in creates an account for
+    that address with no password. The colleague signs in by clicking "Reset
+    password" first; typing a password at the sign-in page is refused. Nobody
+    else can claim the share by signing in with that address first.
+  - Sharing a dashboard gives the recipients access only to the chats the
+    dashboard's owner owns. A tile pinned from a chat that was itself shared
+    with the owner shows its saved picture to the recipients, but cannot be
+    refreshed by them.
+  - Only a chat's owner can share one of its conversations.
+- **A forced password change blocks everything until it is done.** After a
+  password reset (or the first administrator sign-in with the bootstrap
+  password) the user must set a new password before anything else works: the
+  pages redirect to the change form, and every data request is refused with
+  "Password change required" until the change is made.
 - **Upgrades:** pull or load the new tag of **both** images, update the tag in
   your `docker-compose.yml`, then `docker compose up -d`. The two images belong
   to one release, so upgrading only one leaves the pair mismatched. The

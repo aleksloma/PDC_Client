@@ -324,6 +324,23 @@ Nothing of the customer's is mounted in this container, so removing a
 web-owned stray here costs nothing that the ownership rule protects on the
 other side. Neither sweep follows a symlink.
 
+"Aged" means older than an hour on both sides — and an entry whose
+modification time lies more than five minutes in the FUTURE counts as aged
+too: generated code can set any mtime on what it creates, and a negative age
+would otherwise keep a forward-dated stash forever. This service's removal
+first opens the mode of every directory in the entry, top-down and without
+following symlinks (generated code can `chmod 0500` or `0000` a directory it
+created), then removes it, and writes a REMOVED line only after an `lstat`
+confirms the entry is gone; otherwise it writes the matching failure line
+(`… entry still present after removal`).
+
+The web service additionally refuses its stray pass outright when the jobs
+directory IS `DATA_ROOT` or encloses it (`reason=encloses_data_root`), or
+resolves anywhere INSIDE `DATA_ROOT` other than exactly
+`<DATA_ROOT>/exec_jobs`, the default (`reason=inside_data_root`) — any other
+path under the data root is customer state. Job-id-shaped directories are
+still swept in both cases.
+
 The per-job input write bounds what a job is GIVEN, which is what makes the
 per-role table grants meaningful on the way in. It does not bound what a job
 can deposit on the way out, so read that property as applying to the input
@@ -398,8 +415,12 @@ time and exit code, with the job id as the session id. The process sweep logs
 abandoned job directory and `EXEC_STRAY_ENTRY_REMOVED kind=file|dir|link|other`
 for something generated code left in the jobs root (with
 `EXEC_STRAY_ENTRY_REMOVE_FAILED` when it cannot). The web service adds
-`EXEC_STRAY_SWEEP_REFUSED` on the one configuration where it declines to
-look at strays at all. A removal line is worth reading rather than
+`EXEC_STRAY_SWEEP_REFUSED reason=encloses_data_root|inside_data_root|unresolved`
+(once per process) on the configurations where it declines to look at strays
+at all, and `EXEC_ORPHAN_LEFT_TO_SANDBOX reason=owned_by_another_uid` (once
+per path) when an abandoned job directory could not be removed because the
+entry that blocked it belongs to another identity — the sandbox's — whose own
+sweep clears it. A removal line is worth reading rather than
 filtering: it means a question wrote something outside its own job
 directory.
 
@@ -506,7 +527,9 @@ down, busy, or refusing the job, and retrying one costs a planner call plus
 another wait for a slot. A `TimeoutError`, a `MemoryError` and a
 `ResultTooLarge` are NOT in that set on purpose — the planner can genuinely
 write cheaper code — and neither is a crash the generated code caused
-(`reason=exit` or `reason=signal`), for the same reason. Without this split
+(`reason=exit` or `reason=signal`), for the same reason. That carve-out
+applies only to a text that STARTS with `ExecutorCrashError`: another
+`Executor*` text that merely quotes `reason=exit` stays infrastructure. Without this split
 one unreachable sandbox turned a single question into three pro-tier planner
 calls and three further waits.
 
@@ -514,7 +537,10 @@ calls and three further waits.
 `executor_reachable` and `executor_checked_at`. The value is a CACHED
 observation — the startup handshake, every dispatch outcome, and a
 short-lived background probe refresh it — never a live call made while the
-request waits. That is deliberate: a stopped sandbox drops out of Docker's
+request waits. `executor_checked_at` moves only when a verdict lands: taking
+the refresh slot is stamped in its own `claimed_at` field, so a probe that is
+still running (a DNS miss outlasts its budget) does not make a stale verdict
+look fresh. That is deliberate: a stopped sandbox drops out of Docker's
 DNS, the lookup then falls through to the host resolver and costs seconds
 before any HTTP timeout applies, which would block the event loop and fail
 the container's own health probe at the exact moment the field exists to
@@ -522,10 +548,12 @@ report. `/health` therefore stays 200 with `executor_reachable: false`, and
 an operator must not read a healthy container as a working stack.
 
 **A job directory the sandbox locked.** Generated code can `chmod` a
-directory it created under `out/`. The sandbox's own sweep repairs the mode
+directory it created under `out/`. The sandbox's own sweep opens the modes
 and removes it within the hour; the web service cannot, because it may not
-chmod what the sandbox uid owns. It therefore logs such a failure once per
-path per process rather than on every sweep. If the sandbox is stopped or
+chmod what the sandbox uid owns. When the entry that blocked the removal
+belongs to that other identity it logs `EXEC_ORPHAN_LEFT_TO_SANDBOX` at INFO,
+once per path per process; any other failure is `EXEC_ORPHAN_REMOVE_FAILED`,
+also once per path. If the sandbox is stopped or
 removed, those directories stay until it returns — they hold one job's input
 frames, so the jobs volume is worth a glance after a failed upgrade.
 
@@ -534,8 +562,9 @@ and removes it in a `finally` — success, failure and refusal alike. A removal
 that fails is logged, not retried, because the sweeps cover it: this side
 sweeps job-id-shaped directories older than an hour at startup and
 opportunistically after a dispatch, and the sandbox does the same on its own
-schedule (§7). Only 32-hex directory names inside the shared directory are
-ever touched.
+schedule (§7). Beyond 32-hex job directories, the only entries either side
+touches are the aged strays of the jobs root described in §7 — on this side
+never one it owns, and never at all when the jobs directory is refused.
 
 **Version handshake.** At startup the web service calls `/healthz` and logs
 one warning per library whose version differs from its own, plus

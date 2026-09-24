@@ -10,6 +10,28 @@ file documents the enterprise client's implementation of each one.
 > them gracefully where the feature does not exist on-prem). See
 > "Lesson learned" at the bottom.
 
+### Behaviour common to every route
+
+- **Pending forced password change.** While the session carries
+  `must_change_password` (a temp-password or bootstrap-password sign-in),
+  every route answers `403 {"error": "Password change required", "code":
+  "PASSWORD_CHANGE_REQUIRED"}` EXCEPT: the pages `/`, `/lab`, `/c/…`,
+  `/dashboards/…`, `/admin/data_sources`, `/power/data_sources` (each
+  redirects to the change form itself), `/static/…`, `/health`, `/version`,
+  `/auth/login`, `/auth/logout`, `/auth/change_password`,
+  `/auth/reset_password`, `/auth/me` and the Microsoft sign-in routes
+  (`/auth/microsoft…`). Source: `PasswordChangeGate` in `app.py`.
+- **Requests from the analysis sandbox's network.** A request whose network
+  peer lies inside the sandbox's subnet (`EXECUTOR_NETWORK_CIDR`) is refused
+  on EVERY path, `/health` included, with a bare `403 {"error": "forbidden"}`
+  (no path, range or caller named) and one `BACKEND_REQUEST_REFUSED` log line
+  per peer address. Source: `BackendNetworkGuard` in `app.py`.
+- **Chat ids.** A chat id outside `[A-Za-z0-9_-]{1,64}` answers
+  `404 {"error": "Chat not found"}`, like an unknown chat.
+- **CSRF.** The session cookie is `SameSite=lax`, and every state-changing
+  endpoint is a `POST` — a cross-site form or link cannot carry the session
+  into a write.
+
 ---
 
 ## Pages (HTML)
@@ -44,7 +66,7 @@ relay (`/v1/send_welcome_email`, `/v1/send_password_reset_email`).
 
 | Method | Path | Behavior |
 |---|---|---|
-| `POST` | `/auth/login` | form-encoded `email=`, `password=`, `remember?`. Genuinely NEW email (no user folder) → entered password becomes the password + welcome email (fire-and-forget). LEGACY email-only account (folder, no hash) → 403 with the "set your password via Reset password" notice (never adopts the typed password). Wrong password → landing re-rendered with red "Incorrect password" + Reset action (401). Temp password → session flagged and redirected to `/auth/change_password`. Success target: `/lab` for everyone — promoted admins included — except the bootstrap ladmin account → `/admin/data_sources` (`_post_login_target`, keyed on `AuthStore.is_bootstrap_admin`, 19g). `remember` → persistent ~30-day session cookie (RememberMeSessionMiddleware in app.py); otherwise browser-session cookie. |
+| `POST` | `/auth/login` | form-encoded `email=`, `password=`, `remember?`. Genuinely NEW email (no user folder) → entered password becomes the password + welcome email (fire-and-forget). LEGACY email-only account (folder, no hash) → 403 with the "set your password via Reset password" notice (never adopts the typed password); a placeholder account created by a share to a never-signed-in address is refused the same way, with a "something was shared with this address" notice. Wrong password → landing re-rendered with red "Incorrect password" + Reset action (401). Temp password → session flagged and redirected to `/auth/change_password`. Success target: `/lab` for everyone — promoted admins included — except the bootstrap ladmin account → `/admin/data_sources` (`_post_login_target`, keyed on `AuthStore.is_bootstrap_admin`, 19g). `remember` → persistent ~30-day session cookie (RememberMeSessionMiddleware in app.py); otherwise browser-session cookie. |
 | `POST` | `/auth/reset_password` | form-encoded `email=`. Unknown email → "This account does not exist." Known → generates a temp password locally, stores its hash + `must_change_password`, brain-relays it by mail; on relay failure the temp credential is rolled back and an error shown. The user's own password stays valid until the temp one is used (a stranger's reset request can't lock the real user out). |
 | `POST` | `/auth/change_password` | form-encoded `new_password=`, `confirm_password=` — the forced-change submit (session required) |
 | `POST` | `/auth/logout` | clears session, redirects to `/`. |
@@ -257,8 +279,9 @@ of `/generate_chatdata`. It merges the temp session store into the existing
   to the View / Edit Descriptions modal (which re-fetches
   `/api/chat/{id}/schema` on open).
 
-Requires an authenticated session with access to `{chat_id}` (owner or shared
-recipient). `400` when no files were uploaded in the session; raw data never
+Requires an authenticated session that OWNS `{chat_id}` — a shared recipient
+reads the chat but does not change it, and gets `403 {"error": "Access
+denied"}`. `400` when no files were uploaded in the session; raw data never
 leaves the client.
 
 ### Add Data name-collision dialog (frontend)
@@ -363,6 +386,15 @@ the enforcement): dashboard.js / dashboard_view.js pre-freeze refresh buttons
 whose code references an `allowed:false` table with a role tooltip instead of
 letting the click fail.
 
+`GET /api/chat/{chat_id}/schema` also returns an additive `is_owner` (bool —
+`true` only for the chat's recorded owner, fails closed to `false`). The
+owner-only mutations — `POST /api/chat/{id}/schema` (descriptions),
+`POST /add_data_to_chat`, `POST /api/chat/{id}/share` and
+`POST /api/chat/{id}/auto_analysis/start` — answer a share recipient
+`403 {"error": "Access denied"}`; when `is_owner` is `false` the `/lab` page
+hides View / Edit Descriptions, Add Data and Auto Analytics instead of letting
+them fail.
+
 ### Admin routes — `/api/admin/*` (ladmin + scoped POWER USERS)
 
 Two guards (prompt 19):
@@ -404,14 +436,22 @@ Two guards (prompt 19):
     reconcile is limited to that held subset: roles they do NOT hold keep
     their ladmin-granted membership (ladmin's reconcile stays exact). A
     fresh registration with the panel untouched is visible only to the
-    registerer via the ownership read. Everything else — confirm lock, drift
-    check, duplicate check, snapshot — is unchanged.
+    registerer via the ownership read. The posted `relations` array is
+    scope-checked too: a relation the power user ADDS or CHANGES whose related
+    table is outside their management scope → `403 OUT_OF_SCOPE`; an
+    unchanged copy of a stored out-of-scope relation passes, and a stored
+    out-of-scope relation the post omits is KEPT (they can neither add nor
+    remove it). Everything else — confirm lock, drift check, duplicate check,
+    snapshot — is unchanged.
   - `POST /tables/{tid}/delete`: in scope AND `registered_by == <the power
     user>` — else `403 OUT_OF_SCOPE` / `403 {"code": "NOT_OWNER"}` (absent
     `registered_by` = ladmin-registered/legacy → NOT_OWNER). Ladmin deletes
     anything, unchanged.
   - `/relations/accept|delete|dismiss`: EVERY referenced side (child AND
-    parent/related) must be manageable; recommendation status/classify/accept
+    parent/related) must be manageable — on `accept` this includes the
+    related table of a `replaces` entry (the relation being replaced is
+    removed, so it must be in scope as well; else `403 OUT_OF_SCOPE`);
+    recommendation status/classify/accept
     check the rec's (connection, schema); `accept_recommendation` registers
     with `registered_by` = the power user.
   - Every power-user WRITE's audit row carries `actor_kind: "power_user"` in
@@ -436,7 +476,7 @@ action appends to the append-only audit JSONL `DATA_ROOT/admin_audit.jsonl`
 
 | Method | Path | Behavior |
 |---|---|---|
-| `GET` | `/api/admin/dialects` | dialect registry for the UI (`postgresql`, `mysql`, `mariadb`, `mssql`, `oracle`, `clickhouse`) with per-dialect `{available, unavailable_reason}` (e.g. msodbcsql18 not installed). The connection form is built from this response alone — `label`, `default_port`, `needs`, `available` — so a new dialect needs no UI change unless it needs a form field beyond database / service_name |
+| `GET` | `/api/admin/dialects` | dialect registry for the UI (`postgresql`, `mysql`, `mariadb`, `mssql`, `oracle`, `clickhouse`) with per-dialect `{available, unavailable_reason}` (e.g. msodbcsql18 not installed), plus `plaintext_port` (the port the server speaks WITHOUT TLS where it differs from `default_port`, else `null`) and `ssl_default` (the form pre-ticks SSL / Encrypt for a NEW connection). ClickHouse: `default_port` 9440 (TLS), `plaintext_port` 9000, `ssl_default: true`; a stored connection with no port resolves to 9000 unless SSL is on, and the form warns when port 9000 is entered or SSL is off. The connection form is built from this response alone — `label`, `default_port`, `needs`, `available` — so a new dialect needs no UI change unless it needs a form field beyond database / service_name |
 | `GET/POST` | `/api/admin/connections` | list (masked) / create. Create requires `CLIENT_ENCRYPTION_KEY` (else 503 — passwords are Fernet-encrypted at rest, never plaintext) |
 | `POST` | `/api/admin/connections/test` | SELECT-1 probe with a short connect timeout. Accepts `{connection_id}` OR a full unsaved draft incl. `password` (Test-before-Save). `{ok, error?, server_version?, elapsed_ms}` |
 | `POST` | `/api/admin/connections/{cid}` | edit; omitted/empty `password` keeps the stored credential |
@@ -506,8 +546,8 @@ The wizard save's `access_role_ids` writes through `roles_store.set_table_roles`
 (audited `role.set_tables`). Admin-page UI: **Users** section (searchable list,
 19c multi-role checkbox picker — every toggle POSTs the full held list — and
 the 19e per-row Permission dropdown Standard / Power user / Local admin with a
-confirm dialog before promoting to admin; admin rows render the roles picker
-disabled) + **Roles** section (cards + a tri-state access tree
+confirm dialog before promoting to admin; the roles picker stays enabled on
+admin rows — promoted admins hold roles like anyone) + **Roles** section (cards + a tri-state access tree
 connection → schema → tables; checking a schema/connection stores a scope
 grant and locks its descendants "via schema/connection").
 
@@ -585,6 +625,18 @@ algorithm the planner prompt used to spell out inline; QA 2.6); data
 ## Chat (SSE stream)
 
 **`POST /api/chat/{chat_id}/chat/stream`** — body `{question, conv_id?}`.
+
+**Conversation access.** The chat's owner may act on any conversation of the
+chat. Anyone else (a share recipient) may act only on conversations recorded in
+their OWN conversation list (their own conversations in the shared chat and the
+snapshot copies shared with them) — otherwise `403 {"error": "Access denied"}`,
+checked before any history is read or written. This applies to `chat/stream`
+with a supplied `conv_id`, `edit-regenerate`,
+`conversation/{conv_id}/history` and `conversation/{conv_id}/stop`. The legacy
+`GET /api/chat/{chat_id}/history` (newest conversation, which may be anyone's)
+returns `{"history": []}` to a non-owner. `conversation/{conv_id}/stop` and
+`conversation/{conv_id}/status` also answer `403` when the conversation does
+not belong to the chat in the path — for the owner too.
 
 The endpoint is implemented as a real SSE stream (`text/event-stream`), same
 content-type and event shape as the B2C `chat_stream_api`:
@@ -783,7 +835,8 @@ local re-execution.
 Every chart and table that carries its own stored `code` (live events and
 persisted history records both do) gets a small refresh icon button (double
 curved arrows) in its action bar. Clicking it re-runs ONLY that item's stored
-code against the chat's **current** dataframes — re-execution via
+code against the chat's **current** dataframes (the server enforces this — see
+**Stored code only** below) — re-execution via
 `render_plot_safe` / `safe_execute`, i.e. the sandbox container, the same path
 `_reexecute_full_df` uses;
 **no LLM/brain call** — and swaps the chart image / table content in place.
@@ -804,6 +857,17 @@ refreshed to reflect the new data.
   code that can't be matched to the item — show no button. The endpoint keeps
   rejecting joined code with `400` as a guard; the frontend always sends a
   single clean segment.
+- **Stored code only.** The posted `code` must be code the chat already
+  holds: the stored code of an AI answer in any of the chat's conversations,
+  one `###NEXT_PLOT###` segment of a multi-chart answer's joined code, the
+  code of a durable full-table record, or the code of the answer currently
+  being generated (so a chart streamed a moment ago is refreshable before its
+  history row exists). The comparison is made after trimming surrounding
+  whitespace and turning CRLF into LF. Anything else →
+  `403 {"error": "This item's code is not part of the chat's history.",
+  "code": "CODE_NOT_STORED"}` (logged `REFRESH_CODE_NOT_STORED`). Checked
+  after the two `400`s (empty code, joined code) and BEFORE the role gate, so
+  unstored code is never role-checked or executed.
 - Auth/permission failures use HTTP codes; **execution** failures return
   `200 {ok: false, error}` — the frontend keeps the previous render and shows
   a small non-blocking note.
@@ -858,12 +922,12 @@ chars, regex-guarded (path-traversal safe). Old-shape docs load with defaults
 | `GET` | `/api/dashboards/{id}` | full doc + `is_owner`; **bumps `last_used_at`** (opened == used) |
 | `POST` | `/api/dashboards/{id}/rename` | `{name}` — owner only (shared recipients → 403) |
 | `POST` | `/api/dashboards/{id}/delete` | owner → deletes the doc (+ own index row); shared recipient → drops only their pointer row (`{ok, deleted: bool}`); idempotent |
-| `POST` | `/api/dashboards/{id}/tiles` | pin one item. Body `{chat_id, kind: "chart"\|"table", description?, code?, image_base64?, is_plotly?, table?, full_table_key?, chart_data?\|chart_data_key?}`. Owner only + `_require_chat(chat_id)` (can only pin from accessible chats). Volatile `chart_data_key` is resolved to durable inline data AT PIN TIME; table rows capped at 50 (honest `total_rows`) with `styled_html`/`dtype`/`title` preserved (styled_html dropped only over 2M chars — plain rows remain) so conditional formatting survives on the tile; chart snapshots >5M chars → 400; `###NEXT_PLOT###` code is nulled (tile renders, can't refresh). **Table code is authoritative-from-record**: when `full_table_key` resolves to a durable record with clean `code`, that code (+ its `result_key`) is stored on the tile — the client-sent code can be the CHART's code in mixed chart+table answers, and the frontend sends no code for a table pinned from such a message. **Journal layout defaults (QA 3.1)**: charts are HALF-width (w6) and a new chart pairs into the right half of the previous left-half chart's row (2 per row); tables are FULL-width (w12); text blocks w12×h2. **Text blocks**: `{kind: "text", text (≤2000, required), style: header1\|header2\|paragraph, color: default\|gray\|red\|orange\|green\|blue\|purple, size: S\|M\|L, align: left\|center\|right (default left), valign: top\|middle\|bottom (default top)}` — no `chat_id`/snapshot/code; invalid enums → 400; alignment lives at tile TOP LEVEL (never inside `layout`, which every drag rewrites to exactly `{x,y,w,h}`) and tiles stored before it existed render as left/top; rendered as styled text tiles (draggable/resizable like any tile, visible read-only in the shared view; refresh on them is a no-op that never freezes). Legacy layoutless tiles get a computed half-width default in the GET RESPONSE only (never persisted — the first drag persists real positions). |
+| `POST` | `/api/dashboards/{id}/tiles` | pin one item. Body `{chat_id, kind: "chart"\|"table", description?, code?, image_base64?, is_plotly?, table?, full_table_key?, chart_data?\|chart_data_key?}`. Owner only + `_require_chat(chat_id)` (can only pin from accessible chats). Volatile `chart_data_key` is resolved to durable inline data AT PIN TIME; table rows capped at 50 (honest `total_rows`) with `styled_html`/`dtype`/`title` preserved (styled_html dropped only over 2M chars — plain rows remain) so conditional formatting survives on the tile; chart snapshots >5M chars → 400; `###NEXT_PLOT###` code is nulled (tile renders, can't refresh). **Table code is authoritative-from-record**: when `full_table_key` resolves to a durable record with clean `code`, that code (+ its `result_key`) is stored on the tile — the client-sent code can be the CHART's code in mixed chart+table answers, and the frontend sends no code for a table pinned from such a message. **Stored code only** (same rule as `refresh_item`, because every later tile refresh re-runs it): a chart tile — or a table tile whose `full_table_key` did not resolve to a durable record — posted with code the source chat does not hold → `400 {"error", "code": "CODE_NOT_STORED"}` (logged `DASH_PIN_CODE_NOT_STORED`); a pin WITHOUT code is still accepted (the tile renders but cannot refresh). **Journal layout defaults (QA 3.1)**: charts are HALF-width (w6) and a new chart pairs into the right half of the previous left-half chart's row (2 per row); tables are FULL-width (w12); text blocks w12×h2. **Text blocks**: `{kind: "text", text (≤2000, required), style: header1\|header2\|paragraph, color: default\|gray\|red\|orange\|green\|blue\|purple, size: S\|M\|L, align: left\|center\|right (default left), valign: top\|middle\|bottom (default top)}` — no `chat_id`/snapshot/code; invalid enums → 400; alignment lives at tile TOP LEVEL (never inside `layout`, which every drag rewrites to exactly `{x,y,w,h}`) and tiles stored before it existed render as left/top; rendered as styled text tiles (draggable/resizable like any tile, visible read-only in the shared view; refresh on them is a no-op that never freezes). Legacy layoutless tiles get a computed half-width default in the GET RESPONSE only (never persisted — the first drag persists real positions). |
 | `POST` | `/api/dashboards/{id}/tiles/{tile_id}/update` | owner only; TEXT tiles only (chart/table tiles → 400 — their content changes via refresh, never free edits). Body: any subset of `{text, style, color, size, align, valign}`, same validation as create; empty body → 400. Returns `{ok, tile}`. |
 | `POST` | `/api/dashboards/{id}/tiles/{tile_id}/remove` | owner only |
 | `POST` | `/api/dashboards/{id}/layout` | `{tiles: [{tile_id, x, y, w, h}]}` bulk save — owner only; ints validated/clamped, unknown tile_ids ignored (stale client) |
 | `POST` | `/api/dashboards/{id}/tiles/{tile_id}/refresh` | allowed for owner AND shared recipients. Table tiles first **re-resolve + self-heal** their code from the durable full-table record (tiles pinned with a wrong/chart code get the corrected code persisted); tiles with a `result_key` (one table of a multi-table RESULT) re-execute via `_reexecute_full_df` and persist a fresh durable key, others via `run_item_refresh` (Styler results keep `styled_html`). Deleted source chat → persists `frozen/frozen_reason="source_deleted"` on the tile, returns `200 {ok:false, frozen:true, reason}`; a caller without source-chat access gets the same shape with `reason:"access_revoked"` but nothing is persisted (caller-specific). Execution failures → `200 {ok:false, error}`, stored snapshot untouched. Success updates the snapshot (+ re-inlined `chart_data` / new `full_table_key`), clears `frozen`, returns `{ok, kind, image_base64\|table, is_plotly?, tile}`. |
-| `POST` | `/api/dashboards/{id}/share` | `{emails: [...]\|"a@x, b@y", message?}` — owner only, mirrors the chat share contract (`{ok, shared_with, added, email_sent, smtp_configured, failed}`). Adds recipients to the doc's `shared_with`, writes a pointer row into each recipient's dashboard index, **and grants them access to every tile's source chat** (`add_share_recipients`, same grant conversation-sharing performs) so their Show-data/refresh work. Brain SMTP relay gets only the dashboard name + comment (Article II — never tile content). No revoke exists (parity with chat sharing). |
+| `POST` | `/api/dashboards/{id}/share` | `{emails: [...]\|"a@x, b@y", message?}` — owner only, mirrors the chat share contract (`{ok, shared_with, added, email_sent, smtp_configured, failed}`). Adds recipients to the doc's `shared_with`, writes a pointer row into each recipient's dashboard index, **and grants them access to every tile's source chat that the dashboard OWNER owns** (`add_share_recipients`, same grant conversation-sharing performs) so their Show-data/refresh work. A tile pinned from a chat the owner merely RECEIVED is not re-shared: those recipients see its stored snapshot, and its refresh answers `{ok:false, frozen:true, reason:"access_revoked"}` for them. An address that has never signed in gets a password-less placeholder account (see Sharing rules). Brain SMTP relay gets only the dashboard name + comment (Article II — never tile content). No revoke exists (parity with chat sharing). |
 
 **Frontend**: the `/lab` top bar has a Dashboards dropdown at the LEFT corner
 (filled navy `#001E44` bold button with an inline-SVG list icon — rows of
@@ -954,9 +1018,9 @@ values leave the client.
 
 | Endpoint | Behavior |
 |---|---|
-| `POST /api/chat/{id}/share` | adds recipients to `meta.json["sharing"]["shared_with"]`, asks brain `/v1/send_share_email` to SMTP-relay invites using this tenant's SMTP config |
+| `POST /api/chat/{id}/share` | owner only (`403 {"error": "Access denied"}` for a share recipient); adds recipients to `meta.json["sharing"]["shared_with"]` (a never-signed-in address gets a placeholder account — see Sharing rules), asks brain `/v1/send_share_email` to SMTP-relay invites using this tenant's SMTP config |
 | `GET  /api/chat/{id}/share` | returns the current sharing record (`{shared_with, owner}`) |
-| `POST /auth/conversations/{conv_id}/share` | **conversation-level share** — for each recipient, snapshot the conversation history into a fresh `conv_id` via `ChatDataStore.copy_conv_to_new`, add them to the chat's `sharing.shared_with`, record the new conv in the recipient's `conversations.jsonl` with title prefix "(Shared) …" and `shared_by` field, then SMTP-relay an invite. Recipients access the chat through `_require_chat`'s shared-recipient check |
+| `POST /auth/conversations/{conv_id}/share` | **conversation-level share** — only the chat's OWNER may share (sharing a conversation also grants access to its chat): anyone else → `403 {"error": "Access denied"}`. For each recipient, snapshot the conversation history into a fresh `conv_id` via `ChatDataStore.copy_conv_to_new`, add them to the chat's `sharing.shared_with`, record the new conv in the recipient's `conversations.jsonl` with title prefix "(Shared) …" and `shared_by` field, then SMTP-relay an invite. Recipients access the chat through `_require_chat`'s shared-recipient check |
 | `GET  /api/chat/{id}/full_table/{key}` | returns the full result table cached under `key`. The chat stream sets `full_table_key` on responses that contain a tabular result. Backed by a bounded in-memory LRU (256 most recent results) |
 | Conversation title generation | After the 2nd human message, the chat stream fires a background `brain_client.title()` call and renames the conversation via `AuthStore.rename_conversation` |
 | Activity logging | `auth.py` (login), `upload.py` (file_uploaded), `chat.py` (plot_generated, per chart), `report.py` (report_exported), `auto_analytics.py` (auto_analytics_completed) all call `brain_client.post_activity` → brain `/v1/activity`. Fire-and-forget: the post runs on a single background worker thread (ordered), so a slow brain can never block a request or the event loop — telemetry lags instead. |
@@ -964,6 +1028,12 @@ values leave the client.
 | **Multi-chart streaming** | The chat SSE stream uses `run_chat_multi_plot` (a generator port of global's). The brain Agent classifier sets `suggested_approach` to "Decompose into multiple PLOT_CODE blocks ... separated by ###NEXT_PLOT###" for dashboard/overview-style queries; the planner emits the multi-block raw_text; the client splits it via `_extract_multi_plot_blocks` and executes each block locally with retry, yielding a `{partial: true, chart_n, chart_total, image_base64, answer}` SSE event per chart and a final `{done: true}` combined event. Capped at 6 charts per response. Single-chart queries fall through to the existing one-shot path |
 | **Edit-regenerate** | `POST /api/chat/{id}/edit-regenerate` — verbatim port of global's `edit_regenerate_api` (`backend/routes/chat.py` L1136-1296). dashboard.js fires this from the pencil-edit affordance on a past user message. Server-side: find last `human` turn, `truncate_conv_history` to drop it (and everything after), append the edited human turn, run `run_chat_multi_plot` against the local dfs, persist the AI turn in the same shape the SSE stream uses (`image_base64` for 0/1 charts, `images: [...]` for 2+). Returns a single JSON (NOT SSE — global's is also a one-shot JSON response) |
 | **Chart persistence across refresh / reopen** | `routes/chat.py` accumulates each multi-plot partial's `(image_base64, answer)` while streaming. On the final `done` event the AI turn is appended to `conversations/{conv_id}.jsonl` using global's shape (`backend/routes/chat.py` L1088–1105): 0 images → no image fields, 1 image → top-level `image_base64`, 2+ images → `images: [{image_base64, answer}, ...]`. The single-chart path already stored `image_base64` directly. `dashboard.js` reopens the conversation via `GET /api/chat/{id}/conversation/{conv_id}/history`; lines 1551 and 2184 render `msg.images` as one assistant bubble per chart, otherwise render `msg.image_base64` — identical to global. **Bug fixed (May 2026):** multi-plot history previously persisted `image_base64: null` and no `images` field, so charts vanished on refresh |
+
+### Sharing rules
+
+- **New addresses.** Sharing a chat, a conversation or a dashboard with an address that has never signed in creates a password-less placeholder account (`AuthStore.ensure_invited_user`, `invited_by`/`invited_at` on the profile). Its first sign-in is refused with a "Reset password" notice, so the recipient sets a password through the reset flow — whoever types the address first at the sign-in page cannot claim the share.
+- **Dashboards.** A dashboard share grants the recipients access only to the source chats the dashboard OWNER owns. Tiles pinned from a chat the owner merely received show their stored snapshot, and their refresh answers `{ok:false, frozen:true, reason:"access_revoked"}` for those recipients.
+- **Conversations.** A conversation share is owner-only, like the chat-level share.
 
 ---
 

@@ -367,11 +367,14 @@ Runbook:
    controls (change password / sign out) live at the bottom of the panel's
    sidebar.
 2. **Connections** section → **＋ Add connection** → fill
-   host/port/database/user/password (SSL toggle; MSSQL and ClickHouse also
-   use Trust-server-certificate for self-signed certs — on ClickHouse it maps
-   to the driver's `verify=false`). **ClickHouse + SSL also needs the port
-   changed to 9440** — the form pre-fills the plaintext native port 9000 and
-   does not adjust it when SSL is ticked. → **Test connection**
+   host/port/database/user/password (SSL toggle; MSSQL, Oracle and ClickHouse
+   also use Trust-server-certificate for self-signed certs — on ClickHouse it
+   maps to the driver's `verify=false`, on Oracle it also skips the server
+   DN match). A NEW ClickHouse connection is pre-filled with the TLS native
+   port 9440 and SSL ticked; the form warns when port 9000 (plaintext) is
+   entered or SSL is off. What the SSL toggle enforces per database is
+   tabulated in `CUSTOMER_INSTALL.md` ("Connecting your own databases").
+   → **Test connection**
    (works on the unsaved draft) → Save. With zero connections the section
    shows a 3-step getting-started hero instead of an empty table.
 3. **＋ Register table** (from a connection row or the Registered-tables
