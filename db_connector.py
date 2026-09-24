@@ -51,6 +51,7 @@ import importlib.util
 import os
 import re
 import socket
+import ssl
 import threading
 import time
 from dataclasses import dataclass, field
@@ -89,6 +90,13 @@ class Dialect:
     exact_count_fallback: bool = False
     allow_url_override: bool = False
     hidden: bool = False
+    # The port the server speaks WITHOUT TLS, for dialects where that differs
+    # from `default_port` (ClickHouse: 9000 plaintext, 9440 TLS). A blank
+    # stored port with SSL off resolves to it, so an existing row keeps the
+    # port it has always reached.
+    plaintext_port: Optional[int] = None
+    # The admin form pre-ticks SSL for a NEW connection of this dialect.
+    ssl_default: bool = False
 
     def available(self) -> tuple[bool, Optional[str]]:
         if importlib.util.find_spec(self.driver_module) is None:
@@ -118,6 +126,52 @@ def _pg_connect_args(cfg: dict, timeout: int) -> dict:
 def _pg_stmt_timeout(conn, seconds: int) -> None:
     from sqlalchemy import text
     conn.execute(text(f"SET statement_timeout = {int(seconds) * 1000}"))
+
+
+class TLSNotNegotiated(Exception):
+    """The connection was configured to require TLS but the session came up
+    in plaintext."""
+
+
+_TLS_NOT_NEGOTIATED_MSG = ("TLS is required for this connection but the "
+                           "server did not offer it")
+
+
+def _mysql_require_tls(dbapi_connection, connection_record) -> None:
+    """`connect` listener for MySQL/MariaDB with SSL ticked. PyMySQL
+    negotiates TLS only when the server advertises it and otherwise carries
+    on in PLAINTEXT without an error, so the session is asked for its cipher
+    and a plaintext one is refused. The DBAPI connection is closed BEFORE the
+    raise: SQLAlchemy does not close a connection whose `connect` event
+    raised. This checks that the channel is encrypted; it does not verify the
+    server's identity."""
+    cipher = None
+    try:
+        cur = dbapi_connection.cursor()
+        try:
+            cur.execute("SHOW SESSION STATUS LIKE 'Ssl_cipher'")
+            row = cur.fetchone()
+            if row and len(row) > 1:
+                cipher = row[1]
+        finally:
+            try:
+                cur.close()
+            except Exception as e:
+                log_with_sid("db", "warning",
+                             f"DB_TLS_PROBE_CURSOR_CLOSE_FAILED error={type(e).__name__}")
+    except Exception as e:
+        # The probe itself failed: the channel's state is unknown, so the
+        # connection is refused like a plaintext one rather than leaked.
+        log_with_sid("db", "warning",
+                     f"DB_TLS_PROBE_FAILED error={type(e).__name__}")
+        cipher = None
+    if not cipher:
+        try:
+            dbapi_connection.close()
+        except Exception as e:
+            log_with_sid("db", "warning",
+                         f"DB_TLS_PROBE_CLOSE_FAILED error={type(e).__name__}")
+        raise TLSNotNegotiated(_TLS_NOT_NEGOTIATED_MSG)
 
 
 def _mysql_connect_args(cfg: dict, timeout: int) -> dict:
@@ -165,7 +219,24 @@ def _oracle_query_args(cfg: dict) -> dict:
 def _oracle_connect_args(cfg: dict, timeout: int) -> dict:
     # Thin-mode oracledb: without this the connect falls back to the OS TCP
     # timeout (~127s on Linux), the one dialect that could outlast a click.
-    return {"tcp_connect_timeout": float(timeout)}
+    args = {"tcp_connect_timeout": float(timeout)}
+    if cfg.get("ssl"):
+        # TLS: a `tcps://` DSN replaces the plain-TCP one the dialect builds
+        # from the URL (create_engine applies connect_args after the
+        # dialect's own). The server certificate's DN is matched unless the
+        # trust box is ticked, which — like the SQL Server and ClickHouse
+        # trust flags — also skips certificate verification.
+        port = cfg.get("port") or 1521
+        service = cfg.get("service_name") or cfg.get("database") or ""
+        trust = bool(cfg.get("trust_server_certificate"))
+        args["dsn"] = f"tcps://{cfg.get('host') or ''}:{port}/{service}"
+        args["ssl_server_dn_match"] = not trust
+        if trust:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            args["ssl_context"] = ctx
+    return args
 
 
 def _oracle_stmt_timeout(conn, seconds: int) -> None:
@@ -269,7 +340,11 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
     Dialect(
         key="clickhouse", label="ClickHouse",
         drivername="clickhouse+native", driver_module="clickhouse_driver",
-        default_port=9000, needs=("database",),
+        # A new connection is offered the TLS port with SSL ticked; 9000 is
+        # the plaintext port, kept so a blank-port row with SSL off still
+        # resolves to it (see build_url).
+        default_port=9440, plaintext_port=9000, ssl_default=True,
+        needs=("database",),
         # ClickHouse "databases" are what the SQLAlchemy dialect exposes as
         # schemas, so the schema browser lists them like any other dialect.
         supports_schemas=True, select1_sql="SELECT 1",
@@ -316,7 +391,9 @@ def list_dialects() -> list[dict]:
         ok, reason = d.available()
         out.append({"key": d.key, "label": d.label, "default_port": d.default_port,
                     "needs": list(d.needs), "supports_schemas": d.supports_schemas,
-                    "available": ok, "unavailable_reason": reason})
+                    "available": ok, "unavailable_reason": reason,
+                    "plaintext_port": d.plaintext_port,
+                    "ssl_default": d.ssl_default})
     return out
 
 
@@ -403,12 +480,19 @@ def build_url(cfg: dict, password: str):
     database = cfg.get("database")
     if d.key == "oracle":
         database = None  # service_name rides in the query args
+    # A blank port resolves to the dialect's plaintext port when SSL is off
+    # and the dialect has one, else to its default: a stored row saved
+    # without a port keeps reaching the port it always reached.
+    fallback_port = (d.plaintext_port
+                     if (d.plaintext_port and not cfg.get("ssl"))
+                     else d.default_port)
+    port = cfg.get("port") or fallback_port
     return URL.create(
         drivername=d.drivername,
         username=cfg.get("user") or None,
         password=password or None,
         host=cfg.get("host") or None,
-        port=int(cfg.get("port") or d.default_port) if (cfg.get("port") or d.default_port) else None,
+        port=int(port) if port else None,
         database=database,
         query={k: str(v) for k, v in d.query_args(cfg).items()},
     )
@@ -426,7 +510,11 @@ def get_engine(cfg: dict, password: str, *, connect_timeout: Optional[int] = Non
     ca = d.connect_args(cfg, timeout)
     if ca:
         kwargs["connect_args"] = ca
-    return create_engine(url, **kwargs)
+    engine = create_engine(url, **kwargs)
+    if d.key in ("mysql", "mariadb") and cfg.get("ssl"):
+        from sqlalchemy import event
+        event.listen(engine, "connect", _mysql_require_tls)
+    return engine
 
 
 def _catalog_name(dialect, name: Optional[str]) -> Optional[str]:

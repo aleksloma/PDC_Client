@@ -56,7 +56,8 @@ def test_registry_shape():
             "clickhouse"} <= keys
     for r in db_connector.list_dialects():
         assert set(r) == {"key", "label", "default_port", "needs",
-                          "supports_schemas", "available", "unavailable_reason"}
+                          "supports_schemas", "available", "unavailable_reason",
+                          "plaintext_port", "ssl_default"}
 
 
 def test_build_url_masks_password():
@@ -223,6 +224,47 @@ def test_every_text_literal_is_select_or_set():
         assert m.group(1) in ("SELECT",)
     for m in re.finditer(r'text\(f?"([A-Za-z]+)[ _]', src):
         assert m.group(1).upper() in ("SELECT", "SET"), m.group(0)
+
+
+def test_every_execute_string_literal_is_select_set_or_the_tls_probe():
+    """Structural guard, raw-cursor half: a string literal handed DIRECTLY to
+    an `.execute(` call (a DBAPI cursor, bypassing `text()`) must also start
+    with SELECT/SET. SHOW is allowed for exactly one statement — the
+    post-connect `SHOW SESSION STATUS LIKE 'Ssl_cipher'` probe that refuses a
+    MySQL/MariaDB session the server silently left in plaintext."""
+    import ast
+    src = Path(db_connector.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    def _literal(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.JoinedStr):
+            parts = [v.value for v in node.values
+                     if isinstance(v, ast.Constant) and isinstance(v.value, str)]
+            return "".join(parts) if parts else None
+        if (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "text"
+                and node.args):
+            return _literal(node.args[0])
+        return None
+
+    seen = 0
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "execute" and node.args):
+            continue
+        sql = _literal(node.args[0])
+        if sql is None:
+            continue
+        seen += 1
+        head = sql.strip().split(None, 1)[0].upper() if sql.strip() else ""
+        if head == "SHOW":
+            probe = " ".join(sql.split()).upper()
+            assert probe == "SHOW SESSION STATUS LIKE 'SSL_CIPHER'", sql
+            continue
+        assert head in ("SELECT", "SET"), sql
+    assert seen >= 3, "the analyser found none of the SET helpers — broken walk"
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +630,11 @@ def test_clickhouse_registry_entry():
     assert d.label == "ClickHouse"
     assert d.drivername == "clickhouse+native"
     assert d.driver_module == "clickhouse_driver"
-    assert d.default_port == 9000
+    # The TLS port is the default a new connection is offered; the plaintext
+    # port stays known so a blank-port row with SSL off keeps reaching it.
+    assert d.default_port == 9440
+    assert d.plaintext_port == 9000
+    assert d.ssl_default is True
     assert d.needs == ("database",)
     # ClickHouse databases are exposed as schemas, so the browser lists them.
     assert d.supports_schemas is True

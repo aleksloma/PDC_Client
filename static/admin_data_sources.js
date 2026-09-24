@@ -319,12 +319,42 @@
     const prev = DIALECTS.find((x) => x.key === _prevDialectKey);
     const cur = String($('connPort').value || '').trim();
     if (!cur || (prev && cur === String(prev.default_port || ''))) {
-      $('connPort').value = d.default_port || '';
+      // A STORED connection with no port reaches the plaintext port while
+      // SSL is off (the server resolves a blank port the same way), so the
+      // form must not quietly move it to the TLS port on the next save.
+      $('connPort').value = (editingConnId && d.plaintext_port && !$('connSsl').checked)
+        ? d.plaintext_port : (d.default_port || '');
+      // A dialect whose default port is its TLS port (ClickHouse) also gets
+      // SSL ticked along with that port, and switching away from it unticks
+      // it again — for a NEW connection only; a stored connection's box is
+      // never touched.
+      if (!editingConnId) $('connSsl').checked = !!d.ssl_default;
     }
     _prevDialectKey = d.key;
     const needsService = (d.needs || []).includes('service_name');
     $('connServiceWrap').classList.toggle('hidden', !needsService);
     $('connDatabaseWrap').classList.toggle('hidden', needsService);
+    _updateTlsBadge();
+  }
+
+  // Warning line when the chosen port is the dialect's plaintext port, or
+  // SSL is off for a dialect that has a separate plaintext port. Display
+  // only — it never changes a value.
+  function _updateTlsBadge() {
+    const warn = $('connTlsWarn');
+    if (!warn) return;
+    const d = DIALECTS.find((x) => x.key === $('connType').value);
+    const plain = d && d.plaintext_port;
+    const port = parseInt(String($('connPort').value || '').trim(), 10);
+    const show = !!plain && (port === plain || !$('connSsl').checked);
+    if (show) {
+      warn.textContent = (port === plain)
+        ? `Port ${plain} is ${d.label}'s plaintext port — use ${d.default_port} with SSL / Encrypt on.`
+        : `SSL / Encrypt is off — this ${d.label} connection would travel unencrypted.`;
+    } else {
+      warn.textContent = '';
+    }
+    warn.classList.toggle('hidden', !show);
   }
 
   function connFormBody() {
@@ -3265,6 +3295,9 @@
     $('btnTestConn').addEventListener('click', testConnDraft);
     $('btnSaveConn').addEventListener('click', saveConn);
     $('connType').addEventListener('change', onDialectChange);
+    $('connPort').addEventListener('input', _updateTlsBadge);
+    $('connPort').addEventListener('change', _updateTlsBadge);
+    $('connSsl').addEventListener('change', _updateTlsBadge);
 
     $('btnRegisterTable').addEventListener('click', registerTableEntry);
     $('closeTableModal').addEventListener('click', () => $('tableModal').classList.add('hidden'));
