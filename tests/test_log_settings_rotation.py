@@ -1,4 +1,4 @@
-"""C3 — log-rotation settings must be tolerant, plus a REAL rollover test.
+"""Log-rotation settings must be tolerant, plus a REAL rollover test.
 
 `settings.py` parsed LOG_MAX_BYTES / LOG_BACKUP_COUNT with a bare `int()`:
 
@@ -8,7 +8,7 @@
     configure;
   * `LOG_MAX_BYTES=0` parses fine and silently turns rotation OFF
     (RotatingFileHandler treats maxBytes=0 as "never roll over"), which is
-    exactly the unbounded-log finding the rotation fix closed.
+    exactly the unbounded log the rotation exists to prevent.
 
 Wanted: parse failures fall back to the default, and the values are clamped
 to a sane minimum so rotation can never be switched off from the environment.
@@ -125,8 +125,8 @@ def test_get_logger_rotates_and_keeps_only_backup_count_backups(
         tmp_path, monkeypatch, clean_datachat_logger):
     """Drive the REAL `logger_utils.get_logger()` at a tiny maxBytes.
 
-    The log directory is `Path(settings.DATA_ROOT) / "logs"` (Task 2 — the
-    log lives on the data volume, not in the image), so redirecting it is a
+    The log directory is `Path(settings.DATA_ROOT) / "logs"` (the log lives
+    on the data volume, not in the image), so redirecting it is a
     matter of pointing DATA_ROOT at tmp_path (monkeypatch restores it).
     """
     import logger_utils

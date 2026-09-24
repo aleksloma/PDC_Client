@@ -1606,3 +1606,54 @@ def test_a_numpy_int_dict_key_arrives_as_a_string(job_dir):
     frame = result["2023"]
     assert isinstance(frame, pd.DataFrame), type(frame)
     assert list(frame.columns) == list(df.columns), list(frame.columns)
+
+
+# ---------------------------------------------------------------------------
+# log_safe_text — one untrusted string, one log line
+# ---------------------------------------------------------------------------
+# `str.splitlines` breaks on more than CR/LF: VT, FF, the three information
+# separators, NEL and the two Unicode line/paragraph separators. A log reader
+# (or any tool that splits on those) would see a forged second record from any
+# of them, and ESC starts a terminal control sequence on an operator's screen.
+_LINE_BREAKERS = "\r\n\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029\x1b"
+
+
+@pytest.mark.parametrize("ch", list(_LINE_BREAKERS))
+def test_log_safe_text_escapes_every_line_breaker(ch):
+    raw = f"before{ch}EXEC_OK job_id=forged"
+    out = exec_transport.log_safe_text(raw, 500)
+    assert ch not in out, (repr(ch), out)
+    assert len(out.splitlines()) == 1, (repr(ch), out)
+    assert "before" in out and "EXEC_OK job_id=forged" in out
+    assert "\\" in out, "the escape must stay visible to the reader"
+
+
+def test_log_safe_text_escapes_all_breakers_at_once():
+    raw = "a" + "b".join(_LINE_BREAKERS) + "z"
+    out = exec_transport.log_safe_text(raw, 500)
+    leaked = [c for c in _LINE_BREAKERS if c in out]
+    assert leaked == [], [repr(c) for c in leaked]
+    assert len(out.splitlines()) == 1, out
+
+
+def test_log_safe_text_keeps_the_cr_lf_renderings():
+    out = exec_transport.log_safe_text("x\r\ny\nz", 500)
+    assert out == "x\\r\\ny\\nz", out
+
+
+def test_log_safe_text_cap_semantics_unchanged():
+    head = exec_transport.log_safe_text("abcdefghij", 4)
+    assert head == "abcd", head
+    tail = exec_transport.log_safe_text("abcdefghij", 4, tail=True)
+    assert tail == "ghij", tail
+    # An escape doubles a character; the field is still bounded by the cap.
+    bounded = exec_transport.log_safe_text("\u2028" * 50, 10)
+    assert len(bounded) <= 10, bounded
+    assert "\u2028" not in bounded
+    bounded_tail = exec_transport.log_safe_text("\x85" * 50, 10, tail=True)
+    assert len(bounded_tail) <= 10 and "\x85" not in bounded_tail
+    assert exec_transport.log_safe_text(None) == ""
+    assert exec_transport.log_safe_text(12) == ""
+    assert exec_transport.log_safe_text("") == ""
+    plain = exec_transport.log_safe_text("ordinary text", 500)
+    assert plain == "ordinary text", plain

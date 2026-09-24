@@ -1,10 +1,10 @@
-"""C1 — /upload/finalize must contain its download inside the session
+"""/upload/finalize must contain its download inside the session
 files_dir, like `UserStore.save_upload` already does.
 
 `routes/upload.py` builds the destination as `store.files_dir / filename`
 and hands it straight to `gcs_upload.download_to`. Every other write path
-gained a `resolve().is_relative_to(files_dir)` check with the R-02 fix;
-this one did not. Today the ONLY thing standing between an attacker-supplied
+gained a `resolve().is_relative_to(files_dir)` check with the upload-name
+sanitizer; this one did not. Today the ONLY thing standing between an attacker-supplied
 object key and an arbitrary write is the upstream `_safe_upload_filename`
 helper — one edit away (a new extension, an NFC tweak, a refactor that lets
 a separator through) from an arbitrary file write by any authenticated user.

@@ -1,8 +1,7 @@
-"""Security remediation Task 1 — upload filename sanitization (R-02), the
-Secure session-cookie flag (R-07), log rotation (R-10) and the probe_columns
-sibling of the filename bug (1e.1).
+"""Upload filename sanitization, the Secure session-cookie flag, log
+rotation, and the same filename rule applied to `probe_columns`.
 
-R-02: `/upload` handed the RAW multipart filename to `UserStore.save_upload`,
+Upload names: `/upload` handed the RAW multipart filename to `UserStore.save_upload`,
 which did `self.files_dir / filename`. `Path(base) / "/abs/evil"` resolves to
 the absolute path and `../` walks out of the session folder, so any
 authenticated user could write anywhere the process can. The fix is ONE
@@ -172,7 +171,7 @@ def test_upload_absolute_filename_is_contained(tmp_path, upload_client):
 
 
 # ---------------------------------------------------------------------------
-# 1e.1. probe_columns resolves the stored basename, never the parent dir
+# probe_columns resolves the stored basename, never the parent dir
 # ---------------------------------------------------------------------------
 @pytest.fixture
 def probe_client(data_root, monkeypatch):

@@ -2262,3 +2262,256 @@ def test_a_stray_name_carrying_a_newline_is_logged_on_one_line(dispatcher, exec_
     assert len(name_field) <= 200, len(name_field)
     impostors = [row for row in lines if str(row["message"]).startswith("EXEC_OK")]
     assert impostors == [], [row["message"] for row in impostors]
+
+
+# ===========================================================================
+# the web-side sweep: forward-dated entries, jobs dir inside DATA_ROOT,
+# "not mine to repair", startup order, claimed_at
+# ===========================================================================
+ONE_YEAR_S = 365 * 24 * 3600
+LEFT_TO_SANDBOX = "EXEC_ORPHAN_LEFT_TO_SANDBOX"
+ORPHAN_REMOVE_FAILED = "EXEC_ORPHAN_REMOVE_FAILED"
+
+
+def _forward_date(path, seconds: float = ONE_YEAR_S) -> None:
+    stamp = time.time() + seconds
+    try:
+        os.utime(path, (stamp, stamp), follow_symlinks=False)
+    except (NotImplementedError, OSError):
+        os.utime(path, (stamp, stamp))
+
+
+def _foreign_owner(monkeypatch, dispatcher) -> None:
+    """Make every entry the test creates read as NOT owned by this process.
+
+    The web sweep leaves what it owns, and on POSIX the test process owns
+    everything it creates; an identity no file carries makes the ownership
+    rule step aside so the age rule is what is under test.
+    """
+    monkeypatch.setattr(dispatcher, "_own_euid", lambda: 2 ** 31 - 7)
+
+
+def test_a_forward_dated_job_dir_is_treated_as_aged(dispatcher, exec_env, monkeypatch):
+    """`now - mtime` is NEGATIVE for an entry dated in the future, and a
+    negative age used to read as "fresh" — forever. Generated code can set any
+    mtime it likes on what it creates, so a forward-dated entry would have
+    been immune to both sweeps. A negative age is anything but fresh."""
+    _foreign_owner(monkeypatch, dispatcher)
+    job = exec_transport.create_job_dir(exec_env, exec_transport.new_job_id())
+    _forward_date(job)
+
+    dispatcher.sweep_orphans()
+
+    assert not job.exists(), "a job directory dated one year ahead survived the sweep"
+
+
+def test_a_forward_dated_stray_is_treated_as_aged(dispatcher, exec_env, monkeypatch):
+    _foreign_owner(monkeypatch, dispatcher)
+    stray_file = exec_env / "future_stash.txt"
+    stray_file.write_text("x", encoding="utf-8")
+    stray_dir = exec_env / "future_dir"
+    stray_dir.mkdir()
+    (stray_dir / "inner.txt").write_text("x", encoding="utf-8")
+    for path in (stray_file, stray_dir):
+        _forward_date(path)
+
+    dispatcher.sweep_orphans()
+
+    assert not stray_file.exists(), "a forward-dated stray file survived"
+    assert not stray_dir.exists(), "a forward-dated stray directory survived"
+
+
+def test_a_just_created_entry_is_still_fresh(dispatcher, exec_env, monkeypatch):
+    """The forward-dating fix must not widen the delete to entries that are
+    genuinely new: an age of 0..threshold stays fresh."""
+    _foreign_owner(monkeypatch, dispatcher)
+    job = exec_transport.create_job_dir(exec_env, exec_transport.new_job_id())
+    stray = exec_env / "just_now.txt"
+    stray.write_text("x", encoding="utf-8")
+
+    dispatcher.sweep_orphans()
+
+    assert job.is_dir() and stray.is_file()
+
+
+def test_an_entry_slightly_ahead_of_the_clock_is_still_fresh(dispatcher, exec_env,
+                                                               monkeypatch):
+    """A just-created directory can carry an mtime a moment ahead of this
+    process's clock. Treating EVERY future mtime as aged would let the sweep
+    delete a live job directory mid-dispatch; only an entry dated beyond the
+    tolerance counts as forward-dated."""
+    _foreign_owner(monkeypatch, dispatcher)
+    job = exec_transport.create_job_dir(exec_env, exec_transport.new_job_id())
+    stray = exec_env / "clock_skew.txt"
+    stray.write_text("x", encoding="utf-8")
+    for path in (job, stray):
+        _forward_date(path, 60)
+
+    dispatcher.sweep_orphans()
+
+    assert job.is_dir() and stray.is_file()
+
+
+def test_a_jobs_dir_inside_the_data_root_refuses_the_stray_pass(dispatcher, exec_env,
+                                                                tmp_path, monkeypatch):
+    """A jobs directory INSIDE `DATA_ROOT` (other than exactly
+    `<DATA_ROOT>/exec_jobs`) is customer state, not a jobs volume: pointing
+    `EXECUTOR_SHARED_DIR` at `<DATA_ROOT>/chatdata` must not turn every aged
+    chat directory into a "stray". The stray pass stands down with one line
+    naming the reason."""
+    _foreign_owner(monkeypatch, dispatcher)
+    data_root = tmp_path / "dr"
+    jobs = data_root / "chatdata"
+    chat = jobs / "c_0123456789abcdef"
+    chat.mkdir(parents=True)
+    (chat / "meta.json").write_text("{}", encoding="utf-8")
+    _age(chat)
+    loose = jobs / "index.json"
+    loose.write_text("{}", encoding="utf-8")
+    _age(loose)
+    monkeypatch.setattr(settings, "DATA_ROOT", str(data_root))
+    monkeypatch.setattr(settings, "EXECUTOR_SHARED_DIR", str(jobs))
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    dispatcher.sweep_orphans()
+
+    assert chat.is_dir() and (chat / "meta.json").is_file(), \
+        "the stray pass removed a chat directory under DATA_ROOT"
+    assert loose.is_file(), "the stray pass removed a file under DATA_ROOT"
+    hits = _messages(lines, STRAY_REFUSED)
+    assert len(hits) == 1, [row["message"] for row in lines]
+    assert "reason=inside_data_root" in hits[0]["message"], hits[0]["message"]
+    removed = _messages(lines, STRAY_REMOVED)
+    assert removed == [], [row["message"] for row in removed]
+
+
+def test_the_default_jobs_dir_under_the_data_root_still_sweeps(dispatcher, exec_env,
+                                                               tmp_path, monkeypatch):
+    """`<DATA_ROOT>/exec_jobs` is THE default jobs directory — the one
+    in-DATA_ROOT path that is allowed."""
+    _foreign_owner(monkeypatch, dispatcher)
+    data_root = tmp_path / "dr2"
+    jobs = data_root / "exec_jobs"
+    jobs.mkdir(parents=True)
+    stray = jobs / "stash.txt"
+    stray.write_text("x", encoding="utf-8")
+    _age(stray)
+    monkeypatch.setattr(settings, "DATA_ROOT", str(data_root))
+    monkeypatch.setattr(settings, "EXECUTOR_SHARED_DIR", str(jobs))
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    dispatcher.sweep_orphans()
+
+    assert not stray.exists(), "the default jobs dir stopped sweeping strays"
+    assert _messages(lines, STRAY_REFUSED) == [], [row["message"] for row in lines]
+
+
+def _unremovable_job(exec_env, monkeypatch, dispatcher):
+    """An aged job directory whose removal fails with a permission error on a
+    subtree, the shape generated code leaves by `chmod 0500` on a directory it
+    created under `out/`."""
+    job = exec_transport.create_job_dir(exec_env, exec_transport.new_job_id())
+    locked = job / "out" / "locked"
+    locked.mkdir(parents=True)
+    _age(job)
+
+    def refuse(path, *args, **kwargs):
+        raise PermissionError(13, "Permission denied", str(locked))
+
+    monkeypatch.setattr(dispatcher.shutil, "rmtree", refuse)
+    monkeypatch.setattr(dispatcher, "_REMOVE_WARNED", set())
+    return job, locked
+
+
+def test_a_subtree_owned_by_another_uid_is_left_to_the_sandbox(dispatcher, exec_env,
+                                                               monkeypatch):
+    """The web uid cannot chmod what the sandbox uid owns, so a removal that
+    fails on such a path is not a failure of this side — it is the sandbox's
+    to clear. The outcome is named for what it is, once per path across
+    sweeps, and is not reported as a removal failure."""
+    job, locked = _unremovable_job(exec_env, monkeypatch, dispatcher)
+    owner = os.lstat(locked).st_uid
+    monkeypatch.setattr(dispatcher, "_own_euid", lambda: owner + 1)
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    dispatcher.sweep_orphans()
+    dispatcher.sweep_orphans()
+
+    left = _messages(lines, LEFT_TO_SANDBOX)
+    assert len(left) == 1, [row["message"] for row in lines]
+    failed = _messages(lines, ORPHAN_REMOVE_FAILED)
+    assert failed == [], [row["message"] for row in failed]
+
+
+def test_a_removal_failure_on_an_owned_path_is_still_a_failure(dispatcher, exec_env,
+                                                               monkeypatch):
+    """The converse: when this side OWNS the path it could not remove, the
+    generic failure line stays — the new outcome is only for what is not
+    ours to repair."""
+    job, locked = _unremovable_job(exec_env, monkeypatch, dispatcher)
+    owner = os.lstat(locked).st_uid
+    monkeypatch.setattr(dispatcher, "_own_euid", lambda: owner)
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    dispatcher.sweep_orphans()
+    dispatcher.sweep_orphans()
+
+    failed = _messages(lines, ORPHAN_REMOVE_FAILED)
+    assert len(failed) == 1, [row["message"] for row in lines]
+    assert _messages(lines, LEFT_TO_SANDBOX) == []
+
+
+def test_startup_reports_unsafe_concurrency_even_when_the_jobs_dir_fails(
+        dispatcher, exec_env, monkeypatch):
+    """The concurrency self-check is pure configuration and must not depend
+    on the two I/O steps before it: a jobs volume that cannot be prepared is
+    exactly the boot where the operator reads the log, and the isolation
+    warning has to be in it."""
+    monkeypatch.setattr(settings, "EXECUTOR_MAX_CONCURRENT", 2)
+
+    def broken():
+        raise OSError("volume missing")
+
+    monkeypatch.setattr(dispatcher, "ensure_shared_dir", broken)
+    _install(monkeypatch, _raising_handler(
+        lambda request: httpx.ConnectError("refused", request=request), []))
+    lines = _log_recorder(monkeypatch, dispatcher)
+
+    assert dispatcher.startup() is None
+
+    hits = _messages(lines, "EXECUTOR_CONCURRENCY_UNSAFE")
+    assert len(hits) == 1, [row["message"] for row in lines]
+    assert "max_concurrent=2" in hits[0]["message"], hits[0]["message"]
+
+
+@pytest.mark.executor_probe
+def test_claiming_the_refresh_slot_does_not_move_checked_at(dispatcher, exec_env,
+                                                           monkeypatch):
+    """`executor_checked_at` on `/health` means "when a verdict last landed".
+    Taking the refresh slot is not a verdict, so it is stamped in a separate
+    `claimed_at`; `reachable()` keeps reporting the OLD `checked_at` until the
+    probe's answer arrives, and the slot still cannot be claimed twice."""
+    _reset_reach(dispatcher)
+    dispatcher._REACH.pop("claimed_at", None)
+    dispatcher._REACH["ok"] = True
+    dispatcher._REACH["checked_at"] = 1.0          # stale
+    probes = []
+    monkeypatch.setattr(dispatcher, "probe", lambda *a, **k: probes.append(1),
+                        raising=False)
+
+    claimed = dispatcher._claim_refresh()
+
+    assert claimed is True, claimed
+    assert dispatcher._REACH["checked_at"] == 1.0, dispatcher._REACH
+    claimed_at = dispatcher._REACH.get("claimed_at")
+    assert isinstance(claimed_at, float) and claimed_at > 1.0, dispatcher._REACH
+
+    ok, checked_at = dispatcher.reachable()
+    assert ok is True, ok
+    assert checked_at == 1.0, checked_at
+    assert dispatcher._claim_refresh() is False, "the slot was claimed twice"
+
+    dispatcher._note_reachable(False)
+    ok, checked_at = dispatcher.reachable()
+    assert ok is False, ok
+    assert checked_at > 1.0, checked_at

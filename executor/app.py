@@ -71,6 +71,13 @@ _MAX_INPUT_FRAMES = 64
 _RESPONSE_MAX_BYTES = 64 * 1024 * 1024
 _READER_JOIN_S = 5.0
 _ORPHAN_MAX_AGE_S = 3600
+
+# A modification time in the FUTURE is treated as aged (generated code can
+# forward-date an entry it owns so it never looks old), but only beyond this
+# tolerance: a directory created a moment ago can carry an mtime slightly
+# ahead of this process's clock, and deleting a live job dir would break
+# the job in flight.
+_FUTURE_MTIME_TOLERANCE_S = 300
 _ORPHAN_SWEEP_INTERVAL_S = 600
 _VERSION_MODULES = ("matplotlib", "numpy", "pandas", "plotly", "pyarrow")
 
@@ -140,7 +147,9 @@ def _refuse_on_secret_env() -> None:
         if not (os.environ.get(name) or "").strip():
             continue
         if name.startswith(_REFUSED_SECRET_PREFIX) or name in _REFUSED_SECRET_NAMES:
-            log_with_sid("executor", "error", f"EXECUTOR_REFUSED_SECRET_ENV name={name}")
+            log_with_sid("executor", "error",
+                         f"EXECUTOR_REFUSED_SECRET_ENV "
+                         f"name={exec_transport.log_safe_text(name, 200)}")
             raise SystemExit(1)
 
 
@@ -160,7 +169,9 @@ def _refuse_on_unwritable_shared_dir(shared_dir: Path) -> None:
         os.unlink(probe)
     except OSError as e:
         log_with_sid("executor", "error",
-                     f"EXECUTOR_SHARED_DIR_NOT_WRITABLE dir={shared_dir} {e}")
+                     f"EXECUTOR_SHARED_DIR_NOT_WRITABLE "
+                     f"dir={exec_transport.log_safe_text(str(shared_dir), 300)} "
+                     f"{exec_transport.log_safe_text(str(e))}")
         with suppress(OSError):
             os.unlink(probe)
         raise SystemExit(1)
@@ -172,7 +183,10 @@ def _library_versions() -> dict:
             try:
                 _VERSIONS[name] = str(getattr(importlib.import_module(name), "__version__", ""))
             except Exception as e:
-                log_with_sid("executor", "warning", f"EXECUTOR_VERSION_UNKNOWN module={name}: {e}")
+                log_with_sid("executor", "warning",
+                             f"EXECUTOR_VERSION_UNKNOWN "
+                             f"module={exec_transport.log_safe_text(name, 80)}: "
+                             f"{exec_transport.log_safe_text(str(e))}")
                 _VERSIONS[name] = ""
     return dict(_VERSIONS)
 
@@ -189,14 +203,15 @@ async def lifespan(app: FastAPI):
     config = _load_config()
     if not config.shared_dir.is_dir():
         log_with_sid("executor", "error",
-                     f"EXECUTOR_SHARED_DIR_INVALID dir={config.shared_dir}")
+                     f"EXECUTOR_SHARED_DIR_INVALID "
+                     f"dir={exec_transport.log_safe_text(str(config.shared_dir), 300)}")
         raise SystemExit(1)
     _refuse_on_unwritable_shared_dir(config.shared_dir)
     if config.max_concurrent > 1:
         # More than one job at a time gives up the guarantee the stray-process
         # sweep rests on (one runner per uid), so it must never be silent.
         log_with_sid("executor", "warning",
-                     f"EXECUTOR_CONCURRENCY_UNSAFE max_concurrent={config.max_concurrent}")
+                     f"EXECUTOR_CONCURRENCY_UNSAFE max_concurrent={int(config.max_concurrent)}")
     _STATE["config"] = config
     _STATE["semaphore"] = asyncio.Semaphore(config.max_concurrent)
     _STATE["pool"] = ThreadPoolExecutor(max_workers=config.max_concurrent + 1,
@@ -207,9 +222,12 @@ async def lifespan(app: FastAPI):
                                daemon=True, name="orphan_sweep")
     sweeper.start()
     log_with_sid("executor", "info",
-                 f"EXECUTOR_START shared_dir={config.shared_dir} "
-                 f"mem_limit_mb={config.mem_limit_mb} max_concurrent={config.max_concurrent} "
-                 f"max_timeout_s={config.max_timeout_s} grace_s={config.grace_s}")
+                 f"EXECUTOR_START "
+                 f"shared_dir={exec_transport.log_safe_text(str(config.shared_dir), 300)} "
+                 f"mem_limit_mb={int(config.mem_limit_mb)} "
+                 f"max_concurrent={int(config.max_concurrent)} "
+                 f"max_timeout_s={float(config.max_timeout_s)} "
+                 f"grace_s={float(config.grace_s)}")
     try:
         yield
     finally:
@@ -247,7 +265,8 @@ def _sweep_orphans(shared_dir: Path) -> None:
     try:
         entries = list(Path(shared_dir).iterdir())
     except OSError as e:
-        log_with_sid("executor", "warning", f"EXEC_ORPHAN_SWEEP_FAILED: {e}")
+        log_with_sid("executor", "warning",
+                     f"EXEC_ORPHAN_SWEEP_FAILED: {exec_transport.log_safe_text(str(e))}")
         return
     now = time.time()
     for child in entries:
@@ -262,12 +281,19 @@ def _sweep_orphans(shared_dir: Path) -> None:
                 # so it is a stash wearing a job id, not a job.
                 _remove_stray_entry(child, now)
                 continue
-            if now - info.st_mtime <= _ORPHAN_MAX_AGE_S:
+            # A FUTURE mtime is not fresh: generated code can forward-date
+            # what it writes, and a negative age would keep it forever.
+            if -_FUTURE_MTIME_TOLERANCE_S <= now - info.st_mtime <= _ORPHAN_MAX_AGE_S:
                 continue
             _rmtree_repairing_modes(child)
+            if _still_present(child):
+                log_with_sid(child.name, "warning",
+                             "EXEC_ORPHAN_REMOVE_FAILED: entry still present after removal")
+                continue
             log_with_sid(child.name, "info", "EXEC_ORPHAN_REMOVED")
         except OSError as e:
-            log_with_sid(child.name, "warning", f"EXEC_ORPHAN_REMOVE_FAILED: {e}")
+            log_with_sid(child.name, "warning",
+                         f"EXEC_ORPHAN_REMOVE_FAILED: {exec_transport.log_safe_text(str(e))}")
 
 
 def _remove_stray_entry(child, now: float) -> None:
@@ -305,7 +331,8 @@ def _remove_stray_entry(child, now: float) -> None:
     an abandoned, web-created job directory is what the group write is for.
 
     Still bounded two ways: the age threshold a job directory gets, so nothing
-    mid-creation is taken; and a symlink is UNLINKED, never followed —
+    mid-creation is taken (an entry dated in the FUTURE is not fresh — a
+    negative age would keep a forward-dated stash forever); and a symlink is UNLINKED, never followed —
     generated code chooses where it points, and the same volume is read by the
     container where the customer's data IS mounted.
 
@@ -313,20 +340,26 @@ def _remove_stray_entry(child, now: float) -> None:
     """
     try:
         info = os.lstat(child)
-        if now - info.st_mtime <= _ORPHAN_MAX_AGE_S:
+        if -_FUTURE_MTIME_TOLERANCE_S <= now - info.st_mtime <= _ORPHAN_MAX_AGE_S:
             return
         mode = info.st_mode
         if stat.S_ISLNK(mode):
-            kind = "link"
+            entry_kind = "link"
             os.unlink(child)
         elif stat.S_ISDIR(mode):
-            kind = "dir"
+            entry_kind = "dir"
             _rmtree_repairing_modes(child)
         else:
-            kind = "file" if stat.S_ISREG(mode) else "other"
+            entry_kind = "file" if stat.S_ISREG(mode) else "other"
             os.unlink(child)
+        if _still_present(child):
+            log_with_sid("executor", "warning",
+                         f"EXEC_STRAY_ENTRY_REMOVE_FAILED "
+                         f"name={exec_transport.log_safe_text(Path(child).name, 200)}: "
+                         f"entry still present after removal")
+            return
         log_with_sid("executor", "info",
-                     f"EXEC_STRAY_ENTRY_REMOVED kind={kind} "
+                     f"EXEC_STRAY_ENTRY_REMOVED kind={entry_kind} "
                      f"name={exec_transport.log_safe_text(Path(child).name, 200)}")
     except FileNotFoundError:
         # The main app's sweep got there first; that is the success case.
@@ -350,10 +383,54 @@ def _repair_mode_and_retry(function, path, excinfo) -> None:
         os.chmod(path, 0o770)
         function(path)
     except OSError as e:
-        log_with_sid(Path(path).name, "warning", f"EXEC_ORPHAN_MODE_REPAIR_FAILED: {e}")
+        log_with_sid(exec_transport.log_safe_text(Path(path).name, 200) or "executor",
+                     "warning",
+                     f"EXEC_ORPHAN_MODE_REPAIR_FAILED: {exec_transport.log_safe_text(str(e))}")
+
+
+def _still_present(path) -> bool:
+    """True while an entry is still on disk after a removal attempt.
+
+    The `rmtree` error hook swallows what it cannot repair, so `rmtree`
+    returning is NOT proof of removal; a REMOVED line is written only once an
+    `lstat` confirms the entry is gone. Anything but "not found" counts as
+    present, so the log never claims a removal it cannot see.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _open_directory_modes(top) -> None:
+    """Make every DIRECTORY under `top` writable and traversable, top-down.
+
+    Generated code can `chmod 0500` (or `0000`) a directory it created. The
+    `rmtree` error hook only ever sees the entry whose removal failed — a FILE
+    whose parent is read-only — and chmodding that file never makes its
+    parent writable, so the directories are opened first, from the top, each
+    one before the walk descends into it. Only what this uid owns can be
+    changed; everything else is left for the removal to report. Symlinks are
+    never followed or chmodded (`os.chmod` would change their TARGET).
+    Never raises.
+    """
+    with suppress(OSError):
+        if stat.S_ISDIR(os.lstat(top).st_mode):
+            os.chmod(top, 0o770)
+    for current, dirnames, _ in os.walk(top, topdown=True, followlinks=False,
+                                        onerror=lambda _error: None):
+        for name in dirnames:
+            candidate = os.path.join(current, name)
+            with suppress(OSError):
+                if stat.S_ISDIR(os.lstat(candidate).st_mode):
+                    os.chmod(candidate, 0o770)
 
 
 def _rmtree_repairing_modes(path: Path) -> None:
+    _open_directory_modes(path)
     # Python 3.12 renamed rmtree's error callback `onerror` -> `onexc`; keep
     # working if either is the one this interpreter offers.
     try:
@@ -407,7 +484,7 @@ def _sweep_same_uid_processes() -> None:
             os.kill(pid, signal.SIGKILL)
         except OSError:
             continue
-        log_with_sid("executor", "warning", f"EXEC_STRAY_KILLED pid={pid}")
+        log_with_sid("executor", "warning", f"EXEC_STRAY_KILLED pid={int(pid)}")
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +646,9 @@ def _execute_job(config: Config, request: ExecuteRequest, job_dir: Path,
             os.close(write_fd)
     except Exception as e:
         os.close(read_fd)
-        log_with_sid(job_id, "error", f"EXEC_JOB_SPAWN_FAILED {type(e).__name__}: {e}")
+        log_with_sid(job_id, "error",
+                     f"EXEC_JOB_SPAWN_FAILED "
+                     f"{exec_transport.log_safe_text(f'{type(e).__name__}: {e}')}")
         return {"status": "crashed", "kind": request.kind, "payload": None,
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
                 "peak_rss_mb": None, "stdout": "", "stderr": "",
@@ -661,10 +740,13 @@ def _execute_job(config: Config, request: ExecuteRequest, job_dir: Path,
     level = "info" if response["status"] in ("ok", "error") else "warning"
     log_with_sid(job_id, level,
                  f"EXEC_JOB_END status={response['status']} code_hash={code_hash} "
-                 f"elapsed_ms={elapsed_ms} "
-                 f"exit_code={exit_code} reason={response.get('reason')}")
+                 f"elapsed_ms={int(elapsed_ms)} "
+                 f"exit_code={exit_code} "
+                 f"reason={exec_transport.log_safe_text(str(response.get('reason')), 80)}")
     if response["status"] in ("killed", "crashed"):
-        log_with_sid(job_id, "warning", f"EXEC_JOB_STDERR {stderr_text[-2000:]}")
+        log_with_sid(job_id, "warning",
+                     f"EXEC_JOB_STDERR "
+                     f"{exec_transport.log_safe_text(stderr_text, 2000, tail=True)}")
     return response
 
 
@@ -784,7 +866,9 @@ async def execute(request: ExecuteRequest) -> Response:
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(pool, _run_job, config, request, job_dir, remaining)
     except Exception as e:
-        log_with_sid(request.job_id, "error", f"EXEC_JOB_FAILED {type(e).__name__}: {e}")
+        log_with_sid(request.job_id, "error",
+                     f"EXEC_JOB_FAILED "
+                     f"{exec_transport.log_safe_text(f'{type(e).__name__}: {e}')}")
         response = {"status": "crashed", "kind": request.kind, "payload": None,
                     "elapsed_ms": None, "peak_rss_mb": None, "stdout": "", "stderr": "",
                     "traceback": f"{type(e).__name__}: {e}", "exit_code": None,

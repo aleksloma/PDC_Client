@@ -1,4 +1,4 @@
-"""Task 2 — the log file lives under DATA_ROOT, never inside the image.
+"""The log file lives under DATA_ROOT, never inside the image.
 
 `logger_utils.get_logger()` used to build its directory from
 `Path(__file__).parent / "logs"`, i.e. `/app/logs` in the container — a write

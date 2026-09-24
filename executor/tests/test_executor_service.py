@@ -1378,3 +1378,127 @@ def test_a_stray_name_carrying_a_newline_is_logged_on_one_line(executor_env, cap
     impostors = [record.getMessage() for record in caplog.records
                  if record.getMessage().startswith("EXEC_OK")]
     assert impostors == [], impostors
+
+
+# ---------------------------------------------------------------------------
+# forward-dated entries, and removal as the sandbox's own uid
+# ---------------------------------------------------------------------------
+ONE_YEAR_S = 365 * 24 * 3600
+
+
+def test_a_forward_dated_stray_and_job_dir_are_treated_as_aged(executor_env):
+    """`now - mtime` is NEGATIVE for an entry dated in the future, and a
+    negative age used to read as "fresh" forever. Generated code sets any
+    mtime it likes on what it creates (`os.utime` needs only ownership), so a
+    forward-dated stash would have been immune to the sweep. A negative age is
+    anything but fresh."""
+    stray = executor_env / "future_stash"
+    stray.mkdir()
+    (stray / "inner.csv").write_text("x", encoding="utf-8")
+    job = exec_transport.create_job_dir(executor_env, exec_transport.new_job_id())
+    for path in (stray, job):
+        _age_entry(path, -ONE_YEAR_S)
+    assert os.lstat(stray).st_mtime > time.time() + ONE_YEAR_S / 2
+
+    _sweep(executor_env)
+
+    assert not stray.exists(), "a stray dated one year ahead survived the sweep"
+    assert not job.exists(), "a job directory dated one year ahead survived the sweep"
+
+
+def test_an_entry_slightly_ahead_of_the_clock_is_still_fresh(executor_env):
+    """Clock skew between the two containers and the filesystem must not make
+    a just-created job directory look forward-dated: only an mtime beyond the
+    tolerance is treated as aged."""
+    stray = executor_env / "clock_skew"
+    stray.mkdir()
+    job = exec_transport.create_job_dir(executor_env, exec_transport.new_job_id())
+    for path in (stray, job):
+        _age_entry(path, -60)
+
+    _sweep(executor_env)
+
+    assert stray.exists() and job.exists()
+
+
+_SWEEP_AS_EXEC_UID = """
+import json, os, sys, time
+sys.path.insert(0, {root!r})
+from pathlib import Path
+import executor.app as app
+
+lines = []
+app.log_with_sid = lambda sid, level, message, *a, **k: lines.append(
+    [str(sid), str(level), str(message)])
+shared = Path({shared!r})
+
+# What generated code leaves when it locks its own output: created AS THIS
+# uid, then `chmod 0500` on the directory that holds the file.
+stray = shared / {own_name!r}
+(stray / "out").mkdir(parents=True)
+(stray / "out" / "stash.csv").write_text("x")
+os.chmod(stray / "out", 0o500)
+stamp = time.time() - 7200
+os.utime(stray, (stamp, stamp))
+
+app._sweep_orphans(shared)
+print(json.dumps({{"lines": lines, "own_left": stray.exists()}}))
+"""
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="setuid to 10002 needs root (the Dockerfile test stage)")
+def test_two_uid_the_sandbox_uid_clears_its_own_locked_stash_and_logs_only_what_went(shared_dir):
+    """As root the mode bits are advisory, so the one-uid tests above prove
+    nothing about the runtime identity. Here the sweep runs AS uid 10002:
+
+    * a stray it OWNS, with a `chmod 0500` directory inside, must be gone — the
+      directory modes are repaired top-down BEFORE the removal, because the
+      `rmtree` error hook only sees the file whose unlink failed, and chmodding
+      the FILE never makes its parent writable;
+    * a stray and a job directory holding a subtree owned by ANOTHER uid,
+      which this uid cannot chmod, survive — and the log must not claim
+      otherwise: `EXEC_STRAY_ENTRY_REMOVED` / `EXEC_ORPHAN_REMOVED` are
+      written only after an `lstat` confirms the entry is gone.
+    """
+    shared = shared_dir
+    os.chown(shared, 0, SHARED_GID)
+    os.chmod(shared, 0o2770)
+    stamp = time.time() - 2 * 3600
+
+    def plant_foreign_subtree(top: Path) -> None:
+        foreign = top / "out" / "foreign"
+        foreign.mkdir(parents=True)
+        (foreign / "held.csv").write_text("x", encoding="utf-8")
+        os.chmod(foreign, 0o500)                      # root-owned, not ours to chmod
+        for path in (top, top / "out"):
+            os.chown(path, EXEC_UID, SHARED_GID)
+            os.chmod(path, 0o2770)
+        os.utime(top, (stamp, stamp))
+
+    stuck_stray = shared / "zz_foreign_stash"
+    plant_foreign_subtree(stuck_stray)
+    stuck_job = shared / exec_transport.new_job_id()
+    plant_foreign_subtree(stuck_job)
+
+    own_name = "zz_locked_stash"
+    script = _SWEEP_AS_EXEC_UID.format(root=str(ROOT), shared=str(shared), own_name=own_name)
+    proc = subprocess.run([sys.executable, "-c", script], user=EXEC_UID, group=SHARED_GID,
+                          extra_groups=[], env=_uid_env(EXEC_UID, SHARED_GID), cwd=str(ROOT),
+                          capture_output=True, text=True, timeout=180)
+    assert proc.returncode == 0, (proc.returncode, proc.stdout[-2000:], proc.stderr[-4000:])
+    report = exec_transport.loads(proc.stdout.strip().splitlines()[-1])
+    lines = report["lines"]
+
+    assert report["own_left"] is False, (
+        "the sandbox uid could not clear a stash it owns after generated code "
+        f"locked it: {lines}")
+    assert not (shared / own_name).exists()
+
+    assert stuck_stray.is_dir(), "the foreign subtree was expected to block removal"
+    assert stuck_job.is_dir(), "the foreign subtree was expected to block removal"
+    false_stray = [line for line in lines
+                   if "EXEC_STRAY_ENTRY_REMOVED" in line[2] and stuck_stray.name in line[2]]
+    assert false_stray == [], ("a stray that is still on disk was logged as removed", lines)
+    false_orphan = [line for line in lines
+                    if "EXEC_ORPHAN_REMOVED" in line[2] and line[0] == stuck_job.name]
+    assert false_orphan == [], ("a job dir that is still on disk was logged as removed", lines)

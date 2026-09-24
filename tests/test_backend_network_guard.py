@@ -291,3 +291,119 @@ def test_other_ipv6_forms_are_not_refused(monkeypatch, peer):
     response = _client(peer).get(HEALTH_PATH)
     status = response.status_code
     assert status == 200, (peer, status, response.text[:300])
+
+
+# ---------------------------------------------------------------------------
+# the shipped default range, IPv6 ranges, the path renderer, websockets
+# ---------------------------------------------------------------------------
+IPV6_CIDR = "fd00:1::/64"
+IPV6_INSIDE = ("fd00:1::5", 51000)
+IPV6_OUTSIDE = ("fd00:2::5", 51000)
+
+
+def _compose_default_cidr() -> str:
+    """The range both compose files fall back to when `PDC_BACKEND_SUBNET` is
+    unset — i.e. what every install that did not override it runs with."""
+    import re
+    from pathlib import Path
+
+    text = (Path(app_mod.__file__).resolve().parent / "docker-compose.yml").read_text(
+        encoding="utf-8")
+    found = set(re.findall(r"\$\{PDC_BACKEND_SUBNET:-([0-9a-fA-F.:/]+)\}", text))
+    assert len(found) == 1, found
+    return found.pop()
+
+
+def test_an_ipv4_mapped_peer_is_refused_under_the_shipped_default_range(monkeypatch):
+    """The mapping must hold for the range customers actually run with, not
+    only for the constant this file picked."""
+    default = _compose_default_cidr()
+    _set_cidr(monkeypatch, default)
+    import ipaddress
+    first_host = next(ipaddress.ip_network(default).hosts())
+    peer = (f"::ffff:{first_host}", 51000)
+
+    response = _client(peer).get(HEALTH_PATH)
+    status = response.status_code
+    assert status == 403, (default, peer, status, response.text[:300])
+    body = response.json()
+    assert body == FORBIDDEN_BODY, body
+
+
+def test_an_ipv6_backend_range_refuses_its_own_peers(monkeypatch):
+    _set_cidr(monkeypatch, IPV6_CIDR)
+    response = _client(IPV6_INSIDE).get(HEALTH_PATH)
+    status = response.status_code
+    assert status == 403, (status, response.text[:300])
+    body = response.json()
+    assert body == FORBIDDEN_BODY, body
+
+
+def test_an_ipv6_backend_range_allows_a_neighbouring_range(monkeypatch):
+    _set_cidr(monkeypatch, IPV6_CIDR)
+    response = _client(IPV6_OUTSIDE).get(HEALTH_PATH)
+    status = response.status_code
+    assert status == 200, (status, response.text[:300])
+
+
+def test_the_refused_path_renderer_escapes_and_truncates():
+    """The one place the guard repeats caller-chosen text: one line, and at
+    most `_REFUSED_PATH_MAX_CHARS` characters of it."""
+    rendered = app_mod._refused_path("/lab\nforged=1")
+    assert "\n" not in rendered and "\r" not in rendered, repr(rendered)
+    assert "\\n" in rendered, rendered
+
+    long_path = "/" + "a" * 199 + "TAILMARK" + "b" * 100
+    rendered = app_mod._refused_path(long_path)
+    assert "TAILMARK" not in rendered, rendered
+    assert app_mod._REFUSED_PATH_MAX_CHARS == 120
+    inner = rendered[1:-1]                     # strip the repr quotes
+    assert len(inner) == 120, len(inner)
+    assert inner == long_path[:120], inner
+
+
+def test_a_long_refused_path_is_truncated_on_the_log_line(monkeypatch, refusal_log):
+    _set_cidr(monkeypatch, CIDR)
+    long_path = "/" + "a" * 199 + "TAILMARK"
+
+    response = _client(INSIDE).get(long_path)
+    status = response.status_code
+    assert status == 403, status
+
+    hits = [str(line) for line in refusal_log if REFUSED_EVENT in str(line)]
+    assert len(hits) == 1, refusal_log
+    assert "TAILMARK" not in hits[0], hits[0]
+    assert "a" * 119 in hits[0], hits[0]
+
+
+def test_a_websocket_from_inside_is_closed_with_policy_violation(monkeypatch):
+    """No websocket route exists in this app today; the branch is there so the
+    guard can never be the thing that raises on one. Pinned against a
+    throwaway app with a real websocket route behind the same guard."""
+    from starlette.applications import Starlette
+    from starlette.routing import WebSocketRoute
+    from starlette.websockets import WebSocketDisconnect
+
+    reached = []
+
+    async def endpoint(websocket):
+        reached.append(True)
+        await websocket.accept()
+        await websocket.send_text("hello")
+        await websocket.close()
+
+    inner = Starlette(routes=[WebSocketRoute("/ws", endpoint)])
+    wrapped = app_mod.BackendNetworkGuard(inner)
+    _set_cidr(monkeypatch, CIDR)
+
+    with pytest.raises(WebSocketDisconnect) as ei:
+        with TestClient(wrapped, client=INSIDE).websocket_connect("/ws") as ws:
+            ws.receive_text()
+    code = ei.value.code
+    assert code == 1008, code
+    assert reached == [], "the route ran for a refused peer"
+
+    # The same app from a normal peer still upgrades.
+    with TestClient(wrapped, client=OUTSIDE).websocket_connect("/ws") as ws:
+        greeting = ws.receive_text()
+    assert greeting == "hello", greeting

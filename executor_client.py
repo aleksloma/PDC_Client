@@ -45,6 +45,13 @@ _WRITE_TIMEOUT_S = 30
 
 _DIR_MODE = 0o2770
 _ORPHAN_MAX_AGE_S = 3600
+
+# A modification time in the FUTURE is treated as aged (generated code can
+# forward-date an entry it owns so it never looks old), but only beyond this
+# tolerance: a directory created a moment ago can carry an mtime slightly
+# ahead of this process's clock, and deleting a live job dir would break
+# the job in flight.
+_FUTURE_MTIME_TOLERANCE_S = 300
 _SWEEP_INTERVAL_S = 600
 
 # Compared against the sandbox's own `/healthz` report: the two images are
@@ -65,6 +72,7 @@ _UNREADABLE_TEXT = "ExecutorError: the analysis answer could not be read ({exc})
 # The prefix of every failure this hop invents, and the two reasons that are
 # NOT one — see `is_infrastructure_error`.
 _INFRA_PREFIX = "Executor"
+_CRASH_PREFIX = "ExecutorCrashError"
 _CODE_CAUSED_CRASH_REASONS = ("reason=exit", "reason=signal")
 
 # Test seam: an `httpx.BaseTransport` used for BOTH `/execute` and `/healthz`,
@@ -93,7 +101,7 @@ _LAST_SWEEP: dict = {"at": 0.0}
 # async handler calling sync clients, and the container's own healthcheck
 # allows 5 s — so the web service would be marked unhealthy precisely when the
 # operator needs it to answer that the sandbox is down.
-_REACH: dict = {"ok": None, "checked_at": 0.0}
+_REACH: dict = {"ok": None, "checked_at": 0.0, "claimed_at": 0.0}
 _REACH_LOCK = threading.Lock()
 _REACH_MAX_AGE_S = 30
 # The refresh probe's own total budget: short, because nobody waits for it.
@@ -121,6 +129,10 @@ _STRAY_REFUSED: dict = {"logged": False}
 # exists only in the sandbox's log, which sits on a tmpfs and is gone on
 # restart. Capped because the strings are untrusted and unbounded.
 _LOG_TAIL_MAX_CHARS = 2000
+# The generated-code snippet on the two error lines: its lines are joined with
+# a VISIBLE `\n`, and the field is escaped and capped like any other text this
+# process did not write (the code came from the planner).
+_CODE_SNIPPET_MAX_CHARS = 4000
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +266,13 @@ def is_infrastructure_error(text) -> bool:
     """
     if not isinstance(text, str) or not text.startswith(_INFRA_PREFIX):
         return False
-    return not any(marker in text for marker in _CODE_CAUSED_CRASH_REASONS)
+    # The carve-out is decided by the text's PREFIX: only a crash sentence
+    # can claim it. Another `Executor*` text that merely quotes the phrase
+    # (a response error naming a value the sandbox chose) stays
+    # infrastructure.
+    if text.startswith(_CRASH_PREFIX):
+        return not any(marker in text for marker in _CODE_CAUSED_CRASH_REASONS)
+    return True
 
 
 def _code_hash(code: str) -> str:
@@ -277,22 +295,6 @@ def _error_text(out: dict):
     return value if isinstance(value, str) and value else None
 
 
-def _success_meta(kind: str, out: dict) -> dict:
-    if kind == "PLOT":
-        charts = out.get("multi_charts")
-        return {
-            "image": bool(out.get("image") or out.get("plotly_html") or charts),
-            "is_plotly": out.get("is_plotly"),
-            "charts": len(charts) if isinstance(charts, list) else None,
-        }
-    preview = out.get("preview")
-    return {
-        "has_result": out.get("result") is not None,
-        "preview_type": type(preview).__name__ if preview is not None else "None",
-        "image": bool(out.get("image_base64")),
-    }
-
-
 def _tail(value) -> str:
     """The shared log-field guard, bound to this module's cap.
 
@@ -304,21 +306,6 @@ def _tail(value) -> str:
     keeps the LAST characters, which is where an exception's message is.
     """
     return exec_transport.log_safe_text(value, _LOG_TAIL_MAX_CHARS, tail=True)
-
-
-def _log_tails(response) -> dict:
-    """`traceback=` / `stderr=` for the two error lines — LOG ONLY.
-
-    When `exec()` ran in this process, a failing block's traceback landed in
-    this container's log. It now exists only in the sandbox's log, which lives
-    on a tmpfs and is wiped on restart, so the durable copy is this tail. It
-    never reaches the returned dict: the callers' error channel is the text the
-    planner and the user see, and it is unchanged.
-    """
-    if not isinstance(response, dict):
-        return {}
-    return {"traceback": _tail(response.get("traceback")),
-            "stderr": _tail(response.get("stderr"))}
 
 
 def _response_meta(response) -> dict:
@@ -362,7 +349,8 @@ def ensure_shared_dir() -> Path:
             except OSError as e:
                 # Windows has no setgid bit; a dev run must not fail on it.
                 log_with_sid("startup", "warning",
-                             f"EXECUTOR_SHARED_DIR_CHMOD_FAILED dir={shared}: "
+                             f"EXECUTOR_SHARED_DIR_CHMOD_FAILED "
+                             f"dir={exec_transport.log_safe_text(str(shared), 300)}: "
                              f"{_tail(str(e))}")
         elif not (os.stat(shared).st_mode & stat.S_IWGRP):
             # A pre-existing directory is only ever REPORTED on, never
@@ -374,31 +362,35 @@ def ensure_shared_dir() -> Path:
             # create `out/` and every job will come back crashed, so that is
             # worth a line.
             log_with_sid("startup", "warning",
-                         f"EXECUTOR_SHARED_DIR_NOT_GROUP_WRITABLE dir={shared}")
+                         f"EXECUTOR_SHARED_DIR_NOT_GROUP_WRITABLE "
+                         f"dir={exec_transport.log_safe_text(str(shared), 300)}")
     except OSError as e:
         log_with_sid("startup", "error",
-                     f"EXECUTOR_SHARED_DIR_UNUSABLE dir={shared}: {_tail(str(e))}")
+                     f"EXECUTOR_SHARED_DIR_UNUSABLE "
+                     f"dir={exec_transport.log_safe_text(str(shared), 300)}: "
+                     f"{_tail(str(e))}")
     return shared
 
 
-def _warn_once_per_path(path, sid: str, message: str, **fields) -> None:
-    """Log a removal failure the FIRST time it happens for this path.
+def _first_warning_for(path) -> bool:
+    """True the FIRST time a removal problem is reported for this path.
 
     Generated code can `chmod 0500` a directory it created under `out/`, and
     only the sandbox uid — which owns it — can then clear it, by its own hourly
     sweep. This side cannot fix it, so warning on every pass would turn one
-    unfixable directory into an unbounded log stream.
+    unfixable directory into an unbounded log stream. The caller writes the
+    line itself, so every field on it is visible where it is built.
     """
     key = str(path)
     if key in _REMOVE_WARNED:
-        return
+        return False
     if len(_REMOVE_WARNED) >= _REMOVE_WARNED_MAX:
         _REMOVE_WARNED.clear()
     _REMOVE_WARNED.add(key)
-    log_with_sid(sid, "warning", message, **fields)
+    return True
 
 
-def _remove_job_dir(job_dir, sid: str) -> None:
+def _remove_job_dir(job_dir, log_sid: str) -> None:
     if job_dir is None:
         return
     try:
@@ -408,20 +400,33 @@ def _remove_job_dir(job_dir, sid: str) -> None:
         # The sandbox uid owns everything under `out/`, so the OSError text
         # can quote a file name IT chose — escaped like every other field it
         # writes.
-        _warn_once_per_path(job_dir, sid,
-                            f"EXEC_JOB_DIR_REMOVE_FAILED "
-                            f"{_tail(f'{type(e).__name__}: {e}')}",
-                            job_id=Path(job_dir).name)
+        if _first_warning_for(job_dir):
+            log_with_sid(log_sid, "warning",
+                         f"EXEC_JOB_DIR_REMOVE_FAILED "
+                         f"{_tail(f'{type(e).__name__}: {e}')}",
+                         job_id=exec_transport.log_safe_text(Path(job_dir).name, 64))
 
 
-def _name_field(path) -> str:
-    """One entry name of the jobs root as a log field.
+def _not_ours_to_repair(error) -> bool:
+    """True when a removal failed on a path another uid owns.
 
-    The name of anything that is not a job directory was chosen by generated
-    code, so it is untrusted text on a newline-delimited line (Article IV) and
-    goes through the shared escaper like every other field the sandbox writes.
+    The web uid cannot chmod what the sandbox uid owns, so such a failure is
+    not this side's to fix — the sandbox's own sweep clears it. Decided from
+    the path the error names (`filename`), because the entry at the top of
+    the removal may well be ours while the subtree that blocked it is not.
+    Never raises; anything it cannot decide reads as False, i.e. an ordinary
+    failure.
     """
-    return exec_transport.log_safe_text(Path(path).name, 200)
+    try:
+        if not isinstance(error, PermissionError):
+            return False
+        failing = getattr(error, "filename", None)
+        own = _own_euid()
+        if not failing or own is None:
+            return False
+        return os.lstat(failing).st_uid != own
+    except Exception:
+        return False
 
 
 def _own_euid():
@@ -440,7 +445,8 @@ def _own_euid():
 
 
 def _stray_removal_allowed(shared) -> bool:
-    """False when the configured jobs directory ENCLOSES the data root.
+    """False when the configured jobs directory ENCLOSES the data root, or
+    sits INSIDE it anywhere but at `<DATA_ROOT>/exec_jobs`.
 
     Until now this sweep only ever touched 32-hex names, and that was its
     whole protection against `EXECUTOR_SHARED_DIR` — an operator-supplied
@@ -450,6 +456,12 @@ def _stray_removal_allowed(shared) -> bool:
     IS `DATA_ROOT`, or contains it, is a misconfigured install rather than a
     jobs volume. The refusal is logged once — the condition cannot change
     while the process runs, and a line every 10 minutes forever is a stream.
+
+    A jobs directory INSIDE `DATA_ROOT` is refused the same way, with the one
+    exception of `<DATA_ROOT>/exec_jobs` — the default the setting falls back
+    to. Any other path under the data root is customer state (pointing the
+    setting at `<DATA_ROOT>/chatdata` would otherwise turn every aged chat
+    directory into a "stray").
 
     This is the bound that holds on any platform; the per-entry ownership
     check in `_remove_stray_entry` is the one that holds inside the
@@ -463,8 +475,17 @@ def _stray_removal_allowed(shared) -> bool:
             if not _STRAY_REFUSED["logged"]:
                 _STRAY_REFUSED["logged"] = True
                 log_with_sid("exec", "warning",
-                             f"EXEC_STRAY_SWEEP_REFUSED dir={target} "
+                             f"EXEC_STRAY_SWEEP_REFUSED "
+                             f"dir={exec_transport.log_safe_text(str(target), 300)} "
                              f"reason=encloses_data_root")
+            return False
+        if target.is_relative_to(data_root) and target != data_root / "exec_jobs":
+            if not _STRAY_REFUSED["logged"]:
+                _STRAY_REFUSED["logged"] = True
+                log_with_sid("exec", "warning",
+                             f"EXEC_STRAY_SWEEP_REFUSED "
+                             f"dir={exec_transport.log_safe_text(str(target), 300)} "
+                             f"reason=inside_data_root")
             return False
         return True
     except Exception as e:
@@ -493,7 +514,9 @@ def _remove_stray_entry(child, now: float, own_uid) -> None:
     both go.
 
     Bounded three ways: the same age threshold a job directory gets, so
-    nothing mid-creation is taken; an entry this identity OWNS is left alone,
+    nothing mid-creation is taken (an entry dated in the FUTURE is not fresh:
+    generated code can set any mtime on what it creates, and a negative age
+    would otherwise keep it forever); an entry this identity OWNS is left alone,
     which is what keeps a misconfigured `EXECUTOR_SHARED_DIR` pointed at the
     customer's own state from being swept (everything under `DATA_ROOT` was
     written by this uid, while a stash written by generated code carries the
@@ -508,27 +531,28 @@ def _remove_stray_entry(child, now: float, own_uid) -> None:
         info = os.lstat(child)
         if own_uid is not None and info.st_uid == own_uid:
             return
-        if now - info.st_mtime <= _ORPHAN_MAX_AGE_S:
+        if -_FUTURE_MTIME_TOLERANCE_S <= now - info.st_mtime <= _ORPHAN_MAX_AGE_S:
             return
         mode = info.st_mode
         if stat.S_ISLNK(mode):
-            kind = "link"
+            entry_kind = "link"
             os.unlink(child)
         elif stat.S_ISDIR(mode):
-            kind = "dir"
+            entry_kind = "dir"
             shutil.rmtree(child)
         else:
-            kind = "file" if stat.S_ISREG(mode) else "other"
+            entry_kind = "file" if stat.S_ISREG(mode) else "other"
             os.unlink(child)
-        log_with_sid("exec", "info", f"EXEC_STRAY_ENTRY_REMOVED kind={kind}",
-                     name=_name_field(child))
+        log_with_sid("exec", "info", f"EXEC_STRAY_ENTRY_REMOVED kind={entry_kind}",
+                     name=exec_transport.log_safe_text(Path(child).name, 200))
     except FileNotFoundError:
         # A concurrent sweep got there first; that is the success case.
         return
     except OSError as e:
-        _warn_once_per_path(child, "exec",
-                            f"EXEC_STRAY_ENTRY_REMOVE_FAILED: {_tail(str(e))}",
-                            name=_name_field(child))
+        if _first_warning_for(child):
+            log_with_sid("exec", "warning",
+                         f"EXEC_STRAY_ENTRY_REMOVE_FAILED: {_tail(str(e))}",
+                         name=exec_transport.log_safe_text(Path(child).name, 200))
 
 
 def sweep_orphans() -> None:
@@ -546,7 +570,9 @@ def sweep_orphans() -> None:
         # Startup created this directory, so a failure here means the volume
         # itself is gone or unreadable — the next dispatch will say so too.
         log_with_sid("exec", "warning",
-                     f"EXEC_ORPHAN_SWEEP_FAILED dir={shared}: {_tail(str(e))}")
+                     f"EXEC_ORPHAN_SWEEP_FAILED "
+                     f"dir={exec_transport.log_safe_text(str(shared), 300)}: "
+                     f"{_tail(str(e))}")
         return
     now = time.time()
     strays = _stray_removal_allowed(shared)
@@ -565,13 +591,23 @@ def sweep_orphans() -> None:
                 if strays:
                     _remove_stray_entry(child, now, own_uid)
                 continue
-            if now - info.st_mtime <= _ORPHAN_MAX_AGE_S:
+            # A FUTURE mtime is not fresh: generated code can forward-date
+            # what it writes, and a negative age would keep it forever.
+            if -_FUTURE_MTIME_TOLERANCE_S <= now - info.st_mtime <= _ORPHAN_MAX_AGE_S:
                 continue
             shutil.rmtree(child)
             log_with_sid(child.name, "info", "EXEC_ORPHAN_REMOVED")
         except OSError as e:
-            _warn_once_per_path(child, child.name,
-                                f"EXEC_ORPHAN_REMOVE_FAILED: {_tail(str(e))}")
+            if not _first_warning_for(child):
+                continue
+            if _not_ours_to_repair(e):
+                # Not a failure of this side: the subtree that blocked the
+                # removal belongs to the sandbox uid, whose own sweep clears it.
+                log_with_sid(child.name, "info",
+                             "EXEC_ORPHAN_LEFT_TO_SANDBOX reason=owned_by_another_uid")
+                continue
+            log_with_sid(child.name, "warning",
+                         f"EXEC_ORPHAN_REMOVE_FAILED: {_tail(str(e))}")
 
 
 def _maybe_sweep() -> None:
@@ -610,8 +646,9 @@ def _compare_versions(reported) -> None:
             # untrusted side, and JSON bounds neither its length nor its
             # characters; `ours` is this image's own metadata.
             log_with_sid("startup", "warning",
-                         f"EXECUTOR_VERSION_MISMATCH module={name} "
-                         f"app={ours} "
+                         f"EXECUTOR_VERSION_MISMATCH "
+                         f"module={exec_transport.log_safe_text(name, 80)} "
+                         f"app={exec_transport.log_safe_text(ours, 120)} "
                          f"executor={exec_transport.log_safe_text(theirs, 120)}")
 
 
@@ -635,7 +672,7 @@ def _note_reachable(ok: bool) -> None:
         return
     try:
         log_with_sid("exec", "info" if ok else "warning",
-                     f"EXECUTOR_REACHABLE_CHANGED ok={ok}")
+                     f"EXECUTOR_REACHABLE_CHANGED ok={bool(ok)}")
     except Exception:
         # Never the reason a probe, a handshake or a dispatch fails.
         pass
@@ -671,19 +708,20 @@ def probe() -> bool:
 def _claim_refresh() -> bool:
     """Take the refresh slot, or report that someone else holds it.
 
-    Stamping `checked_at` at the START is what stops a second thread: the
-    state is fresh again immediately, so no further caller can claim the slot
-    until the window reopens, however long the probe itself takes (a DNS miss
-    outlasts its httpx budget by seconds). The probe overwrites both fields
-    when it lands, so a stale verdict can outlive its timestamp by at most one
-    probe — and the CALLER always gets the values as they were before the
-    claim.
+    The claim is stamped in its OWN field, `claimed_at`, at the START: no
+    further caller can claim the slot until the window reopens, however long
+    the probe itself takes (a DNS miss outlasts its httpx budget by seconds).
+    `checked_at` is left alone, because `/health` reports it as the moment a
+    VERDICT last landed, and taking the slot is not one — the probe moves it
+    when its answer arrives. The CALLER always gets the values as they were
+    before the claim.
     """
     now = time.time()
     with _REACH_LOCK:
-        if (now - (_REACH.get("checked_at") or 0.0)) <= _REACH_MAX_AGE_S:
+        last = max(_REACH.get("checked_at") or 0.0, _REACH.get("claimed_at") or 0.0)
+        if (now - last) <= _REACH_MAX_AGE_S:
             return False
-        _REACH["checked_at"] = now
+        _REACH["claimed_at"] = now
         return True
 
 
@@ -725,15 +763,16 @@ def handshake() -> bool:
         log_with_sid("startup", "warning",
                      f"EXECUTOR_UNREACHABLE_AT_STARTUP "
                      f"{_tail(f'{type(e).__name__}: {e}')}",
-                     url=_service_url("/healthz"))
+                     url=exec_transport.log_safe_text(_service_url("/healthz"), 300))
         return False
     _PENDING["handshake"] = False
     _note_reachable(True)
     # The version string is the response's own choice too: capped and
     # escaped before it lands on the boot line.
     version = (body or {}).get("version") if isinstance(body, dict) else ""
-    version = exec_transport.log_safe_text(version, 120)
-    log_with_sid("startup", "info", f"EXECUTOR_HANDSHAKE_OK version={version or 'dev'}")
+    log_with_sid("startup", "info",
+                 f"EXECUTOR_HANDSHAKE_OK "
+                 f"version={exec_transport.log_safe_text(version, 120) or 'dev'}")
     _compare_versions((body or {}).get("versions") if isinstance(body, dict) else None)
     return True
 
@@ -745,16 +784,18 @@ def startup() -> None:
     come up, and the dispatcher reports it per call anyway.
     """
     try:
-        ensure_shared_dir()
-        handshake()
-        sweep_orphans()
+        # Pure configuration, so it runs FIRST: a jobs volume that cannot be
+        # prepared is exactly the boot where the operator reads this log.
         concurrent = _max_concurrent()
         if concurrent > 1:
             # Raising this forfeits the isolation the sandbox exists for (see
             # docs/EXECUTOR_PROTOCOL.md §7), and it must never exceed the
             # sandbox's own limit.
             log_with_sid("startup", "warning",
-                         f"EXECUTOR_CONCURRENCY_UNSAFE max_concurrent={concurrent}")
+                         f"EXECUTOR_CONCURRENCY_UNSAFE max_concurrent={int(concurrent)}")
+        ensure_shared_dir()
+        handshake()
+        sweep_orphans()
     except Exception as e:
         log_with_sid("startup", "error",
                      f"EXECUTOR_STARTUP_FAILED {_tail(f'{type(e).__name__}: {e}')}")
@@ -773,7 +814,9 @@ def execute(kind: str, code: str, dfs: dict, sid: str | None = None,
     response — including which keys are ABSENT.
     """
     kind = "PLOT" if kind == "PLOT" else "PYTHON"
-    log_sid = sid or "exec"
+    # The sid is the caller's; escaped ONCE here, and every line of this job
+    # carries this form of it.
+    log_sid = exec_transport.log_safe_text(sid, 200) or "exec"
     budget = exec_transport.normalize_timeout(timeout_s)
     code_hash = _code_hash(code)
 
@@ -785,7 +828,7 @@ def execute(kind: str, code: str, dfs: dict, sid: str | None = None,
     gate = _gate()
     if not gate.acquire(timeout=_queue_max_s()):
         log_with_sid(log_sid, "error", "EXEC_QUEUE_EXPIRED",
-                     code_hash=code_hash, kind=kind, waited_s=_queue_max_s())
+                     code_hash=code_hash, kind=kind, waited_s=float(_queue_max_s()))
         return _error_shape(kind, BUSY_TEXT)
     try:
         return _dispatch(kind, code, dfs, log_sid, sid, budget, split_multi_axes, code_hash)
@@ -855,7 +898,8 @@ def _dispatch(kind: str, code: str, dfs: dict, log_sid: str, sid, budget,
             _note_reachable(False)
             log_with_sid(log_sid, "error",
                          f"EXEC_UNAVAILABLE {_tail(f'{type(e).__name__}: {e}')}",
-                         job_id=job_id, url=_service_url("/execute"))
+                         job_id=job_id,
+                         url=exec_transport.log_safe_text(_service_url("/execute"), 300))
             return _error_shape(kind, UNAVAILABLE_TEXT)
 
         # Any HTTP status at all is a conversation: the service is up. A
@@ -877,7 +921,7 @@ def _dispatch(kind: str, code: str, dfs: dict, log_sid: str, sid, budget,
             except Exception:
                 pass
             log_with_sid(log_sid, "error",
-                         f"EXEC_REJECTED status={response.status_code} code={rejected}",
+                         f"EXEC_REJECTED status={int(response.status_code)} code={rejected}",
                          job_id=job_id, code_hash=code_hash)
             return _error_shape(kind, _REJECTED_TEXT.format(code=rejected))
 
@@ -906,14 +950,38 @@ def _log_outcome(kind: str, out: dict, response, log_sid: str, job_id: str,
     """The three outcome lines, with the field names the existing log tooling
     already reads (`code_hash`, the success meta) plus the join keys."""
     try:
-        meta = _response_meta(response)
+        metrics = _response_meta(response)
+        elapsed_ms = metrics.get("elapsed_ms")
+        peak_rss_mb = metrics.get("peak_rss_mb")
         error = _error_text(out)
         if error is None:
+            if kind == "PLOT":
+                charts = out.get("multi_charts")
+                chart_count = len(charts) if isinstance(charts, list) else None
+                log_with_sid(log_sid, "info", f"EXEC_OK code_hash={code_hash}",
+                             job_id=job_id,
+                             image=bool(out.get("image") or out.get("plotly_html") or charts),
+                             is_plotly=out.get("is_plotly"),
+                             charts=chart_count,
+                             elapsed_ms=elapsed_ms, peak_rss_mb=peak_rss_mb)
+                return
+            preview = out.get("preview")
             log_with_sid(log_sid, "info", f"EXEC_OK code_hash={code_hash}",
-                         job_id=job_id, **_success_meta(kind, out), **meta)
+                         job_id=job_id,
+                         has_result=bool(out.get("result") is not None),
+                         preview_type=exec_transport.log_safe_text(
+                             type(preview).__name__ if preview is not None else "None", 80),
+                         image=bool(out.get("image_base64")),
+                         elapsed_ms=elapsed_ms, peak_rss_mb=peak_rss_mb)
             return
         keys = list(dfs.keys()) if isinstance(dfs, dict) else []
-        tails = _log_tails(response)
+        # `traceback=` / `stderr=` — LOG ONLY. When `exec()` ran in this
+        # process, a failing block's traceback landed in this container's
+        # log. It now exists only in the sandbox's log, which lives on a tmpfs
+        # and is wiped on restart, so the durable copy is this tail. It never
+        # reaches the returned dict: the callers' error channel is the text
+        # the planner and the user see, and it is unchanged.
+        reply = response if isinstance(response, dict) else {}
         if error == exec_transport.timeout_error_text(budget):
             # `reason` separates a real overrun from a slot that expired while
             # the job waited — the second never ran and must not read as
@@ -921,11 +989,18 @@ def _log_outcome(kind: str, out: dict, response, log_sid: str, job_id: str,
             # passes the transport's CLOSED vocabulary first (anything else
             # becomes `unknown`): a log line is as much a destination for an
             # injected string as a prompt is.
-            reason = (exec_transport.known_reason(response.get("reason"))
-                      if isinstance(response, dict) else None)
-            log_with_sid(log_sid, "error", f"EXEC_TIMEOUT after {budget}s",
-                         code_hash=code_hash, job_id=job_id, reason=reason,
-                         code=_code_snippet(code), dfs=keys, **tails, **meta)
+            timeout_reason = (exec_transport.known_reason(response.get("reason"))
+                              if isinstance(response, dict) else None)
+            log_with_sid(log_sid, "error",
+                         f"EXEC_TIMEOUT after "
+                         f"{exec_transport.log_safe_text(str(budget), 40)}s",
+                         code_hash=code_hash, job_id=job_id, reason=timeout_reason,
+                         code=exec_transport.log_safe_text(_code_snippet(code),
+                                                           _CODE_SNIPPET_MAX_CHARS),
+                         dfs=keys,
+                         traceback=_tail(reply.get("traceback")),
+                         stderr=_tail(reply.get("stderr")),
+                         elapsed_ms=elapsed_ms, peak_rss_mb=peak_rss_mb)
             return
         # The error TEXT goes to the caller verbatim — the planner has to see
         # the real exception to rewrite the code — but the LOG copy is escaped
@@ -936,7 +1011,12 @@ def _log_outcome(kind: str, out: dict, response, log_sid: str, job_id: str,
         # characters, which is where an exception's own message is.
         log_with_sid(log_sid, "error", f"EXEC_ERROR {_tail(error)}",
                      code_hash=code_hash, job_id=job_id,
-                     code=_code_snippet(code), dfs=keys, **tails, **meta)
+                     code=exec_transport.log_safe_text(_code_snippet(code),
+                                                       _CODE_SNIPPET_MAX_CHARS),
+                     dfs=keys,
+                     traceback=_tail(reply.get("traceback")),
+                     stderr=_tail(reply.get("stderr")),
+                     elapsed_ms=elapsed_ms, peak_rss_mb=peak_rss_mb)
     except Exception:
         # Logging must never be the reason an answer is lost.
         pass

@@ -72,18 +72,29 @@ shared jobs volume holds in-flight jobs only and needs no migration.
   Dockerfiles carry an `apt-get upgrade` layer, so rebuilding with a fresh
   package index is usually the whole fix. Findings with no fix available are
   written down as accepted, never silently ignored.
+  A plain rebuild does NOT refresh that layer — Docker reuses the cached
+  `apt-get upgrade` step and the old base image, so the fix is only picked up
+  by a patch rebuild with `--pull --no-cache` (see §2).
 
 ## 2. Build immutable tags (both images, same tag)
 ```
-docker build -t powerdatachat-client:enterprise-<git-sha-or-date> \
+docker build --pull -t powerdatachat-client:enterprise-<git-sha-or-date> \
   --build-arg BUILD_COMMIT=$(git rev-parse --short HEAD) \
   --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%MZ) .
 
-docker build -f executor/Dockerfile \
+docker build --pull -f executor/Dockerfile \
   -t powerdatachat-executor:enterprise-<git-sha-or-date> \
   --build-arg BUILD_COMMIT=$(git rev-parse --short HEAD) \
   --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%MZ) .
 ```
+`--pull` fetches the current base image instead of whatever copy is cached
+locally. For a PATCH rebuild — the same commit rebuilt to pick up OS package
+fixes after a scan finding — add `--no-cache` to both commands as well
+(`docker build --pull --no-cache ...`): without it the `apt-get upgrade` layer
+is reused from the cache and the rebuilt image carries the same packages. No
+cache-busting build argument is kept in the Dockerfiles for this; the flag on
+the build command is the one switch.
+
 Build the sandbox from the repository root (never from `executor/`) and never
 with `--target test`: that stage is root plus pytest. Give both images the SAME
 tag, because the pair is the release.

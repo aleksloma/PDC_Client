@@ -671,9 +671,17 @@ def load_excel_sheets(file_path: Path, filename: str) -> Dict[str, pd.DataFrame]
             try:
                 state = wb_probe[sn].sheet_state
             except Exception as e:
+                from exec_transport import log_safe_text
                 from logger_utils import log_with_sid
-                log_with_sid(filename, "warning",
-                             f"EXCEL_SHEET_STATE_PROBE_FAILED sheet='{sn}': {e}")
+                # The exception TYPE and a fixed reason only: openpyxl quotes
+                # what it choked on, and that is the customer's workbook
+                # content. The sheet NAME and the upload name are escaped,
+                # the log being newline-delimited.
+                log_with_sid(log_safe_text(str(filename), 200) or "excel", "warning",
+                             f"EXCEL_SHEET_STATE_PROBE_FAILED "
+                             f"sheet='{log_safe_text(str(sn), 200)}' "
+                             f"error={log_safe_text(type(e).__name__, 200)} "
+                             f"reason=sheet_visibility_unreadable")
                 state = "visible"  # fall back safely: never drop a sheet on probe failure
             if state == "visible":
                 sheet_names.append(sn)
@@ -684,8 +692,14 @@ def load_excel_sheets(file_path: Path, filename: str) -> Dict[str, pd.DataFrame]
         try:
             xl = pd.ExcelFile(str(file_path), engine="calamine")
         except Exception as e:
+            from exec_transport import log_safe_text
             from logger_utils import log_with_sid
-            log_with_sid(filename, "warning", f"EXCEL_SHARED_HANDLE_FAILED: {e}")
+            # Type + a fixed reason, never the exception text (it can quote a
+            # cell of the customer's workbook).
+            log_with_sid(log_safe_text(str(filename), 200) or "excel", "warning",
+                         f"EXCEL_SHARED_HANDLE_FAILED "
+                         f"error={log_safe_text(type(e).__name__, 200)} "
+                         f"reason=workbook_handle_unavailable")
             xl = None  # per-sheet reads fall back to self-opening (slower, same result)
 
         valid_sheets: List[Tuple[str, pd.DataFrame]] = []

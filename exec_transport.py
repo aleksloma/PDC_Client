@@ -131,6 +131,27 @@ def loads(payload: Any) -> Any:
     return json.loads(payload)
 
 
+# Every character `str.splitlines` breaks a line on — CR, LF, VT, FF, the
+# three information separators, NEL and the two Unicode line/paragraph
+# separators — plus ESC, which opens a terminal control sequence on the screen
+# of whoever reads the log. CR and LF keep their long-standing `\r` / `\n`
+# renderings; the others become their visible Python escape. ONE table, so a
+# character cannot be escaped at one site and forgotten at another.
+_LOG_ESCAPES = str.maketrans({
+    "\r": "\\r",
+    "\n": "\\n",
+    "\x0b": "\\x0b",
+    "\x0c": "\\x0c",
+    "\x1b": "\\x1b",
+    "\x1c": "\\x1c",
+    "\x1d": "\\x1d",
+    "\x1e": "\\x1e",
+    "\x85": "\\x85",
+    "\u2028": "\\u2028",
+    "\u2029": "\\u2029",
+})
+
+
 def log_safe_text(value: Any, max_chars: int = LOG_TEXT_MAX_CHARS, *,
                   tail: bool = False) -> str:
     """ONE line of an untrusted string, length-capped, for a log field.
@@ -146,8 +167,10 @@ def log_safe_text(value: Any, max_chars: int = LOG_TEXT_MAX_CHARS, *,
     NEWLINE-DELIMITED, so an embedded newline forges a complete, plausible
     extra record into the file operators grep — it can claim any other event's
     shape and any other job's id. Truncation does not help: a newline at
-    character 10 still splits the line. CR and LF are therefore escaped at
-    EVERY site that puts such a string on a log line, which is why this helper
+    character 10 still splits the line. Every line break `str.splitlines`
+    recognises (not only CR and LF) and ESC are therefore escaped
+    (`_LOG_ESCAPES`) at EVERY site that puts such a string on a log line,
+    which is why this helper
     lives in the module both containers already share instead of in one
     caller.
 
@@ -164,7 +187,7 @@ def log_safe_text(value: Any, max_chars: int = LOG_TEXT_MAX_CHARS, *,
         limit = (max_chars if isinstance(max_chars, int) and max_chars > 0
                  else LOG_TEXT_MAX_CHARS)
         cut = value[-limit:] if tail else value[:limit]
-        cut = cut.replace("\r", "\\r").replace("\n", "\\n")
+        cut = cut.translate(_LOG_ESCAPES)
         return cut[-limit:] if tail else cut[:limit]
     except Exception:
         return ""
@@ -381,8 +404,8 @@ def create_job_dir(shared_dir, job_id: str) -> Path:
             os.chmod(path, _DIR_MODE)
         except OSError as e:
             # Windows has no setgid bit; a dev run must not fail on it.
-            log_with_sid(job_id, "warning",
-                         f"JOB_DIR_CHMOD_FAILED {path.name}: "
+            log_with_sid(log_safe_text(str(job_id), 64) or "exec", "warning",
+                         f"JOB_DIR_CHMOD_FAILED {log_safe_text(path.name, 64)}: "
                          f"{log_safe_text(str(e))}")
     return job_dir
 
@@ -397,7 +420,7 @@ def ensure_out_dir(job_dir) -> Path:
         # Windows has no setgid bit; a dev run must not fail on it. Mirrors
         # `create_job_dir`'s JOB_DIR_CHMOD_FAILED so a REAL permission problem
         # on the shared volume is visible instead of silent.
-        log_with_sid(Path(job_dir).name, "warning",
+        log_with_sid(log_safe_text(Path(job_dir).name, 64) or "exec", "warning",
                      f"OUT_DIR_CHMOD_FAILED: {log_safe_text(str(e))}")
     return out_dir
 
@@ -477,12 +500,12 @@ def write_inputs(dfs: dict, job_dir, sid: Optional[str] = None) -> list:
             if list(back.columns) != list(df.columns) or not back.equals(df):
                 raise ValueError("pickle round-trip altered the dataframe")
         except Exception as e_pkl:
-            log_with_sid(sid or "exec", "error",
+            log_with_sid(log_safe_text(sid, 200) or "exec", "error",
                          f"EXEC_INPUT_WRITE_FAILED key={log_safe_text(str(name), 200)}: "
                          f"parquet: {log_safe_text(parquet_error)}; "
                          f"pickle: {log_safe_text(str(e_pkl))}")
             raise ValueError(f"cannot transport dataframe {name!r}: {e_pkl}") from e_pkl
-        log_with_sid(sid or "exec", "info",
+        log_with_sid(log_safe_text(sid, 200) or "exec", "info",
                      f"EXEC_INPUT_PICKLE_FALLBACK "
                      f"key={log_safe_text(str(name), 200)}: "
                      f"{log_safe_text(parquet_error)}")
@@ -671,7 +694,7 @@ def _fix_unwritable_object_columns(df: pd.DataFrame) -> pd.DataFrame:
             # embeds a CELL VALUE, and this module never logs values (and a
             # column NAME is user data too).
             log_with_sid("exec", "warning",
-                         f"EXEC_PARQUET_PROBE_FAILED pos={pos} "
+                         f"EXEC_PARQUET_PROBE_FAILED pos={int(pos)} "
                          f"{log_safe_text(type(e).__name__, 200)}")
         if out is df:
             out = df.copy(deep=False)
@@ -950,7 +973,7 @@ def deserialize_result(response: Any, job_dir, kind: str, timeout_s=60,
             raise _Violation("the executor response carries no payload object")
         return _reconstruct(payload, Path(job_dir), kind)
     except _TooLarge as e:
-        log_with_sid(sid or "exec", "error",
+        log_with_sid(log_safe_text(sid, 200) or "exec", "error",
                      f"EXEC_RESPONSE_TOO_LARGE {log_safe_text(str(e))}")
         return _exec_error(kind, f"ResultTooLarge: {e}")
     except Exception as e:
@@ -958,7 +981,6 @@ def deserialize_result(response: Any, job_dir, kind: str, timeout_s=60,
         # path an operator needs, the returned text (which reaches a prompt)
         # never gets it. Escaped because a filesystem error message is not
         # this process's own text and the log file is newline-delimited.
-        detail = log_safe_text(getattr(e, "detail", None))
         # The MESSAGE is escaped for the same reason as `detail`, and it is
         # the one that matters most: these violation texts interpolate a raw
         # pyarrow/pandas exception (`result parquet is unreadable: ...`), and
@@ -966,10 +988,10 @@ def deserialize_result(response: Any, job_dir, kind: str, timeout_s=60,
         # sandbox wrote. A newline there forged a COMPLETE extra record,
         # timestamp, level, sid and event name included, into the file an
         # operator greps to reconstruct what happened.
-        log_with_sid(sid or "exec", "error",
+        log_with_sid(log_safe_text(sid, 200) or "exec", "error",
                      f"EXEC_RESPONSE_INVALID "
                      f"{log_safe_text(f'{type(e).__name__}: {e}')}",
-                     detail=detail)
+                     detail=log_safe_text(getattr(e, "detail", None)))
         return _exec_error(kind, f"ExecutorResponseError: {e}"
                            if isinstance(e, _Violation)
                            else f"ExecutorResponseError: {type(e).__name__}: {e}")

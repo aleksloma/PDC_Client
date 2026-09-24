@@ -1,4 +1,4 @@
-"""Task 2 — the plotly.js self-heal must tolerate a read-only rootfs.
+"""The plotly.js self-heal must tolerate a read-only rootfs.
 
 `plot_utils.ensure_plotly_js_asset()` copies the pip package's plotly.min.js
 into static/vendor/ at app lifespan. In the hardened image (`read_only: true`,

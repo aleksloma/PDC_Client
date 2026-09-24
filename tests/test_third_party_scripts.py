@@ -149,3 +149,164 @@ def test_the_setting_parses_like_client_llm_debug(monkeypatch, env, expected):
     monkeypatch.setenv("ENABLE_THIRD_PARTY_SCRIPTS", env)
     value = getattr(Settings(), "ENABLE_THIRD_PARTY_SCRIPTS", None)  # local: no Settings repr
     assert value is expected
+
+
+# ---------------------------------------------------------------------------
+# structural scan: every served page and script, not only the /lab render
+# ---------------------------------------------------------------------------
+# No page loads code or content from a third-party origin by default.
+#
+# The client runs inside a customer's LAN, often without internet egress, and a
+# security review treats every external origin a page contacts as a data-flow to
+# explain. The served pages may therefore reference an absolute http(s) origin
+# in a LOADING position — a `<script src>`, a stylesheet `<link href>`, an
+# `<iframe src>`, a dynamic `import(...)`, a `fetch(...)`, or a script element's
+# `.src` assigned in JS — only for the origins on the allowlist below, and each
+# of those must sit behind the `third_party_scripts` template gate (default off,
+# `settings.ENABLE_THIRD_PARTY_SCRIPTS`).
+#
+# Non-loading references are ignored by construction, because the patterns only
+# match loading positions: an `<a href>` to a company page, an input
+# `placeholder="https://…"`, and an SVG `xmlns` are not requests the browser
+# makes on its own.
+#
+# Scope: `templates/**/*.html` and `static/**/*.js` (+ any `static/**/*.html`),
+# excluding `static/vendor/`, whose libraries are vendored verbatim and carry
+# no network references of their own that this product uses.
+
+import re  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# Origin -> why it is allowed. Both are loaded ONLY under the
+# `{% if third_party_scripts %}` gate (the hosted demo turns it on).
+ALLOWED_ORIGINS = {
+    "www.googletagmanager.com": "Google Analytics — hosted demo only, gated",
+    "cdn.paddle.com": "Paddle checkout SDK — hosted demo only, gated",
+}
+
+_URL = r"""(https?:)?//(?P<host>[A-Za-z0-9.-]+)"""
+HTML_PATTERNS = [
+    re.compile(r"<script\b[^>]*?\bsrc\s*=\s*[\"']?" + _URL, re.I | re.S),
+    re.compile(r"<link\b[^>]*?\bhref\s*=\s*[\"']?" + _URL, re.I | re.S),
+    re.compile(r"<iframe\b[^>]*?\bsrc\s*=\s*[\"']?" + _URL, re.I | re.S),
+]
+JS_PATTERNS = [
+    re.compile(r"\bimport\s*\(\s*[\"'`]" + _URL),
+    re.compile(r"\bimport\b[^;\n]*?\bfrom\s*[\"'`]" + _URL),
+    re.compile(r"\bfetch\s*\(\s*[\"'`]" + _URL),
+    re.compile(r"\.src\s*=\s*[\"'`]" + _URL),
+    re.compile(r"\bnew\s+(?:Worker|EventSource|WebSocket)\s*\(\s*[\"'`]" + _URL),
+]
+
+
+def _scanned_files():
+    files = sorted((ROOT / "templates").rglob("*.html"))
+    for pattern in ("*.js", "*.html"):
+        for path in sorted((ROOT / "static").rglob(pattern)):
+            rel = path.relative_to(ROOT / "static").as_posix()
+            if rel.startswith("vendor/"):
+                continue
+            files.append(path)
+    return files
+
+
+def _line(text: str, pos: int) -> int:
+    return text.count("\n", 0, pos) + 1
+
+
+def _loading_references():
+    """Yield (relative path, line, host, index, text) for every loading
+    reference to an absolute origin."""
+    for path in _scanned_files():
+        text = path.read_text(encoding="utf-8", errors="replace")
+        patterns = list(JS_PATTERNS)
+        if path.suffix == ".html":
+            patterns = HTML_PATTERNS + JS_PATTERNS     # inline <script> blocks too
+        for pattern in patterns:
+            for m in pattern.finditer(text):
+                yield (path.relative_to(ROOT).as_posix(), _line(text, m.start()),
+                       m.group("host").lower(), m.start(), text)
+
+
+def _inside_third_party_gate(text: str, pos: int) -> bool:
+    """Is `pos` inside a `{% if third_party_scripts %}` … `{% endif %}` block?"""
+    stack = []
+    for m in re.finditer(r"{%-?\s*(if\b[^%]*|endif)\s*-?%}", text[:pos]):
+        token = m.group(1).strip()
+        if token.startswith("if"):
+            stack.append(token)
+        elif stack:
+            stack.pop()
+    return any(re.fullmatch(r"if\s+third_party_scripts", t) for t in stack)
+
+
+def test_the_scan_covers_the_served_pages():
+    names = {p.relative_to(ROOT).as_posix() for p in _scanned_files()}
+    for must in ("templates/dashboard.html", "templates/auth_landing.html",
+                 "templates/admin_data_sources.html", "static/dashboard.js",
+                 "static/admin_data_sources.js"):
+        assert must in names, must
+    assert not any(n.startswith("static/vendor/") for n in names)
+
+
+def test_no_page_loads_from_an_origin_outside_the_allowlist():
+    offenders = [f"{rel}:{line} {host}"
+                 for rel, line, host, _pos, _text in _loading_references()
+                 if host not in ALLOWED_ORIGINS]
+    assert offenders == [], offenders
+
+
+def test_every_allowlisted_origin_is_behind_the_third_party_gate():
+    ungated = [f"{rel}:{line} {host}"
+               for rel, line, host, pos, text in _loading_references()
+               if host in ALLOWED_ORIGINS
+               and not (rel.endswith(".html") and _inside_third_party_gate(text, pos))]
+    assert ungated == [], ungated
+
+
+def test_the_allowlist_has_no_stale_entries():
+    seen = {host for _rel, _line, host, _pos, _text in _loading_references()}
+    stale = sorted(set(ALLOWED_ORIGINS) - seen)
+    assert stale == [], stale
+
+
+def test_the_scanner_recognises_each_loading_form():
+    """The patterns themselves, so a regex slip cannot turn this file into a
+    test that passes by matching nothing."""
+    html_samples = [
+        '<script async src="https://evil.example/x.js"></script>',
+        "<link rel='stylesheet' href='https://evil.example/x.css'>",
+        '<iframe width="1" src="//evil.example/frame"></iframe>',
+    ]
+    for sample in html_samples:
+        assert any(p.search(sample) for p in HTML_PATTERNS), sample
+    js_samples = [
+        "import('https://evil.example/m.js')",
+        'import x from "https://evil.example/m.js";',
+        "fetch(`https://evil.example/api`)",
+        "s.src = 'https://evil.example/x.js'",
+        'new Worker("https://evil.example/w.js")',
+    ]
+    for sample in js_samples:
+        assert any(p.search(sample) for p in JS_PATTERNS), sample
+    ignored = [
+        '<a href="https://www.linkedin.com/company/x">in</a>',
+        '<input placeholder="https://pdc.example.com" />',
+        "document.createElementNS('http://www.w3.org/2000/svg', 'svg')",
+        '<svg xmlns="http://www.w3.org/2000/svg"></svg>',
+        '<script src="/static/vendor/plotly/plotly.min.js"></script>',
+    ]
+    for sample in ignored:
+        assert not any(p.search(sample) for p in HTML_PATTERNS + JS_PATTERNS), sample
+
+
+def test_the_gate_detector_itself():
+    text = ("{% if a %}x{% endif %}{% if third_party_scripts %}<script "
+            "src='https://cdn.paddle.com/p.js'></script>{% endif %}"
+            "<script src='https://cdn.paddle.com/q.js'></script>")
+    first = text.index("https://cdn.paddle.com/p.js")
+    second = text.index("https://cdn.paddle.com/q.js")
+    assert _inside_third_party_gate(text, first) is True
+    assert _inside_third_party_gate(text, second) is False

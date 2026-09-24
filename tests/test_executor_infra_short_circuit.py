@@ -141,6 +141,21 @@ def test_a_crash_the_generated_code_caused_still_retries(text):
     assert verdict is False, (text, verdict)
 
 
+def test_the_crash_carve_out_is_anchored_on_the_crash_prefix():
+    """`reason=exit` exempts only an `ExecutorCrashError`. Any other
+    `Executor*` text that merely CONTAINS the phrase — e.g. a response error
+    quoting a sandbox-supplied kind — stays infrastructure; the carve-out is
+    decided by what the text starts with, not by a substring anywhere."""
+    crafted = "ExecutorResponseError: unknown result kind 'x reason=exit'"
+    assert _predicate()(crafted) is True, crafted
+    crafted_signal = "ExecutorResponseError: unknown result kind 'x reason=signal'"
+    assert _predicate()(crafted_signal) is True, crafted_signal
+    real = "ExecutorCrashError: the analysis process exited unexpectedly (exit=3, signal=None, reason=exit)"
+    assert _predicate()(real) is False, real
+    short = "ExecutorCrashError: ... reason=exit"
+    assert _predicate()(short) is False, short
+
+
 @pytest.mark.parametrize("text", [
     TIMEOUT_TEXT, MEMORY_TEXT, TOO_LARGE_TEXT, PLAIN_ERROR,
     "ValueError: could not convert", "",
@@ -929,7 +944,7 @@ def _assert_no_value(messages: list, event: str) -> None:
 # is precisely the event it would exist to catch (this class grew from six
 # sites to seventeen twice in a row, each time found by a reader rather than
 # by a test). So the guard is INVERTED: every value that reaches a log LINE
-# in these three modules must be either a call to one of the escaping
+# in these modules must be either a call to one of the escaping
 # helpers, or safe BY CONSTRUCTION under a rule below, or named in the
 # allowlist with its reason. A new site fails by default and its author has
 # to route it through a helper or add a line here — the reviewable act the
@@ -958,15 +973,23 @@ def _assert_no_value(messages: list, event: str) -> None:
 #     generated token, and NOTHING HERE VERIFIES THAT — it is an allowlist
 #     entry, not a proof.
 #   * Any module outside `LOG_SAFE_MODULES`. The same class may exist in
-#     `db_connector.py`, `routes/admin_data.py` or `executor_client.py`; this
+#     `db_connector.py`, `routes/admin_data.py` or `local_store.py`; this
 #     guard says nothing about them.
-LOG_SAFE_MODULES = ["run_chat_local.py", "routes/chat.py", "exec_sanitizer.py"]
+#
+# The list covers the retry loops and chat routes, the sanitize gate, BOTH
+# sides of the executor hop (the shared transport, the web-side dispatcher,
+# the sandbox service) where a forged record was actually reproduced, the web
+# app's own middleware lines, and the Excel detector's openpyxl-failure sites.
+LOG_SAFE_MODULES = ["run_chat_local.py", "routes/chat.py", "exec_sanitizer.py",
+                    "exec_transport.py", "executor_client.py", "app.py",
+                    "executor/app.py", "excel_table_detector.py"]
 
 LOG_CALL_NAME = "log_with_sid"
 
 # The escaping helpers. `_log_safe` is `exec_sanitizer`'s module-local one
-# (that module is a leaf and imports nothing from the transport).
-ESCAPING_HELPERS = {"log_safe_text", "_log_safe"}
+# (that module is a leaf and imports nothing from the transport). `_tail` is
+# `executor_client`'s: it IS `log_safe_text`, bound to that module's cap.
+ESCAPING_HELPERS = {"log_safe_text", "_log_safe", "_tail"}
 
 # Helpers that return a FIXED, value-free string rather than escaping one.
 VALUE_FREE_HELPERS = {"_xlsx_failure_reason"}
@@ -978,7 +1001,13 @@ NON_STRING_COERCIONS = {"len", "bool", "int", "float"}
 # Expressions safe BY CONSTRUCTION, as exact source text, each with the
 # reason it is safe. Adding an entry is a visible, reviewable act — that is
 # why the list lives in the test. Where the reason depends on something
-# OUTSIDE these three modules, it says so.
+# OUTSIDE these modules, it says so.
+#
+# The executor-hop modules, `app.py` and `excel_table_detector.py` joined
+# `LOG_SAFE_MODULES` WITHOUT pre-written entries on purpose: whoever routes
+# those sites adds each entry here together with the validation line that
+# makes it safe. Entries written ahead of the code would be rejected by
+# `test_the_allowlist_has_no_stale_entries` anyway.
 SAFE_BY_CONSTRUCTION = {
     # counts, positions, flags: never strings
     "produced": "an int counter",
@@ -1002,8 +1031,9 @@ SAFE_BY_CONSTRUCTION = {
     "fname": "sanitize_upload_filename output — control chars stripped",
     # ids whose safety comes from OUTSIDE these modules — the mechanism is
     # named exactly, because a wrong reason is worse than none
-    "chat_id": ("no format guard exists; a newline-bearing id matches no "
-                "chatdata directory, so the request 404s before any log line"),
+    "chat_id": ("routes/chat.py `_require_chat` answers 404 unless the id "
+                "fullmatches [A-Za-z0-9_-]{1,64}, before any log line; ids "
+                "read back off the store were created as c_ + 16 hex"),
     "getattr(store, 'chat_id', '')": "same as chat_id, read back off the store",
     "email": ("the session email; the password path validates it, and the SSO "
               "path only requires non-empty with an '@', so an interior "
@@ -1013,6 +1043,61 @@ SAFE_BY_CONSTRUCTION = {
     "sid": ("the caller's request id; every call site in this repository "
             "passes a server-generated token (`secrets.token_hex`) or a "
             "stored id — NOT verified by this test"),
+    # --- the executor hop (executor_client.py, executor/app.py) ---
+    "log_sid": ("executor_client.execute assigns it ONCE as "
+                "`exec_transport.log_safe_text(sid, 200) or 'exec'` and passes "
+                "it unchanged to _dispatch, _log_outcome and _remove_job_dir"),
+    "job_id": ("executor_client._dispatch: `exec_transport.new_job_id()` "
+               "(uuid4().hex, 32 lowercase hex); executor/app._execute_job: "
+               "`request.job_id`, which `_validate` checked with "
+               "`exec_transport.valid_job_id` (32 lowercase hex, length-checked) "
+               "before `/execute` runs the job"),
+    "request.job_id": ("executor/app `/execute`: `_validate` returned BAD_JOB_ID "
+                       "unless `exec_transport.valid_job_id(request.job_id)` "
+                       "(32 lowercase hex, length-checked) — both lines sit "
+                       "after that check"),
+    "child.name": ("both jobs-root sweeps use it as the sid ONLY in the "
+                   "job-directory branch, after `exec_transport.valid_job_id("
+                   "child.name)` returned True — 32 lowercase hex; the stray "
+                   "branch escapes the name instead"),
+    "code_hash": ("a sha256 hexdigest slice: executor_client._code_hash "
+                  "(`hexdigest()[:10]`, or '' on failure) and "
+                  "executor/app._execute_job (`hexdigest()[:10]`) — 0-9a-f only"),
+    "kind": ("executor_client.execute normalizes it on its first line to the "
+             "literal 'PLOT' or 'PYTHON'; _dispatch only receives that value"),
+    "request.kind": ("executor/app `/execute`: `_validate` returned BAD_KIND "
+                     "unless `request.kind in exec_transport.KINDS`, before "
+                     "the job runs"),
+    "entry_kind": ("_remove_stray_entry (both sweeps) assigns one of the "
+                   "literals 'link' / 'dir' / 'file' / 'other' from the lstat "
+                   "mode"),
+    "rejected": ("executor_client._dispatch: the literal 'UNKNOWN', or a str "
+                 "that passed `_CODE_RE.fullmatch` ([A-Z][A-Z0-9_]{0,39}) just "
+                 "above the line"),
+    "timeout_reason": ("executor_client._log_outcome: "
+                       "`exec_transport.known_reason` output — a closed "
+                       "vocabulary, anything else becomes 'unknown'"),
+    "elapsed_ms": ("executor_client._log_outcome: `_response_meta` → "
+                   "`exec_transport.known_number` — a bounded int/float or None"),
+    "peak_rss_mb": ("executor_client._log_outcome: `_response_meta` → "
+                    "`exec_transport.known_number` — a bounded int/float or None"),
+    "chart_count": ("executor_client._log_outcome: `len()` of a list, or None"),
+    "out.get('is_plotly')": ("executor_client._log_outcome: the transport's "
+                             "result reader raises unless `is_plotly` is a "
+                             "bool, so it is a bool or absent (None)"),
+    "keys": ("executor_client._log_outcome: `list(dfs.keys())` — list "
+             "rendering reprs each key, and repr escapes CR/LF and every other "
+             "non-printable character"),
+    "exec_transport.normalize_timeout(request.timeout_s)": (
+        "executor/app._execute_job: `request.timeout_s` is a pydantic float "
+        "that `_validate` bounded to (0, max_timeout_s]; normalize_timeout "
+        "returns it as an int or a float"),
+    "response['status']": ("executor/app._execute_job: one of the literals "
+                           "'timeout' / 'killed' / 'crashed', or a runner "
+                           "response `_parse_runner_response` accepted only "
+                           "with status in ('ok', 'error', 'timeout')"),
+    "exit_code": ("executor/app._execute_job: `subprocess.Popen.returncode` "
+                  "— an int, or None"),
 }
 
 

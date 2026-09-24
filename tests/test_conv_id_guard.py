@@ -1,4 +1,4 @@
-"""Security remediation Task 1e.2 — conversation-id guard in local_store.
+"""The conversation-id guard in local_store.
 
 `ChatDataStore.get_history` / `append_history` / `truncate_conv_history`
 joined `conv_id` straight into `conversations_dir / f"{conv_id}.jsonl"` with
