@@ -120,9 +120,11 @@ ladmin page returns the landing page to the plain password form instantly.
   session but not the Microsoft browser session — PowerDataChat performs no
   Microsoft front-channel logout. On a shared machine, users should also
   sign out of Microsoft 365 or use a private window.
-- **First SSO login auto-provisions** the local profile. Existing
-  password accounts with the same email simply gain SSO — their password
-  keeps working, and password reset flows are untouched.
+- **First SSO login auto-provisions** the local profile — the one way an
+  account comes to exist without an invitation or a share, since a password
+  sign-in never creates one. Existing password accounts with the same email
+  simply gain SSO — their password keeps working, and password reset flows
+  are untouched.
 - Every Save / Test / Enable / Disable is written to the admin audit log
   (tenant and client IDs only — never the secret).
 

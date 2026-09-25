@@ -155,6 +155,64 @@ TCPS (the server must offer TCPS on the configured port). A failed refresh
 keeps the previous snapshot, so chats keep answering from it while you fix the
 connection.
 
+### Users and sign-in
+
+Nobody can create an account by typing an address at the sign-in page.
+Accounts come to exist in three ways:
+
+- **Invitation.** On the admin panel's **Users** page, `ladmin` enters an
+  address and clicks **Invite user**. The account is created without a
+  password and a link that sets one is mailed to the address. If the mail
+  cannot be sent, the page says so; the colleague can still click **Reset
+  password** on the sign-in page.
+- **Sharing.** Sharing a chat, a conversation or a dashboard with a new
+  address creates the same password-less account. The colleague sets a
+  password through **Reset password**.
+- **Single sign-on.** When Microsoft Entra ID sign-in is enabled, the first
+  Microsoft sign-in creates the account (who may sign in is decided in
+  Entra).
+
+**Set `PUBLIC_BASE_URL`** in `client.env` on every install, to the address
+your users type, e.g. `https://pdc.example.com`. Reset and invitation links
+are built from it and from nothing else. Without it no reset or invitation
+mail is sent at all: the sign-in page still answers normally, an invite
+reports that no mail went out, and the log shows `PUBLIC_BASE_URL_UNSET` at
+start-up. The application deliberately never takes the link's address from
+the incoming request, because a caller controls that address and could
+otherwise have a genuine reset mail point at a server of their choosing.
+
+**Password reset.** "Reset password" mails a link valid for 30 minutes that
+works once. The sign-in page gives the same answer whether or not the address
+has an account. The link's token appears in your proxy's and the
+application's access logs and in the browser history, like any URL; single use
+and the 30-minute lifetime are the protection. A reset does not sign out
+sessions already open elsewhere: a "Remember me" session stays valid until
+30 days after its last use.
+The `ladmin` password cannot be reset by mail — to recover it, delete
+`users/ladmin/auth.json` on the data volume and restart with
+`LOCAL_ADMIN_PASSWORD` set.
+
+**Repeated failures are slowed down, then locked.** After 5 failed attempts
+for one address within 15 minutes, the next four attempts must wait 1, 2, 4
+and 8 seconds, and if the last of them fails too, sign-in for that address is
+locked for 15 minutes; an attempt made too early or during the lock is
+answered "Too many attempts" with a `Retry-After` header.
+Password-reset requests have their own count per address. Attempts from one
+network address are slowed the same way after 20 failures, but never locked,
+so a proxy that hides your users' addresses cannot lock the whole company
+out. Because anyone can trigger the per-address lock, a colleague who meets
+it waits 15 minutes or signs in with Microsoft, which is not limited here.
+The numbers are `AUTH_FAIL_THRESHOLD`, `AUTH_FAIL_THRESHOLD_IP`,
+`AUTH_FAIL_WINDOW_S` and `AUTH_LOCKOUT_S` in `client.env`. The counters live in
+the web process: they reset on restart and assume the single web worker this
+product runs (see "Concurrency and waiting"). Keep a rate limit on your
+reverse proxy as well.
+
+**Addresses.** An address must use letters, digits and `. _ % + -` before the
+`@`. An existing account whose address uses another character, such as an
+apostrophe, can no longer sign in with a password or receive a share; give
+that user a new address or use single sign-on.
+
 ### Single sign-on with Microsoft Entra ID (optional)
 
 After install, the `ladmin` account can connect your Microsoft Entra ID
@@ -317,7 +375,9 @@ The sandbox runs **one job at a time**, and `EXECUTOR_MAX_CONCURRENT` must stay
 The web service itself runs **one worker and one replica**. Keep it that way:
 charts are handed to the browser through a short-lived in-memory store, so a
 second worker or a load-balanced second container would show blank charts
-whenever the browser's two requests land on different processes.
+whenever the browser's two requests land on different processes. The sign-in
+attempt counters and the reset-link lookup live in the same process for the
+same reason.
 One job at a time is what makes "no other process shares this identity" true.
 
 Two honest consequences. Chart rendering is serialized, so a question that
@@ -376,6 +436,13 @@ If you must run plain HTTP on the LAN, set `SESSION_HTTPS_ONLY=false` in
 `client.env`. Sessions then travel unencrypted and can be captured on your
 network; only do this on an isolated segment or for a short evaluation.
 
+**Forward your users' addresses.** The sign-in limits count failures per
+network address as well as per account. Behind a proxy that address is the
+proxy's own unless `FORWARDED_ALLOW_IPS` names the proxy and the proxy sets
+`X-Forwarded-For`. Without that, every user shares one address, which only
+slows everyone down after 20 failures in 15 minutes; it never locks anyone
+out.
+
 **Do not tell the application to trust every proxy.** uvicorn rewrites the
 client address of a request from its `X-Forwarded-For` header for any peer
 listed in `FORWARDED_ALLOW_IPS`. With `FORWARDED_ALLOW_IPS=*` the sandbox
@@ -404,7 +471,9 @@ responses, and do not rewrite the header.
 
 ## 4. Verify
 
-- Open `http://<host>:8000` → enter your work email → you land in `/lab`.
+- Open `http://<host>:8000` → sign in as `ladmin` with `LOCAL_ADMIN_PASSWORD`
+  → you land on the admin panel; invite a first user from **Users** and check
+  that the invitation mail arrives with a link to your `PUBLIC_BASE_URL`.
 - Check the health endpoint:
 
   ```
@@ -485,7 +554,7 @@ worth stating plainly:
 | Table column names | Report generation | Column NAMES only, first 10 — never rows |
 | User email | Every call | Tenant routing and per-user activity |
 | Activity events | Login, upload, chat, report | Event name, user email, lightweight counters |
-| Password-reset payload | Password reset only | The e-mail address and a temporary password, relayed through the brain's mail service (a tokenized reset link replaces this in a future release) |
+| Password-reset payload | Password reset and invitation | The e-mail address and a single-use reset link (valid 30 minutes), relayed through the brain's mail service; the brain never logs or stores the link |
 | Third-party browser scripts | Never, by default | The `/lab` page loads no analytics or billing script; the browser contacts only your own server |
 
 Never sent: uploaded files, DataFrames, query result sets, rendered charts or
@@ -501,8 +570,9 @@ decks, and your branded templates.
 - **Sharing rules your users will meet.**
   - Sharing with a colleague who has never signed in creates an account for
     that address with no password. The colleague signs in by clicking "Reset
-    password" first; typing a password at the sign-in page is refused. Nobody
-    else can claim the share by signing in with that address first.
+    password" first and setting a password through the mailed link; typing a
+    password at the sign-in page is refused. Nobody else can claim the share
+    by signing in with that address first.
   - Sharing a dashboard gives the recipients access only to the chats the
     dashboard's owner owns. A tile pinned from a chat that was itself shared
     with the owner shows its saved picture to the recipients, but cannot be
@@ -515,9 +585,10 @@ decks, and your branded templates.
   - Charts and styled tables that anyone shares are shown in an isolated
     frame or reduced to plain table formatting, so what one user shares
     cannot act in another user's browser session.
-- **A forced password change blocks everything until it is done.** After a
-  password reset (or the first administrator sign-in with the bootstrap
-  password) the user must set a new password before anything else works: the
+- **A forced password change blocks everything until it is done.** After the
+  first administrator sign-in with the bootstrap password (or a sign-in with a
+  temporary password mailed by a release before this one) the user must set a
+  new password before anything else works: the
   pages redirect to the change form, and every data request is refused with
   "Password change required" until the change is made.
 - **Upgrades:** pull or load the new tag of **both** images, update the tag in

@@ -67,7 +67,7 @@ values derived from your data. User email is sent for tenant routing.
 | Table column names | Report generation | Column NAMES only, first 10 — never rows |
 | User email | Every call | Tenant routing and per-user activity |
 | Activity events | Login, upload, chat, report | Event name, user email, lightweight counters |
-| Password-reset payload | Password reset only | The e-mail address and a temporary password, relayed through the brain's mail service (a tokenized reset link replaces this in a future release) |
+| Password-reset payload | Password reset and invitation | The e-mail address and a single-use reset link (valid 30 minutes), relayed through the brain's mail service |
 | Third-party browser scripts | Never, by default | `/lab` loads no analytics or billing script (`ENABLE_THIRD_PARTY_SCRIPTS=false`) |
 
 Never sent: uploaded files, DataFrames, query result sets, rendered charts or
@@ -97,7 +97,7 @@ PDC_Client/
 ├── docker-compose.yml       # customer stack: both services, two networks
 ├── docker-compose.local.yml # local stack: both services, built from this repo
 ├── routes/
-│   ├── auth.py              # /auth/* — email+password login, reset, change
+│   ├── auth.py              # /auth/* — email+password sign-in (by invitation), reset link, change
 │   ├── upload.py            # /upload, /schema_autofill_full, /generate_chatdata
 │   ├── schema.py            # /schema_details, /schema_common_fields, /schema
 │   ├── chat.py              # /api/chat/* — SSE stream, edit-regenerate, sharing
@@ -152,7 +152,9 @@ cp client.env.example client.env      # fill BRAIN_TENANT_TOKEN + SECRET_KEY
 docker compose up -d
 ```
 
-Open `http://localhost:8000` → enter your work email → land in `/lab`.
+Open `http://localhost:8000` and sign in as `ladmin` with `LOCAL_ADMIN_PASSWORD`,
+then invite users from the admin panel's **Users** page; each sets a password
+through the mailed link and lands in `/lab`.
 `curl http://localhost:8000/health` must report `executor_reachable: true`;
 it stays 200 either way, so read the body.
 

@@ -518,17 +518,35 @@ client-side and login proceeds regardless.
 ## `POST /v1/send_password_reset_email`
 
 Same relay + same rate limit / error shape as the welcome mail. Sends the
-user their temporary password and tells them they must change it after
-login. The temp password is generated ON THE CLIENT (which stores only its
-hash); it appears solely in the outgoing mail body — the brain never logs
-or stores it.
+user a link that sets a new password. The link is generated ON THE CLIENT: it
+carries a single-use token valid for 30 minutes, of which the client stores
+only a SHA-256 hash. Its address is the client's configured
+`PUBLIC_BASE_URL`, never taken from an incoming request; a client without
+that setting sends no reset mail. The link is a credential until it is used
+or expires, so
+it appears solely in the outgoing mail body — the brain never logs or stores
+it. The mail states that the link is valid for 30 minutes and works once.
 
 ```jsonc
-{ "sid": "8af3d2e1", "email": "alice@acme.com", "temp_password": "k3P…" }
+{ "sid": "reset-email", "email": "alice@acme.com",
+  "reset_url": "https://pdc.acme.internal/auth/reset/Q2x…" }
 ```
 
-Returns `{ok: true, email_configured: true}` (400 also when
-`temp_password` is missing).
+Returns `{ok: true, email_configured: true}` (400 also when `reset_url` is
+missing or not an `http://` / `https://` URL). The former `temp_password`
+field is gone: the client no longer sends it.
+
+The client calls this in two places. An anonymous "Reset password" request
+calls it from a background thread, so the sign-in page answers the same way
+whether or not the address has an account; on failure the client logs
+`PASSWORD_RESET_EMAIL_FAILED` with the exception type and discards the
+token. The administrator's "Invite user" action calls it while the request
+waits (bounded by `BRAIN_DRAFT_TIMEOUT`) and reports `mail_sent: false` on
+failure.
+
+**Deployment order.** A brain that still requires `temp_password` answers 400
+to this shape, so reset and invitation mails fail (logged, nothing else
+breaks) until the brain accepts `reset_url`. Deploy the brain change first.
 
 ---
 

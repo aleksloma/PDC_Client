@@ -19,8 +19,9 @@ file documents the enterprise client's implementation of each one.
   `/dashboards/…`, `/admin/data_sources`, `/power/data_sources` (each
   redirects to the change form itself), `/static/…`, `/health`, `/version`,
   `/auth/login`, `/auth/logout`, `/auth/change_password`,
-  `/auth/reset_password`, `/auth/me` and the Microsoft sign-in routes
-  (`/auth/microsoft…`). Source: `PasswordChangeGate` in `app.py`.
+  `/auth/reset_password`, `/auth/me`, the reset-link routes (`/auth/reset/…`)
+  and the Microsoft sign-in routes (`/auth/microsoft…`). Source:
+  `PasswordChangeGate` in `app.py`.
 - **Requests from the analysis sandbox's network.** A request whose network
   peer lies inside the sandbox's subnet (`EXECUTOR_NETWORK_CIDR`) is refused
   on EVERY path, `/health` included, with a bare `403 {"error": "forbidden"}`
@@ -35,7 +36,7 @@ file documents the enterprise client's implementation of each one.
   `Content-Security-Policy` header with a fresh nonce per response:
   `default-src 'self'; script-src 'self' 'nonce-…'; style-src 'self'
   'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:;
-  connect-src 'self'; frame-src 'self' blob:; frame-ancestors 'self';
+  connect-src 'self'; frame-src 'self'; frame-ancestors 'self';
   base-uri 'self'; form-action 'self'; object-src 'none'`. Every inline
   `<script>` in the templates carries that nonce, and the page exposes it as
   `window.__CSP_NONCE__`. JSON, event-stream, file and static responses carry
@@ -56,9 +57,11 @@ file documents the enterprise client's implementation of each one.
   on the server to an allowlist of table elements, `T_`-prefixed ids, the
   class names pandas Styler generates (`T_<hex>`, `col<n>`, `row<n>`,
   `level<n>`, `data`, `index_name`, `blank`, `col_heading`, `row_heading`),
-  CSS values without functions other than `rgb`/`rgba`/`hsl`/`hsla`, bounded
-  box sizes and margins (font, text and border sizes are not bounded), and
-  `#T_`-scoped style rules
+  CSS values without functions other than `rgb`/`rgba`/`hsl`/`hsla` and
+  without `!important`, bounded sizes (width/height, margins and padding,
+  font size ≤ 72px / 5em, line height, border widths ≤ 20px, border spacing,
+  a non-negative text indent; no `text-shadow` or `font` shorthand), the
+  Styler's `row_trim`/`col_trim` classes, and `#T_`-scoped style rules
   (`html_sanitize.clean_styled_html`) when it is
   produced, when a table tile is pinned or refreshed, and whenever a stored
   history row or dashboard tile is served; when nothing survives, the field
@@ -72,8 +75,8 @@ file documents the enterprise client's implementation of each one.
 
 | Method | Path | Behavior |
 |---|---|---|
-| `POST` | `/api/charts` | `{html}` (a chart document, ≤ 5,000,000 characters) → `{url: "/charts/<token>"}`. Signed-in only (`401` otherwise); `400` for a missing, non-string, empty or oversize `html`. The HTML goes into a bounded in-memory store (30-minute lifetime, oldest entries evicted first; one web worker). Called by `PDCViewers.setChartFrame` for every chart it renders — live, from history, refreshed, or from a dashboard tile. |
-| `GET` | `/charts/{token}` | the registered document. The token is signed with `SECRET_KEY`, valid 30 minutes and bound to the user who registered it; a bad, expired, evicted or other user's token, or no session, → `404`. Headers: `Content-Security-Policy: sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'self'` (no nonce: the document is served exactly as registered, its inline scripts run inside the sandbox, and external scripts can come only from this server), `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, `Referrer-Policy: no-referrer`. The only response in the application whose policy allows `'unsafe-eval'` (Plotly's WebGL traces need it); the document runs with an opaque origin. |
+| `POST` | `/api/charts` | `{html}` (a chart document, ≤ 5,000,000 characters) → `{url: "/charts/<token>"}`. Signed-in only (`401` otherwise); `400` for a missing, non-string, empty or oversize `html`. The HTML goes into a bounded in-memory store (30-minute lifetime; sizes counted in UTF-8 bytes, 200 MB in total and 40 MB per user; when full, the registering user's own oldest entries go first, then the oldest overall; one web worker). Called by `PDCViewers.setChartFrame` for every chart it renders — live, from history, refreshed, or from a dashboard tile. |
+| `GET` | `/charts/{token}` | the registered document. The token is signed with `SECRET_KEY`, valid 30 minutes and carries only the store entry's id (no address); the entry is bound to the user who registered it; a bad, expired, evicted or other user's token, or no session, → `404`. Headers: `Content-Security-Policy: sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'self'` (no nonce: the document is served exactly as registered, its inline scripts run inside the sandbox, and external scripts can come only from this server), `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, `Referrer-Policy: no-referrer`. The only response in the application whose policy allows `'unsafe-eval'` (Plotly's WebGL traces need it); the document runs with an opaque origin. |
 
 ---
 
@@ -99,18 +102,35 @@ Passwords never leave this container — only a HASH is stored, at
 `DATA_ROOT/users/{email}/auth.json` (`password_hash`, optional
 `temp_password_hash` + `must_change_password`). Hashing:
 `password_utils.py` (stdlib PBKDF2-HMAC-SHA256, werkzeug-compatible
-format). Migration rule: a LEGACY user from the old email-only build
-(user folder exists, no hash) must set their password through the RESET
-flow — login with any password is refused with a "set your password via
-reset" notice, because only the emailed temp password proves mailbox
-ownership. Only a genuinely NEW email (no user folder) gets the entered
-password adopted on first login. The brain is only involved as an email
-relay (`/v1/send_welcome_email`, `/v1/send_password_reset_email`).
+format). Sign-in is by INVITATION: an account exists only after an
+administrator's invite (`POST /api/admin/users/invite`), a share (password-less
+placeholder) or a Microsoft SSO sign-in. An account without a password —
+invited, shared with, or a LEGACY user from the old email-only build — sets
+one through the mailed reset link, which proves mailbox ownership.
+`ALLOW_SELF_REGISTRATION=true` (public demo only) restores the old rule that a
+genuinely NEW email (no user folder) adopts the entered password. The brain
+is only involved as an email relay (`/v1/send_welcome_email`,
+`/v1/send_password_reset_email`, which carries the reset link).
+
+Attempt limits (`auth_limiter.py`, in memory, one web worker): an attempt is
+counted before it is evaluated and retracted on success. After
+`AUTH_FAIL_THRESHOLD` (5) failures for one address within `AUTH_FAIL_WINDOW_S`
+(900 s) the next attempts must wait 1, 2, 4, 8 s, then the address is locked
+for `AUTH_LOCKOUT_S` (900 s); sign-in and reset requests count in separate
+buckets. One peer address is spaced the same way after
+`AUTH_FAIL_THRESHOLD_IP` (20) failures and never locked. An early or locked
+attempt answers `429` with `Retry-After` and "Too many attempts. Please try
+again later." without evaluating anything. A lockout logs `AUTH_LOCKOUT
+kind=… h=<hash prefix>`, never the address. Addresses must match
+`routes.auth._EMAIL_RE` (letters, digits, `._%+-` before the `@`, ≤ 254
+characters) on sign-in, reset, invite and every share route.
 
 | Method | Path | Behavior |
 |---|---|---|
-| `POST` | `/auth/login` | form-encoded `email=`, `password=`, `remember?`. Genuinely NEW email (no user folder) → entered password becomes the password + welcome email (fire-and-forget). LEGACY email-only account (folder, no hash) → 403 with the "set your password via Reset password" notice (never adopts the typed password); a placeholder account created by a share to a never-signed-in address is refused the same way, with a "something was shared with this address" notice. Wrong password → landing re-rendered with red "Incorrect password" + Reset action (401). Temp password → session flagged and redirected to `/auth/change_password`. Success target: `/lab` for everyone — promoted admins included — except the bootstrap ladmin account → `/admin/data_sources` (`_post_login_target`, keyed on `AuthStore.is_bootstrap_admin`, 19g). `remember` → persistent ~30-day session cookie (RememberMeSessionMiddleware in app.py); otherwise browser-session cookie. |
-| `POST` | `/auth/reset_password` | form-encoded `email=`. Unknown email → "This account does not exist." Known → generates a temp password locally, stores its hash + `must_change_password`, brain-relays it by mail; on relay failure the temp credential is rolled back and an error shown. The user's own password stays valid until the temp one is used (a stranger's reset request can't lock the real user out). |
+| `POST` | `/auth/login` | form-encoded `email=`, `password=`, `remember?`. Every failure — unknown address, an account without a password (invited, shared with, legacy) and a wrong password — answers `401` with the SAME page and line, "Sign-in failed. Check your email and password, or use “Reset password” if you have not set one yet.", plus the Reset action, after exactly one password-hash verification (a fixed dummy hash where there is none), so neither the body nor the time says which case it was; nothing is created. The exceptions are the unbootstrapped `ladmin` (403, the server-side fix) and `ALLOW_SELF_REGISTRATION=true`, where a NEW email adopts the entered password + welcome mail. A malformed form → 400; over the attempt limit → 429 + `Retry-After`. A temporary password from a release before this one → session flagged and redirected to `/auth/change_password`. Success target: `/lab` for everyone — promoted admins included — except the bootstrap ladmin account → `/admin/data_sources` (`_post_login_target`, keyed on `AuthStore.is_bootstrap_admin`, 19g). `remember` → persistent ~30-day session cookie (RememberMeSessionMiddleware in app.py); otherwise browser-session cookie. |
+| `POST` | `/auth/reset_password` | form-encoded `email=`. Every well-formed address — known, unknown, or an email-shaped `ladmin` — answers `200` with the same page: "If an account exists for this address, a reset link has been sent. It expires in 30 minutes." Everything that depends on the account runs in a background thread: for an existing account a token (`secrets.token_urlsafe(32)`) is minted, only its SHA-256 stored in `auth.json` (`reset_token_hash`, `reset_expires_at`, `reset_used`; a new request replaces the old token) and the link `<PUBLIC_BASE_URL>/auth/reset/<token>` brain-relayed; a failed send discards the token. With `PUBLIC_BASE_URL` unset or not an http(s) URL nothing is minted or sent (`PASSWORD_RESET_NO_BASE_URL` logged) — the link is never built from the request's `Host`, which the caller controls. The user's own password stays valid until the link is used. A non-email id → 400; over the attempt limit → 429 + `Retry-After`. |
+| `GET` | `/auth/reset/{token}` | the set-new-password form (`reset_password.html`, no script) with `Cache-Control: no-store` and `Referrer-Policy: no-referrer`; no side effect. A malformed, unknown, expired or used token → the sign-in page with "This reset link is invalid or has expired. Request a new one." (404). Invalid tokens count per peer address. |
+| `POST` | `/auth/reset/{token}` | form-encoded `new_password=`, `confirm_password=` (at least 4 characters, matching; a rule failure re-renders the form, 400). Validates and consumes the token in one locked step, sets the password (which also clears any temporary password and pending forced change), `302` → `/?reset=done` ("Your password has been updated. Sign in with it."). No automatic sign-in; other open sessions are not ended. A second use → 404. |
 | `POST` | `/auth/change_password` | form-encoded `new_password=`, `confirm_password=` — the forced-change submit (session required) |
 | `POST` | `/auth/logout` | clears session, redirects to `/`. |
 | `GET`  | `/auth/me` | `{authenticated, email}` |
@@ -577,7 +597,8 @@ skipped at read time, no profile rewrites. Emails are always body-carried
 
 | Method | Path | Behavior |
 |---|---|---|
-| `GET` | `/api/admin/users` | Everyone with a readable profile, sorted by email: `{users:[{email, permission ("standard"\|"power"\|"admin"), role_ids (RESOLVED held list — dangling dropped, empty→["base"]), role_names, role_id/role_name (legacy = first entry), created_at, last_login_at}]}`. Only the bootstrap local-admin account is excluded — admin-permission users ARE listed (19e: they must stay demotable; their held roles stay visible/stored but inert). `member_count` on roles counts holders among these rows. `last_login_at` is stamped by `_start_session` on every login (both branches); `created_at` = first login |
+| `GET` | `/api/admin/users` | Everyone with a readable profile, sorted by email: `{users:[{email, permission ("standard"\|"power"\|"admin"), role_ids (RESOLVED held list — dangling dropped, empty→["base"]), role_names, role_id/role_name (legacy = first entry), created_at, last_login_at}]}`. Only the bootstrap local-admin account is excluded — admin-permission users ARE listed (19e: they must stay demotable; their held roles stay visible/stored but inert). `member_count` on roles counts holders among these rows. `last_login_at` is stamped by `_start_session` on every login; `created_at` = when the account was created (invite, share, SSO or, on the demo, first sign-in) |
+| `POST` | `/api/admin/users/invite` | ladmin only. `{email}` → `200 {ok, email, created, mail_sent[, mail_error]}`: creates a password-less account when the address has none (`created: true`; an existing password-less account is re-invited, `created: false`), mints a reset token and mails the link (`<PUBLIC_BASE_URL>/auth/reset/<token>`) through the brain, waiting up to `BRAIN_DRAFT_TIMEOUT`; with `PUBLIC_BASE_URL` unset the account is still created and the answer is `mail_sent: false` with that reason. A failed mail discards the token and answers `mail_sent: false` with the reason; the account stays. 400 invalid address / the bootstrap account; 409 `{code: "USER_EXISTS"}` when the account already has a password. Audited `user.invite` with `{created, mail_sent}` — never the link. Not attempt-limited (admin-guarded) |
 | `POST` | `/api/admin/users/set_role` | Sets the user's HELD ROLE LIST (19c): `{email, role_ids: [...]}` → `{ok, user}`; the legacy `{email, role_id}` shape is still accepted (→ one-element list); empty list reverts to Base. 400 missing email / the bootstrap ladmin account / any unknown role id (19g: PROMOTED admins take roles like anyone — only the bootstrap identity is refused); 404 unknown user. Audited `user.set_roles` with `{role_ids, role_names}` |
 | `POST` | `/api/admin/users/set_permission` | 19e — sets the per-user PERMISSION: `{email, permission: "standard"\|"power"\|"admin"}` ("standard" stored as "user") → `{ok, user}`. 400 missing email / invalid value / the bootstrap ladmin account / the CALLER's own account (no self-demotion); 404 unknown user. Never touches `data_roles` — and since 19g a promoted admin's roles stay ACTIVE (full analysis user), so promote/demote round-trips are lossless. Audited `user.set_permission` with `{old, new}` |
 | `GET` | `/api/admin/roles` | `{roles:[{…, is_base, is_builtin, member_count}]}` — Base first, the rest by name; `member_count` counts users HOLDING the role (a user with 3 roles counts in all 3) |
@@ -1074,7 +1095,7 @@ values leave the client.
 
 ### Sharing rules
 
-- **New addresses.** Sharing a chat, a conversation or a dashboard with an address that has never signed in creates a password-less placeholder account (`AuthStore.ensure_invited_user`, `invited_by`/`invited_at` on the profile). Its first sign-in is refused with a "Reset password" notice, so the recipient sets a password through the reset flow — whoever types the address first at the sign-in page cannot claim the share.
+- **New addresses.** Sharing a chat, a conversation or a dashboard with an address that has never signed in creates a password-less placeholder account (`AuthStore.ensure_invited_user`, `invited_by`/`invited_at` on the profile). Its sign-in is refused like any failed sign-in, so the recipient sets a password through the mailed reset link — whoever types the address first at the sign-in page cannot claim the share. Recipient addresses must match `routes.auth._EMAIL_RE`.
 - **Dashboards.** A dashboard share grants the recipients access only to the source chats the dashboard OWNER owns. Tiles pinned from a chat the owner merely received show their stored snapshot, and their refresh answers `{ok:false, frozen:true, reason:"access_revoked"}` for those recipients.
 - **Conversations.** A conversation share is owner-only, like the chat-level share.
 

@@ -229,7 +229,11 @@ holds the demo accounts, uploaded demo datasets, chats, and rendered decks.
 ## Security notes
 
 - The URL is public and the client has **open self-registration** — anyone
-  with the URL can create an account. Acceptable because this instance holds
+  with the URL can create an account. This is NOT the image default: the
+  service must carry `ALLOW_SELF_REGISTRATION=true`
+  (`--update-env-vars=ALLOW_SELF_REGISTRATION=true` once, which merges into
+  the existing set); without it only invited, shared-with or SSO accounts can
+  sign in. Acceptable because this instance holds
   demo data only and uses a dedicated demo tenant (kill-switchable from the
   brain admin panel: suspend/revoke the tenant or rotate its token).
 - Never point this instance at a real customer's tenant token.

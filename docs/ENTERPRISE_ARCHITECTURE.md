@@ -1143,10 +1143,12 @@ The identity provider is the **customer's own Entra tenant**. The client
 speaks standard OIDC (authorization-code flow via authlib in
 `routes/sso.py`): PDC never sees a password, and the ONLY claim it reads
 from the validated ID token is the user's email (`preferred_username`,
-fallback `email`), which becomes the same local identity a password login
-would create (`ensure_user` auto-provisioning; who may sign in at all is
+fallback `email`), which becomes the same local identity an invited password
+account has (`ensure_user` auto-provisioning; who may sign in at all is
 decided in Entra via "Assignment required" — there is no client-side
-allow-list). Nothing about SSO crosses to the brain except the normal
+allow-list). SSO is therefore one of the three ways an account comes to
+exist; the others are an administrator's invitation and a share, since a
+password sign-in never creates an account. Nothing about SSO crosses to the brain except the normal
 `login` activity event that password logins already post.
 
 Configuration is DATA, not env: `DATA_ROOT/sso_config.json`
@@ -1176,7 +1178,9 @@ accept any syntactically valid address. What they do enforce: only the owner
 of a chat can share it or one of its conversations, a dashboard share grants
 only the chats the dashboard's owner owns, and an address that has never
 signed in gets a password-less placeholder account, so the share cannot be
-claimed by whoever types that address at the sign-in page first.
+claimed by whoever types that address at the sign-in page first. Password
+sign-in never creates an account at all; the placeholder's owner sets a
+password through a mailed single-use link.
 
 ### 11a. Rendered content isolation
 
@@ -1203,15 +1207,19 @@ to other users through shares. It is therefore never given the page's origin:
   document an opaque origin: no cookies, no storage, no access to the parent
   page, and no request that carries the user's session (the only fetch it
   may make is a script from this server, i.e. the Plotly bundle from
-  `/static/`). Plotly's WebGL traces (scatter and line charts over 1000
+  `/static/`). One channel no Content-Security-Policy directive governs in
+  current browsers remains: WebRTC (`RTCPeerConnection` to an outside STUN
+  host). Plotly's WebGL traces (scatter and line charts over 1000
   points) compile code at run time, which is why `'unsafe-eval'` exists here
   and only here. The document is served exactly as stored.
 - **Script-free tables (pandas Styler `styled_html`)** are inserted into the
   page itself, so they are sanitised on the server
   (`html_sanitize.clean_styled_html`, nh3): table elements only, `T_`-prefixed
   ids and the class names pandas Styler generates, a CSS property allowlist
-  with colour functions only and bounded box sizes and margins, `<style>`
-  rules scoped to `#T_…`, no event handler, link or URL. It runs where the markup is produced, where a tile is
+  with colour functions only, no `!important`, and bounded sizes (box sizes,
+  margins, padding, font size, line height, border widths and spacing, text
+  indent), `<style>` rules scoped to `#T_…`, no event handler, link or URL.
+  The chat page's table container also clips what it holds. It runs where the markup is produced, where a tile is
   pinned or refreshed, and wherever stored history or a tile is served, so
   data stored by earlier releases is covered without being rewritten.
 - **Matplotlib charts** are base64 PNGs shown as `data:image/png` images; no

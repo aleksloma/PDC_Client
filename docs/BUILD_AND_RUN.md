@@ -104,8 +104,9 @@ no sandbox reachable, a chat turn is answered "The analysis service is not
 available right now." and the log carries the internal
 `ExecutorUnavailable: the analysis service is not reachable`.
 
-Open `http://localhost:8091` (local stack) → sign in with your work email +
-password (first login sets the password) → land in `/lab`.
+Open `http://localhost:8091` (local stack) → sign in with an invited account
+(the admin panel's **Users** page invites; the invitee sets a password through
+the mailed link) → land in `/lab`.
 
 The web container runs as uid 10001 and the sandbox as uid 10002 in gid 10001,
 so a HOST BIND MOUNT for `/data/client` must be writable by uid 10001
