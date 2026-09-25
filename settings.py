@@ -188,6 +188,13 @@ class Settings(BaseModel):
     # deliberately want browser analytics and the billing widget.
     ENABLE_THIRD_PARTY_SCRIPTS: bool = Field(default_factory=lambda: os.getenv("ENABLE_THIRD_PARTY_SCRIPTS", "").strip().lower() in ("1", "true", "yes", "on"))
 
+    # Content-Security-Policy DIAGNOSTIC switch. Every HTML page carries an
+    # enforced policy; true sends the same policy as
+    # Content-Security-Policy-Report-Only instead, so a page a proxy or an
+    # unusual browser breaks can be diagnosed from the console without a
+    # rebuild. Logged as a warning at startup. Leave it unset in production.
+    CSP_REPORT_ONLY: bool = Field(default_factory=lambda: os.getenv("CSP_REPORT_ONLY", "").strip().lower() in ("1", "true", "yes", "on"))
+
     # Fixed local admin account (the only role=admin user in Phase 1).
     # LOCAL_ADMIN_PASSWORD bootstraps the account ONCE (hash-only on disk,
     # forced change on first login); an existing hash is never overwritten.

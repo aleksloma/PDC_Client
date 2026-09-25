@@ -505,10 +505,12 @@
     const iframe = document.createElement('iframe');
     iframe.className = 'plotly-iframe';
     iframe.style.cssText = 'width: 100%; border: 1px solid #e7e8ea; border-radius: 8px; display: block;';
-    // Sandbox: allow the chart's scripts to run but block top-level navigation /
-    // new-tab popups from the blank-origin srcdoc document. (keep in sync: dashboard.js)
-    iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
-    iframe.srcdoc = htmlString;
+    // The chart document runs in a frame of its OWN opaque origin, set up by
+    // the one shared builder. Without viewers.js the frame stays empty: a
+    // chart is never rendered any other way. (keep in sync: dashboard.js)
+    if (window.PDCViewers && PDCViewers.setChartFrame) {
+      PDCViewers.setChartFrame(iframe, htmlString);
+    }
     plotlyContainer.appendChild(iframe);
 
     const btnContainer = document.createElement('div');
@@ -523,8 +525,9 @@
       modal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95); z-index: 10000; display: flex; align-items: center; justify-content: center; padding: 0;';
 
       const modalIframe = document.createElement('iframe');
-      modalIframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
-      modalIframe.srcdoc = htmlString;
+      if (window.PDCViewers && PDCViewers.setChartFrame) {
+        PDCViewers.setChartFrame(modalIframe, htmlString);
+      }
       modalIframe.style.cssText = 'width: 100%; height: 100%; border: none; background: white; position: relative; z-index: 1;';
 
       const closeBtn = document.createElement('button');

@@ -140,10 +140,10 @@
       const content = snap.image_base64 || '';
       if (isPlotlySnapshot(tile)) {
         const iframe = document.createElement('iframe');
-        iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
-        // Stored tile snapshots may reference cdn.plot.ly (pre-offline-fix) —
-        // rewrite to the locally served plotly.js for CDN-blocked LANs.
-        iframe.srcdoc = PDCViewers.fixPlotlyOffline(content);
+        // Opaque-origin, scripts-only frame from the shared builder, which
+        // also rewrites a pre-offline-fix cdn.plot.ly reference to the
+        // locally served plotly.js (CDN-blocked LANs).
+        PDCViewers.setChartFrame(iframe, content);
         bodyEl.appendChild(iframe);
       } else {
         const img = document.createElement('img');
@@ -393,8 +393,7 @@
     const snap = tile.snapshot || {};
     if (tile.kind === 'chart' && isPlotlySnapshot(tile)) {
       const iframe = document.createElement('iframe');
-      iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
-      iframe.srcdoc = PDCViewers.fixPlotlyOffline(snap.image_base64 || '');
+      PDCViewers.setChartFrame(iframe, snap.image_base64 || '');
       modal.appendChild(iframe);
     } else if (tile.kind === 'chart') {
       const img = document.createElement('img');

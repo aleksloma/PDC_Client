@@ -23,9 +23,11 @@ import secrets
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+import html_sanitize
 import local_store
 import brain_client
 from brain_client import TenantRevokedError, BrainError
+from exec_transport import log_safe_text
 from logger_utils import log_with_sid
 from routes.chat import (_FULL_KEY_RE, _code_not_stored, _json_safe,
                          _load_full_table_record, _persist_full_table,
@@ -88,7 +90,7 @@ def _resolve_table_record_code(chat_id: str, full_table_key):
             return None, None
         return code, rec.get("result_key")
     except Exception as e:
-        log_with_sid(chat_id, "warning", f"DASH_TABLE_RECORD_RESOLVE_FAILED: {e}")
+        log_with_sid(chat_id, "warning", f"DASH_TABLE_RECORD_RESOLVE_FAILED: {log_safe_text(str(e), 200)}")
         return None, None
 
 
@@ -109,7 +111,11 @@ def _capped_table(table) -> dict | None:
     }
     styled = table.get("styled_html")
     if isinstance(styled, str) and styled and len(styled) <= _MAX_STYLED_HTML_CHARS:
-        out["styled_html"] = styled
+        # The dashboard page inserts this markup into the page itself, so
+        # only the sanitised form is stored (pin and refresh write-back).
+        cleaned = html_sanitize.clean_styled_html(styled)
+        if cleaned:
+            out["styled_html"] = cleaned
     if table.get("dtype"):
         out["dtype"] = table["dtype"]
     if table.get("title"):
@@ -129,7 +135,7 @@ async def list_dashboards(request: Request):
     try:
         rows = _dash_store.list_dashboards(email)
     except Exception as e:
-        log_with_sid(email, "error", f"DASH_LIST_FAILED: {e}")
+        log_with_sid(email, "error", f"DASH_LIST_FAILED: {log_safe_text(str(e), 200)}")
         rows = []
     return {"dashboards": _json_safe(rows)}
 
@@ -150,7 +156,7 @@ async def create_dashboard(request: Request):
     try:
         row = _dash_store.create_dashboard(email, name)
     except Exception as e:
-        log_with_sid(email, "error", f"DASH_CREATE_FAILED: {e}")
+        log_with_sid(email, "error", f"DASH_CREATE_FAILED: {log_safe_text(str(e), 200)}")
         return JSONResponse({"error": "Could not create dashboard."}, status_code=500)
     return _json_safe(row)
 
@@ -184,7 +190,8 @@ def _with_default_layouts(doc: dict) -> dict:
             out_tiles.append(t)
         return {**doc, "tiles": out_tiles}
     except Exception as e:
-        log_with_sid(doc.get("dash_id") or "?", "warning", f"DASH_DEFAULT_LAYOUT_FAILED: {e}")
+        log_with_sid(log_safe_text(str(doc.get("dash_id") or "?"), 80), "warning",
+                     f"DASH_DEFAULT_LAYOUT_FAILED: {log_safe_text(str(e), 200)}")
         return doc
 
 
@@ -197,7 +204,25 @@ async def get_dashboard(request: Request, dash_id: str):
     if doc is None:
         return JSONResponse({"error": "Dashboard not found"}, status_code=404)
     _dash_store.touch_last_used(email, dash_id)
-    return _json_safe({**_with_default_layouts(doc), "is_owner": is_owner})
+    doc = _with_clean_tile_tables(_with_default_layouts(doc))
+    return _json_safe({**doc, "is_owner": is_owner})
+
+
+def _with_clean_tile_tables(doc: dict) -> dict:
+    """Serve every tile's `snapshot.table` through `html_sanitize` — tiles
+    pinned before the sanitiser existed carry their styled markup raw. In
+    the RESPONSE only: copies, the stored document is never rewritten."""
+    tiles = doc.get("tiles")
+    if not isinstance(tiles, list):
+        return doc
+    out_tiles = []
+    for tile in tiles:
+        snap = tile.get("snapshot") if isinstance(tile, dict) else None
+        if isinstance(snap, dict) and isinstance(snap.get("table"), dict):
+            tile = {**tile, "snapshot": {**snap,
+                                         "table": html_sanitize.clean_table(snap["table"])}}
+        out_tiles.append(tile)
+    return {**doc, "tiles": out_tiles}
 
 
 @router.post("/{dash_id}/rename")
@@ -506,7 +531,8 @@ async def refresh_tile(request: Request, dash_id: str, tile_id: str):
             tile["code"], tile["result_key"] = code, result_key
             _dash_store.update_tile(owner, dash_id, tile_id,
                                     {"code": code, "result_key": result_key})
-            log_with_sid(email, "info", f"DASH_TILE_CODE_HEALED dash={dash_id} tile={tile_id}")
+            log_with_sid(email, "info", f"DASH_TILE_CODE_HEALED dash={log_safe_text(dash_id, 80)} "
+                         f"tile={log_safe_text(tile_id, 80)}")
     if not code:
         return {"ok": False, "error": "This tile cannot be refreshed."}
 
@@ -516,7 +542,8 @@ async def refresh_tile(request: Request, dash_id: str, tile_id: str):
     drop, blocked = _role_refresh_block(email, chat_id, code)
     if blocked:
         log_with_sid(email, "info",
-                     f"DASH_TILE_ROLE_DENIED dash={dash_id} tile={tile_id}")
+                     f"DASH_TILE_ROLE_DENIED dash={log_safe_text(dash_id, 80)} "
+                     f"tile={log_safe_text(tile_id, 80)}")
         return {"ok": False, "frozen": True, "reason": "role_denied",
                 "blocked_tables": blocked}
 
@@ -563,7 +590,9 @@ async def refresh_tile(request: Request, dash_id: str, tile_id: str):
             if fresh_cd is not None:
                 patch["chart_data"] = fresh_cd
     if not _dash_store.update_tile(owner, dash_id, tile_id, patch):
-        log_with_sid(email, "warning", f"DASH_TILE_PATCH_LOST dash={dash_id} tile={tile_id}")
+        log_with_sid(email, "warning",
+                     f"DASH_TILE_PATCH_LOST dash={log_safe_text(dash_id, 80)} "
+                     f"tile={log_safe_text(tile_id, 80)}")
     updated_tile = {**tile, **patch}
     return _json_safe({**result, "tile": updated_tile})
 
@@ -625,7 +654,8 @@ async def share_dashboard(request: Request, dash_id: str):
                     and local_store.get_chat_meta_owner(cid) == email):
                 local_store.ChatDataStore(cid).add_share_recipients(recipients)
         except Exception as e:
-            log_with_sid(email, "warning", f"DASH_SHARE_CHAT_GRANT_FAILED chat={cid}: {e}")
+            log_with_sid(email, "warning", f"DASH_SHARE_CHAT_GRANT_FAILED chat={log_safe_text(str(cid), 80)}: "
+                         f"{log_safe_text(str(e), 200)}")
 
     smtp_result = {"smtp_configured": False, "sent": [], "failed": []}
     if new_recipients:
@@ -636,9 +666,9 @@ async def share_dashboard(request: Request, dash_id: str):
                 message=message_text,
             ) or smtp_result
         except (TenantRevokedError, BrainError) as e:
-            log_with_sid(email, "warning", f"DASH_SHARE_EMAIL_BRAIN_ERROR: {e}")
+            log_with_sid(email, "warning", f"DASH_SHARE_EMAIL_BRAIN_ERROR: {log_safe_text(str(e), 200)}")
         except Exception as e:
-            log_with_sid(email, "warning", f"DASH_SHARE_EMAIL_ERROR: {e}")
+            log_with_sid(email, "warning", f"DASH_SHARE_EMAIL_ERROR: {log_safe_text(str(e), 200)}")
 
     fresh = _dash_store.get_dashboard(email, dash_id) or doc
     return {

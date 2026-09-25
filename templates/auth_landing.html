@@ -111,7 +111,7 @@
       First time here? The password you enter becomes your password.</div>
   </form>
   <script src="/static/i18n.js"></script>
-  <script>
+  <script nonce="{{ request.state.csp_nonce }}">
     // Apply the user's stored language preference (set on the /lab page) to
     // the data-i18n-tagged strings; everything else stays server-rendered.
     if (window.i18n) window.i18n.applyAll();

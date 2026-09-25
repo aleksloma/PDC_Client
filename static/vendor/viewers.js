@@ -9,6 +9,7 @@
  *
  * Public API (window.PDCViewers):
  *   fixPlotlyOffline(html)    — rewrite a chart doc's cdn.plot.ly script tag to the local plotly.js asset.
+ *   setChartFrame(iframe, html) — THE one way a chart document is put into a frame (sandbox, registered with /api/charts, loaded from /charts/{token}).
  *   openCode(code)            — open a tab and render highlighted Python.
  *   openData(table)           — open a tab and render a {columns, rows} table.
  *   openBlankWindow(title)    — open a tab with a "Loading…" placeholder; returns the handle.
@@ -73,6 +74,13 @@
     return out;
   }
 
+  // The page's per-response policy nonce (templates set window.__CSP_NONCE__).
+  // Documents written into an about:blank tab INHERIT the page policy, so
+  // their inline scripts must carry it to run.
+  function pageNonce() {
+    return String(window.__CSP_NONCE__ || "").replace(/[^A-Za-z0-9_\-+\/=]/g, "");
+  }
+
   function writeDoc(win, html) {
     if (!win) return;
     try {
@@ -108,8 +116,10 @@
         '<pre><code id="code-' + i + '">' + highlightPython(b) + "</code></pre></div>";
     }).join("");
 
-    // Raw code blocks are stashed in a JSON island so Copy yields the original text.
-    var raw = JSON.stringify(blocks);
+    // Raw code blocks are stashed in a JSON island so Copy yields the original
+    // text. "<" is written as \u003c (the same string once parsed), so no
+    // sequence in the code can close the surrounding script element.
+    var raw = JSON.stringify(blocks).replace(/</g, "\\u003c");
 
     return "<!doctype html><html><head><meta charset='utf-8'><title>Generated code</title>" +
       "<style>" +
@@ -127,7 +137,7 @@
       ".b{color:#4ec9b0;}.f{color:#dcdcaa;}.d{color:#dcdcaa;}" +
       "</style></head><body>" +
       "<h1>Generated Python</h1>" + sections +
-      "<script>var RAW=" + raw + ";document.querySelectorAll('.copy-btn').forEach(function(btn){" +
+      "<script nonce=\"" + pageNonce() + "\">var RAW=" + raw + ";document.querySelectorAll('.copy-btn').forEach(function(btn){" +
       "btn.addEventListener('click',function(){var t=RAW[+btn.dataset.idx]||'';" +
       "navigator.clipboard&&navigator.clipboard.writeText(t).then(function(){btn.textContent='Copied';" +
       "setTimeout(function(){btn.textContent='Copy';},1200);},function(){btn.textContent='Copy failed';});});});" +
@@ -217,7 +227,7 @@
   // commas stripped; others sort locale-aware. Repeated clicks toggle asc/desc
   // and a ▲/▼ indicator marks the active column. No network / no dependencies.
   function sortScript() {
-    return "<script>(function(){" +
+    return "<script nonce=\"" + pageNonce() + "\">(function(){" +
       "function pn(t){t=(t||'').replace(/,/g,'').trim();if(t==='')return NaN;" +
         "var c=t.replace(/[^0-9.\\-eE+]/g,'');if(!/[0-9]/.test(c))return NaN;" +
         "var n=Number(c);return isFinite(n)?n:NaN;}" +
@@ -267,8 +277,41 @@
     }
   }
 
+  // Put a chart document (plotly HTML: a full document with inline scripts)
+  // into `iframe`. The frame is sandboxed with scripts ONLY, so the document
+  // gets an opaque origin of its own: no cookies, no storage, no access to
+  // this page, no navigation of it. The document is not written into the
+  // frame by this page: it is registered with `POST /api/charts` and the
+  // frame loads the `/charts/{token}` URL that comes back. That route serves
+  // it under a policy of its own (sandbox, application scripts plus a
+  // per-response nonce), so the page policy never has to allow what plotly
+  // needs. On a registration failure the frame stays blank and a console
+  // warning names the reason. Returns the registration promise.
+  // The stored chart HTML is never changed; this is render-time only.
+  function setChartFrame(iframe, html) {
+    if (!iframe) return Promise.resolve();
+    var doc = fixPlotlyOffline(typeof html === "string" ? html : String(html == null ? "" : html));
+    iframe.setAttribute('sandbox', 'allow-scripts');
+    return fetch('/api/charts', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ html: doc })
+    }).then(function (resp) {
+      if (!resp.ok) throw new Error('chart registration failed (' + resp.status + ')');
+      return resp.json();
+    }).then(function (data) {
+      var url = data && typeof data.url === "string" ? data.url : "";
+      if (url.indexOf('/charts/') !== 0) throw new Error('chart registration answered no url');
+      iframe.src = url;
+    }).catch(function (e) {
+      console.warn('[PDCViewers] chart frame left blank:', e && e.message ? e.message : e);
+    });
+  }
+
   window.PDCViewers = {
     fixPlotlyOffline: fixPlotlyOffline,
+    setChartFrame: setChartFrame,
     openCode: function (code) {
       var win = window.open("", "_blank");
       writeDoc(win, codeDocument(code));

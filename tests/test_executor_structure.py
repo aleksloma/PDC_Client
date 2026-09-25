@@ -75,6 +75,8 @@ FORBIDDEN_EXECUTOR_PACKAGES = [
     "google-api-core", "google-cloud-core", "google-resumable-media",
     "google-crc32c", "googleapis-common-protos", "proto-plus", "protobuf",
     "cachetools", "pyasn1", "pyasn1_modules", "rsa", "croniter",
+    # the styled-table HTML sanitiser: main app only, never in the sandbox
+    "nh3",
 ]
 
 # Dockerfile COPY sources: the modules the runner imports plus the transport.

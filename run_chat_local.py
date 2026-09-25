@@ -28,6 +28,7 @@ import pandas as pd
 
 import brain_client
 import executor_client
+import html_sanitize
 import result_backstop
 from code_exec import safe_execute
 from plot_utils import render_plot_safe, _is_noninteractive_standard_chart
@@ -84,8 +85,10 @@ def _styler_to_html(result_obj) -> Optional[str]:
     uuid-scoped ``<style>`` and applies the model's ``.format()`` so numbers are
     already rounded/grouped. Returns the HTML string, or None for a non-Styler
     result / oversized table / any failure — callers then fall back to the plain
-    table. Defensively strips ``<script>`` (the markup is table + ``<style>``
-    only; the CSS is uuid-namespaced so it can't restyle the rest of the page).
+    table. The pages insert this markup into the page itself, so it goes
+    through ``html_sanitize.clean_styled_html`` (allowlisted table markup, and
+    only ``#T_``-scoped ``<style>`` rules with allowlisted properties); markup
+    that does not survive cleaning also answers None.
     """
     try:
         # A Styler exposes the underlying frame as ``.data`` plus ``.to_html``;
@@ -100,10 +103,7 @@ def _styler_to_html(result_obj) -> Optional[str]:
         html = result_obj.to_html()
         if not isinstance(html, str) or not html.strip() or len(html) > _STYLED_MAX_CHARS:
             return None
-        import re
-        html = re.sub(r"(?is)<script\b.*?</script\s*>", "", html)
-        html = re.sub(r"(?is)<script\b[^>]*/?>", "", html)
-        return html
+        return html_sanitize.clean_styled_html(html)
     except Exception:
         return None
 

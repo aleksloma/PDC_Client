@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+import html_sanitize
 import local_store
 import run_chat_local
 import brain_client
@@ -980,7 +981,26 @@ async def history(request: Request, chat_id: str, conv_id: str):
     if not _may_use_conversation(email, chat_id, conv_id):
         return _access_denied()
     store = local_store.ChatDataStore(chat_id)
-    return {"history": store.get_history(conv_id)}
+    return {"history": _clean_history_rows(store.get_history(conv_id))}
+
+
+def _clean_history_rows(rows):
+    """History rows as served: each row's `table` / `tables` styled markup
+    passes `html_sanitize` (rows written before the sanitiser existed carry
+    it raw). Shallow copies — the stored conversation file is never
+    rewritten by a read."""
+    if not isinstance(rows, list):
+        return rows
+    out = []
+    for row in rows:
+        if isinstance(row, dict) and ("table" in row or "tables" in row):
+            row = dict(row)
+            if "table" in row:
+                row["table"] = html_sanitize.clean_table(row["table"])
+            if "tables" in row:
+                row["tables"] = html_sanitize.clean_tables(row["tables"])
+        out.append(row)
+    return out
 
 
 @router.get("/{chat_id}/conversation/{conv_id}/status")
@@ -1044,7 +1064,8 @@ async def chat_history(request: Request, chat_id: str):
         if not convs:
             return {"history": []}
         conv_id = convs[0].stem
-        return {"history": store.get_history(conv_id), "conv_id": conv_id}
+        return {"history": _clean_history_rows(store.get_history(conv_id)),
+                "conv_id": conv_id}
     except Exception:
         return {"history": []}
 
@@ -1793,6 +1814,19 @@ async def share_post(request: Request, chat_id: str):
     auth = local_store.AuthStore()
     for rec in recipients:
         auth.ensure_invited_user(rec, email)
+    # List the chat in each recipient's sidebar, as the conversation-level
+    # share does (the store skips a chat the recipient already lists).
+    sidebar_title = meta.get("title") or "Chat"
+    sidebar_files = [f.get("file_name") for f in meta.get("files", []) if f.get("file_name")]
+    for rec in recipients:
+        try:
+            auth.record_shared_chat(rec, chat_id, sidebar_title, sidebar_files,
+                                    shared_by=email)
+        except Exception as e:
+            log_with_sid(email, "warning",
+                         f"SHARE_SIDEBAR_RECORD_FAILED "
+                         f"error={log_safe_text(type(e).__name__, 80)}",
+                         chat_id=chat_id, recipient=log_safe_text(rec, 120))
 
     chat_title = meta.get("title", "")
     smtp_result = {"smtp_configured": False, "sent": [], "failed": []}

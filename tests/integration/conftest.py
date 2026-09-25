@@ -174,6 +174,51 @@ def precreate_account(email: str, password: str) -> bool:
     return True
 
 
+# Runs INSIDE pdc-client: opens a conversation on `chat_id`, appends the JSON
+# rows given (base64 on argv, like `_SEED_SCRIPT`) and, when an email is
+# given, records the conversation in that user's own index so `/c/{conv_id}`
+# resolves for them.
+_SEED_ROWS_SCRIPT = (
+    "import base64, json, sys, time\n"
+    "import local_store\n"
+    "chat_id = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
+    "rows = json.loads(base64.b64decode(sys.argv[2]).decode('utf-8'))\n"
+    "email = base64.b64decode(sys.argv[3]).decode('utf-8')\n"
+    "store = local_store.ChatDataStore(chat_id)\n"
+    "conv_id = store.new_conversation('integration rows')\n"
+    "for row in rows:\n"
+    "    row.setdefault('ts', time.time())\n"
+    "    store.append_history(conv_id, row)\n"
+    "if email:\n"
+    "    local_store.AuthStore().record_conversation(email, chat_id, conv_id,\n"
+    "                                               'integration rows')\n"
+    "print(conv_id)\n"
+)
+
+
+def seed_history_rows(chat_id: str, rows: list, email: str = "") -> str:
+    """Persist `rows` (history row dicts, written as-is through the app's own
+    store) as a new conversation of `chat_id` inside the web container and
+    return its id; with `email`, the conversation is also recorded in that
+    user's index. Skips the calling test when docker is not on PATH."""
+    if not docker_available():
+        pytest.skip("docker is not on PATH: history rows cannot be seeded")
+    result = docker_exec(WEB_CONTAINER, "python", "-c", _SEED_ROWS_SCRIPT,
+                         _b64(chat_id), _b64(json.dumps(rows)), _b64(email or ""))
+    assert result.returncode == 0, (result.stdout[-300:], result.stderr[-500:])
+    ids = re.findall(r"cv_[0-9a-f]{16}", result.stdout or "")
+    assert ids, result.stdout[-300:]
+    return ids[-1]
+
+
+def seed_history_row(chat_id: str, row: dict, email: str = "") -> str:
+    """One question plus `row` as its answer — the shape the report routes
+    turn into a finding."""
+    return seed_history_rows(
+        chat_id, [{"role": "human", "content": "Show the seeded chart and table."}, row],
+        email)
+
+
 @pytest.fixture(scope="session")
 def base_url() -> str:
     url = (os.environ.get(STACK_URL_ENV) or "").strip().rstrip("/")
@@ -217,8 +262,16 @@ def session(base_url, account):
     client.close()
 
 
+@pytest.fixture(scope="session")
+def session_scoped_extra_emails() -> list:
+    """Further throwaway accounts a test created (a share recipient, …),
+    removed by the same teardown as the main account."""
+    return []
+
+
 @pytest.fixture(scope="session", autouse=True)
-def cleanup(account, session_scoped_chat_ids, session_scoped_upload_sids):
+def cleanup(account, session_scoped_chat_ids, session_scoped_upload_sids,
+            session_scoped_extra_emails):
     """Remove the throwaway user, chat AND upload-session directories.
 
     The upload session is the one that used to be missed: it is not named in
@@ -228,6 +281,8 @@ def cleanup(account, session_scoped_chat_ids, session_scoped_upload_sids):
     yield
     email = account["email"]
     targets = [f"/data/client/users/{email}"]
+    targets += [f"/data/client/users/{extra}" for extra in session_scoped_extra_emails
+                if extra and "/" not in extra and extra not in (".", "..")]
     targets += [f"/data/client/chatdata/{cid}" for cid in session_scoped_chat_ids]
     unreadable = sorted(sid for sid in session_scoped_upload_sids if not sid)
     targets += [f"/data/client/sessions/{sid}"

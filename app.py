@@ -14,6 +14,7 @@ Backend:
 from __future__ import annotations
 
 import ipaddress
+import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -44,6 +45,7 @@ from routes.admin_data import router as admin_data_router
 from routes.admin_users import router as admin_users_router
 from routes.sso import router as sso_router
 from routes.sso import admin_router as sso_admin_router
+from routes.charts import router as charts_router
 
 
 _HERE = Path(__file__).resolve().parent
@@ -90,6 +92,10 @@ async def lifespan(app: FastAPI):
     # lifespan-scoped on purpose: an import-time thread would leak into every
     # pytest session (the local_store sweeper lesson).
     AuthStore().ensure_local_admin()
+    if settings.CSP_REPORT_ONLY:
+        log_with_sid("startup", "warning",
+                     "CSP_REPORT_ONLY_ENABLED the page policy is reported, not enforced "
+                     "(diagnostic setting; unset CSP_REPORT_ONLY to enforce)")
     # Offline plotly.js: materialize the pip package's bundle into static/vendor/
     # so chart iframes never need cdn.plot.ly (air-gapped LANs). Idempotent —
     # no-ops in the Docker image where the build already baked it.
@@ -322,6 +328,17 @@ _PASSWORD_CHANGE_OPEN_PREFIXES = ("/static/", "/c/", "/dashboards/",
                                   "/auth/microsoft")
 
 
+def _routed_path(scope) -> str:
+    """The path the ROUTER matches: `scope["path"]` with the ASGI
+    `root_path` removed when the server mounts the app under a prefix (a
+    proxy's `--root-path`). Without a root_path it is `scope["path"]`."""
+    path = str(scope.get("path") or "")
+    root = str(scope.get("root_path") or "").rstrip("/")
+    if root and (path == root or path.startswith(root + "/")):
+        path = path[len(root):] or "/"
+    return path
+
+
 def _open_during_password_change(path) -> bool:
     path = str(path or "")
     return (path in _PASSWORD_CHANGE_OPEN_PATHS
@@ -352,12 +369,115 @@ class PasswordChangeGate:
             return
         session = scope.get("session") or {}
         if (not (session.get("email") and session.get("must_change_password"))
-                or _open_during_password_change(scope.get("path"))):
+                or _open_during_password_change(_routed_path(scope))):
             await self.app(scope, receive, send)
             return
         response = JSONResponse({"error": "Password change required",
                                  "code": "PASSWORD_CHANGE_REQUIRED"}, status_code=403)
         await response(scope, receive, send)
+
+
+# The enterprise page policy. `{nonce}` is the per-response nonce every
+# inline <script> of the templates carries; nothing else inline may run.
+# Styles stay 'unsafe-inline' (the pages and the styled tables use inline
+# style attributes); frames are same-origin documents (the chart route) and
+# blob documents only.
+_CSP_BASE = {
+    "default-src": ["'self'"],
+    "script-src": ["'self'", "'nonce-{nonce}'"],
+    "style-src": ["'self'", "'unsafe-inline'"],
+    "img-src": ["'self'", "data:", "blob:"],
+    "font-src": ["'self'", "data:"],
+    "connect-src": ["'self'"],
+    "frame-src": ["'self'", "blob:"],
+    "frame-ancestors": ["'self'"],
+    "base-uri": ["'self'"],
+    "form-action": ["'self'"],
+    "object-src": ["'none'"],
+}
+# Hosted-demo widenings, each behind the setting that loads the thing.
+_CSP_THIRD_PARTY = {
+    "script-src": ["https://www.googletagmanager.com", "https://cdn.paddle.com"],
+    "connect-src": ["https://*.google-analytics.com", "https://*.analytics.google.com",
+                    "https://www.googletagmanager.com", "https://*.paddle.com"],
+    "frame-src": ["https://*.paddle.com"],
+    "img-src": ["https://*.google-analytics.com", "https://www.googletagmanager.com"],
+}
+_CSP_DIRECT_UPLOAD = {"connect-src": ["https://storage.googleapis.com"]}
+_CSP_FAILED_LOGGED = False
+
+
+def _render_policy(directives: dict, nonce: str) -> str:
+    return "; ".join(
+        " ".join([name] + [token.replace("{nonce}", nonce) for token in tokens])
+        for name, tokens in directives.items())
+
+
+def _build_csp(nonce: str) -> str:
+    """The policy for one response, built from the settings at REQUEST time
+    (the suite and an operator's restart both change them). Never raises: a
+    failure logs once and answers the enterprise default — never no policy."""
+    global _CSP_FAILED_LOGGED
+    try:
+        directives = {name: list(tokens) for name, tokens in _CSP_BASE.items()}
+        widenings = []
+        if settings.ENABLE_THIRD_PARTY_SCRIPTS:
+            widenings.append(_CSP_THIRD_PARTY)
+        if gcs_upload.enabled():
+            widenings.append(_CSP_DIRECT_UPLOAD)
+        for extra in widenings:
+            for name, tokens in extra.items():
+                directives[name].extend(t for t in tokens if t not in directives[name])
+        return _render_policy(directives, nonce)
+    except Exception as e:
+        if not _CSP_FAILED_LOGGED:
+            _CSP_FAILED_LOGGED = True
+            log_with_sid("security", "error",
+                         f"CSP_BUILD_FAILED {log_safe_text(type(e).__name__, 80)}")
+        return _render_policy(_CSP_BASE, nonce)
+
+
+class ContentSecurityPolicy:
+    """Nonce-based Content-Security-Policy on every HTML response.
+
+    Per http request a fresh nonce goes into `scope["state"]["csp_nonce"]`
+    (read by handlers and templates as `request.state.csp_nonce`); when the
+    response starts with a `text/html` content type the policy header is
+    added (`Content-Security-Policy`, or `...-Report-Only` while the
+    `CSP_REPORT_ONLY` diagnostic is on). JSON, event streams, static files
+    and redirects pass untouched, and so does an HTML response that already
+    carries a `Content-Security-Policy` of its own (the chart route,
+    `routes/charts.py`): nothing is added to it, report-only included.
+
+    Pure ASGI, registered INSIDE the backend-network guard (a refusal there
+    never reaches this layer) and outside the session middleware.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        nonce = secrets.token_urlsafe(16)
+        state = scope.setdefault("state", {})
+        state["csp_nonce"] = nonce
+
+        async def send_with_policy(message) -> None:
+            if message.get("type") == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                content_type = (headers.get("content-type") or "").lower()
+                # A response that carries its own policy (the chart route)
+                # keeps it: no page policy, no report-only variant on top.
+                has_own = "content-security-policy" in headers
+                if content_type.startswith("text/html") and not has_own:
+                    name = ("Content-Security-Policy-Report-Only"
+                            if settings.CSP_REPORT_ONLY else "Content-Security-Policy")
+                    headers.append(name, _build_csp(nonce))
+            await send(message)
+
+        await self.app(scope, receive, send_with_policy)
 
 
 _REMEMBER_ME_MAX_AGE = 30 * 24 * 60 * 60   # ~30 days
@@ -369,6 +489,9 @@ app.add_middleware(PasswordChangeGate)
 app.add_middleware(RememberMeSessionMiddleware, secret_key=settings.SECRET_KEY,
                    same_site="lax", max_age=_REMEMBER_ME_MAX_AGE,
                    https_only=settings.SESSION_HTTPS_ONLY)
+# Inside the guard, outside the session: adds the page policy to every HTML
+# response (and so also covers the password gate and the session layer).
+app.add_middleware(ContentSecurityPolicy)
 # LAST registered = OUTERMOST layer (Starlette inserts each at index 0 and
 # builds the stack from the front), which is what the guard needs: a request
 # from the sandbox's range must be refused before a session is even unsigned.
@@ -383,6 +506,7 @@ app.include_router(schema_router)
 app.include_router(chat_router)
 app.include_router(report_router)
 app.include_router(dashboards_router)
+app.include_router(charts_router)
 app.include_router(admin_data_router)
 app.include_router(admin_users_router)
 app.include_router(sso_router)

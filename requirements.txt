@@ -25,6 +25,11 @@ jinja2==3.1.6
 # (urlencoded) — the unauthenticated path — so the pin is kept at/above the
 # current fix version.
 python-multipart==0.0.32
+# Styled-table HTML sanitiser (html_sanitize.py): the allowlist that reduces a
+# rendered Styler to inert table markup before any page inserts it. Compiled
+# (abi3 wheels for amd64 + arm64). Main app only — deliberately NOT in
+# executor/requirements.txt (a structural test forbids it there).
+nh3==0.3.7
 # Microsoft Entra ID SSO (OIDC authorization-code flow, routes/sso.py).
 # Authlib 1.8.x does the OIDC heavy lifting (discovery, JWKS, ID-token
 # validation, state/nonce in the cookie session) and since 1.7 delegates JOSE

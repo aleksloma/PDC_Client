@@ -743,7 +743,7 @@
     </div>
   </div>
 
-  <script>
+  <script nonce="{{ request.state.csp_nonce }}">
     window.__MANAGER_MODE__ = "{{ manager_mode | default('admin') }}";
     {# tojson: autoescape would entity-escape '/& inside emails and break the
        registered_by === MANAGER_EMAIL ownership compare in the JS #}

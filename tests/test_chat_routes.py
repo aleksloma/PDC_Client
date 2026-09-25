@@ -700,3 +700,92 @@ def test_apis_answer_normally_after_the_password_is_changed(flagged):
     r = tc.get(f"/api/chat/{FLAGGED_CHAT}/schema")
     assert r.status_code == 200, r.text[:200]
     assert tc.get("/api/dashboards").status_code == 200
+
+
+# ===========================================================================
+# I. the chat-level share lists the chat for the recipient
+# ===========================================================================
+def test_chat_share_records_the_chat_in_the_recipients_sidebar(client, world):
+    """The recipient's chat list (`active_chats`) gains the shared chat, marked
+    with who shared it, exactly as the conversation-level share does."""
+    r = client.post(f"/api/chat/{CHAT}/share", json={"emails": ["eve@acme.com"]})
+    assert r.status_code == 200, r.text
+    rows = [row for row in local_store.AuthStore().list_active_chats("eve@acme.com")
+            if row.get("chat_id") == CHAT]
+    assert len(rows) == 1, rows
+    assert rows[0].get("shared_by") == OWNER, rows
+
+
+def test_sharing_the_chat_twice_lists_it_once(client, world):
+    for _ in range(2):
+        r = client.post(f"/api/chat/{CHAT}/share", json={"emails": ["eve@acme.com"]})
+        assert r.status_code == 200, r.text
+    rows = [row for row in local_store.AuthStore().list_active_chats("eve@acme.com")
+            if row.get("chat_id") == CHAT]
+    assert len(rows) == 1, rows
+
+
+# ===========================================================================
+# J. in-flight codes through the real generation paths
+# ===========================================================================
+INFLIGHT_CODE = "fig = px.bar(dfs['d.csv'], x='a')"
+
+
+def _chart_events(recorded=None):
+    """A one-chart multi-plot run. With `recorded`, the generator notes whether
+    the chart's code counts as stored when it is resumed after the partial —
+    i.e. while the route is still streaming and nothing is persisted."""
+    import routes.chat as chat_mod
+
+    def gen(**kw):
+        if recorded is not None:
+            recorded.append(("before", chat_mod.code_is_stored(CHAT, INFLIGHT_CODE)))
+        yield {"partial": True, "image_base64": "<div>plotly</div>", "answer": "a1",
+               "code": INFLIGHT_CODE, "chart_n": 1, "chart_total": 1, "usage": {}}
+        if recorded is not None:
+            recorded.append(("after_partial", chat_mod.code_is_stored(CHAT, INFLIGHT_CODE)))
+        yield {"done": True, "combined_answer": "a1",
+               "combined_codes": [INFLIGHT_CODE], "total_usage": {}}
+
+    return gen
+
+
+def test_stream_registers_a_partial_code_before_the_turn_is_persisted(client, monkeypatch):
+    import routes.chat as chat_mod
+    recorded = []
+    gen = _chart_events(recorded)
+    monkeypatch.setattr(chat_mod.run_chat_local, "run_chat_multi_plot",
+                        lambda **kw: gen(**kw))
+    r = client.post(f"/api/chat/{CHAT}/chat/stream", json={"question": "chart"})
+    assert r.status_code == 200, r.text[:300]
+    assert '"done": true' in r.text, r.text[-300:]
+    assert recorded == [("before", False), ("after_partial", True)], recorded
+    # Persisted now, and the registry holds nothing for the chat.
+    assert chat_mod.code_is_stored(CHAT, INFLIGHT_CODE) is True
+    assert CHAT not in chat_mod._INFLIGHT_CODES, chat_mod._INFLIGHT_CODES.get(CHAT)
+
+
+def test_edit_regenerate_registers_its_codes_until_the_record_is_written(
+        client, world, monkeypatch):
+    """Edit-regenerate consumes the whole run first, then persists; its codes
+    must count as stored at the moment the AI record is appended (before it
+    is on disk), and be released afterwards."""
+    import routes.chat as chat_mod
+    gen = _chart_events()
+    monkeypatch.setattr(chat_mod.run_chat_local, "run_chat_multi_plot",
+                        lambda **kw: gen(**kw))
+    seen = []
+    original = local_store.ChatDataStore.append_history
+
+    def spy(self, conv_id, row):
+        if isinstance(row, dict) and row.get("role") == "ai":
+            seen.append(chat_mod.code_is_stored(self.chat_id, INFLIGHT_CODE))
+        return original(self, conv_id, row)
+
+    monkeypatch.setattr(local_store.ChatDataStore, "append_history", spy)
+    r = client.post(f"/api/chat/{CHAT}/edit-regenerate",
+                    json={"edited_question": "again", "conv_id": world["owner_conv"]})
+    assert r.status_code == 200, r.text[:300]
+    assert seen == [True], seen
+    assert chat_mod.code_is_stored(CHAT, INFLIGHT_CODE) is True
+    assert CHAT not in chat_mod._INFLIGHT_CODES, chat_mod._INFLIGHT_CODES.get(CHAT)

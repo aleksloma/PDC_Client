@@ -4,7 +4,7 @@
 {% if third_party_scripts %}
 <!-- Google tag (gtag.js) -->
 <script async src="https://www.googletagmanager.com/gtag/js?id=G-DPQTG64LRY"></script>
-<script>
+<script nonce="{{ request.state.csp_nonce }}">
   window.dataLayer = window.dataLayer || [];
   function gtag(){dataLayer.push(arguments);}
   gtag('js', new Date());
@@ -473,7 +473,8 @@
     </div>
   </div>
 
-  <script>
+  <script nonce="{{ request.state.csp_nonce }}">
+    window.__CSP_NONCE__ = "{{ request.state.csp_nonce }}";
     window.DEFAULT_DAYS = {{ default_days }};
     window.MAX_DAYS = {{ max_days }};
     window.OPEN_CONV_ID = "{{ open_conv_id | default('') }}";
@@ -482,7 +483,7 @@
   {% if third_party_scripts %}
   <!-- Paddle.js Checkout -->
   <script src="https://cdn.paddle.com/paddle/v2/paddle.js"></script>
-  <script>
+  <script nonce="{{ request.state.csp_nonce }}">
   (function() {
     window._paddleConfig = null;
 
@@ -517,7 +518,7 @@
     <div class="modal-content sub-modal-content">
       <div class="modal-header">
         <h3 id="subModalTitle" data-i18n="sub.title">Plan Change</h3>
-        <button id="closeSubModal" class="ghost" onclick="document.getElementById('subscriptionModal').classList.add('hidden')">&#10005;</button>
+        <button id="closeSubModal" class="ghost">&#10005;</button>
       </div>
       <div id="subModalBody" class="modal-body"></div>
       <div id="subModalActions" class="modal-actions"></div>
@@ -529,7 +530,7 @@
     <div class="modal-content" style="max-width: 900px; max-height: 85vh; display: flex; flex-direction: column;">
       <div class="modal-header" style="flex-shrink: 0;">
         <h3 data-i18n="about.title">About PowerDataChat</h3>
-        <button class="ghost" onclick="document.getElementById('aboutModal').classList.add('hidden')">&#10005;</button>
+        <button id="closeAboutModal" class="ghost">&#10005;</button>
       </div>
       <div style="padding: 24px; line-height: 1.7; overflow-y: auto; flex: 1;">
         <section style="margin-bottom: 32px; padding-bottom: 24px; border-bottom: 2px solid #e5e7eb;">
@@ -581,8 +582,8 @@
     </div>
   </div>
 
-  <script>window.__IS_ADMIN__ = {{ 'true' if is_admin else 'false' }};</script>
-  <script>window.__DIRECT_UPLOAD__ = {{ 'true' if direct_upload_enabled else 'false' }};</script>
+  <script nonce="{{ request.state.csp_nonce }}">window.__IS_ADMIN__ = {{ 'true' if is_admin else 'false' }};</script>
+  <script nonce="{{ request.state.csp_nonce }}">window.__DIRECT_UPLOAD__ = {{ 'true' if direct_upload_enabled else 'false' }};</script>
   <script src="/static/i18n.js?v={{ ts }}"></script>
   <script src="/static/vendor/viewers.js?v={{ ts }}"></script>
   <script src="/static/dashboard.js?v={{ ts }}"></script>

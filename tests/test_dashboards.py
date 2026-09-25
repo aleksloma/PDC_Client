@@ -11,6 +11,7 @@ only code the chat's history holds, which is what the product's own answer
 persistence guarantees for every button the UI renders.
 """
 import json
+import re
 
 import pytest
 from fastapi import FastAPI, Request
@@ -71,6 +72,20 @@ PIN_CHART_CODE = "import plotly.express as px"
 def _seed_chart_code(chat_id="chat123", code=PIN_CHART_CODE):
     """The code `_pin_chart` posts, persisted in the chat's history."""
     return seed_history(chat_id, code)
+
+
+def _assert_inert_styled(html, *, text, style):
+    """Cleaned styled_html: the cell text and the allowlisted style
+    declaration survive inside a style attribute; no script element and no
+    event-handler attribute survive."""
+    assert isinstance(html, str) and html, html
+    compact = html.replace(" ", "")
+    assert text in compact, (text, html)
+    assert re.search(r"""style=["'][^"']*""" + re.escape(style), compact), (style, html)
+    low = html.lower()
+    assert "<script" not in low, html
+    assert "<img" not in low, html
+    assert not re.search(r"\son[a-z]+\s*=", low), html
 
 
 def _pin_chart(client, dash_id, chat_id="chat123", **extra):
@@ -355,14 +370,19 @@ def test_add_tile_preserves_styled_html_dtype_title(client, monkeypatch):
     _stub_chat(monkeypatch)
     client.post(f"/_login/{OWNER}")
     dash = _mk_dash(client)
-    styled = "<table><tr><td style='background:#fee'>x</td></tr></table>"
+    # The markup is cleaned on the way in (inert, formatting kept): the
+    # allowlisted colour and the cell text survive, script and event
+    # attributes do not.
+    styled = ("<table><tr><td style='background:#fee'>x</td>"
+              "<td><script>document.title='x'</script>"
+              "<img src=x onerror=\"fetch('/auth/me')\"></td></tr></table>")
     tile = client.post(f"/api/dashboards/{dash}/tiles",
                        json={"chat_id": "c1", "kind": "table",
                              "table": {"columns": ["a"], "rows": [{"a": 1}],
                                        "total_rows": 1, "styled_html": styled,
                                        "dtype": "series", "title": "KPIs"}}).json()["tile"]
     snap = tile["snapshot"]["table"]
-    assert snap["styled_html"] == styled
+    _assert_inert_styled(snap["styled_html"], text=">x<", style="background:#fee")
     assert snap["dtype"] == "series"
     assert snap["title"] == "KPIs"
 
@@ -485,14 +505,17 @@ def test_refresh_patch_keeps_styled_html(client, monkeypatch):
                        json={"chat_id": "c1", "kind": "table", "code": "RESULT = dfs",
                              "table": {"columns": ["a"], "rows": [{"a": 1}],
                                        "total_rows": 1}}).json()["tile"]
-    styled = "<table><tr><td style='color:red'>9</td></tr></table>"
+    styled = ("<table><tr><td style='color:red'>9</td>"
+              "<td onclick=\"fetch('/auth/me')\"><script>x()</script></td></tr></table>")
     _stub_refresh(monkeypatch, {"ok": True, "kind": "table",
                                 "table": {"columns": ["a"], "rows": [{"a": 9}],
                                           "total_rows": 1, "styled_html": styled}})
     assert client.post(f"/api/dashboards/{dash}/tiles/{tile['tile_id']}/refresh",
                        json={}).json()["ok"] is True
     doc = client.get(f"/api/dashboards/{dash}").json()
-    assert doc["tiles"][0]["snapshot"]["table"]["styled_html"] == styled
+    # Inert, formatting kept (the refresh write-back is cleaned like a pin).
+    _assert_inert_styled(doc["tiles"][0]["snapshot"]["table"]["styled_html"],
+                         text=">9<", style="color:red")
 
 
 # ---------------------------------------------------------------------------

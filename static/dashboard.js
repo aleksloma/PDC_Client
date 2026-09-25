@@ -203,7 +203,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Setup event listeners FIRST so buttons are immediately responsive
   setupEventListeners();
-  
+  // The two modal close buttons of the page template (bound here: the page
+  // policy runs no inline handler).
+  document.getElementById('closeSubModal')?.addEventListener('click', () => {
+    document.getElementById('subscriptionModal')?.classList.add('hidden');
+  });
+  document.getElementById('closeAboutModal')?.addEventListener('click', () => {
+    document.getElementById('aboutModal')?.classList.add('hidden');
+  });
+
   // Check authentication
   const authRes = await fetch('/auth/me');
   const authData = await authRes.json();
@@ -2446,14 +2454,20 @@ function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
   const iframe = document.createElement('iframe');
   iframe.className = 'plotly-iframe';
   iframe.style.cssText = 'width: 100%; border: 1px solid #e7e8ea; border-radius: 8px; display: block;';
-  // Sandbox: allow the chart's scripts to run but block top-level navigation /
-  // new-tab popups from the blank-origin srcdoc document. (keep in sync: chat.js)
-  iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
-  iframe.srcdoc = currentHtml;
+  // The chart document runs in a frame of its OWN opaque origin (scripts
+  // only: no cookies, no storage, no access to this page); the one shared
+  // builder sets the frame up. (keep in sync: chat.js)
+  PDCViewers.setChartFrame(iframe, currentHtml);
   plotlyContainer.appendChild(iframe);
 
   // Used by the per-chart Refresh button to update the chart in place.
-  plotlyContainer._setChartHtml = (h) => { currentHtml = PDCViewers.fixPlotlyOffline(h); iframe.srcdoc = currentHtml; };
+  plotlyContainer._setChartHtml = (h) => {
+    currentHtml = PDCViewers.fixPlotlyOffline(h);
+    PDCViewers.setChartFrame(iframe, currentHtml);
+  };
+  // The chart's own HTML (what a pin stores) — never the frame's wrapped
+  // document.
+  plotlyContainer._getChartHtml = () => currentHtml;
 
   const btnContainer = document.createElement('div');
   btnContainer.className = 'pdc-action-bar';
@@ -2468,8 +2482,7 @@ function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
     modal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95); z-index: 10000; display: flex; align-items: center; justify-content: center; padding: 0;';
 
     const modalIframe = document.createElement('iframe');
-    modalIframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
-    modalIframe.srcdoc = currentHtml;
+    PDCViewers.setChartFrame(modalIframe, currentHtml);
     modalIframe.style.cssText = 'width: 100%; height: 100%; border: none; background: white; position: relative; z-index: 1;';
 
     const closeBtn = document.createElement('button');
@@ -4012,6 +4025,17 @@ function removeFile(index) {
 function renderSelectedFilesList() {
   const container = document.getElementById('selectedFilesList');
   if (!container) return;
+  // One delegated listener for every row's remove button (bound once; the
+  // page policy runs no inline handler).
+  if (!container._pdcRemoveBound) {
+    container._pdcRemoveBound = true;
+    container.addEventListener('click', (e) => {
+      const btn = e.target.closest('.file-remove-btn');
+      if (!btn || !container.contains(btn)) return;
+      const index = parseInt(btn.dataset.index, 10);
+      if (Number.isInteger(index)) removeFile(index);
+    });
+  }
   container.innerHTML = '';
   selectedFiles.forEach((file, index) => {
     const isGoogle = !!file._isGoogleSheet;
@@ -4024,7 +4048,7 @@ function renderSelectedFilesList() {
         ${isGoogle ? '<span class="selected-file-badge">📎 Google Sheet</span>' : ''}
         ${isDb ? '<span class="selected-file-badge db">🗄️ DB table</span>' : ''}
       </span>
-      <button type="button" class="file-remove-btn" onclick="removeFile(${index})">×</button>
+      <button type="button" class="file-remove-btn" data-index="${index}">×</button>
     `;
     container.appendChild(row);
   });
@@ -5732,8 +5756,9 @@ function _pinnableCode(rawCode) {
 
 function _wireAddToDash(contentDiv, chartContainer, extras, content) {
   extras = extras || {};
-  // Chart pin — payload is read at CLICK time: the iframe's srcdoc / img src
-  // reflect any in-chat refresh, extras.chartDataKey is mutated by refresh.
+  // Chart pin — payload is read at CLICK time: the chart container's current
+  // HTML / the img src reflect any in-chat refresh, extras.chartDataKey is
+  // mutated by refresh.
   if (chartContainer) {
     const bar = chartContainer.querySelector('.pdc-action-bar');
     if (bar && !bar.querySelector('.pdc-pin-btn')) {
@@ -5744,7 +5769,9 @@ function _wireAddToDash(contentDiv, chartContainer, extras, content) {
         const img = chartContainer.querySelector('img');
         let image = null, isPlotly = false;
         if (iframe) {
-          image = iframe.srcdoc || '';
+          const holder = iframe.closest('.plotly-container');
+          image = (holder && typeof holder._getChartHtml === 'function')
+            ? (holder._getChartHtml() || '') : '';
           isPlotly = true;
         } else if (img && img.src.startsWith('data:image/png;base64,')) {
           image = img.src.slice('data:image/png;base64,'.length);
