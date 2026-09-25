@@ -155,7 +155,7 @@
     }
     // table tile
     const wrap = document.createElement('div');
-    wrap.className = 'pdc-tile-tablewrap';
+    wrap.className = 'pdc-tile-tablewrap styled-table-container';
     const table = snap.table || {};
     const cols = Array.isArray(table.columns) ? table.columns : [];
     const rows = Array.isArray(table.rows) ? table.rows : [];

@@ -390,9 +390,16 @@ def test_the_key_cap_evicts_the_least_recently_touched(lim, monkeypatch):
     monkeypatch.setattr(mod, "MAX_KEYS", 3)
     mod.reset()
     _five_failures(mod, email="e1@x.com")
+    # Past e1's one-second wait: e1 is now the least recently touched key and
+    # holds no live wait, so it is the one a new key evicts. (A key that is
+    # still waiting or locked is never evicted while a stale one exists.)
+    clock.advance(2)
     assert _begin(mod, email="e2@x.com").allowed
     assert _begin(mod, email="e3@x.com").allowed
-    assert _begin(mod, email="e4@x.com").allowed    # evicts e1 (least recent)
+    assert _begin(mod, email="e4@x.com").allowed    # evicts e1 (least recent, stale)
+    # Evicted: e1 starts from scratch, so two quick attempts are both free.
+    # Kept, it would carry six failures and the second would have to wait.
+    assert _begin(mod, email="e1@x.com").allowed is True
     assert _begin(mod, email="e1@x.com").allowed is True, "e1 was not evicted"
 
 
@@ -412,7 +419,7 @@ def test_a_recently_touched_key_survives_the_cap(lim, monkeypatch):
 
 
 def test_the_ip_space_is_capped_too(lim, monkeypatch):
-    mod, _ = lim
+    mod, clock = lim
     mod.MAX_KEYS  # noqa: B018 -- fails cleanly while the module is missing
     monkeypatch.setattr(mod, "MAX_KEYS", 3)
     _set(monkeypatch, "AUTH_FAIL_THRESHOLD_IP", 2)
@@ -420,9 +427,14 @@ def test_the_ip_space_is_capped_too(lim, monkeypatch):
     assert _begin(mod, email="a@x.com", ip="1.1.1.1").allowed
     assert _begin(mod, email="b@x.com", ip="1.1.1.1").allowed
     assert _begin(mod, email="c@x.com", ip="1.1.1.1").allowed is False
+    # Past the peer's wait: 1.1.1.1 is now stale and the least recently touched.
+    clock.advance(2)
     for i, peer in enumerate(("2.2.2.2", "3.3.3.3", "4.4.4.4")):
         assert _begin(mod, email=f"p{i}@x.com", ip=peer).allowed
-    assert _begin(mod, email="d@x.com", ip="1.1.1.1").allowed is True, \
+    # Evicted: the peer starts from scratch, so two quick attempts are free.
+    # Kept, its third failure would impose a wait on the next attempt.
+    assert _begin(mod, email="d@x.com", ip="1.1.1.1").allowed is True
+    assert _begin(mod, email="e@x.com", ip="1.1.1.1").allowed is True, \
         "the least recently touched peer was not evicted"
 
 

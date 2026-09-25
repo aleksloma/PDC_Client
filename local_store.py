@@ -39,10 +39,14 @@ from excel_table_detector import load_excel_sheets, _EXTRACTED_TEXT_ABOVE_TABLE 
 
 _LOCK = threading.RLock()
 
-# Reset links: sha256(token) -> email. A CACHE filled at mint time (one
-# worker), never consulted for validity — the auth record is the one source
-# of truth, and `AuthStore.find_reset_token` scans the records on a miss.
+# Reset links: sha256(token) -> email. Filled once from the auth records at
+# startup (`AuthStore.load_reset_token_index`, app lifespan) and at mint time
+# (one worker); never consulted for validity — the auth record is the one
+# source of truth. A miss still scans the records, so a token written by
+# another process (an operator script, the integration suite) is found.
 _RESET_TOKEN_INDEX: dict = {}
+# auth.json paths already reported unreadable by a scan (one line per path).
+_UNREADABLE_AUTH_LOGGED: set = set()
 RESET_TOKEN_TTL_S = 1800
 _RESET_KEYS = ("reset_token_hash", "reset_expires_at", "reset_used")
 # Exactly what secrets.token_urlsafe(32) produces.
@@ -67,6 +71,27 @@ def reset_record_live(rec: dict) -> bool:
     return (rec.get("reset_used") is False
             and isinstance(expires, (int, float)) and not isinstance(expires, bool)
             and expires > _time.time())
+
+
+def _read_auth_for_scan(udir: Path):
+    """The auth record under `udir` as a dict, or None (no record, not a
+    dict, unreadable). An unreadable record is logged once per path with
+    the exception type only — never its content."""
+    p = udir / "auth.json"
+    try:
+        if not udir.is_dir() or not p.is_file():
+            return None
+        rec = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        key = str(p)
+        if key not in _UNREADABLE_AUTH_LOGGED:
+            _UNREADABLE_AUTH_LOGGED.add(key)
+            from exec_transport import log_safe_text
+            log_with_sid("auth", "warning",
+                         f"AUTH_RECORD_UNREADABLE path={log_safe_text(key, 300)} "
+                         f"error={log_safe_text(type(e).__name__, 80)}")
+        return None
+    return rec if isinstance(rec, dict) else None
 
 
 def _data_root() -> Path:
@@ -1327,10 +1352,10 @@ class AuthStore:
     def find_reset_token(self, token: str):
         """`(email, auth_record)` of the account whose record holds this
         token's hash, else None. Validity (expiry, used) is the caller's
-        check — see `reset_record_live`. The in-memory index is a cache
-        filled at mint time; on a miss (a restart between mint and click) the
-        auth records are scanned. The stored hash is compared constant-time.
-        Never raises."""
+        check — see `reset_record_live`. The in-memory index is filled at
+        startup and at mint time; a miss scans the auth records, so a token
+        another process wrote is still found. The stored hash is compared
+        constant-time. Never raises."""
         try:
             if not isinstance(token, str) or not _RESET_TOKEN_RE.fullmatch(token):
                 return None
@@ -1344,14 +1369,8 @@ class AuthStore:
             if not users.is_dir():
                 return None
             for udir in users.iterdir():
-                p = udir / "auth.json"
-                try:
-                    if not udir.is_dir() or not p.is_file():
-                        continue
-                    rec = json.loads(p.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-                if not isinstance(rec, dict):
+                rec = _read_auth_for_scan(udir)
+                if rec is None:
                     continue
                 if hmac.compare_digest(str(rec.get("reset_token_hash") or ""), token_hash):
                     _RESET_TOKEN_INDEX[token_hash] = udir.name
@@ -1359,6 +1378,33 @@ class AuthStore:
             return None
         except Exception as e:
             log_with_sid("auth", "error", f"PASSWORD_RESET_LOOKUP_FAILED {type(e).__name__}")
+            return None
+
+    def load_reset_token_index(self) -> Optional[int]:
+        """Index every reset-link hash held by an auth record (used ones
+        included, so a reuse is still recognised), so the first click after
+        a restart is a dict hit, and report unreadable records at start-up.
+        Called once from the app lifespan. Returns the number of indexed
+        tokens, or None on failure (lookups then scan on a miss, as they
+        always do). Never raises."""
+        try:
+            found = {}
+            users = _data_root() / "users"
+            if users.is_dir():
+                for udir in users.iterdir():
+                    rec = _read_auth_for_scan(udir)
+                    if rec is None:
+                        continue
+                    token_hash = rec.get("reset_token_hash")
+                    if isinstance(token_hash, str) and token_hash:
+                        found[token_hash] = udir.name
+            with _LOCK:
+                _RESET_TOKEN_INDEX.update(found)
+            log_with_sid("startup", "info", f"RESET_TOKEN_INDEX_FILLED count={len(found)}")
+            return len(found)
+        except Exception as e:
+            log_with_sid("startup", "error",
+                         f"RESET_TOKEN_INDEX_FILL_FAILED {type(e).__name__}")
             return None
 
     def consume_reset_token(self, token: str, new_password: str) -> Optional[str]:

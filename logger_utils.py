@@ -17,6 +17,36 @@ class ScannerFilter(logging.Filter):
         msg = record.getMessage().lower()
         return not any(pattern in msg for pattern in scanner_patterns)
 
+
+_RESET_LINK_PREFIX = "/auth/reset/"
+
+
+class ResetLinkRedactor(logging.Filter):
+    """Keep reset-link tokens out of uvicorn's access log.
+
+    uvicorn logs `(client, method, path, http_version, status)`; when the
+    path starts with `/auth/reset/`, everything after that prefix (the token
+    and any query string) becomes `<redacted>`. Any other record, or a
+    record of another shape, passes unchanged. Never drops a record and never
+    raises."""
+    def filter(self, record):
+        try:
+            args = record.args
+            if isinstance(args, tuple) and len(args) == 5:
+                path = args[2]
+                if isinstance(path, str) and path.startswith(_RESET_LINK_PREFIX):
+                    record.args = (args[0], args[1], _RESET_LINK_PREFIX + "<redacted>",
+                                   args[3], args[4])
+        except Exception as e:
+            # Never break logging: the record goes out as it is, and the
+            # failure is reported on the application log (not this logger).
+            try:
+                log_with_sid("logging", "warning",
+                             f"ACCESS_LOG_REDACT_FAILED {type(e).__name__}")
+            except Exception:
+                pass
+        return True
+
 def _log_dir() -> Path:
     """The directory the log file lives in.
 
@@ -99,6 +129,8 @@ def get_logger():
     uvicorn_access = logging.getLogger("uvicorn.access")
     if not any(isinstance(f, ScannerFilter) for f in uvicorn_access.filters):
         uvicorn_access.addFilter(ScannerFilter())
+    if not any(isinstance(f, ResetLinkRedactor) for f in uvicorn_access.filters):
+        uvicorn_access.addFilter(ResetLinkRedactor())
     
     return logger
 

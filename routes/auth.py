@@ -51,11 +51,13 @@ without re-skinning it, we return `username = email` and `subscription_plan =
 """
 from __future__ import annotations
 
+import atexit
 import re
 import secrets
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -139,11 +141,26 @@ def _peer(request: Request) -> str:
     return request.client.host if request.client and request.client.host else "unknown"
 
 
-def _run_in_background(fn, *args) -> None:
-    """Run `fn(*args)` on a daemon thread (the reset mail must not make the
-    response time depend on whether the account exists). Never raises."""
+# The reset mail runs off the request (its duration must not say whether the
+# account exists) on ONE worker, so a burst of reset requests queues instead
+# of starting a thread each.
+_AUTH_BG_EXEC = ThreadPoolExecutor(max_workers=1, thread_name_prefix="auth_bg")
+atexit.register(lambda: _AUTH_BG_EXEC.shutdown(wait=False, cancel_futures=True))
+
+
+def _background_job(fn, *args) -> None:
+    """Run `fn(*args)`; a failure is logged with its type only, never raised."""
     try:
-        threading.Thread(target=fn, args=args, daemon=True, name="auth_bg").start()
+        fn(*args)
+    except Exception as e:
+        log_with_sid("auth", "error",
+                     f"AUTH_BACKGROUND_FAILED {log_safe_text(type(e).__name__, 80)}")
+
+
+def _run_in_background(fn, *args) -> None:
+    """Hand `fn(*args)` to the auth background worker. Never raises."""
+    try:
+        _AUTH_BG_EXEC.submit(_background_job, fn, *args)
     except Exception as e:
         log_with_sid("auth", "error",
                      f"AUTH_BACKGROUND_START_FAILED {log_safe_text(type(e).__name__, 80)}")
@@ -260,10 +277,13 @@ def _landing(request: Request, *, error: str = None, password_error: str = None,
     )
 
 
-def _too_many(request: Request, verdict, *, email: str = ""):
-    """The 429 answer to a refused attempt: nothing was evaluated."""
+def _too_many(request: Request, verdict, *, email: str = "", headers: dict = None):
+    """The 429 answer to a refused attempt: nothing was evaluated. `headers`
+    are sent next to Retry-After (the reset-link routes pass theirs)."""
+    merged = dict(headers or {})
+    merged["Retry-After"] = str(int(verdict.retry_after_s))
     return _landing(request, error=TOO_MANY_TEXT, email=email, status_code=429,
-                    headers={"Retry-After": str(int(verdict.retry_after_s))})
+                    headers=merged)
 
 
 def _start_session(request: Request, email: str, *, remember: bool,
@@ -298,7 +318,8 @@ def _send_welcome_email_async(email: str) -> None:
             brain_client.send_welcome_email(email)
             log_with_sid(email, "info", "WELCOME_EMAIL_REQUESTED")
         except Exception as e:
-            log_with_sid(email, "warning", f"WELCOME_EMAIL_FAILED: {log_safe_text(str(e), 200)}")
+            log_with_sid(email, "warning",
+                         f"WELCOME_EMAIL_FAILED {log_safe_text(type(e).__name__, 80)}")
     threading.Thread(target=_fire, daemon=True, name="welcome_email").start()
 
 
@@ -506,7 +527,7 @@ async def reset_link_page(request: Request, token: str):
     ip = _peer(request)
     verdict = auth_limiter.begin("token", None, ip)
     if not verdict.allowed:
-        return _too_many(request, verdict)
+        return _too_many(request, verdict, headers=_RESET_PAGE_HEADERS)
     if _live_reset_email(token) is None:
         log_with_sid("auth", "info", "PASSWORD_RESET_LINK_INVALID")
         return _reset_invalid(request)
@@ -522,7 +543,7 @@ async def reset_link_submit(request: Request, token: str):
     ip = _peer(request)
     verdict = auth_limiter.begin("token", None, ip)
     if not verdict.allowed:
-        return _too_many(request, verdict)
+        return _too_many(request, verdict, headers=_RESET_PAGE_HEADERS)
     link_email = _live_reset_email(token)
     if link_email is None:
         log_with_sid("auth", "info", "PASSWORD_RESET_LINK_INVALID")

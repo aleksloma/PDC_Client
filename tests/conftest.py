@@ -209,3 +209,24 @@ def reset_auth_limiter():
     yield
     if callable(reset):
         reset()
+
+
+@pytest.fixture(autouse=True)
+def reset_reset_token_index():
+    """Start every test with an empty reset-link index.
+
+    The index lives in the process, and entering the real app's lifespan
+    fills it from whatever DATA_ROOT was then. Without this a test that ran
+    the lifespan would leave entries pointing into another test's data.
+    Read defensively so a missing name never breaks the suite.
+    """
+    import local_store
+
+    def _clear():
+        index = getattr(local_store, "_RESET_TOKEN_INDEX", None)
+        if isinstance(index, dict):
+            index.clear()
+
+    _clear()
+    yield
+    _clear()

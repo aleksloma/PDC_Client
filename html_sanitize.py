@@ -33,8 +33,12 @@ survives:
   a unitless number up to 10 or a length within 200px / 10em / 10rem; every
   length in a border width (`border-width`, `border-<side>-width` and the
   `border` / `border-<side>` shorthands) is within 20px / 2em / 2rem;
-  `border-spacing` within 50px / 5em / 5rem; `text-indent` within 0 ...
-  200px / 20em / 20rem. `text-shadow` and the `font` shorthand are denied.
+  `border-spacing` within 50px / 5em / 5rem; `border-radius` and the four
+  `border-<corner>-radius` longhands take one to four lengths within 50px /
+  5em / 5rem / 50%; `text-indent` within 0 ... 200px / 20em / 20rem.
+  `text-shadow`, the `font` shorthand, `border-image` and its longhands,
+  `font-size-adjust`, `text-decoration-thickness` and
+  `text-underline-offset` are denied.
 
 Positioning, stacking, transforms, generated content and filters are never
 allowed, and box, font, line, border, spacing and indent sizes are bounded:
@@ -92,7 +96,13 @@ _ALLOWED_PROPERTIES = frozenset({
     "width", "height", "min-width", "max-width", "min-height", "max-height",
 })
 _ALLOWED_PROPERTY_PREFIXES = ("font-", "text-", "border", "padding", "margin")
-_DENIED_PROPERTIES = frozenset({"text-shadow", "font"})
+_DENIED_PROPERTIES = frozenset({
+    "text-shadow", "font",
+    # Paint or offset content outside the cell; a table never needs them.
+    "border-image", "border-image-source", "border-image-width",
+    "border-image-outset", "border-image-slice", "border-image-repeat",
+    "font-size-adjust", "text-decoration-thickness", "text-underline-offset",
+})
 _PROPERTY_RE = re.compile(r"^[a-z][a-z-]{0,40}$")
 _VALUE_RE = re.compile(r"^[A-Za-z0-9#%.,()\s'\"+\-/_]{1,200}$")
 _VALUE_FORBIDDEN = ("url(", "expression(", "javascript", "@", "\\", "<", ">",
@@ -115,6 +125,11 @@ _LINE_HEIGHT_LIMITS = {"px": 200, "em": 10, "rem": 10}
 _LINE_HEIGHT_UNITLESS_MAX = 10
 _BORDER_WIDTH_LIMITS = {"px": 20, "em": 2, "rem": 2}
 _BORDER_SPACING_LIMITS = {"px": 50, "em": 5, "rem": 5}
+_BORDER_RADIUS_LIMITS = {"px": 50, "em": 5, "rem": 5, "%": 50}
+_BORDER_RADIUS_PROPERTIES = frozenset({"border-radius", "border-top-left-radius",
+                                       "border-top-right-radius",
+                                       "border-bottom-left-radius",
+                                       "border-bottom-right-radius"})
 _TEXT_INDENT_LIMITS = {"px": 200, "em": 20, "rem": 20}
 # The shorthands whose width is bounded, besides every `*-width` of a border.
 _BORDER_SHORTHANDS = frozenset({"border", "border-top", "border-right",
@@ -198,6 +213,8 @@ def _size_allowed(prop: str, value: str) -> bool:
         return _length_within(value, _TEXT_INDENT_LIMITS)
     if prop == "border-spacing":
         return _lengths_within(value, _BORDER_SPACING_LIMITS, range(1, 3))
+    if prop in _BORDER_RADIUS_PROPERTIES:
+        return _lengths_within(value, _BORDER_RADIUS_LIMITS, range(1, 5))
     if prop in _BORDER_SHORTHANDS or (prop.startswith("border") and prop.endswith("-width")):
         return _border_width_allowed(value)
     if prop.startswith(_BOX_PREFIXES):

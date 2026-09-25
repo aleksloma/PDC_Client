@@ -107,6 +107,14 @@ async def lifespan(app: FastAPI):
     # lifespan-scoped on purpose: an import-time thread would leak into every
     # pytest session (the local_store sweeper lesson).
     AuthStore().ensure_local_admin()
+    # Reset links: index every outstanding token once, so a probe for an
+    # unknown link is answered from memory instead of a scan of every
+    # account. It never raises; wrapped anyway so the boot cannot fail on it.
+    try:
+        AuthStore().load_reset_token_index()
+    except Exception as e:
+        log_with_sid("startup", "error",
+                     f"RESET_TOKEN_INDEX_STARTUP_FAILED {log_safe_text(type(e).__name__, 80)}")
     if settings.CSP_REPORT_ONLY:
         log_with_sid("startup", "warning",
                      "CSP_REPORT_ONLY_ENABLED the page policy is reported, not enforced "

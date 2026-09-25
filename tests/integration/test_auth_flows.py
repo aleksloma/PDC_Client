@@ -173,6 +173,27 @@ def test_unknown_and_known_reset_requests_answer_alike(base_url, session_scoped_
     assert not _exists_in_container(f"/data/client/users/{unknown}")
 
 
+def test_a_reset_ends_a_session_that_was_already_open(base_url, session_scoped_extra_emails):
+    """A browser signed in before the reset is signed out by it: its next
+    API call answers 401 and the response clears the session cookie."""
+    _require_docker()
+    account = _new_account(session_scoped_extra_emails)
+    with _client(base_url) as open_session:
+        signed_in = open_session.post("/auth/login", data={"email": account["email"],
+                                                           "password": account["password"]})
+        assert signed_in.status_code == 302, (signed_in.status_code, signed_in.text[:300])
+        assert open_session.get("/auth/profile").status_code == 200
+        token = _mint(account["email"])
+        new_password = f"new-{secrets.token_hex(8)}"
+        with _client(base_url) as c:
+            done = c.post(f"/auth/reset/{token}",
+                          data={"new_password": new_password, "confirm_password": new_password})
+        assert done.status_code == 302, (done.status_code, done.text[:300])
+        after = open_session.get("/auth/profile")
+    assert after.status_code == 401, (after.status_code, after.text[:300])
+    assert "session=null" in after.headers.get("set-cookie", ""), dict(after.headers)
+
+
 # ---------------------------------------------------------------------------
 # the lockout -- LAST in this module
 # ---------------------------------------------------------------------------

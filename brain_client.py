@@ -22,6 +22,7 @@ import httpx
 
 from settings import settings
 from logger_utils import log_with_sid
+from exec_transport import log_safe_text
 
 
 class BrainError(RuntimeError):
@@ -84,6 +85,8 @@ def _headers() -> dict[str, str]:
 # On a failed brain call we ALWAYS surface the HTTP status + body snippet so it
 # is never swallowed (this is independent of CLIENT_LLM_DEBUG).
 _ERROR_BODY_SNIPPET_CHARS = 2000
+# The mail relays: their error body is never logged (only the status).
+_MAIL_PATHS = frozenset({"/v1/send_password_reset_email", "/v1/send_welcome_email"})
 
 
 def _trunc(value: Any, limit: int) -> str:
@@ -153,14 +156,22 @@ def _post(path: str, payload: dict[str, Any], sid: str,
         raise BrainError(f"Cannot reach brain: {e}") from e
 
     elapsed = time.monotonic() - t0
+    if resp.status_code >= 400:
+        # The body is the brain's text, escaped before it reaches the
+        # newline-delimited log; a mail call's body may echo the address or
+        # the link, so for those only the status is logged.
+        if path in _MAIL_PATHS:
+            detail = ""
+        else:
+            detail = ": " + log_safe_text(resp.text or "", _ERROR_BODY_SNIPPET_CHARS)
     if resp.status_code in (401, 403):
-        log_with_sid(sid, "error", f"BRAIN_AUTH {resp.status_code} {path}: {resp.text[:_ERROR_BODY_SNIPPET_CHARS]}")
+        log_with_sid(sid, "error", f"BRAIN_AUTH {resp.status_code} {path}{detail}")
         raise TenantRevokedError(f"Tenant {resp.status_code}: {resp.text[:200]}")
     if resp.status_code >= 500:
-        log_with_sid(sid, "error", f"BRAIN_5XX {resp.status_code} {path}: {resp.text[:_ERROR_BODY_SNIPPET_CHARS]}")
+        log_with_sid(sid, "error", f"BRAIN_5XX {resp.status_code} {path}{detail}")
         raise BrainError(f"Brain error {resp.status_code}")
     if resp.status_code >= 400:
-        log_with_sid(sid, "warning", f"BRAIN_4XX {resp.status_code} {path}: {resp.text[:_ERROR_BODY_SNIPPET_CHARS]}")
+        log_with_sid(sid, "warning", f"BRAIN_4XX {resp.status_code} {path}{detail}")
         raise BrainError(f"Brain rejected request {resp.status_code}: {resp.text[:200]}")
 
     log_with_sid(sid, "info", f"BRAIN_OK {path}", elapsed_s=f"{elapsed:.2f}")

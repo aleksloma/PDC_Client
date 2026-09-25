@@ -31,8 +31,11 @@ The worse of the two verdicts applies. A not-before stamp is answered with a
 `Retry-After`, never a server-side sleep, so a concurrent burst is refused
 rather than queued.
 
-Each space holds at most `MAX_KEYS` keys, the least recently touched evicted,
-so spraying addresses or peers cannot grow memory. Thresholds are read from
+Each space holds at most `MAX_KEYS` keys, so spraying addresses or peers
+cannot grow memory. The key evicted is the least recently touched one that
+holds no live wait (its lockout and not-before both past); only when every
+other key is live does plain least-recently-touched apply, so a spray of
+fresh addresses cannot erase a lockout. Thresholds are read from
 `settings` at CALL time; `clock` is a module attribute the tests replace.
 The counters live in this process: correct because the web server runs ONE
 worker. Leaf module: stdlib + settings + logger_utils.
@@ -89,14 +92,33 @@ def _lookup(space_name: str, key: str):
     return entry
 
 
-def _create(space_name: str, key: str) -> _Key:
+def _evict_one(space: OrderedDict, keep: str, now: float) -> None:
+    """Drop the least recently touched key without a live wait; the least
+    recently touched key of all when every one is live. Never `keep`."""
+    fallback = None
+    for name, entry in space.items():
+        if name == keep:
+            continue
+        if entry.locked_until <= now and entry.not_before <= now:
+            del space[name]
+            return
+        if fallback is None:
+            fallback = name
+    if fallback is not None:
+        del space[fallback]
+
+
+def _create(space_name: str, key: str, now: float) -> _Key:
     space = _space(space_name)
     entry = space.get(key)
     if entry is None:
         entry = space[key] = _Key()
         limit = max(1, int(MAX_KEYS))
         while len(space) > limit:
-            space.popitem(last=False)
+            before = len(space)
+            _evict_one(space, key, now)
+            if len(space) == before:
+                break
     else:
         space.move_to_end(key)
     return entry
@@ -141,7 +163,7 @@ def begin(kind: str, email, ip, *, lockout: bool = True) -> Verdict:
         if wait > 0:
             return Verdict(False, max(1, math.ceil(wait)))
         if addr_key:
-            entry = _create(*addr_key)
+            entry = _create(*addr_key, now)
             entry.failures.append(now)
             extra = len(entry.failures) - max(1, int(settings.AUTH_FAIL_THRESHOLD))
             if extra >= _SCHEDULE_STEPS and not lockout:
@@ -152,7 +174,7 @@ def begin(kind: str, email, ip, *, lockout: bool = True) -> Verdict:
             elif extra >= 0:
                 entry.not_before = now + 2 ** extra
         if ip_key:
-            entry = _create(*ip_key)
+            entry = _create(*ip_key, now)
             entry.failures.append(now)
             extra = len(entry.failures) - max(1, int(settings.AUTH_FAIL_THRESHOLD_IP))
             if extra >= 0:
