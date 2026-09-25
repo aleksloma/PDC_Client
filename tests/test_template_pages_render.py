@@ -139,3 +139,46 @@ def test_change_password_error_rerenders_html_with_400(client, form, expected_er
     again = client.get("/auth/change_password", follow_redirects=False)
     again_status = again.status_code
     assert again_status == 200, (again_status, again.text[:300])
+
+
+# ---------------------------------------------------------------------------
+# Task 9: the reset-link page (templates/reset_password.html)
+# ---------------------------------------------------------------------------
+RESET_MARKER = "Set a new password"
+
+
+def _mint_reset_token(email):
+    mint = getattr(local_store.AuthStore, "create_reset_token", None)
+    if mint is None:
+        pytest.fail("AuthStore.create_reset_token missing")
+    token = local_store.AuthStore().create_reset_token(email)
+    assert token, "no reset token minted for an existing account"
+    return token
+
+
+def test_reset_link_page_renders_html(client):
+    """`GET /auth/reset/{token}` with a live token renders the set-new-password
+    form (200) posting back to the same URL -- no session needed."""
+    token = _mint_reset_token(EMAIL)
+    r = client.get(f"/auth/reset/{token}", follow_redirects=False)
+    _assert_html(r, 200, RESET_MARKER)
+    text = r.text
+    assert f'action="/auth/reset/{token}"' in text, text[:600]
+    assert 'name="new_password"' in text, text[:600]
+    assert 'name="confirm_password"' in text, text[:600]
+
+
+def test_reset_link_error_rerenders_html_with_400(client):
+    """`POST /auth/reset/{token}` with a mismatched pair re-renders the same
+    template with the error and 400; the link stays usable (a password-rule
+    failure consumes nothing)."""
+    token = _mint_reset_token(EMAIL)
+    r = client.post(f"/auth/reset/{token}",
+                    data={"new_password": "abcd-1234", "confirm_password": "abcd-9999"},
+                    follow_redirects=False)
+    _assert_html(r, 400, RESET_MARKER)
+    text = r.text
+    assert "Passwords do not match" in text, text[:300]
+    again = client.get(f"/auth/reset/{token}", follow_redirects=False)
+    again_status = again.status_code
+    assert again_status == 200, (again_status, again.text[:300])

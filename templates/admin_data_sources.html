@@ -254,12 +254,20 @@
         <header class="adm-page-head">
           <div>
             <h1>Users</h1>
-            <p class="adm-page-sub">Everyone who has signed in. Roles control which registered
+            <p class="adm-page-sub">Everyone with an account — invited, shared with, or signed in. Roles control which registered
                database tables a user can pick and refresh (several roles combine); the
                permission level (Standard / Power user / Local admin) controls whether they
                may manage data sources. Existing chats always keep their saved data.</p>
           </div>
         </header>
+        {# Sign-in is invitation-only: an invite creates the account and mails
+           the address a link to set its password (valid 30 minutes). #}
+        <div class="adm-users-invite">
+          <input type="email" id="inviteEmail" class="adm-search" autocomplete="off"
+                 name="pdc-invite-email" placeholder="name@company.com" />
+          <button id="btnInviteUser" type="button" class="adm-btn primary">Invite user</button>
+        </div>
+        <div id="inviteResult" class="adm-alert hidden" role="status"></div>
         <div class="adm-users-toolbar">
           {# autocomplete=off + non-credential name: Chrome used to autofill the
              saved login email here and silently filter the list to one user. #}

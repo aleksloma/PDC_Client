@@ -14,8 +14,10 @@ a URL the app serves:
 
 The token is signed and short-lived (`routes.charts.TOKEN_MAX_AGE_S`, 1800,
 read at call time); the store is in memory, bounded
-(`STORE_MAX_TOTAL_CHARS`, oldest entries evicted first) and time-limited
-(`ENTRY_TTL_S`), both read at call time.
+(`STORE_MAX_TOTAL_BYTES` in UTF-8 bytes, plus a per-user share
+`USER_MAX_BYTES` so one user's registrations cannot evict another's live
+chart -- Task 8b Part A #4) and time-limited (`ENTRY_TTL_S`), all read at
+call time. The token carries the store id only; the entry holds the email.
 
 The served document carries ONE Content-Security-Policy of its own:
 `sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-eval'
@@ -152,11 +154,24 @@ def _real_plotly_document() -> str:
 # ---------------------------------------------------------------------------
 # the module
 # ---------------------------------------------------------------------------
+def _bound(mod, name):
+    if not isinstance(getattr(mod, name, None), int):
+        pytest.fail(f"routes.charts.{name} missing")
+    return getattr(mod, name)
+
+
 def test_the_module_exposes_its_bounds():
+    """The store bounds are counted in UTF-8 BYTES (renamed from the
+    character bound, Task 8b Part A #4); the request contract MAX_DOC_CHARS
+    is unchanged. A maximal document of 4-byte characters still fits in one
+    user's share, and a share fits in the store."""
     mod = _charts()
     assert getattr(mod, "TOKEN_MAX_AGE_S", None) == 1800
-    assert isinstance(getattr(mod, "STORE_MAX_TOTAL_CHARS", None), int)
-    assert mod.STORE_MAX_TOTAL_CHARS >= MAX_HTML_CHARS, mod.STORE_MAX_TOTAL_CHARS
+    assert getattr(mod, "MAX_DOC_CHARS", None) == MAX_HTML_CHARS
+    total = _bound(mod, "STORE_MAX_TOTAL_BYTES")
+    share = _bound(mod, "USER_MAX_BYTES")
+    assert share >= 4 * MAX_HTML_CHARS, share
+    assert total >= share, (total, share)
     assert getattr(mod, "ENTRY_TTL_S", None) == 1800
 
 
@@ -274,7 +289,10 @@ def test_an_entry_past_its_ttl_is_404(env, monkeypatch):
 
 def test_the_store_evicts_the_oldest_entries_first(env, monkeypatch):
     mod = _charts()
-    monkeypatch.setattr(mod, "STORE_MAX_TOTAL_CHARS", 250)
+    _bound(mod, "STORE_MAX_TOTAL_BYTES")
+    _bound(mod, "USER_MAX_BYTES")
+    monkeypatch.setattr(mod, "STORE_MAX_TOTAL_BYTES", 250)
+    monkeypatch.setattr(mod, "USER_MAX_BYTES", 10_000)
     docs = [f"<p>doc-{i}</p>" + "x" * (100 - len(f"<p>doc-{i}</p>")) for i in range(3)]
     assert all(len(d) == 100 for d in docs)
     urls = [_register(env, html=d) for d in docs]
@@ -362,3 +380,95 @@ def test_the_password_change_gate_covers_the_document_route(env):
     r = env["client"]("temp").get(url, follow_redirects=False)
     assert r.status_code == 403, (r.status_code, r.text[:200])
     assert r.json() == GATE_BODY, r.text[:200]
+
+
+# ---------------------------------------------------------------------------
+# Task 8b Part A #4: token without the email, byte totals, per-user share
+# ---------------------------------------------------------------------------
+def _token_payload(url):
+    from itsdangerous import URLSafeTimedSerializer
+    token = URL_RE.match(url).group(1)
+    return URLSafeTimedSerializer(settings.SECRET_KEY, salt="chart-frame").loads(token)
+
+
+def _doc(tag: str, size: int) -> str:
+    head = f"<p>{tag}</p>"
+    return head + "x" * (size - len(head))
+
+
+def test_the_token_carries_the_store_id_only(env):
+    """The chart URL ends up in browser history and access logs; it names the
+    store entry, never the registering user's address."""
+    url = _register(env)
+    payload = _token_payload(url)
+    assert isinstance(payload, dict), payload
+    assert set(payload) == {"i"}, payload
+    assert USER not in url
+
+
+def test_the_owner_check_still_holds_without_the_email_in_the_token(env):
+    """The entry holds the email; another user's session still gets 404."""
+    url = _register(env, who="user")
+    assert set(_token_payload(url)) == {"i"}
+    r = env["client"]("other").get(url, follow_redirects=False)
+    assert r.status_code == 404, (r.status_code, r.text[:200])
+
+
+def test_the_store_total_is_counted_in_utf8_bytes(env, monkeypatch):
+    """Three documents of 103 characters but 403 UTF-8 bytes each (100
+    astral-plane characters of 4 bytes) exceed a 1000-byte store; counted in
+    characters they would not."""
+    mod = _charts()
+    _bound(mod, "STORE_MAX_TOTAL_BYTES")
+    _bound(mod, "USER_MAX_BYTES")
+    monkeypatch.setattr(mod, "STORE_MAX_TOTAL_BYTES", 1000)
+    monkeypatch.setattr(mod, "USER_MAX_BYTES", 100_000)
+    astral = "😀" * 100
+    docs = [f"<p{i}" + astral for i in range(3)]
+    assert all(len(d) == 103 and len(d.encode("utf-8")) == 403 for d in docs)
+    urls = [_register(env, html=d) for d in docs]
+    r = env["client"]("user").get(urls[0], follow_redirects=False)
+    assert r.status_code == 404, ("the oldest entry must be evicted by bytes",
+                                  r.status_code)
+    _get_ok(env, urls[1])
+    _get_ok(env, urls[2])
+
+
+def test_another_users_registrations_never_evict_a_live_entry_within_its_share(
+        env, monkeypatch):
+    """User B registering far more than the store would hold loses B's own
+    oldest entries; A's single entry, well within A's share, stays served."""
+    mod = _charts()
+    _bound(mod, "STORE_MAX_TOTAL_BYTES")
+    _bound(mod, "USER_MAX_BYTES")
+    monkeypatch.setattr(mod, "STORE_MAX_TOTAL_BYTES", 500)
+    monkeypatch.setattr(mod, "USER_MAX_BYTES", 300)
+    a_url = _register(env, html=_doc("user-a", 100), who="user")
+    b_urls = [_register(env, html=_doc(f"user-b-{i}", 100), who="other")
+              for i in range(8)]
+    kept = _get_ok(env, a_url, who="user")
+    assert "user-a" in kept.text
+    # B keeps its newest three (its 300-byte share), its older ones are gone.
+    for url in b_urls[:-3]:
+        r = env["client"]("other").get(url, follow_redirects=False)
+        assert r.status_code == 404, (url, r.status_code)
+    for url in b_urls[-3:]:
+        _get_ok(env, url, who="other")
+
+
+def test_a_user_over_their_share_loses_their_own_oldest_first(env, monkeypatch):
+    """The per-user share evicts the SAME user's oldest entry, not the
+    globally oldest one (which belongs to someone else)."""
+    mod = _charts()
+    _bound(mod, "STORE_MAX_TOTAL_BYTES")
+    _bound(mod, "USER_MAX_BYTES")
+    monkeypatch.setattr(mod, "STORE_MAX_TOTAL_BYTES", 10_000)
+    monkeypatch.setattr(mod, "USER_MAX_BYTES", 300)
+    b_url = _register(env, html=_doc("user-b", 100), who="other")
+    a_urls = [_register(env, html=_doc(f"user-a-{i}", 100), who="user")
+              for i in range(4)]
+    r = env["client"]("user").get(a_urls[0], follow_redirects=False)
+    assert r.status_code == 404, ("A's oldest must go first", r.status_code)
+    for url in a_urls[1:]:
+        _get_ok(env, url, who="user")
+    _get_ok(env, b_url, who="other")

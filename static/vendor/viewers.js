@@ -292,6 +292,10 @@
     if (!iframe) return Promise.resolve();
     var doc = fixPlotlyOffline(typeof html === "string" ? html : String(html == null ? "" : html));
     iframe.setAttribute('sandbox', 'allow-scripts');
+    // Per-frame generation: two quick refreshes race, and the first
+    // registration may answer last. Only the newest one may set the src.
+    var gen = (iframe.__pdcChartGen || 0) + 1;
+    iframe.__pdcChartGen = gen;
     return fetch('/api/charts', {
       method: 'POST',
       credentials: 'same-origin',
@@ -301,6 +305,7 @@
       if (!resp.ok) throw new Error('chart registration failed (' + resp.status + ')');
       return resp.json();
     }).then(function (data) {
+      if (iframe.__pdcChartGen !== gen) return;   // a newer chart was set meanwhile
       var url = data && typeof data.url === "string" ? data.url : "";
       if (url.indexOf('/charts/') !== 0) throw new Error('chart registration answered no url');
       iframe.src = url;

@@ -99,13 +99,50 @@ def test_login_still_rejects_non_email_for_others(client):
     assert r.status_code == 400
 
 
-def test_reset_password_refuses_ladmin(client):
+NEUTRAL_RESET = "If an account exists for this address, a reset link has been sent."
+
+
+def _reset_seams(monkeypatch):
+    import routes.auth as auth_mod
+    sent = []
+    monkeypatch.setattr(auth_mod.brain_client, "send_password_reset_email",
+                        lambda *a, **k: sent.append((a, k)))
+    monkeypatch.setattr(auth_mod, "_run_in_background",
+                        lambda fn, *args: fn(*args), raising=False)
+    return sent
+
+
+def test_reset_password_refuses_ladmin(client, monkeypatch):
+    """Task 9 (plan §2): the non-email bootstrap id is not an address, so
+    the reset answers 400 "Please enter a valid email" like any non-email id --
+    nothing minted (no reset token, no temp password), no mail attempted."""
+    sent = _reset_seams(monkeypatch)
     local_store.AuthStore().ensure_local_admin()
     r = client.post("/auth/reset_password", data={"email": "ladmin"},
                     follow_redirects=False)
-    assert r.status_code == 403
-    # No unusable temp credential was written.
-    assert not local_store.AuthStore().get_auth("ladmin").get("temp_password_hash")
+    assert r.status_code == 400, r.status_code
+    assert "Please enter a valid email" in r.text
+    auth = local_store.AuthStore().get_auth("ladmin")
+    assert not auth.get("reset_token_hash")
+    assert not auth.get("temp_password_hash")
+    assert sent == []
+
+
+def test_reset_password_for_an_email_shaped_ladmin_is_neutral(client, monkeypatch):
+    """Task 9 (D9-6): an email-shaped bootstrap account gets the SAME neutral
+    200 page as any address, but nothing is minted and no mail is attempted
+    (the account has no mailbox)."""
+    sent = _reset_seams(monkeypatch)
+    monkeypatch.setattr(settings, "LOCAL_ADMIN_USERNAME", "admin@corp.example")
+    local_store.AuthStore().ensure_local_admin()
+    r = client.post("/auth/reset_password", data={"email": "admin@corp.example"},
+                    follow_redirects=False)
+    assert r.status_code == 200, r.status_code
+    assert NEUTRAL_RESET in r.text
+    auth = local_store.AuthStore().get_auth("admin@corp.example")
+    assert not auth.get("reset_token_hash")
+    assert not auth.get("temp_password_hash")
+    assert sent == []
 
 
 def test_ladmin_login_without_bootstrap_password_gets_server_hint(client, monkeypatch):

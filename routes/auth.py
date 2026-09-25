@@ -1,17 +1,31 @@
 """Client-side auth: email+password landing + the profile + sidebar endpoints.
 
 Password model (all local — the brain never sees a password):
-  - First-time email (no stored hash — includes every legacy user from the
-    email-only build): the entered password BECOMES the password (hash-only
-    storage via `AuthStore.set_password`), and the brain Gmail-relays a
-    welcome mail (fire-and-forget — login succeeds even if that fails).
-  - Wrong password → red "Incorrect password" + a Reset password action.
-  - Reset: the client generates a secure temp password, stores its hash with
-    `must_change_password`, and asks the brain to email it
-    (`/v1/send_password_reset_email`). Logging in with the temp password
-    forces a password change before the workspace opens.
+  - Sign-in is INVITATION-ONLY: accounts come to exist through an admin
+    invite (`POST /api/admin/users/invite`), a share (password-less
+    placeholder) or Microsoft SSO. `/auth/login` never creates one unless
+    `ALLOW_SELF_REGISTRATION` is on (the hosted demo only): then an address
+    with NO user folder gets the typed password + the welcome mail.
+  - Every sign-in failure — unknown address, account without a password,
+    wrong password — answers 401 with ONE neutral line and the Reset action,
+    after exactly one PBKDF2 verification (a dummy hash where there is none),
+    so neither the page nor its timing says which case it was.
+  - Reset: `POST /auth/reset_password` answers every well-formed address the
+    same (200, neutral line); a background thread checks the account, mints
+    a single-use 30-minute link token (only its sha256 is stored) and asks
+    the brain to mail the link (`/v1/send_password_reset_email`). The link
+    opens `GET /auth/reset/{token}` (set-new-password form) and
+    `POST /auth/reset/{token}` sets the password and redirects to
+    `/?reset=done` — no automatic sign-in.
+  - A temp password stored by the PREVIOUS release still signs in and
+    forces a password change (accounts mid-reset at upgrade time).
+  - Attempts are limited per address and per peer (`auth_limiter`); a
+    refused attempt answers 429 + Retry-After without evaluating anything.
   - "Remember me" → persistent session cookie (~30 days) via the
     RememberMeSessionMiddleware in app.py; unchecked → browser-session cookie.
+
+Every value that reaches a log line passes `exec_transport.log_safe_text` (or
+is a validated address / constant); a reset token or link is never logged.
 
 The dashboard.html template (copied verbatim from B2C) expects a profile JSON
 with `email`, `username`, `subscription_plan` keys. To keep that page working
@@ -29,28 +43,100 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pathlib import Path as _P
 
-from local_store import AuthStore
+import auth_limiter
+import password_utils
+from exec_transport import log_safe_text
+from local_store import AuthStore, reset_record_live
 from logger_utils import log_with_sid
+from settings import settings
 import brain_client
 
 router = APIRouter(tags=["client-auth"])
 
 _TEMPLATES = Jinja2Templates(directory=str(_P(__file__).resolve().parent.parent / "templates"))
 
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# Conventional address characters only, at most 254 characters. Anchored
+# with \Z (a `$` would also accept a trailing newline); callers use
+# `.fullmatch`. It gates sign-in, reset, the admin invite and every share
+# route's recipients, so markup, quotes, slashes and whitespace can never
+# become an identity (a user folder, a sidebar owner label).
+_EMAIL_RE = re.compile(
+    r"^(?=.{1,254}\Z)[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\Z")
+
+# Exactly what secrets.token_urlsafe(32) produces.
+_RESET_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 
 _FIXED_PLAN = "Enterprise"
 
+SIGNIN_FAILED_TEXT = ("Sign-in failed. Check your email and password, or use "
+                      "“Reset password” if you have not set one yet.")
+RESET_SENT_TEXT = ("If an account exists for this address, a reset link has been "
+                   "sent. It expires in 30 minutes.")
+RESET_INVALID_TEXT = "This reset link is invalid or has expired. Request a new one."
+TOO_MANY_TEXT = "Too many attempts. Please try again later."
+
+_DUMMY_HASH = None
+_DUMMY_LOCK = threading.Lock()
+
 
 def _local_admin_username() -> str:
-    from settings import settings
     return (settings.LOCAL_ADMIN_USERNAME or "").strip().lower()
 
 
 def _valid_login_id(value: str) -> bool:
     """A real email, or the fixed local-admin username (the ONLY non-email
     identity; every other id still requires a valid email)."""
-    return bool(_EMAIL_RE.match(value)) or (value and value == _local_admin_username())
+    return bool(_EMAIL_RE.fullmatch(value)) or bool(value and value == _local_admin_username())
+
+
+def _peer(request: Request) -> str:
+    return request.client.host if request.client and request.client.host else "unknown"
+
+
+def _run_in_background(fn, *args) -> None:
+    """Run `fn(*args)` on a daemon thread (the reset mail must not make the
+    response time depend on whether the account exists). Never raises."""
+    try:
+        threading.Thread(target=fn, args=args, daemon=True, name="auth_bg").start()
+    except Exception as e:
+        log_with_sid("auth", "error",
+                     f"AUTH_BACKGROUND_START_FAILED {log_safe_text(type(e).__name__, 80)}")
+
+
+def _dummy_hash() -> str:
+    """A hash of a random secret nobody knows, generated on first use."""
+    global _DUMMY_HASH
+    with _DUMMY_LOCK:
+        if _DUMMY_HASH is None:
+            _DUMMY_HASH = password_utils.generate_password_hash(secrets.token_urlsafe(24))
+        return _DUMMY_HASH
+
+
+def _verify_nothing(password: str) -> None:
+    """Spend the same PBKDF2 verification a wrong password costs, for a
+    sign-in that has no hash to check (unknown / password-less address)."""
+    try:
+        password_utils.check_password_hash(_dummy_hash(), password)
+    except Exception as e:
+        log_with_sid("auth", "warning",
+                     f"AUTH_DUMMY_VERIFY_FAILED {log_safe_text(type(e).__name__, 80)}")
+
+
+def _public_base() -> str:
+    """The base of a mailed reset link: PUBLIC_BASE_URL when it is an http(s)
+    URL (trailing slash stripped), else "". There is deliberately NO fallback
+    to the request's own address: that comes from the caller's Host header,
+    so an anonymous reset request could make a victim's genuine mail carry a
+    live token to a host of the caller's choosing (D9-26). Empty means no
+    link is minted or mailed at all."""
+    base = (settings.PUBLIC_BASE_URL or "").strip()
+    if base.lower().startswith(("http://", "https://")):
+        return base.rstrip("/")
+    return ""
+
+
+def reset_link(base: str, token: str) -> str:
+    return base + "/auth/reset/" + token
 
 
 def _public_profile(email: str) -> dict:
@@ -67,13 +153,13 @@ def _public_profile(email: str) -> dict:
         import roles_store
         is_power = roles_store.is_power_user(email)   # permission == "power" (19e)
     except Exception as e:
-        log_with_sid(email, "warning", f"PROFILE_POWER_FLAG_FAILED: {e}")
+        log_with_sid(email, "warning", f"PROFILE_POWER_FLAG_FAILED: {log_safe_text(str(e), 200)}")
     is_admin_user = False
     try:
         store = AuthStore()
         is_admin_user = store.is_admin(email) and not store.is_bootstrap_admin(email)
     except Exception as e:
-        log_with_sid(email, "warning", f"PROFILE_ADMIN_FLAG_FAILED: {e}")
+        log_with_sid(email, "warning", f"PROFILE_ADMIN_FLAG_FAILED: {log_safe_text(str(e), 200)}")
     return {
         "username": email,
         "email": email,
@@ -98,13 +184,14 @@ def _post_login_target(email: str) -> str:
 
 def _landing(request: Request, *, error: str = None, password_error: str = None,
              info: str = None, email: str = "", status_code: int = 200,
-             show_reset: bool = False, legacy_reset: bool = False):
+             show_reset: bool = False, signin_failed: bool = False,
+             headers: dict = None):
     """Render the landing page with optional messages.
 
-    `password_error` renders in red under the password field; `show_reset`
-    additionally renders the Reset-password action next to it;
-    `legacy_reset` renders the i18n-wrapped "set your password via reset"
-    notice for pre-password accounts. `error` is the generic top message.
+    `password_error` renders in red under the password field; `signin_failed`
+    renders the ONE neutral sign-in failure line there instead (i18n-tagged);
+    `show_reset` additionally renders the Reset-password action. `error` is
+    the generic top message, `info` the green one.
     """
     # Function-local import ON PURPOSE: routes/sso.py imports this module, so
     # a top-level sso_store import here would invite a future cycle. The flag
@@ -114,15 +201,23 @@ def _landing(request: Request, *, error: str = None, password_error: str = None,
         import sso_store
         sso_enabled = sso_store.is_enabled()
     except Exception as e:
-        log_with_sid("sso", "warning", f"SSO_LANDING_CHECK_FAILED: {e}")
+        log_with_sid("sso", "warning", f"SSO_LANDING_CHECK_FAILED: {log_safe_text(str(e), 200)}")
     return _TEMPLATES.TemplateResponse(
         request,
         "auth_landing.html",
         {"request": request, "error": error, "password_error": password_error,
          "info": info, "email": email, "show_reset": show_reset,
-         "legacy_reset": legacy_reset, "sso_enabled": sso_enabled},
+         "signin_failed": signin_failed, "sso_enabled": sso_enabled,
+         "self_registration": bool(settings.ALLOW_SELF_REGISTRATION)},
         status_code=status_code,
+        headers=headers,
     )
+
+
+def _too_many(request: Request, verdict, *, email: str = ""):
+    """The 429 answer to a refused attempt: nothing was evaluated."""
+    return _landing(request, error=TOO_MANY_TEXT, email=email, status_code=429,
+                    headers={"Retry-After": str(int(verdict.retry_after_s))})
 
 
 def _start_session(request: Request, email: str, *, remember: bool,
@@ -139,8 +234,9 @@ def _start_session(request: Request, email: str, *, remember: bool,
     # Issue a per-session SID for the temp UserStore (the upload flow keys off it)
     if not request.session.get("sid"):
         request.session["sid"] = "s_" + secrets.token_hex(8)
-    # Single funnel for BOTH login branches (new-user and returning) — the one
-    # place to stamp last_login_at. touch_last_login never raises.
+    # Single funnel for every sign-in branch (password, self-registration,
+    # SSO) — the one place to stamp last_login_at. touch_last_login never
+    # raises.
     AuthStore().touch_last_login(email)
 
 
@@ -151,7 +247,7 @@ def _send_welcome_email_async(email: str) -> None:
             brain_client.send_welcome_email(email)
             log_with_sid(email, "info", "WELCOME_EMAIL_REQUESTED")
         except Exception as e:
-            log_with_sid(email, "warning", f"WELCOME_EMAIL_FAILED: {e}")
+            log_with_sid(email, "warning", f"WELCOME_EMAIL_FAILED: {log_safe_text(str(e), 200)}")
     threading.Thread(target=_fire, daemon=True, name="welcome_email").start()
 
 
@@ -159,11 +255,12 @@ def _send_welcome_email_async(email: str) -> None:
 async def login(request: Request):
     """Email+password login (form-encoded: email, password, remember?).
 
-    A genuinely NEW email (no user folder) gets the entered password set as
-    theirs + the welcome mail. A LEGACY account (folder from the email-only
-    build, no hash) is refused with a "set your password via reset" notice —
-    the reset flow proves mailbox ownership. A stored temp password logs in
-    but forces a change before /lab opens.
+    Invitation-only: an address without a password (unknown, placeholder,
+    legacy) and a wrong password get the same 401 page after one PBKDF2
+    verification. `ALLOW_SELF_REGISTRATION` (demo only) lets an address with
+    NO user folder set its password here. A stored temp password (previous
+    release) signs in but forces a change before /lab opens. Every attempt
+    counts against the limiter until it succeeds.
     """
     form = await request.form()
     email = (form.get("email") or "").strip().lower()
@@ -176,12 +273,21 @@ async def login(request: Request):
         return _landing(request, password_error="Please enter a password",
                         email=email, status_code=400)
 
+    ip = _peer(request)
+    verdict = auth_limiter.begin("login", email, ip)
+    if not verdict.allowed:
+        return _too_many(request, verdict, email=email)
+
+    def _refuse():
+        return _landing(request, email=email, status_code=401,
+                        signin_failed=True, show_reset=True)
+
     store = AuthStore()
     auth = store.get_auth(email)
     if not auth.get("password_hash") and not auth.get("temp_password_hash"):
         if email == _local_admin_username():
             # Bootstrapped account without a password (LOCAL_ADMIN_PASSWORD
-            # unset at boot). The reset flow is refused for ladmin (no
+            # unset at boot). The reset flow does not serve ladmin (no
             # mailbox), so point at the server-side fix instead.
             log_with_sid(email, "warning", "LADMIN_LOGIN_NO_BOOTSTRAP")
             return _landing(
@@ -189,109 +295,191 @@ async def login(request: Request):
                 password_error=("The administrator account has no password yet. "
                                 "Set LOCAL_ADMIN_PASSWORD in the server "
                                 "environment and restart the container."))
+        if not store.user_exists(email) and settings.ALLOW_SELF_REGISTRATION:
+            # Demo-only open registration: a genuinely NEW address (no user
+            # folder) sets its own password here.
+            store.ensure_user(email)
+            store.set_password(email, password)
+            auth_limiter.success("login", email, ip)
+            _start_session(request, email, remember=remember)
+            log_with_sid(email, "info", "USER_LOGIN_FIRST_PASSWORD_SET",
+                         sid=log_safe_text(request.session.get("sid"), 40))
+            _send_welcome_email_async(email)
+            try:
+                brain_client.post_activity("login", email)
+            except Exception as e:
+                log_with_sid(email, "warning",
+                             f"LOGIN_ACTIVITY_FAILED {log_safe_text(type(e).__name__, 80)}")
+            return RedirectResponse(url="/lab", status_code=302)
+        # Unknown address, share placeholder or legacy account: the typed
+        # password must never become theirs, and the page must not say which
+        # case it was. The mailbox owner sets a password through the reset
+        # link instead.
+        _verify_nothing(password)
         if store.user_exists(email):
-            # An account without a password: a LEGACY account from the
-            # email-only build, or a placeholder created when something was
-            # shared with this address before it ever signed in. Either way
-            # the typed password must NOT silently become theirs — ownership
-            # of the mailbox is proven through the reset flow (temp password
-            # emailed via the brain + forced change).
-            invited = bool((store.get_profile(email) or {}).get("invited_by"))
-            if invited:
-                log_with_sid(email, "info", "USER_LOGIN_INVITED_RESET_REQUIRED")
-                return _landing(
-                    request, email=email, status_code=403,
-                    password_error=("Something was shared with this address. "
-                                    "Please click “Reset password” — we will "
-                                    "email you a temporary password to sign "
-                                    "in and set your own."),
-                    show_reset=True,
-                )
-            log_with_sid(email, "info", "USER_LOGIN_LEGACY_RESET_REQUIRED")
-            return _landing(
-                request, email=email, status_code=403,
-                password_error=("This account existed before passwords were "
-                                "introduced. Please click “Reset password” "
-                                "— we will email you a temporary password to "
-                                "sign in and set your own."),
-                show_reset=True, legacy_reset=True,
-            )
-        # Genuinely NEW email (no user folder): the entered password becomes
-        # this user's password. An outstanding temp password counts as
-        # credentials — it goes through verify_password below so the forced
-        # change still triggers.
-        store.ensure_user(email)
-        store.set_password(email, password)
-        _start_session(request, email, remember=remember)
-        log_with_sid(email, "info", "USER_LOGIN_FIRST_PASSWORD_SET",
-                     sid=request.session.get("sid"))
-        _send_welcome_email_async(email)
-        try:
-            brain_client.post_activity("login", email)
-        except Exception:
-            pass
-        return RedirectResponse(url="/lab", status_code=302)
+            log_with_sid(email, "info", "USER_LOGIN_NO_PASSWORD")
+        else:
+            log_with_sid(email, "info", "USER_LOGIN_UNKNOWN_ADDRESS")
+        return _refuse()
 
-    verdict = store.verify_password(email, password)
-    if verdict is None:
+    outcome = store.verify_password(email, password)
+    if outcome is None:
         log_with_sid(email, "warning", "USER_LOGIN_BAD_PASSWORD")
-        return _landing(request, password_error="Incorrect password",
-                        email=email, status_code=401, show_reset=True)
+        return _refuse()
 
-    must_change = (verdict == "temp") or bool(store.get_auth(email).get("must_change_password"))
+    auth_limiter.success("login", email, ip)
+    must_change = (outcome == "temp") or bool(store.get_auth(email).get("must_change_password"))
     _start_session(request, email, remember=remember, must_change=must_change)
-    log_with_sid(email, "info", "USER_LOGIN", sid=request.session.get("sid"),
-                 must_change=must_change)
+    log_with_sid(email, "info", "USER_LOGIN", sid=log_safe_text(request.session.get("sid"), 40),
+                 must_change=bool(must_change))
     try:
         brain_client.post_activity("login", email)
-    except Exception:
-        pass
+    except Exception as e:
+        log_with_sid(email, "warning",
+                     f"LOGIN_ACTIVITY_FAILED {log_safe_text(type(e).__name__, 80)}")
     target = "/auth/change_password" if must_change else _post_login_target(email)
     return RedirectResponse(url=target, status_code=302)
 
 
+def _send_reset_link(email: str, base: str) -> None:
+    """The account-dependent half of a reset request, off the request path:
+    existence check, token mint, mail. Logs only; never raises."""
+    try:
+        if email == _local_admin_username():
+            # The bootstrap account has no mailbox; recovery is server-side
+            # (CUSTOMER_INSTALL).
+            log_with_sid(email, "warning", "LADMIN_RESET_REFUSED")
+            return
+        store = AuthStore()
+        if not store.user_exists(email):
+            log_with_sid(email, "info", "PASSWORD_RESET_UNKNOWN_ACCOUNT")
+            return
+        if not base:
+            # No trusted address to build a link from (D9-26): mint nothing,
+            # mail nothing; the caller already has the neutral page.
+            log_with_sid(log_safe_text(email, 254), "error",
+                         "PASSWORD_RESET_NO_BASE_URL PUBLIC_BASE_URL is not set, "
+                         "so no reset link can be mailed")
+            return
+        token = store.create_reset_token(email)
+        if not token:
+            return
+        try:
+            brain_client.send_password_reset_email(
+                email, reset_link(base, token),
+                timeout=settings.BRAIN_DRAFT_TIMEOUT)
+        except Exception as e:
+            # No unusable link stays behind; the user's own password still
+            # works, and "Reset password" can be tried again.
+            store.clear_reset_token(email)
+            log_with_sid(email, "error",
+                         f"PASSWORD_RESET_EMAIL_FAILED {log_safe_text(type(e).__name__, 80)}")
+            return
+        log_with_sid(email, "info", "PASSWORD_RESET_EMAIL_SENT")
+    except Exception as e:
+        log_with_sid(email, "error",
+                     f"PASSWORD_RESET_FAILED {log_safe_text(type(e).__name__, 80)}")
+
+
 @router.post("/auth/reset_password")
 async def reset_password(request: Request):
-    """Password reset (form-encoded: email). Generates a temp password
-    locally, stores ONLY its hash (+ must_change flag), and asks the brain
-    to email it. The temp password never appears in any log."""
+    """Password reset request (form-encoded: email). Every well-formed
+    address takes the same path and gets the same page: count the request,
+    hand the address to a background thread, answer 200 with the neutral
+    line. Whether a link was minted and mailed never shows."""
     form = await request.form()
     email = (form.get("email") or "").strip().lower()
-    if email and email == _local_admin_username():
-        # ladmin has no mailbox — an email reset would store a temp hash
-        # nobody can ever receive AND lock the admin behind must_change.
-        # Server-side recovery: delete users/ladmin/auth.json and restart.
-        log_with_sid(email, "warning", "LADMIN_RESET_REFUSED")
-        return _landing(
-            request, email=email, status_code=403,
-            error=("The local administrator password cannot be reset by email. "
-                   "Ask whoever installed PowerDataChat to reset it on the server."))
-    if not _EMAIL_RE.match(email):
+    if not _EMAIL_RE.fullmatch(email):
         return _landing(request, error="Please enter a valid email",
                         email=email, status_code=400)
+    verdict = auth_limiter.begin("reset", email, _peer(request))
+    if not verdict.allowed:
+        return _too_many(request, verdict, email=email)
+    _run_in_background(_send_reset_link, email, _public_base())
+    return _landing(request, email=email, info=RESET_SENT_TEXT)
 
-    store = AuthStore()
-    if not store.user_exists(email):
-        log_with_sid(email, "info", "PASSWORD_RESET_UNKNOWN_ACCOUNT")
-        return _landing(request, error="This account does not exist.",
-                        email=email, status_code=404)
 
-    temp_password = secrets.token_urlsafe(9)
-    store.set_temp_password(email, temp_password)
+# --- Reset link ----------------------------------------------------------------
+
+_RESET_PAGE_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+
+
+def _live_reset_email(token: str):
+    """The email a live reset link belongs to, else None. Read only."""
+    if not _RESET_TOKEN_RE.fullmatch(token or ""):
+        return None
+    found = AuthStore().find_reset_token(token)
+    if not found:
+        return None
+    if found[1].get("reset_used") is True:
+        log_with_sid(log_safe_text(found[0], 254), "warning", "RESET_TOKEN_REUSED")
+        return None
+    return found[0] if reset_record_live(found[1]) else None
+
+
+def _reset_invalid(request: Request):
+    return _landing(request, error=RESET_INVALID_TEXT, status_code=404,
+                    headers=dict(_RESET_PAGE_HEADERS))
+
+
+def _reset_page(request: Request, token: str, error: str = None, status_code: int = 200):
+    return _TEMPLATES.TemplateResponse(
+        request,
+        "reset_password.html",
+        {"request": request, "token": token, "error": error},
+        status_code=status_code,
+        headers=dict(_RESET_PAGE_HEADERS),
+    )
+
+
+@router.get("/auth/reset/{token}")
+async def reset_link_page(request: Request, token: str):
+    """The set-new-password form behind a mailed link. Read only — a mail
+    scanner pre-fetching the link changes nothing. Only an invalid, expired
+    or used link counts against the limiter."""
+    ip = _peer(request)
+    verdict = auth_limiter.begin("token", None, ip)
+    if not verdict.allowed:
+        return _too_many(request, verdict)
+    if _live_reset_email(token) is None:
+        log_with_sid("auth", "info", "PASSWORD_RESET_LINK_INVALID")
+        return _reset_invalid(request)
+    auth_limiter.success("token", None, ip)
+    return _reset_page(request, token)
+
+
+@router.post("/auth/reset/{token}")
+async def reset_link_submit(request: Request, token: str):
+    """Form-encoded {new_password, confirm_password}. Sets the password,
+    marks the link used and redirects to the landing page — the user then
+    signs in with the new password (no automatic sign-in)."""
+    ip = _peer(request)
+    verdict = auth_limiter.begin("token", None, ip)
+    if not verdict.allowed:
+        return _too_many(request, verdict)
+    if _live_reset_email(token) is None:
+        log_with_sid("auth", "info", "PASSWORD_RESET_LINK_INVALID")
+        return _reset_invalid(request)
+    # A live link: whatever happens next is not a failed guess.
+    auth_limiter.success("token", None, ip)
+    form = await request.form()
+    new_password = form.get("new_password") or ""
+    confirm = form.get("confirm_password") or ""
+    if len(new_password) < 4:
+        return _reset_page(request, token, "Password must be at least 4 characters", 400)
+    if new_password != confirm:
+        return _reset_page(request, token, "Passwords do not match", 400)
     try:
-        brain_client.send_password_reset_email(email, temp_password)
+        email = AuthStore().consume_reset_token(token, new_password)
     except Exception as e:
-        # Roll the temp password back so the failed reset leaves no
-        # unusable credential behind; the user's own password still works.
-        store.clear_temp_password(email)
-        log_with_sid(email, "error", f"PASSWORD_RESET_EMAIL_FAILED: {e}")
-        return _landing(
-            request, email=email, status_code=502,
-            error="Could not send the reset email. Please try again later or contact your administrator.",
-        )
-    log_with_sid(email, "info", "PASSWORD_RESET_EMAIL_SENT")
-    return _landing(request, email=email,
-                    info="A temporary password has been sent to your email.")
+        log_with_sid("auth", "error",
+                     f"PASSWORD_RESET_SAVE_FAILED {log_safe_text(type(e).__name__, 80)}")
+        return _reset_page(request, token, "Could not save the new password. Please try again.", 500)
+    if not email:
+        return _reset_invalid(request)
+    log_with_sid(log_safe_text(email, 254), "info", "PASSWORD_RESET_COMPLETED")
+    return RedirectResponse(url="/?reset=done", status_code=302,
+                            headers=dict(_RESET_PAGE_HEADERS))
 
 
 # --- Forced password change (temp-password logins) ----------------------------
@@ -343,7 +531,7 @@ async def change_password_submit(request: Request):
     try:
         AuthStore().set_password(email, new_password)
     except Exception as e:
-        log_with_sid(email, "error", f"FORCED_PASSWORD_CHANGE_FAILED: {e}")
+        log_with_sid(email, "error", f"FORCED_PASSWORD_CHANGE_FAILED: {log_safe_text(str(e), 200)}")
         return _page("Could not save the new password. Please try again.", 500)
     request.session.pop("must_change_password", None)
     log_with_sid(email, "info", "USER_PASSWORD_CHANGED", forced=True)
@@ -396,7 +584,8 @@ async def update_profile(request: Request):
     if new_email and new_email != email:
         # Enterprise build does not support changing email mid-session — would
         # require re-logging in. Surface a friendly no-op rather than failing.
-        log_with_sid(email, "info", "PROFILE_UPDATE_IGNORED_EMAIL_CHANGE", attempt=new_email)
+        log_with_sid(email, "info", "PROFILE_UPDATE_IGNORED_EMAIL_CHANGE",
+                     attempt=log_safe_text(new_email, 254))
     AuthStore().update_profile(email)
     return _public_profile(email)
 
@@ -425,7 +614,7 @@ async def change_password(request: Request):
     try:
         store.set_password(email, new_password)
     except Exception as e:
-        log_with_sid(email, "error", f"PASSWORD_CHANGE_FAILED: {e}")
+        log_with_sid(email, "error", f"PASSWORD_CHANGE_FAILED: {log_safe_text(str(e), 200)}")
         return JSONResponse({"error": "Could not save the new password"}, status_code=500)
     request.session.pop("must_change_password", None)
     log_with_sid(email, "info", "USER_PASSWORD_CHANGED", forced=False)
@@ -490,7 +679,7 @@ async def conversation_publish_disabled(request: Request, conv_id: str):
     email = request.session.get("email")
     if not email:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
-    log_with_sid(email, "info", f"CONVERSATION_PUBLISH_DISABLED conv_id={conv_id}")
+    log_with_sid(email, "info", f"CONVERSATION_PUBLISH_DISABLED conv_id={log_safe_text(conv_id, 80)}")
     return JSONResponse(
         {"error": "Public publish is not available in the on-prem build."},
         status_code=400,
@@ -601,7 +790,7 @@ async def share_conversation(request: Request, conv_id: str):
     recipients: list[str] = []
     for e in raw_emails:
         e = (e or "").strip().lower()
-        if _EMAIL_RE.match(e) and e != email:
+        if _EMAIL_RE.fullmatch(e) and e != email:
             recipients.append(e)
     if not recipients:
         return JSONResponse({"error": "Provide at least one valid recipient email."}, status_code=400)
@@ -651,10 +840,11 @@ async def share_conversation(request: Request, conv_id: str):
                 sender_email=email, chat_title=chat_title, message=message_text,
             ) or smtp_result
         except Exception as e:
-            log_with_sid(email, "warning", f"CONV_SHARE_EMAIL_ERROR: {e}")
+            log_with_sid(email, "warning", f"CONV_SHARE_EMAIL_ERROR: {log_safe_text(str(e), 200)}")
 
     log_with_sid(email, "info",
-                 f"CONV_SHARED chat_id={chat_id} conv_id={conv_id} to={','.join(recipients)}")
+                 f"CONV_SHARED chat_id={chat_id} conv_id={log_safe_text(conv_id, 80)} "
+                 f"to={log_safe_text(','.join(recipients), 2000)}")
     return {
         "ok": True,
         "shared_with": recipients,

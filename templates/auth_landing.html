@@ -85,14 +85,13 @@
       <label for="password">Password</label>
       <input id="password" name="password" type="password"
              autocomplete="current-password" placeholder="Your password" required />
-      {% if password_error %}
-      {% if legacy_reset %}
-      {# Pre-password (email-only era) account: password must be set through
-         the reset flow. data-i18n lets a stored language pref translate it. #}
-      <div class="pw-error" data-i18n="auth.legacy_reset_required">{{ password_error }}</div>
-      {% else %}
+      {% if signin_failed %}
+      {# ONE line for every sign-in failure (unknown address, no password
+         yet, wrong password) — the page never says which it was. data-i18n
+         lets a stored language pref translate it. #}
+      <div class="pw-error" data-i18n="auth.signin_failed">Sign-in failed. Check your email and password, or use “Reset password” if you have not set one yet.</div>
+      {% elif password_error %}
       <div class="pw-error">{{ password_error }}</div>
-      {% endif %}
       {% endif %}
       {% if show_reset %}
       {# Reset posts the SAME form (uses the email field) to the reset endpoint #}
@@ -108,7 +107,7 @@
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
     {% if info %}<div class="info">{{ info }}</div>{% endif %}
     <div class="footer">Enterprise · on-premise deployment<br>
-      First time here? The password you enter becomes your password.</div>
+      {% if self_registration %}First time here? The password you enter becomes your password.{% else %}Accounts are created by invitation.{% endif %}</div>
   </form>
   <script src="/static/i18n.js"></script>
   <script nonce="{{ request.state.csp_nonce }}">

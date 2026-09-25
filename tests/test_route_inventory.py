@@ -68,6 +68,7 @@ EXPECTED_ROUTES = [
     ('GET', '/auth/microsoft'),
     ('GET', '/auth/microsoft/callback'),
     ('GET', '/auth/profile'),
+    ('GET', '/auth/reset/{token}'),
     ('GET', '/auth/subscription'),
     ('GET', '/c/{conv_id}'),
     ('GET', '/charts/{token}'),
@@ -113,6 +114,7 @@ EXPECTED_ROUTES = [
     ('POST', '/api/admin/tables/{tid}/dismiss_drift'),
     ('POST', '/api/admin/tables/{tid}/refresh'),
     ('POST', '/api/admin/tables/{tid}/schedule'),
+    ('POST', '/api/admin/users/invite'),
     ('POST', '/api/admin/users/set_permission'),
     ('POST', '/api/admin/users/set_role'),
     ('POST', '/api/charts'),
@@ -159,6 +161,7 @@ EXPECTED_ROUTES = [
     ('POST', '/auth/logout'),
     ('POST', '/auth/password'),
     ('POST', '/auth/profile/update'),
+    ('POST', '/auth/reset/{token}'),
     ('POST', '/auth/reset_password'),
     ('POST', '/auth/subscription'),
     ('POST', '/generate_chatdata'),
@@ -183,7 +186,12 @@ EXPECTED_OPEN_PATHS = frozenset({
     "/auth/login", "/auth/logout", "/auth/change_password",
     "/auth/reset_password", "/auth/me",
 })
-EXPECTED_OPEN_PREFIXES = ("/static/", "/c/", "/dashboards/", "/auth/microsoft")
+# "/auth/reset/" (Task 9, D9-8): the emailed reset link must work for a user
+# who signed in with a temp password on the same browser. The walk below
+# requests it as /auth/reset/x, an invalid link, which answers 404 -- not the
+# gate's 403, which is exactly what an open prefix means.
+EXPECTED_OPEN_PREFIXES = ("/static/", "/c/", "/dashboards/", "/auth/microsoft",
+                          "/auth/reset/")
 
 GATE_BODY = {"error": "Password change required", "code": "PASSWORD_CHANGE_REQUIRED"}
 FLAGGED = "inventory-flagged@x.com"
@@ -276,7 +284,7 @@ def flagged(tmp_path, monkeypatch):
     monkeypatch.setattr(brain_client, "send_welcome_email", lambda *a, **k: None)
     monkeypatch.setattr(auth_mod, "_send_welcome_email_async", lambda email: None)
     monkeypatch.setattr(auth_mod.brain_client, "send_password_reset_email",
-                        lambda *a, **k: None)
+                        lambda email, reset_url: None)
     auth = local_store.AuthStore()
     auth.ensure_user(FLAGGED)
     auth.set_password(FLAGGED, FLAGGED_PW, force_change=True)

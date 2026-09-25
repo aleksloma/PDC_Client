@@ -525,11 +525,11 @@ function renderConversations(conversations) {
   }
   container.innerHTML = conversations.map(conv => `
     <div class="list-item-wrapper">
-      <button class="list-item" data-type="conversation" data-chat-id="${conv.chat_id}" data-conv-id="${conv.conv_id}">
+      <button class="list-item" data-type="conversation" data-chat-id="${escapeHtml(conv.chat_id)}" data-conv-id="${escapeHtml(conv.conv_id)}">
         <span class="list-item-title">${escapeHtml(conv.title || 'Untitled')}</span>
-        <span class="list-item-subtitle">${conv.chat_name || ''}</span>
+        <span class="list-item-subtitle">${escapeHtml(conv.chat_name || '')}</span>
       </button>
-      <button class="item-menu-btn" data-type="conversation" data-chat-id="${conv.chat_id}" data-conv-id="${conv.conv_id}" data-title="${escapeHtml(conv.title || 'Untitled')}" title="More options">
+      <button class="item-menu-btn" data-type="conversation" data-chat-id="${escapeHtml(conv.chat_id)}" data-conv-id="${escapeHtml(conv.conv_id)}" data-title="${escapeHtml(conv.title || 'Untitled')}" title="More options">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
           <circle cx="8" cy="3" r="1.5"/>
           <circle cx="8" cy="8" r="1.5"/>
@@ -588,11 +588,11 @@ function renderMyChats(chats) {
   }
   container.innerHTML = chats.map(chat => `
     <div class="list-item-wrapper">
-      <button class="list-item${chat.chat_id === currentChatId ? ' active' : ''}" data-type="chat" data-chat-id="${chat.chat_id}" data-slug="${chat.slug || ''}">
+      <button class="list-item${chat.chat_id === currentChatId ? ' active' : ''}" data-type="chat" data-chat-id="${escapeHtml(chat.chat_id)}" data-slug="${escapeHtml(chat.slug || '')}">
         <span class="list-item-title">${escapeHtml(chat.name || 'Untitled')}</span>
-        <span class="list-item-subtitle">${chat.files ? chat.files.slice(0, 2).join(', ') : ''}</span>
+        <span class="list-item-subtitle">${escapeHtml(chat.files ? chat.files.slice(0, 2).join(', ') : '')}</span>
       </button>
-      <button class="item-menu-btn" data-type="chat" data-chat-id="${chat.chat_id}" data-name="${escapeHtml(chat.name || 'Untitled')}" title="More options">
+      <button class="item-menu-btn" data-type="chat" data-chat-id="${escapeHtml(chat.chat_id)}" data-name="${escapeHtml(chat.name || 'Untitled')}" title="More options">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
           <circle cx="8" cy="3" r="1.5"/>
           <circle cx="8" cy="8" r="1.5"/>
@@ -612,11 +612,11 @@ function renderSharedChats(chats) {
   }
   container.innerHTML = chats.map(chat => `
     <div class="list-item-wrapper">
-      <button class="list-item${chat.chat_id === currentChatId ? ' active' : ''}" data-type="chat" data-chat-id="${chat.chat_id}" data-slug="${chat.slug || ''}">
+      <button class="list-item${chat.chat_id === currentChatId ? ' active' : ''}" data-type="chat" data-chat-id="${escapeHtml(chat.chat_id)}" data-slug="${escapeHtml(chat.slug || '')}">
         <span class="list-item-title">${escapeHtml(chat.name || 'Untitled')}</span>
-        <span class="list-item-subtitle">Shared by ${chat.owner || 'unknown'}</span>
+        <span class="list-item-subtitle">Shared by ${escapeHtml(chat.owner || 'unknown')}</span>
       </button>
-      <button class="item-menu-btn" data-type="chat" data-chat-id="${chat.chat_id}" data-name="${escapeHtml(chat.name || 'Untitled')}" data-shared="true" title="More options">
+      <button class="item-menu-btn" data-type="chat" data-chat-id="${escapeHtml(chat.chat_id)}" data-name="${escapeHtml(chat.name || 'Untitled')}" data-shared="true" title="More options">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
           <circle cx="8" cy="3" r="1.5"/>
           <circle cx="8" cy="8" r="1.5"/>
@@ -755,9 +755,9 @@ function renderUnifiedChatList(chats, conversations) {
     if (isExpanded) wrapperClass += ' expanded';
 
     return `
-      <div class="${wrapperClass}" data-chat-id="${chatId}">
-        <div class="chat-item-row${chatId === currentChatId ? ' active' : ''}" data-chat-id="${chatId}" data-slug="${chat.slug || ''}">
-          <button class="chat-expand-btn${isExpanded ? ' expanded' : ''}" data-chat-id="${chatId}" title="Show conversations">
+      <div class="${wrapperClass}" data-chat-id="${escapeHtml(chatId)}">
+        <div class="chat-item-row${chatId === currentChatId ? ' active' : ''}" data-chat-id="${escapeHtml(chatId)}" data-slug="${escapeHtml(chat.slug || '')}">
+          <button class="chat-expand-btn${isExpanded ? ' expanded' : ''}" data-chat-id="${escapeHtml(chatId)}" title="Show conversations">
             <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
               <path d="M4.5 2L8.5 6L4.5 10" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/>
             </svg>
@@ -766,7 +766,7 @@ function renderUnifiedChatList(chats, conversations) {
             <span class="chat-name">${chat.pinned ? '<span class="chat-pin-icon" title="Pinned">📌</span>' : ''}${escapeHtml(chat.name || 'Untitled')}</span>
             ${subtitle ? `<span class="chat-subtitle">${escapeHtml(subtitle)}</span>` : ''}
           </div>
-          <button class="chat-menu-btn" data-type="chat" data-chat-id="${chatId}" data-name="${escapeHtml(chat.name || 'Untitled')}" data-shared="${isShared ? 'true' : 'false'}" data-published="${isPublished ? 'true' : 'false'}" data-pinned="${chat.pinned ? 'true' : 'false'}" title="More options">
+          <button class="chat-menu-btn" data-type="chat" data-chat-id="${escapeHtml(chatId)}" data-name="${escapeHtml(chat.name || 'Untitled')}" data-shared="${isShared ? 'true' : 'false'}" data-published="${isPublished ? 'true' : 'false'}" data-pinned="${chat.pinned ? 'true' : 'false'}" title="More options">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
               <circle cx="8" cy="3" r="1.5"/>
               <circle cx="8" cy="8" r="1.5"/>
@@ -774,14 +774,14 @@ function renderUnifiedChatList(chats, conversations) {
             </svg>
           </button>
         </div>
-        <div class="chat-conversations${isExpanded ? ' visible' : ''}" data-chat-id="${chatId}">
-          <button class="conversation-item start-new" data-chat-id="${chatId}">
+        <div class="chat-conversations${isExpanded ? ' visible' : ''}" data-chat-id="${escapeHtml(chatId)}">
+          <button class="conversation-item start-new" data-chat-id="${escapeHtml(chatId)}">
             <span class="conversation-title">+ Start new conversation</span>
           </button>
           ${chatConversations.map(conv => `
-            <div class="conversation-item${conv.conv_id === currentConvId ? ' active' : ''}" data-chat-id="${chatId}" data-conv-id="${conv.conv_id}">
+            <div class="conversation-item${conv.conv_id === currentConvId ? ' active' : ''}" data-chat-id="${escapeHtml(chatId)}" data-conv-id="${escapeHtml(conv.conv_id)}">
               <span class="conversation-title">${escapeHtml(conv.title || 'Untitled')}</span>
-              <button class="conversation-menu-btn" data-type="conversation" data-chat-id="${chatId}" data-conv-id="${conv.conv_id}" data-title="${escapeHtml(conv.title || 'Untitled')}" data-published="${conv.is_published ? 'true' : 'false'}" title="More options">
+              <button class="conversation-menu-btn" data-type="conversation" data-chat-id="${escapeHtml(chatId)}" data-conv-id="${escapeHtml(conv.conv_id)}" data-title="${escapeHtml(conv.title || 'Untitled')}" data-published="${conv.is_published ? 'true' : 'false'}" title="More options">
                 <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
                   <circle cx="8" cy="3" r="1.5"/>
                   <circle cx="8" cy="8" r="1.5"/>

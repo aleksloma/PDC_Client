@@ -12,7 +12,8 @@ survives:
   are dropped with their content);
 * attributes: `class` (only the tokens a Styler generates — `T_<hex/_>`,
   `col<n>`, `row<n>`, `level<n>`, `data`, `index_name`, `blank`,
-  `col_heading`, `row_heading`; every other token is dropped, so a table
+  `col_heading`, `row_heading`, and `row_trim` / `col_trim` on a truncated
+  Styler's elided row and column; every other token is dropped, so a table
   cannot borrow one of the page's own classes), `id` (the Styler's `T_`
   prefix only, so a table cannot take over one of the page's own ids),
   `colspan`/`rowspan`/`span` (digits), `scope`, and `style` through the
@@ -22,18 +23,25 @@ survives:
   descendant/child combinators and simple pseudo-classes; its declarations
   pass the property allowlist and the value filter; the surviving rules are
   re-emitted as ONE `<style>` element in front of the fragment;
-* declaration values (inline `style` and scoped rules alike): a value with
-  `(` survives only when every function in it is rgb/rgba/hsl/hsla;
-  width/height and their min/max take `auto` or one non-negative length
-  within 2000px / 100em / 100rem / 100%; margin*/padding* take one to four
-  non-negative lengths within 200px / 20em / 20rem (margins also `auto`).
+* declaration values (inline `style` and scoped rules alike): no `!`
+  (so no `!important`); a value with `(` survives only when every function
+  in it is rgb/rgba/hsl/hsla; width/height and their min/max take `auto` or
+  one non-negative length within 2000px / 100em / 100rem / 100%;
+  margin*/padding* take one to four non-negative lengths within 200px /
+  20em / 20rem (margins also `auto`); `font-size` takes a size keyword or
+  one length within 72px / 5em / 5rem / 500%; `line-height` takes `normal`,
+  a unitless number up to 10 or a length within 200px / 10em / 10rem; every
+  length in a border width (`border-width`, `border-<side>-width` and the
+  `border` / `border-<side>` shorthands) is within 20px / 2em / 2rem;
+  `border-spacing` within 50px / 5em / 5rem; `text-indent` within 0 ...
+  200px / 20em / 20rem. `text-shadow` and the `font` shorthand are denied.
 
 Positioning, stacking, transforms, generated content and filters are never
-allowed, and box sizes and margins are bounded (font, text and border sizes
-are not): once script is gone, an overlay
-drawn from a table cell is the remaining way markup could reach outside its
-own box. Only colour functions are allowed because any other function may
-make the browser fetch something on its own.
+allowed, and box, font, line, border, spacing and indent sizes are bounded:
+once script is gone, an overlay drawn from a table cell is the remaining way
+markup could reach outside its own box (the pages also clip the container).
+Only colour functions are allowed because any other function may make the
+browser fetch something on its own.
 
 Failure is closed: non-string, blank or oversize input, a missing `nh3`, or
 any internal error answers None, and the pages then fall back to the plain
@@ -73,7 +81,7 @@ _ATTRIBUTES = {
 _ID_RE = re.compile(r"^T_[A-Za-z0-9_]+$")
 _CLASS_TOKEN_RE = re.compile(
     r"^(?:T_[0-9a-f_]+|col\d+|row\d+|level\d+|data|index_name|blank"
-    r"|col_heading|row_heading)$")
+    r"|col_heading|row_heading|row_trim|col_trim)$")
 _DIGITS_RE = re.compile(r"^\d{1,3}$")
 _SCOPE_RE = re.compile(r"^(?:row|col|rowgroup|colgroup)$")
 
@@ -84,8 +92,9 @@ _ALLOWED_PROPERTIES = frozenset({
     "width", "height", "min-width", "max-width", "min-height", "max-height",
 })
 _ALLOWED_PROPERTY_PREFIXES = ("font-", "text-", "border", "padding", "margin")
+_DENIED_PROPERTIES = frozenset({"text-shadow", "font"})
 _PROPERTY_RE = re.compile(r"^[a-z][a-z-]{0,40}$")
-_VALUE_RE = re.compile(r"^[A-Za-z0-9#%.,()\s'\"+\-/!_]{1,200}$")
+_VALUE_RE = re.compile(r"^[A-Za-z0-9#%.,()\s'\"+\-/_]{1,200}$")
 _VALUE_FORBIDDEN = ("url(", "expression(", "javascript", "@", "\\", "<", ">",
                     "{", "}", ";")
 
@@ -98,6 +107,23 @@ _BOX_PREFIXES = ("margin", "padding")
 _LENGTH_RE = re.compile(r"^(\d+(?:\.\d+)?|\.\d+)(px|em|rem|%)?$")
 _SIZE_LIMITS = {"px": 2000, "em": 100, "rem": 100, "%": 100}
 _BOX_LIMITS = {"px": 200, "em": 20, "rem": 20}
+_FONT_SIZE_LIMITS = {"px": 72, "em": 5, "rem": 5, "%": 500}
+_FONT_SIZE_KEYWORDS = frozenset({"xx-small", "x-small", "small", "medium", "large",
+                                 "x-large", "xx-large", "xxx-large", "smaller",
+                                 "larger"})
+_LINE_HEIGHT_LIMITS = {"px": 200, "em": 10, "rem": 10}
+_LINE_HEIGHT_UNITLESS_MAX = 10
+_BORDER_WIDTH_LIMITS = {"px": 20, "em": 2, "rem": 2}
+_BORDER_SPACING_LIMITS = {"px": 50, "em": 5, "rem": 5}
+_TEXT_INDENT_LIMITS = {"px": 200, "em": 20, "rem": 20}
+# The shorthands whose width is bounded, besides every `*-width` of a border.
+_BORDER_SHORTHANDS = frozenset({"border", "border-top", "border-right",
+                                "border-bottom", "border-left", "border-block",
+                                "border-inline", "border-block-start",
+                                "border-block-end", "border-inline-start",
+                                "border-inline-end"})
+_NUMERIC_START_RE = re.compile(r"^[+\-.\d]")
+_COLOUR_FUNCTION_RE = re.compile(r"[A-Za-z-]+\([^)]*\)")
 
 _SELECTOR_RE = re.compile(
     r"#T_[A-Za-z0-9_-]+"
@@ -111,7 +137,7 @@ _nh3_missing_logged = False
 
 
 def _property_allowed(prop: str) -> bool:
-    if not _PROPERTY_RE.match(prop):
+    if not _PROPERTY_RE.match(prop) or prop in _DENIED_PROPERTIES:
         return False
     return prop in _ALLOWED_PROPERTIES or prop.startswith(_ALLOWED_PROPERTY_PREFIXES)
 
@@ -138,9 +164,42 @@ def _length_within(token: str, limits: dict) -> bool:
     return unit in limits and number <= limits[unit]
 
 
+def _lengths_within(value: str, limits: dict, count: range) -> bool:
+    parts = value.split()
+    return len(parts) in count and all(_length_within(p, limits) for p in parts)
+
+
+def _border_width_allowed(value: str) -> bool:
+    """Every numeric token of a border width / shorthand (colour functions
+    set aside) is a length within the border bounds."""
+    tokens = _COLOUR_FUNCTION_RE.sub(" ", value).split()
+    return all(_length_within(t, _BORDER_WIDTH_LIMITS)
+               for t in tokens if _NUMERIC_START_RE.match(t))
+
+
+def _line_height_allowed(value: str) -> bool:
+    low = value.lower()
+    if low == "normal":
+        return True
+    m = _LENGTH_RE.match(low)
+    if m and m.group(2) is None:
+        return float(m.group(1)) <= _LINE_HEIGHT_UNITLESS_MAX
+    return _length_within(low, _LINE_HEIGHT_LIMITS)
+
+
 def _size_allowed(prop: str, value: str) -> bool:
     if prop in _SIZE_PROPERTIES:
         return value.lower() == "auto" or _length_within(value, _SIZE_LIMITS)
+    if prop == "font-size":
+        return value.lower() in _FONT_SIZE_KEYWORDS or _length_within(value, _FONT_SIZE_LIMITS)
+    if prop == "line-height":
+        return _line_height_allowed(value)
+    if prop == "text-indent":
+        return _length_within(value, _TEXT_INDENT_LIMITS)
+    if prop == "border-spacing":
+        return _lengths_within(value, _BORDER_SPACING_LIMITS, range(1, 3))
+    if prop in _BORDER_SHORTHANDS or (prop.startswith("border") and prop.endswith("-width")):
+        return _border_width_allowed(value)
     if prop.startswith(_BOX_PREFIXES):
         parts = value.split()
         if not 1 <= len(parts) <= 4:

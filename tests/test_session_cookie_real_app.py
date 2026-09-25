@@ -37,6 +37,10 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(auth_mod.brain_client, "post_activity", lambda *a, **k: None)
     monkeypatch.setattr(auth_mod.brain_client, "send_welcome_email", lambda *a, **k: None)
     monkeypatch.setattr(auth_mod, "_send_welcome_email_async", lambda email: None)
+    # Sign-in is invitation-only (Task 9, D9-1): the account exists first.
+    store = local_store.AuthStore()
+    store.ensure_user(EMAIL)
+    store.set_password(EMAIL, PASSWORD)
     # https base_url: a Secure cookie is only stored/resent by the client over
     # https, and the logout branch needs the cookie to come back.
     tc = TestClient(app_mod.app, base_url="https://testserver")

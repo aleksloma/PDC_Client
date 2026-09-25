@@ -2644,6 +2644,42 @@
     renderUsers();
   }
 
+  // Invite (sign-in is invitation-only): creates the account and mails the
+  // address a set-your-password link; the outcome line says whether the mail
+  // went out. Text only (textContent) — the address is user input.
+  async function inviteUser() {
+    const input = $('inviteEmail');
+    const out = $('inviteResult');
+    const btn = $('btnInviteUser');
+    const email = (input.value || '').trim();
+    if (!email) { input.focus(); return; }
+    btn.disabled = true;
+    const r = await api('/api/admin/users/invite', {
+      method: 'POST', body: JSON.stringify({ email }),
+    });
+    btn.disabled = false;
+    let text;
+    let ok = false;
+    if (r.ok && r.data.ok) {
+      if (r.data.mail_sent) {
+        ok = true;
+        text = `Invitation sent to ${r.data.email}. The link is valid for 30 minutes.`;
+      } else {
+        text = `${r.data.email} was invited. `
+          + (r.data.mail_error || 'The invitation mail could not be sent.')
+          + ' They can use “Reset password” on the sign-in page.';
+      }
+      input.value = '';
+      loadUsers();
+    } else {
+      text = r.data.error || 'Could not invite this user.';
+    }
+    out.textContent = text;
+    out.classList.toggle('ok', ok);
+    out.classList.toggle('warn', !ok);
+    out.classList.remove('hidden');
+  }
+
   // 19c multi-role model: the role cell is a button + checkbox panel. A user
   // holds SEVERAL roles (read access = union); checked = held, and every
   // toggle POSTs the full id list immediately (same instant semantics the
@@ -2671,7 +2707,7 @@
     const rows = q ? USERS.filter((u) => (u.email || '').toLowerCase().includes(q)) : USERS;
     if (!rows.length) {
       box.innerHTML = `<div class="adm-card"><div class="adm-empty">
-        ${q ? 'No users match the search.' : 'No users yet — users appear after their first sign-in.'}
+        ${q ? 'No users match the search.' : 'No users yet — invite one, or they arrive through a share or single sign-on.'}
       </div></div>`;
       return;
     }
@@ -3326,6 +3362,10 @@
     $('userSearch')?.addEventListener('input', () => {
       _userSearchTyped = true;   // real typing — never clear it again
       renderUsers();
+    });
+    $('btnInviteUser')?.addEventListener('click', inviteUser);
+    $('inviteEmail')?.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); inviteUser(); }
     });
     $('btnAddRole')?.addEventListener('click', () => openRoleModal(null));
     $('closeRoleModal').addEventListener('click', () => $('roleModal').classList.add('hidden'));

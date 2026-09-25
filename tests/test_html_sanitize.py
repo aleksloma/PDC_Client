@@ -650,3 +650,106 @@ def test_the_overlay_markup_is_cleaned_through_clean_table():
     assert "-9999" not in styled, styled
     assert "cell-9" in styled, styled
     assert table["styled_html"] == OVERLAY_STYLED, "the input must not be mutated"
+
+
+# ---------------------------------------------------------------------------
+# Task 8b Part A #2 / #8: font, line, border, spacing and indent bounds;
+# `!important`, `text-shadow` and the `font` shorthand denied; the Styler's
+# truncation classes kept.
+#
+# font-size: a size keyword, or ONE non-negative length within 72px / 5em /
+#   5rem / 500%.
+# line-height: `normal`, a unitless number <= 10, or a length within 200px /
+#   10em / 10rem.
+# border widths (border-width, border-<side>-width, and the width inside the
+#   `border` / `border-<side>` shorthands): within 20px / 2em / 2rem.
+# border-spacing: within 50px / 5em / 5rem.
+# text-indent: 0 ... 200px / 20em / 20rem (never negative).
+# ---------------------------------------------------------------------------
+TYPO_KEPT = [
+    "font-size:72px", "font-size:5em", "font-size:5rem", "font-size:500%",
+    "font-size:12px", "font-size:xx-small", "font-size:xx-large",
+    "font-size:smaller", "font-size:larger", "font-size:medium",
+    "line-height:normal", "line-height:10", "line-height:1.5",
+    "line-height:200px", "line-height:10em", "line-height:10rem",
+    "border-width:20px", "border-top-width:2em", "border-left-width:2rem",
+    "border-spacing:50px", "border-spacing:5em", "border-spacing:5rem",
+    "border-spacing:0",
+    "text-indent:0", "text-indent:200px", "text-indent:20em", "text-indent:20rem",
+]
+TYPO_DROPPED = [
+    "font-size:73px", "font-size:6em", "font-size:5.5rem", "font-size:501%",
+    "font-size:9999px", "font-size:-5px", "font-size:10vw", "font-size:1e3px",
+    "line-height:11", "line-height:201px", "line-height:11em", "line-height:10.5rem",
+    "line-height:-1",
+    "border-width:21px", "border-width:3000px", "border-top-width:3em",
+    "border-left-width:2.5rem", "border-bottom-width:9999px",
+    "border-spacing:51px", "border-spacing:6em", "border-spacing:5000px",
+    "text-indent:201px", "text-indent:21em", "text-indent:-1px",
+    "text-indent:-9999px",
+]
+BORDER_SHORTHAND_KEPT = [
+    "border:1px solid #ccc", "border-left:2px solid red",
+    "border-bottom:20px solid #000", "border:2em solid #eee",
+]
+BORDER_SHORTHAND_DROPPED = [
+    "border:3000px solid red", "border-left:21px solid red",
+    "border-top:3em solid #000", "border:solid 9999px red",
+    "border-right:2.5rem dashed blue",
+]
+DENIED_DECLS = [
+    "text-shadow:0 0 5px red", "font:italic 900px serif", "font:12px sans-serif",
+]
+
+
+@pytest.mark.parametrize("decl", TYPO_KEPT + BORDER_SHORTHAND_KEPT)
+def test_a_typographic_size_at_the_limit_survives_in_a_style_attribute(decl):
+    assert _flat(decl) in _flat(_decl_in_attr(decl))
+
+
+@pytest.mark.parametrize("decl", TYPO_KEPT + BORDER_SHORTHAND_KEPT)
+def test_a_typographic_size_at_the_limit_survives_in_a_scoped_rule(decl):
+    assert _flat(decl) in _flat(_decl_in_rule(decl))
+
+
+@pytest.mark.parametrize("decl", TYPO_DROPPED + BORDER_SHORTHAND_DROPPED + DENIED_DECLS)
+def test_a_typographic_size_above_the_limit_is_dropped_from_a_style_attribute(decl):
+    out = _decl_in_attr(decl)
+    assert out is not None
+    prop = decl.split(":")[0]
+    assert f"{prop}:" not in _flat(out), out
+    assert "color:green" in _flat(out), out
+
+
+@pytest.mark.parametrize("decl", TYPO_DROPPED + BORDER_SHORTHAND_DROPPED + DENIED_DECLS)
+def test_a_typographic_size_above_the_limit_is_dropped_from_a_scoped_rule(decl):
+    css = _flat(_decl_in_rule(decl))
+    prop = decl.split(":")[0]
+    assert f"{prop}:" not in css, css
+    assert "green" in css, css
+
+
+@pytest.mark.parametrize("decl", [
+    "background-color:red !important", "background-color:red!important",
+    "font-weight:bold !important", "border:1px solid red !important",
+])
+def test_important_is_dropped_everywhere(decl):
+    attr_out = _decl_in_attr(decl)
+    assert attr_out is not None
+    rule_css = _decl_in_rule(decl)
+    prop = decl.split(":")[0]
+    for text in (attr_out, rule_css):
+        assert "important" not in (text or "").lower(), text
+        assert f"{prop}:" not in _flat(text), text
+    assert "color:green" in _flat(attr_out), attr_out
+    assert "green" in _flat(rule_css), rule_css
+
+
+@pytest.mark.parametrize("cls", ["row_trim", "col_trim", "data row_trim",
+                                 "col_heading level0 col_trim"])
+def test_the_styler_truncation_classes_are_kept(cls):
+    """A truncated Styler (max_rows / max_columns) marks the elided row and
+    column with `row_trim` / `col_trim`; they belong to its vocabulary."""
+    out = _clean(_classed_cell(cls))
+    assert out is not None
+    assert _class_tokens(out) == cls.split(), out

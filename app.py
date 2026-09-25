@@ -96,6 +96,16 @@ async def lifespan(app: FastAPI):
         log_with_sid("startup", "warning",
                      "CSP_REPORT_ONLY_ENABLED the page policy is reported, not enforced "
                      "(diagnostic setting; unset CSP_REPORT_ONLY to enforce)")
+    if not (settings.PUBLIC_BASE_URL or "").strip().lower().startswith(("http://", "https://")):
+        log_with_sid("startup", "error",
+                     "PUBLIC_BASE_URL_UNSET password-reset and invitation mails are "
+                     "disabled until PUBLIC_BASE_URL is set to the http(s) address "
+                     "users type to reach this app")
+    if settings.ALLOW_SELF_REGISTRATION:
+        log_with_sid("startup", "warning",
+                     "SELF_REGISTRATION_ENABLED any unknown address that signs in "
+                     "becomes an account (hosted-demo setting; unset "
+                     "ALLOW_SELF_REGISTRATION on a customer install)")
     # Offline plotly.js: materialize the pip package's bundle into static/vendor/
     # so chart iframes never need cdn.plot.ly (air-gapped LANs). Idempotent —
     # no-ops in the Docker image where the build already baked it.
@@ -324,8 +334,10 @@ _PASSWORD_CHANGE_OPEN_PATHS = frozenset({
     "/auth/login", "/auth/logout", "/auth/change_password",
     "/auth/reset_password", "/auth/me",
 })
+# "/auth/reset/": a mailed reset link must work for a user who signed in
+# with a temp password on the same browser.
 _PASSWORD_CHANGE_OPEN_PREFIXES = ("/static/", "/c/", "/dashboards/",
-                                  "/auth/microsoft")
+                                  "/auth/microsoft", "/auth/reset/")
 
 
 def _routed_path(scope) -> str:
@@ -380,8 +392,7 @@ class PasswordChangeGate:
 # The enterprise page policy. `{nonce}` is the per-response nonce every
 # inline <script> of the templates carries; nothing else inline may run.
 # Styles stay 'unsafe-inline' (the pages and the styled tables use inline
-# style attributes); frames are same-origin documents (the chart route) and
-# blob documents only.
+# style attributes); frames are same-origin documents only (the chart route).
 _CSP_BASE = {
     "default-src": ["'self'"],
     "script-src": ["'self'", "'nonce-{nonce}'"],
@@ -389,7 +400,7 @@ _CSP_BASE = {
     "img-src": ["'self'", "data:", "blob:"],
     "font-src": ["'self'", "data:"],
     "connect-src": ["'self'"],
-    "frame-src": ["'self'", "blob:"],
+    "frame-src": ["'self'"],
     "frame-ancestors": ["'self'"],
     "base-uri": ["'self'"],
     "form-action": ["'self'"],
@@ -532,11 +543,14 @@ async def landing(request: Request):
         sso_enabled = sso_auto = False
     if sso_enabled and sso_auto and request.query_params.get("local") != "1":
         return RedirectResponse(url="/auth/microsoft", status_code=302)
+    info = ("Your password has been updated. Sign in with it."
+            if request.query_params.get("reset") == "done" else None)
     return templates.TemplateResponse(
         request,
         "auth_landing.html",
         {"request": request, "error": None, "password_error": None,
-         "info": None, "email": "", "sso_enabled": sso_enabled},
+         "info": info, "email": "", "sso_enabled": sso_enabled,
+         "self_registration": bool(settings.ALLOW_SELF_REGISTRATION)},
     )
 
 

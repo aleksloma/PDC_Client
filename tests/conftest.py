@@ -187,3 +187,25 @@ def execute_generated_code_in_process(request, monkeypatch):
     monkeypatch.setattr(plot_utils, "render_plot_safe", render_in_process)
     monkeypatch.setattr(run_chat_local, "safe_execute", in_process)
     monkeypatch.setattr(run_chat_local, "render_plot_safe", render_in_process)
+
+
+@pytest.fixture(autouse=True)
+def reset_auth_limiter():
+    """Start every test with empty sign-in / reset attempt counters.
+
+    Every TestClient presents the same peer address (`"testclient"`), so the
+    per-IP counters of `auth_limiter` (Task 9) would otherwise carry one
+    test's sign-ins into the next and throttle it. Imported lazily: before
+    the module exists there is nothing to reset, and a missing module must
+    not break the whole suite.
+    """
+    try:
+        import auth_limiter
+    except ImportError:
+        auth_limiter = None
+    reset = getattr(auth_limiter, "reset", None)
+    if callable(reset):
+        reset()
+    yield
+    if callable(reset):
+        reset()

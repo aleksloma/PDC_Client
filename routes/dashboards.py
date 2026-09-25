@@ -625,12 +625,11 @@ async def share_dashboard(request: Request, dash_id: str):
     raw_emails = body.get("emails") or []
     if isinstance(raw_emails, str):
         raw_emails = [e.strip() for e in raw_emails.replace(",", "\n").splitlines() if e.strip()]
-    import re as _re
-    _email_re = _re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    from routes.auth import _EMAIL_RE   # the one address pattern
     recipients = []
     for e in raw_emails:
         e = (e or "").strip().lower()
-        if _email_re.match(e) and e != email:
+        if _EMAIL_RE.fullmatch(e) and e != email:
             recipients.append(e)
     if not recipients:
         return JSONResponse({"error": "Provide at least one valid recipient email."},

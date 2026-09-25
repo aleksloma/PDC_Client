@@ -2447,3 +2447,8 @@ button.danger:hover {
   padding: 4px 10px;
   white-space: nowrap;
 }
+
+/* Styled (pandas Styler) tables: the sanitised markup is inserted into the
+   page, so its box is clipped here — whatever it draws stays inside the
+   message column. */
+.styled-table-container { overflow: auto; max-width: 100%; contain: paint; }

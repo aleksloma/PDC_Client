@@ -416,6 +416,8 @@ body.admin-ds-page {
 .adm-btn.danger:hover { background: #b91c1c; }
 .adm-btn.danger:disabled { background: #fca5a5; cursor: not-allowed; }
 .adm-users-toolbar { margin-bottom: 12px; }
+.adm-users-invite { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+.adm-alert.ok { background: #ecfdf5; border-color: #a7f3d0; color: #065f46; }
 .adm-search {
   width: 320px; max-width: 100%; box-sizing: border-box;
   border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 12px;

@@ -10,7 +10,7 @@ Enterprise policy (default settings):
 
     default-src 'self'; script-src 'self' 'nonce-N'; style-src 'self' 'unsafe-inline';
     img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self';
-    frame-src 'self' blob:; frame-ancestors 'self'; base-uri 'self';
+    frame-src 'self'; frame-ancestors 'self'; base-uri 'self';
     form-action 'self'; object-src 'none'
 
 Widenings are setting-driven: `ENABLE_THIRD_PARTY_SCRIPTS` adds the Google
@@ -104,7 +104,19 @@ def env(tmp_path, monkeypatch):
             cache["dash"] = r.json()["dash_id"]
         return cache["dash"]
 
-    yield {"client": client, "dash": dashboard_id}
+    def reset_link() -> str:
+        """A live reset link for USER (Task 9): the token is minted through
+        the store, exactly what the mailed link carries."""
+        if "reset" not in cache:
+            mint = getattr(local_store.AuthStore, "create_reset_token", None)
+            if mint is None:
+                pytest.fail("AuthStore.create_reset_token missing")
+            token = local_store.AuthStore().create_reset_token(USER)
+            assert token, "no reset token minted for an existing account"
+            cache["reset"] = f"/auth/reset/{token}"
+        return cache["reset"]
+
+    yield {"client": client, "dash": dashboard_id, "reset": reset_link}
     local_store._DATAFRAME_CACHE.invalidate()
 
 
@@ -117,6 +129,7 @@ def _pages():
         ("dashboard", "user", lambda e: f"/dashboards/{e['dash']()}"),
         ("admin_data_sources", "admin", lambda e: "/admin/data_sources"),
         ("change_password", "temp", lambda e: "/auth/change_password"),
+        ("reset_password", "anon", lambda e: e["reset"]()),
     ]
 
 
@@ -192,7 +205,9 @@ def test_the_enterprise_directives(env, page_id):
     assert {"'self'", "data:", "blob:"} <= set(p.get("img-src", [])), p
     assert sorted(p.get("font-src", [])) == sorted(["'self'", "data:"]), p
     assert p.get("connect-src") == ["'self'"], p
-    assert "'self'" in p.get("frame-src", []), p
+    # Exactly 'self' (Task 8b Part A #6): chart frames load /charts/{token};
+    # no page loads a blob: frame any more.
+    assert p.get("frame-src") == ["'self'"], p
     assert p.get("frame-ancestors") == ["'self'"], p
     assert p.get("base-uri") == ["'self'"], p
     assert p.get("form-action") == ["'self'"], p

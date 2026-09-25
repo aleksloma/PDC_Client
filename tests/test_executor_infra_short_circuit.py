@@ -980,12 +980,15 @@ def _assert_no_value(messages: list, event: str) -> None:
 # sides of the executor hop (the shared transport, the web-side dispatcher,
 # the sandbox service) where a forged record was actually reproduced, the web
 # app's own middleware lines, the Excel detector's openpyxl-failure sites,
-# the dashboard routes (request-controlled ids and exception texts) and the
-# chart-document routes (request-controlled tokens and bodies).
+# the dashboard routes (request-controlled ids and exception texts), the
+# chart-document routes (request-controlled tokens and bodies) and the auth
+# routes (typed addresses, reset tokens and mail-relay exception texts --
+# Task 9, D9-15).
 LOG_SAFE_MODULES = ["run_chat_local.py", "routes/chat.py", "exec_sanitizer.py",
                     "exec_transport.py", "executor_client.py", "app.py",
                     "executor/app.py", "excel_table_detector.py",
-                    "routes/dashboards.py", "routes/charts.py"]
+                    "routes/dashboards.py", "routes/charts.py",
+                    "routes/auth.py"]
 
 LOG_CALL_NAME = "log_with_sid"
 

@@ -26,8 +26,8 @@ anything not removed accumulates there forever. Three kinds of directory are
 created — the account `integration-<hex>@example.invalid` (pre-created with
 its password through the app's own store inside the container, so the login
 is a RETURNING sign-in and the brain never receives a welcome mail or a
-first-login activity for a synthetic address; only without docker does the
-real login route's new-account branch create it), the chats
+first-login activity for a synthetic address; without docker the session
+fixture skips, because sign-in no longer creates accounts), the chats
 `/generate_chatdata` promotes, and the UPLOAD SESSION directory `/new_session`
 opens, which holds the uploaded fixture file and its parquet cache. The app
 has no delete endpoint for any of them, so teardown removes all three with
@@ -246,10 +246,13 @@ def session(base_url, account):
 
     The account is pre-created inside the container first, so this is a
     returning sign-in: the new-account branch (brain welcome mail + a login
-    activity for a synthetic address) never fires. Without docker the login
-    route's own new-account branch creates it, as before.
+    activity for a synthetic address) never fires. Without docker there is
+    no way to create it any more -- sign-in is invitation-only (Task 9,
+    D9-1) -- so every test that needs a session SKIPS with that reason.
     """
-    precreate_account(account["email"], account["password"])
+    if not precreate_account(account["email"], account["password"]):
+        pytest.skip("docker is not on PATH: the throwaway account cannot be "
+                    "pre-created, and sign-in no longer creates accounts")
     client = httpx.Client(base_url=base_url, follow_redirects=True,
                           timeout=REQUEST_TIMEOUT_S)
     response = client.post("/auth/login",

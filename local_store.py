@@ -15,6 +15,7 @@ is JSONL with atomic appends.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
 import json
 import math
@@ -37,6 +38,29 @@ from excel_table_detector import load_excel_sheets, _EXTRACTED_TEXT_ABOVE_TABLE 
 
 
 _LOCK = threading.RLock()
+
+# Reset links: sha256(token) -> email. A CACHE filled at mint time (one
+# worker), never consulted for validity — the auth record is the one source
+# of truth, and `AuthStore.find_reset_token` scans the records on a miss.
+_RESET_TOKEN_INDEX: dict = {}
+RESET_TOKEN_TTL_S = 1800
+_RESET_KEYS = ("reset_token_hash", "reset_expires_at", "reset_used")
+# Exactly what secrets.token_urlsafe(32) produces.
+_RESET_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
+
+
+def _reset_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def reset_record_live(rec: dict) -> bool:
+    """True when an auth record's reset link is unused and not expired."""
+    if not isinstance(rec, dict) or not rec.get("reset_token_hash"):
+        return False
+    expires = rec.get("reset_expires_at")
+    return (rec.get("reset_used") is False
+            and isinstance(expires, (int, float)) and not isinstance(expires, bool)
+            and expires > _time.time())
 
 
 def _data_root() -> Path:
@@ -934,14 +958,19 @@ class AuthStore:
 
     # --- Password auth (hash-only storage under users/{email}/auth.json) ----
     #
-    # Two hash slots:
+    # Hash slots:
     #   password_hash       — the user's own password.
-    #   temp_password_hash  — a reset-issued temporary password (must_change).
-    # A login with the temp password forces a password change; a login with
-    # the primary password invalidates any outstanding temp password (so a
-    # third party requesting resets can never lock the real user out).
-    # Legacy users from the email-only build simply have no auth.json — their
-    # next login is treated like a first visit (entered password gets set).
+    #   temp_password_hash  — a temporary password issued by the PREVIOUS
+    #                         release's reset (must_change). Nothing writes it
+    #                         any more; an account mid-reset at upgrade time
+    #                         still signs in with it and is forced to change.
+    # A login with the primary password invalidates any outstanding temp one.
+    # Reset links (tokenized reset): `reset_token_hash` (sha256 hex of the
+    # mailed token — the raw token is never stored), `reset_expires_at` (epoch
+    # seconds) and `reset_used`. One outstanding link per account; setting a
+    # password on ANY path drops the three keys, except that a consumed link
+    # keeps its hash (marked used) until it would have expired, so a second
+    # use is recognised and logged.
 
     def _auth_path(self, email: str) -> Path:
         return _data_root() / "users" / _safe_email(email) / "auth.json"
@@ -993,10 +1022,12 @@ class AuthStore:
             return {}
 
     def _write_auth(self, email: str, auth: dict) -> None:
+        """Whole-record replace through tmp + os.replace, so a concurrent
+        reader (the reset-token scan) never sees a torn record."""
         p = self._auth_path(email)
         p.parent.mkdir(parents=True, exist_ok=True)
         auth["updated_at"] = _now()
-        p.write_text(json.dumps(auth, indent=2, ensure_ascii=False), encoding="utf-8")
+        _write_json_atomic(p, auth)
 
     def has_password(self, email: str) -> bool:
         return bool(self.get_auth(email).get("password_hash"))
@@ -1016,17 +1047,28 @@ class AuthStore:
         except Exception as e:
             log_with_sid(email, "warning", f"SSO_MARK_LOGIN_FAILED: {e}")
 
+    @staticmethod
+    def _apply_password_hash(auth: dict, password_hash: str, force_change: bool) -> None:
+        auth["password_hash"] = password_hash
+        auth.pop("temp_password_hash", None)
+        auth["must_change_password"] = bool(force_change)
+        for key in _RESET_KEYS:
+            auth.pop(key, None)
+
     def set_password(self, email: str, password: str, *, force_change: bool = False) -> None:
-        """Set the user's own password. Clears any outstanding temp password.
-        force_change=True (used only by the ladmin bootstrap) keeps the
-        must_change_password flag ON so the first login forces a change."""
+        """Set the user's own password. Clears any outstanding temp password
+        and any outstanding reset link. force_change=True (used only by the
+        ladmin bootstrap) keeps the must_change_password flag ON so the first
+        login forces a change."""
         from password_utils import generate_password_hash
+        new_hash = generate_password_hash(password)   # PBKDF2 outside the lock
         with _LOCK:
             auth = self.get_auth(email)
-            auth["password_hash"] = generate_password_hash(password)
-            auth.pop("temp_password_hash", None)
-            auth["must_change_password"] = bool(force_change)
+            old = auth.get("reset_token_hash")
+            self._apply_password_hash(auth, new_hash, force_change)
             self._write_auth(email, auth)
+            if old:
+                _RESET_TOKEN_INDEX.pop(old, None)
         log_with_sid(email, "info", "USER_PASSWORD_SET")
 
     # --- Roles (stored on profile.json — the identity record; auth.json is
@@ -1202,16 +1244,114 @@ class AuthStore:
         except Exception as e:
             log_with_sid("startup", "error", f"LADMIN_BOOTSTRAP_FAILED: {e}")
 
-    def set_temp_password(self, email: str, temp_password: str) -> None:
-        """Store a reset-issued temp password hash + must_change flag. The
-        user's own password (if any) stays valid until the temp one is used."""
+    # --- Reset links ----------------------------------------------------------
+
+    def create_reset_token(self, email: str) -> Optional[str]:
+        """Mint a reset link token for an EXISTING account (profile or auth
+        record) and return it — the only place the raw token exists outside
+        the mail. Replaces any earlier token. None, with nothing written, for
+        an unknown address or on failure (Article IV)."""
+        try:
+            token = secrets.token_urlsafe(32)
+            token_hash = _reset_token_hash(token)
+            with _LOCK:
+                if not self.user_exists(email):
+                    return None
+                auth = self.get_auth(email)
+                old = auth.get("reset_token_hash")
+                auth["reset_token_hash"] = token_hash
+                auth["reset_expires_at"] = int(_time.time()) + RESET_TOKEN_TTL_S
+                auth["reset_used"] = False
+                self._write_auth(email, auth)
+                if old:
+                    _RESET_TOKEN_INDEX.pop(old, None)
+                _RESET_TOKEN_INDEX[token_hash] = _safe_email(email)
+            log_with_sid(email, "info", "PASSWORD_RESET_TOKEN_CREATED")
+            return token
+        except Exception as e:
+            log_with_sid(email, "error",
+                         f"PASSWORD_RESET_TOKEN_FAILED {type(e).__name__}")
+            return None
+
+    def find_reset_token(self, token: str):
+        """`(email, auth_record)` of the account whose record holds this
+        token's hash, else None. Validity (expiry, used) is the caller's
+        check — see `reset_record_live`. The in-memory index is a cache
+        filled at mint time; on a miss (a restart between mint and click) the
+        auth records are scanned. The stored hash is compared constant-time.
+        Never raises."""
+        try:
+            if not isinstance(token, str) or not _RESET_TOKEN_RE.fullmatch(token):
+                return None
+            token_hash = _reset_token_hash(token)
+            cached = _RESET_TOKEN_INDEX.get(token_hash)
+            if cached:
+                rec = self.get_auth(cached)
+                if hmac.compare_digest(str(rec.get("reset_token_hash") or ""), token_hash):
+                    return cached, rec
+            users = _data_root() / "users"
+            if not users.is_dir():
+                return None
+            for udir in users.iterdir():
+                p = udir / "auth.json"
+                try:
+                    if not udir.is_dir() or not p.is_file():
+                        continue
+                    rec = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if hmac.compare_digest(str(rec.get("reset_token_hash") or ""), token_hash):
+                    _RESET_TOKEN_INDEX[token_hash] = udir.name
+                    return udir.name, rec
+            return None
+        except Exception as e:
+            log_with_sid("auth", "error", f"PASSWORD_RESET_LOOKUP_FAILED {type(e).__name__}")
+            return None
+
+    def consume_reset_token(self, token: str, new_password: str) -> Optional[str]:
+        """Use a reset link: lookup, expiry and `used` checks, the new
+        password and the used mark in ONE step under the store lock, so two
+        concurrent posts of the same link cannot both succeed. Returns the
+        account's email, or None when the link is not (or no longer) valid.
+        The hash stays, marked used, so a second use is recognised."""
         from password_utils import generate_password_hash
+        new_hash = generate_password_hash(new_password)   # PBKDF2 outside the lock
         with _LOCK:
-            auth = self.get_auth(email)
-            auth["temp_password_hash"] = generate_password_hash(temp_password)
-            auth["must_change_password"] = True
-            self._write_auth(email, auth)
-        log_with_sid(email, "info", "USER_TEMP_PASSWORD_SET")
+            found = self.find_reset_token(token)
+            if not found:
+                return None
+            email, rec = found
+            if rec.get("reset_used") is True:
+                log_with_sid(email, "warning", "RESET_TOKEN_REUSED")
+                return None
+            if not reset_record_live(rec):
+                return None
+            token_hash, expires = rec.get("reset_token_hash"), rec.get("reset_expires_at")
+            self._apply_password_hash(rec, new_hash, False)
+            rec["reset_token_hash"] = token_hash
+            rec["reset_expires_at"] = expires
+            rec["reset_used"] = True
+            self._write_auth(email, rec)
+        log_with_sid(email, "info", "USER_PASSWORD_SET")
+        return email
+
+    def clear_reset_token(self, email: str) -> None:
+        """Drop an outstanding reset link (the failed-send rollback)."""
+        try:
+            with _LOCK:
+                auth = self.get_auth(email)
+                if not any(key in auth for key in _RESET_KEYS):
+                    return
+                old = auth.get("reset_token_hash")
+                for key in _RESET_KEYS:
+                    auth.pop(key, None)
+                self._write_auth(email, auth)
+                if old:
+                    _RESET_TOKEN_INDEX.pop(old, None)
+        except Exception as e:
+            log_with_sid(email, "error", f"PASSWORD_RESET_CLEAR_FAILED {type(e).__name__}")
 
     def clear_temp_password(self, email: str) -> None:
         with _LOCK:

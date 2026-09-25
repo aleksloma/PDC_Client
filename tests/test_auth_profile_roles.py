@@ -138,9 +138,15 @@ def client(monkeypatch):
     return TestClient(app)
 
 
-def test_login_stamps_last_login_on_both_branches(client):
+def test_login_stamps_last_login_on_both_branches(client, monkeypatch, tmp_path):
+    """Task 9 (D9-1/D9-2): the new-address branch exists only behind
+    ALLOW_SELF_REGISTRATION (the hosted demo); both it and the returning
+    sign-in still stamp last_login_at through the _start_session funnel."""
+    if "ALLOW_SELF_REGISTRATION" not in type(settings).model_fields:
+        pytest.fail("settings.ALLOW_SELF_REGISTRATION missing")
+    monkeypatch.setattr(settings, "ALLOW_SELF_REGISTRATION", True)
     auth = local_store.AuthStore()
-    # New-user branch (no user folder → entered password becomes theirs).
+    # New-user branch (flag on, no user folder -> entered password becomes theirs).
     r = client.post("/auth/login",
                     data={"email": "new@x.com", "password": "pw123"},
                     follow_redirects=False)
@@ -154,3 +160,19 @@ def test_login_stamps_last_login_on_both_branches(client):
     assert r2.status_code == 302
     second = auth.get_profile("new@x.com")["last_login_at"]
     assert second and second >= first
+
+
+def test_login_does_not_self_register_by_default(client, tmp_path, monkeypatch):
+    """Invitation-only sign-in (D9-1): with ALLOW_SELF_REGISTRATION at its
+    default (false) an unknown address is refused with 401 and no user
+    folder is created for it."""
+    # The shipped default (asserted on a fresh Settings() in
+    # tests/test_auth_reset_flow.py); pinned here so a devbox env cannot flip it.
+    if "ALLOW_SELF_REGISTRATION" in type(settings).model_fields:
+        monkeypatch.setattr(settings, "ALLOW_SELF_REGISTRATION", False)
+    r = client.post("/auth/login",
+                    data={"email": "new@x.com", "password": "pw123"},
+                    follow_redirects=False)
+    assert r.status_code == 401, (r.status_code, r.headers.get("location"))
+    assert not (tmp_path / "users" / "new@x.com").exists()
+    assert local_store.AuthStore().get_profile("new@x.com") is None

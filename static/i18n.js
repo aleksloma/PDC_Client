@@ -54,7 +54,7 @@ window.I18N_TRANSLATIONS = {
     'auth.google_signup': 'Sign up with Google',
     'auth.sign_in_microsoft': 'Sign in with Microsoft',
     'auth.reset_password': 'Reset password',
-    'auth.legacy_reset_required': 'This account existed before passwords were introduced. Please click “Reset password” — we will email you a temporary password to sign in and set your own.',
+    'auth.signin_failed': 'Sign-in failed. Check your email and password, or use “Reset password” if you have not set one yet.',
 
     // "What You Can Do" section (login.html)
     'section.wycd_title': 'What You Can Do',
@@ -449,7 +449,7 @@ window.I18N_TRANSLATIONS = {
     'auth.google_signup': 'დარეგისტრირდით Google-ით',
     'auth.sign_in_microsoft': 'შედით Microsoft-ით',
     'auth.reset_password': 'პაროლის აღდგენა',
-    'auth.legacy_reset_required': 'ეს ანგარიში პაროლების შემოღებამდე არსებობდა. დააჭირეთ „პაროლის აღდგენას“ — ელფოსტაზე დროებით პაროლს გამოგიგზავნით, რომლითაც შეხვალთ და საკუთარს დააყენებთ.',
+    'auth.signin_failed': 'შესვლა ვერ მოხერხდა. შეამოწმეთ ელფოსტა და პაროლი, ან გამოიყენეთ „პაროლის აღდგენა“, თუ პაროლი ჯერ არ დაგიყენებიათ.',
 
     // "What You Can Do" section
     'section.wycd_title': 'რა შეგიძლია გააკეთო',
@@ -844,7 +844,7 @@ window.I18N_TRANSLATIONS = {
     'auth.google_signup': 'Зарегистрироваться через Google',
     'auth.sign_in_microsoft': 'Войти через Microsoft',
     'auth.reset_password': 'Сбросить пароль',
-    'auth.legacy_reset_required': 'Эта учётная запись существовала до введения паролей. Нажмите «Сбросить пароль» — мы отправим на вашу почту временный пароль, чтобы войти и задать свой собственный.',
+    'auth.signin_failed': 'Не удалось войти. Проверьте адрес и пароль или нажмите «Сбросить пароль», если вы ещё не задали пароль.',
 
     // "What You Can Do" section
     'section.wycd_title': 'Что вы можете делать',

@@ -86,6 +86,13 @@ def _templates() -> list[Path]:
     return sorted(TEMPLATES.rglob("*.html"))
 
 
+def _templates_referencing(file_name: str) -> list[str]:
+    """Templates whose source names `file_name` as a path segment (a script
+    src, a url_for, or a bare quoted name)."""
+    pat = re.compile(r"""(?:["'/=]|^)""" + re.escape(file_name) + r"""(?:["'?#\s>]|$)""", re.M)
+    return [str(t.relative_to(ROOT)) for t in _templates() if pat.search(_read(t))]
+
+
 def _function_body(src: str, name: str) -> str:
     """Source of the function `name` (declaration, `name = function`, or
     `name: function` / arrow), braces matched naively. "" when absent."""
@@ -294,6 +301,11 @@ def test_the_file_remove_button_is_bound_not_inline():
                          ids=lambda p: str(p.relative_to(ROOT)))
 def test_other_live_scripts_build_no_inline_handlers(path):
     if path.name in ("chat.js", "config.js", "login.js", "register.js", "index_new.js"):
+        # The skip trusts the file NAME, so prove the claim first: a template
+        # that starts loading one of these files turns this into a failure
+        # instead of a silent skip (Task 8b Part A #20).
+        loaders = _templates_referencing(path.name)
+        assert loaders == [], (path.name, "is loaded by", loaders)
         pytest.skip("not loaded by any template")
     assert _inline_handler_calls(_read(path)) == [], path
 
@@ -531,3 +543,220 @@ def test_nh3_is_pinned_exactly_for_the_main_app():
 def test_nh3_is_not_in_the_sandbox_image():
     text = _read(ROOT / "executor" / "requirements.txt").lower()
     assert "nh3" not in text
+
+
+# ===========================================================================
+# Task 8b Part A: refresh race, sidebar escaping, the policy opt-out pin
+# ===========================================================================
+_STAMP_WRITE_RE = re.compile(
+    r"\biframe\s*(?:\.\s*dataset)?\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*['\"]([\w$-]+)['\"]\s*\])"
+    r"\s*(?:=(?!=)|\+\+|\+=)")
+_STAMP_ATTR_RE = re.compile(r"\biframe\s*\.\s*setAttribute\(\s*['\"](data-[\w-]+)['\"]")
+
+
+def _generation_stamps(body: str) -> set:
+    names = {a or b for a, b in _STAMP_WRITE_RE.findall(body)}
+    names |= set(_STAMP_ATTR_RE.findall(body))
+    names -= {"src", "sandbox"}
+    return names
+
+
+def _compared_before_src(body: str, name: str) -> bool:
+    """`name` takes part in an (in)equality test that comes before the
+    frame's `.src =` assignment, i.e. a stale resolution is recognised
+    before it could overwrite a newer chart."""
+    src_at = [m.start() for m in re.finditer(r"\.src\s*=(?!=)", body)]
+    if not src_at:
+        return False
+    last_src = src_at[-1]
+    key = re.escape(name)
+    cmp_re = re.compile(rf"(?:\b{key}\b|['\"]{key}['\"])[^;\n]*?(?:!==|===|!=|==)"
+                        rf"|(?:!==|===|!=|==)[^;\n]*?(?:\b{key}\b|['\"]{key}['\"])")
+    return any(m.start() < last_src for m in cmp_re.finditer(body))
+
+
+def test_the_generation_stamp_scanner_finds_a_known_sample():
+    sample = ("{ var gen = (iframe.__pdcChartGen || 0) + 1; iframe.__pdcChartGen = gen;\n"
+              "  return fetch(u).then(function (d) {\n"
+              "    if (iframe.__pdcChartGen !== gen) return;\n"
+              "    iframe.src = d.url; }); }")
+    assert _generation_stamps(sample) == {"__pdcChartGen"}
+    assert _compared_before_src(sample, "__pdcChartGen")
+    unguarded = "{ iframe.__g = 1; fetch(u).then(function (d) { iframe.src = d.url; }); }"
+    assert not _compared_before_src(unguarded, "__g")
+    ds = ("{ iframe.dataset.chartGen = String(n);\n"
+          "  p.then(function () { if (iframe.dataset.chartGen !== String(n)) return;\n"
+          "  iframe.src = x; }); }")
+    assert _generation_stamps(ds) == {"chartGen"}
+    assert _compared_before_src(ds, "chartGen")
+
+
+def test_set_chart_frame_ignores_a_registration_that_resolves_late():
+    """Two rapid refreshes race on `iframe.src`: the first registration may
+    resolve after the second. `setChartFrame` stamps a per-frame generation
+    when it starts and compares it before assigning `src`, so a stale answer
+    is dropped (Task 8b Part A #7)."""
+    body = _function_body(_read(VIEWERS), "setChartFrame")
+    assert body, "setChartFrame is missing"
+    stamps = _generation_stamps(body)
+    assert stamps, "setChartFrame stores no per-frame generation on the iframe"
+    assert any(_compared_before_src(body, name) for name in stamps), (
+        "setChartFrame never compares the frame's generation before setting src", stamps)
+
+
+SIDEBAR_RENDERERS = ("renderConversations", "renderMyChats", "renderSharedChats")
+UNESCAPED_SIDEBAR_SINKS = ("${chat.owner", "${chat.files", "${conv.chat_name",
+                           "${chat.chat_id}", "${conv.chat_id}", "${conv.conv_id}",
+                           "${chat.slug")
+
+
+def _template_expressions(body: str) -> list:
+    """The source of every `${...}` in `body`, braces matched."""
+    out = []
+    i = 0
+    while True:
+        start = body.find("${", i)
+        if start < 0:
+            return out
+        depth = 0
+        end = None
+        for j in range(start + 1, len(body)):
+            if body[j] == "{":
+                depth += 1
+            elif body[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end is None:
+            out.append(body[start + 2:])
+            return out
+        out.append(body[start + 2:end])
+        i = end + 1
+
+
+def _strip_escaped_calls(expr: str) -> str:
+    """`expr` with every `escapeHtml(...)` call (parens matched) removed."""
+    out, i = [], 0
+    while True:
+        k = expr.find("escapeHtml(", i)
+        if k < 0:
+            out.append(expr[i:])
+            return "".join(out)
+        out.append(expr[i:k])
+        depth = 0
+        end = len(expr) - 1
+        for j in range(k + len("escapeHtml"), len(expr)):
+            if expr[j] == "(":
+                depth += 1
+            elif expr[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        i = end + 1
+
+
+# After removing the escaped calls, what is left may only be a condition that
+# selects between string literals / escaped values: `a === b ? ' active' : ''`
+# or `chat.files ? <escaped> : ''`. The condition itself is never rendered.
+_CONSTANT_REST_RE = re.compile(
+    r"^\s*(?:[\w.$]+\s*(?:===|!==)?\s*[\w.$]*\s*\?\s*)?(?:'[^']*'|\"[^\"]*\")?\s*"
+    r"(?::\s*(?:'[^']*'|\"[^\"]*\")?\s*)?$")
+
+
+def test_the_sidebar_escape_scanner_reads_a_known_sample():
+    sample = ("function renderX(c) { return `<b data-id=\"${escapeHtml(c.id)}\""
+              " class=\"${c.id === cur ? ' active' : ''}\">"
+              "${c.files ? escapeHtml(c.files.join(', ')) : ''}"
+              "${c.owner}</b>`; }")
+    exprs = _template_expressions(_function_body(sample, "renderX"))
+    assert exprs == ["escapeHtml(c.id)", "c.id === cur ? ' active' : ''",
+                     "c.files ? escapeHtml(c.files.join(', ')) : ''", "c.owner"], exprs
+    verdicts = [bool(_CONSTANT_REST_RE.match(_strip_escaped_calls(e))) for e in exprs]
+    assert verdicts == [True, True, True, False], verdicts
+
+
+@pytest.mark.parametrize("name", SIDEBAR_RENDERERS)
+def test_the_sidebar_renderers_escape_every_interpolated_value(name):
+    """A chat's owner address, file names and the conversation's chat name
+    are user-controlled; the sidebar builds its rows through innerHTML, so
+    every interpolated value -- text and `data-*` attribute alike -- passes
+    `escapeHtml` (Task 8b Part A #11; Article XV rule 4). The one exemption
+    is a condition that only chooses between string literals (the `active`
+    class), which renders no user value."""
+    body = _function_body(_read(DASHBOARD_JS), name)
+    assert body, f"{name} is missing from static/dashboard.js"
+    raw = [sink for sink in UNESCAPED_SIDEBAR_SINKS if sink in body]
+    assert raw == [], (name, raw)
+    bad = [e.strip() for e in _template_expressions(body)
+           if not _CONSTANT_REST_RE.match(_strip_escaped_calls(e))]
+    assert bad == [], (name, bad)
+
+
+LIVE_SIDEBAR_RENDERER = "renderUnifiedChatList"
+LIVE_SIDEBAR_ID_SINKS = ("${chatId}", "${chat.slug", "${conv.conv_id}", "${conv.chat_id}")
+
+
+def test_the_live_sidebar_renderer_escapes_its_ids_and_subtitle():
+    """`renderUnifiedChatList` is the sidebar the page actually builds (the
+    three renderers above are no longer called). Its subtitle -- the sharer's
+    address or the file names -- goes through `escapeHtml` at render time, and
+    the chat / conversation ids in its `data-*` attributes do too."""
+    body = _function_body(_read(DASHBOARD_JS), LIVE_SIDEBAR_RENDERER)
+    assert body, f"{LIVE_SIDEBAR_RENDERER} is missing from static/dashboard.js"
+    raw = [sink for sink in LIVE_SIDEBAR_ID_SINKS if sink in body]
+    assert raw == [], raw
+    assert "escapeHtml(subtitle)" in body
+    assert "${subtitle}" not in body
+
+
+_CSP_NAME = "content-security-policy"
+_SKIP_DIRS = {"tests", ".venv", "venv", "node_modules", "__pycache__", ".git",
+              "docs", ".claude"}
+
+
+def _application_modules() -> list:
+    out = []
+    for p in sorted(ROOT.rglob("*.py")):
+        rel = p.relative_to(ROOT).parts
+        if any(part in _SKIP_DIRS for part in rel[:-1]):
+            continue
+        out.append(p)
+    return out
+
+
+def _policy_header_literals(path: Path) -> list:
+    """Line numbers of string/bytes literals (docstrings excluded) that name
+    the Content-Security-Policy header."""
+    import ast
+    tree = ast.parse(_read(path))
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            first = node.body[0] if node.body else None
+            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                docstrings.add(id(first.value))
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and id(node) not in docstrings:
+            value = node.value
+            if isinstance(value, bytes):
+                value = value.decode("latin-1")
+            if isinstance(value, str) and _CSP_NAME in value.lower():
+                hits.append(node.lineno)
+    return hits
+
+
+def test_only_the_chart_route_sets_its_own_policy_header():
+    """The page-policy middleware leaves any HTML response that already
+    carries a policy alone, so a module that sets one opts its page out of
+    the nonce policy. Outside the middleware (`app.py`) the ONLY such module
+    is the chart-document route (Task 8b Part A #13/#21)."""
+    owners = {str(p.relative_to(ROOT)).replace("\\", "/"): _policy_header_literals(p)
+              for p in _application_modules()}
+    owners = {k: v for k, v in owners.items() if v}
+    assert "routes/charts.py" in owners, "the scanner no longer sees the chart route"
+    extra = {k: v for k, v in owners.items() if k not in ("app.py", "routes/charts.py")}
+    assert extra == {}, extra

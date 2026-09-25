@@ -25,17 +25,25 @@ Design (docs/ENTERPRISE_ARCHITECTURE.md — roles & permissions):
   - Listings include admin-permission users (they must stay demotable); only
     the bootstrap local-admin account itself is excluded, and it never takes
     a data role or a permission change.
+  - Sign-in is invitation-only: `POST /users/invite` creates a password-less
+    placeholder and mails it a reset link (besides a share placeholder and
+    Microsoft SSO, the only way an account comes to exist).
 """
 from __future__ import annotations
+
+import asyncio
+import functools
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+import brain_client
 import db_sources
 import roles_store
 from local_store import AuthStore
 from logger_utils import log_with_sid
 from routes.admin_data import _require_admin, _json_body
+from settings import settings
 
 router = APIRouter(prefix="/api/admin", tags=["client-admin-users"])
 
@@ -282,6 +290,77 @@ async def set_user_permission(request: Request):
         "created_at": prof.get("created_at"),
         "last_login_at": prof.get("last_login_at"),
     }, roles_by_id)}
+
+
+NO_BASE_URL_MAIL_ERROR = "PUBLIC_BASE_URL is not set, so no invitation link can be mailed."
+
+
+@router.post("/users/invite")
+async def invite_user(request: Request):
+    """Invite an address (sign-in is invitation-only, D9-1): body {email}.
+    Creates a password-less placeholder (`invited_by` = this admin) when the
+    address has no account — a legacy or placeholder account without a
+    password is used as it is — mints a reset link and mails it through the
+    brain, waiting for the answer (the admin may learn whether it went out).
+    Answers {ok, email, created, mail_sent[, mail_error]}; a failed mail is
+    still 200 — the account exists and "Reset password" works for the
+    invitee. With PUBLIC_BASE_URL unset (or not http(s)) nothing is minted or
+    mailed: 200 with mail_sent false and that reason (D9-26). 400 for an invalid address or the bootstrap account, 409
+    USER_EXISTS for an account that already has a password. Audited
+    `user.invite` (never the link)."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    from routes.auth import _EMAIL_RE, _public_base, reset_link
+    body = await _json_body(request)
+    target = str(body.get("email") or "").strip().lower()
+    if not _EMAIL_RE.fullmatch(target):
+        return JSONResponse({"error": "Enter a valid email address."}, status_code=400)
+    auth = AuthStore()
+    if auth.is_bootstrap_admin(target):
+        return JSONResponse(
+            {"error": "The local admin account cannot be invited."}, status_code=400)
+    if auth.has_password(target):
+        return JSONResponse(
+            {"error": "This user already has an account.", "code": "USER_EXISTS"},
+            status_code=409)
+    created = False
+    if not auth.user_exists(target):
+        created = auth.ensure_invited_user(target, email)
+    base = _public_base()
+    mail_error = None
+    if not base:
+        # No trusted address to build a link from (D9-26): the account
+        # exists, nothing is minted or mailed.
+        if not auth.user_exists(target):
+            log_with_sid(email, "error", f"ADMIN_USER_INVITE_FAILED user={target}")
+            return JSONResponse({"error": "Could not create the invitation."}, status_code=500)
+        mail_error = NO_BASE_URL_MAIL_ERROR
+    else:
+        token = auth.create_reset_token(target) if auth.user_exists(target) else None
+        if not token:
+            log_with_sid(email, "error", f"ADMIN_USER_INVITE_FAILED user={target}")
+            return JSONResponse({"error": "Could not create the invitation."}, status_code=500)
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, functools.partial(brain_client.send_password_reset_email,
+                                        target, reset_link(base, token),
+                                        timeout=settings.BRAIN_DRAFT_TIMEOUT))
+        except Exception as e:
+            # No link nobody received stays behind; the invitee asks for a
+            # fresh one from the sign-in page.
+            auth.clear_reset_token(target)
+            mail_error = f"The invitation mail could not be sent ({type(e).__name__})."
+    mail_sent = mail_error is None
+    db_sources.audit(email, "user.invite", target=target,
+                     detail={"created": created, "mail_sent": mail_sent},
+                     ip=(request.client.host if request.client else None))
+    log_with_sid(email, "info",
+                 f"ADMIN_USER_INVITED user={target} created={created} mail_sent={mail_sent}")
+    out = {"ok": True, "email": target, "created": created, "mail_sent": mail_sent}
+    if mail_error:
+        out["mail_error"] = mail_error
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -555,13 +555,17 @@ def send_welcome_email(email: str) -> dict:
     }, sid="welcome-email")
 
 
-def send_password_reset_email(email: str, temp_password: str) -> dict:
-    """Calls /v1/send_password_reset_email — brain Gmail-relays the
-    client-generated temporary password to the user. The temp password is
-    never logged on either side; only its hash is stored (client-side)."""
+def send_password_reset_email(email: str, reset_url: str,
+                              timeout: float | None = None) -> dict:
+    """Calls /v1/send_password_reset_email — brain Gmail-relays the reset
+    link (valid 30 minutes, single use) to the user. The link carries a
+    bearer token: it is never logged on either side, and the client stores
+    only its sha256. `timeout` overrides the client-wide default (the admin
+    invite waits for the answer; the anonymous reset runs in the background).
+    Raises BrainError on non-2xx like every other wrapper."""
     return _post("/v1/send_password_reset_email", {
-        "sid": "reset-email", "email": email, "temp_password": temp_password,
-    }, sid="reset-email")
+        "sid": "reset-email", "email": email, "reset_url": reset_url,
+    }, sid="reset-email", timeout=timeout)
 
 
 def auto_analytics_plan(sid: str, schema_text: str, df_names: list[str],

@@ -12,7 +12,9 @@ URL it gets back:
   store still holds the entry; `404` otherwise, whatever the reason.
 
 The token is signed with `SECRET_KEY` (itsdangerous, salt "chart-frame") and
-names the store id and the registering user's email. Any chart can be served
+names the store id only (the URL ends up in browser history and access logs);
+the entry holds the registering user's email, which the GET compares with the
+session. Any chart can be served
 this way — a streamed chart before its history row exists, or a refreshed
 chart that is never persisted — because the lookup is by store id, not by a
 stored record.
@@ -28,10 +30,14 @@ carries a policy alone.
 
 The store lives in this process's memory. That is correct because the web
 server runs ONE worker (`--workers 1` in the Dockerfile); a second worker
-would not see the first one's entries. Entries expire after `ENTRY_TTL_S`
-and the store's total size is capped at `STORE_MAX_TOTAL_CHARS`, the oldest
-entries evicted first. A restart empties it; the page simply registers the
-chart again on its next render.
+would not see the first one's entries. Entries expire after `ENTRY_TTL_S`;
+sizes are counted in UTF-8 bytes: each user holds at most `USER_MAX_BYTES`
+and the store at most `STORE_MAX_TOTAL_BYTES`. An insert evicts, in this
+order, expired entries, then the SAME user's oldest while that user is over
+the share, then the globally oldest while the store is over its total —
+never the new entry — so one user's registrations cannot push out another
+user's live chart while the store has room for both shares. A restart
+empties it; the page simply registers the chart again on its next render.
 
 All bounds are module attributes read at CALL time. Nothing here logs the
 HTML or the token.
@@ -56,14 +62,16 @@ router = APIRouter()
 TOKEN_MAX_AGE_S = 1800
 ENTRY_TTL_S = 1800
 MAX_DOC_CHARS = 5_000_000
-STORE_MAX_TOTAL_CHARS = 200_000_000
+STORE_MAX_TOTAL_BYTES = 200_000_000
+USER_MAX_BYTES = 40_000_000
 
 _SALT = "chart-frame"
 
 _LOCK = threading.Lock()
-# id -> (email, html, created_monotonic), oldest first.
+# id -> (email, html, created_monotonic, utf8_bytes), oldest first.
 _STORE: "OrderedDict[str, tuple]" = OrderedDict()
-_STORE_CHARS = 0
+_STORE_BYTES = 0
+_USER_BYTES: dict = {}
 
 
 def _serializer() -> URLSafeTimedSerializer:
@@ -80,27 +88,41 @@ def _not_found() -> Response:
 
 def _drop(entry_id: str) -> None:
     """Remove one entry; caller holds `_LOCK`."""
-    global _STORE_CHARS
+    global _STORE_BYTES
     entry = _STORE.pop(entry_id, None)
     if entry is not None:
-        _STORE_CHARS -= len(entry[1])
+        _STORE_BYTES -= entry[3]
+        left = _USER_BYTES.get(entry[0], 0) - entry[3]
+        if left > 0:
+            _USER_BYTES[entry[0]] = left
+        else:
+            _USER_BYTES.pop(entry[0], None)
 
 
 def _store_put(email: str, html: str) -> str:
-    """Store a document and return its id. Expired entries go first, then
-    the oldest ones while the store is over its size cap; the new entry
-    itself is never evicted."""
-    global _STORE_CHARS
+    """Store a document and return its id. Evicts expired entries, then the
+    same user's oldest while the user is over `USER_MAX_BYTES`, then the
+    globally oldest while the store is over `STORE_MAX_TOTAL_BYTES`; the new
+    entry itself is never evicted."""
+    global _STORE_BYTES
     entry_id = secrets.token_hex(16)
+    size = len(html.encode("utf-8"))
     now = time.monotonic()
     with _LOCK:
         ttl = ENTRY_TTL_S
         for old_id in [k for k, v in _STORE.items() if now - v[2] > ttl]:
             _drop(old_id)
-        _STORE[entry_id] = (email, html, now)
-        _STORE_CHARS += len(html)
-        cap = STORE_MAX_TOTAL_CHARS
-        while _STORE_CHARS > cap and len(_STORE) > 1:
+        _STORE[entry_id] = (email, html, now, size)
+        _STORE_BYTES += size
+        _USER_BYTES[email] = _USER_BYTES.get(email, 0) + size
+        share = USER_MAX_BYTES
+        if _USER_BYTES[email] > share:
+            for old_id in [k for k, v in _STORE.items() if v[0] == email and k != entry_id]:
+                if _USER_BYTES.get(email, 0) <= share:
+                    break
+                _drop(old_id)
+        cap = STORE_MAX_TOTAL_BYTES
+        while _STORE_BYTES > cap and len(_STORE) > 1:
             oldest = next(iter(_STORE))
             if oldest == entry_id:
                 break
@@ -152,7 +174,7 @@ async def register_chart(request: Request):
         return JSONResponse({"error": "Chart document is too large"}, status_code=400)
     try:
         entry_id = _store_put(email, html)
-        token = _serializer().dumps({"i": entry_id, "e": email})
+        token = _serializer().dumps({"i": entry_id})
     except Exception as e:
         log_with_sid("charts", "error",
                      f"CHART_REGISTER_FAILED error={log_safe_text(type(e).__name__, 80)}")
@@ -173,12 +195,14 @@ async def serve_chart(token: str, request: Request):
         return _not_found()
     if not isinstance(data, dict):
         return _not_found()
-    entry_id, owner = data.get("i"), _norm_email(data.get("e"))
-    if not isinstance(entry_id, str) or not owner or owner != email:
-        log_with_sid("charts", "info", "CHART_TOKEN_REJECTED reason=owner_mismatch")
+    entry_id = data.get("i")
+    if not isinstance(entry_id, str):
         return _not_found()
     entry = _store_get(entry_id)
-    if entry is None or _norm_email(entry[0]) != email:
+    if entry is None:
+        return _not_found()
+    if _norm_email(entry[0]) != email:
+        log_with_sid("charts", "info", "CHART_TOKEN_REJECTED reason=owner_mismatch")
         return _not_found()
     return HTMLResponse(entry[1], headers={
         "Content-Security-Policy": _POLICY,

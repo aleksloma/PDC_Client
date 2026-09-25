@@ -195,6 +195,32 @@ class Settings(BaseModel):
     # rebuild. Logged as a warning at startup. Leave it unset in production.
     CSP_REPORT_ONLY: bool = Field(default_factory=lambda: os.getenv("CSP_REPORT_ONLY", "").strip().lower() in ("1", "true", "yes", "on"))
 
+    # The address users reach this app at (e.g. https://pdc.corp.example),
+    # used to build the password-reset / invitation link a user receives by
+    # mail. Only a value starting with http:// or https:// is used; otherwise
+    # NO link is minted or mailed (D9-26 — the request's own address comes
+    # from its Host header, which the caller controls). A startup error says
+    # so when it is unset.
+    PUBLIC_BASE_URL: str = Field(default_factory=lambda: os.getenv("PUBLIC_BASE_URL", ""))
+
+    # Open self-registration: an unknown address signing in becomes an
+    # account with the password it typed. OFF by default — accounts are
+    # created by an admin invite, a share or Microsoft SSO. The only reason it
+    # is a setting and not a deletion is the hosted demo (a startup warning
+    # when on). Never set it on a customer install.
+    ALLOW_SELF_REGISTRATION: bool = Field(default_factory=lambda: os.getenv("ALLOW_SELF_REGISTRATION", "").strip().lower() in ("1", "true", "yes", "on"))
+
+    # Sign-in / reset attempt limiting (auth_limiter.py, in memory — correct
+    # only under the one-worker rule). Beyond AUTH_FAIL_THRESHOLD failures per
+    # address inside AUTH_FAIL_WINDOW_S seconds the next attempts must wait
+    # 1, 2, 4, 8 s, then the address is locked for AUTH_LOCKOUT_S. The peer
+    # address key spaces attempts beyond AUTH_FAIL_THRESHOLD_IP the same way
+    # but never locks.
+    AUTH_FAIL_THRESHOLD: int = Field(default_factory=lambda: _int_env("AUTH_FAIL_THRESHOLD", 5, 1))
+    AUTH_FAIL_THRESHOLD_IP: int = Field(default_factory=lambda: _int_env("AUTH_FAIL_THRESHOLD_IP", 20, 1))
+    AUTH_FAIL_WINDOW_S: int = Field(default_factory=lambda: _int_env("AUTH_FAIL_WINDOW_S", 900, 1))
+    AUTH_LOCKOUT_S: int = Field(default_factory=lambda: _int_env("AUTH_LOCKOUT_S", 900, 1))
+
     # Fixed local admin account (the only role=admin user in Phase 1).
     # LOCAL_ADMIN_PASSWORD bootstraps the account ONCE (hash-only on disk,
     # forced change on first login); an existing hash is never overwritten.

@@ -24,11 +24,20 @@ Setup, all through the running stack as a normal user would do it:
   `styled_html` is seeded inside the web container on A's chat; A opens it
   at `/c/{conv_id}`; the PDF and PPTX reports render for that conversation.
 
-"No request as the viewer" is observed on the SERVER: the number of
-`GET /auth/me` lines the web container logs while the page with the markup
-loads must equal the number for a control page without it (both pages call
-`/auth/me` once for the profile menu). Browser-side request events also fire
-for requests a policy blocks, so they cannot prove a request was not sent.
+"No request as the viewer" is observed on the SERVER: the payload fetches
+`/auth/me?probe=<per-run hex>`, and the web container's log must carry no
+line with that marker after the page with the markup has loaded. Counting the
+marker only (Task 8b Part A #18) keeps the check independent of whatever
+else calls `/auth/me` on the stack at the same time; a control page still
+proves the access log is readable, so a clean result is not a blind one.
+Browser-side request events also fire for requests a policy blocks, so they
+cannot prove a request was not sent.
+
+Task 8b Part A cases: a styled table with oversized font / border /
+`!important` payloads stays inside its message column on the chat page; two
+rapid `_setChartHtml` calls on one chart end on the SECOND chart even when
+the first registration answers last; a file name made of markup is shown
+literally in the sidebar.
 
 Gated like the rest of `tests/integration/`: skipped unless `PDC_STACK_URL`
 is set; the report case also needs `PDC_STACK_BRAIN`; everything skips with a
@@ -62,10 +71,12 @@ pytestmark = [
                        reason=f"playwright is not importable: {_PLAYWRIGHT_ERROR}"),
 ]
 
+PROBE = secrets.token_hex(8)
 PAYLOAD = ("<script>parent.document.title='x'</script>"
-           "<img src=x onerror=\"fetch('/auth/me')\">")
+           f"<img src=x onerror=\"fetch('/auth/me?probe={PROBE}')\">")
 HOSTILE_TITLE = "x"
 AUTH_ME_LINE = re.compile(r'"GET /auth/me[ ?]')
+PROBE_LINE = re.compile(r'"GET /auth/me\?probe=' + PROBE + r'[ "&]')
 CSP_TEXT = "Content-Security-Policy"
 CDN_PLOTLY_HOST = "cdn.plot.ly"
 SETTLE_S = 2.5
@@ -108,10 +119,29 @@ def _log_anchor() -> str:
     return str(int(time.time()) - 120)
 
 
-def _auth_me_hits(anchor: str) -> int:
+def _web_log(anchor: str) -> str:
     result = subprocess.run(["docker", "logs", "--since", anchor, WEB_CONTAINER],
                             capture_output=True, text=True, timeout=120)
-    return len(AUTH_ME_LINE.findall((result.stdout or "") + (result.stderr or "")))
+    return (result.stdout or "") + (result.stderr or "")
+
+
+def _auth_me_hits(anchor: str) -> int:
+    """Every `/auth/me` line: only used to prove the access log is readable."""
+    return len(AUTH_ME_LINE.findall(_web_log(anchor)))
+
+
+def _probe_hits(anchor: str) -> int:
+    """`/auth/me` requests carrying THIS run's marker -- the only ones the
+    payload could make."""
+    return len(PROBE_LINE.findall(_web_log(anchor)))
+
+
+def test_the_probe_marker_is_in_the_payload_and_matches_a_log_line():
+    assert f"/auth/me?probe={PROBE}" in PAYLOAD
+    line = f'INFO: 172.18.0.1:5000 - "GET /auth/me?probe={PROBE} HTTP/1.1" 401'
+    assert PROBE_LINE.search(line)
+    assert not PROBE_LINE.search('"GET /auth/me HTTP/1.1" 200')
+    assert not PROBE_LINE.search(f'"GET /auth/me?probe={PROBE}0 HTTP/1.1" 200')
 
 
 def _login_cookie(base_url: str, email: str, password: str) -> str:
@@ -347,7 +377,7 @@ def test_recipient_dashboard_markup_has_no_effect_on_the_viewer(
         pytest.skip("the web container's access log shows no /auth/me line for the "
                     "control page; the server-side count cannot be taken")
 
-    before = _auth_me_hits(anchor)
+    before = _probe_hits(anchor)
     ctx, page, seen, _ = _load_dashboard(browser, base_url, recipient["cookie"], hostile_id, 3)
     try:
         title = page.title()
@@ -363,8 +393,9 @@ def test_recipient_dashboard_markup_has_no_effect_on_the_viewer(
             assert "<script" not in low, html[:300]
     finally:
         ctx.close()
-    extra = _auth_me_hits(anchor) - before - control
-    assert extra == 0, f"{extra} /auth/me request(s) beyond the page's own"
+    time.sleep(SETTLE_S)
+    extra = _probe_hits(anchor) - before
+    assert extra == 0, f"{extra} /auth/me request(s) carrying the payload's marker"
 
 
 def test_real_plotly_tile_renders_offline_with_hover_and_no_violation(
@@ -434,7 +465,7 @@ def test_chat_page_seeded_markup_has_no_effect_on_the_viewer(
         pytest.skip("the web container's access log shows no /auth/me line for the "
                     "control page; the server-side count cannot be taken")
 
-    before = _auth_me_hits(anchor)
+    before = _probe_hits(anchor)
     ctx, page, seen, frame = _load_conversation(browser, base_url, cookie, seeded_conversation)
     try:
         title = page.title()
@@ -448,8 +479,9 @@ def test_chat_page_seeded_markup_has_no_effect_on_the_viewer(
             assert "<img" not in low and "onerror" not in low and "<script" not in low, html[:300]
     finally:
         ctx.close()
-    extra = _auth_me_hits(anchor) - before - control
-    assert extra == 0, f"{extra} /auth/me request(s) beyond the page's own"
+    time.sleep(SETTLE_S)
+    extra = _probe_hits(anchor) - before
+    assert extra == 0, f"{extra} /auth/me request(s) carrying the payload's marker"
 
 
 def test_chat_page_real_chart_renders_offline_with_hover_and_no_violation(
@@ -686,5 +718,206 @@ def test_a_chart_document_cannot_load_script_from_another_host(
         assert EXTERNAL_MARK not in text, text
         assert beacon_server["hits"] == [], (
             f"the chart document fetched script from another host: {beacon_server['hits']}")
+    finally:
+        context.close()
+
+
+# ---------------------------------------------------------------------------
+# Task 8b Part A #2/#15: an oversized styled table stays in its message
+# ---------------------------------------------------------------------------
+OVERSIZED_STYLED = (
+    "<style>#T_ov td { font-size: 4000px !important; border: 3000px solid red; "
+    "line-height: 900; text-indent: -9999px; border-spacing: 5000px; }</style>"
+    '<table id="T_ov"><tr><td class="data row0 col0" '
+    'style="font-size:9999px !important; border-width:3000px; line-height:500; '
+    'text-shadow:0 0 900px red; text-indent:9999px">ov-cell</td></tr></table>')
+MAX_FONT_PX = 72
+MAX_BORDER_PX = 20
+
+
+@pytest.fixture(scope="module")
+def oversized_conversation(session, chat, account) -> str:
+    return seed_history_row(chat, {
+        "role": "ai", "content": "Seeded oversized table.",
+        "table": {"columns": ["a"], "rows": [{"a": "1"}], "total_rows": 1,
+                  "styled_html": OVERSIZED_STYLED},
+    }, email=account["email"])
+
+
+_TABLE_GEOMETRY = """() => {
+  const out = [];
+  document.querySelectorAll('.styled-table-container').forEach((box) => {
+    const msg = box.closest('.message-content') || box.closest('.message');
+    const b = box.getBoundingClientRect();
+    const m = msg ? msg.getBoundingClientRect() : null;
+    let font = 0, border = 0;
+    box.querySelectorAll('td, th').forEach((cell) => {
+      const cs = getComputedStyle(cell);
+      font = Math.max(font, parseFloat(cs.fontSize) || 0);
+      for (const side of ['Top', 'Right', 'Bottom', 'Left']) {
+        border = Math.max(border, parseFloat(cs['border' + side + 'Width']) || 0);
+      }
+    });
+    out.push({text: box.innerText.slice(0, 40),
+              box: [b.left, b.right, b.top, b.bottom],
+              msg: m ? [m.left, m.right, m.top, m.bottom] : null,
+              font: font, border: border});
+  });
+  return out;
+}"""
+
+
+def test_an_oversized_styled_table_stays_inside_its_message(
+        base_url, browser, session, oversized_conversation):
+    cookie = session.cookies.get(SESSION_COOKIE)
+    assert cookie
+    context, page, seen = _new_page(browser, base_url, cookie)
+    try:
+        page.goto(f"{base_url}/c/{oversized_conversation}", wait_until="load",
+                  timeout=PAGE_TIMEOUT_MS)
+        page.wait_for_selector(".styled-table-container", timeout=PAGE_TIMEOUT_MS)
+        page.wait_for_timeout(int(SETTLE_S * 1000))
+        rows = [r for r in page.evaluate(_TABLE_GEOMETRY) if "ov-cell" in r["text"]]
+        assert rows, "the oversized table did not render as a styled table"
+        for row in rows:
+            assert row["msg"], "the table is not inside a message"
+            left, right, top, bottom = row["box"]
+            m_left, m_right, _m_top, _m_bottom = row["msg"]
+            assert left >= m_left - 1 and right <= m_right + 1, row
+            assert bottom - top < 1500, row
+            assert row["font"] <= MAX_FONT_PX, row
+            assert row["border"] <= MAX_BORDER_PX, row
+        assert _violations(page) == [], _violations(page)
+    finally:
+        context.close()
+
+
+# ---------------------------------------------------------------------------
+# Task 8b Part A #7/#19: two rapid refreshes end on the second chart
+# ---------------------------------------------------------------------------
+RACE_FIRST = ("<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>"
+              "<div id=\"race\">race-first</div></body></html>")
+RACE_SECOND = ("<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>"
+               "<div id=\"race\">race-second</div></body></html>")
+_TWO_REFRESHES = """([first, second]) => {
+  const c = document.querySelector('.plotly-container');
+  if (!c || typeof c._setChartHtml !== 'function') return false;
+  c._setChartHtml(first);
+  c._setChartHtml(second);
+  return true;
+}"""
+_FRAME_SRC = """() => {
+  const f = document.querySelector('.plotly-container iframe');
+  return f ? f.src : '';
+}"""
+
+
+def _race_text(page) -> str:
+    src = page.evaluate(_FRAME_SRC)
+    for frame in _child_frames(page):
+        if frame.url == src:
+            try:
+                return frame.locator("#race").inner_text(timeout=1_000)
+            except Exception:
+                return ""
+    return ""
+
+
+def test_two_rapid_refreshes_end_on_the_second_chart(
+        base_url, browser, session, seeded_conversation):
+    """The FIRST registration is held back until the second has landed, so it
+    resolves last -- exactly the race; the frame must keep the second chart."""
+    cookie = session.cookies.get(SESSION_COOKIE)
+    assert cookie
+    ctx, page, seen, _frame = _load_conversation(browser, base_url, cookie, seeded_conversation)
+    held = []
+
+    def hold_first(route):
+        body = route.request.post_data or ""
+        if "race-first" in body and not held:
+            held.append(route)
+            return
+        route.continue_()
+
+    try:
+        page.route("**/api/charts", hold_first)
+        assert page.evaluate(_TWO_REFRESHES, [RACE_FIRST, RACE_SECOND]) is True, \
+            "no plotly container with a _setChartHtml hook on the page"
+        deadline = time.time() + 30
+        while _race_text(page) != "race-second" and time.time() < deadline:
+            page.wait_for_timeout(250)
+        assert _race_text(page) == "race-second", "the second chart never rendered"
+        assert held, "the first registration was not intercepted"
+        held[0].continue_()
+        page.wait_for_timeout(int(SETTLE_S * 1000) * 2)
+        assert _race_text(page) == "race-second", \
+            "the late first registration replaced the newer chart"
+    finally:
+        try:
+            page.unroute("**/api/charts")
+        except Exception:
+            pass
+        ctx.close()
+
+
+# ---------------------------------------------------------------------------
+# Task 8b Part A #11: a file name made of markup is shown as text
+# ---------------------------------------------------------------------------
+# `</b>` would not survive: the upload sanitiser keeps the BASENAME, and the
+# slash in a closing tag starts a new path component. Opening tags only.
+MARKUP_FILE_NAME = "<b>x<i>y.csv"
+
+
+@pytest.fixture(scope="module")
+def markup_named_chat(session, repo_root, session_scoped_chat_ids,
+                      session_scoped_upload_sids):
+    import os
+
+    from .conftest import FIXTURE_CSV, session_id
+    import local_store
+
+    if local_store.sanitize_upload_filename(MARKUP_FILE_NAME) != MARKUP_FILE_NAME:
+        pytest.skip("the upload sanitiser alters the markup file name")
+    assert session.post("/new_session").status_code == 200
+    session_scoped_upload_sids.add(session_id(session))
+    with open(os.path.join(repo_root, "tools", "fixtures", FIXTURE_CSV), "rb") as fh:
+        up = session.post("/upload", files={"files": (MARKUP_FILE_NAME, fh.read(), "text/csv")})
+    assert up.status_code == 200, (up.status_code, up.text[:300])
+    session_scoped_upload_sids.add(session_id(session))
+    saved = up.json().get("saved") or []
+    if MARKUP_FILE_NAME not in json_dumps(saved):
+        pytest.skip(f"the stored name differs from the uploaded one: {saved!r}")
+    created = session.post("/generate_chatdata", json={})
+    assert created.status_code == 200, (created.status_code, created.text[:300])
+    chat_id = created.json().get("chat_id")
+    assert chat_id
+    session_scoped_chat_ids.append(chat_id)
+    return chat_id
+
+
+def json_dumps(value) -> str:
+    import json
+    return json.dumps(value, ensure_ascii=False)
+
+
+def test_a_markup_file_name_is_shown_literally_in_the_sidebar(
+        base_url, browser, session, markup_named_chat):
+    cookie = session.cookies.get(SESSION_COOKIE)
+    assert cookie
+    context, page, seen = _new_page(browser, base_url, cookie)
+    try:
+        page.goto(f"{base_url}/lab", wait_until="load", timeout=PAGE_TIMEOUT_MS)
+        # The live sidebar is renderUnifiedChatList (static/dashboard.js) into
+        # #chatsList; renderMyChats / #myChatsList is dead code (no template
+        # carries that container), so a locator there can never match.
+        item = page.locator(f'#chatsList .chat-item-row[data-chat-id="{markup_named_chat}"]')
+        deadline = time.time() + PAGE_TIMEOUT_MS / 1000
+        while item.count() < 1 and time.time() < deadline:
+            page.wait_for_timeout(250)
+        assert item.count() >= 1, "the chat is not listed in the sidebar"
+        subtitle = item.first.locator(".chat-subtitle")
+        text = subtitle.inner_text()
+        assert MARKUP_FILE_NAME in text, text
+        assert subtitle.locator("b, i").count() == 0, subtitle.inner_html()
     finally:
         context.close()

@@ -4,10 +4,13 @@
   account (`users/<email>/profile.json` with `invited_by` / `invited_at`, no
   password) through all three share routes — chat, conversation, dashboard —
   via `AuthStore.ensure_invited_user`, which never overwrites an existing
-  profile. The first-sign-in branch then refuses that address (403, nothing
-  stored, no session): the mailbox owner proves ownership through the mailed
-  reset instead of whoever types the address first. An existing account is
-  unaffected.
+  profile. Sign-in then refuses that address (nothing stored, no session):
+  the mailbox owner proves ownership through the mailed reset link instead of
+  whoever types the address first. An existing account is unaffected.
+* Task 9 (D9-4): every sign-in failure -- placeholder, legacy password-less
+  account, unknown address, wrong password -- answers 401 with ONE neutral
+  line, so the page never tells an anonymous caller which kind of address it
+  typed.
 * Only the chat's OWNER may share a conversation of it: the route also grants
   chat-level access, which a recipient must not be able to hand out.
 * `local_store._safe_email` never yields `.`, `..` or an empty path segment.
@@ -16,6 +19,7 @@ Offline: DATA_ROOT is tmp_path, the mail relays are stubbed, the activity
 worker is stubbed by tests/conftest.py.
 """
 import json
+import re
 
 import pytest
 from fastapi import FastAPI, Request
@@ -31,6 +35,17 @@ EXISTING = "existing@acme.com"
 EXISTING_PW = "Existing-passw0rd"
 NEWBIE = "new.person@corp.example"
 CHAT = "c_authroutes0001"
+
+NEUTRAL_FAILURE = ("Sign-in failed. Check your email and password, or use "
+                   "“Reset password” if you have not set one yet.")
+# The per-request CSP nonce appears as `nonce="..."` attributes and inside the
+# policy header; strip every form so two renders of the same page compare equal.
+_NONCE_RE = re.compile(r"""nonce(?:-[A-Za-z0-9_\-]+|\s*=\s*["'][^"']*["'])"""
+                       r"""|__CSP_NONCE__\s*=\s*["'][^"']*["']""")
+
+
+def _strip_nonce(text: str) -> str:
+    return _NONCE_RE.sub("nonce", text)
 
 
 @pytest.fixture
@@ -150,7 +165,9 @@ def test_placeholder_address_cannot_be_claimed_at_first_sign_in(app_client, rout
     stranger = TestClient(app_client["app"])
     r = stranger.post("/auth/login", data={"email": NEWBIE, "password": "attacker-pw"},
                       follow_redirects=False)
-    assert r.status_code == 403, (r.status_code, r.headers.get("location"))
+    assert r.status_code == 401, (r.status_code, r.headers.get("location"))
+    assert NEUTRAL_FAILURE in r.text
+    assert "shared with this address" not in r.text
     assert not local_store.AuthStore().get_auth(NEWBIE).get("password_hash")
     assert stranger.get("/auth/me").status_code == 401
 
@@ -205,11 +222,11 @@ def test_safe_email_leaves_a_normal_address_unchanged():
     assert local_store._safe_email("a/b@x.com") == "a_b@x.com"
 
 
-def test_a_legacy_email_only_profile_still_takes_the_legacy_reset_path(app_client):
+def test_a_legacy_email_only_profile_gets_the_neutral_refusal(app_client):
     """A profile written by the email-only build ({email, created_at}, no
-    password, no invitation fields) must keep its old sign-in answer: refused
-    with the "existed before passwords" text, never the invitation text, and
-    the typed password is not adopted."""
+    password, no invitation fields) is refused with the ONE neutral line
+    (401) -- no "existed before passwords" text that would tell a caller the
+    address is a legacy account -- and the typed password is not adopted."""
     legacy = "legacy-user@example.com"
     path = _profile_path(app_client["tmp"], legacy)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -218,7 +235,50 @@ def test_a_legacy_email_only_profile_still_takes_the_legacy_reset_path(app_clien
     stranger = TestClient(app_client["app"])
     r = stranger.post("/auth/login", data={"email": legacy, "password": "typed-pw"},
                       follow_redirects=False)
-    assert r.status_code == 403
-    assert "existed before passwords" in r.text
+    assert r.status_code == 401
+    assert NEUTRAL_FAILURE in r.text
+    assert "existed before passwords" not in r.text
     assert "shared with this address" not in r.text
     assert not local_store.AuthStore().get_auth(legacy).get("password_hash")
+    assert stranger.get("/auth/me").status_code == 401
+
+
+def test_every_sign_in_failure_renders_the_same_page(app_client):
+    """Invited placeholder, legacy account, unknown address and wrong password
+    all get the same status and the byte-identical body once the per-request
+    nonce is stripped (the email field echoes the typed address, so every case
+    types the SAME address shape through its own account)."""
+    tmp = app_client["tmp"]
+    invited = "invited-case@example.com"
+    legacy = "legacy-case@example.com"
+    unknown = "unknown-case@example.com"
+    local_store.AuthStore().ensure_invited_user(invited, OWNER)
+    lp = _profile_path(tmp, legacy)
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    lp.write_text(json.dumps({"email": legacy, "created_at": "2025-01-01T00:00:00Z"}),
+                  encoding="utf-8")
+
+    def attempt(email, password):
+        tc = TestClient(app_client["app"])
+        r = tc.post("/auth/login", data={"email": email, "password": password},
+                    follow_redirects=False)
+        # The typed address is echoed into the form; neutralise it so only
+        # the refusal itself is compared.
+        return r.status_code, _strip_nonce(r.text.replace(email, "EMAIL"))
+
+    results = {
+        "invited": attempt(invited, "attacker-pw"),
+        "legacy": attempt(legacy, "attacker-pw"),
+        "unknown": attempt(unknown, "attacker-pw"),
+        "wrong_password": attempt(EXISTING, "not-the-password"),
+    }
+    for name, (status, body) in results.items():
+        assert status == 401, (name, status)
+        assert NEUTRAL_FAILURE in body, name
+        assert "shared with this address" not in body, name
+        assert "existed before passwords" not in body, name
+    bodies = {name: body for name, (_, body) in results.items()}
+    ref = bodies["wrong_password"]
+    for name, body in bodies.items():
+        assert body == ref, f"{name} page differs from the wrong-password page"
+    assert not (tmp / "users" / unknown).exists()

@@ -140,7 +140,7 @@ def test_normal_login_form_still_reaches_the_route(client):
     """A 2-field urlencoded form is far below the caps; the login route must
     run and produce ITS response. Wrong password is used so the response is
     unmistakably route-produced (401 + the landing template with the
-    "Incorrect password" message) and not the parser's 400."""
+    neutral sign-in failure message) and not the parser's 400."""
     r = client.post("/auth/login", data={"email": EMAIL, "password": "wrong-pw"},
                     follow_redirects=False)
     status = r.status_code
@@ -149,7 +149,7 @@ def test_normal_login_form_still_reaches_the_route(client):
     assert status == 401, (status, text[:300])
     assert status != 400, (status, text[:300])
     assert "text/html" in content_type, (content_type, text[:300])
-    assert "Incorrect password" in text, text[:300]
+    assert "Sign-in failed. Check your email and password" in text, text[:300]
     assert "Too many fields" not in text, text[:300]
     # And the correct password goes all the way through the route (302 to /lab).
     ok = _login(client)
