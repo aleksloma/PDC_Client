@@ -148,14 +148,14 @@ def test_login_stamps_last_login_on_both_branches(client, monkeypatch, tmp_path)
     auth = local_store.AuthStore()
     # New-user branch (flag on, no user folder -> entered password becomes theirs).
     r = client.post("/auth/login",
-                    data={"email": "new@x.com", "password": "pw123"},
+                    data={"email": "new@x.com", "password": "pw123-long"},
                     follow_redirects=False)
     assert r.status_code == 302
     first = auth.get_profile("new@x.com")["last_login_at"]
     assert first
     # Returning-user branch (password verify path).
     r2 = client.post("/auth/login",
-                     data={"email": "new@x.com", "password": "pw123"},
+                     data={"email": "new@x.com", "password": "pw123-long"},
                      follow_redirects=False)
     assert r2.status_code == 302
     second = auth.get_profile("new@x.com")["last_login_at"]
@@ -171,7 +171,7 @@ def test_login_does_not_self_register_by_default(client, tmp_path, monkeypatch):
     if "ALLOW_SELF_REGISTRATION" in type(settings).model_fields:
         monkeypatch.setattr(settings, "ALLOW_SELF_REGISTRATION", False)
     r = client.post("/auth/login",
-                    data={"email": "new@x.com", "password": "pw123"},
+                    data={"email": "new@x.com", "password": "pw123-long"},
                     follow_redirects=False)
     assert r.status_code == 401, (r.status_code, r.headers.get("location"))
     assert not (tmp_path / "users" / "new@x.com").exists()

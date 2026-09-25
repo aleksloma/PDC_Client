@@ -53,6 +53,21 @@ templates = Jinja2Templates(directory=str(_HERE / "templates"))
 
 _STARTED_AT = datetime.now(timezone.utc)
 
+# The clock the session layer reads (the absolute session lifetime and the
+# sign-in time routes/auth.py stamps). A module attribute so the tests can
+# replace it.
+_session_clock = time.time
+
+
+def _session_now() -> int:
+    """`_session_clock()` as whole seconds; the wall clock if it fails."""
+    try:
+        return int(_session_clock())
+    except Exception as e:
+        log_with_sid("session", "warning",
+                     f"SESSION_CLOCK_FAILED {log_safe_text(type(e).__name__, 80)}")
+        return int(time.time())
+
 
 def _build_stamp() -> str:
     """One line identifying the RUNNING build, for the admin sidebar.
@@ -134,15 +149,47 @@ async def lifespan(app: FastAPI):
 
 
 class RememberMeSessionMiddleware(SessionMiddleware):
-    """SessionMiddleware with a per-session cookie lifetime.
+    """SessionMiddleware with an ABSOLUTE session lifetime.
 
-    Sessions carrying `remember: True` (the "Remember me" checkbox at login)
-    get a persistent cookie with `Max-Age` = the configured `max_age`
-    (~30 days); all other sessions get a browser-session cookie (no Max-Age),
-    which dies when the browser closes. Only the Set-Cookie write differs
-    from the stock starlette middleware — reading/unsigning is inherited
-    behavior (max_age acts as the outer validity cap for both kinds).
+    `max_age` (REMEMBER_ME_MAX_DAYS in days) is the cap, counted from the
+    sign-in time `iat` that routes/auth.py stamps at every sign-in, however
+    often the cookie is renewed. A cookie issued before `iat` existed takes
+    its signer timestamp (its last renewal) as `iat`, written into the
+    session. At `now - iat >= max_age` the session is emptied and the
+    clearing cookie is sent. Sessions carrying `remember: True` (the
+    "Remember me" checkbox) get a persistent cookie whose `Max-Age` is the
+    REMAINING lifetime, so the browser's expiry stays sign-in + cap; all
+    other sessions get a browser-session cookie (no Max-Age), refused at the
+    same cap. The signer's own `max_age` check (real time since the last
+    renewal) still runs first as the outer bound.
     """
+
+    def _enforce_lifetime(self, scope, signed_at) -> None:
+        """Stamp a missing `iat` from the signer timestamp; empty a session
+        whose lifetime is over. Never raises (a failure leaves the session
+        as it is — it is still a validly signed one)."""
+        try:
+            session = scope.get("session")
+            if not session or not self.max_age:
+                return
+            iat = session.get("iat")
+            if not isinstance(iat, int) or isinstance(iat, bool):
+                iat = int(signed_at.timestamp())
+                session["iat"] = iat
+            if _session_now() - iat >= self.max_age:
+                scope["session"] = {}
+        except Exception as e:
+            log_with_sid("session", "warning",
+                         f"SESSION_LIFETIME_CHECK_FAILED {log_safe_text(type(e).__name__, 80)}")
+
+    def _remaining_max_age(self, session) -> int:
+        """Seconds left of the session's lifetime (the whole cap when it
+        carries no usable `iat`)."""
+        iat = session.get("iat")
+        if not isinstance(iat, int) or isinstance(iat, bool):
+            return int(self.max_age)
+        elapsed = max(0, _session_now() - iat)
+        return max(0, int(self.max_age) - elapsed)
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] not in ("http", "websocket"):
@@ -160,9 +207,11 @@ class RememberMeSessionMiddleware(SessionMiddleware):
         if self.session_cookie in connection.cookies:
             data = connection.cookies[self.session_cookie].encode("utf-8")
             try:
-                data = self.signer.unsign(data, max_age=self.max_age)
+                data, signed_at = self.signer.unsign(data, max_age=self.max_age,
+                                                     return_timestamp=True)
                 scope["session"] = _json.loads(b64decode(data))
                 initial_session_was_empty = False
+                self._enforce_lifetime(scope, signed_at)
             except BadSignature:
                 scope["session"] = {}
         else:
@@ -174,13 +223,17 @@ class RememberMeSessionMiddleware(SessionMiddleware):
                     data = b64encode(_json.dumps(scope["session"]).encode("utf-8"))
                     data = self.signer.sign(data)
                     headers = MutableHeaders(scope=message)
-                    # Persistent Max-Age only when the user asked to be remembered.
+                    # Persistent Max-Age only when the user asked to be
+                    # remembered, and then only what is LEFT of the lifetime.
                     persist = bool(scope["session"].get("remember"))
+                    max_age = ""
+                    if persist and self.max_age:
+                        max_age = f"Max-Age={self._remaining_max_age(scope['session'])}; "
                     header_value = "{session_cookie}={data}; path={path}; {max_age}{security_flags}".format(
                         session_cookie=self.session_cookie,
                         data=data.decode("utf-8"),
                         path=self.path,
-                        max_age=f"Max-Age={self.max_age}; " if (persist and self.max_age) else "",
+                        max_age=max_age,
                         security_flags=self.security_flags,
                     )
                     headers.append("Set-Cookie", header_value)
@@ -389,6 +442,43 @@ class PasswordChangeGate:
         await response(scope, receive, send)
 
 
+class SessionGenerationGate:
+    """End a session whose account changed its password since it signed in.
+
+    Sign-in stamps the account's `session_generation` into the session as
+    `gen`; a password change or a used reset link writes a new one (the
+    session that made a change re-stamps itself). For every session carrying
+    an `email`, a `gen` (absent = "") that differs from the account's value
+    EMPTIES the session in place: the request continues as anonymous (pages
+    redirect to `/`, APIs answer 401) and the session middleware sends the
+    clearing cookie. A cookie without `gen` on an account that has no
+    generation matches, so an upgrade signs nobody out. The account's value
+    is cached in-process (local_store), never read per request.
+
+    Pure ASGI, registered INSIDE the session middleware (which fills
+    `scope["session"]`) and outside the password-change gate. A failure is
+    logged and lets the request through (the cookie is still a signed one).
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http":
+            try:
+                session = scope.get("session")
+                email = session.get("email") if session else None
+                if email and session.get("gen", "") != AuthStore().session_generation(email):
+                    session.clear()
+                    log_with_sid("session", "info",
+                                 f"SESSION_ENDED_BY_PASSWORD_CHANGE "
+                                 f"email={log_safe_text(str(email), 254)}")
+            except Exception as e:
+                log_with_sid("session", "error",
+                             f"SESSION_GENERATION_CHECK_FAILED {log_safe_text(type(e).__name__, 80)}")
+        await self.app(scope, receive, send)
+
+
 # The enterprise page policy. `{nonce}` is the per-response nonce every
 # inline <script> of the templates carries; nothing else inline may run.
 # Styles stay 'unsafe-inline' (the pages and the styled tables use inline
@@ -491,12 +581,16 @@ class ContentSecurityPolicy:
         await self.app(scope, receive, send_with_policy)
 
 
-_REMEMBER_ME_MAX_AGE = 30 * 24 * 60 * 60   # ~30 days
+# The absolute session lifetime (seconds): RememberMeSessionMiddleware's cap.
+_REMEMBER_ME_MAX_AGE = settings.REMEMBER_ME_MAX_DAYS * 86400
 
 app = FastAPI(title="PowerDataChat Client (enterprise)", version="1.0", lifespan=lifespan)
 # Registered FIRST, so it sits INSIDE the session middleware below and sees
 # the unsigned session.
 app.add_middleware(PasswordChangeGate)
+# Between the session middleware and the password gate: a session ended by
+# a password change is emptied before anything else reads it.
+app.add_middleware(SessionGenerationGate)
 app.add_middleware(RememberMeSessionMiddleware, secret_key=settings.SECRET_KEY,
                    same_site="lax", max_age=_REMEMBER_ME_MAX_AGE,
                    https_only=settings.SESSION_HTTPS_ONLY)

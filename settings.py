@@ -221,6 +221,17 @@ class Settings(BaseModel):
     AUTH_FAIL_WINDOW_S: int = Field(default_factory=lambda: _int_env("AUTH_FAIL_WINDOW_S", 900, 1))
     AUTH_LOCKOUT_S: int = Field(default_factory=lambda: _int_env("AUTH_LOCKOUT_S", 900, 1))
 
+    # The one password rule (routes/auth.password_rule_error), applied
+    # wherever a password is SET: at least PASSWORD_MIN_LENGTH characters
+    # (default 8; never below 4). Sign-in never checks it, so an existing
+    # shorter password keeps working until its next change.
+    PASSWORD_MIN_LENGTH: int = Field(default_factory=lambda: _int_env("PASSWORD_MIN_LENGTH", 8, 4))
+
+    # Absolute session lifetime: a session ends REMEMBER_ME_MAX_DAYS after
+    # sign-in however often it is renewed (remembered or not); a remembered
+    # cookie's Max-Age is the REMAINING lifetime.
+    REMEMBER_ME_MAX_DAYS: int = Field(default_factory=lambda: _int_env("REMEMBER_ME_MAX_DAYS", 30, 1))
+
     # Fixed local admin account (the only role=admin user in Phase 1).
     # LOCAL_ADMIN_PASSWORD bootstraps the account ONCE (hash-only on disk,
     # forced change on first login); an existing hash is never overwritten.

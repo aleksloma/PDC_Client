@@ -67,12 +67,14 @@ def world(tmp_path, monkeypatch):
     roles_store.RolesStore().ensure_base_role()
 
     sent = []
+    sent_kwargs = []
     fail = {"on": False}
 
     def fake_reset_mail(email, reset_url, **kwargs):
         if fail["on"]:
             raise brain_client.BrainError("brain answered 400")
         sent.append((email, reset_url))
+        sent_kwargs.append(dict(kwargs))
         return {"ok": True}
 
     monkeypatch.setattr(brain_client, "send_password_reset_email", fake_reset_mail)
@@ -101,7 +103,8 @@ def world(tmp_path, monkeypatch):
             tc.post(f"/_login/{who}")
         return tc
 
-    return {"tmp": tmp_path, "sent": sent, "fail": fail, "client": client}
+    return {"tmp": tmp_path, "sent": sent, "sent_kwargs": sent_kwargs, "fail": fail,
+            "client": client}
 
 
 def _invite(world, email, who=ADMIN):
@@ -144,6 +147,23 @@ def test_an_admin_invites_a_new_address(world):
     assert len(token) == 43
     assert _auth(world["tmp"], INVITEE).get("reset_token_hash") == \
         hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def test_the_invite_mail_is_of_kind_invite(world):
+    """The invitee gets invitation wording, not "a password reset was
+    requested": the route passes kind="invite" to the brain relay."""
+    assert _invite(world, INVITEE).status_code == 200
+    assert world["sent_kwargs"], "no invitation mail"
+    assert world["sent_kwargs"][-1].get("kind") == "invite", world["sent_kwargs"]
+
+
+def test_a_reset_requested_by_the_invitee_is_of_kind_reset(world):
+    assert _invite(world, INVITEE).status_code == 200
+    r = world["client"]().post("/auth/reset_password", data={"email": INVITEE},
+                               follow_redirects=False)
+    assert r.status_code == 200
+    assert len(world["sent_kwargs"]) == 2, world["sent_kwargs"]
+    assert world["sent_kwargs"][-1].get("kind", "reset") == "reset", world["sent_kwargs"]
 
 
 def test_the_invite_is_audited(world):

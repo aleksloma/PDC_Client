@@ -424,3 +424,111 @@ def test_the_ip_space_is_capped_too(lim, monkeypatch):
         assert _begin(mod, email=f"p{i}@x.com", ip=peer).allowed
     assert _begin(mod, email="d@x.com", ip="1.1.1.1").allowed is True, \
         "the least recently touched peer was not evicted"
+
+
+# ---------------------------------------------------------------------------
+# lockout=False: spaced, never locked (the configured local admin account)
+#
+# `begin(kind, email, ip, *, lockout=True)`. With lockout=False the address
+# key keeps the 1, 2, 4, 8 s spacing and, where it would lock, sets another
+# 8 s not-before instead: never a lockout, never an AUTH_LOCKOUT line. The
+# thresholds and the IP schedule are unchanged.
+# ---------------------------------------------------------------------------
+def _begin_nolock(mod, email=EMAIL, ip=IP, kind="login"):
+    v = mod.begin(kind, email, ip, lockout=False)
+    assert hasattr(v, "allowed") and hasattr(v, "retry_after_s"), v
+    return v
+
+
+def _capture_limiter_logs(mod, monkeypatch):
+    lines = []
+
+    def rec(sid, level, message, **ctx):
+        lines.append(f"{sid} {level} {message} {ctx}")
+
+    monkeypatch.setattr(mod, "log_with_sid", rec, raising=False)
+    return lines
+
+
+def test_without_lockout_the_threshold_and_first_steps_are_unchanged(lim):
+    mod, clock = lim
+    for i in range(5):
+        assert _begin_nolock(mod).allowed, i + 1
+    for gap in (1, 2, 4, 8):
+        early = _begin_nolock(mod)
+        assert early.allowed is False and early.retry_after_s == gap, (gap, early)
+        clock.advance(gap)
+        assert _begin_nolock(mod).allowed is True, gap
+
+
+def test_without_lockout_the_address_is_spaced_at_eight_seconds_and_never_locked(lim, monkeypatch):
+    mod, clock = lim
+    lines = _capture_limiter_logs(mod, monkeypatch)
+    for i in range(5):
+        assert _begin_nolock(mod).allowed, i + 1
+    admitted = 0
+    for n in range(14):                       # far past the point that locks by default
+        early = _begin_nolock(mod)
+        assert early.allowed is False, n
+        assert 1 <= early.retry_after_s <= 8, (n, early)
+        clock.advance(early.retry_after_s)
+        v = _begin_nolock(mod)
+        assert v.allowed is True, (n, v, "locked instead of spaced")
+        admitted += 1
+    assert admitted == 14
+    # From the would-be lockout on, the step stays at 8 s.
+    early = _begin_nolock(mod)
+    assert early.allowed is False and early.retry_after_s == 8, early
+    assert not [ln for ln in lines if "AUTH_LOCKOUT" in ln], lines
+
+
+def test_without_lockout_the_would_be_lock_point_is_an_eight_second_wait(lim):
+    mod, clock = lim
+    for i in range(5):
+        assert _begin_nolock(mod).allowed
+    for gap in (1, 2, 4, 8):
+        clock.advance(gap)
+        assert _begin_nolock(mod).allowed, gap
+    clock.advance(8)
+    assert _begin_nolock(mod).allowed is True, "the 10th attempt was locked"
+    v = _begin_nolock(mod)
+    assert v.allowed is False and v.retry_after_s == 8, v
+    clock.advance(7)
+    v = _begin_nolock(mod)
+    assert v.allowed is False and v.retry_after_s == 1, v
+    clock.advance(1)
+    assert _begin_nolock(mod).allowed is True
+
+
+def test_the_default_still_locks(lim, monkeypatch):
+    mod, clock = lim
+    lines = _capture_limiter_logs(mod, monkeypatch)
+    for i in range(5):
+        assert mod.begin("login", EMAIL, IP, lockout=True).allowed
+    for gap in (1, 2, 4, 8):
+        clock.advance(gap)
+        assert mod.begin("login", EMAIL, IP, lockout=True).allowed, gap
+    clock.advance(16)
+    v = mod.begin("login", EMAIL, IP)
+    assert v.allowed is False and v.retry_after_s > 8, v
+    assert len([ln for ln in lines if "AUTH_LOCKOUT" in ln]) == 1, lines
+
+
+def test_without_lockout_the_ip_schedule_still_applies(lim, monkeypatch):
+    mod, clock = lim
+    _set(monkeypatch, "AUTH_FAIL_THRESHOLD_IP", 3)
+    for i in range(3):
+        assert _begin_nolock(mod, email=f"n{i}@x.com").allowed
+    v = _begin_nolock(mod, email="fresh@x.com")
+    assert v.allowed is False and v.retry_after_s == 1, v
+
+
+def test_a_no_lockout_key_does_not_shield_another_address(lim):
+    """The flag is per call: a normal address from the same peer still locks."""
+    mod, clock = lim
+    for _ in range(5):
+        assert _begin_nolock(mod, email="admin-id").allowed
+    _nine_failures(mod, clock)
+    clock.advance(16)
+    v = _begin(mod)
+    assert v.allowed is False and v.retry_after_s > 8, v

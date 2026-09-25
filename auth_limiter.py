@@ -10,7 +10,7 @@ POST) share one set of counters:
 * each key holds the timestamps of its failures inside `AUTH_FAIL_WINDOW_S`
   plus a NOT-BEFORE stamp; an address key can also carry a lockout.
 
-`begin(kind, email, ip)` checks the keys and, when the attempt is allowed,
+`begin(kind, email, ip, *, lockout=True)` checks the keys and, when the attempt is allowed,
 records it as a failure UP FRONT — a concurrent burst cannot all pass the
 check before the first failure lands. `success(kind, email, ip)` retracts it:
 the address key is cleared and one failure comes off the IP key. An attempt
@@ -19,7 +19,11 @@ NOT recorded — the caller answers 429 without evaluating anything.
 
 Address schedule: `AUTH_FAIL_THRESHOLD` failures are free; the next four
 attempts are allowed no sooner than 1, 2, 4 and 8 s after the previous one;
-the failure after those locks the address key for `AUTH_LOCKOUT_S`. The IP
+the failure after those locks the address key for `AUTH_LOCKOUT_S`. A call
+with `lockout=False` (the sign-in of the configured local admin account, so
+an anonymous caller cannot lock the operator out) keeps that spacing and,
+where the key would lock, only sets another 8 s not-before: never a lockout,
+never an `AUTH_LOCKOUT` line. The IP
 key spaces attempts beyond `AUTH_FAIL_THRESHOLD_IP` the same way (capped at
 8 s) and NEVER locks: behind a proxy that does not forward the client address
 everyone shares one peer, and a lockout there would lock out the company.
@@ -121,8 +125,10 @@ def _hash_prefix(space_name: str, key: str) -> str:
     return hashlib.sha256(f"{space_name}:{key}".encode("utf-8")).hexdigest()[:12]
 
 
-def begin(kind: str, email, ip) -> Verdict:
-    """Check the attempt and record it as a failure when it is allowed."""
+def begin(kind: str, email, ip, *, lockout: bool = True) -> Verdict:
+    """Check the attempt and record it as a failure when it is allowed.
+    `lockout=False` replaces the address lockout with an 8 s spacing step;
+    the thresholds and the IP schedule are the same either way."""
     if kind not in KINDS:
         raise ValueError("unknown attempt kind")
     now = float(clock())
@@ -138,7 +144,9 @@ def begin(kind: str, email, ip) -> Verdict:
             entry = _create(*addr_key)
             entry.failures.append(now)
             extra = len(entry.failures) - max(1, int(settings.AUTH_FAIL_THRESHOLD))
-            if extra >= _SCHEDULE_STEPS:
+            if extra >= _SCHEDULE_STEPS and not lockout:
+                entry.not_before = now + 2 ** (_SCHEDULE_STEPS - 1)
+            elif extra >= _SCHEDULE_STEPS:
                 entry.locked_until = now + max(1, int(settings.AUTH_LOCKOUT_S))
                 locked = _hash_prefix(*addr_key)
             elif extra >= 0:

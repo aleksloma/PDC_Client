@@ -121,12 +121,14 @@ def world(tmp_path, monkeypatch):
 
     import routes.auth as auth_mod
     sent = []
+    sent_kwargs = []
     fail = {"on": False}
 
     def fake_reset_mail(email, reset_url, **kwargs):
         if fail["on"]:
             raise brain_client.BrainError("brain answered 400")
         sent.append((email, reset_url))
+        sent_kwargs.append(dict(kwargs))
         return {"ok": True}
 
     monkeypatch.setattr(brain_client, "send_password_reset_email", fake_reset_mail)
@@ -157,8 +159,8 @@ def world(tmp_path, monkeypatch):
         # filesystems).
         return TestClient(app, raise_server_exceptions=False)
 
-    return {"tmp": tmp_path, "sent": sent, "fail": fail, "client": client,
-            "app": app, "auth_mod": auth_mod}
+    return {"tmp": tmp_path, "sent": sent, "sent_kwargs": sent_kwargs, "fail": fail,
+            "client": client, "app": app, "auth_mod": auth_mod}
 
 
 def _request_reset(world, email):
@@ -231,8 +233,29 @@ def test_the_reset_mail_carries_a_link_and_never_a_password(monkeypatch):
     assert len(posted) == 1, posted
     path, payload = posted[0]
     assert path == "/v1/send_password_reset_email"
-    assert set(payload) == {"sid", "email", "reset_url"}, payload
+    assert set(payload) == {"sid", "email", "reset_url", "kind"}, payload
     assert payload["email"] == KNOWN and payload["reset_url"] == url
+    assert payload["kind"] == "reset", payload
+
+
+def test_the_reset_mail_names_its_kind(monkeypatch):
+    """`kind` is always posted: "reset" by default, "invite" when asked, so
+    the brain words an invitation as one."""
+    posted = []
+
+    class _FakeClient:
+        def post(self, path, json=None, headers=None, timeout=None):
+            posted.append(json)
+            return _FakeResp()
+
+    monkeypatch.setattr(brain_client, "_get_client", lambda: _FakeClient())
+    monkeypatch.setattr(brain_client.settings, "BRAIN_TENANT_TOKEN", "tkn", raising=False)
+    url = BASE + "/auth/reset/" + "A" * 43
+    brain_client.send_password_reset_email(KNOWN, url, kind="invite")
+    brain_client.send_password_reset_email(KNOWN, url, timeout=5, kind="reset")
+    assert [p.get("kind") for p in posted] == ["invite", "reset"], posted
+    for payload in posted:
+        assert set(payload) == {"sid", "email", "reset_url", "kind"}, payload
 
 
 def test_the_brain_client_no_longer_mentions_a_temp_password():
@@ -258,6 +281,12 @@ def test_an_unknown_address_leaves_nothing_behind(world):
     assert r.status_code == 200
     assert not (world["tmp"] / "users" / UNKNOWN).exists()
     assert [to for to, _ in world["sent"]] == []
+
+
+def test_the_anonymous_reset_mail_is_of_kind_reset(world):
+    assert _request_reset(world, KNOWN).status_code == 200
+    assert world["sent_kwargs"], "no reset mail"
+    assert world["sent_kwargs"][-1].get("kind", "reset") == "reset", world["sent_kwargs"]
 
 
 def test_a_known_address_gets_a_token_record_and_a_link(world):
@@ -498,8 +527,10 @@ def test_a_wrong_or_malformed_token_is_404(world, token):
 
 @pytest.mark.parametrize("form,error", [
     ({"new_password": "abcd-1234", "confirm_password": "abcd-9999"}, "Passwords do not match"),
-    ({"new_password": "ab", "confirm_password": "ab"}, "Password must be at least 4 characters"),
-], ids=["mismatch", "too_short"])
+    ({"new_password": "ab", "confirm_password": "ab"}, "Password must be at least 8 characters"),
+    ({"new_password": "Abcde-1", "confirm_password": "Abcde-1"},
+     "Password must be at least 8 characters"),
+], ids=["mismatch", "too_short", "seven_chars"])
 def test_a_password_rule_failure_rerenders_and_consumes_nothing(world, form, error):
     token = _mint(KNOWN)
     tc = world["client"]()

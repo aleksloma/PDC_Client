@@ -121,7 +121,7 @@ def test_change_password_page_renders_html_for_a_forced_change_session(client):
     "form,expected_error",
     [
         ({"new_password": "abcd-1234", "confirm_password": "abcd-9999"}, "Passwords do not match"),
-        ({"new_password": "ab", "confirm_password": "ab"}, "Password must be at least 4 characters"),
+        ({"new_password": "ab", "confirm_password": "ab"}, "Password must be at least 8 characters"),
     ],
     ids=["mismatch", "too_short"],
 )

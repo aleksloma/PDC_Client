@@ -21,8 +21,25 @@ Password model (all local — the brain never sees a password):
     forces a password change (accounts mid-reset at upgrade time).
   - Attempts are limited per address and per peer (`auth_limiter`); a
     refused attempt answers 429 + Retry-After without evaluating anything.
-  - "Remember me" → persistent session cookie (~30 days) via the
-    RememberMeSessionMiddleware in app.py; unchecked → browser-session cookie.
+    The configured local admin account is spaced but never locked, so an
+    anonymous caller cannot lock the operator out.
+  - One password rule everywhere a password is SET (`password_rule_error`,
+    `PASSWORD_MIN_LENGTH`); sign-in never checks it, so an existing shorter
+    password works until its next change.
+  - A password change or a used reset link ends every OTHER session of the
+    account: sign-in stamps the account's `session_generation` into the
+    session as `gen`, app.py's SessionGenerationGate empties a session whose
+    `gen` no longer matches, and the session that made a change re-stamps
+    itself.
+  - An account that signs in with Microsoft and has no local password
+    (`AuthStore.is_sso_only`) cannot obtain one here, neither through a
+    reset link nor through the profile change (a local password would
+    bypass the identity provider's MFA).
+  - "Remember me" → persistent session cookie via the
+    RememberMeSessionMiddleware in app.py; unchecked → browser-session
+    cookie. Either kind ends REMEMBER_ME_MAX_DAYS after sign-in (`iat`,
+    stamped at every sign-in) however often it is renewed: an absolute
+    lifetime, not a sliding one.
 
 Every value that reaches a log line passes `exec_transport.log_safe_text` (or
 is a validated address / constant); a reset token or link is never logged.
@@ -36,7 +53,9 @@ from __future__ import annotations
 
 import re
 import secrets
+import sys
 import threading
+import time
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -74,6 +93,7 @@ RESET_SENT_TEXT = ("If an account exists for this address, a reset link has been
                    "sent. It expires in 30 minutes.")
 RESET_INVALID_TEXT = "This reset link is invalid or has expired. Request a new one."
 TOO_MANY_TEXT = "Too many attempts. Please try again later."
+SSO_NO_LOCAL_PASSWORD_TEXT = "This account signs in with Microsoft and has no local password."
 
 _DUMMY_HASH = None
 _DUMMY_LOCK = threading.Lock()
@@ -87,6 +107,32 @@ def _valid_login_id(value: str) -> bool:
     """A real email, or the fixed local-admin username (the ONLY non-email
     identity; every other id still requires a valid email)."""
     return bool(_EMAIL_RE.fullmatch(value)) or bool(value and value == _local_admin_username())
+
+
+def password_rule_error(password: str):
+    """The one password rule, applied wherever a password is SET: the
+    message when `password` is shorter than PASSWORD_MIN_LENGTH (read at call
+    time), else None. Sign-in never applies it."""
+    minimum = int(settings.PASSWORD_MIN_LENGTH)
+    if len(password or "") < minimum:
+        return f"Password must be at least {minimum} characters"
+    return None
+
+
+def _session_now() -> int:
+    """The session layer's clock (app._session_clock, which the tests
+    replace), read without importing app (app imports this module). Falls
+    back to the wall clock when app is not loaded (router-only apps)."""
+    app_mod = sys.modules.get("app")
+    clock = getattr(app_mod, "_session_clock", None)
+    if not callable(clock):
+        clock = time.time
+    try:
+        return int(clock())
+    except Exception as e:
+        log_with_sid("auth", "warning",
+                     f"SESSION_CLOCK_FAILED {log_safe_text(type(e).__name__, 80)}")
+        return int(time.time())
 
 
 def _peer(request: Request) -> str:
@@ -234,6 +280,11 @@ def _start_session(request: Request, email: str, *, remember: bool,
     # Issue a per-session SID for the temp UserStore (the upload flow keys off it)
     if not request.session.get("sid"):
         request.session["sid"] = "s_" + secrets.token_hex(8)
+    # The account's current generation (a later password change or reset
+    # ends this session) and the sign-in time (the absolute lifetime starts
+    # again at every sign-in).
+    request.session["gen"] = AuthStore().session_generation(email)
+    request.session["iat"] = _session_now()
     # Single funnel for every sign-in branch (password, self-registration,
     # SSO) — the one place to stamp last_login_at. touch_last_login never
     # raises.
@@ -274,7 +325,10 @@ async def login(request: Request):
                         email=email, status_code=400)
 
     ip = _peer(request)
-    verdict = auth_limiter.begin("login", email, ip)
+    # The configured local admin account is spaced but never locked: an
+    # anonymous caller must not be able to lock the operator out.
+    verdict = auth_limiter.begin("login", email, ip,
+                                 lockout=(email != _local_admin_username()))
     if not verdict.allowed:
         return _too_many(request, verdict, email=email)
 
@@ -297,7 +351,13 @@ async def login(request: Request):
                                 "environment and restart the container."))
         if not store.user_exists(email) and settings.ALLOW_SELF_REGISTRATION:
             # Demo-only open registration: a genuinely NEW address (no user
-            # folder) sets its own password here.
+            # folder) sets its own password here, under the same rule as
+            # every other place a password is set, checked before anything
+            # is written.
+            rule_error = password_rule_error(password)
+            if rule_error:
+                return _landing(request, password_error=rule_error,
+                                email=email, status_code=400)
             store.ensure_user(email)
             store.set_password(email, password)
             auth_limiter.success("login", email, ip)
@@ -353,6 +413,12 @@ def _send_reset_link(email: str, base: str) -> None:
         store = AuthStore()
         if not store.user_exists(email):
             log_with_sid(email, "info", "PASSWORD_RESET_UNKNOWN_ACCOUNT")
+            return
+        if store.is_sso_only(email):
+            # Signs in with Microsoft and has no local password: mint
+            # nothing. The caller already has the neutral page, which must
+            # not reveal the account type.
+            log_with_sid(email, "info", "SSO_ACCOUNT_RESET_REFUSED")
             return
         if not base:
             # No trusted address to build a link from (D9-26): mint nothing,
@@ -457,16 +523,22 @@ async def reset_link_submit(request: Request, token: str):
     verdict = auth_limiter.begin("token", None, ip)
     if not verdict.allowed:
         return _too_many(request, verdict)
-    if _live_reset_email(token) is None:
+    link_email = _live_reset_email(token)
+    if link_email is None:
         log_with_sid("auth", "info", "PASSWORD_RESET_LINK_INVALID")
         return _reset_invalid(request)
     # A live link: whatever happens next is not a failed guess.
     auth_limiter.success("token", None, ip)
+    if AuthStore().is_sso_only(link_email):
+        # A link minted before the account moved to Microsoft sign-in.
+        log_with_sid(log_safe_text(link_email, 254), "warning", "SSO_ACCOUNT_RESET_REFUSED")
+        return _reset_page(request, token, SSO_NO_LOCAL_PASSWORD_TEXT, 403)
     form = await request.form()
     new_password = form.get("new_password") or ""
     confirm = form.get("confirm_password") or ""
-    if len(new_password) < 4:
-        return _reset_page(request, token, "Password must be at least 4 characters", 400)
+    rule_error = password_rule_error(new_password)
+    if rule_error:
+        return _reset_page(request, token, rule_error, 400)
     if new_password != confirm:
         return _reset_page(request, token, "Passwords do not match", 400)
     try:
@@ -524,15 +596,22 @@ async def change_password_submit(request: Request):
             status_code=code,
         )
 
-    if len(new_password) < 4:
-        return _page("Password must be at least 4 characters")
+    if AuthStore().is_sso_only(email):
+        log_with_sid(log_safe_text(email, 254), "warning", "SSO_ACCOUNT_PASSWORD_REFUSED",
+                     forced=True)
+        return _page(SSO_NO_LOCAL_PASSWORD_TEXT, 403)
+    rule_error = password_rule_error(new_password)
+    if rule_error:
+        return _page(rule_error)
     if new_password != confirm:
         return _page("Passwords do not match")
     try:
-        AuthStore().set_password(email, new_password)
+        generation = AuthStore().set_password(email, new_password)
     except Exception as e:
         log_with_sid(email, "error", f"FORCED_PASSWORD_CHANGE_FAILED: {log_safe_text(str(e), 200)}")
         return _page("Could not save the new password. Please try again.", 500)
+    # Every OTHER session of the account ends; this one carries on.
+    request.session["gen"] = generation
     request.session.pop("must_change_password", None)
     log_with_sid(email, "info", "USER_PASSWORD_CHANGED", forced=True)
     return RedirectResponse(url=_post_login_target(email), status_code=302)
@@ -545,6 +624,8 @@ async def logout(request: Request):
     request.session.pop("sid", None)
     request.session.pop("remember", None)
     request.session.pop("must_change_password", None)
+    request.session.pop("gen", None)
+    request.session.pop("iat", None)
     if email:
         log_with_sid(email, "info", "USER_LOGOUT")
     return RedirectResponse(url="/", status_code=302)
@@ -603,19 +684,29 @@ async def change_password(request: Request):
         body = {}
     current = body.get("current_password") or ""
     new_password = (body.get("new_password") or "").strip()
-    if len(new_password) < 4:
-        return JSONResponse({"error": "Password must be at least 4 characters"}, status_code=400)
-
     store = AuthStore()
+    if store.is_sso_only(email):
+        # Without this, an account with no password would set one here
+        # without any current-password check.
+        log_with_sid(log_safe_text(email, 254), "warning", "SSO_ACCOUNT_PASSWORD_REFUSED",
+                     forced=False)
+        return JSONResponse({"error": SSO_NO_LOCAL_PASSWORD_TEXT, "code": "SSO_ACCOUNT"},
+                            status_code=403)
+    rule_error = password_rule_error(new_password)
+    if rule_error:
+        return JSONResponse({"error": rule_error}, status_code=400)
+
     if store.has_password(email) or store.get_auth(email).get("temp_password_hash"):
         if store.verify_password(email, current) is None:
             log_with_sid(email, "warning", "PASSWORD_CHANGE_BAD_CURRENT")
             return JSONResponse({"error": "Incorrect current password"}, status_code=401)
     try:
-        store.set_password(email, new_password)
+        generation = store.set_password(email, new_password)
     except Exception as e:
         log_with_sid(email, "error", f"PASSWORD_CHANGE_FAILED: {log_safe_text(str(e), 200)}")
         return JSONResponse({"error": "Could not save the new password"}, status_code=500)
+    # Every OTHER session of the account ends; this one carries on.
+    request.session["gen"] = generation
     request.session.pop("must_change_password", None)
     log_with_sid(email, "info", "USER_PASSWORD_CHANGED", forced=False)
     return {"ok": True}

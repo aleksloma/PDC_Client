@@ -66,6 +66,8 @@ services:
       # The local stack is plain HTTP on a host port, so the Secure session
       # cookie has to be off or the browser drops it.
       - SESSION_HTTPS_ONLY=false
+      # The address the local stack is reached at, so reset/invite links are minted.
+      - PUBLIC_BASE_URL=http://localhost:8091
       # Topology, set HERE rather than in client.local.env on purpose: compose
       # `environment` overrides `env_file`, so the wiring of the two containers
       # cannot be broken by an edit to an env file. Timeouts stay tunable there.

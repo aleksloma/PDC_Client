@@ -556,15 +556,19 @@ def send_welcome_email(email: str) -> dict:
 
 
 def send_password_reset_email(email: str, reset_url: str,
-                              timeout: float | None = None) -> dict:
+                              timeout: float | None = None,
+                              kind: str = "reset") -> dict:
     """Calls /v1/send_password_reset_email — brain Gmail-relays the reset
     link (valid 30 minutes, single use) to the user. The link carries a
     bearer token: it is never logged on either side, and the client stores
     only its sha256. `timeout` overrides the client-wide default (the admin
     invite waits for the answer; the anonymous reset runs in the background).
+    `kind` is always posted and chooses the mail's wording: "reset" (the
+    anonymous reset request) or "invite" (the admin invite).
     Raises BrainError on non-2xx like every other wrapper."""
     return _post("/v1/send_password_reset_email", {
         "sid": "reset-email", "email": email, "reset_url": reset_url,
+        "kind": kind,
     }, sid="reset-email", timeout=timeout)
 
 

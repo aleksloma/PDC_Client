@@ -3292,11 +3292,8 @@
   async function savePassword() {
     const err = $('pwError');
     err.classList.add('hidden');
-    if ($('pwNew').value.length < 4) {
-      err.textContent = 'Password must be at least 4 characters';
-      err.classList.remove('hidden');
-      return;
-    }
+    // The length rule is the server's (PASSWORD_MIN_LENGTH); its message
+    // lands in the error line below.
     if ($('pwNew').value !== $('pwNew2').value) {
       err.textContent = 'Passwords do not match';
       err.classList.remove('hidden');

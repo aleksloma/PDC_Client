@@ -48,6 +48,12 @@ _RESET_KEYS = ("reset_token_hash", "reset_expires_at", "reset_used")
 # Exactly what secrets.token_urlsafe(32) produces.
 _RESET_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 
+# Session generations: auth.json path (DATA_ROOT + the safe email) -> the
+# account's `session_generation`. Filled from auth.json on the first miss and
+# updated by the two password writers, so the per-request session check reads
+# the disk once per account per process (one worker).
+_SESSION_GEN_CACHE: dict = {}
+
 
 def _reset_token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -1055,21 +1061,66 @@ class AuthStore:
         for key in _RESET_KEYS:
             auth.pop(key, None)
 
-    def set_password(self, email: str, password: str, *, force_change: bool = False) -> None:
+    def set_password(self, email: str, password: str, *, force_change: bool = False) -> str:
         """Set the user's own password. Clears any outstanding temp password
         and any outstanding reset link. force_change=True (used only by the
         ladmin bootstrap) keeps the must_change_password flag ON so the first
-        login forces a change."""
+        login forces a change. Writes a fresh `session_generation` (every
+        other session of the account ends) and RETURNS it, so the session
+        that made the change can re-stamp itself."""
         from password_utils import generate_password_hash
         new_hash = generate_password_hash(password)   # PBKDF2 outside the lock
         with _LOCK:
             auth = self.get_auth(email)
             old = auth.get("reset_token_hash")
             self._apply_password_hash(auth, new_hash, force_change)
+            generation = secrets.token_hex(8)
+            auth["session_generation"] = generation
             self._write_auth(email, auth)
+            _SESSION_GEN_CACHE[str(self._auth_path(email))] = generation
             if old:
                 _RESET_TOKEN_INDEX.pop(old, None)
         log_with_sid(email, "info", "USER_PASSWORD_SET")
+        return generation
+
+    def session_generation(self, email: str) -> str:
+        """The account's current session generation, "" when it has none
+        (no auth.json, or one written before generations existed). Cached per
+        account; the two password writers update the cache. An unreadable
+        record answers "" uncached (Article IV) — such an account cannot sign
+        in anyway."""
+        key = str(self._auth_path(email))
+        cached = _SESSION_GEN_CACHE.get(key)
+        if cached is not None:
+            return cached
+        with _LOCK:
+            cached = _SESSION_GEN_CACHE.get(key)
+            if cached is not None:
+                return cached
+            p = Path(key)
+            if not p.exists():
+                _SESSION_GEN_CACHE[key] = ""
+                return ""
+            try:
+                rec = json.loads(p.read_text(encoding="utf-8"))
+            except Exception as e:
+                log_with_sid("auth", "error",
+                             f"SESSION_GENERATION_READ_FAILED {type(e).__name__}")
+                return ""
+            value = rec.get("session_generation") if isinstance(rec, dict) else None
+            value = value if isinstance(value, str) else ""
+            _SESSION_GEN_CACHE[key] = value
+            return value
+
+    def is_sso_only(self, email: str) -> bool:
+        """True for an account that signs in with Microsoft and has no local
+        password: `sso_provider` set and neither `password_hash` nor
+        `temp_password_hash`. Such an account must not obtain one (it would
+        bypass the identity provider's MFA). A local account that also uses
+        Microsoft is not SSO-only."""
+        auth = self.get_auth(email)
+        return bool(auth.get("sso_provider")) and not (
+            auth.get("password_hash") or auth.get("temp_password_hash"))
 
     # --- Roles (stored on profile.json — the identity record; auth.json is
     # credentials-only and is rewritten wholesale on password churn) ---------
@@ -1333,7 +1384,10 @@ class AuthStore:
             rec["reset_token_hash"] = token_hash
             rec["reset_expires_at"] = expires
             rec["reset_used"] = True
+            generation = secrets.token_hex(8)
+            rec["session_generation"] = generation
             self._write_auth(email, rec)
+            _SESSION_GEN_CACHE[str(self._auth_path(email))] = generation
         log_with_sid(email, "info", "USER_PASSWORD_SET")
         return email
 

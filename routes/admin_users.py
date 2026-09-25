@@ -306,12 +306,14 @@ async def invite_user(request: Request):
     still 200 — the account exists and "Reset password" works for the
     invitee. With PUBLIC_BASE_URL unset (or not http(s)) nothing is minted or
     mailed: 200 with mail_sent false and that reason (D9-26). 400 for an invalid address or the bootstrap account, 409
-    USER_EXISTS for an account that already has a password. Audited
-    `user.invite` (never the link)."""
+    USER_EXISTS for an account that already has a password, 409 SSO_ACCOUNT
+    for an account that signs in with Microsoft and has none. The mail is of
+    kind "invite" (invitation wording). Audited `user.invite` (never the
+    link)."""
     email, err = _require_admin(request)
     if err:
         return err
-    from routes.auth import _EMAIL_RE, _public_base, reset_link
+    from routes.auth import SSO_NO_LOCAL_PASSWORD_TEXT, _EMAIL_RE, _public_base, reset_link
     body = await _json_body(request)
     target = str(body.get("email") or "").strip().lower()
     if not _EMAIL_RE.fullmatch(target):
@@ -324,6 +326,11 @@ async def invite_user(request: Request):
         return JSONResponse(
             {"error": "This user already has an account.", "code": "USER_EXISTS"},
             status_code=409)
+    if auth.is_sso_only(target):
+        # Signs in with Microsoft: an invitation link would give it a local
+        # password that bypasses the identity provider's MFA.
+        return JSONResponse({"error": SSO_NO_LOCAL_PASSWORD_TEXT, "code": "SSO_ACCOUNT"},
+                            status_code=409)
     created = False
     if not auth.user_exists(target):
         created = auth.ensure_invited_user(target, email)
@@ -345,7 +352,8 @@ async def invite_user(request: Request):
             await asyncio.get_running_loop().run_in_executor(
                 None, functools.partial(brain_client.send_password_reset_email,
                                         target, reset_link(base, token),
-                                        timeout=settings.BRAIN_DRAFT_TIMEOUT))
+                                        timeout=settings.BRAIN_DRAFT_TIMEOUT,
+                                        kind="invite"))
         except Exception as e:
             # No link nobody received stays behind; the invitee asks for a
             # fresh one from the sign-in page.

@@ -338,3 +338,99 @@ def test_the_invite_route_is_not_limited(world, monkeypatch):
     codes = [tc.post("/api/admin/users/invite", json={"email": f"invitee{i}@corp.example"}).status_code
              for i in range(25)]
     assert codes == [200] * 25, codes
+
+
+# ===========================================================================
+# the configured local admin account is spaced but never locked
+#
+# An anonymous caller must not be able to lock the operator out: sign-in
+# attempts for LOCAL_ADMIN_USERNAME keep the 1, 2, 4, 8 s address spacing
+# (and the per-peer spacing), but where another address would be locked for
+# AUTH_LOCKOUT_S the admin account only waits another 8 s.
+# ===========================================================================
+LADMIN = "ladmin"
+LADMIN_PW = "Ladmin-passw0rd"
+
+
+def _bootstrap_ladmin():
+    store = local_store.AuthStore()
+    store.ensure_user(LADMIN)
+    store.set_role(LADMIN, "admin")
+    store.set_password(LADMIN, LADMIN_PW)
+
+
+def _hammer(world, email, attempts, client=None):
+    """`attempts` wrong passwords, each admitted after waiting whatever the
+    429 asked for. Returns every Retry-After seen."""
+    waits = []
+    evaluated = 0
+    for i in range(attempts * 3):
+        if evaluated == attempts:
+            break
+        tc = client or world["client"]()
+        r = tc.post("/auth/login", data={"email": email, "password": f"wrong-{i}"},
+                    follow_redirects=False)
+        if r.status_code == 429:
+            wait = _assert_limited(r)
+            waits.append(wait)
+            if wait > 8:
+                return waits, evaluated
+            world["clock"].advance(wait)
+            continue
+        assert r.status_code == 401, (i, r.status_code)
+        evaluated += 1
+    return waits, evaluated
+
+
+def test_the_local_admin_is_spaced_but_never_locked(world, monkeypatch):
+    lim = _need(world["lim"])
+    _bootstrap_ladmin()
+    lines = []
+
+    def rec(sid, level, message, **ctx):
+        lines.append(f"{sid} {level} {message} {ctx}")
+
+    monkeypatch.setattr(lim, "log_with_sid", rec, raising=False)
+    waits, evaluated = _hammer(world, LADMIN, 14)
+    assert waits, "the admin account was never spaced"
+    assert max(waits) <= 8, waits
+    assert evaluated == 14, (evaluated, waits)
+    assert not [ln for ln in lines if "AUTH_LOCKOUT" in ln], lines
+    # After waiting, the right password signs in.
+    early = world["client"]().post("/auth/login",
+                                   data={"email": LADMIN, "password": LADMIN_PW},
+                                   follow_redirects=False)
+    if early.status_code == 429:
+        wait = _assert_limited(early)
+        assert wait <= 8, wait
+        world["clock"].advance(wait)
+    r = world["client"]().post("/auth/login", data={"email": LADMIN, "password": LADMIN_PW},
+                               follow_redirects=False)
+    assert r.status_code == 302, (r.status_code, r.headers.get("retry-after"))
+    assert r.headers["location"] == "/admin/data_sources"
+
+
+def test_a_normal_address_from_another_peer_still_locks(world):
+    _need(world["lim"])
+    _bootstrap_ladmin()
+    _hammer(world, LADMIN, 12)
+    other_peer = TestClient(world["app"], raise_server_exceptions=False,
+                            client=("10.20.30.40", 50000))
+    _five_wrong_from(other_peer, USER)
+    for gap in (1, 2, 4, 8):
+        world["clock"].advance(gap)
+        r = other_peer.post("/auth/login", data={"email": USER, "password": f"w{gap}"},
+                            follow_redirects=False)
+        assert r.status_code == 401, (gap, r.status_code)
+    world["clock"].advance(16)
+    r = other_peer.post("/auth/login", data={"email": USER, "password": USER_PW},
+                        follow_redirects=False)
+    wait = _assert_limited(r)
+    assert wait > 8, ("a normal address must still lock", wait)
+
+
+def _five_wrong_from(tc, email):
+    for i in range(5):
+        r = tc.post("/auth/login", data={"email": email, "password": f"wrong-{i}"},
+                    follow_redirects=False)
+        assert r.status_code == 401, (i + 1, r.status_code)

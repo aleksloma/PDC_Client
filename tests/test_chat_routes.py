@@ -618,7 +618,7 @@ def flagged(tmp_path, monkeypatch):
     monkeypatch.setattr(auth_mod, "_send_welcome_email_async", lambda email: None)
     # Task 9: the reset mail carries a link, not a temp password.
     monkeypatch.setattr(auth_mod.brain_client, "send_password_reset_email",
-                        lambda email, reset_url: None)
+                        lambda email, reset_url, **kw: None)
     auth = local_store.AuthStore()
     auth.ensure_user(FLAGGED)
     auth.set_password(FLAGGED, FLAGGED_PW, force_change=True)
