@@ -118,25 +118,55 @@ counted before it is evaluated and retracted on success. After
 (900 s) the next attempts must wait 1, 2, 4, 8 s, then the address is locked
 for `AUTH_LOCKOUT_S` (900 s); sign-in and reset requests count in separate
 buckets. One peer address is spaced the same way after
-`AUTH_FAIL_THRESHOLD_IP` (20) failures and never locked. An early or locked
+`AUTH_FAIL_THRESHOLD_IP` (20) failures and never locked. The configured
+`LOCAL_ADMIN_USERNAME` is never address-locked either (`begin(...,
+lockout=False)`): where it would lock it waits another 8 s instead. An early or locked
 attempt answers `429` with `Retry-After` and "Too many attempts. Please try
 again later." without evaluating anything. A lockout logs `AUTH_LOCKOUT
 kind=… h=<hash prefix>`, never the address. Addresses must match
 `routes.auth._EMAIL_RE` (letters, digits, `._%+-` before the `@`, ≤ 254
 characters) on sign-in, reset, invite and every share route.
 
+Password rule: every password SET — reset link, forced change,
+`/auth/password`, demo self-registration — must have at least
+`PASSWORD_MIN_LENGTH` (8) characters; the one message is "Password must be at
+least N characters". Sign-in never checks it, so an older, shorter password
+keeps working until it is changed.
+
+Sessions: sign-in stamps the session with `iat` (sign-in time) and `gen` (the
+account's `session_generation` from `auth.json`). Every password write gives
+the account a new generation; `SessionGenerationGate` (app.py, inside the
+session middleware) empties a session whose `gen` no longer matches, so the
+request continues signed out (pages → `/`, APIs → 401) and the response clears
+the cookie. The route that changed the password re-stamps its own session. A
+session ends `REMEMBER_ME_MAX_DAYS` (30) days after `iat`, remembered or not;
+a remembered cookie's `Max-Age` is the remaining lifetime. A cookie from an
+earlier release carries neither key: an account whose password has not
+changed since keeps it, and its lifetime is counted from its last renewal.
+The generation is cached in the one web process, so a password written by
+another process (an operator script) ends other sessions only after the next
+restart; and a request the changing browser had already sent before the
+change completed can sign that browser out too (it signs in again).
+
+Microsoft-only accounts (`sso_provider` set, no local hash —
+`AuthStore.is_sso_only`) never get a local password: the anonymous reset
+request mints nothing and answers the neutral page; the reset-link POST, the
+forced change and `/auth/password` answer 403 with "This account signs in with
+Microsoft and has no local password." (`/auth/password`: `{error, code:
+"SSO_ACCOUNT"}`); the invite answers 409 with the same code.
+
 | Method | Path | Behavior |
 |---|---|---|
-| `POST` | `/auth/login` | form-encoded `email=`, `password=`, `remember?`. Every failure — unknown address, an account without a password (invited, shared with, legacy) and a wrong password — answers `401` with the SAME page and line, "Sign-in failed. Check your email and password, or use “Reset password” if you have not set one yet.", plus the Reset action, after exactly one password-hash verification (a fixed dummy hash where there is none), so neither the body nor the time says which case it was; nothing is created. The exceptions are the unbootstrapped `ladmin` (403, the server-side fix) and `ALLOW_SELF_REGISTRATION=true`, where a NEW email adopts the entered password + welcome mail. A malformed form → 400; over the attempt limit → 429 + `Retry-After`. A temporary password from a release before this one → session flagged and redirected to `/auth/change_password`. Success target: `/lab` for everyone — promoted admins included — except the bootstrap ladmin account → `/admin/data_sources` (`_post_login_target`, keyed on `AuthStore.is_bootstrap_admin`, 19g). `remember` → persistent ~30-day session cookie (RememberMeSessionMiddleware in app.py); otherwise browser-session cookie. |
+| `POST` | `/auth/login` | form-encoded `email=`, `password=`, `remember?`. Every failure — unknown address, an account without a password (invited, shared with, legacy) and a wrong password — answers `401` with the SAME page and line, "Sign-in failed. Check your email and password, or use “Reset password” if you have not set one yet.", plus the Reset action, after exactly one password-hash verification (a fixed dummy hash where there is none), so neither the body nor the time says which case it was; nothing is created. The exceptions are the unbootstrapped `ladmin` (403, the server-side fix) and `ALLOW_SELF_REGISTRATION=true`, where a NEW email adopts the entered password + welcome mail. A malformed form → 400; over the attempt limit → 429 + `Retry-After`. A temporary password from a release before this one → session flagged and redirected to `/auth/change_password`. Success target: `/lab` for everyone — promoted admins included — except the bootstrap ladmin account → `/admin/data_sources` (`_post_login_target`, keyed on `AuthStore.is_bootstrap_admin`, 19g). `remember` → persistent session cookie whose `Max-Age` is the time left of the 30-day lifetime (RememberMeSessionMiddleware in app.py); otherwise browser-session cookie; either way the session ends 30 days after sign-in. |
 | `POST` | `/auth/reset_password` | form-encoded `email=`. Every well-formed address — known, unknown, or an email-shaped `ladmin` — answers `200` with the same page: "If an account exists for this address, a reset link has been sent. It expires in 30 minutes." Everything that depends on the account runs in a background thread: for an existing account a token (`secrets.token_urlsafe(32)`) is minted, only its SHA-256 stored in `auth.json` (`reset_token_hash`, `reset_expires_at`, `reset_used`; a new request replaces the old token) and the link `<PUBLIC_BASE_URL>/auth/reset/<token>` brain-relayed; a failed send discards the token. With `PUBLIC_BASE_URL` unset or not an http(s) URL nothing is minted or sent (`PASSWORD_RESET_NO_BASE_URL` logged) — the link is never built from the request's `Host`, which the caller controls. The user's own password stays valid until the link is used. A non-email id → 400; over the attempt limit → 429 + `Retry-After`. |
 | `GET` | `/auth/reset/{token}` | the set-new-password form (`reset_password.html`, no script) with `Cache-Control: no-store` and `Referrer-Policy: no-referrer`; no side effect. A malformed, unknown, expired or used token → the sign-in page with "This reset link is invalid or has expired. Request a new one." (404). Invalid tokens count per peer address. |
-| `POST` | `/auth/reset/{token}` | form-encoded `new_password=`, `confirm_password=` (at least 4 characters, matching; a rule failure re-renders the form, 400). Validates and consumes the token in one locked step, sets the password (which also clears any temporary password and pending forced change), `302` → `/?reset=done` ("Your password has been updated. Sign in with it."). No automatic sign-in; other open sessions are not ended. A second use → 404. |
-| `POST` | `/auth/change_password` | form-encoded `new_password=`, `confirm_password=` — the forced-change submit (session required) |
+| `POST` | `/auth/reset/{token}` | form-encoded `new_password=`, `confirm_password=` (the password rule above, matching; a rule failure re-renders the form, 400; a Microsoft-only account → 403). Validates and consumes the token in one locked step, sets the password (which also clears any temporary password and pending forced change), `302` → `/?reset=done` ("Your password has been updated. Sign in with it."). No automatic sign-in; every open session of the account ends. A second use → 404; a 429 here carries the same no-store / no-referrer headers. |
+| `POST` | `/auth/change_password` | form-encoded `new_password=`, `confirm_password=` — the forced-change submit (session required; the password rule above, 400; a Microsoft-only account → 403). Ends the account's other sessions; this one stays signed in. |
 | `POST` | `/auth/logout` | clears session, redirects to `/`. |
 | `GET`  | `/auth/me` | `{authenticated, email}` |
 | `GET`  | `/auth/profile` | `{username: email, email, full_name: "", subscription_plan: "Enterprise", is_local_admin, is_power_user, is_admin_user}` — shape that dashboard.js expects. `is_local_admin` and `is_admin_user` (deliberately NEVER `is_admin` — that key feeds the B2C Publish menu, 400 by design on-prem); `is_power_user` = the user's per-account PERMISSION is "power" (AuthStore profile `role`, 19e — roles_store.is_power_user delegates to it; admin is NOT power; fail-closed false on any error); `is_admin_user` (19g) = a PROMOTED admin — permission "admin" AND not the bootstrap account (fail-closed false). Both feed the profile-dropdown "DB config" item: power → `/power/data_sources`, promoted admin → `/admin/data_sources` (the partial bakes the target into `data-target`) |
 | `POST` | `/auth/profile/update` | email is the identity; attempts to change it are silently ignored |
-| `POST` | `/auth/password` | JSON `{current_password, new_password}` — real change-password (verified server-side), used by the /lab profile-dropdown modal. 401 on wrong current password. |
+| `POST` | `/auth/password` | JSON `{current_password, new_password}` — real change-password (verified server-side), used by the /lab profile-dropdown modal and the admin panel's password modal. 400 on the password rule; 401 on wrong current password; 403 `{code: "SSO_ACCOUNT"}` for a Microsoft-only account. Ends the account's other sessions; this one stays signed in. |
 | `GET`  | `/auth/subscription` | constant `{plan: "Enterprise"}` |
 | `GET`  | `/auth/active_chats` | list of user's chats |
 | `GET`  | `/auth/conversations` | list of user's conversations |
@@ -598,7 +628,7 @@ skipped at read time, no profile rewrites. Emails are always body-carried
 | Method | Path | Behavior |
 |---|---|---|
 | `GET` | `/api/admin/users` | Everyone with a readable profile, sorted by email: `{users:[{email, permission ("standard"\|"power"\|"admin"), role_ids (RESOLVED held list — dangling dropped, empty→["base"]), role_names, role_id/role_name (legacy = first entry), created_at, last_login_at}]}`. Only the bootstrap local-admin account is excluded — admin-permission users ARE listed (19e: they must stay demotable; their held roles stay visible/stored but inert). `member_count` on roles counts holders among these rows. `last_login_at` is stamped by `_start_session` on every login; `created_at` = when the account was created (invite, share, SSO or, on the demo, first sign-in) |
-| `POST` | `/api/admin/users/invite` | ladmin only. `{email}` → `200 {ok, email, created, mail_sent[, mail_error]}`: creates a password-less account when the address has none (`created: true`; an existing password-less account is re-invited, `created: false`), mints a reset token and mails the link (`<PUBLIC_BASE_URL>/auth/reset/<token>`) through the brain, waiting up to `BRAIN_DRAFT_TIMEOUT`; with `PUBLIC_BASE_URL` unset the account is still created and the answer is `mail_sent: false` with that reason. A failed mail discards the token and answers `mail_sent: false` with the reason; the account stays. 400 invalid address / the bootstrap account; 409 `{code: "USER_EXISTS"}` when the account already has a password. Audited `user.invite` with `{created, mail_sent}` — never the link. Not attempt-limited (admin-guarded) |
+| `POST` | `/api/admin/users/invite` | ladmin only. `{email}` → `200 {ok, email, created, mail_sent[, mail_error]}`: creates a password-less account when the address has none (`created: true`; an existing password-less account is re-invited, `created: false`), mints a reset token and mails the link (`<PUBLIC_BASE_URL>/auth/reset/<token>`) through the brain, waiting up to `BRAIN_DRAFT_TIMEOUT`; with `PUBLIC_BASE_URL` unset the account is still created and the answer is `mail_sent: false` with that reason. A failed mail discards the token and answers `mail_sent: false` with the reason; the account stays. 400 invalid address / the bootstrap account; 409 `{code: "USER_EXISTS"}` when the account already has a password; 409 `{code: "SSO_ACCOUNT"}` for a Microsoft-only account. The mail is sent with `kind: "invite"` (invitation wording). Audited `user.invite` with `{created, mail_sent}` — never the link. Not attempt-limited (admin-guarded) |
 | `POST` | `/api/admin/users/set_role` | Sets the user's HELD ROLE LIST (19c): `{email, role_ids: [...]}` → `{ok, user}`; the legacy `{email, role_id}` shape is still accepted (→ one-element list); empty list reverts to Base. 400 missing email / the bootstrap ladmin account / any unknown role id (19g: PROMOTED admins take roles like anyone — only the bootstrap identity is refused); 404 unknown user. Audited `user.set_roles` with `{role_ids, role_names}` |
 | `POST` | `/api/admin/users/set_permission` | 19e — sets the per-user PERMISSION: `{email, permission: "standard"\|"power"\|"admin"}` ("standard" stored as "user") → `{ok, user}`. 400 missing email / invalid value / the bootstrap ladmin account / the CALLER's own account (no self-demotion); 404 unknown user. Never touches `data_roles` — and since 19g a promoted admin's roles stay ACTIVE (full analysis user), so promote/demote round-trips are lossless. Audited `user.set_permission` with `{old, new}` |
 | `GET` | `/api/admin/roles` | `{roles:[{…, is_base, is_builtin, member_count}]}` — Base first, the rest by name; `member_count` counts users HOLDING the role (a user with 3 roles counts in all 3) |

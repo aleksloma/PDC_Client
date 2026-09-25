@@ -262,7 +262,11 @@ client must be closed on FastAPI lifespan shutdown.
    see Article XIV, which owns this boundary in full.
 6. Never commit `.env` files. Commit `.env.example` templates only.
 7. SMTP credentials live on the brain (per-tenant config). The client relays
-   share emails through `POST /v1/send_share_email`.
+   share emails through `POST /v1/send_share_email`, and reset and invitation
+   links through `POST /v1/send_password_reset_email`. Such a link sets the
+   account's password until it is used or expires, so it is a credential in
+   transit: the brain and its mail relay are trusted with it, it appears only
+   in the mail body, and it is never logged on either side.
 8. **Database credentials (client "Data sources")** are Fernet-encrypted at
    rest (`CLIENT_ENCRYPTION_KEY` env var; no key → the feature refuses to
    save, NEVER a plaintext fallback), masked in every API response, never

@@ -67,7 +67,7 @@ values derived from your data. User email is sent for tenant routing.
 | Table column names | Report generation | Column NAMES only, first 10 — never rows |
 | User email | Every call | Tenant routing and per-user activity |
 | Activity events | Login, upload, chat, report | Event name, user email, lightweight counters |
-| Password-reset payload | Password reset and invitation | The e-mail address and a single-use reset link (valid 30 minutes), relayed through the brain's mail service |
+| Password-reset payload | Password reset and invitation | The e-mail address, whether it is a reset or an invitation, and a single-use reset link (valid 30 minutes), relayed through the brain's mail service; until it is used or expires the link sets the account's password |
 | Third-party browser scripts | Never, by default | `/lab` loads no analytics or billing script (`ENABLE_THIRD_PARTY_SCRIPTS=false`) |
 
 Never sent: uploaded files, DataFrames, query result sets, rendered charts or

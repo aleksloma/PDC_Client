@@ -1163,8 +1163,11 @@ and the landing page is byte-identical to a pre-SSO build. SSO sessions are
 browser-session cookies (`remember=False` — Entra re-auth is silent on
 joined devices); logout is local-only (no Microsoft front-channel logout,
 documented). The bootstrap ladmin keeps password login (`/?local=1` is the
-always-on escape hatch when auto-redirect is enabled). Customer guide:
-`docs/SSO_MICROSOFT.md`.
+always-on escape hatch when auto-redirect is enabled). An account that
+signed in with Microsoft and holds no local password can never obtain one
+(reset, password change and invite all refuse it, `AuthStore.is_sso_only`),
+because a local password would bypass Entra's MFA and conditional access.
+Customer guide: `docs/SSO_MICROSOFT.md`.
 
 ---
 

@@ -172,6 +172,12 @@ Accounts come to exist in three ways:
   Microsoft sign-in creates the account (who may sign in is decided in
   Entra).
 
+**Passwords** must be at least 8 characters (`PASSWORD_MIN_LENGTH` in
+`client.env`; it cannot be set below 4). The rule applies whenever a password
+is set: through a reset or invitation link, the forced change after a
+temporary password, and **Change Password** in the profile menu. A password
+set before this release keeps working until its owner changes it.
+
 **Set `PUBLIC_BASE_URL`** in `client.env` on every install, to the address
 your users type, e.g. `https://pdc.example.com`. Reset and invitation links
 are built from it and from nothing else. Without it no reset or invitation
@@ -183,11 +189,26 @@ otherwise have a genuine reset mail point at a server of their choosing.
 
 **Password reset.** "Reset password" mails a link valid for 30 minutes that
 works once. The sign-in page gives the same answer whether or not the address
-has an account. The link's token appears in your proxy's and the
-application's access logs and in the browser history, like any URL; single use
-and the 30-minute lifetime are the protection. A reset does not sign out
-sessions already open elsewhere: a "Remember me" session stays valid until
-30 days after its last use.
+has an account. The link's token appears in the browser history and in your
+proxy's access log, like any URL (the
+application's own access log shows it as `/auth/reset/<redacted>`); single use
+and the 30-minute lifetime are the protection.
+
+**Sessions.** Setting a new password — through a reset link, the forced
+change or **Change Password** — signs the account out everywhere else; the
+browser that made the change stays signed in. Every session ends 30 days
+after sign-in (`REMEMBER_ME_MAX_DAYS`), whether or not "Remember me" was
+ticked and however often it is used; "Remember me" only decides whether the
+session survives closing the browser.
+
+**Microsoft accounts have no local password.** An account that has signed in
+with Microsoft and never had a password here cannot get one: "Reset password"
+sends it nothing (the page answers as for any address), and a password change
+or an invitation for it is refused with "This account signs in with Microsoft
+and has no local password." Such users get multi-factor authentication and
+conditional access from Entra; a local password would let them sign in
+without either. An account that already had a password and later also used
+Microsoft keeps its password.
 The `ladmin` password cannot be reset by mail — to recover it, delete
 `users/ladmin/auth.json` on the data volume and restart with
 `LOCAL_ADMIN_PASSWORD` set.
@@ -202,6 +223,10 @@ network address are slowed the same way after 20 failures, but never locked,
 so a proxy that hides your users' addresses cannot lock the whole company
 out. Because anyone can trigger the per-address lock, a colleague who meets
 it waits 15 minutes or signs in with Microsoft, which is not limited here.
+The `ladmin` account is never locked, so nobody can lock the operator out: its
+attempts are only spaced, one every 8 seconds at most after the first five
+failures. Give it a long `LOCAL_ADMIN_PASSWORD`. Restarting the web container
+clears every counter and lifts any lock.
 The numbers are `AUTH_FAIL_THRESHOLD`, `AUTH_FAIL_THRESHOLD_IP`,
 `AUTH_FAIL_WINDOW_S` and `AUTH_LOCKOUT_S` in `client.env`. The counters live in
 the web process: they reset on restart and assume the single web worker this
@@ -211,7 +236,8 @@ reverse proxy as well.
 **Addresses.** An address must use letters, digits and `. _ % + -` before the
 `@`. An existing account whose address uses another character, such as an
 apostrophe, can no longer sign in with a password or receive a share; give
-that user a new address or use single sign-on.
+that user a new address. Single sign-on lets such a user sign in, but shares
+and invitations to that address are still refused.
 
 ### Single sign-on with Microsoft Entra ID (optional)
 
@@ -554,7 +580,7 @@ worth stating plainly:
 | Table column names | Report generation | Column NAMES only, first 10 — never rows |
 | User email | Every call | Tenant routing and per-user activity |
 | Activity events | Login, upload, chat, report | Event name, user email, lightweight counters |
-| Password-reset payload | Password reset and invitation | The e-mail address and a single-use reset link (valid 30 minutes), relayed through the brain's mail service; the brain never logs or stores the link |
+| Password-reset payload | Password reset and invitation | The e-mail address, whether it is a reset or an invitation, and a single-use reset link (valid 30 minutes), relayed through the brain's mail service; the brain never logs or stores the link. Until it is used or expires the link sets the account's password, so the operator of the brain and of its mail relay is trusted with it, as with any mailed reset link |
 | Third-party browser scripts | Never, by default | The `/lab` page loads no analytics or billing script; the browser contacts only your own server |
 
 Never sent: uploaded files, DataFrames, query result sets, rendered charts or

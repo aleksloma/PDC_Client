@@ -107,8 +107,10 @@ The password form is **always** reachable at:
 ```
 
 Use it for the `ladmin` account (which has no Microsoft identity and always
-signs in with its password) and as the recovery path if the SSO
-configuration ever breaks while auto-redirect is on. **Disable SSO** on the
+signs in with its password), for local accounts, and as the recovery path if
+the SSO configuration ever breaks while auto-redirect is on. A user whose
+account was created by Microsoft sign-in cannot use it: that account has no
+local password and cannot get one (below). **Disable SSO** on the
 ladmin page returns the landing page to the plain password form instantly.
 
 ## Behavior details
@@ -125,6 +127,12 @@ ladmin page returns the landing page to the plain password form instantly.
   sign-in never creates one. Existing password accounts with the same email
   simply gain SSO — their password keeps working, and password reset flows
   are untouched.
+- **No local password for Microsoft accounts.** An account that has signed in
+  with Microsoft and holds no local password cannot obtain one: "Reset
+  password" mails it nothing, and a password change or an invitation for it
+  is refused ("This account signs in with Microsoft and has no local
+  password."). Multi-factor authentication, conditional access and
+  deprovisioning all live in Entra; a local password would bypass them.
 - Every Save / Test / Enable / Disable is written to the admin audit log
   (tenant and client IDs only — never the secret).
 

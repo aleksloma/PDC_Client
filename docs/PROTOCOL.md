@@ -575,8 +575,10 @@ request never uses up a recipient's hourly allowance. Every field rejection
 logs `RESET_EMAIL_REJECTED reason=<the error text>` with the tenant id — the
 reason is a fixed string, never the submitted value.
 
-The client calls this in two places. An anonymous "Reset password" request
-calls it from a background thread, so the sign-in page answers the same way
+The client calls this in two places and always sends `kind`: `reset` from
+the anonymous "Reset password" request, `invite` from the administrator's
+invitation. An anonymous "Reset password" request calls it from a background
+thread, so the sign-in page answers the same way
 whether or not the address has an account; on failure the client logs
 `PASSWORD_RESET_EMAIL_FAILED` with the exception type and discards the
 token. The administrator's "Invite user" action calls it while the request
