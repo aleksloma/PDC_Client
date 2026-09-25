@@ -88,6 +88,12 @@ Two more settings are worth knowing about, both optional:
 - **`ENABLE_THIRD_PARTY_SCRIPTS`** — leave it unset. By default the `/lab` page
   loads no third-party script at all: no browser analytics, no billing widget.
   Setting it to `true` restores them, which no on-premise install needs.
+- **`CSP_REPORT_ONLY`** — leave it unset. Every page carries a
+  Content-Security-Policy that the browser enforces. Setting this to `true`
+  makes the browser only report violations in its console instead of
+  blocking them, which is useful for a short diagnosis of a page that renders
+  wrongly behind your proxy, and nothing else. The container logs
+  `CSP_REPORT_ONLY_ENABLED` at startup while it is on.
 
 Leave the `EXECUTOR_*` variables out of `client.env`. The ones that wire the
 two containers together (`EXECUTOR_URL`, `EXECUTOR_SHARED_DIR`,
@@ -126,7 +132,7 @@ your hard guarantee. Set the nightly snapshot-refresh time in the admin UI
 | Database | Ticked | Server identity |
 |---|---|---|
 | PostgreSQL | `sslmode=require`: a server that does not offer TLS is refused | Not verified. (The PostgreSQL client library upgrades `require` to certificate verification if a `root.crt` exists in the container user's `~/.postgresql`; this image does not ship one.) |
-| MySQL / MariaDB | The connection is refused if the server did not negotiate TLS — the driver would otherwise carry on in plaintext | Not verified |
+| MySQL / MariaDB | The connection is refused if the server did not negotiate TLS — the driver would otherwise carry on in plaintext. The check runs after sign-in, so it detects a server without TLS, not an attacker in the network path | Not verified |
 | SQL Server | `Encrypt=yes` | Certificate verified, unless "Trust server certificate" is ticked |
 | Oracle | TCPS (TLS) instead of plain TCP | Server certificate DN is matched, unless "Trust server certificate" is ticked |
 | ClickHouse | Secure native protocol on port 9440 | Certificate verified, unless "Trust server certificate" is ticked |
@@ -307,6 +313,11 @@ it handles.
 
 The sandbox runs **one job at a time**, and `EXECUTOR_MAX_CONCURRENT` must stay
 `1` on both services. Raising it forfeits the isolation the sandbox exists for.
+
+The web service itself runs **one worker and one replica**. Keep it that way:
+charts are handed to the browser through a short-lived in-memory store, so a
+second worker or a load-balanced second container would show blank charts
+whenever the browser's two requests land on different processes.
 One job at a time is what makes "no other process shares this identity" true.
 
 Two honest consequences. Chart rendering is serialized, so a question that
@@ -384,6 +395,12 @@ proxy_read_timeout 900s;
 
 Set it comfortably above `EXECUTOR_QUEUE_MAX_S`, or lower that setting to fit
 the timeout you already have.
+
+**Pass the application's security headers through unchanged.** Every page
+carries a `Content-Security-Policy` header with a value that changes on each
+response. A proxy that strips it, caches pages, or adds a second policy of its
+own can leave charts blank or the page unprotected. Do not cache HTML
+responses, and do not rewrite the header.
 
 ## 4. Verify
 
@@ -491,6 +508,13 @@ decks, and your branded templates.
     with the owner shows its saved picture to the recipients, but cannot be
     refreshed by them.
   - Only a chat's owner can share one of its conversations.
+  - A colleague a chat is shared with can read it, ask new questions in it,
+    refresh its charts and pin them, but cannot edit its descriptions, add
+    data, start Auto Analytics or share it on. The shared chat appears in
+    their chat list.
+  - Charts and styled tables that anyone shares are shown in an isolated
+    frame or reduced to plain table formatting, so what one user shares
+    cannot act in another user's browser session.
 - **A forced password change blocks everything until it is done.** After a
   password reset (or the first administrator sign-in with the bootstrap
   password) the user must set a new password before anything else works: the

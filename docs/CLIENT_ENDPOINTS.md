@@ -31,6 +31,49 @@ file documents the enterprise client's implementation of each one.
 - **CSRF.** The session cookie is `SameSite=lax`, and every state-changing
   endpoint is a `POST` — a cross-site form or link cannot carry the session
   into a write.
+- **Content-Security-Policy.** Every `text/html` response carries a
+  `Content-Security-Policy` header with a fresh nonce per response:
+  `default-src 'self'; script-src 'self' 'nonce-…'; style-src 'self'
+  'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:;
+  connect-src 'self'; frame-src 'self' blob:; frame-ancestors 'self';
+  base-uri 'self'; form-action 'self'; object-src 'none'`. Every inline
+  `<script>` in the templates carries that nonce, and the page exposes it as
+  `window.__CSP_NONCE__`. JSON, event-stream, file and static responses carry
+  no policy. `ENABLE_THIRD_PARTY_SCRIPTS` adds the analytics and billing
+  origins; `GCS_UPLOAD_BUCKET` adds `https://storage.googleapis.com` to
+  `connect-src`; `CSP_REPORT_ONLY=true` sends the same policy as
+  `Content-Security-Policy-Report-Only` (a diagnostic). The page policy never
+  allows `'unsafe-eval'`, and it is not added to a response that already
+  carries its own policy (the chart documents below). Source:
+  `ContentSecurityPolicy` in `app.py`.
+- **Rendered chart and table markup.** Chart HTML (`image_base64` holding a
+  Plotly document, from a stream, history, a refresh or a dashboard tile) is
+  rendered only inside an iframe with `sandbox="allow-scripts"` — an opaque
+  origin with no cookies, storage or access to the page — built by
+  `PDCViewers.setChartFrame` (`static/vendor/viewers.js`), which registers the
+  HTML with `POST /api/charts` and loads the returned `/charts/{token}` (see
+  "Chart documents"). `styled_html` (a pandas Styler's table) is sanitised
+  on the server to an allowlist of table elements, `T_`-prefixed ids, the
+  class names pandas Styler generates (`T_<hex>`, `col<n>`, `row<n>`,
+  `level<n>`, `data`, `index_name`, `blank`, `col_heading`, `row_heading`),
+  CSS values without functions other than `rgb`/`rgba`/`hsl`/`hsla`, bounded
+  box sizes and margins (font, text and border sizes are not bounded), and
+  `#T_`-scoped style rules
+  (`html_sanitize.clean_styled_html`) when it is
+  produced, when a table tile is pinned or refreshed, and whenever a stored
+  history row or dashboard tile is served; when nothing survives, the field
+  is omitted and the page shows the plain `{columns, rows}` table. Stored
+  files are never rewritten. Matplotlib charts stay base64 PNGs shown as
+  `data:image/png` images.
+
+---
+
+## Chart documents
+
+| Method | Path | Behavior |
+|---|---|---|
+| `POST` | `/api/charts` | `{html}` (a chart document, ≤ 5,000,000 characters) → `{url: "/charts/<token>"}`. Signed-in only (`401` otherwise); `400` for a missing, non-string, empty or oversize `html`. The HTML goes into a bounded in-memory store (30-minute lifetime, oldest entries evicted first; one web worker). Called by `PDCViewers.setChartFrame` for every chart it renders — live, from history, refreshed, or from a dashboard tile. |
+| `GET` | `/charts/{token}` | the registered document. The token is signed with `SECRET_KEY`, valid 30 minutes and bound to the user who registered it; a bad, expired, evicted or other user's token, or no session, → `404`. Headers: `Content-Security-Policy: sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'self'` (no nonce: the document is served exactly as registered, its inline scripts run inside the sandbox, and external scripts can come only from this server), `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, `Referrer-Policy: no-referrer`. The only response in the application whose policy allows `'unsafe-eval'` (Plotly's WebGL traces need it); the document runs with an opaque origin. |
 
 ---
 
@@ -1018,7 +1061,7 @@ values leave the client.
 
 | Endpoint | Behavior |
 |---|---|
-| `POST /api/chat/{id}/share` | owner only (`403 {"error": "Access denied"}` for a share recipient); adds recipients to `meta.json["sharing"]["shared_with"]` (a never-signed-in address gets a placeholder account — see Sharing rules), asks brain `/v1/send_share_email` to SMTP-relay invites using this tenant's SMTP config |
+| `POST /api/chat/{id}/share` | owner only (`403 {"error": "Access denied"}` for a share recipient); adds recipients to `meta.json["sharing"]["shared_with"]` (a never-signed-in address gets a placeholder account — see Sharing rules), lists the chat in each recipient's chat list (`AuthStore.record_shared_chat`, a row with `shared_by`; idempotent), asks brain `/v1/send_share_email` to SMTP-relay invites using this tenant's SMTP config |
 | `GET  /api/chat/{id}/share` | returns the current sharing record (`{shared_with, owner}`) |
 | `POST /auth/conversations/{conv_id}/share` | **conversation-level share** — only the chat's OWNER may share (sharing a conversation also grants access to its chat): anyone else → `403 {"error": "Access denied"}`. For each recipient, snapshot the conversation history into a fresh `conv_id` via `ChatDataStore.copy_conv_to_new`, add them to the chat's `sharing.shared_with`, record the new conv in the recipient's `conversations.jsonl` with title prefix "(Shared) …" and `shared_by` field, then SMTP-relay an invite. Recipients access the chat through `_require_chat`'s shared-recipient check |
 | `GET  /api/chat/{id}/full_table/{key}` | returns the full result table cached under `key`. The chat stream sets `full_table_key` on responses that contain a tabular result. Backed by a bounded in-memory LRU (256 most recent results) |

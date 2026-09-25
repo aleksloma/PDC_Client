@@ -4,7 +4,7 @@
 > enterprise (on-prem) edition. Adapted from the original B2C constitution
 > for the brain/client split.
 
-**Version:** 1.3 (enterprise)
+**Version:** 1.4 (enterprise)
 **Last Updated:** 2026-09-25
 
 ---
@@ -454,7 +454,10 @@ already holds (an answer's stored code, a segment of it, a durable full-table
 record, or the answer being generated) — the server refuses any other posted
 code with `CODE_NOT_STORED` — so a signed-in user cannot submit arbitrary code
 of their choice through those routes; generated code itself still runs
-arbitrary Python inside the boundary, which is why the boundary exists.
+arbitrary Python inside the boundary, which is why the boundary exists. The
+question remains an input to that code: a user who asks the planner to run
+specific code may get it stored if the model complies, so the stored-code
+rule bounds who writes the bytes, not what they contain.
 
 ### The five properties that make it a boundary
 1. **A different unprivileged identity.** The web service is uid 10001, the
@@ -601,6 +604,37 @@ everything it is handed was selected for the job it is running.
 
 ---
 
+## Article XV: Rendered Content
+
+**Markup that users, the planner or the analysis sandbox can influence never
+runs with the page's origin.**
+
+1. A document that needs script (a Plotly chart) is rendered only through
+   `PDCViewers.setChartFrame`: an iframe with `sandbox="allow-scripts"` and
+   no other token, loading `/charts/{token}` — never inline document
+   markup. Never add `allow-same-origin`, `allow-top-navigation`,
+   `allow-popups` or `allow-forms` to a frame that holds such markup, and
+   never set a `sandbox` attribute anywhere else — a structural test pins
+   both. `/charts/{token}` serves the document with its own policy, which
+   starts with `sandbox allow-scripts` and is the ONLY policy in the
+   application that allows `'unsafe-eval'`.
+2. Markup inserted into the page itself (a Styler's `styled_html`) passes
+   `html_sanitize.clean_styled_html` on the server, at every point where it
+   is produced, stored from a request, or served from storage. Widening its
+   allowlist is a security change: positioning, stacking, transforms,
+   generated content, URLs and event handlers stay out.
+3. Every HTML page carries the nonce-based Content-Security-Policy from
+   `app.py`. An inline `<script>` in a template carries
+   `nonce="{{ request.state.csp_nonce }}"`; inline event-handler attributes
+   are not added (bind listeners in the script instead); `'unsafe-inline'`
+   and `'unsafe-eval'` are never added to the page policy's `script-src`.
+   Code that needs evaluation runs only in a chart document behind
+   `/charts/{token}` (rule 1), never on a page that holds the session.
+4. Text that reaches the page through `innerHTML` is escaped first, as the
+   existing renderers do; new renderers use `textContent` where they can.
+
+---
+
 ## Amendment process
 
 To modify this constitution:
@@ -627,3 +661,4 @@ To modify this constitution:
 | Exec dtypes  | Sandbox sees standard dtypes only. `sanitize_for_execution` is the gate.  |
 | Exec location| Generated Python runs in `pdc-executor`, never in the web process. `exec()` only on the two paths its runner enters (one of them a private callee). |
 | Exec boundary| Art. XIV: the sandbox container is the boundary — separate uid, no secrets, no DB, no network route, no customer data mounted. Its responses are untrusted input. |
+| Rendered markup| Art. XV: charts only in `sandbox="allow-scripts"` frames loading `/charts/{token}` (the only policy with `'unsafe-eval'`); `styled_html` through `clean_styled_html`; nonce CSP without eval on every page. |

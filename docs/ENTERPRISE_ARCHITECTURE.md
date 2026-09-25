@@ -1168,18 +1168,66 @@ always-on escape hatch when auto-redirect is enabled). Customer guide:
 
 ## 11. Sharing restriction
 
-The enterprise/company version restricts sharing to within the company's
-own domain (no sharing outside their domain). This builds on the existing
-share logic.
+The original intent was to restrict sharing to the company's own domain.
+**It is not implemented:** no per-tenant domain list exists on either side,
+and the share routes (`POST /api/chat/{id}/share`,
+`POST /auth/conversations/{conv_id}/share`, `POST /api/dashboards/{id}/share`)
+accept any syntactically valid address. What they do enforce: only the owner
+of a chat can share it or one of its conversations, a dashboard share grants
+only the chats the dashboard's owner owns, and an address that has never
+signed in gets a password-less placeholder account, so the share cannot be
+claimed by whoever types that address at the sign-in page first.
 
-**Resolved (partial):** per-tenant config carries an `allowed_sharing_domains`
-list; the client's `POST /api/chat/{id}/share` and
-`POST /auth/conversations/{conv_id}/share` filter recipients against that
-list before calling the brain to send invites. Recipients outside the
-allowlist are rejected with `400`.
+### 11a. Rendered content isolation
 
-**Still OPEN:** whether to enforce on the brain side too as defense in
-depth.
+Chart and table markup is data a user can influence — a planner answer, the
+code the analysis sandbox ran, or a tile another user pinned — and it is shown
+to other users through shares. It is therefore never given the page's origin:
+
+- **Script-bearing charts (Plotly)** render only in an iframe with
+  `sandbox="allow-scripts"` and nothing else, loaded from a dedicated route.
+  One builder (`PDCViewers.setChartFrame` in `static/vendor/viewers.js`)
+  creates every chart frame: it registers the chart HTML with
+  `POST /api/charts` and points the frame at the returned `/charts/{token}`
+  (a signed token, valid 30 minutes, bound to the user who registered it;
+  the document is fetched by the id inside the token from a bounded
+  in-memory store — the web server runs one worker). That route serves the
+  document with its OWN policy:
+  `sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-eval'
+  'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; frame-ancestors
+  'self'`. Inline script is allowed because every script of a chart document
+  is meant to run inside the sandbox; there is deliberately no nonce, since a
+  nonce would also let a stored document load script from any host, while
+  `'self'` limits external scripts to this server.
+  The `sandbox` directive and the frame's sandbox attribute each give the
+  document an opaque origin: no cookies, no storage, no access to the parent
+  page, and no request that carries the user's session (the only fetch it
+  may make is a script from this server, i.e. the Plotly bundle from
+  `/static/`). Plotly's WebGL traces (scatter and line charts over 1000
+  points) compile code at run time, which is why `'unsafe-eval'` exists here
+  and only here. The document is served exactly as stored.
+- **Script-free tables (pandas Styler `styled_html`)** are inserted into the
+  page itself, so they are sanitised on the server
+  (`html_sanitize.clean_styled_html`, nh3): table elements only, `T_`-prefixed
+  ids and the class names pandas Styler generates, a CSS property allowlist
+  with colour functions only and bounded box sizes and margins, `<style>`
+  rules scoped to `#T_…`, no event handler, link or URL. It runs where the markup is produced, where a tile is
+  pinned or refreshed, and wherever stored history or a tile is served, so
+  data stored by earlier releases is covered without being rewritten.
+- **Matplotlib charts** are base64 PNGs shown as `data:image/png` images; no
+  HTML path exists for them.
+- **Every authenticated page carries a nonce-based Content-Security-Policy**
+  (`script-src 'self' 'nonce-…'`) and NEVER `'unsafe-inline'` or
+  `'unsafe-eval'` for scripts. The split is deliberate: the pages that hold
+  the session run no evaluated code at all; the chart documents that need
+  evaluation run it only inside a sandboxed, opaque-origin document served by
+  `/charts/{token}`. The page policy is not added to a response that already
+  carries its own policy. The chart HTML stored in history and on tiles is
+  unchanged.
+
+The analysis sandbox still produces chart HTML exactly as before (Article XIV
+treats its output as untrusted input); the isolation is applied where the
+markup meets a browser.
 
 ---
 
@@ -1190,8 +1238,8 @@ Items still undecided. Do not invent or assume:
 - Auth/token rotation policy (lifetime, automatic rotation cadence).
 - How the client server reaches the brain at the network level (public
   HTTPS endpoint + token vs. VPN/private link — likely tenant-specific).
-- Whether to add brain-side enforcement of the sharing-domain allowlist
-  (currently client-side only).
+- Whether to restrict sharing by recipient domain at all (see §11; nothing
+  enforces a domain today).
 - Whether the dashboard top-bar should expose a "tenant ID" badge for
   operator support.
 
