@@ -523,18 +523,57 @@ carries a single-use token valid for 30 minutes, of which the client stores
 only a SHA-256 hash. Its address is the client's configured
 `PUBLIC_BASE_URL`, never taken from an incoming request; a client without
 that setting sends no reset mail. The link is a credential until it is used
-or expires, so
-it appears solely in the outgoing mail body — the brain never logs or stores
-it. The mail states that the link is valid for 30 minutes and works once.
+or expires, so it appears solely in the outgoing mail body — the brain never
+logs or stores it.
 
 ```jsonc
 { "sid": "reset-email", "email": "alice@acme.com",
-  "reset_url": "https://pdc.acme.internal/auth/reset/Q2x…" }
+  "reset_url": "https://pdc.acme.internal/auth/reset/Q2x…",
+  "kind": "reset" }            // optional: "reset" (default) | "invite"
 ```
 
-Returns `{ok: true, email_configured: true}` (400 also when `reset_url` is
-missing or not an `http://` / `https://` URL). The former `temp_password`
-field is gone: the client no longer sends it.
+`reset_url` must be an absolute `http://` or `https://` URL with a host and
+no user info (`user@` / `user:pw@`), at most 2048 characters, with no
+whitespace, control or invisible format characters (zero-width, bidi
+overrides — they could make the mailed link read differently from its
+target). The brain has no
+per-tenant allowed-hosts list: the host is whatever the client's
+`PUBLIC_BASE_URL` says.
+
+`kind` picks the wording; the link handling is the same for both:
+
+| `kind` | Subject | Body |
+|--------|---------|------|
+| `reset` (default) | "PowerDataChat password reset" | a reset was requested; set a new password at the link; if you did not request it, ignore the mail — the current password stays valid |
+| `invite` | "You have been invited to PowerDataChat" | you have been given access; set your password at the link; if it has expired, use "Reset password" on the sign-in page |
+
+Both mails state that the link is valid for 30 minutes and can be used only
+once. Neither contains a password.
+
+**Deprecated shape — `temp_password`.** Clients not yet upgraded (the hosted
+demo) still send `{sid, email, temp_password}`. The brain keeps accepting
+it: the mail is the old one, unchanged ("Your temporary password is: …",
+change it after login), and every such call logs one
+`RESET_EMAIL_TEMP_PASSWORD_DEPRECATED` warning (tenant id only — never the
+password). Upgraded clients never send it; it will be removed once no
+client does.
+
+Returns `{ok: true, email_configured: true}`. Errors, besides the welcome
+mail's 400 / 429 / 502 / 503:
+
+| HTTP | When |
+|------|------|
+| 400  | neither `reset_url` nor `temp_password` (only `null` / `""` count as absent) |
+| 400  | both `reset_url` and `temp_password` |
+| 400  | `reset_url` not a string, or not an acceptable URL (rule above) |
+| 400  | `kind` other than `reset` / `invite` (`null` / `""` mean `reset`) |
+| 400  | `kind: "invite"` with `temp_password` (an invitation needs a link) |
+| 400  | `temp_password` not a string |
+
+The field checks run before the email / rate-limit checks, so a malformed
+request never uses up a recipient's hourly allowance. Every field rejection
+logs `RESET_EMAIL_REJECTED reason=<the error text>` with the tenant id — the
+reason is a fixed string, never the submitted value.
 
 The client calls this in two places. An anonymous "Reset password" request
 calls it from a background thread, so the sign-in page answers the same way
@@ -545,8 +584,9 @@ waits (bounded by `BRAIN_DRAFT_TIMEOUT`) and reports `mail_sent: false` on
 failure.
 
 **Deployment order.** A brain that still requires `temp_password` answers 400
-to this shape, so reset and invitation mails fail (logged, nothing else
-breaks) until the brain accepts `reset_url`. Deploy the brain change first.
+to the `reset_url` shape, so reset and invitation mails fail (logged, nothing
+else breaks) until the brain accepts `reset_url`. Deploy the brain change
+first.
 
 ---
 
