@@ -485,7 +485,11 @@ def test_guard_refusal_reaches_retry_as_class_guard(chat, granted, brain,
     assert seen["exec"] == []
     assert len(calls["retry"]) == 3
     first = calls["retry"][0]
-    assert first["sql"] == {KEY: "DELETE FROM t"}
+    # Contract change (retry `sql` = what RAN this turn): a SELECT the guard
+    # refused never reached the database, so it is reported as `null` for
+    # its key — `sql_error` names the refusal. Re-pinned from the earlier
+    # echo of the refused text.
+    assert first["sql"] == {KEY: None}
     err = first["sql_error"]
     assert err["table"] == KEY
     assert err["dialect"] == "sqlite"
@@ -497,7 +501,8 @@ def test_guard_refusal_reaches_retry_as_class_guard(chat, granted, brain,
     assert first["failed_code"] == CODE_SUM
     assert [c["use_pro"] for c in calls["retry"]] == [False, True, True]
     assert "couldn't" in out["text"] or "could not" in out["text"].lower()
-    assert out["sql"] == {KEY: "DELETE FROM t"}
+    # Same contract change on the result: the refused SELECT did not run.
+    assert out["sql"] == {KEY: None}
 
 
 # ===========================================================================
@@ -949,3 +954,200 @@ def test_unreadable_registry_serves_no_snapshot_entry_either(
     assert "d.csv" in dfs
     assert SNAP_KEY not in dfs
     assert _records(caplog, "LIVE_REGISTRY_PROBE_FAILED")
+
+
+# ===========================================================================
+# 21. the `df` alias: the executor binds `df` to the FIRST frame, so on a
+#     chat whose first frame is a live table `df`-only code references it
+# ===========================================================================
+CODE_DF = "RESULT = df['a'].sum()"
+
+
+def test_df_alias_on_a_live_first_chat_takes_the_default_read(chat, granted, brain,
+                                                              executor):
+    """The chat's only frame is the live table: code using nothing but `df`
+    fetches it (the default read when the planner sent no SELECT) — never
+    an answer computed on the empty placeholder."""
+    calls, state = brain
+    seen, _ = executor
+    state["plan"]["code"] = CODE_DF
+    state["plan"].pop("sql", None)
+    out = _run(chat)
+    assert len(seen["exec"]) == 1
+    assert len(seen["exec"][0]["dfs"][KEY]) == 25
+    assert out["sql"] == {KEY: None}
+    assert out["live_rows"] == {KEY: 25}
+    assert out["text"] == "summarized"
+
+
+def test_df_alias_on_a_live_first_chat_takes_the_planners_select(chat, granted,
+                                                                 brain, executor):
+    calls, state = brain
+    seen, _ = executor
+    state["plan"]["code"] = CODE_DF
+    state["plan"]["sql"] = {KEY: "SELECT a, b FROM t WHERE a > 5"}
+    out = _run(chat)
+    assert len(seen["exec"]) == 1
+    assert len(seen["exec"][0]["dfs"][KEY]) == 19
+    assert out["sql"] == {KEY: "SELECT a, b FROM t WHERE a > 5"}
+    assert out["live_rows"] == {KEY: 19}
+
+
+def test_df_alias_on_a_snapshot_first_chat_fetches_nothing(chat, granted, brain,
+                                                           executor, monkeypatch):
+    """With a file loaded first, `df` is that file: the live table is not
+    referenced and nothing is fetched (`sql == {}`, the placeholder stays)."""
+    calls, state = brain
+    seen, _ = executor
+    _add_csv(chat)
+    dfs = chat.load_dataframes(include_live=True)
+    assert next(iter(dfs)) == "d.csv" and KEY in dfs
+    state["plan"]["code"] = "RESULT = df['x'].sum()"
+    state["plan"].pop("sql", None)
+    _no_engine(monkeypatch)
+    out = _run(chat)
+    assert len(seen["exec"]) == 1
+    assert len(seen["exec"][0]["dfs"][KEY]) == 0
+    assert out["sql"] == {}
+    assert out["live_rows"] == {}
+
+
+@pytest.mark.parametrize("code", ["RESULT = df2", "RESULT = 'xdfx'"],
+                         ids=["df2", "quoted-word"])
+def test_names_that_merely_contain_df_are_not_the_alias(chat, granted, brain,
+                                                        executor, monkeypatch, code):
+    """`df2` and a `df` inside another word are not the first-frame alias:
+    no fetch, `sql == {}`."""
+    calls, state = brain
+    seen, _ = executor
+    state["plan"]["code"] = code
+    state["plan"].pop("sql", None)
+    _no_engine(monkeypatch)
+    out = _run(chat)
+    assert len(seen["exec"]) == 1
+    assert len(seen["exec"][0]["dfs"][KEY]) == 0
+    assert out["sql"] == {}
+
+
+# ===========================================================================
+# 22. the retry's `sql` is what RAN this turn: the text for a SELECT that
+#     reached the database, None for a default read / an ignored SELECT
+#     (filtered table) / a guard refusal, absent for a key never fetched
+# ===========================================================================
+FILTERED_SQL_MESSAGE = ("The table is filtered by the administrator; "
+                        "no SELECT is accepted for it.")
+
+
+def test_bad_column_retry_keeps_the_select_text_that_reached_the_database(
+        chat, granted, brain, executor):
+    """A SELECT the database refused (unknown column) IS sent back under
+    `sql` — the brain needs the text to fix it."""
+    calls, state = brain
+    bad = "SELECT nope FROM t"
+    state["plan"]["sql"] = {KEY: bad}
+    state["retry"] = {"kind": "PYTHON", "code": CODE_SUM, "usage": {}}
+    out = _run(chat)
+    assert calls["retry"]
+    assert calls["retry"][0]["sql"] == {KEY: bad}
+    assert calls["retry"][0]["sql_error"]["class"] == "unknown_column"
+    assert out["sql"] == {KEY: bad}
+
+
+def test_filtered_table_python_error_retry_sends_null_and_the_ignore_refusal(
+        env, brain, executor, caplog):
+    """The registration carries an admin row filter, so the planner's SELECT
+    was IGNORED and the default read ran. A Python error then goes to retry
+    with `sql: {key: null}` (the SELECT did not run) and a `sql_error` of
+    class `guard` carrying the fixed sentence — never the echo of a SELECT
+    that was not executed."""
+    live = _register(env, where_filter="a >= 20")
+    _grant(USER, [live["tid"]])
+    chat = _chat_with([_db_entry(KEY, live["tid"], live["cid"])])
+    calls, state = brain
+    seen, behaviour = executor
+    state["plan"]["sql"] = {KEY: "SELECT a, b FROM t WHERE a > 5"}
+    behaviour["errors"] = ["NameError: name 'x' is not defined"]
+    with caplog.at_level(logging.INFO):
+        out = _run(chat)
+    assert _records(caplog, "LIVE_SQL_IGNORED_FILTERED")
+    assert len(calls["retry"]) == 1
+    kw = calls["retry"][0]
+    assert kw["sql"] == {KEY: None}
+    assert kw["sql_error"] == {"table": KEY, "dialect": "sqlite",
+                               "class": "guard", "guard": True,
+                               "message": FILTERED_SQL_MESSAGE}
+    assert kw["error_msg"].startswith("NameError")
+    assert sorted(seen["exec"][0]["dfs"][KEY]["a"].tolist()) == [20, 21, 22, 23, 24]
+    assert out["sql"] == {KEY: None}
+    assert out["text"] == "summarized"
+
+
+def test_python_error_on_a_default_read_retry_sends_null_and_no_sql_error(
+        chat, granted, brain, executor):
+    """No planner SELECT: the default read ran, so the retry says
+    `sql: {key: null}` (the key WAS fetched, by the default read) and
+    carries no `sql_error` — a Python error is not a query error."""
+    calls, state = brain
+    seen, behaviour = executor
+    state["plan"].pop("sql", None)
+    behaviour["errors"] = ["NameError: name 'x' is not defined"]
+    out = _run(chat)
+    assert len(calls["retry"]) == 1
+    kw = calls["retry"][0]
+    assert kw["sql"] == {KEY: None}
+    assert kw["sql_error"] is None
+    assert len(seen["exec"]) == 2
+    assert out["sql"] == {KEY: None}
+    assert out["text"] == "summarized"
+
+
+def test_plan_sql_for_a_key_never_referenced_is_absent_from_the_retry(
+        chat, granted, brain, executor, monkeypatch):
+    """The planner sent a SELECT for a key the code never touches: nothing
+    was fetched, so the retry's `sql` does not carry that key (None, or a
+    map without it) — the map reports what ran, not what was planned."""
+    calls, state = brain
+    seen, behaviour = executor
+    state["plan"]["code"] = CODE_NO_LIVE
+    state["plan"]["sql"] = {"other key": "SELECT 1"}
+    behaviour["errors"] = ["ZeroDivisionError: division by zero"]
+    state["retry"] = {"kind": "PYTHON", "code": CODE_NO_LIVE, "usage": {}}
+    _no_engine(monkeypatch)
+    out = _run(chat)
+    assert len(calls["retry"]) == 1
+    kw = calls["retry"][0]
+    assert "other key" not in (kw["sql"] or {})
+    assert kw["sql_error"] is None
+    assert out["sql"] == {}
+
+
+
+# ===========================================================================
+# 29. a REGENERATION retry's `sql` holds only what ran
+# ===========================================================================
+def test_plotly_regen_retry_sql_holds_only_the_selects_that_ran(chat, granted,
+                                                                brain, executor):
+    """A static matplotlib bar chart triggers the one-shot Plotly rewrite
+    (`_PLOTLY_REGEN_INSTRUCTION`). The planner sent SELECTs for the live key
+    AND for a key the code never touches: the regen retry's `sql` carries
+    the SELECT that ran for the live key and nothing for the other key, and
+    no `sql_error`."""
+    calls, state = brain
+    seen, _ = executor
+    select = "SELECT a, b FROM t WHERE a > 5"
+    state["plan"] = {"raw_text": "", "kind": "PLOT_CODE",
+                     "code": "plt.bar(dfs['live t']['b'], dfs['live t']['a'])",
+                     "usage": {}, "context_decision": {},
+                     "sql": {KEY: select, "other key": "SELECT 1"}}
+    # The rewrite answers prose, so the static chart is kept (one regen call).
+    state["retry"] = {"kind": "NO_CODE", "code": "", "usage": {}}
+    _run(chat)
+    assert len(seen["plot"]) >= 1
+    assert len(seen["plot"][0]["dfs"][KEY]) == 19
+    regen = [kw for kw in calls["retry"]
+             if kw["error_msg"] == run_chat_local._PLOTLY_REGEN_INSTRUCTION]
+    assert len(regen) == 1, [kw["error_msg"][:60] for kw in calls["retry"]]
+    kw = regen[0]
+    assert "other key" not in kw["sql"]
+    assert kw["sql"][KEY] == select
+    assert kw["sql_error"] is None

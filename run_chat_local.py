@@ -88,19 +88,28 @@ def _infrastructure_answer(sid, error_text) -> Optional[str]:
 _LIVE_ROLE_DENIED_TEXT = ("You no longer have access to {table}; ask your "
                           "administrator.")
 _LIVE_FAILED_PREFIX = "Live query for table '{table}' failed: {sentence}"
+# The refusal a retry's `sql_error` carries when the planner sent a SELECT for
+# a table the administrator filtered: the SELECT was ignored (the filtered
+# default read ran instead), so it is reported as not run.
+_FILTERED_SQL_MESSAGE = ("The table is filtered by the administrator; "
+                         "no SELECT is accepted for it.")
 
 
 def _new_live_state(plan_out: dict | None = None) -> dict:
     """The per-turn live state shared by every executor call and retry:
     `sql_map` (df key -> the planner's SELECT), `fetched` (keys whose frame
-    is in place), `sql_used` (what actually ran: the SQL text, or None for
-    a default read), `live_rows`, `truncated`, `failed_sql` (key -> the
+    is in place), `sql_used` (what actually ran: the SQL text of a SELECT
+    that reached the database — also when the database failed it — or None
+    for a default read, a SELECT ignored on a filtered table and a SELECT
+    the guard refused), `live_rows`, `truncated`, `failed_sql` (key -> the
     SELECT that failed, so it is never re-run or replaced by a default read
     until the planner sends a new one), `sql_error` (the value-free shape of
-    the LAST failure), `failed_key` / `failed_text`, `role_denied`."""
+    the LAST failure), `ignored_sql` (key -> the guard-shaped refusal of a
+    planner SELECT ignored on a filtered table), `failed_key` /
+    `failed_text`, `role_denied`."""
     state = {"sql_map": {}, "fetched": set(), "sql_used": {}, "live_rows": {},
              "truncated": set(), "failed_sql": {}, "failed_sql_error": {},
-             "failed_sql_text": {}, "sql_error": None,
+             "failed_sql_text": {}, "sql_error": None, "ignored_sql": {},
              "failed_key": None, "failed_text": None, "role_denied": None}
     _merge_retry_sql(state, plan_out)
     return state
@@ -118,6 +127,27 @@ def _merge_retry_sql(state: dict, response: dict | None) -> None:
             state["sql_map"][key] = sql
             state["fetched"].discard(key)
             state["failed_sql"].pop(key, None)
+
+
+def _retry_sql(state: dict) -> dict | None:
+    """The retry payload's `sql`: the SELECTs that RAN this turn — the text
+    for a SELECT that reached the database (also when it failed there, so
+    the planner can fix it), None for a default read, an ignored SELECT
+    (filtered table) or a guard refusal; keys never fetched are absent.
+    None when nothing was fetched."""
+    return dict(state.get("sql_used") or {}) or None
+
+
+def _retry_sql_error(state: dict) -> dict | None:
+    """The retry payload's `sql_error`: the last fetch failure, else the
+    refusal of the most recent SELECT ignored on a filtered table, else None
+    (a Python error on a default read is not a query error)."""
+    if state.get("sql_error"):
+        return state["sql_error"]
+    ignored = state.get("ignored_sql") or {}
+    if ignored:
+        return list(ignored.values())[-1]
+    return None
 
 
 def _live_specs(schema_docs, dfs) -> dict:
@@ -179,9 +209,13 @@ def _allowed_table_pairs(row: dict, cfg: dict) -> set:
 
 
 _DFS_GENERIC_RE = re.compile(r"\bdfs\b")
+# The executor binds `df` to the FIRST frame of the dict it receives
+# (`code_exec._execute_in_process`); `\bdf\b` matches neither `dfs` nor `df2`.
+_DF_ALIAS_RE = re.compile(r"\bdf\b")
 
 
-def _referenced_live_keys(code: str, live_keys, all_keys) -> tuple[list, list]:
+def _referenced_live_keys(code: str, live_keys, all_keys, *,
+                          first_key=None) -> tuple[list, list]:
     """(named, generic) live keys the code is about to use.
 
     NAMED: the key's name appears anywhere in the text as a plain quoted
@@ -194,9 +228,19 @@ def _referenced_live_keys(code: str, live_keys, all_keys) -> tuple[list, list]:
     placeholder must never reach the executor silently. Code that names only
     other keys and uses `dfs` in no generic form references nothing. This
     only decides WHICH keys are fetched; the fetch method (the planner's
-    SELECT when one exists, else the default read) is the same for both."""
+    SELECT when one exists, else the default read) is the same for both.
+
+    THE `df` ALIAS: `first_key` is the key of the first frame of the dict
+    the executor will receive (explicit — None disables the rule). When it
+    is a live key not already named and the code uses `df` as a word, it is
+    NAMED too: the executor binds `df` to that frame, so the placeholder
+    must not be what the code computes on. A `df` in a comment over-fetches
+    (the cost is a fetch, never a miss)."""
     text = code or ""
     named = [k for k in live_keys if f"'{k}'" in text or f'"{k}"' in text]
+    if (first_key is not None and first_key in live_keys
+            and first_key not in named and _DF_ALIAS_RE.search(text)):
+        named.append(first_key)
     stripped = text
     for key in sorted(set(all_keys or ()) | set(live_keys), key=len, reverse=True):
         for quoted in (f"'{key}'", f'"{key}"'):
@@ -238,7 +282,8 @@ def _ensure_live(sid, dfs: dict, schema_docs, code: str, state: dict,
         specs = _live_specs(schema_docs, dfs)
         if not specs:
             return True
-        named, generic = _referenced_live_keys(code, list(specs), list(dfs or {}))
+        named, generic = _referenced_live_keys(code, list(specs), list(dfs or {}),
+                                               first_key=next(iter(dfs or {}), None))
         referenced = [k for k in named + generic if k not in state["fetched"]]
         if not referenced:
             return True
@@ -278,6 +323,9 @@ def _ensure_live(sid, dfs: dict, schema_docs, code: str, state: dict,
             if spec["filtered"] and sql:
                 log_with_sid(sid, "info",
                              f"LIVE_SQL_IGNORED_FILTERED table={log_safe_text(str(key), 120)}")
+                state["ignored_sql"][key] = brain_client.live_sql_error(
+                    key, spec.get("dialect") or "", "guard", guard=True,
+                    message=_FILTERED_SQL_MESSAGE)
                 sql = None
             if sql and state["failed_sql"].get(key) == sql:
                 # The same SELECT failed on an earlier attempt of this turn
@@ -307,7 +355,9 @@ def _ensure_live(sid, dfs: dict, schema_docs, code: str, state: dict,
                     res = db_connector.default_live_fetch(conn, password, row,
                                                           cap=cap, sid=sid)
                 password = None
-            state["sql_used"][key] = sql or None
+            # What RAN: the text only for a SELECT that reached the database
+            # (success or a database failure); a guard refusal never did.
+            state["sql_used"][key] = None if res.get("guard") else (sql or None)
             if res.get("ok") and res.get("df") is not None:
                 df = res["df"]
                 try:
@@ -770,7 +820,7 @@ def _run_chat_body(*, sid, dfs, schema_docs, question, history_rows, user_email,
             use_pro=use_pro, use_search=use_search,
             user_email=user_email,
             dataset_profile=dataset_profile,
-            sql=state["sql_map"] or None, sql_error=state["sql_error"] or None,
+            sql=_retry_sql(state), sql_error=_retry_sql_error(state),
             live_tables=live_tables,
         )
         _merge_retry_sql(state, retry_out)
@@ -830,7 +880,7 @@ def _run_chat_body(*, sid, dfs, schema_docs, question, history_rows, user_email,
             error_msg=_PLOTLY_REGEN_INSTRUCTION, failed_code=code,
             use_pro=False, use_search=False, user_email=user_email,
             dataset_profile=dataset_profile,
-            sql=state["sql_map"] or None, sql_error=None, live_tables=live_tables,
+            sql=_retry_sql(state), sql_error=None, live_tables=live_tables,
         )
         _merge_retry_sql(state, retry_out)
         usage = _sum_usage(usage, retry_out.get("usage") or {})
@@ -1615,7 +1665,7 @@ def run_chat_multi_plot(
                 error_msg=error_msg, failed_code=code,
                 use_pro=use_pro, use_search=use_search, user_email=user_email,
                 dataset_profile=dataset_profile,
-                sql=state["sql_map"] or None, sql_error=state["sql_error"] or None,
+                sql=_retry_sql(state), sql_error=_retry_sql_error(state),
                 live_tables=live_tables,
             )
             _merge_retry_sql(state, retry_out)
@@ -1677,7 +1727,7 @@ def run_chat_multi_plot(
                     error_msg=plot_out.get("error", ""), failed_code=code,
                     use_pro=True, use_search=False, user_email=user_email,
                     dataset_profile=dataset_profile,
-                    sql=state["sql_map"] or None, sql_error=None,
+                    sql=_retry_sql(state), sql_error=None,
                     live_tables=live_tables,
                 )
                 _merge_retry_sql(state, retry_out)
@@ -1748,7 +1798,7 @@ def run_chat_multi_plot(
                 error_msg=_PLOTLY_REGEN_INSTRUCTION, failed_code=code,
                 use_pro=False, use_search=False, user_email=user_email,
                 dataset_profile=dataset_profile,
-                sql=state["sql_map"] or None, sql_error=None, live_tables=live_tables,
+                sql=_retry_sql(state), sql_error=None, live_tables=live_tables,
             )
             _merge_retry_sql(state, retry_out)
             total_usage = _sum_usage(total_usage, retry_out.get("usage") or {})
@@ -1777,7 +1827,7 @@ def run_chat_multi_plot(
                 error_msg=_MATRIX_REGEN_INSTRUCTION, failed_code=code,
                 use_pro=False, use_search=False, user_email=user_email,
                 dataset_profile=dataset_profile,
-                sql=state["sql_map"] or None, sql_error=None, live_tables=live_tables,
+                sql=_retry_sql(state), sql_error=None, live_tables=live_tables,
             )
             _merge_retry_sql(state, retry_out)
             total_usage = _sum_usage(total_usage, retry_out.get("usage") or {})
@@ -2022,7 +2072,7 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
             use_pro=use_pro, use_search=use_search,
             user_email=user_email,
             dataset_profile=dataset_profile,
-            sql=state["sql_map"] or None, sql_error=state["sql_error"] or None,
+            sql=_retry_sql(state), sql_error=_retry_sql_error(state),
             live_tables=live_tables,
         )
         _merge_retry_sql(state, retry_out)

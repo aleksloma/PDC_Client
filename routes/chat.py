@@ -68,7 +68,8 @@ _FULL_KEY_RE = re.compile(r"[0-9a-fA-F]{16}")
 
 def _persist_full_table(store, table: dict, code: str | None,
                         result_key: str | None = None,
-                        sql: dict | None = None) -> str | None:
+                        sql: dict | None = None,
+                        first_key: str | None = None) -> str | None:
     """Persist {columns, rows, code, total_rows} to disk and mirror it into the
     in-memory LRU. Returns the durable key, or None on failure (caller then
     leaves `full_table_key` unset and the frontend exports the preview rows).
@@ -80,7 +81,11 @@ def _persist_full_table(store, table: dict, code: str | None,
     `sql`: the turn's live-table map (df key -> SELECT or None); the subset
     for the keys `code` references is stored as `sql`, so a re-execution
     of this record (a dashboard tile, Download Excel) re-runs the same
-    query."""
+    query.
+
+    `first_key`: the key of the turn's FIRST frame (what the executor binds
+    `df` to), so a `df`-only answer on a live-first chat keeps its SELECT;
+    None disables the alias rule (the sql map has no frame order)."""
     try:
         key = secrets.token_hex(8)  # 16 hex chars — matches _FULL_KEY_RE
         record = _json_safe({
@@ -97,7 +102,7 @@ def _persist_full_table(store, table: dict, code: str | None,
             # quote style, or every key on a generic `dfs` walk), so a
             # `dfs.get("k")` answer keeps its SELECT on the durable record.
             named, generic = run_chat_local._referenced_live_keys(
-                code, list(sql), list(sql))
+                code, list(sql), list(sql), first_key=first_key)
             refs = set(named) | set(generic)
             subset = {k: v for k, v in sql.items() if k in refs}
             if subset:
@@ -151,8 +156,10 @@ async def _reexecute_full_df(chat_id: str, code: str | None, result_key: str | N
 
     `drop_df_keys`: df keys removed from the exec namespace AFTER load (role
     gate defense in depth — the dashboard tile-refresh path passes the denied
-    set; the full_table/Download-Excel callers pass nothing and stay ungated
-    by design: viewing existing data is never blocked retroactively). Filtered
+    set; the full_table/Download-Excel callers pass nothing: their live fetch
+    is gated by the routes (`_live_reexec_block`, before this call) and
+    snapshot re-execution stays ungated — viewing existing data is never
+    blocked retroactively). Filtered
     post-load on purpose — _load_dataframes_cached's cache key is per-chat,
     not per-user, so the cache must always hold the full set.
 
@@ -889,7 +896,8 @@ def _prefetch_stored_live(store, code: str, dfs: dict, sid: str):
         if not specs:
             return None, {}
         named, generic = run_chat_local._referenced_live_keys(
-            code, list(specs), list(dfs or {}))
+            code, list(specs), list(dfs or {}),
+            first_key=next(iter(dfs or {}), None))
         referenced = list(dict.fromkeys(named + generic))
         if not referenced:
             return None, {}
@@ -1458,7 +1466,8 @@ async def chat_stream(request: Request, chat_id: str):
                         _tbl = _res.get("table")
                         if isinstance(_tbl, dict) and _tbl.get("rows"):
                             _k = _persist_full_table(store, _tbl, _res.get("code"),
-                                                     sql=_res.get("sql"))
+                                                     sql=_res.get("sql"),
+                                                     first_key=next(iter(dfs), None))
                             if _k:
                                 event["full_table_key"] = _k
                                 w_full_table_key = _k
@@ -1472,7 +1481,8 @@ async def chat_stream(request: Request, chat_id: str):
                                 _k = _persist_full_table(
                                     store, _t, _res.get("code"),
                                     result_key=_t.get("title"),
-                                    sql=_res.get("sql"))
+                                    sql=_res.get("sql"),
+                                    first_key=next(iter(dfs), None))
                                 _keys.append(_k)
                             event["full_table_keys"] = _keys
                             w_full_table_keys = _keys
@@ -1489,7 +1499,8 @@ async def chat_stream(request: Request, chat_id: str):
                                 store, _t,
                                 _codes[_i] if _i < len(_codes) else None,
                                 result_key=_rkeys[_i] if _i < len(_rkeys) else None,
-                                sql=event.get("sql")))
+                                sql=event.get("sql"),
+                                first_key=next(iter(dfs), None)))
                         event["full_table_keys"] = _keys
                     # Register the codes this event shows BEFORE the browser can
                     # see it: its refresh / pin buttons work while the turn is
@@ -1916,7 +1927,8 @@ async def edit_regenerate(request: Request, chat_id: str):
                         _persist_full_table(store, t,
                                             codes_per[i] if i < len(codes_per) else None,
                                             result_key=rkeys[i] if i < len(rkeys) else None,
-                                            sql=ev.get("sql"))
+                                            sql=ev.get("sql"),
+                                            first_key=next(iter(dfs), None))
                         for i, t in enumerate(tbls)
                     ]
                     history_obj["tables"] = tbls
@@ -1949,7 +1961,8 @@ async def edit_regenerate(request: Request, chat_id: str):
                 if isinstance(tbl, dict) and tbl.get("rows"):
                     full_table_key = _persist_full_table(
                         store, tbl, single_result.get("code"),
-                        sql=single_result.get("sql"))
+                        sql=single_result.get("sql"),
+                        first_key=next(iter(dfs), None))
                 # Multi-table answer: one durable key per table (see chat_stream).
                 full_table_keys = None
                 tbls = single_result.get("tables")
@@ -1957,7 +1970,8 @@ async def edit_regenerate(request: Request, chat_id: str):
                     full_table_keys = [
                         _persist_full_table(store, t, single_result.get("code"),
                                             result_key=t.get("title"),
-                                            sql=single_result.get("sql"))
+                                            sql=single_result.get("sql"),
+                                            first_key=next(iter(dfs), None))
                         for t in tbls
                     ]
                 ai_record = {
@@ -2256,6 +2270,10 @@ async def full_table_get(request: Request, chat_id: str, key: str):
     rec = _load_full_table_record(store, key)
     if not rec:
         return JSONResponse({"error": "Full table not found or expired."}, status_code=404)
+    denied = await _live_reexec_denial(email, chat_id, rec.get("code"),
+                                       "FULL_TABLE_ROLE_DENIED")
+    if denied is not None:
+        return denied
     df = await _reexecute_full_df(chat_id, rec.get("code"), rec.get("result_key"))
     if df is not None and not df.empty:
         return _json_safe({
@@ -2276,6 +2294,20 @@ async def full_table_get(request: Request, chat_id: str, key: str):
 # shows a small non-blocking note (Article IV: logged, safe fallback).
 
 _DF_KEY_RE = re.compile(r"dfs\[\s*['\"]([^'\"]+)['\"]\s*\]")
+
+
+class _GateFailed(tuple):
+    """The `(frozenset(), [])` answer `_role_refresh_block` gives when it
+    crashed. Unpacks exactly like the ordinary answer, so `refresh_item` and
+    the dashboard tile keep failing open; `_live_reexec_block` recognises it
+    and fails closed. `error_type` is the caught exception's type name."""
+    error_type = ""
+
+
+def _gate_failed(error_type: str) -> "_GateFailed":
+    out = _GateFailed((frozenset(), []))
+    out.error_type = error_type
+    return out
 
 
 def _role_refresh_block(email: str, chat_id: str, code: str):
@@ -2316,7 +2348,93 @@ def _role_refresh_block(email: str, chat_id: str, code: str):
         # raised about table names and df keys.
         log_with_sid(email, "warning",
                      f"ROLE_GATE_FAILED chat={chat_id}: {log_safe_text(str(e), 200)}")
-        return frozenset(), []
+        # Same value as "nothing denied" for the fail-open callers; the
+        # marker lets the full-table gate fail closed instead.
+        return _gate_failed(type(e).__name__)
+
+
+_ROLE_DENIED_REFRESH_TEXT = ("Your role does not include this table's data — "
+                             "refresh is unavailable.")
+
+
+def _live_reexec_block(email: str, chat_id: str, code: str | None):
+    """Role gate for the two routes that re-run a stored answer for its
+    FULL result ("Show full table", "Download Excel"). Blocking — call it
+    off the event loop. Returns (denied, blocked_display_names).
+
+    The same gate `refresh_item` uses, by table (`_role_refresh_block`),
+    narrowed to the LIVE fetch: the item is refused only when its code
+    references — by the pre-fetch's own rule (`_referenced_live_keys`: a
+    quoted key, a generic `dfs` walk, the `df` alias of the first frame) —
+    a live key the requester's role does not cover, because re-running it
+    would query the customer database on their behalf. Snapshot
+    re-execution is unchanged (viewing existing data is never blocked
+    retroactively). FAILS CLOSED: an exception raised here — by the gate
+    call, the loader, the schema read or the referencing rule — and a gate
+    answer marked `_GateFailed` (the gate swallowed its own crash) are a
+    denial naming no table (`LIVE_REEXEC_GATE_FAILED`, the exception type
+    only)."""
+    try:
+        gate = _role_refresh_block(email, chat_id, code)
+        if isinstance(gate, _GateFailed):
+            log_with_sid(email, "warning",
+                         f"LIVE_REEXEC_GATE_FAILED "
+                         f"error={log_safe_text(str(gate.error_type or '?'), 80)}",
+                         chat_id=log_safe_text(str(chat_id), 80))
+            return True, []
+        drop, _ = gate
+        if not drop:
+            return False, []
+        store = local_store.ChatDataStore(chat_id)
+        dfs = store.load_dataframes(include_live=True)
+        schema_docs = store.schema_docs()
+        specs = run_chat_local._live_specs(schema_docs, dfs)
+        if not specs:
+            return False, []
+        named, generic = run_chat_local._referenced_live_keys(
+            code or "", list(specs), list(dfs or {}),
+            first_key=next(iter(dfs or {}), None))
+        keys = [k for k in dict.fromkeys(named + generic) if k in drop]
+        if not keys:
+            return False, []
+        names = {}
+        for e in local_store.db_entries_from_meta(store.read_meta()):
+            if e.get("file_name"):
+                names[e["file_name"]] = ((e.get("db") or {}).get("display_name")
+                                         or e["file_name"])
+        return True, sorted(str(names.get(k) or k) for k in keys)
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid(email, "warning",
+                     f"LIVE_REEXEC_GATE_FAILED "
+                     f"error={log_safe_text(type(e).__name__, 80)}",
+                     chat_id=log_safe_text(str(chat_id), 80))
+        return True, []
+
+
+async def _live_reexec_denial(email: str, chat_id: str, code: str | None,
+                              event: str):
+    """The 403 a full-table / Excel request gets when `_live_reexec_block`
+    denies it (the refresh path's `ROLE_DENIED` body — 403 because the Excel
+    route's success answer is a byte stream), else None. Decided BEFORE
+    `_reexecute_full_df`, so a denied call issues no database query."""
+    try:
+        loop = asyncio.get_running_loop()
+        denied, blocked = await loop.run_in_executor(
+            _EXEC, _live_reexec_block, email, chat_id, code)
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid(email, "warning",
+                     f"LIVE_REEXEC_GATE_FAILED "
+                     f"error={log_safe_text(type(e).__name__, 80)}",
+                     chat_id=log_safe_text(str(chat_id), 80))
+        denied, blocked = True, []
+    if not denied:
+        return None
+    log_with_sid(email, "info",
+                 f"{log_safe_text(event, 40)} tables={log_safe_text(', '.join(blocked), 400)}",
+                 chat_id=log_safe_text(str(chat_id), 80))
+    return JSONResponse({"ok": False, "code": "ROLE_DENIED",
+                         "blocked_tables": blocked,
+                         "error": _ROLE_DENIED_REFRESH_TEXT}, status_code=403)
 
 
 async def run_item_refresh(chat_id: str, code: str, kind: str, sid: str,
@@ -2374,7 +2492,8 @@ async def run_item_refresh(chat_id: str, code: str, kind: str, sid: str,
                 return {"ok": False, "error": "Re-execution did not produce a table."}
             payload = {"ok": True, "kind": "table", "table": table}
             full_table_key = _persist_full_table(store, table, code,
-                                                 sql=sql_used or None)
+                                                 sql=sql_used or None,
+                                                 first_key=next(iter(dfs), None))
             if full_table_key:
                 payload["full_table_key"] = full_table_key
             log_with_sid(sid, "info", "REFRESH_ITEM_OK", kind="table",
@@ -2567,6 +2686,10 @@ async def download_excel(request: Request, chat_id: str, key: str):
     rec = _load_full_table_record(store, key)
     if not rec:
         return JSONResponse({"error": "Table not found or expired."}, status_code=404)
+    denied = await _live_reexec_denial(email, chat_id, rec.get("code"),
+                                       "DOWNLOAD_EXCEL_ROLE_DENIED")
+    if denied is not None:
+        return denied
     try:
         df = await _reexecute_full_df(chat_id, rec.get("code"), rec.get("result_key"))
         if df is not None and not df.empty:

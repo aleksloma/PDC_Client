@@ -359,8 +359,12 @@ def retry(sid: str, question: str, schema_text: str, df_names: list[str],
         "dataset_profile": _compact_profiles_for_transport(dataset_profile),
     }
     # The live-table fields ride only when a live fetch was involved: `sql`
-    # is the map of SELECTs that ran (the planner's own text, echoed back),
-    # `sql_error` the value-free `live_sql_error` shape.
+    # is the map of what RAN this turn, per fetched key — the SELECT text
+    # when it reached the database (also when the database failed it), null
+    # for a default read, a SELECT ignored on a filtered table or a SELECT
+    # the guard refused; keys never fetched are absent. `sql_error` is the
+    # value-free `live_sql_error` shape of the failure (or of the ignored
+    # SELECT's refusal).
     if sql:
         payload["sql"] = sql
     if sql_error:

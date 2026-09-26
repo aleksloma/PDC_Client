@@ -485,3 +485,208 @@ def test_edit_regenerate_on_a_denied_live_only_chat_ends_without_the_planner(
     assert rows[-1]["role"] == "ai"
     assert "no longer have access" in rows[-1]["content"]
     assert KEY in rows[-1]["content"]
+
+
+# ===========================================================================
+# 13. "Show full table" and "Download Excel" re-run a stored live SELECT:
+#     the requester's role gate runs BEFORE any fetch
+# ===========================================================================
+FRIEND = "friend@x.com"
+ROLE_DENIED_TEXT = ("Your role does not include this table's data — "
+                    "refresh is unavailable.")
+PREVIEW = {"columns": ["a", "b"], "rows": [{"a": 0, "b": "v0"}], "total_rows": 1}
+
+
+def _full_record(chat_id, code, *, sql=None):
+    """What the product leaves behind for a tabular answer: the AI row
+    holding `code` (and `sql`) plus the durable full-table record the two
+    routes resolve by key."""
+    import routes.chat as chat_mod
+    store = local_store.ChatDataStore(chat_id)
+    _seed_row(chat_id, code, sql=sql)
+    key = chat_mod._persist_full_table(store, PREVIEW, code, sql=sql)
+    assert key
+    return key
+
+
+def _full_table(client, key, chat_id=CHAT):
+    return client.get(f"/api/chat/{chat_id}/full_table/{key}")
+
+
+def _excel(client, key, chat_id=CHAT):
+    return client.post(f"/api/chat/{chat_id}/download_excel/{key}", json={})
+
+
+def _assert_role_denied(r, blocked):
+    assert r.status_code == 403, r.text[:300]
+    body = r.json()
+    assert body["ok"] is False
+    assert body["code"] == "ROLE_DENIED"
+    assert body["blocked_tables"] == blocked
+    assert body["error"] == ROLE_DENIED_TEXT
+
+
+def _add_snapshot_entry(chat, registry):
+    meta = chat.read_meta()
+    meta["files"].append(_db_entry("snap u", registry["snap_tid"],
+                                   registry["cid"], table="u"))
+    chat.write_meta(meta)
+    local_store._DATAFRAME_CACHE.invalidate()
+
+
+def test_full_table_and_excel_refetch_the_live_rows_for_a_granted_owner(
+        client, chat, registry, granted):
+    """The owner's role covers the table: both routes re-run the stored
+    SELECT and serve the CURRENT rows (the table grew after the answer)."""
+    key = _full_record(CHAT, CODE, sql={KEY: SQL})
+    _insert_rows(registry["db"], 3)
+    r = _full_table(client, key)
+    assert r.status_code == 200, r.text[:300]
+    assert r.json()["total_rows"] == 28
+    assert r.json()["columns"] == ["a", "b"]
+    r = _excel(client, key)
+    assert r.status_code == 200, r.text[:300]
+    assert "spreadsheetml" in r.headers["content-type"]
+    assert r.content[:2] == b"PK"
+
+
+def test_full_table_and_excel_refuse_an_uncovered_live_key_before_any_fetch(
+        client, chat, monkeypatch, caplog):
+    """OWNER holds only Base: both routes answer the refresh path's denial
+    shape with 403 and issue NO database query — no LIVE_PREFETCH /
+    LIVE_QUERY_OK line exists for the refused calls."""
+    key = _full_record(CHAT, CODE, sql={KEY: SQL})
+    _no_fetch(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        _assert_role_denied(_full_table(client, key), [KEY])
+        _assert_role_denied(_excel(client, key), [KEY])
+    assert _records(caplog, "LIVE_PREFETCH") == []
+    assert _records(caplog, "LIVE_QUERY_OK") == []
+    assert _records(caplog, "FULL_TABLE_ROLE_DENIED")
+    assert _records(caplog, "DOWNLOAD_EXCEL_ROLE_DENIED")
+
+
+def test_full_table_and_excel_refuse_a_share_recipient_without_the_grant(
+        client, chat, granted, monkeypatch, caplog):
+    """The gate keys on the REQUESTER: the owner's grant does not carry over
+    to a recipient whose role never covered the table."""
+    key = _full_record(CHAT, CODE, sql={KEY: SQL})
+    local_store.AuthStore().ensure_user(FRIEND)
+    chat.add_share_recipients([FRIEND])
+    client.post(f"/_login/{FRIEND}")
+    _no_fetch(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        _assert_role_denied(_full_table(client, key), [KEY])
+        _assert_role_denied(_excel(client, key), [KEY])
+    assert _records(caplog, "LIVE_PREFETCH") == []
+
+
+def test_snapshot_only_answer_stays_served_on_both_routes_without_a_grant(
+        client, chat, registry, monkeypatch):
+    """Unchanged contract: an answer computed on a SNAPSHOT table is still
+    viewable and downloadable after a role change — the gate on these two
+    routes covers the live fetch only (no query is issued either way)."""
+    _add_snapshot_entry(chat, registry)
+    key = _full_record(CHAT, "RESULT = dfs['snap u']")
+    _no_fetch(monkeypatch)
+    r = _full_table(client, key)
+    assert r.status_code == 200, r.text[:300]
+    assert r.json()["total_rows"] == 2
+    r = _excel(client, key)
+    assert r.status_code == 200, r.text[:300]
+    assert r.content[:2] == b"PK"
+
+
+@pytest.mark.parametrize("route", ["full_table", "download_excel"])
+def test_full_table_gate_crash_fails_closed_without_a_fetch(
+        client, chat, granted, monkeypatch, caplog, route):
+    """A crash inside the role gate on these two routes refuses (403, the
+    denial shape with no table named) instead of letting the fetch through:
+    `LIVE_REEXEC_GATE_FAILED` names the exception type, and no query runs."""
+    import routes.chat as chat_mod
+    key = _full_record(CHAT, CODE, sql={KEY: SQL})
+
+    def boom(email, chat_id, code):
+        raise RuntimeError("gate unavailable")
+    monkeypatch.setattr(chat_mod, "_role_refresh_block", boom)
+    _no_fetch(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        r = _full_table(client, key) if route == "full_table" else _excel(client, key)
+    _assert_role_denied(r, [])
+    failed = _records(caplog, "LIVE_REEXEC_GATE_FAILED")
+    assert failed
+    assert any("RuntimeError" in x.getMessage() for x in failed)
+    assert _records(caplog, "LIVE_PREFETCH") == []
+
+
+# ===========================================================================
+# 14. the `df` alias on the re-execution paths: `df` is the FIRST frame, so
+#     on a chat whose first frame is a live table it references that table
+# ===========================================================================
+def test_reexecute_full_df_fetches_for_df_only_code_on_a_live_first_chat(
+        client, live_only_chat, registry, granted):
+    """Stored code that uses only `df` on a chat whose first (and only) frame
+    is the live table re-runs the stored SELECT — the executor binds `df`
+    to that frame, so the placeholder must never be what it computes on."""
+    import routes.chat as chat_mod
+    _seed_row(LIVE_ONLY_CHAT, "RESULT = df", sql={KEY: SQL})
+    _insert_rows(registry["db"], 2)
+    df = asyncio.run(chat_mod._reexecute_full_df(LIVE_ONLY_CHAT, "RESULT = df"))
+    assert df is not None
+    assert len(df) == 27
+    assert list(df.columns) == ["a", "b"]
+
+
+def test_persist_full_table_keeps_the_sql_of_a_df_only_answer(client, live_only_chat):
+    """`_persist_full_table(..., first_key=)` — the first frame's key — lets
+    a `df`-only answer keep its SELECT on the durable record."""
+    import routes.chat as chat_mod
+    key = chat_mod._persist_full_table(live_only_chat, PREVIEW, "RESULT = df",
+                                       sql={KEY: SQL}, first_key=KEY)
+    assert key
+    rec = chat_mod._load_full_table_record(live_only_chat, key)
+    assert rec["code"] == "RESULT = df"
+    assert rec["sql"] == {KEY: SQL}
+
+
+@pytest.mark.parametrize("route", ["full_table", "download_excel"])
+def test_full_table_gate_fails_closed_when_the_role_lookup_itself_fails(
+        client, chat, granted, monkeypatch, caplog, route):
+    """The REAL `_role_refresh_block` swallows a crash of the roles lookup
+    and answers "nothing denied" (`ROLE_GATE_FAILED`). On these two routes
+    that answer must not let a live fetch through: 403 with the denial
+    shape and no table named, `LIVE_REEXEC_GATE_FAILED`, no query."""
+    key = _full_record(CHAT, CODE, sql={KEY: SQL})
+
+    def boom(email):
+        raise RuntimeError("roles unreadable")
+    monkeypatch.setattr(roles_store, "allowed_table_ids_for", boom)
+    _no_fetch(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        r = _full_table(client, key) if route == "full_table" else _excel(client, key)
+    _assert_role_denied(r, [])
+    assert _records(caplog, "LIVE_REEXEC_GATE_FAILED")
+    assert _records(caplog, "LIVE_PREFETCH") == []
+
+
+def test_refresh_item_keeps_its_fail_open_gate_when_the_role_lookup_fails(
+        client, chat, granted, monkeypatch, caplog):
+    """Companion, unchanged behaviour: `refresh_item`'s gate fails OPEN on
+    the same crash (`ROLE_GATE_FAILED`) and the refresh proceeds to its own
+    pre-fetch — here `_no_fetch` makes that pre-fetch fail, so the answer
+    is the execution-failure shape (200, ok false), not a role denial."""
+    _seed_row(CHAT, CODE, sql={KEY: SQL})
+
+    def boom(email):
+        raise RuntimeError("roles unreadable")
+    monkeypatch.setattr(roles_store, "allowed_table_ids_for", boom)
+    _no_fetch(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        r = client.post(f"/api/chat/{CHAT}/refresh_item",
+                        json={"code": CODE, "kind": "table"})
+    assert r.status_code == 200, r.text[:300]
+    body = r.json()
+    assert body["ok"] is False
+    assert body.get("code") != "ROLE_DENIED"
+    assert _records(caplog, "ROLE_GATE_FAILED")
+    assert _records(caplog, "LIVE_REEXEC_GATE_FAILED") == []

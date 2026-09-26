@@ -333,7 +333,8 @@ def test_stranger_is_denied_before_anything_else(client, refresh_calls):
 def test_full_table_and_download_excel_carry_no_role_gate(client, world,
                                                           monkeypatch):
     """By design: viewing or downloading an existing result is never blocked
-    retroactively by a role change — only re-running is."""
+    retroactively by a role change — only re-running is — except a live
+    fetch, which is gated (see test_live_refresh_paths)."""
     import routes.chat as chat_mod
 
     def blocked(email, chat_id, code):
