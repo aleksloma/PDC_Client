@@ -764,3 +764,140 @@ def test_clickhouse_catalog_estimates_are_bound_by_schema_and_table():
     for sql in (d.row_count_sql, d.table_size_sql):
         assert sql.startswith("SELECT ") and "system.tables" in sql
         assert ":schema" in sql and ":table" in sql
+
+
+# ---------------------------------------------------------------------------
+# count_rows / sample_rows / _is_timeout (live-mode sizing and profiling)
+# ---------------------------------------------------------------------------
+
+def test_live_constants():
+    assert db_connector.COUNT_TIMEOUT_CAP_S == 60
+    assert db_connector.LIVE_PROFILE_SAMPLE_ROWS == 10_000
+
+
+def test_is_timeout_walks_the_cause_chain():
+    try:
+        try:
+            raise TimeoutError("socket timed out")
+        except TimeoutError as inner:
+            raise RuntimeError("could not connect") from inner
+    except RuntimeError as e:
+        assert db_connector._is_timeout(e) is True
+    assert db_connector._is_timeout(
+        RuntimeError("canceling statement due to statement timeout")) is True
+    assert db_connector._is_timeout(
+        RuntimeError('FATAL: password authentication failed for user "pdc"')) is False
+    assert db_connector._is_timeout(
+        RuntimeError("DPY-6005: cannot connect to database")) is False
+
+
+def test_is_timeout_survives_a_self_referential_cause_chain():
+    a = RuntimeError("a")
+    b = RuntimeError("b")
+    a.__cause__ = b
+    b.__cause__ = a
+    assert db_connector._is_timeout(a) is False
+
+
+def test_count_rows_counts(sqlite_cfg):
+    res = db_connector.count_rows(sqlite_cfg, "", None, "orders", sid="t")
+    assert res["ok"] is True
+    assert res["count"] == 7
+    assert isinstance(res["count"], int)
+    assert res["timed_out"] is False
+
+
+def test_count_rows_honours_where(sqlite_cfg):
+    res = db_connector.count_rows(sqlite_cfg, "", None, "orders",
+                                  where="client_id = 0", sid="t")
+    assert res["ok"] is True and res["count"] == 3
+
+
+def test_count_rows_failure_never_raises(sqlite_cfg):
+    res = db_connector.count_rows(sqlite_cfg, "", None, "no_such_table", sid="t")
+    assert res["ok"] is False
+    assert res["timed_out"] is False
+    assert res["error"]
+
+
+def test_count_rows_timeout_is_flagged(sqlite_cfg, monkeypatch):
+    def boom(*a, **kw):
+        raise TimeoutError("statement timed out")
+    monkeypatch.setattr(db_connector, "get_engine", boom)
+    res = db_connector.count_rows(sqlite_cfg, "", None, "orders", sid="t")
+    assert res["ok"] is False
+    assert res["timed_out"] is True
+
+
+def test_count_rows_timeout_in_the_cause_chain_is_flagged(sqlite_cfg, monkeypatch):
+    def boom(*a, **kw):
+        try:
+            raise TimeoutError("socket timed out")
+        except TimeoutError as inner:
+            raise RuntimeError("driver failure") from inner
+    monkeypatch.setattr(db_connector, "get_engine", boom)
+    res = db_connector.count_rows(sqlite_cfg, "", None, "orders", sid="t")
+    assert res["ok"] is False and res["timed_out"] is True
+
+
+def _engine_spy(monkeypatch):
+    seen = []
+    real = db_connector.get_engine
+
+    def spy(cfg, *a, **kw):
+        seen.append(dict(cfg))
+        return real(cfg, *a, **kw)
+    monkeypatch.setattr(db_connector, "get_engine", spy)
+    return seen
+
+
+def test_count_rows_caps_the_statement_timeout(sqlite_cfg, monkeypatch):
+    """The count is interactive (wizard introspect): the engine is built from
+    a cfg copy whose statement_timeout is capped, so every dialect's own
+    mechanism (session SET, connect arg, URL query) sees the bound."""
+    monkeypatch.setattr(db_connector.settings, "DB_STATEMENT_TIMEOUT", 300)
+    seen = _engine_spy(monkeypatch)
+    assert db_connector.count_rows(sqlite_cfg, "", None, "orders", sid="t")["ok"]
+    assert seen and seen[-1]["statement_timeout"] == 60
+    assert "statement_timeout" not in sqlite_cfg      # caller's cfg untouched
+
+
+def test_count_rows_explicit_timeout_and_a_lower_connection_bound(sqlite_cfg,
+                                                                  monkeypatch):
+    monkeypatch.setattr(db_connector.settings, "DB_STATEMENT_TIMEOUT", 300)
+    seen = _engine_spy(monkeypatch)
+    db_connector.count_rows(sqlite_cfg, "", None, "orders", timeout_s=5, sid="t")
+    assert seen[-1]["statement_timeout"] == 5
+    low = dict(sqlite_cfg, statement_timeout=10)
+    db_connector.count_rows(low, "", None, "orders", sid="t")
+    assert seen[-1]["statement_timeout"] == 10
+
+
+def test_sample_rows_returns_a_bounded_frame(sqlite_cfg):
+    res = db_connector.sample_rows(sqlite_cfg, "", None, "orders", limit=3, sid="t")
+    assert res["ok"] is True
+    df = res["df"]
+    assert isinstance(df, pd.DataFrame)
+    assert len(df) == 3
+    assert list(df.columns) == ["order_id", "client_id", "amount", "segment"]
+
+
+def test_sample_rows_default_limit_and_columns(sqlite_cfg):
+    res = db_connector.sample_rows(sqlite_cfg, "", None, "orders",
+                                   columns=["order_id", "amount"], sid="t")
+    assert res["ok"] is True
+    assert list(res["df"].columns) == ["order_id", "amount"]
+    assert len(res["df"]) == 7            # all rows, under the default limit
+
+
+def test_sample_rows_honours_where(sqlite_cfg):
+    res = db_connector.sample_rows(sqlite_cfg, "", None, "orders",
+                                   where="client_id = 0", sid="t")
+    assert res["ok"] is True and len(res["df"]) == 3
+
+
+def test_sample_rows_failure_shape(sqlite_cfg):
+    res = db_connector.sample_rows(sqlite_cfg, "", None, "no_such_table", sid="t")
+    assert res["ok"] is False
+    assert res["df"] is None
+    assert res["error"]

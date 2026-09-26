@@ -128,3 +128,20 @@ def test_profile_json_round_trips_through_json_safe():
     })
     payload = json.dumps(local_store._json_safe(dp.compute_profile(df)))
     assert isinstance(json.loads(payload), dict)
+
+
+def test_total_rows_marks_a_sample_with_the_true_count():
+    """A live table is profiled from a bounded sample: `total_rows` carries
+    the true row count, and the profile says it is sampled."""
+    df = pd.DataFrame({"n": range(5), "s": list("abcde")})
+    prof = dp.compute_profile(df, total_rows=1000)
+    assert prof["rows"] == 1000
+    assert prof["sampled"] is True
+    assert prof["columns"]["n"]["nunique"] == 5      # stats on the sample
+
+
+def test_without_total_rows_nothing_changes():
+    df = pd.DataFrame({"n": range(5)})
+    prof = dp.compute_profile(df)
+    assert prof["rows"] == 5
+    assert prof["sampled"] is False

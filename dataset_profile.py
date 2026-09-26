@@ -197,12 +197,21 @@ def _build_warnings(work: pd.DataFrame, col_profiles: dict,
     return warnings[:MAX_WARNINGS]
 
 
-def compute_profile(df: pd.DataFrame) -> dict:
+def compute_profile(df: pd.DataFrame, *, total_rows: int | None = None) -> dict:
     """The profile for one table. Pure; deterministic (sample uses a fixed
-    seed); bounded (sampling above SAMPLE_THRESHOLD, pair scan capped)."""
-    rows = int(len(df))
-    sampled = rows > SAMPLE_THRESHOLD
-    work = df.sample(n=SAMPLE_ROWS, random_state=0) if sampled else df
+    seed); bounded (sampling above SAMPLE_THRESHOLD, pair scan capped).
+
+    `total_rows` (live tables): `df` is ALREADY a bounded sample of a table
+    holding `total_rows` rows — `rows` reports that true count, `sampled` is
+    True and the statistics run on the given frame as it is."""
+    if total_rows is not None:
+        rows = int(total_rows)
+        sampled = True
+        work = df
+    else:
+        rows = int(len(df))
+        sampled = rows > SAMPLE_THRESHOLD
+        work = df.sample(n=SAMPLE_ROWS, random_state=0) if sampled else df
     total = len(work)
 
     col_profiles: dict = {}

@@ -133,3 +133,73 @@ def test_a_stored_blank_port_connection_is_shown_on_its_plaintext_port():
     body = body[:body.index("_prevDialectKey = d.key")]
     assert re.search(r"editingConnId\s*&&\s*d\.plaintext_port\s*&&\s*!\$\('connSsl'\)\.checked",
                      body), "stored blank-port fallback to the plaintext port is missing"
+
+
+# ---------------------------------------------------------------------------
+# Live-mode storage choice: the wizard's step-3 radios + hint, the per-table
+# mode modal, the list badge, and the snapshot-only promises made mode-aware.
+# ---------------------------------------------------------------------------
+CSS = (ROOT / "static" / "admin_data_sources.css").read_text(encoding="utf-8")
+
+
+def _norm_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s)
+
+
+def test_wizard_has_the_storage_radios():
+    for elem_id in ("twModeSnapshot", "twModeLive"):
+        tag = _tag_with_id(HTML, elem_id)
+        assert re.search(r'type="radio"', tag), tag
+        assert re.search(r'name="twMode"', tag), tag
+
+
+def test_wizard_mode_hint_is_a_hidden_warning():
+    tag = _tag_with_id(HTML, "twModeHint")
+    cls = re.search(r'class="([^"]*)"', tag)
+    assert cls, tag
+    classes = cls.group(1).split()
+    assert {"adm-alert", "warn", "hidden"} <= set(classes), tag
+
+
+def test_wizard_mode_note_exists():
+    _tag_with_id(HTML, "twModeNote")
+
+
+def test_table_mode_modal_holds_its_controls():
+    _tag_with_id(HTML, "tableModeModal")
+    start = HTML.index('id="tableModeModal"')
+    for elem_id in ("tmmSnapshot", "tmmLive", "btnTmmSave", "btnTmmCancel",
+                    "closeTmmModal", "tmmHint"):
+        _tag_with_id(HTML, elem_id)
+        assert HTML.index(f'id="{elem_id}"') > start, \
+            f"#{elem_id} must sit inside #tableModeModal"
+
+
+def test_mode_functions_are_defined():
+    for name in ("openTableModeModal", "saveTableMode", "_renderModeHint"):
+        _function_body(JS, name)
+
+
+def test_save_table_mode_posts_to_the_mode_route():
+    assert "/mode" in _function_body(JS, "saveTableMode")
+
+
+def test_save_table_sends_the_mode():
+    assert re.search(r"\bmode\b", _function_body(JS, "saveTable"))
+
+
+def test_table_list_renders_the_live_badge():
+    assert "adm-chip live" in _function_body(JS, "renderTables")
+
+
+def test_live_required_is_handled_in_the_script():
+    assert "LIVE_REQUIRED" in JS
+
+
+def test_live_chip_style_exists():
+    assert re.search(r"\.adm-chip\.live\s*[{,]", CSS)
+
+
+def test_snapshot_only_promises_are_gone():
+    assert "user questions never query your database directly" not in _norm_ws(HTML)
+    assert "never against your database" not in _norm_ws(JS)

@@ -112,6 +112,7 @@ EXPECTED_ROUTES = [
     ('POST', '/api/admin/tables/{tid}'),
     ('POST', '/api/admin/tables/{tid}/delete'),
     ('POST', '/api/admin/tables/{tid}/dismiss_drift'),
+    ('POST', '/api/admin/tables/{tid}/mode'),
     ('POST', '/api/admin/tables/{tid}/refresh'),
     ('POST', '/api/admin/tables/{tid}/schedule'),
     ('POST', '/api/admin/users/invite'),

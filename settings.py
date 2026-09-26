@@ -246,6 +246,15 @@ class Settings(BaseModel):
     DB_PREVIEW_ROWS: int = Field(default_factory=lambda: int(os.getenv("DB_PREVIEW_ROWS", "20")))
     DB_MAX_AUTO_CONNECTORS: int = Field(default_factory=lambda: int(os.getenv("DB_MAX_AUTO_CONNECTORS", "25")))
 
+    # Live-mode size thresholds, in CELLS (row count x column count). At or
+    # above LIVE_MODE_CELL_THRESHOLD the admin UI suggests live mode; at or
+    # above LIVE_MODE_FORCE_THRESHOLD a snapshot is refused and live is
+    # required. The effective force threshold is max(force, cell). Read
+    # through _int_env: a typo falls back to the default instead of stopping
+    # the boot.
+    LIVE_MODE_CELL_THRESHOLD: int = Field(default_factory=lambda: _int_env("LIVE_MODE_CELL_THRESHOLD", 50_000_000, 1))
+    LIVE_MODE_FORCE_THRESHOLD: int = Field(default_factory=lambda: _int_env("LIVE_MODE_FORCE_THRESHOLD", 500_000_000, 1))
+
     # Nightly snapshot refresh (container-local time; the admin UI value in
     # data_sources.json wins once set — these are first-boot defaults only).
     DB_REFRESH_TIME: str = Field(default_factory=lambda: os.getenv("DB_REFRESH_TIME", "00:00"))

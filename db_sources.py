@@ -54,6 +54,39 @@ _SECRET_KEYS = {"password", "password_enc", "url", "url_override", "dsn", "conne
 
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
+# Storage mode of a registered table. "snapshot" (the default) = a local
+# parquet refreshed on a schedule; "live" = no parquet, queried at question
+# time. An ABSENT or null `mode` reads as snapshot (table_mode) — documents
+# written before the field existed are never rewritten.
+MODES = ("snapshot", "live")
+LIVE_REASONS = ("threshold", "manual")
+_LIVE_KEYS = ("live_reason", "live_set_by", "live_set_at")
+
+
+def table_mode(doc) -> str:
+    """The storage mode of a table doc; absent / null / anything unusable
+    reads as "snapshot" (the one reader every caller uses)."""
+    mode = (doc or {}).get("mode") if isinstance(doc, dict) else None
+    return "live" if mode == "live" else "snapshot"
+
+
+def validate_mode_fields(doc: dict) -> None:
+    """Reject a mode / live_reason / live_set_by / live_set_at value outside
+    the allowed set (ValueError — the routes answer 400 BAD_MODE). Absent or
+    null values are accepted (absent mode = snapshot)."""
+    if not isinstance(doc, dict):
+        raise ValueError("table document must be an object")
+    mode = doc.get("mode")
+    if mode is not None and mode not in MODES:
+        raise ValueError("mode must be 'snapshot' or 'live'")
+    reason = doc.get("live_reason")
+    if reason is not None and reason not in LIVE_REASONS:
+        raise ValueError("live_reason must be 'threshold' or 'manual'")
+    for key in ("live_set_by", "live_set_at"):
+        value = doc.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{key} must be a string")
+
 
 class EncryptionUnavailable(RuntimeError):
     """CLIENT_ENCRYPTION_KEY is missing or invalid — credentials cannot be
@@ -417,11 +450,12 @@ class DataSourceStore:
         return {"ok": True, "deleted_tables": deleted_tables}
 
     # ---- tables ------------------------------------------------------------
-    def list_tables(self, *, include_connector: bool = True) -> list[dict]:
+    def list_tables(self, *, include_connector: bool = True,
+                    include_live: bool = True) -> list[dict]:
         tables = self.read_doc()["tables"]
-        if include_connector:
-            return [dict(t) for t in tables]
-        return [dict(t) for t in tables if not t.get("is_connector")]
+        return [dict(t) for t in tables
+                if (include_connector or not t.get("is_connector"))
+                and (include_live or table_mode(t) != "live")]
 
     def get_table(self, tid: str) -> Optional[dict]:
         if not self.valid_id(tid):
@@ -435,7 +469,11 @@ class DataSourceStore:
                      actor_kind: Optional[str] = None) -> dict:
         """Insert (no/unknown id) or replace (existing id) a table doc. The
         caller (routes/admin_data.py) is responsible for the mandatory-confirm
-        gate; this store never invents confirmation fields."""
+        gate; this store never invents confirmation fields. The mode fields
+        are validated BEFORE anything is written (ValueError); an absent mode
+        is normalized to "snapshot"."""
+        validate_mode_fields(table_doc)
+        table_doc["mode"] = table_mode(table_doc)
         with _LOCK:
             doc = self.read_doc()
             tid = table_doc.get("id")
@@ -808,6 +846,74 @@ class DataSourceStore:
               actor_kind=actor_kind)
         return True
 
+    def set_table_mode(self, tid: str, mode: str, *, actor: str,
+                       actor_kind: Optional[str] = None,
+                       reason: Optional[str] = None,
+                       cell_count: Optional[int] = None) -> bool:
+        """Field-level storage-mode switch (the set_table_schedule idiom).
+        ValueError for a mode/reason outside the allowed set; False for an
+        unknown table. The SAME mode as stored writes nothing and audits
+        nothing. → live stamps live_reason (default "manual"), live_set_by =
+        actor and live_set_at = now; → snapshot removes the three. Never
+        touches a snapshot parquet (no update deletes state). Audited as
+        `table.mode` {from, to, reason, cell_count} after the lock."""
+        if mode not in MODES:
+            raise ValueError("mode must be 'snapshot' or 'live'")
+        if mode == "live":
+            reason = reason or "manual"
+            if reason not in LIVE_REASONS:
+                raise ValueError("live_reason must be 'threshold' or 'manual'")
+        with _LOCK:
+            doc = self.read_doc()
+            for t in doc["tables"]:
+                if t.get("id") == tid:
+                    before = table_mode(t)
+                    if before == mode:
+                        return True
+                    t["mode"] = mode
+                    if mode == "live":
+                        t["live_reason"] = reason
+                        t["live_set_by"] = actor
+                        t["live_set_at"] = _now()
+                    else:
+                        for key in _LIVE_KEYS:
+                            t.pop(key, None)
+                    self._write_doc(doc)
+                    break
+            else:
+                return False
+        audit(actor, "table.mode", target=tid,
+              detail={"from": before, "to": mode, "reason": reason,
+                      "cell_count": cell_count},
+              actor_kind=actor_kind)
+        return True
+
+    def mark_live_profiled(self, tid: str, *, row_count: Optional[int],
+                           columns: Optional[list], profiled_at: str,
+                           sample_rows: int) -> None:
+        """Field-level bookkeeping of a live table's sampled profile: the
+        counted rows, the columns (with technical descriptions from the
+        sample), `live_profiled_at` and `live_sample_rows`. `refreshed_at` is
+        NOT stamped — no snapshot was taken. Never raises."""
+        try:
+            with _LOCK:
+                doc = self.read_doc()
+                for t in doc["tables"]:
+                    if t.get("id") == tid:
+                        if row_count is not None:
+                            t["row_count"] = int(row_count)
+                        if columns is not None:
+                            t["columns"] = columns
+                        t["live_profiled_at"] = str(profiled_at)
+                        t["live_sample_rows"] = int(sample_rows)
+                        self._write_doc(doc)
+                        return
+        except Exception as e:
+            from exec_transport import log_safe_text
+            log_with_sid("db_sources", "error",
+                         f"DB_MARK_LIVE_PROFILED_FAILED table={log_safe_text(tid)} "
+                         f"error={type(e).__name__}: {log_safe_text(str(e))}")
+
     def mark_table_fired(self, tid: str, fired_at_iso: str) -> None:
         """Persist an overridden table's last fire moment. Never raises."""
         try:
@@ -849,6 +955,8 @@ def expand_with_connectors(table_ids: list[str],
       via the membership check.
     - Deterministic (sorted) so the df-key order feeds a stable schema_text
       cache key; capped at settings.DB_MAX_AUTO_CONNECTORS auto-includes.
+    - A LIVE connector is never pulled in (nor walked through): a live
+      registration has no parquet to load until the live query path ships.
     """
     store = store or DataSourceStore()
     tables = {t.get("id"): t for t in store.list_tables() if t.get("id")}
@@ -889,6 +997,8 @@ def expand_with_connectors(table_ids: list[str],
             if nid in result:
                 continue
             if not tables[nid].get("is_connector"):
+                continue
+            if table_mode(tables[nid]) == "live":
                 continue
             if auto_added >= cap:
                 log_with_sid("db_sources", "warning",

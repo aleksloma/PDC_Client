@@ -434,15 +434,26 @@ def _friendly_db_error(exc: Exception, phrase: str, *secrets_: Optional[str]) ->
     "Code: 159. … Timeout exceeded"), so the whole cause chain is checked.
     Anything not timeout-shaped keeps its scrubbed driver text — no error is
     ever replaced by a guess."""
+    if _is_timeout(exc):
+        return phrase
+    return _scrub(f"{type(exc).__name__}: {exc}", *secrets_)
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """True when `exc` or anything in its `__cause__`/`__context__` chain
+    (at most five links, so a self-referential chain terminates) is
+    timeout-shaped: a TimeoutError / socket.timeout, or a message matching
+    `_TIMEOUT_PAT`. The one timeout classifier — `_friendly_db_error` and
+    `count_rows` share it."""
     seen = 0
     e: Optional[BaseException] = exc
     while e is not None and seen < 5:
         if isinstance(e, (TimeoutError, socket.timeout)) or \
                 _TIMEOUT_PAT.search(f"{type(e).__name__} {e}"):
-            return phrase
+            return True
         e = e.__cause__ or e.__context__
         seen += 1
-    return _scrub(f"{type(exc).__name__}: {exc}", *secrets_)
+    return False
 
 
 _FORBIDDEN_TOKENS = re.compile(
@@ -904,6 +915,104 @@ def preview_rows(cfg: dict, password: str, schema: Optional[str], table: str,
         err = _friendly_db_error(e, "Database connection timed out.", password)
         log_with_sid(sid, "warning", f"DB_PREVIEW_FAILED table={schema}.{table} err={err}")
         return {"ok": False, "error": err, "columns": [], "rows": []}
+    finally:
+        if engine is not None:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Live-mode sizing and profiling
+# ---------------------------------------------------------------------------
+
+# The row count runs behind an interactive click (the register wizard's
+# introspect step), so the connection's statement timeout is capped here.
+COUNT_TIMEOUT_CAP_S = 60
+# A live table is profiled from a bounded sample, never a full read.
+LIVE_PROFILE_SAMPLE_ROWS = 10_000
+
+
+def count_rows(cfg: dict, password: str, schema: Optional[str], table: str,
+               *, where: Optional[str] = None, timeout_s: Optional[int] = None,
+               sid: str) -> dict:
+    """`SELECT COUNT(*)` over the table (with the admin's WHERE filter),
+    built as a construct over `_select_stmt(...)` as a subquery — the
+    fingerprint idiom — so the dialect quotes the identifiers and the compiled
+    statement passes the SELECT-only gate.
+
+    Bounded by the connection's statement timeout capped at
+    `COUNT_TIMEOUT_CAP_S` (or the explicit `timeout_s`, whichever is lower).
+    The bound goes into a COPY of the cfg the engine is built from, because
+    mssql (pyodbc `timeout`) and ClickHouse (URL `max_execution_time`) take it
+    from connection arguments, not a session statement; the caller's cfg is
+    never modified.
+
+    Returns {ok, count, timed_out, error}. Never raises (Article IV)."""
+    engine = None
+    try:
+        from sqlalchemy import func, select as sa_select
+        d = get_dialect(cfg.get("db_type"))
+        bound = min(int(cfg.get("statement_timeout") or settings.DB_STATEMENT_TIMEOUT),
+                    int(timeout_s or COUNT_TIMEOUT_CAP_S))
+        bound = max(1, bound)
+        inner = _select_stmt(schema, table, where=where).subquery("pdc_c")
+        stmt = sa_select(func.count().label("pdc_n")).select_from(inner)
+        engine = get_engine({**cfg, "statement_timeout": bound}, password)
+        with engine.connect() as conn:
+            d.apply_stmt_timeout(conn, bound)
+            _compiled_sql(stmt, conn.dialect)
+            df = pd.read_sql(stmt, conn)
+        count = int(df.iloc[0]["pdc_n"])
+        return {"ok": True, "count": count, "timed_out": False, "error": None}
+    except Exception as e:
+        timed_out = _is_timeout(e)
+        err = _friendly_db_error(e, "Counting the rows timed out.", password)
+        from exec_transport import log_safe_text
+        log_with_sid(sid, "warning",
+                     f"DB_COUNT_FAILED table={log_safe_text(str(schema))}."
+                     f"{log_safe_text(str(table))} timed_out={timed_out} "
+                     f"err={log_safe_text(err)}")
+        return {"ok": False, "count": None, "timed_out": timed_out,
+                "error": err or "Row count failed."}
+    finally:
+        if engine is not None:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+
+
+def sample_rows(cfg: dict, password: str, schema: Optional[str], table: str,
+                *, columns: Optional[list] = None, where: Optional[str] = None,
+                limit: Optional[int] = None, sid: str) -> dict:
+    """A bounded sample of the table as a raw DataFrame — the `preview_rows`
+    twin used to profile a live table (no parquet is written). The dialect
+    renders the row limit (`_select_stmt(row_cap=...)`); the statement
+    timeout applies as on every read. Values feed only the local profile and
+    technical descriptions — never the brain, never a log line.
+
+    Returns {ok, df, error}. Never raises (Article IV)."""
+    engine = None
+    try:
+        d = get_dialect(cfg.get("db_type"))
+        limit = int(limit or LIVE_PROFILE_SAMPLE_ROWS)
+        stmt = _select_stmt(schema, table, columns=columns, where=where,
+                            row_cap=limit)
+        engine = get_engine(cfg, password)
+        with engine.connect() as conn:
+            d.apply_stmt_timeout(conn, int(cfg.get("statement_timeout") or settings.DB_STATEMENT_TIMEOUT))
+            _compiled_sql(stmt, conn.dialect)
+            df = pd.read_sql(stmt, conn)
+        return {"ok": True, "df": df.head(limit), "error": None}
+    except Exception as e:
+        err = _friendly_db_error(e, "Database connection timed out.", password)
+        from exec_transport import log_safe_text
+        log_with_sid(sid, "warning",
+                     f"DB_SAMPLE_FAILED table={log_safe_text(str(schema))}."
+                     f"{log_safe_text(str(table))} err={log_safe_text(err)}")
+        return {"ok": False, "df": None, "error": err or "Sample query failed."}
     finally:
         if engine is not None:
             try:

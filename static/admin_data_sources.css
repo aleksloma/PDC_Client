@@ -138,8 +138,8 @@ body.admin-ds-page {
 .adm-table tbody tr:last-child td { border-bottom: 0; }
 .adm-table tbody tr:hover td { background: #f8fafc; }
 .adm-th-actions { width: 1%; }
-.adm-actions-cell { text-align: right; }
-.adm-actions-cell button { margin-left: 4px; }
+.adm-actions-cell { text-align: right; white-space: nowrap; width: 1%; }
+.adm-actions-cell button { margin-left: 2px; }
 .adm-cell-sub { color: #94a3b8; font-size: 11.5px; }
 .adm-cell-mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: #475569; }
 .adm-row-bad td { background: #fef2f2; }
@@ -498,3 +498,9 @@ body.admin-ds-page {
   font-size: 13px; background: #fff; color: inherit;
 }
 .adm-user-roles-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+/* Live-mode storage: the LIVE badge in the tables list (the amber pair of
+   .adm-alert.warn) and the step-3 storage block of the register wizard. */
+.adm-chip.live { background: #fef3c7; color: #92400e; }
+.adm-mode-block { margin: 6px 0 10px; }
+.adm-mode-block .adm-alert { margin: 8px 0 4px; }

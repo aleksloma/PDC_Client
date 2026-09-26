@@ -217,3 +217,43 @@ def test_add_data_merge_keeps_user_edits_on_same_table(client, registry, monkeyp
     # Not duplicated.
     assert sum(1 for e in meta2["files"]
                if (e.get("db") or {}).get("table_id") == registry["cl_info"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Live-mode tables: no parquet exists for a live registration, so until the
+# live query path ships the picker hides them, the session route refuses them
+# and the connector closure never pulls a live connector in.
+# ---------------------------------------------------------------------------
+
+def _make_live(tid):
+    store = db_sources.DataSourceStore()
+    doc = store.get_table(tid)
+    doc["mode"] = "live"
+    store.upsert_table(doc, actor="ladmin")
+
+
+def test_api_db_tables_hides_live_tables(client, registry):
+    _make_live(registry["tr_data"])
+    r = client.get("/api/db_tables")
+    assert r.status_code == 200
+    names = {t["display_name"] for t in r.json()["tables"]}
+    assert names == {"clients information"}
+
+
+def test_session_db_tables_refuses_a_live_table(client, registry):
+    _make_live(registry["tr_data"])
+    r = client.post("/session/db_tables",
+                    json={"table_ids": [registry["tr_data"]]})
+    assert r.status_code == 400
+    assert r.json().get("code") == "LIVE_NOT_AVAILABLE"
+    meta = local_store.UserStore("s_dbflow").read_meta()
+    assert local_store.db_entries_from_meta(meta) == []
+
+
+def test_session_closure_skips_a_live_connector(client, registry):
+    _make_live(registry["city_dict"])
+    r = client.post("/session/db_tables",
+                    json={"table_ids": [registry["cl_info"]]})
+    assert r.status_code == 200
+    keys = {row["df_key"] for row in r.json()["tables"]}
+    assert keys == {"clients information"}

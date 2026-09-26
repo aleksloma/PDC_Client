@@ -45,6 +45,7 @@ import brain_client
 import db_connector
 import db_sources
 import relation_discovery
+from exec_transport import log_safe_text
 from local_store import AuthStore
 from logger_utils import log_with_sid
 from settings import settings
@@ -372,6 +373,14 @@ async def refresh_connection(request: Request, cid: str):
     tables = [t for t in store.list_tables() if t.get("connection_id") == cid]
     results = []
     for t in tables:
+        if db_sources.table_mode(t) == "live":
+            # A live table takes no snapshot (its profile is refreshed by the
+            # per-table Refresh now).
+            results.append({"table_id": t.get("id"),
+                            "display_name": t.get("display_name"),
+                            "ok": True, "rows": None, "error": None,
+                            "skipped": "live"})
+            continue
         res = await _run(db_scheduler.refresh_one_table, t.get("id"), actor=email)
         results.append({"table_id": t.get("id"),
                         "display_name": t.get("display_name"),
@@ -1339,6 +1348,16 @@ async def accept_recommendation(request: Request):
                                         sid=f"admin:{email}")
         if not intro.get("ok"):
             return {"ok": False, "error": intro.get("error")}
+        # A recommendation never registers live: a table at or above the
+        # force threshold cannot be snapshotted, so it is refused here,
+        # before the (brain) draft and before anything is written.
+        _phase("count")
+        count_res = db_connector.count_rows(
+            cfg, password, intro.get("schema"), intro.get("table") or table,
+            sid=f"admin:{email}")
+        if _size_verdict(intro, count_res).get("live_required"):
+            return {"ok": False, "code": "LIVE_REQUIRED",
+                    "error": _LIVE_REQUIRED_TEXT}
         _phase("draft")
         draft = _draft_table_descriptions(cfg, password, schema, table, email,
                                           intro=intro)
@@ -1391,6 +1410,9 @@ async def accept_recommendation(request: Request):
                              "chosen_type": chosen_type},
                      actor_kind=_kind(scope))
     if not res.get("ok"):
+        if res.get("code") == "LIVE_REQUIRED":
+            return JSONResponse({"ok": False, "error": res.get("error"),
+                                 "code": "LIVE_REQUIRED"}, status_code=400)
         return {"ok": False, "error": res.get("error")}
 
     # Replay the stored SQL evidence through the NORMAL candidate pipeline
@@ -1466,8 +1488,20 @@ async def list_tables(request: Request):
     email, scope, err = _require_source_manager(request)
     if err:
         return err
-    return {"tables": _scoped_tables(scope,
-                                     db_sources.DataSourceStore().list_tables())}
+    rows = _scoped_tables(scope, db_sources.DataSourceStore().list_tables())
+    # Additive, derived on every read from the STORED row count (rewritten by
+    # every snapshot refresh and every live profile) x the column count, so
+    # the list shows the live suggestion after any refresh.
+    out = []
+    for t in rows:
+        row = dict(t)
+        v = _stored_verdict(t)
+        row["mode"] = db_sources.table_mode(t)
+        row["cell_count"] = v["cell_count"]
+        row["live_suggested"] = v["live_suggested"]
+        row["live_required"] = v["live_required"]
+        out.append(row)
+    return {"tables": out}
 
 
 @router.get("/my_roles")
@@ -1529,16 +1563,197 @@ async def introspect_table(request: Request):
                          columns=[c.get("name") for c in (intro.get("columns") or [])
                                   if c.get("name")],
                          sid=f"admin:{email}")
+    # Size verdict for the storage choice (snapshot / live): an exact
+    # COUNT(*) under a capped statement timeout, the catalog estimate when
+    # the count fails, "unknown" when both are missing.
+    count_res = await _run(db_connector.count_rows, cfg, password,
+                           intro.get("schema"), intro.get("table") or table,
+                           where=(body.get("where_filter") or "").strip() or None,
+                           sid=f"admin:{email}")
+    size_verdict = _size_verdict(intro, count_res)
     db_sources.audit(email, "table.introspect", target=f"{schema}.{table}",
                      detail={"columns": len(intro.get("columns") or []),
                              "degraded": intro.get("degraded")},
                      actor_kind=_kind(scope))
     return {"ok": True, "introspection": intro, "preview": preview,
             "degraded": intro.get("degraded") or [],
+            "size_verdict": size_verdict,
             # Pre-ticks the wizard's connector box from the columns already in
             # hand (no extra round-trip). A suggestion the admin edits freely.
             "classification": relation_discovery.classify_table_type(
                 intro.get("columns") or [])}
+
+
+# ---------------------------------------------------------------------------
+# Live mode: size verdict + sampled profile
+# ---------------------------------------------------------------------------
+
+_LIVE_DOC_KEYS = ("live_reason", "live_set_by", "live_set_at")
+
+_LIVE_REQUIRED_TEXT = ("This table is above the snapshot size limit. A "
+                       "snapshot is refused; register it in live mode.")
+
+
+def _verdict_for(row_count, ncols: int) -> tuple:
+    """(cell_count, live_suggested, live_required) for a row count and a
+    column count; an unknown row count gives no verdict (fail-open). The
+    effective force threshold is max(force, cell)."""
+    if isinstance(row_count, bool) or not isinstance(row_count, (int, float)):
+        return None, False, False
+    cell = int(row_count) * int(ncols)
+    cell_t = int(settings.LIVE_MODE_CELL_THRESHOLD)
+    force_t = max(int(settings.LIVE_MODE_FORCE_THRESHOLD), cell_t)
+    return cell, cell >= cell_t, cell >= force_t
+
+
+def _size_verdict(intro: dict, count_res, row_cap=None) -> dict:
+    """The storage verdict from an introspection + a `count_rows` result:
+    ok => the exact count; timed out => treated as above the force threshold
+    (live required); any other failure => the catalog estimate; both missing
+    => unknown (no suggestion, no refusal). A `row_cap` bounds the snapshot,
+    so a known row count is taken at most at the cap (a timeout still means
+    the source could not be counted and stays required)."""
+    cap = _safe_int(row_cap)
+    ncols = len([c for c in ((intro or {}).get("columns") or []) if c.get("name")])
+    count_res = count_res if isinstance(count_res, dict) else {}
+    if count_res.get("ok") and count_res.get("count") is not None:
+        row_count = int(count_res["count"])
+        if cap:
+            row_count = min(row_count, cap)
+        cell, suggested, required = _verdict_for(row_count, ncols)
+        return {"row_count": row_count, "count_source": "count",
+                "timed_out": False, "cell_count": cell,
+                "live_suggested": suggested, "live_required": required}
+    if count_res.get("timed_out"):
+        return {"row_count": None, "count_source": None, "timed_out": True,
+                "cell_count": None, "live_suggested": True,
+                "live_required": True}
+    est = (intro or {}).get("row_count_estimate")
+    if isinstance(est, (int, float)) and not isinstance(est, bool):
+        est = min(int(est), cap) if cap else int(est)
+        cell, suggested, required = _verdict_for(est, ncols)
+        return {"row_count": est, "count_source": "estimate",
+                "timed_out": False, "cell_count": cell,
+                "live_suggested": suggested, "live_required": required}
+    return {"row_count": None, "count_source": None, "timed_out": False,
+            "cell_count": None, "live_suggested": False,
+            "live_required": False}
+
+
+def _stored_verdict(doc: dict) -> dict:
+    """The verdict derived from a registry row's STORED row count (rewritten
+    by every snapshot refresh and live profile) x its column count."""
+    ncols = len([c for c in ((doc or {}).get("columns") or [])
+                 if isinstance(c, dict) and c.get("name")])
+    cell, suggested, required = _verdict_for((doc or {}).get("row_count"), ncols)
+    return {"cell_count": cell, "live_suggested": suggested,
+            "live_required": required}
+
+
+def _profile_live_table(tid: str, cfg: dict, password: str, doc: dict,
+                        count_res, actor: str, actor_kind=None) -> dict:
+    """Sampled profile of a LIVE table — no parquet is written. Sample (the
+    dialect's own row limit, LIVE_PROFILE_SAMPLE_ROWS) -> compute_profile with
+    the counted rows as `total_rows` (marked sampled) -> the sidecar profile
+    at db_profile_path with the live stamp -> technical descriptions from the
+    sample -> `mark_live_profiled`. Never raises (Article IV): returns
+    {ok, rows, sample_rows, profiled_at} or {ok: False, error}."""
+    sid = f"admin:{actor}"
+    try:
+        import dataset_profile
+        import local_store
+        schema = db_connector.qname(doc.get("schema") or None,
+                                    doc.get("schema_quote"))
+        table = db_connector.qname(doc.get("table_name"), doc.get("table_quote"))
+        cols = [db_connector.col_ident(c) for c in (doc.get("columns") or [])
+                if isinstance(c, dict) and c.get("name")]
+        cap = _safe_int(doc.get("row_cap"))
+        limit = db_connector.LIVE_PROFILE_SAMPLE_ROWS
+        if cap:
+            limit = min(limit, cap)
+        res = db_connector.sample_rows(cfg, password, schema, table,
+                                       columns=cols or None,
+                                       where=doc.get("where_filter") or None,
+                                       limit=limit, sid=sid)
+        if not res.get("ok") or res.get("df") is None:
+            return {"ok": False, "error": res.get("error") or "Sample query failed."}
+        df = res["df"]
+        n_sample = int(len(df))
+        count_res = count_res if isinstance(count_res, dict) else {}
+        rows = count_res.get("count") if count_res.get("ok") else doc.get("row_count")
+        if isinstance(rows, bool) or not isinstance(rows, (int, float)):
+            rows = None
+        else:
+            rows = int(rows)
+            if cap:
+                rows = min(rows, cap)
+        prof = dataset_profile.compute_profile(
+            df, total_rows=rows if rows is not None else n_sample)
+        profiled_at = datetime.now(timezone.utc).isoformat()
+        local_store.write_profile(
+            local_store.db_profile_path(tid), prof,
+            {"kind": "live", "profiled_at": profiled_at,
+             "sample_rows": n_sample})
+        tech = {}
+        try:
+            tech = {str(c): dataset_profile._generate_technical_description(
+                        df[c], n_sample) for c in df.columns}
+        except Exception as e:
+            log_with_sid(sid, "warning",
+                         f"LIVE_TECH_DESC_FAILED table={log_safe_text(tid)} "
+                         f"error={type(e).__name__}")
+        new_columns = []
+        for c in (doc.get("columns") or []):
+            if not isinstance(c, dict):
+                continue
+            col = dict(c)
+            td = tech.get(str(col.get("name")))
+            if td:
+                col["technical_description"] = td
+            new_columns.append(col)
+        db_sources.DataSourceStore().mark_live_profiled(
+            tid, row_count=rows, columns=new_columns, profiled_at=profiled_at,
+            sample_rows=n_sample)
+        log_with_sid(sid, "info",
+                     f"LIVE_PROFILE_OK table={log_safe_text(tid)} rows={rows} "
+                     f"sample_rows={n_sample}")
+        return {"ok": True, "rows": rows, "sample_rows": n_sample,
+                "profiled_at": profiled_at}
+    except Exception as e:
+        log_with_sid(sid, "error",
+                     f"LIVE_PROFILE_FAILED table={log_safe_text(tid)} "
+                     f"error={log_safe_text(type(e).__name__, 80)}")
+        return {"ok": False, "error": "Profiling the live table failed."}
+
+
+def _count_and_profile_live(tid: str, actor: str, actor_kind=None) -> dict:
+    """Re-count and re-sample a registered live table (Refresh now, and the
+    switch to live). Never raises."""
+    try:
+        store = db_sources.DataSourceStore()
+        doc = store.get_table(tid)
+        if doc is None:
+            return {"ok": False, "error": "Unknown table."}
+        conn = store.get_connection(doc.get("connection_id"), with_secret=True)
+        if conn is None:
+            return {"ok": False, "error": "Connection no longer exists."}
+        password = db_sources.decrypt_password(conn.get("password_enc"))
+        if password is None and conn.get("password_enc"):
+            return {"ok": False,
+                    "error": "Stored credential cannot be read — re-enter the "
+                             "connection password."}
+        count_res = db_connector.count_rows(
+            conn, password or "",
+            db_connector.qname(doc.get("schema") or None, doc.get("schema_quote")),
+            db_connector.qname(doc.get("table_name"), doc.get("table_quote")),
+            where=doc.get("where_filter") or None, sid=f"admin:{actor}")
+        return _profile_live_table(tid, conn, password or "", doc, count_res,
+                                   actor, actor_kind)
+    except Exception as e:
+        log_with_sid(f"admin:{actor}", "error",
+                     f"LIVE_PROFILE_FAILED table={log_safe_text(tid)} "
+                     f"error={log_safe_text(type(e).__name__, 80)}")
+        return {"ok": False, "error": "Profiling the live table failed."}
 
 
 def _draft_table_descriptions(cfg: dict, password: str, schema, table: str,
@@ -1665,6 +1880,13 @@ def _build_table_doc(*, tid: str, connection_id, schema, table: str,
             carried["schedule_last_fired_at"] = existing.get("schedule_last_fired_at")
         if existing.get("registered_by"):
             carried["registered_by"] = existing["registered_by"]
+        # Storage mode + who/when/why it went live: an edit-save must never
+        # silently turn a live table back into a snapshot table.
+        if existing.get("mode") in db_sources.MODES:
+            carried["mode"] = existing["mode"]
+        for key in _LIVE_DOC_KEYS:
+            if existing.get(key) is not None:
+                carried[key] = existing[key]
     else:
         carried["registered_by"] = email
     # Case-sensitivity flags come from the FRESH introspection, never the
@@ -1747,6 +1969,13 @@ async def save_table(request: Request, tid: str = ""):
     verr = _validate_table_body(body, store)
     if verr is not None:
         return verr
+    # Storage mode: absent => the existing registration's mode (resolved
+    # below), "snapshot" for a new one. live_reason / live_set_by /
+    # live_set_at are SERVER-derived; any posted value is ignored.
+    posted_mode = body.get("mode")
+    if posted_mode is not None and posted_mode not in db_sources.MODES:
+        return JSONResponse({"error": "mode must be 'snapshot' or 'live'.",
+                             "code": "BAD_MODE"}, status_code=400)
 
     # 19f publish+share: a power user may share their registration, but only
     # with roles they HOLD — an outside id is rejected up-front (403, never
@@ -1824,6 +2053,20 @@ async def save_table(request: Request, tid: str = ""):
             {"error": "Table structure changed since introspection — re-run introspect.",
              "code": "SCHEMA_DRIFT"}, status_code=409)
 
+    # The enforcement point of the size thresholds: counted again after the
+    # fresh introspection; a snapshot at or above the force threshold is
+    # refused BEFORE anything is written.
+    prev_mode = db_sources.table_mode(own) if own is not None else None
+    mode = posted_mode if posted_mode is not None else (prev_mode or "snapshot")
+    count_res = await _run(db_connector.count_rows, cfg, password,
+                           intro.get("schema"), intro.get("table") or table,
+                           where=(body.get("where_filter") or "").strip() or None,
+                           sid=f"admin:{email}")
+    verdict = _size_verdict(intro, count_res, row_cap=body.get("row_cap"))
+    if mode == "snapshot" and verdict.get("live_required"):
+        return JSONResponse({"error": _LIVE_REQUIRED_TEXT,
+                             "code": "LIVE_REQUIRED"}, status_code=400)
+
     doc = _build_table_doc(
         tid=tid, connection_id=body.get("connection_id"), schema=schema,
         table=table, display_name=body.get("display_name") or "",
@@ -1833,6 +2076,18 @@ async def save_table(request: Request, tid: str = ""):
         relations=relations, intro=intro,
         where_filter=body.get("where_filter"), row_cap=body.get("row_cap"),
         email=email, existing=own)
+    doc["mode"] = mode
+    if mode == "live":
+        if prev_mode != "live":
+            # Flipped (or registered) live by THIS save: the stamps come from
+            # the session identity, the server clock and the counted size.
+            doc["live_reason"] = ("threshold" if verdict.get("live_suggested")
+                                  else "manual")
+            doc["live_set_by"] = email
+            doc["live_set_at"] = datetime.now(timezone.utc).isoformat()
+    else:
+        for key in _LIVE_DOC_KEYS:
+            doc.pop(key, None)
     # Relations are stored verbatim here (frozen contract — rejecting would
     # break payloads this API must keep accepting), but a join key naming a
     # column neither side has is a silent broken hint: make it observable.
@@ -1856,6 +2111,12 @@ async def save_table(request: Request, tid: str = ""):
         log_with_sid(email, "warning", f"REL_SAVE_COLCHECK_FAILED: {type(e).__name__}")
 
     saved = store.upsert_table(doc, actor=email, actor_kind=_kind(scope))
+    if mode != (prev_mode or "snapshot"):
+        db_sources.audit(email, "table.mode", target=saved["id"],
+                         detail={"from": prev_mode or "snapshot", "to": mode,
+                                 "reason": doc.get("live_reason"),
+                                 "cell_count": verdict.get("cell_count")},
+                         actor_kind=_kind(scope))
 
     # Access panel (wizard step 3): canonical storage on the ROLE records,
     # never on the table doc. Absent field ⇒ no role writes (recommendation
@@ -1883,12 +2144,23 @@ async def save_table(request: Request, tid: str = ""):
         except Exception as e:
             log_with_sid(email, "warning", f"TABLE_ACCESS_ROLES_FAILED: {e}")
 
+    status = 201 if not db_sources.DataSourceStore.valid_id(tid) else 200
+    if mode == "live":
+        # No parquet for a live table: a sampled profile instead. A failure
+        # keeps the registration (live_profile.ok false) — "Refresh now"
+        # re-counts and re-samples.
+        live_profile = await _run(_profile_live_table, saved["id"], cfg,
+                                  password, store.get_table(saved["id"]) or saved,
+                                  count_res, email, _kind(scope))
+        return JSONResponse({"table": store.get_table(saved["id"]),
+                             "snapshot": None, "live_profile": live_profile},
+                            status_code=status)
+
     # Snapshot (or re-snapshot). A failure keeps the registration saved with
     # last_refresh_error set — "Refresh now" retries.
     import db_scheduler
     snap = await _run(db_scheduler.refresh_one_table, saved["id"], actor=email,
                       actor_kind=_kind(scope))
-    status = 201 if not db_sources.DataSourceStore.valid_id(tid) else 200
     return JSONResponse({"table": store.get_table(saved["id"]), "snapshot": snap},
                         status_code=status)
 
@@ -1935,15 +2207,20 @@ async def delete_table(request: Request, tid: str):
 @router.post("/tables/{tid}/refresh")
 async def refresh_table(request: Request, tid: str):
     """Admin "Refresh now" — always a FULL snapshot (refresh_one_table's
-    force default), never the fingerprint skip."""
+    force default), never the fingerprint skip. A LIVE table takes no
+    snapshot: it is re-counted and re-sampled (a fresh profile)."""
     email, scope, err = _require_source_manager(request)
     if err:
         return err
+    doc = db_sources.DataSourceStore().get_table(tid)
     if scope is not None:
-        doc = db_sources.DataSourceStore().get_table(tid)
         if doc is None or not _in_scope(scope, doc.get("connection_id"),
                                         doc.get("schema")):
             return _out_of_scope()
+    if doc is not None and db_sources.table_mode(doc) == "live":
+        lp = await _run(_count_and_profile_live, tid, email, _kind(scope))
+        return {"ok": bool(lp.get("ok")), "live_profile": lp,
+                "rows": lp.get("rows"), "error": lp.get("error")}
     import db_scheduler
     return await _run(db_scheduler.refresh_one_table, tid, actor=email,
                       actor_kind=_kind(scope))
@@ -2094,6 +2371,62 @@ async def set_table_schedule(request: Request, tid: str):
     except Exception:
         pass
     return out
+
+
+@router.post("/tables/{tid}/mode")
+async def set_table_mode(request: Request, tid: str):
+    """Switch a registered table between "snapshot" and "live". Source
+    managers only — administrators unrestricted, power users inside their
+    management scope (not owner-only: mode is operational, like the schedule
+    override). Same mode => 200, nothing written, no audit. To live: the live
+    keys are stamped, an existing parquet is KEPT (no update deletes state)
+    and a sampled profile is computed. To snapshot: refused (LIVE_REQUIRED)
+    when the stored size is at or above the force threshold; otherwise the
+    live keys are cleared and a fresh snapshot is taken (a parquet kept
+    from before the live period would be stale).
+    Audited as `table.mode`."""
+    email, scope, err = _require_source_manager(request)
+    if err:
+        return err
+    body = await _json_body(request)
+    store = db_sources.DataSourceStore()
+    doc = store.get_table(tid)
+    if scope is not None:
+        if doc is None or not _in_scope(scope, doc.get("connection_id"),
+                                        doc.get("schema")):
+            return _out_of_scope()
+    if doc is None:
+        return JSONResponse({"error": "Unknown table."}, status_code=404)
+    mode = body.get("mode")
+    if mode not in db_sources.MODES:
+        return JSONResponse({"error": "mode must be 'snapshot' or 'live'.",
+                             "code": "BAD_MODE"}, status_code=400)
+    if mode == db_sources.table_mode(doc):
+        return {"ok": True, "table": doc}
+    stored = _stored_verdict(doc)
+    if mode == "snapshot":
+        if stored["live_required"]:
+            return JSONResponse({"error": _LIVE_REQUIRED_TEXT,
+                                 "code": "LIVE_REQUIRED"}, status_code=400)
+        found = store.set_table_mode(tid, "snapshot", actor=email,
+                                     actor_kind=_kind(scope),
+                                     cell_count=stored["cell_count"])
+        if not found:
+            return JSONResponse({"error": "Unknown table."}, status_code=404)
+        # Always a fresh full snapshot: a parquet kept from before the live
+        # period would otherwise be served to chats as current data.
+        import db_scheduler
+        snap = await _run(db_scheduler.refresh_one_table, tid, actor=email,
+                          actor_kind=_kind(scope))
+        return {"ok": True, "table": store.get_table(tid), "snapshot": snap}
+    reason = "threshold" if stored["live_suggested"] else "manual"
+    found = store.set_table_mode(tid, "live", actor=email,
+                                 actor_kind=_kind(scope), reason=reason,
+                                 cell_count=stored["cell_count"])
+    if not found:
+        return JSONResponse({"error": "Unknown table."}, status_code=404)
+    lp = await _run(_count_and_profile_live, tid, email, _kind(scope))
+    return {"ok": True, "table": store.get_table(tid), "live_profile": lp}
 
 
 @router.get("/audit")

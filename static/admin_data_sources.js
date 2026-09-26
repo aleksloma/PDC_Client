@@ -99,6 +99,7 @@
   let editingTableId = null;    // null = registering new
   let currentIntro = null;      // last introspection result (register wizard)
   let currentPreview = null;    // last preview sample (feeds wizard suggestions)
+  let currentSizeVerdict = null; // introspect size_verdict (storage choice hint)
   let wizardConnId = null;
   let wizardStep = 1;
   let wizardPrefill = null;     // ghost-hint shortcut: {schema, table, connector}
@@ -453,22 +454,40 @@
     // enforces the same rule (NOT_OWNER); ladmin sees Delete everywhere.
     const canDelete = (t) => !POWER ||
       String(t.registered_by || '').toLowerCase() === MANAGER_EMAIL;
+    const isLive = (t) => t.mode === 'live';
+    // Title of the LIVE badge: why and who/when (server-stamped values).
+    const liveTitle = (t) => {
+      const why = t.live_reason === 'threshold' ? 'Live: above the size threshold'
+        : 'Live: set manually';
+      const who = [t.live_set_by, t.live_set_at].filter(Boolean).join(', ');
+      return (who ? `${why} (${who})` : why)
+        + '. Queried in your database; not offered in chats until the live query path ships.';
+    };
     const rows = TABLES.map((t) => `
       <tr data-tid="${esc(t.id)}">
-        <td><strong>${esc(t.display_name)}</strong>${t.is_connector
+        <td><strong>${esc(t.display_name)}</strong>${isLive(t)
+          ? ` <span class="adm-chip live" title="${esc(liveTitle(t))}">live</span>` : ''}${t.is_connector
           ? ' <span class="adm-chip conn" title="Hidden from users; auto-included via relations">connector</span>' : ''}${
-          t.schedule ? ' <span class="adm-chip conn" title="Refreshes on its own schedule">own schedule</span>'
-            : ' <span class="adm-chip" title="Follows the global refresh schedule">inherits global</span>'}</td>
+          isLive(t) ? ''
+            : t.schedule ? ' <span class="adm-chip conn" title="Refreshes on its own schedule">own schedule</span>'
+              : ' <span class="adm-chip" title="Follows the global refresh schedule">inherits global</span>'}</td>
         <td class="adm-cell-mono">${esc(connName(t.connection_id))} · ${esc([t.schema, t.table_name].filter(Boolean).join('.'))}</td>
         <td>${t.row_count != null ? Number(t.row_count).toLocaleString() : '—'}</td>
-        <td title="${esc(t.last_refresh_error || '')}">${t.refreshed_at
-          ? esc(t.refreshed_at) + (t.last_refresh_error
+        <td title="${esc(t.last_refresh_error || '')}">${isLive(t)
+          ? 'live · ' + (t.live_profiled_at
+            ? 'profiled ' + esc(String(t.live_profiled_at).slice(0, 16).replace('T', ' '))
+            : 'not profiled yet')
+          : t.refreshed_at
+          ? `<span title="${esc(t.refreshed_at)}">${esc(String(t.refreshed_at).slice(0, 16).replace('T', ' '))}</span>` + (t.last_refresh_error
             ? ' <span class="adm-chip bad">refresh failed</span>' : '')
           : (t.last_refresh_error ? '<span class="adm-chip bad">failed</span>' : '—')}${
           t.last_drift && !t.last_drift.dismissed
             ? ` <span class="adm-chip bad" title="${esc(_driftBits(t.last_drift).join(' · '))}">schema drift</span>` : ''}</td>
         <td class="adm-actions-cell">
-          <button class="adm-icon-btn" data-act="refresh" title="Refresh snapshot now (always a full snapshot)">⟳</button>
+          <button class="adm-icon-btn" data-act="refresh" title="${isLive(t)
+            ? 'Re-count and re-profile now (no snapshot)'
+            : 'Refresh snapshot now (always a full snapshot)'}">⟳</button>
+          <button class="adm-icon-btn" data-act="mode" title="Storage mode: snapshot or live">⇄</button>
           <button class="adm-icon-btn" data-act="schedule" title="Refresh schedule for this table">⏱</button>
           <button class="adm-icon-btn" data-act="edit" title="Edit descriptions / relations">✎</button>
           ${canDelete(t)
@@ -495,7 +514,15 @@
       try {
         r = await api(`/api/admin/tables/${tid}/refresh`, { method: 'POST', body: '{}' });
       } finally { _busyDone(); }
-      if (r.data.ok && r.data.skipped) {
+      if (r.data.live_profile) {
+        const lp = r.data.live_profile;
+        if (lp.ok) {
+          toast(`Re-profiled: ${lp.rows != null ? Number(lp.rows).toLocaleString() : 'unknown'} rows `
+            + `(sample of ${Number(lp.sample_rows).toLocaleString()})`);
+        } else {
+          toast(lp.error || 'Profiling failed', true);
+        }
+      } else if (r.data.ok && r.data.skipped) {
         toast('No changes detected — snapshot already current');
       } else if (r.data.ok) {
         const d = r.data.drift || {};
@@ -510,6 +537,8 @@
         toast(r.data.error || 'Refresh failed', true);
       }
       loadAll();
+    } else if (act === 'mode') {
+      openTableModeModal(t);
     } else if (act === 'schedule') {
       openTableScheduleModal(t);
     } else if (act === 'edit') {
@@ -572,6 +601,12 @@
     // otherwise overwrite it.
     wizardPrefill = prefill || null;
     currentIntro = null;
+    currentSizeVerdict = null;
+    $('twModeSnapshot').disabled = false;
+    $('twModeSnapshot').checked = true;
+    $('twModeLive').checked = false;
+    _renderModeHint($('twModeHint'), null);
+    _onModeChange();
     $('tableModalTitle').textContent = existing
       ? `Edit table — ${existing.display_name}` : 'Register table';
     $('twConfirm').checked = false;
@@ -794,11 +829,74 @@
     // save outcome, now with origin/cardinality + verification shown; seeded
     // rows would dedupe the suggestions away). Edits keep their stored rows.
     renderRelations(existing ? (existing.relations || []) : []);
+    _applyModeChoice(existing, r.data.size_verdict || null);
     $('twConfirm').checked = false;
     $('twDraftBanner').classList.add('hidden');
     updateSaveEnabled();
     if (advance) setWizardStep(2);
     return true;
+  }
+
+  // ── Storage mode (snapshot / live) ───────────────────────────────────────
+  // The size verdict comes from the server (an exact row count, or the
+  // catalog estimate); the hint is display only, like the TLS badge. The
+  // server refuses a snapshot above the force threshold (LIVE_REQUIRED).
+  function _modeHintText(v) {
+    if (!v) return '';
+    const n = v.cell_count != null ? Number(v.cell_count).toLocaleString() : null;
+    if (v.live_required) {
+      if (n == null) {
+        return 'Counting the rows timed out: the table is treated as above the snapshot '
+          + 'limit. A snapshot is refused; live mode is required.';
+      }
+      return `About ${n} cells: above the snapshot limit. A snapshot is refused; `
+        + 'live mode is required.';
+    }
+    if (v.live_suggested && n != null) {
+      return `About ${n} cells: live mode is suggested. Live tables are queried at `
+        + 'question time instead of copied.';
+    }
+    if (n == null) return 'Row count unavailable: pick Live yourself if the table is large.';
+    return '';
+  }
+
+  function _renderModeHint(el, v) {
+    const text = _modeHintText(v);
+    el.textContent = text;
+    el.classList.toggle('hidden', !text);
+  }
+
+  function _wizardMode() {
+    return $('twModeLive').checked ? 'live' : 'snapshot';
+  }
+
+  function _saveTableLabel() {
+    return _wizardMode() === 'live' ? '💾 Save & profile' : '💾 Save & snapshot';
+  }
+
+  function _onModeChange() {
+    $('twModeNote').classList.toggle('hidden', _wizardMode() !== 'live');
+    $('btnSaveTable').textContent = _saveTableLabel();
+    if (wizardStep === 3) renderSummary();
+  }
+
+  // Pre-tick precedence: the stored doc's mode > a prefill > the verdict
+  // (required ⇒ live, with the Snapshot radio disabled).
+  function _applyModeChoice(existing, verdict) {
+    currentSizeVerdict = verdict;
+    const required = !!(verdict && verdict.live_required);
+    let mode = 'snapshot';
+    if (existing && existing.mode) {
+      mode = existing.mode === 'live' ? 'live' : 'snapshot';
+    } else if (wizardPrefill && (wizardPrefill.mode === 'live' || wizardPrefill.mode === 'snapshot')) {
+      mode = wizardPrefill.mode;
+    }
+    if (required) mode = 'live';
+    $('twModeLive').checked = mode === 'live';
+    $('twModeSnapshot').checked = mode !== 'live';
+    $('twModeSnapshot').disabled = required;
+    _renderModeHint($('twModeHint'), verdict);
+    _onModeChange();
   }
 
   function wizardNext() {
@@ -825,8 +923,11 @@
       <div class="adm-summary-row"><span>Source</span><strong>${esc(connName)} · ${esc($('twSchema').value)}.${esc($('twTable').value)}</strong></div>
       <div class="adm-summary-row"><span>Rows (estimate)</span><strong>${rc != null ? Number(rc).toLocaleString() : 'n/a'}</strong></div>
       <div class="adm-summary-row"><span>Column descriptions</span><strong>${filled} of ${described.length} filled</strong></div>
-      <div class="adm-summary-note">Saving takes a local snapshot now — user questions run against
-        the snapshot, never against your database.</div>`;
+      <div class="adm-summary-note">${_wizardMode() === 'live'
+        ? 'Saving profiles a sample of the table; no snapshot is taken. Live tables query '
+          + 'your database on every question and are not offered in chats until the live '
+          + 'query path ships.'
+        : 'Saving takes a local snapshot now; user questions run against the snapshot.'}</div>`;
   }
 
   function renderRelations(rels) {
@@ -1619,6 +1720,12 @@
       loadRelRecommendations();
       return;
     }
+    if (r.data.code === 'LIVE_REQUIRED') {
+      toast(r.data.error || 'This table is above the snapshot limit — register it from '
+        + 'the Tables list in live mode.', true);
+      loadRelRecommendations();
+      return;
+    }
     if (!r.data.ok) {
       toast(r.data.error || 'Registration failed — the recommendation stays open', true);
       loadRelRecommendations();
@@ -2379,21 +2486,28 @@
       columns,
       is_connector: $('twIsConnector').checked,
       relations: rels,
+      mode: _wizardMode(),
       confirm: $('twConfirm').checked === true,
     };
     // Access panel → role records. Omitted (not []) when roles were
     // unavailable, so an edit-save can never strip existing grants.
     if (_wizAccessReady) body.access_role_ids = collectCheckedAccessRoles();
     $('btnSaveTable').disabled = true;
-    $('btnSaveTable').textContent = 'Snapshotting…';
-    _busy(`Saving "${body.display_name}" and taking a snapshot… large tables can take a while.`);
+    $('btnSaveTable').textContent = body.mode === 'live' ? 'Profiling…' : 'Snapshotting…';
+    _busy(body.mode === 'live'
+      ? `Saving "${body.display_name}" and profiling a sample…`
+      : `Saving "${body.display_name}" and taking a snapshot… large tables can take a while.`);
     const path = editingTableId ? `/api/admin/tables/${editingTableId}` : '/api/admin/tables';
     let r;
     try {
       r = await api(path, { method: 'POST', body: JSON.stringify(body) });
     } finally { _busyDone(); }
-    $('btnSaveTable').textContent = '💾 Save & snapshot';
+    $('btnSaveTable').textContent = _saveTableLabel();
     updateSaveEnabled();
+    if (r.data.code === 'LIVE_REQUIRED') {
+      toast(r.data.error || 'This table is above the snapshot limit — choose Live.', true);
+      return;
+    }
     if (r.status === 409) {
       toast(r.data.error || 'Table structure changed — go back and reload the structure.', true);
       return;
@@ -2403,7 +2517,14 @@
       return;
     }
     const snap = r.data.snapshot || {};
-    if (snap.ok) {
+    const lp = r.data.live_profile;
+    if (lp) {
+      if (lp.ok) {
+        toast(`Saved as live — profiled from ${Number(lp.sample_rows).toLocaleString()} sampled rows`);
+      } else {
+        toast(`Saved as live, but profiling failed: ${lp.error || 'unknown'} — use Refresh to retry`, true);
+      }
+    } else if (snap.ok) {
       toast(`Saved — snapshot ${Number(snap.rows).toLocaleString()} rows`);
     } else {
       toast(`Saved, but snapshot failed: ${snap.error || 'unknown'} — use Refresh to retry`, true);
@@ -2605,6 +2726,62 @@
       $('tsmPreview').textContent = r.data.error || 'Save failed';
       $('tsmPreview').classList.add('adm-bad-text');
     }
+  }
+
+  // Per-table storage mode (the schedule-modal idiom).
+  let _tmmTable = null;
+
+  function openTableModeModal(t) {
+    _tmmTable = t;
+    $('tmmTitle').textContent = `Storage mode — ${t.display_name}`;
+    const live = t.mode === 'live';
+    $('tmmLive').checked = live;
+    $('tmmSnapshot').checked = !live;
+    $('tmmSnapshot').disabled = !!t.live_required;
+    _renderModeHint($('tmmHint'), {
+      cell_count: t.cell_count, live_suggested: !!t.live_suggested,
+      live_required: !!t.live_required });
+    $('tableModeModal').classList.remove('hidden');
+  }
+
+  async function saveTableMode() {
+    if (!_tmmTable) return;
+    const t = _tmmTable;
+    const mode = $('tmmLive').checked ? 'live' : 'snapshot';
+    if (mode === (t.mode === 'live' ? 'live' : 'snapshot')) {
+      $('tableModeModal').classList.add('hidden');
+      return;
+    }
+    _busy(mode === 'live' ? `Switching "${t.display_name}" to live and profiling a sample…`
+      : `Switching "${t.display_name}" to snapshot… large tables can take a while.`);
+    let r;
+    try {
+      r = await api(`/api/admin/tables/${t.id}/mode`, {
+        method: 'POST', body: JSON.stringify({ mode }) });
+    } finally { _busyDone(); }
+    if (r.data.code === 'LIVE_REQUIRED') {
+      toast(r.data.error || 'This table is above the snapshot limit — it must stay live.', true);
+      return;
+    }
+    if (r.data.code === 'OUT_OF_SCOPE') {
+      toast('This table is outside your managed scope.', true);
+      return;
+    }
+    if (!r.ok) {
+      toast(r.data.error || 'Could not change the storage mode', true);
+      return;
+    }
+    $('tableModeModal').classList.add('hidden');
+    const lp = r.data.live_profile;
+    const snap = r.data.snapshot;
+    if (lp && !lp.ok) {
+      toast(`Now live, but profiling failed: ${lp.error || 'unknown'} — use Refresh to retry`, true);
+    } else if (snap && !snap.ok) {
+      toast(`Now snapshot, but the snapshot failed: ${snap.error || 'unknown'} — use Refresh to retry`, true);
+    } else {
+      toast(mode === 'live' ? 'Table is now live' : 'Table is now a snapshot table');
+    }
+    loadAll();
   }
 
   // ── Audit ──────────────────────────────────────────────────────────────
@@ -3341,6 +3518,12 @@
     $('btnAddRelation').addEventListener('click', () => addRelationRow(null));
     $('twConfirm').addEventListener('change', updateSaveEnabled);
     $('btnSaveTable').addEventListener('click', saveTable);
+    // Storage choice + mode modal: rendered in BOTH manager modes.
+    $('twModeSnapshot').addEventListener('change', _onModeChange);
+    $('twModeLive').addEventListener('change', _onModeChange);
+    $('btnTmmSave').addEventListener('click', saveTableMode);
+    $('btnTmmCancel').addEventListener('click', () => $('tableModeModal').classList.add('hidden'));
+    $('closeTmmModal').addEventListener('click', () => $('tableModeModal').classList.add('hidden'));
 
     $('btnRelScan').addEventListener('click', scanRelations);
     $('btnRelAnalyzeSql').addEventListener('click', analyzeRelSql);
