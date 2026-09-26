@@ -203,3 +203,27 @@ def test_live_chip_style_exists():
 def test_snapshot_only_promises_are_gone():
     assert "user questions never query your database directly" not in _norm_ws(HTML)
     assert "never against your database" not in _norm_ws(JS)
+
+
+def test_stored_mode_wins_and_snapshot_is_disabled_only_for_a_new_table():
+    """Editing an existing table keeps its stored mode: the Snapshot radio is
+    disabled by a required verdict only when there is no stored doc."""
+    body = _function_body(JS, "_applyModeChoice")
+    assert "existing" in body
+    lines = [ln for ln in body.splitlines()
+             if re.search(r"twModeSnapshot['\"]\s*\)\s*\.disabled\s*=", ln)]
+    assert lines, "the Snapshot radio's disabled state is not set here"
+    assert all("existing" in ln for ln in lines), lines
+
+
+def test_summary_prints_the_counted_verdict():
+    assert "currentSizeVerdict" in _function_body(JS, "renderSummary")
+
+
+def test_live_copy_does_not_promise_per_question_queries():
+    assert "on every question" not in _norm_ws(HTML)
+    assert "on every question" not in _norm_ws(JS)
+
+
+def test_mode_switch_reports_a_reverted_snapshot():
+    assert "reverted" in _function_body(JS, "saveTableMode")

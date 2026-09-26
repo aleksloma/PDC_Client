@@ -1588,7 +1588,12 @@ async def introspect_table(request: Request):
 # Live mode: size verdict + sampled profile
 # ---------------------------------------------------------------------------
 
-_LIVE_DOC_KEYS = ("live_reason", "live_set_by", "live_set_at")
+# Who/when/why a table went live — carried through an edit-save.
+_LIVE_STAMP_KEYS = ("live_reason", "live_set_by", "live_set_at")
+# Every live-only key; all removed when a save turns the table to snapshot.
+# The last two are re-stamped by each live profile, so an edit-save does not
+# carry them.
+_LIVE_DOC_KEYS = _LIVE_STAMP_KEYS + ("live_profiled_at", "live_sample_rows")
 
 _LIVE_REQUIRED_TEXT = ("This table is above the snapshot size limit. A "
                        "snapshot is refused; register it in live mode.")
@@ -1611,8 +1616,10 @@ def _size_verdict(intro: dict, count_res, row_cap=None) -> dict:
     ok => the exact count; timed out => treated as above the force threshold
     (live required); any other failure => the catalog estimate; both missing
     => unknown (no suggestion, no refusal). A `row_cap` bounds the snapshot,
-    so a known row count is taken at most at the cap (a timeout still means
-    the source could not be counted and stays required)."""
+    so a known row count is taken at most at the cap; a timeout under a cap
+    whose cap x columns stays below the force threshold reads as
+    `count_source: "cap"` with the cap as the row count (not required),
+    otherwise a timeout stays required."""
     cap = _safe_int(row_cap)
     ncols = len([c for c in ((intro or {}).get("columns") or []) if c.get("name")])
     count_res = count_res if isinstance(count_res, dict) else {}
@@ -1625,6 +1632,15 @@ def _size_verdict(intro: dict, count_res, row_cap=None) -> dict:
                 "timed_out": False, "cell_count": cell,
                 "live_suggested": suggested, "live_required": required}
     if count_res.get("timed_out"):
+        if cap:
+            # The snapshot copies at most `cap` rows: when even that many
+            # stay under the force threshold, the count timeout does not
+            # make live required.
+            cell, suggested, required = _verdict_for(cap, ncols)
+            if not required:
+                return {"row_count": cap, "count_source": "cap",
+                        "timed_out": True, "cell_count": cell,
+                        "live_suggested": suggested, "live_required": False}
         return {"row_count": None, "count_source": None, "timed_out": True,
                 "cell_count": None, "live_suggested": True,
                 "live_required": True}
@@ -1855,6 +1871,18 @@ async def draft_descriptions(request: Request):
     return res
 
 
+# A save body without a `where_filter` / `row_cap` key: the stored value is
+# kept. An explicit null still clears it.
+_NOT_POSTED = object()
+
+
+def _posted_or_stored(value, existing, key: str):
+    """`value`, or the existing doc's `key` when `value` is `_NOT_POSTED`."""
+    if value is not _NOT_POSTED:
+        return value
+    return existing.get(key) if isinstance(existing, dict) else None
+
+
 def _build_table_doc(*, tid: str, connection_id, schema, table: str,
                      display_name: str, description: str, columns: list,
                      is_connector: bool, relations: list, intro: dict,
@@ -1871,7 +1899,10 @@ def _build_table_doc(*, tid: str, connection_id, schema, table: str,
     ladmin-registered / not deletable by any power user). Deliberately NOT
     carried: `last_drift` / `last_fingerprint` — an edit-save is the admin
     reviewing the table (drift review resolved), and the post-save refresh
-    stores a fresh fingerprint anyway."""
+    stores a fresh fingerprint anyway. `where_filter` / `row_cap` passed as
+    `_NOT_POSTED` keep the existing doc's values."""
+    where_filter = _posted_or_stored(where_filter, existing, "where_filter")
+    row_cap = _posted_or_stored(row_cap, existing, "row_cap")
     now = datetime.now(timezone.utc).isoformat()
     carried = {}
     if isinstance(existing, dict):
@@ -1884,7 +1915,7 @@ def _build_table_doc(*, tid: str, connection_id, schema, table: str,
         # silently turn a live table back into a snapshot table.
         if existing.get("mode") in db_sources.MODES:
             carried["mode"] = existing["mode"]
-        for key in _LIVE_DOC_KEYS:
+        for key in _LIVE_STAMP_KEYS:
             if existing.get(key) is not None:
                 carried[key] = existing[key]
     else:
@@ -1960,7 +1991,10 @@ async def save_table(request: Request, tid: str = ""):
     (1) confirm:true required; (2) drafts are never persisted elsewhere;
     (3) descriptions_confirmed_by/at stamped from the SESSION + server clock,
     never the body; (4) a fresh introspection must match the posted column
-    set (409 SCHEMA_DRIFT) so a stale wizard can't confirm the wrong shape."""
+    set (409 SCHEMA_DRIFT) so a stale wizard can't confirm the wrong shape.
+    The response carries the counted `size_verdict`; a snapshot is refused
+    (LIVE_REQUIRED) only for a new registration or an edit switching mode.
+    A body without `where_filter` / `row_cap` keeps the stored values."""
     email, scope, err = _require_source_manager(request)
     if err:
         return err
@@ -2053,17 +2087,28 @@ async def save_table(request: Request, tid: str = ""):
             {"error": "Table structure changed since introspection — re-run introspect.",
              "code": "SCHEMA_DRIFT"}, status_code=409)
 
-    # The enforcement point of the size thresholds: counted again after the
-    # fresh introspection; a snapshot at or above the force threshold is
-    # refused BEFORE anything is written.
+    # The size thresholds: counted again after the fresh introspection (with
+    # the filter and cap the saved doc will carry). A NEW registration — or
+    # an edit that posts a mode different from the stored one — saved as a
+    # snapshot at or above the force threshold is refused BEFORE anything is
+    # written. On any other edit the verdict is advisory only: returned with
+    # the response, the stored mode kept, a count timeout included.
     prev_mode = db_sources.table_mode(own) if own is not None else None
     mode = posted_mode if posted_mode is not None else (prev_mode or "snapshot")
+    is_edit = own is not None
+    flip = is_edit and posted_mode is not None and posted_mode != prev_mode
+    where_in = body["where_filter"] if "where_filter" in body else _NOT_POSTED
+    cap_in = body["row_cap"] if "row_cap" in body else _NOT_POSTED
+    where_filter = _posted_or_stored(where_in, own, "where_filter")
+    row_cap = _posted_or_stored(cap_in, own, "row_cap")
     count_res = await _run(db_connector.count_rows, cfg, password,
                            intro.get("schema"), intro.get("table") or table,
-                           where=(body.get("where_filter") or "").strip() or None,
+                           where=(where_filter.strip()
+                                  if isinstance(where_filter, str) else "") or None,
                            sid=f"admin:{email}")
-    verdict = _size_verdict(intro, count_res, row_cap=body.get("row_cap"))
-    if mode == "snapshot" and verdict.get("live_required"):
+    verdict = _size_verdict(intro, count_res, row_cap=row_cap)
+    if mode == "snapshot" and verdict.get("live_required") and \
+            (not is_edit or flip):
         return JSONResponse({"error": _LIVE_REQUIRED_TEXT,
                              "code": "LIVE_REQUIRED"}, status_code=400)
 
@@ -2074,7 +2119,7 @@ async def save_table(request: Request, tid: str = ""):
         columns=body.get("columns") or [],
         is_connector=bool(body.get("is_connector")),
         relations=relations, intro=intro,
-        where_filter=body.get("where_filter"), row_cap=body.get("row_cap"),
+        where_filter=where_in, row_cap=cap_in,
         email=email, existing=own)
     doc["mode"] = mode
     if mode == "live":
@@ -2153,7 +2198,8 @@ async def save_table(request: Request, tid: str = ""):
                                   password, store.get_table(saved["id"]) or saved,
                                   count_res, email, _kind(scope))
         return JSONResponse({"table": store.get_table(saved["id"]),
-                             "snapshot": None, "live_profile": live_profile},
+                             "snapshot": None, "live_profile": live_profile,
+                             "size_verdict": verdict},
                             status_code=status)
 
     # Snapshot (or re-snapshot). A failure keeps the registration saved with
@@ -2161,7 +2207,8 @@ async def save_table(request: Request, tid: str = ""):
     import db_scheduler
     snap = await _run(db_scheduler.refresh_one_table, saved["id"], actor=email,
                       actor_kind=_kind(scope))
-    return JSONResponse({"table": store.get_table(saved["id"]), "snapshot": snap},
+    return JSONResponse({"table": store.get_table(saved["id"]), "snapshot": snap,
+                         "size_verdict": verdict},
                         status_code=status)
 
 
@@ -2380,11 +2427,14 @@ async def set_table_mode(request: Request, tid: str):
     management scope (not owner-only: mode is operational, like the schedule
     override). Same mode => 200, nothing written, no audit. To live: the live
     keys are stamped, an existing parquet is KEPT (no update deletes state)
-    and a sampled profile is computed. To snapshot: refused (LIVE_REQUIRED)
-    when the stored size is at or above the force threshold; otherwise the
-    live keys are cleared and a fresh snapshot is taken (a parquet kept
-    from before the live period would be stale).
-    Audited as `table.mode`."""
+    and a sampled profile is computed. To snapshot: the rows are counted
+    again (the doc's filter and cap; a count failure falls back to the
+    stored row count) and the switch is refused (LIVE_REQUIRED) at or above
+    the force threshold, a count timeout included, before anything is
+    written; otherwise the live keys are cleared and a fresh snapshot is
+    taken (a parquet kept from before the live period would be stale). When
+    that snapshot fails the table goes back to live and the answer carries
+    `reverted: true`. Audited as `table.mode`."""
     email, scope, err = _require_source_manager(request)
     if err:
         return err
@@ -2405,12 +2455,24 @@ async def set_table_mode(request: Request, tid: str):
         return {"ok": True, "table": doc}
     stored = _stored_verdict(doc)
     if mode == "snapshot":
-        if stored["live_required"]:
+        cfg, password, resp = _conn_cfg_and_password(
+            store, {"connection_id": doc.get("connection_id")})
+        if resp is not None:
+            return resp
+        count_res = await _run(
+            db_connector.count_rows, cfg, password,
+            db_connector.qname(doc.get("schema") or None, doc.get("schema_quote")),
+            db_connector.qname(doc.get("table_name"), doc.get("table_quote")),
+            where=doc.get("where_filter") or None, sid=f"admin:{email}")
+        verdict = _size_verdict({"columns": doc.get("columns") or [],
+                                 "row_count_estimate": doc.get("row_count")},
+                                count_res, row_cap=doc.get("row_cap"))
+        if verdict["live_required"]:
             return JSONResponse({"error": _LIVE_REQUIRED_TEXT,
                                  "code": "LIVE_REQUIRED"}, status_code=400)
         found = store.set_table_mode(tid, "snapshot", actor=email,
                                      actor_kind=_kind(scope),
-                                     cell_count=stored["cell_count"])
+                                     cell_count=verdict["cell_count"])
         if not found:
             return JSONResponse({"error": "Unknown table."}, status_code=404)
         # Always a fresh full snapshot: a parquet kept from before the live
@@ -2418,6 +2480,19 @@ async def set_table_mode(request: Request, tid: str):
         import db_scheduler
         snap = await _run(db_scheduler.refresh_one_table, tid, actor=email,
                           actor_kind=_kind(scope))
+        if not (isinstance(snap, dict) and snap.get("ok")):
+            # The switch holds only once a snapshot exists: back to live,
+            # keeping why it was live before.
+            reason = doc.get("live_reason")
+            if reason not in db_sources.LIVE_REASONS:
+                reason = "manual"
+            store.set_table_mode(tid, "live", actor=email,
+                                 actor_kind=_kind(scope), reason=reason,
+                                 cell_count=verdict["cell_count"])
+            log_with_sid(log_safe_text(f"admin:{email}"), "warning",
+                         f"LIVE_MODE_REVERTED table={log_safe_text(tid)}")
+            return {"ok": True, "table": store.get_table(tid),
+                    "snapshot": snap, "reverted": True}
         return {"ok": True, "table": store.get_table(tid), "snapshot": snap}
     reason = "threshold" if stored["live_suggested"] else "manual"
     found = store.set_table_mode(tid, "live", actor=email,

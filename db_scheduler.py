@@ -76,6 +76,12 @@ def _normalize_dtype(s) -> str:
     return " ".join(str(s or "").split()).upper()
 
 
+def _log_live_skip(table_id) -> None:
+    from exec_transport import log_safe_text
+    log_with_sid("db_refresh", "info",
+                 f"LIVE_SKIP table={log_safe_text(str(table_id))}")
+
+
 def refresh_one_table(table_id: str, *, actor: str = "scheduler",
                       force: bool = True, actor_kind: str | None = None) -> dict:
     """Re-snapshot one registered table and re-sync drifted chat metas.
@@ -94,6 +100,11 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler",
     row = store.get_table(table_id)
     if row is None:
         return {"ok": False, "error": "Unknown table."}
+    if db_sources.table_mode(row) == "live":
+        # A live table is never copied: no connection, no fingerprint, no
+        # snapshot, no profile, and refreshed_at stays as it is.
+        _log_live_skip(table_id)
+        return {"ok": True, "skipped": True, "reason": "live"}
     conn = store.get_connection(row.get("connection_id"), with_secret=True)
     if conn is None:
         store.mark_refreshed(table_id, error="Connection no longer exists.")
@@ -474,6 +485,12 @@ def run_all_due(*, reason: str = "schedule",
         if table_ids is not None:
             wanted = set(table_ids)
             tables = [t for t in tables if t.get("id") in wanted]
+        # Live tables are left out before the loop, so a scheduled run never
+        # opens a connection for them.
+        for t in tables:
+            if db_sources.table_mode(t) == "live":
+                _log_live_skip(t.get("id"))
+        tables = [t for t in tables if db_sources.table_mode(t) != "live"]
         log_with_sid("db_refresh", "info",
                      f"DB_REFRESH_RUN_START reason={reason} tables={len(tables)}")
         for t in tables:

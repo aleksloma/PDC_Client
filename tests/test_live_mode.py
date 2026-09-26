@@ -826,3 +826,280 @@ def test_recommendation_accept_refuses_a_table_above_the_force_threshold(
     assert r.json()["code"] == "LIVE_REQUIRED"
     assert {t["id"] for t in store.list_tables()} == tables_before
     assert store.list_recommendations()[0]["status"] == "open"
+
+
+# ===========================================================================
+# editing an existing table: the size verdict is advisory, the mode is kept
+# ===========================================================================
+def _timed_out_count(monkeypatch):
+    import routes.admin_data as admin_mod
+    monkeypatch.setattr(admin_mod.db_connector, "count_rows",
+                        lambda *a, **k: {"ok": False, "count": None,
+                                         "timed_out": True, "error": "x"},
+                        raising=False)
+
+
+def _edit(client, tid, cid, **extra):
+    return client.post(f"/api/admin/tables/{tid}",
+                       json=_table_body(cid, **extra))
+
+
+def test_edit_of_a_snapshot_table_above_force_keeps_snapshot(client, conn,
+                                                            monkeypatch):
+    tid = _register_snapshot(client, conn)
+    _set_thresholds(monkeypatch, cell=3, force=4)
+    r = _edit(client, tid, conn, mode="snapshot", description="edited")
+    assert r.status_code == 200, r.json()
+    out = r.json()
+    assert "size_verdict" in out, "the save response carries no size_verdict"
+    assert out["size_verdict"]["live_required"] is True
+    doc = db_sources.DataSourceStore().get_table(tid)
+    assert doc["mode"] == "snapshot"
+    assert doc["description"] == "edited"
+    assert _mode_rows() == []
+
+
+def test_edit_without_mode_above_force_keeps_snapshot(client, conn, monkeypatch):
+    tid = _register_snapshot(client, conn)
+    _set_thresholds(monkeypatch, cell=3, force=4)
+    r = _edit(client, tid, conn, description="edited")
+    assert r.status_code == 200, r.json()
+    assert db_sources.DataSourceStore().get_table(tid)["mode"] == "snapshot"
+
+
+def test_edit_with_a_count_timeout_keeps_the_stored_mode(client, conn,
+                                                         monkeypatch):
+    tid = _register_snapshot(client, conn)
+    _timed_out_count(monkeypatch)
+    r = _edit(client, tid, conn, description="edited")
+    assert r.status_code == 200, r.json()
+    assert db_sources.DataSourceStore().get_table(tid)["mode"] == "snapshot"
+    assert r.json().get("size_verdict", {}).get("timed_out") is True
+
+
+def test_edit_posting_live_on_a_snapshot_table_flips_and_stamps(client, conn,
+                                                                monkeypatch):
+    tid = _register_snapshot(client, conn)
+    _set_thresholds(monkeypatch, cell=3, force=4)
+    r = _edit(client, tid, conn, mode="live")
+    assert r.status_code == 200, r.json()
+    doc = db_sources.DataSourceStore().get_table(tid)
+    assert doc["mode"] == "live"
+    assert doc["live_set_by"] == ADMIN
+    assert doc["live_set_at"]
+
+
+def test_edit_posting_snapshot_on_a_live_table_above_force_is_refused(
+        client, conn, monkeypatch):
+    tid = _register_live(client, conn)
+    _set_thresholds(monkeypatch, cell=3, force=4)
+    r = _edit(client, tid, conn, mode="snapshot")
+    assert r.status_code == 400
+    assert r.json()["code"] == "LIVE_REQUIRED"
+    assert db_sources.DataSourceStore().get_table(tid)["mode"] == "live"
+
+
+def test_new_registration_response_carries_the_size_verdict(client, conn):
+    r = client.post("/api/admin/tables", json=_table_body(conn))
+    assert r.status_code == 201, r.json()
+    v = r.json().get("size_verdict")
+    assert isinstance(v, dict), "the save response carries no size_verdict"
+    assert v["row_count"] == 2
+    assert v["cell_count"] == 4
+    assert v["live_required"] is False
+
+
+# ===========================================================================
+# POST /tables/{tid}/mode -> snapshot re-counts before switching
+# ===========================================================================
+def _forget_stored_row_count(tid):
+    store = db_sources.DataSourceStore()
+    doc = store.get_table(tid)
+    doc["row_count"] = None
+    store.upsert_table(doc, actor=ADMIN)
+    assert store.get_table(tid).get("row_count") is None
+    return store
+
+
+def test_mode_route_to_snapshot_recounts_and_refuses_a_timeout(client, conn,
+                                                              monkeypatch):
+    tid = _register_live(client, conn)
+    store = _forget_stored_row_count(tid)
+    _timed_out_count(monkeypatch)
+    r = client.post(f"/api/admin/tables/{tid}/mode", json={"mode": "snapshot"})
+    assert r.status_code == 400, r.json()
+    assert r.json()["code"] == "LIVE_REQUIRED"
+    assert store.get_table(tid)["mode"] == "live"
+    assert not local_store.db_snapshot_path(tid).exists()
+
+
+def test_mode_route_to_snapshot_with_a_healthy_count_succeeds(client, conn):
+    tid = _register_live(client, conn)
+    store = _forget_stored_row_count(tid)
+    r = client.post(f"/api/admin/tables/{tid}/mode", json={"mode": "snapshot"})
+    assert r.status_code == 200, r.json()
+    assert store.get_table(tid)["mode"] == "snapshot"
+
+
+# ===========================================================================
+# POST /tables/{tid}/mode -> snapshot reverts to live when the snapshot fails
+# ===========================================================================
+def test_mode_route_reverts_to_live_when_the_snapshot_fails(client, conn,
+                                                           monkeypatch):
+    import db_scheduler
+    tid = _register_live(client, conn)
+    monkeypatch.setattr(db_scheduler, "refresh_one_table",
+                        lambda *a, **k: {"ok": False, "error": "boom"})
+    before = len(_mode_rows())
+    r = client.post(f"/api/admin/tables/{tid}/mode", json={"mode": "snapshot"})
+    assert r.status_code == 200, r.json()
+    out = r.json()
+    assert out.get("reverted") is True
+    assert out["snapshot"]["ok"] is False
+    store = db_sources.DataSourceStore()
+    assert store.get_table(tid)["mode"] == "live"
+    assert out["table"]["mode"] == "live"
+    rows = _mode_rows()
+    new = rows[:len(rows) - before]
+    assert len(new) == 2, new
+    assert sorted((x["detail"]["from"], x["detail"]["to"]) for x in new) == \
+        [("live", "snapshot"), ("snapshot", "live")]
+    assert tid not in {t["id"] for t in store.list_tables(include_live=False)}
+
+
+# ===========================================================================
+# edit-save keeps where_filter / row_cap unless the body names them
+# ===========================================================================
+def test_edit_without_filter_keys_keeps_where_and_row_cap(client, conn):
+    r = client.post("/api/admin/tables",
+                    json=_table_body(conn, where_filter="a > 0", row_cap=1))
+    assert r.status_code == 201, r.json()
+    tid = r.json()["table"]["id"]
+    r = _edit(client, tid, conn, description="edited")
+    assert r.status_code == 200, r.json()
+    doc = db_sources.DataSourceStore().get_table(tid)
+    assert doc["where_filter"] == "a > 0"
+    assert doc["row_cap"] == 1
+    assert doc["description"] == "edited"
+
+
+def test_edit_with_explicit_null_clears_where_and_row_cap(client, conn):
+    r = client.post("/api/admin/tables",
+                    json=_table_body(conn, where_filter="a > 0", row_cap=1))
+    assert r.status_code == 201, r.json()
+    tid = r.json()["table"]["id"]
+    r = _edit(client, tid, conn, where_filter=None, row_cap=None)
+    assert r.status_code == 200, r.json()
+    doc = db_sources.DataSourceStore().get_table(tid)
+    assert doc.get("where_filter") is None
+    assert doc.get("row_cap") is None
+
+
+# ===========================================================================
+# _size_verdict: a count timeout under a row cap
+# ===========================================================================
+_TWO_COLS = {"columns": [{"name": "a"}, {"name": "b"}]}
+
+
+def test_verdict_timeout_under_a_small_cap_is_not_required(monkeypatch):
+    import routes.admin_data as admin_mod
+    _set_thresholds(monkeypatch, cell=3, force=10)
+    v = admin_mod._size_verdict(_TWO_COLS, {"ok": False, "timed_out": True},
+                                row_cap=1)
+    assert v["live_required"] is False
+    assert v["live_suggested"] is False
+    assert v["count_source"] == "cap"
+    assert v["row_count"] == 1
+    assert v["timed_out"] is True
+
+
+def test_verdict_timeout_under_a_large_cap_is_required(monkeypatch):
+    import routes.admin_data as admin_mod
+    _set_thresholds(monkeypatch, cell=3, force=10)
+    v = admin_mod._size_verdict(_TWO_COLS, {"ok": False, "timed_out": True},
+                                row_cap=100)
+    assert v["live_required"] is True
+
+
+def test_verdict_timeout_without_a_cap_is_required(monkeypatch):
+    import routes.admin_data as admin_mod
+    _set_thresholds(monkeypatch, cell=3, force=10)
+    v = admin_mod._size_verdict(_TWO_COLS, {"ok": False, "timed_out": True})
+    assert v["live_required"] is True
+    assert v["timed_out"] is True
+
+
+# ===========================================================================
+# the flip back to snapshot clears every live bookkeeping key
+# ===========================================================================
+_FIVE_LIVE_KEYS = ("live_reason", "live_set_by", "live_set_at",
+                   "live_profiled_at", "live_sample_rows")
+
+
+def test_mode_route_back_to_snapshot_clears_the_five_live_keys(client, conn):
+    tid = _register_live(client, conn)
+    store = db_sources.DataSourceStore()
+    doc = store.get_table(tid)
+    assert doc.get("live_profiled_at") and doc.get("live_sample_rows")
+    r = client.post(f"/api/admin/tables/{tid}/mode", json={"mode": "snapshot"})
+    assert r.status_code == 200, r.json()
+    doc = store.get_table(tid)
+    assert doc["mode"] == "snapshot"
+    for key in _FIVE_LIVE_KEYS:
+        assert key not in doc, key
+
+
+def test_store_flip_back_to_snapshot_clears_the_five_live_keys(store):
+    tid = _store_table(store)["id"]
+    store.set_table_mode(tid, "live", actor=ADMIN, reason="manual", cell_count=4)
+    store.mark_live_profiled(tid, row_count=2,
+                             columns=[{"name": "a"}, {"name": "b"}],
+                             profiled_at="2026-09-26T00:00:00+00:00",
+                             sample_rows=2)
+    assert store.set_table_mode(tid, "snapshot", actor=ADMIN) is True
+    doc = store.get_table(tid)
+    for key in _FIVE_LIVE_KEYS:
+        assert key not in doc, key
+
+
+# ===========================================================================
+# a failed live sample keeps the registration (three routes)
+# ===========================================================================
+def _failing_sample(monkeypatch):
+    import db_connector
+    monkeypatch.setattr(db_connector, "sample_rows",
+                        lambda *a, **k: {"ok": False, "df": None, "error": "x"})
+
+
+def test_save_live_keeps_the_registration_when_the_sample_fails(client, conn,
+                                                                monkeypatch):
+    _failing_sample(monkeypatch)
+    r = client.post("/api/admin/tables", json=_table_body(conn, mode="live"))
+    assert r.status_code == 201, r.json()
+    out = r.json()
+    assert out["live_profile"]["ok"] is False
+    tid = out["table"]["id"]
+    assert db_sources.DataSourceStore().get_table(tid)["mode"] == "live"
+    assert not local_store.db_snapshot_path(tid).exists()
+    assert not local_store.db_profile_path(tid).exists()
+
+
+def test_mode_route_to_live_keeps_live_when_the_sample_fails(client, conn,
+                                                             monkeypatch):
+    tid = _register_snapshot(client, conn)
+    _failing_sample(monkeypatch)
+    r = client.post(f"/api/admin/tables/{tid}/mode", json={"mode": "live"})
+    assert r.status_code == 200, r.json()
+    assert r.json()["live_profile"]["ok"] is False
+    assert db_sources.DataSourceStore().get_table(tid)["mode"] == "live"
+
+
+def test_refresh_now_on_a_live_table_reports_a_failed_sample(client, conn,
+                                                             monkeypatch):
+    tid = _register_live(client, conn)
+    _failing_sample(monkeypatch)
+    r = client.post(f"/api/admin/tables/{tid}/refresh", json={})
+    assert r.status_code == 200, r.json()
+    assert r.json()["live_profile"]["ok"] is False
+    assert db_sources.DataSourceStore().get_table(tid)["mode"] == "live"
+    assert not local_store.db_snapshot_path(tid).exists()

@@ -23,7 +23,11 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "CLIENT_ENCRYPTION_KEY",
                         Fernet.generate_key().decode())
     local_store._DATAFRAME_CACHE.invalidate()
+    # stop() leaves the module _STOP flag set by design; a test that called it
+    # must not make a later run_all_due() exit before its first table.
+    db_scheduler._STOP.clear()
     yield
+    db_scheduler._STOP.clear()
     local_store._DATAFRAME_CACHE.invalidate()
 
 
@@ -500,3 +504,77 @@ def test_both_probes_failing_aborts_and_keeps_the_last_snapshot(tmp_path, monkey
     assert dest.stat().st_mtime_ns == before_mtime      # last good data kept
     assert row["refreshed_at"] == before_at
     assert [c["name"] for c in row["columns"]] == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# Live tables are never snapshotted by a refresh
+# ---------------------------------------------------------------------------
+
+def _no_engine_spy(monkeypatch):
+    import db_connector
+    calls = []
+
+    def no_engine(*a, **kw):
+        calls.append(1)
+        raise RuntimeError("no connection may be opened for a live table")
+    monkeypatch.setattr(db_connector, "get_engine", no_engine)
+    return calls
+
+
+def test_refresh_one_table_skips_a_live_table(tmp_path, monkeypatch, caplog):
+    import logging
+    _, store, tid = _sqlite_setup(tmp_path)
+    assert store.set_table_mode(tid, "live", actor="ladmin", reason="manual")
+    calls = _no_engine_spy(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        res = db_scheduler.refresh_one_table(tid, actor="test")
+    assert res.get("ok") is True
+    assert res.get("skipped") is True
+    assert res.get("reason") == "live"
+    assert calls == []
+    assert not local_store.db_snapshot_path(tid).exists()
+    assert not local_store.db_profile_path(tid).exists()
+    row = store.get_table(tid)
+    assert not row.get("refreshed_at")
+    assert row["mode"] == "live"
+    assert any("LIVE_SKIP" in r.getMessage() and tid in r.getMessage()
+               for r in caplog.records)
+
+
+def test_refresh_one_table_skips_a_live_table_without_force(tmp_path, monkeypatch):
+    _, store, tid = _sqlite_setup(tmp_path)
+    assert store.set_table_mode(tid, "live", actor="ladmin", reason="manual")
+    calls = _no_engine_spy(monkeypatch)
+    res = db_scheduler.refresh_one_table(tid, actor="test", force=False)
+    assert res.get("skipped") is True and res.get("reason") == "live"
+    assert calls == []
+
+
+def test_run_all_due_leaves_live_tables_out(tmp_path, caplog):
+    import logging
+    from sqlalchemy import create_engine, text
+    db, store, snap_tid = _sqlite_setup(tmp_path)
+    eng = create_engine(f"sqlite+pysqlite:///{db}")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE u (a INTEGER, b TEXT)"))
+        conn.execute(text("INSERT INTO u VALUES (1, 'y')"))
+    eng.dispose()
+    cid = store.get_table(snap_tid)["connection_id"]
+    live_tid = store.upsert_table({
+        "connection_id": cid, "schema": "", "table_name": "u",
+        "display_name": "live table", "description": "d", "mode": "live",
+        "columns": [{"name": "a", "dtype": "INTEGER", "description": "col a"},
+                    {"name": "b", "dtype": "TEXT", "description": "col b"}],
+    }, actor="ladmin")["id"]
+    with caplog.at_level(logging.INFO):
+        out = db_scheduler.run_all_due(reason="test")
+    ids = [r["table_id"] for r in out["results"]]
+    assert live_tid not in ids
+    assert snap_tid in ids
+    snap_res = next(r for r in out["results"] if r["table_id"] == snap_tid)
+    assert snap_res["ok"] is True
+    assert local_store.db_snapshot_path(snap_tid).exists()
+    assert not local_store.db_snapshot_path(live_tid).exists()
+    assert not store.get_table(live_tid).get("refreshed_at")
+    assert any("LIVE_SKIP" in r.getMessage() and live_tid in r.getMessage()
+               for r in caplog.records)

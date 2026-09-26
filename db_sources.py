@@ -60,7 +60,10 @@ _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 # written before the field existed are never rewritten.
 MODES = ("snapshot", "live")
 LIVE_REASONS = ("threshold", "manual")
-_LIVE_KEYS = ("live_reason", "live_set_by", "live_set_at")
+# Every live-only bookkeeping key; all five are removed when a table goes
+# back to snapshot.
+_LIVE_KEYS = ("live_reason", "live_set_by", "live_set_at",
+              "live_profiled_at", "live_sample_rows")
 
 
 def table_mode(doc) -> str:
@@ -854,7 +857,8 @@ class DataSourceStore:
         ValueError for a mode/reason outside the allowed set; False for an
         unknown table. The SAME mode as stored writes nothing and audits
         nothing. → live stamps live_reason (default "manual"), live_set_by =
-        actor and live_set_at = now; → snapshot removes the three. Never
+        actor and live_set_at = now; → snapshot removes those three plus
+        live_profiled_at and live_sample_rows. Never
         touches a snapshot parquet (no update deletes state). Audited as
         `table.mode` {from, to, reason, cell_count} after the lock."""
         if mode not in MODES:

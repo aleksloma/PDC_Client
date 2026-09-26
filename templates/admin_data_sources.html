@@ -115,7 +115,7 @@
             <li><span class="adm-hero-num">2</span>
               <div><strong>Register tables</strong><br>Pick tables, review the AI-drafted
               descriptions, and confirm. A local snapshot is taken, or, for a very large
-              table, the table is marked live and queried at question time.</div></li>
+              table, the table is marked live instead of copied.</div></li>
             <li><span class="adm-hero-num">3</span>
               <div><strong>Users select them in chats</strong><br>Registered tables appear in the
               “Select from DB” list when users create a chat, refreshed nightly.</div></li>
@@ -133,8 +133,9 @@
           <div>
             <h1>Registered tables</h1>
             <p class="adm-page-sub">Tables users can add to chats. <em>Connector</em> tables are
-               hidden from users and auto-included through their relations. <em>Live</em> tables
-               take no snapshot and are not offered in chats until the live query path ships.</p>
+               hidden from users and auto-included through their relations. A <em>live</em> table
+               is not copied when you save it, and scheduled refreshes skip it. Until the live
+               query path ships it is not offered in chats.</p>
           </div>
           <button id="btnRegisterTable" class="adm-btn primary">＋ Register table</button>
         </header>
@@ -442,9 +443,9 @@
               database.</span>
             </label>
             <div id="tmmHint" class="adm-alert warn hidden"></div>
-            <div class="adm-label-note">Live tables take no snapshot and query your database
-              on every question. They are not offered in chats until the live query path
-              ships.</div>
+            <div class="adm-label-note">A live table is not copied when you switch it, and
+              scheduled refreshes skip it. Until the live query path ships it is not offered
+              in chats.</div>
           </div>
           <div class="adm-modal-foot">
             <span class="adm-spacer"></span>
@@ -619,9 +620,9 @@
               database.</span>
             </label>
             <div id="twModeHint" class="adm-alert warn hidden"></div>
-            <div id="twModeNote" class="adm-label-note hidden">Live tables take no snapshot and
-              query your database on every question. They are not offered in chats until the
-              live query path ships.</div>
+            <div id="twModeNote" class="adm-label-note hidden">A live table is not copied when
+              you save it, and scheduled refreshes skip it. Until the live query path ships it
+              is not offered in chats.</div>
           </div>
 
           <div class="adm-suggest-panel">

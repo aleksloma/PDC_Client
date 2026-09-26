@@ -461,7 +461,8 @@
         : 'Live: set manually';
       const who = [t.live_set_by, t.live_set_at].filter(Boolean).join(', ');
       return (who ? `${why} (${who})` : why)
-        + '. Queried in your database; not offered in chats until the live query path ships.';
+        + '. Not copied, and scheduled refreshes skip it. Until the live query path ships '
+        + 'it is not offered in chats.';
     };
     const rows = TABLES.map((t) => `
       <tr data-tid="${esc(t.id)}">
@@ -840,10 +841,16 @@
   // ── Storage mode (snapshot / live) ───────────────────────────────────────
   // The size verdict comes from the server (an exact row count, or the
   // catalog estimate); the hint is display only, like the TLS badge. The
-  // server refuses a snapshot above the force threshold (LIVE_REQUIRED).
-  function _modeHintText(v) {
+  // server refuses a snapshot above the force threshold (LIVE_REQUIRED) for a
+  // new registration or a mode switch; an existing table keeps its stored
+  // mode on an edit, so its hint says so.
+  function _modeHintText(v, existing) {
     if (!v) return '';
     const n = v.cell_count != null ? Number(v.cell_count).toLocaleString() : null;
+    if (v.live_required && existing && existing.mode !== 'live') {
+      return 'Above the snapshot limit — new registrations must be live; this table '
+        + 'keeps its stored mode until you switch it.';
+    }
     if (v.live_required) {
       if (n == null) {
         return 'Counting the rows timed out: the table is treated as above the snapshot '
@@ -853,15 +860,15 @@
         + 'live mode is required.';
     }
     if (v.live_suggested && n != null) {
-      return `About ${n} cells: live mode is suggested. Live tables are queried at `
-        + 'question time instead of copied.';
+      return `About ${n} cells: live mode is suggested. A live table is not copied; `
+        + 'it is not offered in chats until the live query path ships.';
     }
     if (n == null) return 'Row count unavailable: pick Live yourself if the table is large.';
     return '';
   }
 
-  function _renderModeHint(el, v) {
-    const text = _modeHintText(v);
+  function _renderModeHint(el, v, existing) {
+    const text = _modeHintText(v, existing);
     el.textContent = text;
     el.classList.toggle('hidden', !text);
   }
@@ -880,22 +887,23 @@
     if (wizardStep === 3) renderSummary();
   }
 
-  // Pre-tick precedence: the stored doc's mode > a prefill > the verdict
-  // (required ⇒ live, with the Snapshot radio disabled).
+  // Pre-tick precedence: the stored doc's mode always wins (an edit never
+  // changes it by itself); for a new registration a prefill, then the
+  // verdict (required ⇒ live, with the Snapshot radio disabled).
   function _applyModeChoice(existing, verdict) {
     currentSizeVerdict = verdict;
     const required = !!(verdict && verdict.live_required);
     let mode = 'snapshot';
-    if (existing && existing.mode) {
+    if (existing) {
       mode = existing.mode === 'live' ? 'live' : 'snapshot';
     } else if (wizardPrefill && (wizardPrefill.mode === 'live' || wizardPrefill.mode === 'snapshot')) {
       mode = wizardPrefill.mode;
     }
-    if (required) mode = 'live';
+    if (required && !existing) mode = 'live';
     $('twModeLive').checked = mode === 'live';
     $('twModeSnapshot').checked = mode !== 'live';
-    $('twModeSnapshot').disabled = required;
-    _renderModeHint($('twModeHint'), verdict);
+    $('twModeSnapshot').disabled = required && !existing;
+    _renderModeHint($('twModeHint'), verdict, existing);
     _onModeChange();
   }
 
@@ -914,19 +922,27 @@
 
   function renderSummary() {
     if (!currentIntro) { $('twSummary').innerHTML = ''; return; }
-    const rc = currentIntro.row_count_estimate;
+    // The counted verdict wins over the catalog estimate.
+    const v = currentSizeVerdict;
+    let rc = currentIntro.row_count_estimate;
+    let rowsLabel = 'Rows (estimate)';
+    if (v && v.row_count != null) {
+      rc = v.row_count;
+      rowsLabel = v.count_source === 'count' ? 'Rows (counted)'
+        : v.count_source === 'cap' ? 'Rows (capped)' : 'Rows (estimate)';
+    }
     const connName = (CONNECTIONS.find((c) => c.id === wizardConnId) || {}).name || '';
     const described = document.querySelectorAll('#twColsBody .tw-col-desc');
     const filled = Array.from(described).filter((i) => i.value.trim()).length;
     $('twSummary').innerHTML = `
       <div class="adm-summary-row"><span>Display name</span><strong>${esc($('twDisplayName').value)}</strong></div>
       <div class="adm-summary-row"><span>Source</span><strong>${esc(connName)} · ${esc($('twSchema').value)}.${esc($('twTable').value)}</strong></div>
-      <div class="adm-summary-row"><span>Rows (estimate)</span><strong>${rc != null ? Number(rc).toLocaleString() : 'n/a'}</strong></div>
+      <div class="adm-summary-row"><span>${esc(rowsLabel)}</span><strong>${rc != null ? Number(rc).toLocaleString() : 'n/a'}</strong></div>
       <div class="adm-summary-row"><span>Column descriptions</span><strong>${filled} of ${described.length} filled</strong></div>
       <div class="adm-summary-note">${_wizardMode() === 'live'
-        ? 'Saving profiles a sample of the table; no snapshot is taken. Live tables query '
-          + 'your database on every question and are not offered in chats until the live '
-          + 'query path ships.'
+        ? 'Saving profiles a sample of the table. A live table is not copied when you save '
+          + 'it, and scheduled refreshes skip it. Until the live query path ships it is not '
+          + 'offered in chats.'
         : 'Saving takes a local snapshot now; user questions run against the snapshot.'}</div>`;
   }
 
@@ -2774,7 +2790,9 @@
     $('tableModeModal').classList.add('hidden');
     const lp = r.data.live_profile;
     const snap = r.data.snapshot;
-    if (lp && !lp.ok) {
+    if (r.data.reverted) {
+      toast(`Snapshot failed — the table stays live: ${(snap && snap.error) || 'unknown'}`, true);
+    } else if (lp && !lp.ok) {
       toast(`Now live, but profiling failed: ${lp.error || 'unknown'} — use Refresh to retry`, true);
     } else if (snap && !snap.ok) {
       toast(`Now snapshot, but the snapshot failed: ${snap.error || 'unknown'} — use Refresh to retry`, true);
