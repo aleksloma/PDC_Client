@@ -156,13 +156,20 @@ keeps the previous snapshot, so chats keep answering from it while you fix the
 connection.
 
 **Live tables.** A very large table can be marked **live** instead of being
-snapshotted. The admin panel suggests it above `LIVE_MODE_CELL_THRESHOLD`
-cells (rows x columns) and requires it above `LIVE_MODE_FORCE_THRESHOLD`. In
-this release a live table is registered and profiled from a small sample, but
-it is not yet offered in chats, and the nightly refresh still snapshots it
-unless you give it a disabled per-table schedule. Live tables will be
-queried directly in your database, so the database login must be SELECT-only, ideally on a read
-replica.
+snapshotted. The admin panel suggests it at or above
+`LIVE_MODE_CELL_THRESHOLD` cells (rows x columns) and requires it at or above
+`LIVE_MODE_FORCE_THRESHOLD`. To size a table, the register wizard runs an
+exact `SELECT COUNT(*)` against it when it loads the table's structure and
+again at save, each bounded at 60 seconds. Saving or refreshing a live table
+reads a sample of up to 10 000 rows, also bounded at 60 seconds, to profile
+it; no copy is taken. Scheduled refreshes skip live tables. Editing an
+existing table keeps its storage mode. Live tables are not yet offered in
+chats. They will be queried directly in your database, so the database login
+must be SELECT-only, ideally on a read replica, with a database-side
+statement timeout. Revoke EXECUTE from PUBLIC on functions and packages the
+login does not need (a function called inside a SELECT can have side effects
+no query guard can see). The application's own query guard and caps are a
+second line, not a replacement for that grant.
 
 ### Users and sign-in
 

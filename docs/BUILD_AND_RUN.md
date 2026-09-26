@@ -375,8 +375,13 @@ Prerequisites (client env, see `client.env.example`):
   which the wizard suggests live mode (default `50000000`).
 - `LIVE_MODE_FORCE_THRESHOLD`: size in cells at or above which a snapshot is
   refused and the table must be registered live (default `500000000`; never
-  effectively below the first value). In this release a live table is
-  registered and profiled but not yet offered in chats. See
+  effectively below the first value).
+- `LIVE_RESULT_ROW_CAP`: the most rows a live query returns (default
+  `200000`); one more is read to flag truncation.
+- `LIVE_QUERY_TIMEOUT_S`: the live query's statement timeout in seconds
+  (default `60`), capped by the connection's own statement timeout.
+- A live table is registered, profiled from a sample and skipped by
+  scheduled refreshes; it is not yet offered in chats. See
   `docs/LIVE_TABLES_PLAN.md`.
 
 Runbook:

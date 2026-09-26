@@ -4,8 +4,8 @@
 > enterprise (on-prem) edition. Adapted from the original B2C constitution
 > for the brain/client split.
 
-**Version:** 1.4 (enterprise)
-**Last Updated:** 2026-09-25
+**Version:** 1.5 (enterprise)
+**Last Updated:** 2026-09-26
 
 ---
 
@@ -292,10 +292,18 @@ client must be closed on FastAPI lifespan shutdown.
    denylist now guards what is mostly absent anyway. Alongside it: the
    dedicated SELECT-only database login the customer provisions (the grant is
    the real guarantee), plus rules 8 above
-   and the connector's SELECT-only statement gate
-   (`db_connector._assert_single_select`; no route accepts free SQL —
-   relation discovery's "Analyze SQL" box PARSES pasted SQL, it never
-   executes it).
+   and the connector's read-only statement gate. Free-form SELECT text is
+   accepted only through `db_connector.assert_read_only_query`: a regex
+   layer plus a sqlglot parse under the connection's dialect. The
+   connector's own snapshot/preview/count statements are checked strictly
+   without CTEs, and a parse failure there only warns, because the statement
+   is built by the connector itself; live queries are parsed strictly and
+   may use CTEs. A live query is capped by `wrap_with_row_limit` and
+   executed only in the main application by `run_live_select`, under
+   `LIVE_RESULT_ROW_CAP` and `LIVE_QUERY_TIMEOUT_S` — never in the sandbox;
+   its SQL text is never logged, only a hash. No route accepts free SQL
+   from a browser — relation discovery's "Analyze SQL" box PARSES pasted
+   SQL, it never executes it.
 10. **Admin-pasted SQL never leaves this client.** The relation-discovery
    "Analyze SQL" box (`relation_discovery.py`) parses pasted SELECT
    statements in memory only: the SQL TEXT is never persisted, logged,
@@ -660,6 +668,7 @@ To modify this constitution:
 | Logging      | Escape any text you did not write (`log_safe_text`) — message, context values and the sid. Never log a data value at all. |
 | Resources    | `atexit` for executors; close HTTP clients on lifespan shutdown.          |
 | Security     | Secrets in env only. Never commit `.env`. Brain holds the Gemini key.     |
+| SQL          | Free SELECT only through `assert_read_only_query`, capped by `wrap_with_row_limit`, run by `run_live_select` in the main app (never the sandbox), SQL logged as a hash only. The SELECT-only DB grant is the real guarantee. |
 | Deploy       | Brain → enterprise GCP. Client → customer LAN. Two independent images.    |
 | Docs         | Five required docs under `docs/`. Fix contradictions in the same PR.      |
 | Exec dtypes  | Sandbox sees standard dtypes only. `sanitize_for_execution` is the gate.  |
