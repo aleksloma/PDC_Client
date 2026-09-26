@@ -254,6 +254,12 @@ class Settings(BaseModel):
     # the boot.
     LIVE_MODE_CELL_THRESHOLD: int = Field(default_factory=lambda: _int_env("LIVE_MODE_CELL_THRESHOLD", 50_000_000, 1))
     LIVE_MODE_FORCE_THRESHOLD: int = Field(default_factory=lambda: _int_env("LIVE_MODE_FORCE_THRESHOLD", 500_000_000, 1))
+    # A live query (`db_connector.run_live_select`) returns at most
+    # LIVE_RESULT_ROW_CAP rows (one more is read to flag truncation) and runs
+    # under a statement timeout of at most LIVE_QUERY_TIMEOUT_S seconds (the
+    # connection's own timeout wins when lower).
+    LIVE_RESULT_ROW_CAP: int = Field(default_factory=lambda: _int_env("LIVE_RESULT_ROW_CAP", 200_000, 1))
+    LIVE_QUERY_TIMEOUT_S: int = Field(default_factory=lambda: _int_env("LIVE_QUERY_TIMEOUT_S", 60, 1))
 
     # Nightly snapshot refresh (container-local time; the admin UI value in
     # data_sources.json wins once set — these are first-boot defaults only).

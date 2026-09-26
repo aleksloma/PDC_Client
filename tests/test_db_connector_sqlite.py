@@ -195,11 +195,14 @@ def test_assert_single_select_rejects_dml_in_where(sqlite_cfg, tmp_path, bad):
 ])
 def test_assert_single_select_rejects(bad_sql):
     with pytest.raises(ValueError):
-        db_connector._assert_single_select(bad_sql)
+        db_connector.assert_read_only_query(bad_sql, allow_cte=False,
+                                            strict_parse=True)
 
 
 def test_assert_single_select_allows_plain_select():
-    db_connector._assert_single_select('SELECT "a", "b" FROM "s"."t" WHERE "a" > 1')
+    db_connector.assert_read_only_query(
+        'SELECT "a", "b" FROM "s"."t" WHERE "a" > 1', allow_cte=False,
+        strict_parse=True)
 
 
 def test_snapshot_failure_keeps_previous_snapshot(sqlite_cfg, tmp_path):
@@ -871,6 +874,30 @@ def test_count_rows_explicit_timeout_and_a_lower_connection_bound(sqlite_cfg,
     low = dict(sqlite_cfg, statement_timeout=10)
     db_connector.count_rows(low, "", None, "orders", sid="t")
     assert seen[-1]["statement_timeout"] == 10
+
+
+def test_sample_rows_caps_the_statement_timeout(sqlite_cfg, monkeypatch):
+    """The sample runs behind an interactive click (live registration, the
+    switch to live, Refresh now): like the count, the engine is built from a
+    cfg copy whose statement_timeout is capped, and the dialect's session
+    timeout is applied with the same bound."""
+    import dataclasses
+    monkeypatch.setattr(db_connector.settings, "DB_STATEMENT_TIMEOUT", 300)
+    applied = []
+    monkeypatch.setitem(
+        db_connector.DIALECTS, "sqlite",
+        dataclasses.replace(db_connector.DIALECTS["sqlite"],
+                            apply_stmt_timeout=lambda conn, s: applied.append(s)))
+    seen = _engine_spy(monkeypatch)
+    assert db_connector.sample_rows(sqlite_cfg, "", None, "orders", sid="t")["ok"]
+    cap = db_connector.COUNT_TIMEOUT_CAP_S
+    assert seen and seen[-1]["statement_timeout"] == cap
+    assert applied and applied[-1] == cap
+    assert "statement_timeout" not in sqlite_cfg      # caller's cfg untouched
+    low = dict(sqlite_cfg, statement_timeout=10)
+    assert db_connector.sample_rows(low, "", None, "orders", sid="t")["ok"]
+    assert seen[-1]["statement_timeout"] == 10
+    assert applied[-1] == 10
 
 
 def test_sample_rows_returns_a_bounded_frame(sqlite_cfg):

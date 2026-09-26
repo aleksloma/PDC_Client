@@ -31,9 +31,11 @@ point; the dialect decides at compile time what it means. Never inferred,
 never an Oracle-only branch.
 
 Security invariants (docs/AI_CONSTITUTION.md Article VII + DB_TABLES_PLAN):
-  - This module only ever issues SELECT / introspection statements. There is
-    no code path that accepts free-form SQL; `_assert_single_select` guards
-    the one assembled statement (snapshot SELECT + optional admin WHERE).
+  - This module only ever issues SELECT / introspection statements.
+    `assert_read_only_query` is the one read-only gate: the connector's own
+    constructs pass it through `_compiled_sql` (no CTE, a parser gap only
+    warns), and free-form SELECT text is executed only by `run_live_select`
+    (CTE allowed, strict parse), inside the `wrap_with_row_limit` cap.
   - Credentials arrive as function arguments, are embedded via
     `sqlalchemy.engine.URL.create` (whose str()/repr() masks the password),
     and never touch module scope, logs, or brain payloads. Driver exception
@@ -47,6 +49,7 @@ ParquetWriter); it is never offered in the admin UI.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 import re
@@ -97,6 +100,9 @@ class Dialect:
     plaintext_port: Optional[int] = None
     # The admin form pre-ticks SSL for a NEW connection of this dialect.
     ssl_default: bool = False
+    # sqlglot's name for this dialect — the read-only guard parses with it.
+    # Not part of `list_dialects()`.
+    sqlglot_dialect: Optional[str] = None
 
     def available(self) -> tuple[bool, Optional[str]]:
         if importlib.util.find_spec(self.driver_module) is None:
@@ -276,7 +282,7 @@ def _clickhouse_query_args(cfg: dict) -> dict:
 
 DIALECTS: dict[str, Dialect] = {d.key: d for d in [
     Dialect(
-        key="postgresql", label="PostgreSQL",
+        key="postgresql", sqlglot_dialect="postgres", label="PostgreSQL",
         drivername="postgresql+psycopg2", driver_module="psycopg2",
         default_port=5432, needs=("database",),
         supports_schemas=True, select1_sql="SELECT 1",
@@ -288,7 +294,7 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
                         "format('%I.%I', CAST(:schema AS text), CAST(:table AS text)))"),
     ),
     Dialect(
-        key="mysql", label="MySQL",
+        key="mysql", sqlglot_dialect="mysql", label="MySQL",
         drivername="mysql+pymysql", driver_module="pymysql",
         default_port=3306, needs=("database",),
         supports_schemas=False, select1_sql="SELECT 1",
@@ -299,7 +305,7 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
                         "WHERE table_schema = :schema AND table_name = :table"),
     ),
     Dialect(
-        key="mariadb", label="MariaDB",
+        key="mariadb", sqlglot_dialect="mysql", label="MariaDB",
         drivername="mysql+pymysql", driver_module="pymysql",
         default_port=3306, needs=("database",),
         supports_schemas=False, select1_sql="SELECT 1",
@@ -310,7 +316,7 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
                         "WHERE table_schema = :schema AND table_name = :table"),
     ),
     Dialect(
-        key="mssql", label="Microsoft SQL Server",
+        key="mssql", sqlglot_dialect="tsql", label="Microsoft SQL Server",
         drivername="mssql+pyodbc", driver_module="pyodbc",
         default_port=1433, needs=("database",),
         supports_schemas=True, select1_sql="SELECT 1",
@@ -326,7 +332,7 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
                         "WHERE s.name = :schema AND o.name = :table"),
     ),
     Dialect(
-        key="oracle", label="Oracle",
+        key="oracle", sqlglot_dialect="oracle", label="Oracle",
         drivername="oracle+oracledb", driver_module="oracledb",
         default_port=1521, needs=("service_name",),
         supports_schemas=True, select1_sql="SELECT 1 FROM DUAL",
@@ -338,7 +344,7 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
                         "WHERE owner = :schema AND segment_name = :table"),
     ),
     Dialect(
-        key="clickhouse", label="ClickHouse",
+        key="clickhouse", sqlglot_dialect="clickhouse", label="ClickHouse",
         drivername="clickhouse+native", driver_module="clickhouse_driver",
         # A new connection is offered the TLS port with SSL ticked; 9000 is
         # the plaintext port, kept so a blank-port row with SSL off still
@@ -365,7 +371,7 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
     # Hidden test-only entry: the offline pytest suite drives the SAME code
     # path through in-process SQLite. Never offered in the admin UI.
     Dialect(
-        key="sqlite", label="SQLite (tests only)",
+        key="sqlite", sqlglot_dialect="sqlite", label="SQLite (tests only)",
         drivername="sqlite+pysqlite", driver_module="sqlite3",
         default_port=None, needs=(),
         supports_schemas=False, select1_sql="SELECT 1",
@@ -462,23 +468,364 @@ _FORBIDDEN_TOKENS = re.compile(
 
 
 def _strip_sql_comments(sql: str) -> str:
-    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
-    sql = re.sub(r"--[^\n]*", " ", sql)
-    return sql
+    """Remove `--` line comments and `/* */` block comments (optimizer hints
+    `/*+ */` included), each replaced by one space, in ONE left-to-right scan
+    that copies quoted text verbatim: single-quoted strings, double-quoted,
+    backtick and [bracket] identifiers (a doubled closing character is an
+    escape inside them). A comment marker inside quotes is text, not a
+    comment. An unterminated quote or block comment runs to the end."""
+    out = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        c = sql[i]
+        if c in "'\"`[":
+            close = "]" if c == "[" else c
+            j = i + 1
+            while j < n:
+                if sql[j] == close:
+                    if j + 1 < n and sql[j + 1] == close:
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            out.append(sql[i:j])
+            i = j
+        elif sql.startswith("--", i):
+            j = sql.find("\n", i)
+            out.append(" ")
+            i = n if j == -1 else j
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            out.append(" ")
+            i = n if j == -1 else j + 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 
-def _assert_single_select(sql: str) -> None:
-    """The connector's SELECT-only guard: single statement, starts with
-    SELECT, no DML/DDL tokens, no chained statements, no CTE (Phase 1)."""
+_MSG_ONLY_SELECT = "Only SELECT statements are permitted."
+_MSG_MULTIPLE = "Multiple SQL statements are not permitted."
+_MSG_CTE = "CTEs are not permitted."
+_MSG_UNPARSEABLE = "SQL could not be parsed."
+
+# Functions no read-only query needs: sleeps and delays; file, network,
+# mail, directory and shell access; Java and XML primitives that reach a URL
+# or run a nested query; remote-server links; ClickHouse table functions that
+# read outside the connection (object stores, HDFS, other databases, lake
+# formats); advisory and named locks, sequence writers and file stat. Matched
+# lowercased against a function's own name AND against every part of a dotted
+# qualifier (`dbms_lock.sleep`, `utl_http.request`); a name that STARTS with
+# one of `_DENIED_FUNCTION_PREFIXES` is refused too (every dblink variant,
+# every ClickHouse iceberg / deltaLake / hudi table function). No prefix rule
+# for `url` or `file`: ClickHouse's URLHash, URLHierarchy and
+# filesystemAvailable are ordinary read-only functions.
+_DENIED_FUNCTIONS = frozenset({
+    "pg_sleep", "pg_sleep_for", "pg_sleep_until", "sleep", "benchmark",
+    "waitfor", "xp_cmdshell", "xp_regread", "xp_dirtree", "sp_executesql",
+    "openrowset", "opendatasource", "openquery", "load_file", "sys_eval",
+    "sys_exec", "pg_read_file", "pg_read_binary_file", "pg_ls_dir",
+    "pg_terminate_backend", "pg_cancel_backend", "lo_import", "lo_export",
+    "utl_http", "utl_file", "utl_inaddr", "dbms_lock", "dbms_pipe",
+    "dbms_scheduler", "dbms_sql", "dbms_xmlgen", "file", "url", "s3",
+    "remote", "remotesecure", "mysql", "postgresql", "odbc", "jdbc",
+    "executable", "input",
+    "httpuritype", "utl_tcp", "utl_smtp", "utl_mail", "dbms_ldap",
+    "dbms_java", "dbms_advisor", "dbms_xslprocessor", "extractvalue",
+    "xmltype",
+    "s3cluster", "hdfs", "hdfscluster", "azureblobstorage", "gcs",
+    "urlcluster", "mongodb", "redis", "sqlite", "filecluster",
+    "azureblobstoragecluster", "oss", "cosn", "sleepeachrow",
+    "pg_advisory_lock", "pg_advisory_xact_lock", "pg_advisory_lock_shared",
+    "pg_advisory_xact_lock_shared", "pg_try_advisory_lock",
+    "pg_try_advisory_xact_lock", "pg_try_advisory_lock_shared",
+    "pg_try_advisory_xact_lock_shared", "nextval", "setval", "pg_stat_file",
+    "get_lock", "bfilename",
+    "query_to_xml", "query_to_xmlschema",
+    "query_to_xml_and_xmlschema", "cursor_to_xml", "cursor_to_xmlschema",
+    "table_to_xml",
+})
+
+_DENIED_FUNCTION_PREFIXES = ("dblink", "iceberg", "deltalake", "hudi")
+
+# T-SQL table-hint keywords. Written without WITH, `t (NOLOCK)` parses as a
+# table function and `t AS x (TABLOCKX)` as an alias column list.
+_TSQL_TABLE_HINTS = frozenset({
+    "NOLOCK", "READUNCOMMITTED", "READCOMMITTED", "READCOMMITTEDLOCK",
+    "REPEATABLEREAD", "SERIALIZABLE", "SNAPSHOT", "READPAST", "ROWLOCK",
+    "PAGLOCK", "TABLOCK", "TABLOCKX", "UPDLOCK", "XLOCK", "HOLDLOCK",
+    "NOWAIT", "NOEXPAND", "FORCESEEK", "FORCESCAN", "INDEX", "KEEPIDENTITY",
+    "KEEPDEFAULTS", "IGNORE_CONSTRAINTS", "IGNORE_TRIGGERS",
+})
+
+# T-SQL command words. SQL Server ends a statement at one of these without a
+# semicolon, while the parser reads it as a bare alias (`SELECT 1 SHUTDOWN`).
+_TSQL_COMMAND_WORDS = frozenset({
+    "SHUTDOWN", "CHECKPOINT", "RECONFIGURE", "KILL", "BACKUP", "RESTORE",
+    "DBCC", "WAITFOR", "EXEC", "EXECUTE", "USE", "GO", "DENY", "REVERT",
+    "SETUSER", "BULK", "RAISERROR", "PRINT", "THROW", "DECLARE", "OPEN",
+    "FETCH", "CLOSE", "DEALLOCATE",
+})
+
+# sqlglot node classes that are statements of their own (resolved on
+# `sqlglot.exp` at call time — sqlglot is imported function-locally).
+_STATEMENT_NODE_NAMES = (
+    "Command", "Insert", "Update", "Delete", "Merge", "Create", "Drop",
+    "Alter", "Execute", "Copy", "LoadData", "Set", "Transaction", "Pragma",
+    "Commit", "Rollback", "Use", "Grant", "Revoke", "TruncateTable", "Show",
+    "Describe",
+)
+
+
+def _registry_dialect(dialect) -> Optional[Dialect]:
+    """The registry entry for a registry key, a `Dialect`, or a SQLAlchemy
+    dialect object (its `.name`). None when there is none."""
+    if dialect is None:
+        return None
+    if isinstance(dialect, Dialect):
+        return dialect
+    name = dialect if isinstance(dialect, str) else getattr(dialect, "name", None)
+    if not isinstance(name, str):
+        return None
+    return DIALECTS.get(name.strip().lower())
+
+
+def _sqlglot_read(dialect) -> Optional[str]:
+    """sqlglot's dialect name for `dialect`; None = sqlglot's generic parser."""
+    d = _registry_dialect(dialect)
+    return d.sqlglot_dialect if d is not None else None
+
+
+def _assert_regex_layer(sql: str, allow_cte: bool) -> None:
+    """The original text checks, on the comment-stripped text: the anchor, no
+    chained statements, no CTE unless allowed, no DML/DDL tokens."""
     stripped = _strip_sql_comments(sql).strip()
-    if not re.match(r"^SELECT\b", stripped, re.IGNORECASE):
-        raise ValueError("Only SELECT statements are permitted.")
+    if not allow_cte and re.match(r"^WITH\b", stripped, re.IGNORECASE):
+        raise ValueError(_MSG_CTE)
+    anchor = r"^(SELECT|WITH)\b" if allow_cte else r"^SELECT\b"
+    if not re.match(anchor, stripped, re.IGNORECASE):
+        raise ValueError(_MSG_ONLY_SELECT)
     if ";" in stripped.rstrip().rstrip(";"):
-        raise ValueError("Multiple SQL statements are not permitted.")
-    if re.match(r"^WITH\b", stripped, re.IGNORECASE):
-        raise ValueError("CTEs are not permitted.")
+        raise ValueError(_MSG_MULTIPLE)
     if _FORBIDDEN_TOKENS.search(stripped):
-        raise ValueError("Only SELECT statements are permitted.")
+        raise ValueError(_MSG_ONLY_SELECT)
+
+
+def _function_names(node, exp) -> list:
+    """Lowercased names a function node answers to: its own name plus every
+    identifier of a dotted qualifier around it."""
+    own = node.name if isinstance(node, exp.Anonymous) else node.sql_name()
+    names = [str(own or "").lower()]
+    parent = node.parent
+    if isinstance(parent, exp.Dot) and parent.expression is node:
+        qualifier = parent.this
+        if qualifier is not None:
+            if isinstance(qualifier, exp.Identifier):
+                names.append(str(qualifier.name).lower())
+            for ident in qualifier.find_all(exp.Identifier):
+                names.append(str(ident.name).lower())
+    return names
+
+
+def _is_denied_function(name: str) -> bool:
+    return name in _DENIED_FUNCTIONS or name.startswith(_DENIED_FUNCTION_PREFIXES)
+
+
+def _tsql_hint_without_with(node, exp) -> bool:
+    """True for a T-SQL table hint written without WITH: `t (NOLOCK)` (read
+    as a table function whose arguments are bare hint keywords) or a column
+    list on a plain table's alias (`t AS x (TABLOCKX)`) — on a plain table
+    such a list can only be hints."""
+    target = node.this
+    if isinstance(target, exp.Anonymous):
+        for arg in target.expressions:
+            if isinstance(arg, (exp.Column, exp.Identifier)) and                     str(arg.name).upper() in _TSQL_TABLE_HINTS:
+                return True
+    alias = node.args.get("alias")
+    if isinstance(target, exp.Identifier) and isinstance(alias, exp.TableAlias)             and alias.args.get("columns"):
+        return True
+    return False
+
+
+def _tsql_command_alias(node, exp) -> bool:
+    """True for an unquoted alias spelled like a T-SQL command word."""
+    if isinstance(node, exp.Alias):
+        ident = node.args.get("alias")
+    elif isinstance(node, exp.TableAlias):
+        ident = node.this
+    else:
+        return False
+    return isinstance(ident, exp.Identifier) and not ident.quoted and         str(ident.name).upper() in _TSQL_COMMAND_WORDS
+
+
+def _assert_parse_layer(statements: list, allow_cte: bool,
+                        allowed_schemas, exp, read=None) -> None:
+    """Refuse whatever the parsed statement list shows to be not read-only."""
+    statements = [s for s in statements if s is not None]
+    if not statements:
+        raise ValueError(_MSG_ONLY_SELECT)
+    if len(statements) != 1:
+        raise ValueError(_MSG_MULTIPLE)
+    root = statements[0]
+    if not isinstance(root, (exp.Select, exp.SetOperation)):
+        raise ValueError(_MSG_ONLY_SELECT)
+    statement_classes = tuple(getattr(exp, n) for n in _STATEMENT_NODE_NAMES)
+    if root.args.get("into") is not None:
+        raise ValueError("SELECT ... INTO is not permitted.")
+    if root.args.get("locks"):
+        raise ValueError("Row locks are not permitted.")
+    schemas = None
+    if allowed_schemas:
+        schemas = {str(s).strip().lower() for s in allowed_schemas}
+    tsql = read == "tsql"
+    for node in root.walk():
+        if isinstance(node, statement_classes):
+            raise ValueError(_MSG_ONLY_SELECT)
+        if isinstance(node, exp.With) and not allow_cte:
+            raise ValueError(_MSG_CTE)
+        if isinstance(node, exp.Into):
+            raise ValueError("SELECT ... INTO is not permitted.")
+        if isinstance(node, exp.Lock):
+            raise ValueError("Row locks are not permitted.")
+        if isinstance(node, exp.WithTableHint):
+            # T-SQL table hints (TABLOCKX, HOLDLOCK, UPDLOCK, ...) take locks.
+            raise ValueError("Table hints are not permitted.")
+        if tsql and isinstance(node, exp.Table) and                 _tsql_hint_without_with(node, exp):
+            raise ValueError("Table hints are not permitted.")
+        if tsql and _tsql_command_alias(node, exp):
+            raise ValueError(_MSG_ONLY_SELECT)
+        if isinstance(node, (exp.Select, exp.SetOperation)) and \
+                node.args.get("settings"):
+            # ClickHouse query-level SETTINGS override server limits.
+            raise ValueError("Query settings are not permitted.")
+        if isinstance(node, exp.Func):
+            for name in _function_names(node, exp):
+                if _is_denied_function(name):
+                    raise ValueError(f"Function '{name}' is not permitted.")
+        if schemas is not None and isinstance(node, exp.Table):
+            catalog = node.catalog
+            if catalog:
+                raise ValueError(f"Schema '{catalog}' is not permitted.")
+            db = node.db
+            if db and db.lower() not in schemas:
+                raise ValueError(f"Schema '{db}' is not permitted.")
+
+
+def assert_read_only_query(sql: str, *, allow_cte: bool, strict_parse: bool,
+                           dialect=None, allowed_schemas=None) -> None:
+    """The read-only SQL gate. Raises ValueError on refusal; the message may
+    name an identifier (a function, a schema), never the SQL text.
+
+    Two independent layers, in this order:
+
+    1. The regex layer on the comment-stripped text: starts with SELECT (or
+       WITH when `allow_cte`), no chained statement, no CTE unless allowed,
+       no DML/DDL token.
+    2. A sqlglot parse of the ORIGINAL text under `dialect` (a registry key,
+       a `Dialect` or a SQLAlchemy dialect object; unknown = the generic
+       parser). Refused: anything but exactly one statement; a root that is
+       not a SELECT or a set operation (UNION / INTERSECT / EXCEPT); a
+       statement node anywhere in the tree; a CTE when not `allow_cte`;
+       `SELECT ... INTO`; row locks and T-SQL table hints (with or without
+       WITH); on T-SQL, an unquoted alias spelled like a command word
+       (`SELECT 1 SHUTDOWN`); ClickHouse query-level SETTINGS; a function in
+       `_DENIED_FUNCTIONS` or starting with a `_DENIED_FUNCTION_PREFIXES`
+       entry; and,
+       only when `allowed_schemas` is a non-empty collection, a table whose
+       schema is not in it (case-insensitive) or that names a catalog.
+       Without a schema list a UNION to a system catalog passes — the
+       SELECT-only database login is the guarantee there.
+
+    `strict_parse=True` (free-form live queries) refuses text sqlglot cannot
+    parse. `strict_parse=False` (the connector's own constructs) logs one
+    `SQL_GUARD_PARSE_WARN` line (dialect + exception type, never the SQL) and
+    leaves the verdict to the regex layer, so a parser gap on one dialect
+    cannot stop a snapshot. Anything the parse DOES show refuses in both modes."""
+    if not isinstance(sql, str):
+        raise ValueError(_MSG_ONLY_SELECT)
+    _assert_regex_layer(sql, allow_cte)
+    read = _sqlglot_read(dialect)
+    try:
+        import sqlglot
+        from sqlglot import exp
+        statements = sqlglot.parse(sql, read=read)
+    except Exception as e:
+        if strict_parse:
+            raise ValueError(_MSG_UNPARSEABLE) from None
+        from exec_transport import log_safe_text
+        log_with_sid("db", "warning",
+                     f"SQL_GUARD_PARSE_WARN dialect={log_safe_text(read or 'generic')} "
+                     f"error={log_safe_text(type(e).__name__)}")
+        return
+    _assert_parse_layer(statements, allow_cte, allowed_schemas, exp, read)
+
+
+def _live_inner(sql: str) -> str:
+    """The text a live query runs: comments stripped, trailing whitespace and
+    semicolons removed."""
+    inner = _strip_sql_comments(sql).strip()
+    while inner.endswith(";"):
+        inner = inner[:-1].rstrip()
+    return inner
+
+
+def _mssql_needs_offset(inner: str) -> bool:
+    """True when the inner query (a SELECT or a set operation) has a
+    top-level ORDER BY and neither TOP / LIMIT, OFFSET nor FETCH — SQL Server refuses such an ORDER BY inside a
+    derived table unless `OFFSET 0 ROWS` follows it. A window's ORDER BY is
+    not top-level. An unparseable inner is left as it is."""
+    try:
+        import sqlglot
+        from sqlglot import exp
+        root = sqlglot.parse_one(inner, read="tsql")
+    except Exception as e:
+        from exec_transport import log_safe_text
+        log_with_sid("db", "warning",
+                     f"LIVE_WRAP_PARSE_WARN error={log_safe_text(type(e).__name__)}")
+        return False
+    # A trailing ORDER BY of a set operation sits on the operation or, as
+    # T-SQL parses it, on its last unparenthesized SELECT.
+    node = root
+    while isinstance(node, exp.SetOperation) and not node.args.get("order"):
+        node = node.expression
+    if not isinstance(node, (exp.Select, exp.SetOperation)) or \
+            not node.args.get("order"):
+        return False
+    return not any(node.args.get(k) for k in ("limit", "offset", "fetch"))
+
+
+def wrap_with_row_limit(sql: str, dialect, n: int) -> str:
+    """Wrap a SELECT as a derived table under the dialect's outer row limit,
+    so a LIMIT / TOP inside it can never exceed `n`. The inner text is kept
+    VERBATIM (comments stripped, trailing `;` removed) — never re-rendered,
+    which could alter dialect-specific syntax.
+
+      postgresql / mysql / mariadb / clickhouse / sqlite:
+          SELECT * FROM (<inner>) AS pdc_q LIMIT n
+      mssql:  SELECT TOP n * FROM (<inner>) AS pdc_q
+              (` OFFSET 0 ROWS` appended to an inner top-level ORDER BY)
+      oracle: SELECT * FROM (<inner>) pdc_q FETCH FIRST n ROWS ONLY
+              (no AS on the alias; 12c and later)
+
+    Raises ValueError for a non-positive or non-int `n` or an unknown
+    dialect."""
+    if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
+        raise ValueError("The row cap must be a positive integer.")
+    d = _registry_dialect(dialect)
+    if d is None:
+        raise ValueError("Unknown database type for the row limit.")
+    inner = _live_inner(sql if isinstance(sql, str) else "")
+    if d.key == "mssql":
+        if _mssql_needs_offset(inner):
+            inner = f"{inner} OFFSET 0 ROWS"
+        return f"SELECT TOP {n} * FROM ({inner}) AS pdc_q"
+    if d.key == "oracle":
+        return f"SELECT * FROM ({inner}) pdc_q FETCH FIRST {n} ROWS ONLY"
+    if d.key in ("postgresql", "mysql", "mariadb", "clickhouse", "sqlite"):
+        return f"SELECT * FROM ({inner}) AS pdc_q LIMIT {n}"
+    raise ValueError("Unknown database type for the row limit.")
 
 
 def build_url(cfg: dict, password: str):
@@ -605,10 +952,12 @@ def _compiled_sql(stmt, dialect) -> str:
     """Render a construct through the SELECT-only gate and return the SQL.
     Compiled against the LIVE dialect (post-connect, so Oracle's limit syntax
     matches the real server version) with literal binds, so
-    `_assert_single_select` sees exactly what will run."""
+    `assert_read_only_query` (no CTE; a parser gap only warns) sees exactly
+    what will run."""
     sql = str(stmt.compile(dialect=dialect,
                            compile_kwargs={"literal_binds": True}))
-    _assert_single_select(sql)
+    assert_read_only_query(sql, allow_cte=False, strict_parse=False,
+                           dialect=dialect)
     return sql
 
 
@@ -989,20 +1338,26 @@ def sample_rows(cfg: dict, password: str, schema: Optional[str], table: str,
                 limit: Optional[int] = None, sid: str) -> dict:
     """A bounded sample of the table as a raw DataFrame — the `preview_rows`
     twin used to profile a live table (no parquet is written). The dialect
-    renders the row limit (`_select_stmt(row_cap=...)`); the statement
-    timeout applies as on every read. Values feed only the local profile and
-    technical descriptions — never the brain, never a log line.
+    renders the row limit (`_select_stmt(row_cap=...)`). The sample runs
+    behind an interactive click, so — like `count_rows` — the statement
+    timeout is the connection's capped at `COUNT_TIMEOUT_CAP_S`, put into a
+    COPY of the cfg the engine is built from and applied to the session.
+    Values feed only the local profile and technical descriptions — never the
+    brain, never a log line.
 
     Returns {ok, df, error}. Never raises (Article IV)."""
     engine = None
     try:
         d = get_dialect(cfg.get("db_type"))
         limit = int(limit or LIVE_PROFILE_SAMPLE_ROWS)
+        bound = max(1, min(int(cfg.get("statement_timeout")
+                               or settings.DB_STATEMENT_TIMEOUT),
+                           COUNT_TIMEOUT_CAP_S))
         stmt = _select_stmt(schema, table, columns=columns, where=where,
                             row_cap=limit)
-        engine = get_engine(cfg, password)
+        engine = get_engine({**cfg, "statement_timeout": bound}, password)
         with engine.connect() as conn:
-            d.apply_stmt_timeout(conn, int(cfg.get("statement_timeout") or settings.DB_STATEMENT_TIMEOUT))
+            d.apply_stmt_timeout(conn, bound)
             _compiled_sql(stmt, conn.dialect)
             df = pd.read_sql(stmt, conn)
         return {"ok": True, "df": df.head(limit), "error": None}
@@ -1019,6 +1374,139 @@ def sample_rows(cfg: dict, password: str, schema: Optional[str], table: str,
                 engine.dispose()
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Live queries (free-form SELECT text)
+# ---------------------------------------------------------------------------
+
+# A colon SQLAlchemy's `text()` would read as a bind parameter: not preceded
+# by a colon, a backslash or a word character, and followed by a word
+# character. `::int` casts, `'10:30'` and an already escaped `\:` do not
+# match; `':x'` does and becomes `'\:x'`, which `text()` sends as `:x`.
+_BIND_COLON = re.compile(r"(?<![:\\\w]):(?=\w)")
+_LIVE_READ_CHUNK_ROWS = 50_000
+
+
+def run_live_select(cfg: dict, password: str, sql: str, *, dialect=None,
+                    row_cap: Optional[int] = None,
+                    timeout_s: Optional[int] = None, sid: str) -> dict:
+    """Run one free-form SELECT against a live table's connection.
+
+    The text passes `assert_read_only_query` (CTE allowed, strict parse) —
+    both as given and as it will run, comments stripped — then
+    `wrap_with_row_limit` at `row_cap + 1` (default
+    `settings.LIVE_RESULT_ROW_CAP`); reading stops at that row and
+    `truncated` says whether it was reached. The statement timeout is
+    min(the connection's, `timeout_s` or `settings.LIVE_QUERY_TIMEOUT_S`),
+    put into a COPY of the cfg the engine is built from and applied to the
+    session. `dialect` defaults to the connection's; a different one is an
+    error.
+
+    Logs carry a hash of the SQL, row counts, timings and an exception TYPE —
+    never the SQL text and never a driver message (both can quote literals).
+
+    Returns {ok, df, truncated, rows, elapsed_ms, timed_out, error}, plus
+    `guard: True` when the guard refused the text (no engine is built then).
+    Never raises (Article IV)."""
+    t0 = time.monotonic()
+    raw = sql if isinstance(sql, str) else ""
+    sql_hash = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16]
+    from exec_transport import log_safe_text
+    log_sid = log_safe_text(str(sid))
+    engine = None
+    rows_iter = None
+
+    def _elapsed() -> int:
+        return int((time.monotonic() - t0) * 1000)
+
+    def _fail(error: str, *, timed_out: bool = False, guard: bool = False) -> dict:
+        out = {"ok": False, "df": None, "truncated": False, "rows": 0,
+               "elapsed_ms": _elapsed(), "timed_out": timed_out,
+               "error": error}
+        if guard:
+            out["guard"] = True
+        return out
+
+    try:
+        from sqlalchemy import text
+        d = get_dialect(cfg.get("db_type"))
+        if dialect is not None:
+            wanted = _registry_dialect(dialect)
+            if wanted is None or wanted.key != d.key:
+                log_with_sid(log_sid, "warning",
+                             f"LIVE_QUERY_REJECTED sql_hash={sql_hash} "
+                             f"reason=dialect_mismatch")
+                return _fail("The query dialect does not match the connection.")
+        cap = max(1, int(row_cap or settings.LIVE_RESULT_ROW_CAP))
+        try:
+            assert_read_only_query(sql, allow_cte=True, strict_parse=True,
+                                   dialect=d)
+            assert_read_only_query(_live_inner(raw), allow_cte=True,
+                                   strict_parse=True, dialect=d)
+        except ValueError as ge:
+            log_with_sid(log_sid, "warning",
+                         f"LIVE_QUERY_REJECTED sql_hash={sql_hash} "
+                         f"reason={log_safe_text(str(ge))}")
+            return _fail(str(ge), guard=True)
+        wrapped = wrap_with_row_limit(raw, d.key, cap + 1)
+        bound = max(1, min(int(cfg.get("statement_timeout")
+                               or settings.DB_STATEMENT_TIMEOUT),
+                           int(timeout_s or settings.LIVE_QUERY_TIMEOUT_S)))
+        clause = text(_BIND_COLON.sub(r"\\:", wrapped))
+        engine = get_engine({**cfg, "statement_timeout": bound}, password)
+        frames = []
+        read = 0
+        with engine.connect() as conn:
+            d.apply_stmt_timeout(conn, bound)
+            rows_iter = pd.read_sql(clause, conn,
+                                    chunksize=min(cap + 1, _LIVE_READ_CHUNK_ROWS))
+            for chunk in rows_iter:
+                chunk.columns = [str(c) for c in chunk.columns]
+                frames.append(chunk)
+                read += len(chunk)
+                if read > cap:
+                    break
+            close = getattr(rows_iter, "close", None)
+            rows_iter = None
+            if callable(close):
+                close()
+        df = (pd.concat(frames, ignore_index=True) if frames
+              else pd.DataFrame())
+        truncated = read > cap
+        if truncated:
+            df = df.head(cap).reset_index(drop=True)
+        elapsed = _elapsed()
+        log_with_sid(log_sid, "info",
+                     f"LIVE_QUERY_OK sql_hash={sql_hash} rows={len(df)} "
+                     f"truncated={truncated} elapsed_ms={elapsed}")
+        return {"ok": True, "df": df, "truncated": truncated, "rows": len(df),
+                "elapsed_ms": elapsed, "timed_out": False, "error": None}
+    except Exception as e:
+        timed_out = _is_timeout(e)
+        err = _friendly_db_error(e, "The live query timed out.", password)
+        log_with_sid(log_sid, "warning",
+                     f"LIVE_QUERY_ERROR sql_hash={sql_hash} "
+                     f"error_type={log_safe_text(type(e).__name__)} "
+                     f"timed_out={timed_out} elapsed_ms={_elapsed()}")
+        return _fail(err or "The live query failed.", timed_out=timed_out)
+    finally:
+        if rows_iter is not None:
+            close = getattr(rows_iter, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as ce:
+                    log_with_sid(log_sid, "warning",
+                                 f"LIVE_QUERY_READER_CLOSE_FAILED sql_hash={sql_hash} "
+                                 f"error={log_safe_text(type(ce).__name__)}")
+        if engine is not None:
+            try:
+                engine.dispose()
+            except Exception as de:
+                log_with_sid(log_sid, "warning",
+                             f"LIVE_QUERY_DISPOSE_FAILED sql_hash={sql_hash} "
+                             f"error={log_safe_text(type(de).__name__)}")
 
 
 FINGERPRINT_MAX_NUMERIC = 4
