@@ -751,10 +751,10 @@ async def api_db_tables(request: Request):
         # Off the event loop: the registry read is disk I/O (a network round
         # trip per syscall on the GCS-fuse-mounted demo volume).
         def _visible():
-            # A LIVE table has no parquet until the live query path ships:
-            # offering it would only produce "snapshot missing".
+            # Live tables are listed too (queried at question time); the
+            # row's `mode` tells the picker which kind it is.
             rows = DataSourceStore().list_tables(include_connector=False,
-                                                 include_live=False)
+                                                 include_live=True)
             # Role gate: only tables the user's role covers right now (a
             # helper failure resolves to Base → empty list, fail-closed).
             allowed = roles_store.allowed_table_ids_for(email)
@@ -765,12 +765,14 @@ async def api_db_tables(request: Request):
     except Exception as e:
         log_with_sid(email, "warning", f"DB_TABLES_LIST_FAILED: {e}")
         rows = []
+    from db_sources import table_mode
     return {"tables": [{
         "table_id": r.get("id"),
         "display_name": r.get("display_name") or r.get("table_name"),
         "description": (r.get("description") or "")[:300],
         "row_count": r.get("row_count"),
         "refreshed_at": r.get("refreshed_at"),
+        "mode": table_mode(r),
     } for r in rows if r.get("id")]}
 
 
@@ -851,7 +853,7 @@ async def session_db_tables(request: Request):
     raw_ids = (body or {}).get("table_ids") or []
     ids = [t for t in raw_ids if isinstance(t, str)]
 
-    from db_sources import DataSourceStore, expand_with_connectors, table_mode
+    from db_sources import DataSourceStore, expand_with_connectors
     reg = DataSourceStore()
     tables = {t.get("id"): t for t in reg.list_tables() if t.get("id")}
     unknown = [t for t in ids if t not in tables]
@@ -861,13 +863,9 @@ async def session_db_tables(request: Request):
         return JSONResponse(
             {"error": "Connector tables are included automatically and cannot be selected directly."},
             status_code=400)
-    # A LIVE table has no parquet to load until the live query path ships
-    # (the picker hides it; this refuses a direct post).
-    if any(table_mode(tables[t]) == "live" for t in ids):
-        return JSONResponse(
-            {"error": "This table is in live mode and is not available in chats yet.",
-             "code": "LIVE_NOT_AVAILABLE"},
-            status_code=400)
+    # A live seed is accepted like a snapshot one: the chat loads it as a
+    # placeholder and queries it at question time (the connector closure
+    # below still never pulls a live connector in).
     # Role gate on the SEEDS only — the connector closure below is exempt by
     # design (connectors are invisible to users; gating them would silently
     # break allowed joins).

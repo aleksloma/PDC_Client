@@ -511,3 +511,23 @@ def fallback_sentence(lang: str, *, catalog: bool, matrix: bool = False,
 def strip_marker(text: str) -> str:
     """Remove every marker occurrence (and the whitespace it leaves)."""
     return (text or "").replace(DATA_NOTE_MARKER, "").strip()
+
+
+# The note appended to an answer whose live-table query was capped: the
+# client's own sentence (no describe-protocol change), in the same three
+# languages as the fallback sentences above; an unknown code reads as English.
+_LIVE_TRUNCATED = {
+    "ka": "შენიშვნა: {table} ცოცხალი ცხრილია; გამოყენებულია მოთხოვნის შედეგის "
+          "მხოლოდ პირველი {rows} სტრიქონი.",
+    "ru": "Примечание: {table} — живая таблица; использованы только первые "
+          "{rows} строк результата запроса.",
+    "en": "Note: {table} is a live table; only the first {rows} rows of the "
+          "query result were used.",
+}
+
+
+def live_truncated_sentence(lang: str, table: str, rows) -> str:
+    """The localized truncation note for one live table (`lang` is a
+    schema_builder._detect_language code; unknown → English)."""
+    template = _LIVE_TRUNCATED.get(lang) or _LIVE_TRUNCATED["en"]
+    return template.format(table=table, rows=rows)

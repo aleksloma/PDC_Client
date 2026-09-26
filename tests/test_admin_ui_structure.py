@@ -227,3 +227,13 @@ def test_live_copy_does_not_promise_per_question_queries():
 
 def test_mode_switch_reports_a_reverted_snapshot():
     assert "reverted" in _function_body(JS, "saveTableMode")
+
+
+def test_live_copy_says_tables_are_queried_at_question_time():
+    """The interim wording (live tables not offered in chats until the query
+    path ships) is gone from the template and the script; the template now
+    says what a question does with a live table."""
+    for src in (HTML, JS):
+        assert "live query path ships" not in _norm_ws(src)
+        assert "not offered in chats" not in _norm_ws(src)
+    assert "queried at question time" in _norm_ws(HTML)

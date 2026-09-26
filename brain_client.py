@@ -293,11 +293,33 @@ def _compact_caveat_for_transport(caveat: dict | None) -> dict | None:
         return None
 
 
+# A copy of the canonical `db_connector.ERROR_CLASSES` (kept here so this
+# module stays free of the connector import); the two must stay identical.
+SQL_ERROR_CLASSES = ("syntax", "unknown_column", "unknown_table", "timeout",
+                     "permission", "guard", "other")
+
+
+def live_sql_error(table: str, dialect: str, error_class: str, *,
+                   guard: bool = False, message: str | None = None) -> dict:
+    """The `sql_error` shape a failed live-table SELECT hands the retry flow:
+    exactly {table, dialect, class, guard, message}. `class` is one of
+    `SQL_ERROR_CLASSES` (anything else reads as `other`); `guard` is True
+    when this client's SQL gate refused the text and `message` is then the
+    gate's own sentence (an identifier at most), otherwise None. The driver's
+    message — which can quote literals and cell values — never goes in here
+    (Article II)."""
+    cls = error_class if error_class in SQL_ERROR_CLASSES else "other"
+    return {"table": str(table), "dialect": str(dialect or ""), "class": cls,
+            "guard": bool(guard),
+            "message": str(message) if (guard and message) else None}
+
+
 def plan(sid: str, question: str, schema_text: str, df_names: list[str],
          history_rows: list, common_fields: list | None = None,
          user_email: str | None = None,
-         dataset_profile: dict | None = None) -> dict:
-    return _post("/v1/plan", {
+         dataset_profile: dict | None = None,
+         live_tables: list | None = None) -> dict:
+    payload = {
         "sid": sid,
         "question": question,
         "schema_text": schema_text,
@@ -306,7 +328,12 @@ def plan(sid: str, question: str, schema_text: str, df_names: list[str],
         "common_fields": common_fields or [],
         "user_email": user_email,
         "dataset_profile": _compact_profiles_for_transport(dataset_profile),
-    }, sid)
+    }
+    # Sent ONLY when the chat holds a live table — a chat without one posts
+    # exactly the payload it always did.
+    if live_tables:
+        payload["live_tables"] = live_tables
+    return _post("/v1/plan", payload, sid)
 
 
 def retry(sid: str, question: str, schema_text: str, df_names: list[str],
@@ -314,8 +341,10 @@ def retry(sid: str, question: str, schema_text: str, df_names: list[str],
           error_msg: str, failed_code: str,
           use_pro: bool = False, use_search: bool = False,
           user_email: str | None = None,
-          dataset_profile: dict | None = None) -> dict:
-    return _post("/v1/retry", {
+          dataset_profile: dict | None = None,
+          sql: dict | None = None, sql_error: dict | None = None,
+          live_tables: list | None = None) -> dict:
+    payload = {
         "sid": sid,
         "question": question,
         "schema_text": schema_text,
@@ -328,7 +357,17 @@ def retry(sid: str, question: str, schema_text: str, df_names: list[str],
         "use_search": use_search,
         "user_email": user_email,
         "dataset_profile": _compact_profiles_for_transport(dataset_profile),
-    }, sid)
+    }
+    # The live-table fields ride only when a live fetch was involved: `sql`
+    # is the map of SELECTs that ran (the planner's own text, echoed back),
+    # `sql_error` the value-free `live_sql_error` shape.
+    if sql:
+        payload["sql"] = sql
+    if sql_error:
+        payload["sql_error"] = sql_error
+    if live_tables:
+        payload["live_tables"] = live_tables
+    return _post("/v1/retry", payload, sid)
 
 
 def describe(sid: str, question: str, code: str, user_email: str | None = None,

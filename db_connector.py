@@ -199,9 +199,25 @@ def _mariadb_stmt_timeout(conn, seconds: int) -> None:
 
 
 def _mssql_connect_args(cfg: dict, timeout: int) -> dict:
-    # pyodbc: `timeout` is the QUERY timeout (seconds); login timeout goes in
-    # the URL query (LoginTimeout).
+    # pyodbc's `connect(..., timeout=)` keyword is the CONNECTION timeout
+    # ("managed by the driver, not all drivers support this"), NOT a query
+    # bound: the real login bound is the URL's LoginTimeout
+    # (`_mssql_query_args`), and the QUERY bound is the DBAPI connection's
+    # `timeout` attribute, set per session by `_mssql_stmt_timeout`. This
+    # keyword is kept as it always was (a value the driver may ignore).
     return {"timeout": int(cfg.get("statement_timeout") or settings.DB_STATEMENT_TIMEOUT)}
+
+
+def _mssql_stmt_timeout(conn, seconds: int) -> None:
+    """SQL Server's statement bound. pyodbc has no session SET for it: the
+    query timeout is the DBAPI Connection's `timeout` attribute ("the
+    timeout in seconds for SQL queries"), so it is set on the raw pyodbc
+    connection under SQLAlchemy's pool proxy (2.x: `dbapi_connection`;
+    older: the proxy itself). Measured before this existed: with the
+    `connect()` keyword alone a 2 s live query ran 140 s."""
+    proxied = conn.connection
+    raw = getattr(proxied, "dbapi_connection", proxied)
+    raw.timeout = int(seconds)
 
 
 def _mssql_query_args(cfg: dict) -> dict:
@@ -321,6 +337,7 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
         default_port=1433, needs=("database",),
         supports_schemas=True, select1_sql="SELECT 1",
         connect_args=_mssql_connect_args, query_args=_mssql_query_args,
+        apply_stmt_timeout=_mssql_stmt_timeout,
         row_count_sql=("SELECT SUM(p.rows) FROM sys.partitions p "
                        "JOIN sys.objects o ON o.object_id = p.object_id "
                        "JOIN sys.schemas s ON s.schema_id = o.schema_id "
@@ -356,12 +373,14 @@ DIALECTS: dict[str, Dialect] = {d.key: d for d in [
         supports_schemas=True, select1_sql="SELECT 1",
         # connect_args deliberately left at its default — see
         # _clickhouse_query_args for why the native driver ignores it. There
-        # is likewise NO apply_stmt_timeout (mssql is the same shape): a
-        # session `SET max_execution_time` does not survive over the native
-        # protocol, because clickhouse-driver re-sends its OWN settings with
-        # every query and they win. Measured: after `SET 7`,
-        # system.settings still reads the URL value. The bound is real, it
-        # just lives in the connection settings instead.
+        # is likewise NO apply_stmt_timeout: a session `SET
+        # max_execution_time` does not survive over the native protocol,
+        # because clickhouse-driver re-sends its OWN settings with every
+        # query and they win. Measured: after `SET 7`, system.settings still
+        # reads the URL value. The bound is real, it just lives in the
+        # connection settings instead. (SQL Server is NOT this shape: its
+        # bound is the pyodbc connection's `timeout` attribute, set per
+        # session by `_mssql_stmt_timeout`.)
         query_args=_clickhouse_query_args,
         row_count_sql=("SELECT total_rows FROM system.tables "
                        "WHERE database = :schema AND name = :table"),
@@ -459,7 +478,133 @@ def _is_timeout(exc: BaseException) -> bool:
             return True
         e = e.__cause__ or e.__context__
         seen += 1
-    return False
+    # A driver that reports the timeout by CODE rather than by wording
+    # (MySQL 3024, PostgreSQL 57014, pyodbc HYT00, ORA-01013, ClickHouse 159)
+    # is a timeout for every caller too — the count verdict included.
+    return _code_error_class(exc) == "timeout"
+
+
+# The error classes a failed live query is reduced to before anything leaves
+# this function's caller: the class (never the driver's message, which quotes
+# literals and cell values) is what the retry flow and the planner see. One
+# fixed sentence per class is the user-facing / brain-facing text.
+# CANONICAL vocabulary — `brain_client.SQL_ERROR_CLASSES` (the wire shape's
+# copy) must stay identical to it.
+ERROR_CLASSES = ("syntax", "unknown_column", "unknown_table", "timeout",
+                 "permission", "guard", "other")
+_ERROR_CLASS_TEXT = {
+    "syntax": "The query has a syntax error.",
+    "unknown_column": "The query names a column that does not exist.",
+    "unknown_table": "The query names a table that does not exist.",
+    "timeout": "The live query timed out.",
+    "permission": "The database login may not read this.",
+    "other": "The database could not run the query.",
+}
+# Per-driver codes. psycopg2: `pgcode` (SQLSTATE); PyMySQL: errno in
+# `args[0]`; pyodbc: SQLSTATE in `args[0]`; oracledb: `args[0].full_code`
+# ("ORA-nnnnn"); clickhouse-driver: `ServerException.code`. SQLAlchemy wraps
+# every driver exception as `DBAPIError` with the original on `.orig`.
+_PG_ERROR_CLASSES = {"42601": "syntax", "42703": "unknown_column",
+                     "42P01": "unknown_table", "42501": "permission",
+                     "57014": "timeout"}
+_MYSQL_ERROR_CLASSES = {1064: "syntax", 1054: "unknown_column",
+                        1146: "unknown_table", 1142: "permission",
+                        1044: "permission", 1045: "permission", 3024: "timeout"}
+_ODBC_ERROR_CLASSES = {"42000": "syntax", "42S22": "unknown_column",
+                       "42S02": "unknown_table", "HYT00": "timeout",
+                       "28000": "permission"}
+_ORACLE_ERROR_CLASSES = {"ORA-00900": "syntax", "ORA-00907": "syntax",
+                         "ORA-00936": "syntax", "ORA-00904": "unknown_column",
+                         "ORA-00942": "unknown_table", "ORA-01013": "timeout",
+                         "ORA-01031": "permission"}
+_CLICKHOUSE_ERROR_CLASSES = {62: "syntax", 47: "unknown_column",
+                             60: "unknown_table", 159: "timeout",
+                             497: "permission"}
+# sqlite (the hidden test dialect) has no codes: its message is the signal.
+_MESSAGE_ERROR_CLASSES = (("no such column", "unknown_column"),
+                          ("no such table", "unknown_table"),
+                          ("syntax error", "syntax"))
+
+
+def error_class_text(error_class) -> str:
+    """The fixed sentence for an error class (unknown classes read as
+    `other`). The `guard` class carries the guard's own message instead."""
+    return _ERROR_CLASS_TEXT.get(error_class) or _ERROR_CLASS_TEXT["other"]
+
+
+def _classify_one(obj) -> Optional[str]:
+    """The class one exception-like object declares through its driver
+    code, or None when it declares nothing this helper knows."""
+    pgcode = getattr(obj, "pgcode", None)
+    if isinstance(pgcode, str) and pgcode in _PG_ERROR_CLASSES:
+        return _PG_ERROR_CLASSES[pgcode]
+    full = getattr(obj, "full_code", None)
+    if isinstance(full, str) and full.upper() in _ORACLE_ERROR_CLASSES:
+        return _ORACLE_ERROR_CLASSES[full.upper()]
+    args = getattr(obj, "args", None)
+    first = args[0] if isinstance(args, tuple) and args else None
+    if first is not None and not isinstance(first, (str, int, bool)):
+        full = getattr(first, "full_code", None)
+        if isinstance(full, str) and full.upper() in _ORACLE_ERROR_CLASSES:
+            return _ORACLE_ERROR_CLASSES[full.upper()]
+    if isinstance(first, int) and not isinstance(first, bool) \
+            and first in _MYSQL_ERROR_CLASSES:
+        return _MYSQL_ERROR_CLASSES[first]
+    if isinstance(first, str) and first.strip().upper() in _ODBC_ERROR_CLASSES:
+        return _ODBC_ERROR_CLASSES[first.strip().upper()]
+    code = getattr(obj, "code", None)
+    if isinstance(code, int) and not isinstance(code, bool) \
+            and not hasattr(obj, "full_code") and code in _CLICKHOUSE_ERROR_CLASSES:
+        return _CLICKHOUSE_ERROR_CLASSES[code]
+    try:
+        message = str(obj).lower()
+    except Exception:
+        message = ""
+    for needle, cls in _MESSAGE_ERROR_CLASSES:
+        if needle in message:
+            return cls
+    return None
+
+
+def _code_error_class(exc) -> Optional[str]:
+    """The class the driver CODE of `exc`, of its `.orig` (SQLAlchemy's
+    DBAPIError) or of anything down the `__cause__` / `__context__` chain
+    (at most five links) declares; None when nothing is recognised. Never
+    raises."""
+    try:
+        seen = 0
+        e = exc
+        while e is not None and seen < 5:
+            orig = getattr(e, "orig", None)
+            for candidate in ((orig, e) if orig is not None else (e,)):
+                cls = _classify_one(candidate)
+                if cls:
+                    return cls
+            e = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
+            seen += 1
+        return None
+    except Exception:
+        return None
+
+
+def classify_db_error(exc) -> str:
+    """Reduce a failed query's exception to one of `syntax`,
+    `unknown_column`, `unknown_table`, `timeout`, `permission` or `other`
+    (`guard` is the caller's own class for a refusal by the SQL gate).
+
+    Timeout-shaped errors (`_is_timeout`: the wording of the whole cause
+    chain, or a timeout by driver code) come first; then the driver code
+    (`_code_error_class`). The two agree by construction: whatever this
+    function calls `timeout`, `_is_timeout` answers True for. Never raises;
+    anything unrecognised is `other`."""
+    try:
+        if exc is None:
+            return "other"
+        if isinstance(exc, BaseException) and _is_timeout(exc):
+            return "timeout"
+        return _code_error_class(exc) or "other"
+    except Exception:
+        return "other"
 
 
 _FORBIDDEN_TOKENS = re.compile(
@@ -546,6 +691,11 @@ _DENIED_FUNCTIONS = frozenset({
     "query_to_xml", "query_to_xmlschema",
     "query_to_xml_and_xmlschema", "cursor_to_xml", "cursor_to_xmlschema",
     "table_to_xml",
+    # Notifications, server control, WAL, large objects, session settings,
+    # named locks, audit / trace file readers, network ACLs, web-service calls.
+    "pg_notify", "pg_reload_conf", "pg_switch_wal", "pg_create_restore_point",
+    "lo_unlink", "set_config", "release_lock", "fn_xe_file_target_read_file",
+    "fn_get_audit_file", "dbms_network_acl_admin", "utl_dbws",
 })
 
 _DENIED_FUNCTION_PREFIXES = ("dblink", "iceberg", "deltalake", "hudi")
@@ -630,7 +780,8 @@ def _function_names(node, exp) -> list:
 
 
 def _is_denied_function(name: str) -> bool:
-    return name in _DENIED_FUNCTIONS or name.startswith(_DENIED_FUNCTION_PREFIXES)
+    n = str(name or "").lower()
+    return n in _DENIED_FUNCTIONS or n.startswith(_DENIED_FUNCTION_PREFIXES)
 
 
 def _tsql_hint_without_with(node, exp) -> bool:
@@ -660,8 +811,21 @@ def _tsql_command_alias(node, exp) -> bool:
     return isinstance(ident, exp.Identifier) and not ident.quoted and         str(ident.name).upper() in _TSQL_COMMAND_WORDS
 
 
+def _cte_aliases(root, exp) -> set:
+    """Lowercased alias of every CTE in the tree (every `With`, nested ones
+    included): a table reference by such a name is the CTE, not a table."""
+    names = set()
+    for node in root.find_all(exp.With):
+        for cte in node.expressions:
+            alias = getattr(cte, "alias", None)
+            if alias:
+                names.add(str(alias).lower())
+    return names
+
+
 def _assert_parse_layer(statements: list, allow_cte: bool,
-                        allowed_schemas, exp, read=None) -> None:
+                        allowed_schemas, exp, read=None,
+                        allowed_tables=None) -> None:
     """Refuse whatever the parsed statement list shows to be not read-only."""
     statements = [s for s in statements if s is not None]
     if not statements:
@@ -679,6 +843,12 @@ def _assert_parse_layer(statements: list, allow_cte: bool,
     schemas = None
     if allowed_schemas:
         schemas = {str(s).strip().lower() for s in allowed_schemas}
+    tables = None
+    cte_names: set = set()
+    if allowed_tables is not None:
+        tables = {(str(s or "").strip().lower(), str(t or "").strip().lower())
+                  for s, t in allowed_tables}
+        cte_names = _cte_aliases(root, exp)
     tsql = read == "tsql"
     for node in root.walk():
         if isinstance(node, statement_classes):
@@ -711,10 +881,18 @@ def _assert_parse_layer(statements: list, allow_cte: bool,
             db = node.db
             if db and db.lower() not in schemas:
                 raise ValueError(f"Schema '{db}' is not permitted.")
+        if tables is not None and isinstance(node, exp.Table):
+            name = str(node.name or "")
+            db = str(node.db or "")
+            if not db and name.lower() in cte_names:
+                continue
+            if (db.lower(), name.lower()) not in tables:
+                raise ValueError(f"Table '{name}' is not permitted.")
 
 
 def assert_read_only_query(sql: str, *, allow_cte: bool, strict_parse: bool,
-                           dialect=None, allowed_schemas=None) -> None:
+                           dialect=None, allowed_schemas=None,
+                           allowed_tables=None) -> None:
     """The read-only SQL gate. Raises ValueError on refusal; the message may
     name an identifier (a function, a schema), never the SQL text.
 
@@ -738,6 +916,17 @@ def assert_read_only_query(sql: str, *, allow_cte: bool, strict_parse: bool,
        Without a schema list a UNION to a system catalog passes — the
        SELECT-only database login is the guarantee there.
 
+    `allowed_tables` (None = unrestricted) is a collection of
+    `(schema, table)` pairs, compared lowercased with `''` for an
+    unqualified reference: every table in the tree that is not a CTE alias
+    (aliases of every `With`, nested ones included) must match one pair,
+    else "Table '<name>' is not permitted." The caller lists the forms it
+    accepts — the registered schema, the unqualified name and the
+    connection's database name (MySQL / ClickHouse registrations carry no
+    schema). Case-insensitive on purpose: Oracle folds unquoted names to
+    upper case, PostgreSQL to lower, and the registry stores the normalized
+    name.
+
     `strict_parse=True` (free-form live queries) refuses text sqlglot cannot
     parse. `strict_parse=False` (the connector's own constructs) logs one
     `SQL_GUARD_PARSE_WARN` line (dialect + exception type, never the SQL) and
@@ -759,7 +948,8 @@ def assert_read_only_query(sql: str, *, allow_cte: bool, strict_parse: bool,
                      f"SQL_GUARD_PARSE_WARN dialect={log_safe_text(read or 'generic')} "
                      f"error={log_safe_text(type(e).__name__)}")
         return
-    _assert_parse_layer(statements, allow_cte, allowed_schemas, exp, read)
+    _assert_parse_layer(statements, allow_cte, allowed_schemas, exp, read,
+                        allowed_tables)
 
 
 def _live_inner(sql: str) -> str:
@@ -796,6 +986,95 @@ def _mssql_needs_offset(inner: str) -> bool:
     return not any(node.args.get(k) for k in ("limit", "offset", "fetch"))
 
 
+_MSG_CTE_SPLIT = ("The CTE block could not be separated; write the query "
+                  "without a CTE.")
+
+
+def _split_leading_cte(inner: str, read) -> tuple[str, str]:
+    """Split `WITH <ctes> <body>` into (`WITH <ctes> `, `<body>`), both taken
+    VERBATIM from the text by token offsets — nothing is re-rendered.
+
+    The tokenizer walks from the leading WITH (a RECURSIVE keyword rides
+    with the block): per CTE the first depth-0 AS, then either its
+    parenthesized body up to the matching `)` or — a ClickHouse expression
+    CTE (`WITH 1 AS x SELECT`) — the bare alias name; a depth-0 `,` starts
+    the next CTE and anything else starts the body. Cross-checked against a
+    real parse (the CTE count, and the body parsing as a SELECT or a set
+    operation); any mismatch raises ValueError(_MSG_CTE_SPLIT)."""
+    import sqlglot
+    from sqlglot import exp
+    from sqlglot.tokens import Tokenizer, TokenType
+
+    toks = Tokenizer().tokenize(inner)
+    if not toks or toks[0].token_type != TokenType.WITH:
+        raise ValueError(_MSG_CTE_SPLIT)
+    i = 1
+    if i < len(toks) and toks[i].text.upper() == "RECURSIVE":
+        i += 1
+    n_ctes = 0
+    body_start = None
+    while i < len(toks):
+        depth = 0
+        as_idx = None
+        while i < len(toks):
+            tt = toks[i].token_type
+            if tt == TokenType.L_PAREN:
+                depth += 1
+            elif tt == TokenType.R_PAREN:
+                depth -= 1
+            elif depth == 0 and tt == TokenType.ALIAS:
+                as_idx = i
+                break
+            i += 1
+        if as_idx is None:
+            raise ValueError(_MSG_CTE_SPLIT)
+        i = as_idx + 1
+        depth = 0
+        entered = False
+        closed = False
+        while i < len(toks):
+            tt = toks[i].token_type
+            if tt == TokenType.L_PAREN:
+                depth += 1
+                entered = True
+            elif tt == TokenType.R_PAREN:
+                depth -= 1
+                if depth == 0 and entered:
+                    closed = True
+                    i += 1
+                    break
+            elif depth == 0 and not entered and \
+                    tt in (TokenType.COMMA, TokenType.SELECT, TokenType.WITH):
+                closed = i > as_idx + 1        # the bare alias name was read
+                break
+            i += 1
+        if not closed:
+            raise ValueError(_MSG_CTE_SPLIT)
+        n_ctes += 1
+        if i >= len(toks):
+            raise ValueError(_MSG_CTE_SPLIT)
+        if toks[i].token_type == TokenType.COMMA:
+            i += 1
+            continue
+        body_start = toks[i].start
+        break
+    if body_start is None or n_ctes == 0:
+        raise ValueError(_MSG_CTE_SPLIT)
+    prefix = inner[:body_start].rstrip() + " "
+    body = inner[body_start:].strip()
+    try:
+        root = sqlglot.parse_one(inner, read=read)
+        with_node = root.args.get("with_") or root.args.get("with")
+        parsed_ctes = len(with_node.expressions) if with_node is not None else 0
+        body_root = sqlglot.parse_one(body, read=read)
+    except Exception:
+        raise ValueError(_MSG_CTE_SPLIT) from None
+    if parsed_ctes != n_ctes or \
+            not isinstance(body_root, (exp.Select, exp.SetOperation)):
+        raise ValueError(_MSG_CTE_SPLIT)
+    return prefix, body
+
+
 def wrap_with_row_limit(sql: str, dialect, n: int) -> str:
     """Wrap a SELECT as a derived table under the dialect's outer row limit,
     so a LIMIT / TOP inside it can never exceed `n`. The inner text is kept
@@ -809,22 +1088,32 @@ def wrap_with_row_limit(sql: str, dialect, n: int) -> str:
       oracle: SELECT * FROM (<inner>) pdc_q FETCH FIRST n ROWS ONLY
               (no AS on the alias; 12c and later)
 
-    Raises ValueError for a non-positive or non-int `n` or an unknown
-    dialect."""
+    A leading CTE block is HOISTED above the outer SELECT for every dialect
+    (`WITH <ctes> SELECT * FROM (<body>) AS pdc_q LIMIT n`): SQL Server
+    rejects a CTE inside a derived table, and the hoisted form is the same
+    query everywhere. The block and the body are split by token offsets
+    (`_split_leading_cte`) and kept verbatim; a split the parser does not
+    confirm raises ValueError. The mssql ORDER BY rule applies to the body.
+
+    Raises ValueError for a non-positive or non-int `n`, an unknown
+    dialect, or a CTE block that could not be separated."""
     if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
         raise ValueError("The row cap must be a positive integer.")
     d = _registry_dialect(dialect)
     if d is None:
         raise ValueError("Unknown database type for the row limit.")
     inner = _live_inner(sql if isinstance(sql, str) else "")
+    prefix = ""
+    if re.match(r"^WITH\b", inner, re.IGNORECASE):
+        prefix, inner = _split_leading_cte(inner, d.sqlglot_dialect)
     if d.key == "mssql":
         if _mssql_needs_offset(inner):
             inner = f"{inner} OFFSET 0 ROWS"
-        return f"SELECT TOP {n} * FROM ({inner}) AS pdc_q"
+        return f"{prefix}SELECT TOP {n} * FROM ({inner}) AS pdc_q"
     if d.key == "oracle":
-        return f"SELECT * FROM ({inner}) pdc_q FETCH FIRST {n} ROWS ONLY"
+        return f"{prefix}SELECT * FROM ({inner}) pdc_q FETCH FIRST {n} ROWS ONLY"
     if d.key in ("postgresql", "mysql", "mariadb", "clickhouse", "sqlite"):
-        return f"SELECT * FROM ({inner}) AS pdc_q LIMIT {n}"
+        return f"{prefix}SELECT * FROM ({inner}) AS pdc_q LIMIT {n}"
     raise ValueError("Unknown database type for the row limit.")
 
 
@@ -1294,9 +1583,11 @@ def count_rows(cfg: dict, password: str, schema: Optional[str], table: str,
     Bounded by the connection's statement timeout capped at
     `COUNT_TIMEOUT_CAP_S` (or the explicit `timeout_s`, whichever is lower).
     The bound goes into a COPY of the cfg the engine is built from, because
-    mssql (pyodbc `timeout`) and ClickHouse (URL `max_execution_time`) take it
-    from connection arguments, not a session statement; the caller's cfg is
-    never modified.
+    ClickHouse (URL `max_execution_time`) takes it from the connection
+    settings, not a session statement; the caller's cfg is never modified.
+    Every other dialect (SQL Server included, through the pyodbc
+    connection's `timeout` attribute) is bounded by `apply_stmt_timeout` on
+    the session.
 
     Returns {ok, count, timed_out, error}. Never raises (Article IV)."""
     engine = None
@@ -1335,24 +1626,30 @@ def count_rows(cfg: dict, password: str, schema: Optional[str], table: str,
 
 def sample_rows(cfg: dict, password: str, schema: Optional[str], table: str,
                 *, columns: Optional[list] = None, where: Optional[str] = None,
-                limit: Optional[int] = None, sid: str) -> dict:
+                limit: Optional[int] = None, timeout_s: Optional[int] = None,
+                log_driver_text: bool = True, sid: str) -> dict:
     """A bounded sample of the table as a raw DataFrame — the `preview_rows`
     twin used to profile a live table (no parquet is written). The dialect
     renders the row limit (`_select_stmt(row_cap=...)`). The sample runs
     behind an interactive click, so — like `count_rows` — the statement
-    timeout is the connection's capped at `COUNT_TIMEOUT_CAP_S`, put into a
-    COPY of the cfg the engine is built from and applied to the session.
-    Values feed only the local profile and technical descriptions — never the
-    brain, never a log line.
+    timeout is the connection's capped at `COUNT_TIMEOUT_CAP_S` (or the
+    explicit `timeout_s`), put into a COPY of the cfg the engine is built
+    from and applied to the session. Values feed only the local profile and
+    technical descriptions — never the brain, never a log line.
 
-    Returns {ok, df, error}. Never raises (Article IV)."""
+    `log_driver_text=False` (the chat path's default live read) keeps the
+    scrubbed driver text off the failure log line — type and class only,
+    like `run_live_select` — because a driver quotes the value it choked on.
+
+    Returns {ok, df, error, error_class} (`error_class` per
+    `classify_db_error`, None on success). Never raises (Article IV)."""
     engine = None
     try:
         d = get_dialect(cfg.get("db_type"))
         limit = int(limit or LIVE_PROFILE_SAMPLE_ROWS)
         bound = max(1, min(int(cfg.get("statement_timeout")
                                or settings.DB_STATEMENT_TIMEOUT),
-                           COUNT_TIMEOUT_CAP_S))
+                           int(timeout_s or COUNT_TIMEOUT_CAP_S)))
         stmt = _select_stmt(schema, table, columns=columns, where=where,
                             row_cap=limit)
         engine = get_engine({**cfg, "statement_timeout": bound}, password)
@@ -1360,20 +1657,95 @@ def sample_rows(cfg: dict, password: str, schema: Optional[str], table: str,
             d.apply_stmt_timeout(conn, bound)
             _compiled_sql(stmt, conn.dialect)
             df = pd.read_sql(stmt, conn)
-        return {"ok": True, "df": df.head(limit), "error": None}
+        return {"ok": True, "df": df.head(limit), "error": None,
+                "error_class": None}
     except Exception as e:
         err = _friendly_db_error(e, "Database connection timed out.", password)
+        cls = classify_db_error(e)
         from exec_transport import log_safe_text
+        detail = f" err={log_safe_text(err)}" if log_driver_text else ""
         log_with_sid(sid, "warning",
                      f"DB_SAMPLE_FAILED table={log_safe_text(str(schema))}."
-                     f"{log_safe_text(str(table))} err={log_safe_text(err)}")
-        return {"ok": False, "df": None, "error": err or "Sample query failed."}
+                     f"{log_safe_text(str(table))} class={cls} "
+                     f"error_type={log_safe_text(type(e).__name__)}{detail}")
+        return {"ok": False, "df": None, "error": err or "Sample query failed.",
+                "error_class": cls}
     finally:
         if engine is not None:
             try:
                 engine.dispose()
             except Exception:
                 pass
+
+
+def _live_max_bytes() -> int:
+    """The result size cap in bytes (`LIVE_RESULT_MAX_MB`, read at call time)."""
+    try:
+        return max(1, int(settings.LIVE_RESULT_MAX_MB)) * 1024 * 1024
+    except Exception:
+        return 256 * 1024 * 1024
+
+
+def _frame_bytes(df: pd.DataFrame) -> int:
+    try:
+        return int(df.memory_usage(deep=True).sum())
+    except Exception:
+        return 0
+
+
+def default_live_fetch(cfg: dict, password: str, doc: dict, *,
+                       cap: Optional[int] = None, sid: str) -> dict:
+    """The capped default read of a live table — what a question gets when
+    the planner sent no SELECT for it, or when the registration carries an
+    admin row filter (brain-written SQL could not honour that filter, so the
+    connector's own construct is the only statement that runs). Built
+    exactly like the live profile's sample: the persisted identifiers
+    (`qname` / `col_ident`, case flags kept), the doc's `where_filter`, the
+    dialect's own row limit at `cap + 1` so truncation is detectable, then
+    trimmed to `cap`. The statement timeout is `LIVE_QUERY_TIMEOUT_S` (the
+    connection's wins when lower); the in-memory size cap
+    (`LIVE_RESULT_MAX_MB`) trims the frame too.
+
+    Returns {ok, df, truncated, truncated_by, rows, error, error_class} —
+    `error` is the class sentence (never the driver's text), `error_class`
+    per `classify_db_error`. Never raises (Article IV)."""
+    try:
+        schema = qname(doc.get("schema") or None, doc.get("schema_quote"))
+        table = qname(doc.get("table_name"), doc.get("table_quote"))
+        cols = [col_ident(c) for c in (doc.get("columns") or [])
+                if isinstance(c, dict) and c.get("name")]
+        cap = max(1, int(cap or settings.LIVE_RESULT_ROW_CAP))
+        res = sample_rows(cfg, password, schema, table, columns=cols or None,
+                          where=doc.get("where_filter") or None,
+                          limit=cap + 1, timeout_s=settings.LIVE_QUERY_TIMEOUT_S,
+                          log_driver_text=False, sid=sid)
+        if not res.get("ok") or res.get("df") is None:
+            cls = res.get("error_class") or "other"
+            return {"ok": False, "df": None, "truncated": False,
+                    "truncated_by": None, "rows": 0,
+                    "error": error_class_text(cls), "error_class": cls}
+        df = res["df"]
+        df.columns = [str(c) for c in df.columns]
+        truncated_by = None
+        if len(df) > cap:
+            df = df.head(cap).reset_index(drop=True)
+            truncated_by = "rows"
+        max_bytes = _live_max_bytes()
+        size = _frame_bytes(df)
+        if size > max_bytes and len(df) > 1:
+            keep = max(1, int(len(df) * max_bytes / size))
+            df = df.head(keep).reset_index(drop=True)
+            truncated_by = "bytes"
+        return {"ok": True, "df": df, "truncated": truncated_by is not None,
+                "truncated_by": truncated_by, "rows": int(len(df)),
+                "error": None, "error_class": None}
+    except Exception as e:
+        from exec_transport import log_safe_text
+        log_with_sid(sid, "warning",
+                     f"LIVE_DEFAULT_FETCH_FAILED error={log_safe_text(type(e).__name__)}")
+        return {"ok": False, "df": None, "truncated": False, "truncated_by": None,
+                "rows": 0, "error": error_class_text("other"),
+                "error_class": "other"}
 
 
 # ---------------------------------------------------------------------------
@@ -1390,25 +1762,49 @@ _LIVE_READ_CHUNK_ROWS = 50_000
 
 def run_live_select(cfg: dict, password: str, sql: str, *, dialect=None,
                     row_cap: Optional[int] = None,
-                    timeout_s: Optional[int] = None, sid: str) -> dict:
+                    timeout_s: Optional[int] = None,
+                    allowed_schemas=None, allowed_tables=None,
+                    sid: str) -> dict:
     """Run one free-form SELECT against a live table's connection.
 
-    The text passes `assert_read_only_query` (CTE allowed, strict parse) —
-    both as given and as it will run, comments stripped — then
-    `wrap_with_row_limit` at `row_cap + 1` (default
-    `settings.LIVE_RESULT_ROW_CAP`); reading stops at that row and
-    `truncated` says whether it was reached. The statement timeout is
-    min(the connection's, `timeout_s` or `settings.LIVE_QUERY_TIMEOUT_S`),
-    put into a COPY of the cfg the engine is built from and applied to the
-    session. `dialect` defaults to the connection's; a different one is an
-    error.
+    The text passes `assert_read_only_query` (CTE allowed, strict parse,
+    `allowed_schemas` / `allowed_tables` forwarded — the table allowlist is
+    how a SELECT is bound to the one table it was written for) — both as
+    given and as it will run, comments stripped — then `wrap_with_row_limit`
+    at `row_cap + 1` (default `settings.LIVE_RESULT_ROW_CAP`); reading stops
+    at that row and `truncated` says whether it was reached
+    (`truncated_by: "rows"`). The frames read so far are also weighed
+    (`memory_usage(deep=True)`) against `settings.LIVE_RESULT_MAX_MB`; past
+    it the last chunk is trimmed proportionally and `truncated_by` is
+    `"bytes"`. The statement timeout is min(the connection's, `timeout_s` or
+    `settings.LIVE_QUERY_TIMEOUT_S`), put into a COPY of the cfg the engine
+    is built from and applied to the session. `dialect` defaults to the
+    connection's; a different one is an error.
 
-    Logs carry a hash of the SQL, row counts, timings and an exception TYPE —
-    never the SQL text and never a driver message (both can quote literals).
+    Bind-parameter escaping (`_BIND_COLON`): a colon `text()` would read as
+    a bind parameter — not preceded by a colon, a backslash or a word
+    character and followed by a word character — becomes `\\:`, so `':x'`
+    reaches the database as `:x` while `::int` and `'10:30'` stay as they
+    are. Two edges of that regex, documented rather than handled: a
+    backslash-colon written inside a literal (`'a\\:b'`) is left alone and
+    therefore loses its backslash on the way through `text()`; and a
+    colon-word followed by another colon (`':x:'`) keeps the second colon
+    verbatim, since it is not followed by a word character.
 
-    Returns {ok, df, truncated, rows, elapsed_ms, timed_out, error}, plus
-    `guard: True` when the guard refused the text (no engine is built then).
-    Never raises (Article IV)."""
+    Logs carry a hash of the SQL, row counts, timings, an exception TYPE and
+    the error CLASS — never the SQL text and never a driver message (both
+    can quote literals).
+
+    Returns {ok, df, truncated, truncated_by, rows, elapsed_ms, timed_out,
+    error, error_class, error_detail}, plus `guard: True` when the guard
+    refused the text (no engine is built then). On failure `error` is a
+    FIXED sentence for the class (`classify_db_error`: syntax /
+    unknown_column / unknown_table / timeout / permission / other, or the
+    guard's own message for `guard`) — the value the chat flow may show and
+    the retry flow may send; `error_detail` is the scrubbed driver text,
+    which can quote literals and cell values and therefore stays LOCAL —
+    it is never logged and must never be sent anywhere. Both are None on
+    success. Never raises (Article IV)."""
     t0 = time.monotonic()
     raw = sql if isinstance(sql, str) else ""
     sql_hash = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16]
@@ -1420,10 +1816,12 @@ def run_live_select(cfg: dict, password: str, sql: str, *, dialect=None,
     def _elapsed() -> int:
         return int((time.monotonic() - t0) * 1000)
 
-    def _fail(error: str, *, timed_out: bool = False, guard: bool = False) -> dict:
-        out = {"ok": False, "df": None, "truncated": False, "rows": 0,
-               "elapsed_ms": _elapsed(), "timed_out": timed_out,
-               "error": error}
+    def _fail(error: str, *, error_class: str, timed_out: bool = False,
+              guard: bool = False, error_detail: Optional[str] = None) -> dict:
+        out = {"ok": False, "df": None, "truncated": False, "truncated_by": None,
+               "rows": 0, "elapsed_ms": _elapsed(), "timed_out": timed_out,
+               "error": error, "error_class": error_class,
+               "error_detail": error_detail}
         if guard:
             out["guard"] = True
         return out
@@ -1437,35 +1835,57 @@ def run_live_select(cfg: dict, password: str, sql: str, *, dialect=None,
                 log_with_sid(log_sid, "warning",
                              f"LIVE_QUERY_REJECTED sql_hash={sql_hash} "
                              f"reason=dialect_mismatch")
-                return _fail("The query dialect does not match the connection.")
+                return _fail("The query dialect does not match the connection.",
+                             error_class="other")
         cap = max(1, int(row_cap or settings.LIVE_RESULT_ROW_CAP))
         try:
             assert_read_only_query(sql, allow_cte=True, strict_parse=True,
-                                   dialect=d)
+                                   dialect=d, allowed_schemas=allowed_schemas,
+                                   allowed_tables=allowed_tables)
             assert_read_only_query(_live_inner(raw), allow_cte=True,
-                                   strict_parse=True, dialect=d)
+                                   strict_parse=True, dialect=d,
+                                   allowed_schemas=allowed_schemas,
+                                   allowed_tables=allowed_tables)
+            wrapped = wrap_with_row_limit(raw, d.key, cap + 1)
         except ValueError as ge:
             log_with_sid(log_sid, "warning",
                          f"LIVE_QUERY_REJECTED sql_hash={sql_hash} "
                          f"reason={log_safe_text(str(ge))}")
-            return _fail(str(ge), guard=True)
-        wrapped = wrap_with_row_limit(raw, d.key, cap + 1)
+            return _fail(str(ge), error_class="guard", guard=True)
         bound = max(1, min(int(cfg.get("statement_timeout")
                                or settings.DB_STATEMENT_TIMEOUT),
                            int(timeout_s or settings.LIVE_QUERY_TIMEOUT_S)))
         clause = text(_BIND_COLON.sub(r"\\:", wrapped))
         engine = get_engine({**cfg, "statement_timeout": bound}, password)
+        max_bytes = _live_max_bytes()
         frames = []
         read = 0
+        size = 0
+        truncated_by = None
         with engine.connect() as conn:
             d.apply_stmt_timeout(conn, bound)
             rows_iter = pd.read_sql(clause, conn,
                                     chunksize=min(cap + 1, _LIVE_READ_CHUNK_ROWS))
             for chunk in rows_iter:
                 chunk.columns = [str(c) for c in chunk.columns]
+                chunk_bytes = _frame_bytes(chunk)
+                if size + chunk_bytes > max_bytes and len(chunk) > 0:
+                    # Trim the chunk to the share of it that still fits;
+                    # never an empty result when this is the first chunk.
+                    room = max(0, max_bytes - size)
+                    keep = int(len(chunk) * room / chunk_bytes) if chunk_bytes else 0
+                    if keep <= 0 and not frames:
+                        keep = 1
+                    if keep > 0:
+                        frames.append(chunk.head(keep))
+                        read += keep
+                    truncated_by = "bytes"
+                    break
                 frames.append(chunk)
                 read += len(chunk)
+                size += chunk_bytes
                 if read > cap:
+                    truncated_by = "rows"
                     break
             close = getattr(rows_iter, "close", None)
             rows_iter = None
@@ -1473,23 +1893,29 @@ def run_live_select(cfg: dict, password: str, sql: str, *, dialect=None,
                 close()
         df = (pd.concat(frames, ignore_index=True) if frames
               else pd.DataFrame())
-        truncated = read > cap
-        if truncated:
+        if truncated_by == "rows" or len(df) > cap:
             df = df.head(cap).reset_index(drop=True)
+            truncated_by = truncated_by or "rows"
+        truncated = truncated_by is not None
         elapsed = _elapsed()
         log_with_sid(log_sid, "info",
                      f"LIVE_QUERY_OK sql_hash={sql_hash} rows={len(df)} "
-                     f"truncated={truncated} elapsed_ms={elapsed}")
-        return {"ok": True, "df": df, "truncated": truncated, "rows": len(df),
-                "elapsed_ms": elapsed, "timed_out": False, "error": None}
+                     f"truncated={truncated} truncated_by={truncated_by} "
+                     f"elapsed_ms={elapsed}")
+        return {"ok": True, "df": df, "truncated": truncated,
+                "truncated_by": truncated_by, "rows": len(df),
+                "elapsed_ms": elapsed, "timed_out": False, "error": None,
+                "error_class": None, "error_detail": None}
     except Exception as e:
-        timed_out = _is_timeout(e)
-        err = _friendly_db_error(e, "The live query timed out.", password)
+        cls = classify_db_error(e)
+        timed_out = _is_timeout(e) or cls == "timeout"
+        detail = _friendly_db_error(e, "The live query timed out.", password)
         log_with_sid(log_sid, "warning",
                      f"LIVE_QUERY_ERROR sql_hash={sql_hash} "
                      f"error_type={log_safe_text(type(e).__name__)} "
-                     f"timed_out={timed_out} elapsed_ms={_elapsed()}")
-        return _fail(err or "The live query failed.", timed_out=timed_out)
+                     f"class={cls} timed_out={timed_out} elapsed_ms={_elapsed()}")
+        return _fail(error_class_text(cls), error_class=cls,
+                     timed_out=timed_out, error_detail=detail or None)
     finally:
         if rows_iter is not None:
             close = getattr(rows_iter, "close", None)

@@ -727,6 +727,20 @@ def ensure_chat_profiles(store, dfs: dict) -> dict:
     for df_key, df in (dfs or {}).items():
         try:
             entry = by_name.get(df_key) or {"file_name": df_key}
+            if getattr(df, "attrs", {}).get("pdc_live"):
+                # A live table's placeholder holds no rows: never compute (or
+                # write) a profile from it. The admin's sampled profile is
+                # served only when it IS the live kind (checked before the
+                # stamp is dropped); anything else omits the key.
+                tid = (entry.get("db") or {}).get("table_id")
+                prof = read_profile(db_profile_path(tid), None) if tid else None
+                src = prof.get("src") if isinstance(prof, dict) else None
+                if not (isinstance(src, dict) and src.get("kind") == "live"):
+                    continue
+                prof = dict(prof)
+                prof.pop("src", None)
+                out[df_key] = _json_safe(prof)
+                continue
             path, stamp = _profile_src_stamp_for_entry(store, entry)
             prof = read_profile(path, stamp)
             if prof is None:
@@ -767,11 +781,11 @@ def missing_db_tables(meta) -> list[dict]:
     entries = db_entries_from_meta(meta)
     if not entries:
         return []
-    registered: set = set()
+    registered: dict = {}
     registry_ok = False
     try:
-        from db_sources import DataSourceStore
-        registered = {t.get("id") for t in DataSourceStore().list_tables()}
+        from db_sources import DataSourceStore, table_mode
+        registered = {t.get("id"): t for t in DataSourceStore().list_tables()}
         registry_ok = True
     except Exception as e:                                   # noqa: BLE001
         log_with_sid("missing-db", "warning", f"REGISTRY_PROBE_FAILED: {e}")
@@ -779,6 +793,10 @@ def missing_db_tables(meta) -> list[dict]:
     for entry in entries:
         db = entry.get("db") or {}
         tid = db.get("table_id")
+        if registry_ok and tid in registered and table_mode(registered[tid]) == "live":
+            # A live table has no parquet by design: it is queried at
+            # question time, so its absence on disk is not a missing table.
+            continue
         try:
             present = bool(tid) and db_snapshot_path(tid).exists()
         except Exception:
@@ -921,6 +939,75 @@ def merge_schema_entry(old_entry: dict, fresh_entry: dict) -> dict:
         if isinstance(old_vals, dict) and old_vals:
             new_fields[col]["values"] = old_vals
     return fresh
+
+
+def _placeholder_dtype(dtype) -> str:
+    """The pandas dtype a registry column dtype string maps to (Article XIII
+    standard dtypes only): bool / boolean → bool; date / time / timestamp /
+    datetime → datetime64[ns]; int / integer / bigint / smallint / serial →
+    int64; float / double / real / numeric / decimal → float64; else object."""
+    t = str(dtype or "").strip().lower()
+    if "bool" in t:
+        return "bool"
+    if any(k in t for k in ("timestamp", "datetime", "date", "time")):
+        return "datetime64[ns]"
+    if "interval" in t:
+        return "object"
+    if any(k in t for k in ("int", "serial")):
+        return "int64"
+    if any(k in t for k in ("float", "double", "real", "numeric", "decimal")):
+        return "float64"
+    return "object"
+
+
+def _live_placeholder(row: dict) -> pd.DataFrame:
+    """An EMPTY typed frame standing in for a live table until its rows are
+    fetched at question time: the registered column names (str) with the
+    dtypes `_placeholder_dtype` maps, marked `attrs["pdc_live"] = True` so
+    the chat flow can tell it from a loaded table."""
+    cols = {}
+    for col in (row or {}).get("columns") or []:
+        if not (isinstance(col, dict) and col.get("name")):
+            continue
+        name = str(col.get("name"))
+        try:
+            cols[name] = pd.Series([], dtype=_placeholder_dtype(col.get("dtype")))
+        except Exception:
+            cols[name] = pd.Series([], dtype="object")
+    df = pd.DataFrame(cols)
+    df.attrs["pdc_live"] = True
+    return df
+
+
+def _partition_db_entries(db_entries: Optional[list], owner: str) -> tuple[list, list]:
+    """(snapshot entries, [(entry, registry row)] of the LIVE ones) by the
+    registry's mode — ONE registry read. FAIL CLOSED: when the registry
+    cannot be read the mode of NO entry is known, so NO entry is loadable
+    (`([], [])`, one `LIVE_REGISTRY_PROBE_FAILED` line with the exception
+    type) — a table switched to live keeps its old parquet by design, and
+    serving it as current data is exactly what an unreadable registry must
+    not do. The chat then reports its tables through the existing
+    missing / empty paths."""
+    entries = list(db_entries or [])
+    if not entries:
+        return [], []
+    try:
+        from db_sources import DataSourceStore, table_mode
+        rows = {t.get("id"): t for t in DataSourceStore().list_tables()}
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid(owner, "error",
+                     f"LIVE_REGISTRY_PROBE_FAILED error={type(e).__name__} "
+                     f"reason=db_entries_not_loaded")
+        return [], []
+    snapshot, live = [], []
+    for entry in entries:
+        tid = (entry.get("db") or {}).get("table_id")
+        row = rows.get(tid)
+        if row is not None and table_mode(row) == "live":
+            live.append((entry, row))
+        else:
+            snapshot.append(entry)
+    return snapshot, live
 
 
 def _load_dataframes_cached(files_dir: Path, owner: str,
@@ -1989,9 +2076,25 @@ class ChatDataStore:
         except Exception:
             return []
 
-    def load_dataframes(self, include_db: bool = True) -> dict[str, pd.DataFrame]:
+    def load_dataframes(self, include_db: bool = True,
+                        include_live: bool = False) -> dict[str, pd.DataFrame]:
+        """The chat's frames. DB entries are PARTITIONED by the registry's
+        mode BEFORE the cache: snapshot entries load their parquet through
+        `_load_dataframes_cached` exactly as before; a LIVE entry never
+        reaches `_load_db_snapshots` (a parquet kept from before the live
+        period is never served). With `include_live=True` every live entry
+        is appended as an empty typed placeholder (`_live_placeholder`) built
+        OUTSIDE the memory cache; with the default it is simply absent."""
         db = db_entries_from_meta(self.read_meta()) if include_db else None
-        return _load_dataframes_cached(self.files_dir, self.chat_id, db)
+        snapshot, live = _partition_db_entries(db, self.chat_id) if db else ([], [])
+        dfs = _load_dataframes_cached(self.files_dir, self.chat_id,
+                                      snapshot if db else None)
+        if include_live:
+            for entry, row in live:
+                key = entry.get("file_name")
+                if key:
+                    dfs[key] = _live_placeholder(row)
+        return dfs
 
     def schema_docs(self) -> dict:
         """Build {filename: {file_description, fields: {col: {...}}}} for the brain.
@@ -2000,9 +2103,24 @@ class ChatDataStore:
         refreshed_at/relations so schema_builder can render the DB source line
         and the declared-join-keys block. File entries emit EXACTLY the two
         keys they always did — schema_text stays byte-identical for any chat
-        with no database tables."""
+        with no database tables. A DB entry whose registry row is LIVE also
+        carries `live`, `dialect`, `row_cap`, `filtered` and `db_ref` (the
+        pre-fetch's inputs); a snapshot entry emits exactly today's keys."""
         out = {}
-        for file_entry in self.read_meta().get("files", []) or []:
+        meta = self.read_meta()
+        files = meta.get("files", []) or []
+        registry = None
+        connections: dict = {}
+        if any(isinstance(e, dict) and e.get("source") == "database" for e in files):
+            try:
+                from db_sources import DataSourceStore, table_mode
+                reg = DataSourceStore()
+                registry = {t.get("id"): t for t in reg.list_tables()}
+            except Exception as e:                           # noqa: BLE001
+                log_with_sid(self.chat_id, "warning",
+                             f"LIVE_REGISTRY_PROBE_FAILED error={type(e).__name__}")
+                registry = None
+        for file_entry in files:
             name = file_entry.get("file_name")
             if not name:
                 continue
@@ -2017,6 +2135,35 @@ class ChatDataStore:
                 out[name]["db_table"] = f"{db.get('schema') or ''}.{db.get('table_name') or ''}".strip(".")
                 out[name]["refreshed_at"] = db.get("refreshed_at")
                 out[name]["relations"] = db.get("relations") or []
+                row = (registry or {}).get(db.get("table_id"))
+                if row is not None and table_mode(row) == "live":
+                    try:
+                        cid = row.get("connection_id")
+                        if cid not in connections:
+                            conn = reg.get_connection(cid) if cid else None
+                            connections[cid] = (conn or {}).get("db_type") or ""
+                        cap = int(settings.LIVE_RESULT_ROW_CAP)
+                        doc_cap = row.get("row_cap")
+                        if isinstance(doc_cap, (int, float)) and not isinstance(doc_cap, bool) \
+                                and int(doc_cap) > 0:
+                            cap = min(cap, int(doc_cap))
+                        out[name]["live"] = True
+                        out[name]["dialect"] = connections[cid]
+                        out[name]["row_cap"] = cap
+                        out[name]["filtered"] = bool(row.get("where_filter"))
+                        out[name]["db_ref"] = {
+                            "schema": row.get("schema") or "",
+                            "table_name": row.get("table_name") or "",
+                            "schema_quote": bool(row.get("schema_quote")),
+                            "table_quote": bool(row.get("table_quote")),
+                            "connection_id": cid,
+                            "table_id": row.get("id"),
+                            "where_filter": row.get("where_filter") or None,
+                            "row_cap": cap,
+                        }
+                    except Exception as e:                   # noqa: BLE001
+                        log_with_sid(self.chat_id, "warning",
+                                     f"LIVE_SCHEMA_DOC_FAILED error={type(e).__name__}")
         return out
 
     def new_conversation(self, title: str = "New conversation") -> str:

@@ -461,8 +461,8 @@
         : 'Live: set manually';
       const who = [t.live_set_by, t.live_set_at].filter(Boolean).join(', ');
       return (who ? `${why} (${who})` : why)
-        + '. Not copied, and scheduled refreshes skip it. Until the live query path ships '
-        + 'it is not offered in chats.';
+        + '. Not copied, and scheduled refreshes skip it. Live tables are queried at '
+        + 'question time; each question reads at most the configured row cap.';
     };
     const rows = TABLES.map((t) => `
       <tr data-tid="${esc(t.id)}">
@@ -861,7 +861,8 @@
     }
     if (v.live_suggested && n != null) {
       return `About ${n} cells: live mode is suggested. A live table is not copied; `
-        + 'it is not offered in chats until the live query path ships.';
+        + 'live tables are queried at question time; each question reads at most the '
+        + 'configured row cap.';
     }
     if (n == null) return 'Row count unavailable: pick Live yourself if the table is large.';
     return '';
@@ -941,8 +942,8 @@
       <div class="adm-summary-row"><span>Column descriptions</span><strong>${filled} of ${described.length} filled</strong></div>
       <div class="adm-summary-note">${_wizardMode() === 'live'
         ? 'Saving profiles a sample of the table. A live table is not copied when you save '
-          + 'it, and scheduled refreshes skip it. Until the live query path ships it is not '
-          + 'offered in chats.'
+          + 'it, and scheduled refreshes skip it. Live tables are queried at question time; '
+          + 'each question reads at most the configured row cap.'
         : 'Saving takes a local snapshot now; user questions run against the snapshot.'}</div>`;
   }
 

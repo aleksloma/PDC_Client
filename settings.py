@@ -260,6 +260,11 @@ class Settings(BaseModel):
     # connection's own timeout wins when lower).
     LIVE_RESULT_ROW_CAP: int = Field(default_factory=lambda: _int_env("LIVE_RESULT_ROW_CAP", 200_000, 1))
     LIVE_QUERY_TIMEOUT_S: int = Field(default_factory=lambda: _int_env("LIVE_QUERY_TIMEOUT_S", 60, 1))
+    # The in-memory size of a live query's result is capped too (a few wide
+    # text columns can weigh far more than the row cap suggests): reading
+    # stops once the frames read so far exceed LIVE_RESULT_MAX_MB megabytes
+    # (`memory_usage(deep=True)`), and the result is flagged truncated.
+    LIVE_RESULT_MAX_MB: int = Field(default_factory=lambda: _int_env("LIVE_RESULT_MAX_MB", 256, 1))
 
     # Nightly snapshot refresh (container-local time; the admin UI value in
     # data_sources.json wins once set — these are first-boot defaults only).

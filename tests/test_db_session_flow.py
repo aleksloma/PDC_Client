@@ -220,9 +220,10 @@ def test_add_data_merge_keeps_user_edits_on_same_table(client, registry, monkeyp
 
 
 # ---------------------------------------------------------------------------
-# Live-mode tables: no parquet exists for a live registration, so until the
-# live query path ships the picker hides them, the session route refuses them
-# and the connector closure never pulls a live connector in.
+# Live-mode tables: a live registration has no parquet, but it is queried at
+# question time, so the picker lists it (with its mode) and the session route
+# accepts it. The connector closure still never pulls a live connector in: a
+# connector is auto-included without a question-time SELECT of its own.
 # ---------------------------------------------------------------------------
 
 def _make_live(tid):
@@ -232,22 +233,31 @@ def _make_live(tid):
     store.upsert_table(doc, actor="ladmin")
 
 
-def test_api_db_tables_hides_live_tables(client, registry):
+def test_api_db_tables_lists_live_tables_with_their_mode(client, registry):
+    """Re-pinned: the interim gate that hid live tables from the picker was
+    lifted when the question-time query path shipped. Rows carry `mode`."""
     _make_live(registry["tr_data"])
     r = client.get("/api/db_tables")
     assert r.status_code == 200
-    names = {t["display_name"] for t in r.json()["tables"]}
-    assert names == {"clients information"}
+    rows = {t["display_name"]: t for t in r.json()["tables"]}
+    assert set(rows) == {"clients information", "transactions"}
+    assert rows["transactions"]["mode"] == "live"
+    assert rows["clients information"]["mode"] == "snapshot"
 
 
-def test_session_db_tables_refuses_a_live_table(client, registry):
+def test_session_db_tables_accepts_a_live_table(client, registry):
+    """Re-pinned: the interim refusal of a live seed was lifted when the
+    question-time query path shipped — the entry lands in the session meta
+    like any snapshot table's."""
     _make_live(registry["tr_data"])
     r = client.post("/session/db_tables",
                     json={"table_ids": [registry["tr_data"]]})
-    assert r.status_code == 400
-    assert r.json().get("code") == "LIVE_NOT_AVAILABLE"
+    assert r.status_code == 200, r.json()
+    assert {row["df_key"] for row in r.json()["tables"]} == {"transactions"}
     meta = local_store.UserStore("s_dbflow").read_meta()
-    assert local_store.db_entries_from_meta(meta) == []
+    entries = local_store.db_entries_from_meta(meta)
+    assert [e["db"]["table_id"] for e in entries] == [registry["tr_data"]]
+    assert entries[0]["file_name"] == "transactions"
 
 
 def test_session_closure_skips_a_live_connector(client, registry):

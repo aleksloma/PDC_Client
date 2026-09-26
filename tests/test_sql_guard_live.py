@@ -49,10 +49,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def _guard(sql, *, allow_cte=True, strict_parse=True, dialect=None,
-           allowed_schemas=None):
+           allowed_schemas=None, **extra):
     return db_connector.assert_read_only_query(
         sql, allow_cte=allow_cte, strict_parse=strict_parse, dialect=dialect,
-        allowed_schemas=allowed_schemas)
+        allowed_schemas=allowed_schemas, **extra)
 
 
 def _records(caplog, marker):
@@ -498,15 +498,18 @@ def _engine_spy(monkeypatch):
 
 
 def test_run_live_select_response_shape(live_cfg):
+    """Re-pinned when the error was reduced: a success carries `error_class`
+    and `error_detail` too, both None."""
     res = _live(live_cfg, "SELECT n, s FROM r", row_cap=100)
     assert {"ok", "df", "truncated", "rows", "elapsed_ms", "timed_out",
-            "error"} <= set(res)
+            "error", "error_class", "error_detail"} <= set(res)
     assert res["ok"] is True
     assert isinstance(res["df"], pd.DataFrame)
     assert list(res["df"].columns) == ["n", "s"]
     assert len(res["df"]) == 25 and res["rows"] == 25
     assert res["truncated"] is False and res["timed_out"] is False
     assert res["error"] is None
+    assert res["error_class"] is None and res["error_detail"] is None
     assert isinstance(res["elapsed_ms"], (int, float)) and res["elapsed_ms"] >= 0
 
 
@@ -601,15 +604,22 @@ def test_run_live_select_guard_refusal_builds_no_engine(live_cfg, monkeypatch):
 
 
 def test_run_live_select_bad_column_logs_the_type_only(live_cfg, caplog):
+    """Re-pinned when the error was reduced: `error` is the class sentence,
+    the driver's text (which quotes the literal) lives in `error_detail`
+    ONLY, and the log line carries the class beside the exception type."""
     with caplog.at_level(logging.INFO):
         res = _live(live_cfg,
                     "SELECT no_such_col FROM r WHERE s = 'ZQMARK_ERR_9021'",
                     row_cap=10)
     assert res["ok"] is False
-    assert res["error"]
+    assert res["error"] == "The query names a column that does not exist."
+    assert res["error_class"] == "unknown_column"
+    assert "ZQMARK_ERR_9021" not in res["error"]
+    assert "ZQMARK_ERR_9021" in res["error_detail"]
     recs = _records(caplog, "LIVE_QUERY_ERROR")
     assert recs, "no LIVE_QUERY_ERROR line"
     assert "error_type=" in recs[0].getMessage()
+    assert "class=unknown_column" in recs[0].getMessage()
     for r in caplog.records:
         assert "ZQMARK_ERR_9021" not in r.getMessage()
         assert "no_such_col" not in r.getMessage()
@@ -987,3 +997,497 @@ def test_wrap_mssql_union_with_order_by_gets_offset_inside():
 def test_further_look_alikes_pass(sql, dialect, strict):
     assert _guard(sql, allow_cte=True, strict_parse=strict,
                   dialect=dialect) is None
+
+
+# ===========================================================================
+# the table allowlist: a live SELECT may read ONLY the table it was written for
+# ===========================================================================
+_ALLOWED = {("shop", "t"), ("", "t")}
+
+ALLOWLIST_OK = [
+    ("schema-qualified", "SELECT a FROM shop.t"),
+    ("unqualified", "SELECT a FROM t"),
+    ("case-insensitive", "SELECT a FROM SHOP.T"),
+    ("cte-alias-shadows-a-disallowed-name",
+     "WITH u AS (SELECT a FROM shop.t) SELECT a FROM u"),
+    ("nested-with",
+     "SELECT * FROM (WITH c AS (SELECT a FROM shop.t) SELECT a FROM c) q"),
+    ("self-join", "SELECT x.a FROM shop.t x JOIN t y ON x.a = y.a"),
+    ("subquery-same-table",
+     "SELECT a FROM shop.t WHERE a IN (SELECT a FROM t)"),
+]
+
+ALLOWLIST_REFUSED = [
+    ("other-table", "SELECT a FROM shop.u"),
+    ("join-to-other-table", "SELECT t.a FROM shop.t JOIN shop.u ON t.a = u.a"),
+    ("subquery-other-table",
+     "SELECT a FROM shop.t WHERE a IN (SELECT a FROM shop.u)"),
+    ("union-to-catalog",
+     "SELECT a FROM shop.t UNION SELECT relname FROM pg_catalog.pg_class"),
+    ("same-name-other-schema", "SELECT a FROM hr.t"),
+    ("cte-body-names-other-table",
+     "WITH c AS (SELECT a FROM shop.u) SELECT a FROM c"),
+]
+
+
+@pytest.mark.parametrize("sql", [c[1] for c in ALLOWLIST_OK],
+                         ids=[c[0] for c in ALLOWLIST_OK])
+def test_allowlist_accepts_the_registered_table(sql):
+    assert _guard(sql, dialect="postgresql", allowed_tables=_ALLOWED) is None
+
+
+@pytest.mark.parametrize("sql", [c[1] for c in ALLOWLIST_REFUSED],
+                         ids=[c[0] for c in ALLOWLIST_REFUSED])
+def test_allowlist_refuses_any_other_table(sql):
+    with pytest.raises(ValueError) as ei:
+        _guard(sql, dialect="postgresql", allowed_tables=_ALLOWED)
+    assert re.fullmatch(r"Table '[^']+' is not permitted\.", str(ei.value)), \
+        str(ei.value)
+
+
+def test_allowlist_message_names_the_table_only():
+    with pytest.raises(ValueError) as ei:
+        _guard("SELECT a FROM shop.u WHERE b = 'ZQMARK_4471'",
+               dialect="postgresql", allowed_tables=_ALLOWED)
+    assert str(ei.value) == "Table 'u' is not permitted."
+
+
+def test_allowlist_accepts_the_database_qualified_form_when_listed():
+    """MySQL / ClickHouse registrations carry no schema and the planner may
+    qualify with the database name — the caller lists that pair too."""
+    with pytest.raises(ValueError):
+        _guard("SELECT a FROM mydb.t", dialect="mysql", allowed_tables={("", "t")})
+    assert _guard("SELECT a FROM mydb.t", dialect="mysql",
+                  allowed_tables={("", "t"), ("mydb", "t")}) is None
+
+
+def test_allowlist_none_leaves_the_guard_unrestricted():
+    assert _guard("SELECT a FROM shop.u UNION SELECT relname FROM pg_catalog.pg_class",
+                  dialect="postgresql", allowed_tables=None) is None
+
+
+def test_allowlist_refuses_in_lenient_mode_too():
+    with pytest.raises(ValueError):
+        _guard("SELECT a FROM shop.u", strict_parse=False, dialect="postgresql",
+               allowed_tables=_ALLOWED)
+
+
+# ===========================================================================
+# classify_db_error: a driver failure becomes one of the error classes
+# ===========================================================================
+class _Orig(Exception):
+    """A DBAPI exception look-alike; the driver-specific code rides on it."""
+
+
+class _Wrapped(Exception):
+    """A SQLAlchemy DBAPIError look-alike: the driver exception on `.orig`."""
+
+    def __init__(self, orig):
+        super().__init__("wrapped")
+        self.orig = orig
+
+
+def _pg(code):
+    o = _Orig("driver text")
+    o.pgcode = code
+    return _Wrapped(o)
+
+
+def _mysql(errno):
+    return _Wrapped(_Orig(errno, "driver text"))
+
+
+def _odbc(state):
+    return _Wrapped(_Orig(state, "driver text"))
+
+
+def _ora(full_code):
+    class _OracleError:
+        pass
+    e = _OracleError()
+    e.full_code = full_code
+    e.message = "driver text"
+    return _Wrapped(_Orig(e))
+
+
+def _ch(code):
+    o = _Orig("driver text")
+    o.code = code
+    return _Wrapped(o)
+
+
+def _chained_timeout():
+    e = _Wrapped(_Orig("driver text"))
+    e.__cause__ = TimeoutError("socket timed out")
+    return e
+
+
+CLASSIFY = [
+    ("pg-unknown-column", _pg("42703"), "unknown_column"),
+    ("pg-unknown-table", _pg("42P01"), "unknown_table"),
+    ("pg-syntax", _pg("42601"), "syntax"),
+    ("pg-permission", _pg("42501"), "permission"),
+    ("pg-timeout", _pg("57014"), "timeout"),
+    ("mysql-unknown-column", _mysql(1054), "unknown_column"),
+    ("mysql-unknown-table", _mysql(1146), "unknown_table"),
+    ("mysql-syntax", _mysql(1064), "syntax"),
+    ("mysql-permission-1142", _mysql(1142), "permission"),
+    ("mysql-permission-1044", _mysql(1044), "permission"),
+    ("mysql-permission-1045", _mysql(1045), "permission"),
+    ("mysql-timeout", _mysql(3024), "timeout"),
+    ("odbc-unknown-column", _odbc("42S22"), "unknown_column"),
+    ("odbc-unknown-table", _odbc("42S02"), "unknown_table"),
+    ("odbc-syntax", _odbc("42000"), "syntax"),
+    ("odbc-timeout", _odbc("HYT00"), "timeout"),
+    ("odbc-permission", _odbc("28000"), "permission"),
+    ("ora-unknown-column", _ora("ORA-00904"), "unknown_column"),
+    ("ora-unknown-table", _ora("ORA-00942"), "unknown_table"),
+    ("ora-syntax-00900", _ora("ORA-00900"), "syntax"),
+    ("ora-syntax-00907", _ora("ORA-00907"), "syntax"),
+    ("ora-syntax-00936", _ora("ORA-00936"), "syntax"),
+    ("ora-timeout", _ora("ORA-01013"), "timeout"),
+    ("ora-permission", _ora("ORA-01031"), "permission"),
+    ("ch-unknown-column", _ch(47), "unknown_column"),
+    ("ch-unknown-table", _ch(60), "unknown_table"),
+    ("ch-syntax", _ch(62), "syntax"),
+    ("ch-timeout", _ch(159), "timeout"),
+    ("ch-permission", _ch(497), "permission"),
+    ("sqlite-unknown-column", _Wrapped(_Orig("no such column: nope")),
+     "unknown_column"),
+    ("sqlite-unknown-table", _Wrapped(_Orig("no such table: zz")),
+     "unknown_table"),
+    ("sqlite-syntax", _Wrapped(_Orig('near "FROM": syntax error')), "syntax"),
+    ("chained-timeout", _chained_timeout(), "timeout"),
+    ("bare-timeout", TimeoutError("timed out"), "timeout"),
+    ("other-driver-text", _Wrapped(_Orig("something else happened")), "other"),
+    ("plain-exception", RuntimeError("plain"), "other"),
+    ("none", None, "other"),
+]
+
+
+@pytest.mark.parametrize("exc, expected", [c[1:] for c in CLASSIFY],
+                         ids=[c[0] for c in CLASSIFY])
+def test_classify_db_error(exc, expected):
+    assert db_connector.classify_db_error(exc) == expected
+
+
+def test_classify_db_error_vocabulary_is_closed():
+    assert {c[2] for c in CLASSIFY} == {"syntax", "unknown_column",
+                                        "unknown_table", "timeout",
+                                        "permission", "other"}
+
+
+# ===========================================================================
+# run_live_select: the reduced error shape
+# ===========================================================================
+def test_run_live_select_unknown_table_is_classified(live_cfg):
+    res = _live(live_cfg, "SELECT n FROM zz_missing WHERE s = 'ZQMARK_TBL_77'",
+                row_cap=10)
+    assert res["ok"] is False
+    assert res["error_class"] == "unknown_table"
+    assert res["error"] and "ZQMARK_TBL_77" not in res["error"]
+    assert "zz_missing" not in res["error"]
+    assert "zz_missing" in res["error_detail"]
+
+
+def test_run_live_select_guard_refusal_is_class_guard(live_cfg, monkeypatch):
+    def no_engine(*a, **kw):
+        raise RuntimeError("the engine must not be built")
+    monkeypatch.setattr(db_connector, "get_engine", no_engine)
+    res = _live(live_cfg, "DELETE FROM r", row_cap=10)
+    assert res["ok"] is False
+    assert res["guard"] is True
+    assert res["error_class"] == "guard"
+    assert res["error"] == "Only SELECT statements are permitted."
+
+
+def test_run_live_select_timeout_is_class_timeout(live_cfg, monkeypatch):
+    def boom(*a, **kw):
+        raise TimeoutError("statement timed out")
+    monkeypatch.setattr(db_connector, "get_engine", boom)
+    res = _live(live_cfg, "SELECT n FROM r", row_cap=10)
+    assert res["ok"] is False
+    assert res["timed_out"] is True
+    assert res["error_class"] == "timeout"
+    assert res["error"]
+
+
+def test_run_live_select_allowed_tables_refusal(live_cfg, monkeypatch):
+    calls = []
+
+    def no_engine(*a, **kw):
+        calls.append(1)
+        raise RuntimeError("the engine must not be built")
+    monkeypatch.setattr(db_connector, "get_engine", no_engine)
+    res = _live(live_cfg, "SELECT n FROM r", row_cap=10,
+                allowed_tables={("", "other")})
+    assert res["ok"] is False
+    assert res["guard"] is True
+    assert res["error_class"] == "guard"
+    assert res["error"] == "Table 'r' is not permitted."
+    assert calls == []
+
+
+def test_run_live_select_allowed_tables_accepts_the_listed_table(live_cfg):
+    res = _live(live_cfg, "SELECT n FROM r", row_cap=100,
+                allowed_tables={("", "r"), ("main", "r")})
+    assert res["ok"] is True, res.get("error")
+    assert len(res["df"]) == 25
+
+
+def test_sample_rows_carries_an_error_class(live_cfg, monkeypatch):
+    def boom(*a, **kw):
+        raise TimeoutError("statement timed out")
+    monkeypatch.setattr(db_connector, "get_engine", boom)
+    res = db_connector.sample_rows(live_cfg, "", None, "r", sid="t")
+    assert res["ok"] is False
+    assert res["error_class"] == "timeout"
+
+
+# ===========================================================================
+# wrap_with_row_limit hoists a leading CTE block above the outer SELECT
+# ===========================================================================
+CTE_INNER = "WITH c AS (SELECT a FROM t) SELECT a FROM c"
+
+
+@pytest.mark.parametrize("key, expected", [
+    ("postgresql", "WITH c AS (SELECT a FROM t) SELECT * FROM (SELECT a FROM c) "
+                   "AS pdc_q LIMIT 11"),
+    ("mysql", "WITH c AS (SELECT a FROM t) SELECT * FROM (SELECT a FROM c) "
+              "AS pdc_q LIMIT 11"),
+    ("mariadb", "WITH c AS (SELECT a FROM t) SELECT * FROM (SELECT a FROM c) "
+                "AS pdc_q LIMIT 11"),
+    ("clickhouse", "WITH c AS (SELECT a FROM t) SELECT * FROM (SELECT a FROM c) "
+                   "AS pdc_q LIMIT 11"),
+    ("sqlite", "WITH c AS (SELECT a FROM t) SELECT * FROM (SELECT a FROM c) "
+               "AS pdc_q LIMIT 11"),
+    ("mssql", "WITH c AS (SELECT a FROM t) SELECT TOP 11 * FROM (SELECT a FROM c) "
+              "AS pdc_q"),
+    ("oracle", "WITH c AS (SELECT a FROM t) SELECT * FROM (SELECT a FROM c) "
+               "pdc_q FETCH FIRST 11 ROWS ONLY"),
+])
+def test_wrap_hoists_a_cte_per_dialect(key, expected):
+    assert db_connector.wrap_with_row_limit(CTE_INNER, key, 11) == expected
+
+
+def test_wrap_hoists_a_recursive_cte():
+    inner = ("WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r "
+             "WHERE n < 3) SELECT n FROM r")
+    out = db_connector.wrap_with_row_limit(inner, "postgresql", 11)
+    assert out == ("WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r "
+                   "WHERE n < 3) SELECT * FROM (SELECT n FROM r) AS pdc_q LIMIT 11")
+
+
+def test_wrap_hoists_two_ctes():
+    inner = "WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT x FROM a"
+    out = db_connector.wrap_with_row_limit(inner, "postgresql", 11)
+    assert out == ("WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) "
+                   "SELECT * FROM (SELECT x FROM a) AS pdc_q LIMIT 11")
+
+
+def test_wrap_hoisted_cte_mssql_order_by_gets_offset_inside():
+    out = db_connector.wrap_with_row_limit(
+        "WITH c AS (SELECT a FROM t) SELECT a FROM c ORDER BY a", "mssql", 11)
+    assert out == ("WITH c AS (SELECT a FROM t) SELECT TOP 11 * FROM "
+                   "(SELECT a FROM c ORDER BY a OFFSET 0 ROWS) AS pdc_q")
+
+
+def test_wrap_hoisted_cte_text_is_verbatim():
+    """Odd spacing and case inside the CTE block survive: neither half is
+    re-rendered."""
+    inner = "with  c   as (select a   from t)  SELECT a FROM c"
+    out = db_connector.wrap_with_row_limit(inner, "postgresql", 11)
+    assert out.startswith("with  c   as (select a   from t)")
+    assert out.endswith("SELECT * FROM (SELECT a FROM c) AS pdc_q LIMIT 11")
+
+
+def test_wrap_hoists_a_clickhouse_expression_cte():
+    out = db_connector.wrap_with_row_limit("WITH 1 AS x SELECT x", "clickhouse", 11)
+    assert out == "WITH 1 AS x SELECT * FROM (SELECT x) AS pdc_q LIMIT 11"
+
+
+def test_wrap_hoists_a_cte_whose_body_is_a_union():
+    inner = "WITH c AS (SELECT a FROM t) SELECT a FROM c UNION SELECT a FROM u"
+    out = db_connector.wrap_with_row_limit(inner, "postgresql", 11)
+    assert out == ("WITH c AS (SELECT a FROM t) SELECT * FROM "
+                   "(SELECT a FROM c UNION SELECT a FROM u) AS pdc_q LIMIT 11")
+
+
+def test_wrap_without_a_cte_is_unchanged_by_the_hoist():
+    assert db_connector.wrap_with_row_limit(INNER, "postgresql", 11) == \
+        f"SELECT * FROM ({INNER}) AS pdc_q LIMIT 11"
+
+
+def test_run_live_select_sends_the_hoisted_form(live_cfg, monkeypatch):
+    captured = []
+
+    def fake_read_sql(sql, con, *a, **kw):
+        captured.append(str(getattr(sql, "text", sql)))
+        frame = pd.DataFrame({"n": [1]})
+        return iter([frame]) if kw.get("chunksize") else frame
+
+    monkeypatch.setattr(db_connector.pd, "read_sql", fake_read_sql)
+    res = _live(live_cfg, "WITH c AS (SELECT n FROM r WHERE n <= 3) SELECT n FROM c",
+                row_cap=10)
+    assert res["ok"] is True, res.get("error")
+    assert captured, "pd.read_sql was never called"
+    assert captured[-1] == ("WITH c AS (SELECT n FROM r WHERE n <= 3) "
+                            "SELECT * FROM (SELECT n FROM c) AS pdc_q LIMIT 11")
+
+
+def test_run_live_select_cte_on_sqlite_still_returns_the_rows(live_cfg):
+    res = _live(live_cfg,
+                "WITH c AS (SELECT n FROM r WHERE n <= 3) SELECT n FROM c ORDER BY n",
+                row_cap=100)
+    assert res["ok"] is True, res.get("error")
+    assert list(res["df"]["n"]) == [1, 2, 3]
+
+
+# ===========================================================================
+# the result size cap (LIVE_RESULT_MAX_MB)
+# ===========================================================================
+def test_live_result_max_mb_default(monkeypatch):
+    from settings import Settings
+    monkeypatch.delenv("LIVE_RESULT_MAX_MB", raising=False)
+    assert getattr(Settings(), "LIVE_RESULT_MAX_MB", None) == 256
+
+
+def test_live_result_max_mb_env_value_is_read(monkeypatch):
+    from settings import Settings
+    monkeypatch.setenv("LIVE_RESULT_MAX_MB", "3")
+    assert getattr(Settings(), "LIVE_RESULT_MAX_MB", None) == 3
+
+
+@pytest.mark.parametrize("raw", ["abc", "", "1e6"])
+def test_live_result_max_mb_garbage_falls_back(monkeypatch, raw):
+    from settings import Settings
+    monkeypatch.setenv("LIVE_RESULT_MAX_MB", raw)
+    assert getattr(Settings(), "LIVE_RESULT_MAX_MB", None) == 256
+
+
+@pytest.mark.parametrize("raw", ["0", "-3"])
+def test_live_result_max_mb_floor_is_one(monkeypatch, raw):
+    from settings import Settings
+    monkeypatch.setenv("LIVE_RESULT_MAX_MB", raw)
+    assert getattr(Settings(), "LIVE_RESULT_MAX_MB", None) == 1
+
+
+@pytest.fixture
+def wide_cfg(tmp_path):
+    """sqlite table w(n, s): 3000 rows of 1000-character text (about 3 MB in
+    memory) — under the row cap, over a 1 MB size cap."""
+    db = tmp_path / "wide.db"
+    eng = create_engine(f"sqlite+pysqlite:///{db}")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE w (n INTEGER PRIMARY KEY, s TEXT)"))
+        payload = "x" * 1000
+        for i in range(1, 3001):
+            conn.execute(text("INSERT INTO w VALUES (:n, :s)"),
+                         {"n": i, "s": payload})
+    eng.dispose()
+    return {"db_type": "sqlite", "url_override": f"sqlite+pysqlite:///{db}"}
+
+
+def test_run_live_select_truncates_by_bytes(wide_cfg, monkeypatch):
+    _set_setting(monkeypatch, "LIVE_RESULT_MAX_MB", 1)
+    res = _live(wide_cfg, "SELECT n, s FROM w ORDER BY n", row_cap=100_000)
+    assert res["ok"] is True, res.get("error")
+    assert res["truncated"] is True
+    assert res["truncated_by"] == "bytes"
+    assert 0 < len(res["df"]) < 3000
+    assert res["rows"] == len(res["df"])
+    assert res["df"]["s"].map(len).eq(1000).all()
+
+
+def test_run_live_select_truncated_by_names_the_row_cap(live_cfg):
+    res = _live(live_cfg, "SELECT n FROM r ORDER BY n", row_cap=10)
+    assert res["truncated"] is True
+    assert res["truncated_by"] == "rows"
+    ok = _live(live_cfg, "SELECT n FROM r", row_cap=100)
+    assert ok["truncated"] is False
+    assert not ok.get("truncated_by")
+
+
+# ===========================================================================
+# denylist additions: notifications, server control, WAL, large objects,
+# session settings, named locks, audit / trace file readers, network ACLs,
+# web-service calls
+# ===========================================================================
+NEGATIVE_MORE += [
+    ("pg-notify", "SELECT pg_notify('c', 'p')", "postgresql"),
+    ("pg-reload-conf", "SELECT pg_reload_conf()", "postgresql"),
+    ("pg-switch-wal", "SELECT pg_switch_wal()", "postgresql"),
+    ("pg-create-restore-point", "SELECT pg_create_restore_point('x')",
+     "postgresql"),
+    ("pg-lo-unlink", "SELECT lo_unlink(1)", "postgresql"),
+    ("pg-set-config", "SELECT set_config('x', 'y', false)", "postgresql"),
+    ("mysql-release-lock", "SELECT RELEASE_LOCK('x')", "mysql"),
+    ("tsql-fn-xe-file-target-read-file",
+     "SELECT * FROM fn_xe_file_target_read_file('x', NULL, NULL, NULL)", "mssql"),
+    ("tsql-fn-get-audit-file",
+     "SELECT * FROM fn_get_audit_file('x', NULL, NULL)", "mssql"),
+    ("oracle-dbms-network-acl-admin",
+     "SELECT DBMS_NETWORK_ACL_ADMIN.check_privilege('a', 'b', 'c') FROM dual",
+     "oracle"),
+    ("oracle-utl-dbws", "SELECT UTL_DBWS.create_service('x') FROM dual", "oracle"),
+]
+
+_ADDED_IDS = {"pg-notify", "pg-reload-conf", "pg-switch-wal",
+              "pg-create-restore-point", "pg-lo-unlink", "pg-set-config",
+              "mysql-release-lock", "tsql-fn-xe-file-target-read-file",
+              "tsql-fn-get-audit-file", "oracle-dbms-network-acl-admin",
+              "oracle-utl-dbws"}
+
+
+def test_denylist_additions_are_present():
+    for name in ("pg_notify", "pg_reload_conf", "pg_switch_wal",
+                 "pg_create_restore_point", "lo_unlink", "set_config",
+                 "release_lock", "fn_xe_file_target_read_file",
+                 "fn_get_audit_file", "dbms_network_acl_admin", "utl_dbws"):
+        assert db_connector._is_denied_function(name), name
+        assert db_connector._is_denied_function(name.upper()), name
+
+
+@pytest.mark.parametrize("strict", [True, False], ids=["strict", "lenient"])
+@pytest.mark.parametrize("sql, dialect",
+                         [c[1:] for c in NEGATIVE_MORE if c[0] in _ADDED_IDS],
+                         ids=[c[0] for c in NEGATIVE_MORE if c[0] in _ADDED_IDS])
+def test_denylist_additions_refuse(sql, dialect, strict):
+    with pytest.raises(ValueError):
+        _guard(sql, allow_cte=True, strict_parse=strict, dialect=dialect)
+
+
+# ===========================================================================
+# a driver's own execution-time-exceeded error is a timeout on every dialect
+# ===========================================================================
+_DRIVER_TIMEOUTS = [
+    ("mysql-3024", _Wrapped(_Orig(
+        3024, "Query execution was interrupted, maximum statement execution "
+              "time exceeded"))),
+    ("pg-57014", _pg("57014")),
+    ("odbc-HYT00", _odbc("HYT00")),
+]
+
+
+@pytest.mark.parametrize("exc", [c[1] for c in _DRIVER_TIMEOUTS],
+                         ids=[c[0] for c in _DRIVER_TIMEOUTS])
+def test_is_timeout_recognises_the_driver_code(exc):
+    """The count verdict and the live query share this classifier: a
+    statement-time-exceeded error is a timeout by its driver CODE, not only
+    by the wording of its message."""
+    assert db_connector._is_timeout(exc) is True
+
+
+@pytest.mark.parametrize("exc", [c[1] for c in _DRIVER_TIMEOUTS],
+                         ids=[c[0] for c in _DRIVER_TIMEOUTS])
+def test_run_live_select_driver_timeout_is_flagged_and_classified(live_cfg,
+                                                                  monkeypatch,
+                                                                  exc):
+    def boom(*a, **kw):
+        raise exc
+    monkeypatch.setattr(db_connector, "get_engine", boom)
+    res = _live(live_cfg, "SELECT n FROM r", row_cap=10)
+    assert res["ok"] is False
+    assert res["timed_out"] is True
+    assert res["error_class"] == "timeout"
+    assert res["error"] == "The live query timed out."

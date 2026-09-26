@@ -103,3 +103,24 @@ def test_safe_preview_output_always_json_serializable():
                       {"bad": df}, df, [df]):
         out = run_chat_local._safe_preview(candidate)
         json.dumps(out)  # never raises, whatever came in
+
+
+def test_live_fields_round_trip_through_append_history(store):
+    """An AI row remembers the live SELECT it was computed with (`sql`),
+    whether the fetch was capped (`live_truncated`) and the rows per table
+    (`live_rows`, numpy ints included); every history writer normalizes them."""
+    conv = store.new_conversation(title="t")
+    rec = {"role": "ai", "content": "x", "code": "RESULT = dfs['live t']",
+           "sql": {"live t": "SELECT a FROM t", "other": None},
+           "live_truncated": True,
+           "live_rows": {"live t": np.int64(25)}, "ts": 1.0}
+    store.append_history(conv, rec)
+    row = store.get_history(conv)[0]
+    assert row["sql"] == {"live t": "SELECT a FROM t", "other": None}
+    assert row["live_truncated"] is True
+    assert row["live_rows"] == {"live t": 25}
+    safe = local_store._json_safe(rec)
+    json.dumps(safe)
+    assert safe["live_rows"] == {"live t": 25}
+    kept = store.truncate_conv_history(conv, 1)
+    assert kept[0]["sql"] == {"live t": "SELECT a FROM t", "other": None}

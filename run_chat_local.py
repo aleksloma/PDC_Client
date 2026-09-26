@@ -77,6 +77,318 @@ def _infrastructure_answer(sid, error_text) -> Optional[str]:
     return _INFRA_DOWN_TEXT
 
 
+# ---------------------------------------------------------------------------
+# Live database tables: the pre-fetch that runs in THIS process right before
+# the sandbox. A live table's frame is an empty typed placeholder until the
+# code about to run references it; then the planner's own SELECT (or, without
+# one / behind an admin row filter, the connector's capped default read) is
+# executed by db_connector and the result takes the placeholder's key. The
+# sandbox only ever sees a frame (Article XIV: SQL never runs there).
+# ---------------------------------------------------------------------------
+_LIVE_ROLE_DENIED_TEXT = ("You no longer have access to {table}; ask your "
+                          "administrator.")
+_LIVE_FAILED_PREFIX = "Live query for table '{table}' failed: {sentence}"
+
+
+def _new_live_state(plan_out: dict | None = None) -> dict:
+    """The per-turn live state shared by every executor call and retry:
+    `sql_map` (df key -> the planner's SELECT), `fetched` (keys whose frame
+    is in place), `sql_used` (what actually ran: the SQL text, or None for
+    a default read), `live_rows`, `truncated`, `failed_sql` (key -> the
+    SELECT that failed, so it is never re-run or replaced by a default read
+    until the planner sends a new one), `sql_error` (the value-free shape of
+    the LAST failure), `failed_key` / `failed_text`, `role_denied`."""
+    state = {"sql_map": {}, "fetched": set(), "sql_used": {}, "live_rows": {},
+             "truncated": set(), "failed_sql": {}, "failed_sql_error": {},
+             "failed_sql_text": {}, "sql_error": None,
+             "failed_key": None, "failed_text": None, "role_denied": None}
+    _merge_retry_sql(state, plan_out)
+    return state
+
+
+def _merge_retry_sql(state: dict, response: dict | None) -> None:
+    """Take a plan / retry response's `sql` map into the state: a NEW SELECT
+    for a key drops it from `fetched` (re-fetched before the next executor
+    call) and from `failed_sql`. Non-string entries are ignored."""
+    new = (response or {}).get("sql") if isinstance(response, dict) else None
+    if not isinstance(new, dict):
+        return
+    for key, sql in new.items():
+        if isinstance(key, str) and isinstance(sql, str) and sql.strip():
+            state["sql_map"][key] = sql
+            state["fetched"].discard(key)
+            state["failed_sql"].pop(key, None)
+
+
+def _live_specs(schema_docs, dfs) -> dict:
+    """{df key: {dialect, row_cap, filtered, db_ref}} for the chat's LIVE
+    tables that are loaded (present in `dfs`)."""
+    out = {}
+    for key, doc in (schema_docs or {}).items():
+        if not (isinstance(doc, dict) and doc.get("source") == "database"
+                and doc.get("live")):
+            continue
+        if dfs is not None and key not in dfs:
+            continue
+        out[key] = {"dialect": doc.get("dialect") or "",
+                    "row_cap": doc.get("row_cap"),
+                    "filtered": bool(doc.get("filtered")),
+                    "db_ref": doc.get("db_ref") or {}}
+    return out
+
+
+def _live_tables_for_brain(specs: dict) -> list | None:
+    """The `live_tables` rows of the plan / retry payload, None when the
+    chat has no live table (the payload then carries no such key)."""
+    rows = [{"name": key, "dialect": spec["dialect"], "row_cap": spec["row_cap"],
+             "filtered": spec["filtered"]} for key, spec in specs.items()]
+    return rows or None
+
+
+def _live_failure_out(state: dict) -> dict:
+    """The executor-shaped error dict for an attempt whose live fetch failed
+    (the sandbox is NOT run): `error` is the value-free sentence the retry
+    prompt gets; `live_failed` tells the loops it was not an execution
+    error (no infrastructure verdict); `live_role_denied` ends the turn."""
+    if state.get("role_denied"):
+        return {"error": _LIVE_ROLE_DENIED_TEXT.format(table=state["role_denied"]),
+                "result": None, "preview": None, "image_base64": None,
+                "live_failed": True, "live_role_denied": True}
+    return {"error": _LIVE_FAILED_PREFIX.format(table=state.get("failed_key"),
+                                                sentence=state.get("failed_text")),
+            "result": None, "preview": None, "image_base64": None,
+            "live_failed": True}
+
+
+def _live_role_denied_result(state: dict, code, usage) -> dict:
+    return {"text": _LIVE_ROLE_DENIED_TEXT.format(table=state.get("role_denied")),
+            "image_base64": None, "table": None, "code": code, "usage": usage}
+
+
+def _allowed_table_pairs(row: dict, cfg: dict) -> set:
+    """The (schema, table) pairs the guard accepts for one registration: the
+    registered schema, the unqualified name and the connection's database
+    name (MySQL / ClickHouse registrations carry no schema and the planner
+    may qualify with the database) — all lowercased."""
+    table = str(row.get("table_name") or "").lower()
+    pairs = {("", table), (str(row.get("schema") or "").lower(), table)}
+    database = cfg.get("database")
+    if isinstance(database, str) and database.strip():
+        pairs.add((database.strip().lower(), table))
+    return pairs
+
+
+_DFS_GENERIC_RE = re.compile(r"\bdfs\b")
+
+
+def _referenced_live_keys(code: str, live_keys, all_keys) -> tuple[list, list]:
+    """(named, generic) live keys the code is about to use.
+
+    NAMED: the key's name appears anywhere in the text as a plain quoted
+    substring (`'key'` or `"key"`) — `dfs['key']`, `dfs.get("key")` and
+    `name = "key"; dfs[name]` all count. GENERIC: after every named-key form
+    (`dfs['k']`, `dfs["k"]`, `dfs.get('k')`, `dfs.get("k")`) and every
+    quoted df key of the chat is removed, the text still uses `dfs`
+    (iteration, `.values()` / `.items()` / `.keys()`, `in dfs`, a variable
+    index) — then every live key not named is generic, because an empty
+    placeholder must never reach the executor silently. Code that names only
+    other keys and uses `dfs` in no generic form references nothing. This
+    only decides WHICH keys are fetched; the fetch method (the planner's
+    SELECT when one exists, else the default read) is the same for both."""
+    text = code or ""
+    named = [k for k in live_keys if f"'{k}'" in text or f'"{k}"' in text]
+    stripped = text
+    for key in sorted(set(all_keys or ()) | set(live_keys), key=len, reverse=True):
+        for quoted in (f"'{key}'", f'"{key}"'):
+            stripped = stripped.replace(f"dfs[{quoted}]", "")
+            stripped = stripped.replace(f"dfs.get({quoted})", "")
+            stripped = stripped.replace(quoted, "")
+    if not _DFS_GENERIC_RE.search(stripped):
+        return named, []
+    return named, [k for k in live_keys if k not in named]
+
+
+def _ensure_live(sid, dfs: dict, schema_docs, code: str, state: dict,
+                 user_email, *, check_role: bool = True) -> bool:
+    """Fetch every LIVE table `code` references that is not in place yet.
+    IDEMPOTENT: called immediately before EVERY executor call, so a key
+    first referenced by a retry's code is fetched too. True when the code
+    may run; False when a fetch failed (`state["sql_error"]`,
+    `failed_key`, `failed_text` describe it) or the requester's role does
+    not cover a referenced table (`state["role_denied"]`).
+
+    What counts as referenced is `_referenced_live_keys` (a key NAMED in
+    the code in either quote style, or every unfetched live key when the
+    code walks `dfs` GENERICALLY). That rule decides WHETHER a key is
+    fetched, never how: every referenced key takes the planner's SELECT
+    when `sql_map` carries one for it, else the default read.
+
+    Per key: the role gate (`roles_store.allowed_table_ids_for`, connectors
+    exempt; the stream already dropped uncovered keys — this is defence in
+    depth against a planner-invented key or a revocation mid-turn; the
+    refresh paths, whose route gate already ran, pass `check_role=False`),
+    then the connection decrypted into a local, then EITHER the planner's
+    SELECT through `run_live_select` bound to exactly this table
+    (`allowed_tables`) OR — no SELECT, or an admin row filter on the
+    registration — `default_live_fetch`. A SELECT that failed is never
+    re-run and never replaced by a default read until the planner sends a
+    new one. Logs carry the key, counts and the error CLASS — never the SQL
+    text, never a driver message."""
+    try:
+        specs = _live_specs(schema_docs, dfs)
+        if not specs:
+            return True
+        named, generic = _referenced_live_keys(code, list(specs), list(dfs or {}))
+        referenced = [k for k in named + generic if k not in state["fetched"]]
+        if not referenced:
+            return True
+        state["sql_error"] = None
+        state["failed_key"] = None
+        state["failed_text"] = None
+        from db_sources import DataSourceStore, decrypt_password
+        import db_connector
+        import roles_store
+        store = DataSourceStore()
+        rows = {}
+        for key in referenced:
+            tid = (specs[key].get("db_ref") or {}).get("table_id")
+            rows[key] = store.get_table(tid) if tid else None
+        try:
+            allowed = roles_store.allowed_table_ids_for(user_email)                 if (check_role and user_email) else set()
+        except Exception as e:                               # noqa: BLE001
+            log_with_sid(sid, "warning",
+                         f"LIVE_ROLE_PROBE_FAILED error={log_safe_text(type(e).__name__, 80)}")
+            allowed = set()
+        for key in (referenced if check_role else []):
+            row = rows.get(key)
+            if row is not None and row.get("is_connector"):
+                continue
+            tid = (row or {}).get("id") or (specs[key].get("db_ref") or {}).get("table_id")
+            if tid not in allowed:
+                state["role_denied"] = key
+                log_with_sid(sid, "warning",
+                             f"LIVE_ROLE_DENIED table={log_safe_text(str(key), 120)}")
+                return False
+        current_key = None
+        for key in referenced:
+            current_key = key
+            spec = specs[key]
+            row = rows.get(key)
+            sql = state["sql_map"].get(key)
+            if spec["filtered"] and sql:
+                log_with_sid(sid, "info",
+                             f"LIVE_SQL_IGNORED_FILTERED table={log_safe_text(str(key), 120)}")
+                sql = None
+            if sql and state["failed_sql"].get(key) == sql:
+                # The same SELECT failed on an earlier attempt of this turn
+                # and the planner sent no new one: a failed attempt, never a
+                # default read that would silently change the answer.
+                state["sql_error"] = state["failed_sql_error"].get(key)
+                state["failed_key"] = key
+                state["failed_text"] = state["failed_sql_text"].get(key)
+                return False
+            cid = (row or {}).get("connection_id") or \
+                (spec.get("db_ref") or {}).get("connection_id")
+            conn = store.get_connection(cid, with_secret=True) if cid else None
+            if row is None or conn is None:
+                res = {"ok": False, "error": db_connector.error_class_text("other"),
+                       "error_class": "other"}
+            else:
+                password = decrypt_password(conn.get("password_enc")) or ""
+                cap = spec.get("row_cap")
+                if not (isinstance(cap, int) and not isinstance(cap, bool) and cap > 0):
+                    cap = int(settings.LIVE_RESULT_ROW_CAP)
+                if sql:
+                    res = db_connector.run_live_select(
+                        conn, password, sql, dialect=spec.get("dialect") or None,
+                        row_cap=cap, allowed_tables=_allowed_table_pairs(row, conn),
+                        sid=sid)
+                else:
+                    res = db_connector.default_live_fetch(conn, password, row,
+                                                          cap=cap, sid=sid)
+                password = None
+            state["sql_used"][key] = sql or None
+            if res.get("ok") and res.get("df") is not None:
+                df = res["df"]
+                try:
+                    df.attrs["pdc_live"] = True
+                except Exception as e:                       # noqa: BLE001
+                    log_with_sid(sid, "info",
+                                 f"LIVE_ATTRS_SKIPPED table={log_safe_text(str(key), 120)} "
+                                 f"error={log_safe_text(type(e).__name__, 80)}")
+                dfs[key] = df
+                state["fetched"].add(key)
+                state["live_rows"][key] = int(res.get("rows") or len(df))
+                if res.get("truncated"):
+                    state["truncated"].add(key)
+                else:
+                    state["truncated"].discard(key)
+                log_with_sid(sid, "info",
+                             f"LIVE_PREFETCH table={log_safe_text(str(key), 120)} "
+                             f"rows={int(res.get('rows') or len(df))} "
+                             f"truncated={bool(res.get('truncated'))} "
+                             f"elapsed_ms={int(res.get('elapsed_ms') or 0)}")
+                continue
+            cls = res.get("error_class") or "other"
+            guard = bool(res.get("guard"))
+            sentence = str(res.get("error") or db_connector.error_class_text(cls))
+            state["sql_error"] = brain_client.live_sql_error(
+                key, spec.get("dialect") or "", cls, guard=guard,
+                message=sentence if guard else None)
+            state["failed_key"] = key
+            state["failed_text"] = sentence
+            if sql:
+                state["failed_sql"][key] = sql
+                state["failed_sql_error"][key] = state["sql_error"]
+                state["failed_sql_text"][key] = sentence
+            log_with_sid(sid, "warning",
+                         f"LIVE_PREFETCH_FAILED table={log_safe_text(str(key), 120)} "
+                         f"class={log_safe_text(str(cls), 40)}")
+            return False
+        return True
+    except Exception as e:                                   # noqa: BLE001
+        # Raised about registry rows and frames, so the text could quote a
+        # label: the exception TYPE and a fixed reason only.
+        key = locals().get("current_key")
+        log_with_sid(sid, "error",
+                     f"LIVE_PREFETCH_CRASHED table={log_safe_text(str(key or '?'), 120)} "
+                     f"error={log_safe_text(type(e).__name__, 80)} "
+                     f"reason=prefetch_helper_failed")
+        state["sql_error"] = None
+        state["failed_key"] = key or state.get("failed_key") or "?"
+        state["failed_text"] = "The database could not run the query."
+        return False
+
+
+def _finish_live_result(out: dict, state: dict, question: str, sid) -> dict:
+    """Attach the live fields (`sql`, `live_truncated`, `live_rows`) to a
+    turn's result dict and append the localized truncation note to its
+    text when a capped fetch fed the answer."""
+    try:
+        out = dict(out or {})
+        out["sql"] = dict(state.get("sql_used") or {})
+        out["live_truncated"] = bool(state.get("truncated"))
+        out["live_rows"] = dict(state.get("live_rows") or {})
+        if state.get("truncated") and out.get("text"):
+            out["text"] = _append_live_notes(out["text"], state, question)
+        return out
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid(sid, "warning",
+                     f"LIVE_RESULT_FIELDS_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return out
+
+
+def _append_live_notes(text: str, state: dict, question: str) -> str:
+    lang = _detect_answer_language(question)
+    notes = [result_backstop.live_truncated_sentence(
+                 lang, key, state["live_rows"].get(key))
+             for key in sorted(state.get("truncated") or ())]
+    note = " ".join(n for n in notes if n)
+    if not note:
+        return text
+    return f"{text}\n\n{note}" if text else note
+
+
 def _styler_to_html(result_obj) -> Optional[str]:
     """Render a pandas Styler to self-contained HTML (gradient + .format kept).
 
@@ -260,7 +572,7 @@ def _other_registered_tables(schema_docs, dfs, user_email) -> list:
         if not any(isinstance(v, dict) and v.get("source") == "database"
                    for v in docs.values()):
             return []
-        from db_sources import DataSourceStore
+        from db_sources import DataSourceStore, table_mode
         from roles_store import allowed_table_ids_for
         rows = DataSourceStore().list_tables(include_connector=False)
         if not rows:
@@ -292,14 +604,17 @@ def _other_registered_tables(schema_docs, dfs, user_email) -> list:
                                       for p in (rel.get("join_keys") or [])
                                       if isinstance(p, (list, tuple)) and len(p) == 2],
                     })
-            out.append({
+            row = {
                 "id": t.get("id"),
                 "display_name": name,
                 "updated_at": t.get("updated_at"),
                 "columns": [str(c.get("name"))
                             for c in (t.get("columns") or []) if isinstance(c, dict)],
                 "relations": relations,
-            })
+            }
+            if table_mode(t) == "live":
+                row["live"] = True
+            out.append(row)
         out.sort(key=lambda r: r["display_name"])
         return out[:20]
     except Exception as e:
@@ -360,13 +675,34 @@ def run_chat(
           "table": dict | None,
           "code": str | None,
           "usage": dict,
+          "sql": dict,            # live tables: df key -> SELECT run, or None
+          "live_truncated": bool,
+          "live_rows": dict,
         }
     """
+    state = _new_live_state()
+    out = _run_chat_body(sid=sid, dfs=dfs, schema_docs=schema_docs,
+                         question=question, history_rows=history_rows,
+                         user_email=user_email, common_fields=common_fields,
+                         dataset_profile=dataset_profile, state=state)
+    return _finish_live_result(out, state, question, sid)
+
+
+def _run_chat_body(*, sid, dfs, schema_docs, question, history_rows, user_email,
+                   common_fields, dataset_profile, state) -> dict:
     df_names = list(dfs.keys())
     df_columns = {name: list(df.columns) for name, df in dfs.items()}
     schema_str = build_schema_text(
         schema_docs or {}, dfs, common_fields,
         other_tables=_other_registered_tables(schema_docs, dfs, user_email))
+    live_tables = _live_tables_for_brain(_live_specs(schema_docs, dfs))
+
+    def _exec(code_, kind_, **kw):
+        # The live pre-fetch runs before EVERY executor call (idempotent).
+        if not _ensure_live(sid, dfs, schema_docs, code_, state, user_email):
+            return _live_failure_out(state)
+        fn = render_plot_safe if kind_ == "PLOT_CODE" else safe_execute
+        return fn(code_, dfs, sid, **kw)
 
     # 1) Plan
     plan_out = brain_client.plan(
@@ -378,7 +714,9 @@ def run_chat(
         common_fields=common_fields,
         user_email=user_email,
         dataset_profile=dataset_profile,
+        live_tables=live_tables,
     )
+    _merge_retry_sql(state, plan_out)
     kind = plan_out.get("kind")
     code = plan_out.get("code") or ""
     usage = plan_out.get("usage") or {}
@@ -404,16 +742,19 @@ def run_chat(
         return {"text": "I couldn't generate analysis code for this question. Try rephrasing.", "image_base64": None, "table": None, "code": None, "usage": usage}
 
     # 2) Execute locally with retry (up to 3 attempts matching B2C policy)
-    executor = render_plot_safe if kind == "PLOT_CODE" else safe_execute
-    exec_out = executor(code, dfs, sid) if kind == "PLOT_CODE" else executor(code, dfs, sid)
+    exec_out = _exec(code, kind)
 
     retry_count = 0
     max_retries = 3  # up to 3 retry attempts; escalate to pro/search from the 2nd
     while exec_out.get("error") and retry_count < max_retries:
+        if exec_out.get("live_role_denied"):
+            return _live_role_denied_result(state, code, usage)
         error_msg = exec_out.get("error", "Unknown")
         # The sandbox itself failed: no rewrite of this code can help, so
         # answer once instead of spending three brain calls on an outage.
-        infra_text = _infrastructure_answer(sid, error_msg)
+        # (A failed live fetch is a query error, never an outage verdict.)
+        infra_text = None if exec_out.get("live_failed") else \
+            _infrastructure_answer(sid, error_msg)
         if infra_text:
             return {"text": infra_text, "image_base64": None, "table": None,
                     "code": code, "usage": usage}
@@ -429,7 +770,10 @@ def run_chat(
             use_pro=use_pro, use_search=use_search,
             user_email=user_email,
             dataset_profile=dataset_profile,
+            sql=state["sql_map"] or None, sql_error=state["sql_error"] or None,
+            live_tables=live_tables,
         )
+        _merge_retry_sql(state, retry_out)
         new_code = retry_out.get("code") or ""
         new_kind = retry_out.get("kind")
         usage = _sum_usage(usage, retry_out.get("usage") or {})
@@ -441,15 +785,17 @@ def run_chat(
             continue
         code = new_code
         kind = new_kind
-        executor = render_plot_safe if kind == "PLOT_CODE" else safe_execute
-        exec_out = executor(code, dfs, sid)
+        exec_out = _exec(code, kind)
+
+    if exec_out.get("live_role_denied"):
+        return _live_role_denied_result(state, code, usage)
 
     # One-figure-per-chart: if the chart still combines multiple axes after the
     # retries (used by Auto Analytics, which renders one finding at a time),
     # split it and keep the FIRST single-figure chart — so a deck slide never
     # shows two plots in one image and is never silently dropped.
     if exec_out.get("multi_axes"):
-        split_out = render_plot_safe(code, dfs, sid, split_multi_axes=True)
+        split_out = _exec(code, "PLOT_CODE", split_multi_axes=True)
         sub = [c for c in (split_out.get("multi_charts") or []) if c.get("image")]
         if sub:
             d = _describe_with_backstop(sid, question, code, user_email,
@@ -484,11 +830,13 @@ def run_chat(
             error_msg=_PLOTLY_REGEN_INSTRUCTION, failed_code=code,
             use_pro=False, use_search=False, user_email=user_email,
             dataset_profile=dataset_profile,
+            sql=state["sql_map"] or None, sql_error=None, live_tables=live_tables,
         )
+        _merge_retry_sql(state, retry_out)
         usage = _sum_usage(usage, retry_out.get("usage") or {})
         new_code = retry_out.get("code") or ""
         if new_code and retry_out.get("kind") == "PLOT_CODE":
-            re_out = render_plot_safe(new_code, dfs, sid)
+            re_out = _exec(new_code, "PLOT_CODE")
             if not re_out.get("error") and not re_out.get("multi_axes"):
                 code, exec_out = new_code, re_out
 
@@ -1126,15 +1474,35 @@ def run_chat_multi_plot(
         schema_docs or {}, dfs, common_fields,
         other_tables=_other_registered_tables(schema_docs, dfs, user_email))
 
+    live_tables = _live_tables_for_brain(_live_specs(schema_docs, dfs))
+
     # 1) Plan once — reuse the raw_text for single-vs-multi detection
     plan_out = brain_client.plan(
         sid=sid, question=question, schema_text=schema_str,
         df_names=df_names, history_rows=history_rows,
         common_fields=common_fields, user_email=user_email,
-        dataset_profile=dataset_profile,
+        dataset_profile=dataset_profile, live_tables=live_tables,
     )
     raw_text = plan_out.get("raw_text") or ""
     plan_usage = plan_out.get("usage") or {}
+    # The live state is shared across the whole worklist: a table is fetched
+    # once per turn and every block sees the same frame.
+    state = _new_live_state(plan_out)
+
+    def _render(code_, **kw):
+        if not _ensure_live(sid, dfs, schema_docs, code_, state, user_email):
+            return _live_failure_out(state)
+        return render_plot_safe(code_, dfs, sid, **kw)
+
+    def _execute(code_):
+        if not _ensure_live(sid, dfs, schema_docs, code_, state, user_email):
+            return _live_failure_out(state)
+        return safe_execute(code_, dfs, sid)
+
+    def _live_fields():
+        return {"sql": dict(state["sql_used"]),
+                "live_truncated": bool(state["truncated"]),
+                "live_rows": dict(state["live_rows"])}
 
     plot_blocks = _extract_multi_plot_blocks(raw_text)
 
@@ -1158,6 +1526,7 @@ def run_chat_multi_plot(
                 kind=kind, code=code, usage=plan_usage,
                 context_decision=context_decision,
                 dataset_profile=dataset_profile,
+                state=state, live_tables=live_tables,
             )
             yield {"single_response": True, "result": result}
             return
@@ -1220,14 +1589,20 @@ def run_chat_multi_plot(
         except Exception:
             pass
 
-        plot_out = render_plot_safe(code, dfs, sid)
+        plot_out = _render(code)
 
         # Standard execution-error retry (skip when it's the multi-axes signal).
         retry_count = 0
         infra_text = None
         while plot_out.get("error") and not plot_out.get("multi_axes") and retry_count < 3:
             error_msg = plot_out.get("error", "Unknown")
-            infra_text = _infrastructure_answer(sid, error_msg)
+            if plot_out.get("live_role_denied"):
+                # Ends the turn like an outage does: the sentence is the
+                # answer and no further block is attempted.
+                infra_text = error_msg
+                break
+            infra_text = None if plot_out.get("live_failed") else \
+                _infrastructure_answer(sid, error_msg)
             if infra_text:
                 break
             log_with_sid(sid, "warning",
@@ -1240,7 +1615,10 @@ def run_chat_multi_plot(
                 error_msg=error_msg, failed_code=code,
                 use_pro=use_pro, use_search=use_search, user_email=user_email,
                 dataset_profile=dataset_profile,
+                sql=state["sql_map"] or None, sql_error=state["sql_error"] or None,
+                live_tables=live_tables,
             )
+            _merge_retry_sql(state, retry_out)
             new_code = retry_out.get("code") or ""
             new_kind = retry_out.get("kind")
             total_usage = _sum_usage(total_usage, retry_out.get("usage") or {})
@@ -1251,21 +1629,25 @@ def run_chat_multi_plot(
                 continue
             if new_kind == "PLOT_CODE":
                 code = new_code
-                plot_out = render_plot_safe(code, dfs, sid)
+                plot_out = _render(code)
                 continue
             if new_kind == "PYTHON":
                 # The brain rewrote it as analysis code. Execute it; accept the
                 # chart ONLY if it produced an image, else treat as a failed
                 # attempt and keep retrying.
-                py_out = safe_execute(new_code, dfs, sid)
+                py_out = _execute(new_code)
                 if py_out.get("image_base64"):
                     code = new_code
                     plot_out = py_out
                     break
+                if py_out.get("live_role_denied"):
+                    infra_text = py_out.get("error")
+                    break
                 # This branch dispatches too, so the sandbox can fail here as
                 # well — without the check it would burn the remaining
                 # round-trips after the render already failed for that reason.
-                infra_text = _infrastructure_answer(sid, py_out.get("error"))
+                infra_text = None if py_out.get("live_failed") else \
+                    _infrastructure_answer(sid, py_out.get("error"))
                 if infra_text:
                     break
                 continue
@@ -1295,7 +1677,10 @@ def run_chat_multi_plot(
                     error_msg=plot_out.get("error", ""), failed_code=code,
                     use_pro=True, use_search=False, user_email=user_email,
                     dataset_profile=dataset_profile,
+                    sql=state["sql_map"] or None, sql_error=None,
+                    live_tables=live_tables,
                 )
+                _merge_retry_sql(state, retry_out)
                 total_usage = _sum_usage(total_usage, retry_out.get("usage") or {})
                 new_code = retry_out.get("code") or ""
                 if new_code:
@@ -1304,7 +1689,7 @@ def run_chat_multi_plot(
                         work.append((b, ma_retry + 1, np_retry, mx_retry))
                     continue
             # Fallback: split the rendered figure into one image (+ data) per axis.
-            split_out = render_plot_safe(code, dfs, sid, split_multi_axes=True)
+            split_out = _render(code, split_multi_axes=True)
             sub = [c for c in (split_out.get("multi_charts") or []) if c.get("image")]
             if sub:
                 # Dedup: a split group is ONE analysis (all sub-charts share this
@@ -1338,6 +1723,7 @@ def run_chat_multi_plot(
                         "chart_n": produced, "chart_total": produced + len(work),
                         "usage": dict(total_usage), "code": code,
                         "chart_data": cobj.get("chart_data"),
+                        "sql": dict(state["sql_used"]),
                     }
                     # A split block can expand into several axes — respect the
                     # emit cap within the group too.
@@ -1362,7 +1748,9 @@ def run_chat_multi_plot(
                 error_msg=_PLOTLY_REGEN_INSTRUCTION, failed_code=code,
                 use_pro=False, use_search=False, user_email=user_email,
                 dataset_profile=dataset_profile,
+                sql=state["sql_map"] or None, sql_error=None, live_tables=live_tables,
             )
+            _merge_retry_sql(state, retry_out)
             total_usage = _sum_usage(total_usage, retry_out.get("usage") or {})
             new_code = retry_out.get("code") or ""
             if new_code and retry_out.get("kind") == "PLOT_CODE":
@@ -1389,7 +1777,9 @@ def run_chat_multi_plot(
                 error_msg=_MATRIX_REGEN_INSTRUCTION, failed_code=code,
                 use_pro=False, use_search=False, user_email=user_email,
                 dataset_profile=dataset_profile,
+                sql=state["sql_map"] or None, sql_error=None, live_tables=live_tables,
             )
+            _merge_retry_sql(state, retry_out)
             total_usage = _sum_usage(total_usage, retry_out.get("usage") or {})
             new_code = retry_out.get("code") or ""
             if new_code and retry_out.get("kind") == "PLOT_CODE":
@@ -1457,6 +1847,7 @@ def run_chat_multi_plot(
             "chart_n": produced, "chart_total": produced + len(work),
             "usage": dict(total_usage), "code": code,
             "chart_data": plot_out.get("chart_data"),
+            "sql": dict(state["sql_used"]),
         }
 
     # Execute the extracted TABLE blocks (mixed dashboard answers). Each block
@@ -1478,9 +1869,14 @@ def run_chat_multi_plot(
             log_with_sid(sid, "warning", "MIXED_TABLE_BLOCKS_SKIPPED service_down")
             break
         try:
-            exec_out = safe_execute(tb, dfs, sid)
+            exec_out = _execute(tb)
             if exec_out.get("error"):
-                infra_text = _infrastructure_answer(sid, exec_out.get("error"))
+                if exec_out.get("live_role_denied"):
+                    infra_text = exec_out.get("error")
+                elif exec_out.get("live_failed"):
+                    infra_text = None
+                else:
+                    infra_text = _infrastructure_answer(sid, exec_out.get("error"))
                 if infra_text:
                     # Same reasoning, for an outage that starts HERE (a run
                     # whose chart blocks all succeeded, or one that had none
@@ -1530,12 +1926,15 @@ def run_chat_multi_plot(
         combined_text = "Analysis complete."
     else:
         combined_text = "Something went wrong with this analysis. Please try again."
+    if state["truncated"] and combined_text:
+        combined_text = _append_live_notes(combined_text, state, question)
     log_with_sid(sid, "info", f"MULTI_PLOT_DONE rendered={produced}")
     done_event = {
         "partial": False, "done": True,
         "combined_answer": combined_text,
         "combined_codes": combined_codes,
         "total_usage": total_usage,
+        **_live_fields(),
     }
     if combined_tables:
         done_event["tables"] = combined_tables
@@ -1547,14 +1946,43 @@ def run_chat_multi_plot(
 def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
                            question, history_rows, user_email,
                            kind, code, usage, context_decision,
-                           dataset_profile: dict | None = None) -> dict:
+                           dataset_profile: dict | None = None,
+                           state: dict | None = None,
+                           live_tables: list | None = None) -> dict:
     """Execute one already-planned response (kind/code from a prior /v1/plan)
     locally, reusing the same retry + describe/summarize flow as run_chat.
 
     `dataset_profile` feeds both the retry planner and the result backstop. It
     was referenced by the retry call below without being a parameter (Prompt 13
     oversight) — a failing first execution raised NameError instead of retrying.
+
+    `state` is the turn's live state (the caller's, built from the plan
+    response's `sql`); `live_tables` the payload rows for the retry calls.
+    The result carries `sql`, `live_truncated` and `live_rows`.
     """
+    if state is None:
+        state = _new_live_state()
+    out = _run_single_body(sid=sid, dfs=dfs, schema_docs=schema_docs,
+                           schema_str=schema_str, df_columns=df_columns,
+                           df_names=df_names, question=question,
+                           history_rows=history_rows, user_email=user_email,
+                           kind=kind, code=code, usage=usage,
+                           context_decision=context_decision,
+                           dataset_profile=dataset_profile, state=state,
+                           live_tables=live_tables)
+    return _finish_live_result(out, state, question, sid)
+
+
+def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
+                     question, history_rows, user_email,
+                     kind, code, usage, context_decision,
+                     dataset_profile, state, live_tables) -> dict:
+    def _exec(code_, kind_):
+        if not _ensure_live(sid, dfs, schema_docs, code_, state, user_email):
+            return _live_failure_out(state)
+        fn = render_plot_safe if kind_ == "PLOT_CODE" else safe_execute
+        return fn(code_, dfs, sid)
+
     if kind in ("CLARIFICATION", "ANSWER", "MISSING_DATA"):
         return {"text": code, "image_base64": None, "table": None, "code": None, "usage": usage}
 
@@ -1566,16 +1994,19 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
         return {"text": "I couldn't generate analysis code for this question. Try rephrasing.",
                 "image_base64": None, "table": None, "code": None, "usage": usage}
 
-    executor = render_plot_safe if kind == "PLOT_CODE" else safe_execute
-    exec_out = executor(code, dfs, sid)
+    exec_out = _exec(code, kind)
 
     retry_count = 0
     max_retries = 3  # up to 3 retry attempts; escalate to pro/search from the 2nd
     while exec_out.get("error") and retry_count < max_retries:
+        if exec_out.get("live_role_denied"):
+            return _live_role_denied_result(state, code, usage)
         error_msg = exec_out.get("error", "Unknown")
         # The sandbox itself failed: no rewrite of this code can help, so
         # answer once instead of spending three brain calls on an outage.
-        infra_text = _infrastructure_answer(sid, error_msg)
+        # (A failed live fetch is a query error, never an outage verdict.)
+        infra_text = None if exec_out.get("live_failed") else \
+            _infrastructure_answer(sid, error_msg)
         if infra_text:
             return {"text": infra_text, "image_base64": None, "table": None,
                     "code": code, "usage": usage}
@@ -1591,7 +2022,10 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
             use_pro=use_pro, use_search=use_search,
             user_email=user_email,
             dataset_profile=dataset_profile,
+            sql=state["sql_map"] or None, sql_error=state["sql_error"] or None,
+            live_tables=live_tables,
         )
+        _merge_retry_sql(state, retry_out)
         new_code = retry_out.get("code") or ""
         new_kind = retry_out.get("kind")
         usage = _sum_usage(usage, retry_out.get("usage") or {})
@@ -1603,9 +2037,10 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
             continue
         code = new_code
         kind = new_kind
-        executor = render_plot_safe if kind == "PLOT_CODE" else safe_execute
-        exec_out = executor(code, dfs, sid)
+        exec_out = _exec(code, kind)
 
+    if exec_out.get("live_role_denied"):
+        return _live_role_denied_result(state, code, usage)
     if exec_out.get("error"):
         return {
             "text": "I couldn't run this analysis with your current data. Try rephrasing.",

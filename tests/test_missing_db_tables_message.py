@@ -140,3 +140,39 @@ def test_a_chat_that_still_has_one_working_table_is_not_blocked(client):
     store.write_meta(meta)
     r = client.post(f"/api/chat/{CHAT}/chat/stream", json={"question": "hi?"})
     assert r.status_code != 400 or r.json().get("code") != "DB_TABLES_MISSING"
+
+
+def test_a_live_table_is_not_a_missing_table(client, tmp_path, monkeypatch):
+    """A live registration has no parquet by design: the classifier must not
+    report it, and a question on such a chat reaches the planner instead of
+    the missing-tables message."""
+    cid = "cc11cc11cc11cc11"
+    (Path(tmp_path) / "data_sources.json").write_text(json.dumps({
+        "connections": [{"id": cid, "name": "S", "db_type": "sqlite"}],
+        "tables": [{"id": TID, "connection_id": cid, "schema": "shop",
+                    "table_name": "t", "display_name": "transactions",
+                    "mode": "live", "is_connector": False, "relations": [],
+                    "columns": [{"name": "a", "dtype": "INTEGER"}]}]}),
+        encoding="utf-8")
+    import roles_store
+    rs = roles_store.RolesStore()
+    rs.ensure_base_role()
+    rs.update_role(roles_store.BASE_ROLE_ID,
+                   {"scope_grants": [{"connection_id": cid, "schema": None}]},
+                   actor="ladmin")
+    store = _chat([_db_entry("transactions", TID)])
+    assert local_store.missing_db_tables(store.read_meta()) == []
+    assert local_store.empty_dataset_message(store.read_meta()) == \
+        ("Chat dataset is empty.", [])
+    import routes.chat as chat_mod
+
+    def fake_gen(**kw):
+        yield {"single_response": True,
+               "result": {"text": "ok", "image_base64": None, "table": None,
+                          "code": None, "usage": {}}}
+
+    monkeypatch.setattr(chat_mod.run_chat_local, "run_chat_multi_plot",
+                        lambda **kw: fake_gen(**kw))
+    r = client.post(f"/api/chat/{CHAT}/chat/stream", json={"question": "how many?"})
+    assert r.status_code == 200, r.text[:300]
+    assert '"done": true' in r.text, r.text[-300:]

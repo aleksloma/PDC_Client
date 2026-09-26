@@ -67,14 +67,20 @@ _FULL_KEY_RE = re.compile(r"[0-9a-fA-F]{16}")
 
 
 def _persist_full_table(store, table: dict, code: str | None,
-                        result_key: str | None = None) -> str | None:
+                        result_key: str | None = None,
+                        sql: dict | None = None) -> str | None:
     """Persist {columns, rows, code, total_rows} to disk and mirror it into the
     in-memory LRU. Returns the durable key, or None on failure (caller then
     leaves `full_table_key` unset and the frontend exports the preview rows).
 
     `result_key`: set for one table of a multi-table answer — names the dict
     entry of the re-executed RESULT this table comes from (see
-    `_reexecute_full_df`)."""
+    `_reexecute_full_df`).
+
+    `sql`: the turn's live-table map (df key -> SELECT or None); the subset
+    for the keys `code` references is stored as `sql`, so a re-execution
+    of this record (a dashboard tile, Download Excel) re-runs the same
+    query."""
     try:
         key = secrets.token_hex(8)  # 16 hex chars — matches _FULL_KEY_RE
         record = _json_safe({
@@ -86,6 +92,16 @@ def _persist_full_table(store, table: dict, code: str | None,
             record["code"] = code
         if result_key is not None:
             record["result_key"] = result_key
+        if code and isinstance(sql, dict) and sql:
+            # The same referencing rule as the pre-fetch (named in either
+            # quote style, or every key on a generic `dfs` walk), so a
+            # `dfs.get("k")` answer keeps its SELECT on the durable record.
+            named, generic = run_chat_local._referenced_live_keys(
+                code, list(sql), list(sql))
+            refs = set(named) | set(generic)
+            subset = {k: v for k, v in sql.items() if k in refs}
+            if subset:
+                record["sql"] = _json_safe(subset)
         full_dir = store.conversations_dir / "full"
         full_dir.mkdir(parents=True, exist_ok=True)
         (full_dir / f"{key}.json").write_text(
@@ -149,10 +165,19 @@ async def _reexecute_full_df(chat_id: str, code: str | None, result_key: str | N
         from code_exec import safe_execute
         store = local_store.ChatDataStore(chat_id)
         loop = asyncio.get_running_loop()
-        dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
+        dfs = await loop.run_in_executor(
+            _EXEC, lambda: store.load_dataframes(include_live=True))
         if drop_df_keys:
             dfs = {k: v for k, v in dfs.items() if k not in drop_df_keys}
         if not dfs:
+            return None
+        # Live tables: re-run the SELECT the answer was computed with (the
+        # role gate — when the caller has one — ran before this call).
+        live_err, _sql_used = await loop.run_in_executor(
+            _EXEC, lambda: _prefetch_stored_live(store, code, dfs, chat_id))
+        if live_err is not None:
+            log_with_sid(chat_id, "warning",
+                         f"DOWNLOAD_REEXEC_LIVE_REFUSED code={log_safe_text(str(live_err.get('code') or 'FETCH_FAILED'), 40)}")
             return None
         exec_out = await loop.run_in_executor(
             _EXEC, lambda: safe_execute(code, dfs, sid=chat_id))
@@ -324,9 +349,25 @@ def _build_chart_entry(c: dict) -> dict:
     return entry
 
 
+def _attach_live_fields(rec: dict, src) -> dict:
+    """Copy the live-table fields (`sql`, `live_truncated`, `live_rows`) a
+    result dict / done event carries onto a history record — only the keys
+    that are present, so a turn without a live table keeps today's shape."""
+    if not isinstance(src, dict):
+        return rec
+    if isinstance(src.get("sql"), dict):
+        rec["sql"] = dict(src["sql"])
+    if "live_truncated" in src:
+        rec["live_truncated"] = bool(src.get("live_truncated"))
+    if isinstance(src.get("live_rows"), dict):
+        rec["live_rows"] = dict(src["live_rows"])
+    return rec
+
+
 def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
                              usage, charts, full_table_key=None,
-                             full_table_keys=None, combined_tables=None):
+                             full_table_keys=None, combined_tables=None,
+                             live_fields=None):
     """Build the AI-turn history record persisted EXACTLY ONCE by the worker.
 
     Returns None when there is nothing to persist (never writes an empty turn).
@@ -335,6 +376,9 @@ def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
     code/chart_data; 2+ imgs → images=[{image_base64, answer, code?, chart_data?}].
     `full_table_key` (single-shot tabular result) is persisted so a reloaded
     conversation can re-execute for the FULL Download Excel / Show full table.
+    Live tables: the single result's / the done event's (`live_fields`) `sql`,
+    `live_truncated` and `live_rows` are persisted so the refresh paths can
+    re-run the same query.
     """
     if err_msg:
         return {"role": "ai", "content": err_msg, "ts": time.time()}
@@ -348,6 +392,7 @@ def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
             "usage": single.get("usage"),
             "ts": time.time(),
         }
+        _attach_live_fields(rec, single)
         if full_table_key:
             rec["full_table_key"] = full_table_key
         # Multi-table answer: persist the tables array (mirrors the multi-chart
@@ -388,11 +433,13 @@ def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
             rec["tables"] = combined_tables
             if full_table_keys:
                 rec["full_table_keys"] = full_table_keys
+        _attach_live_fields(rec, live_fields)
         return rec
     return None
 
 
-def _build_stopped_record(combined_answer, combined_codes, usage, charts):
+def _build_stopped_record(combined_answer, combined_codes, usage, charts,
+                          live_fields=None):
     """Persist a STOPPED AI turn (user clicked Stop) — never the planner
     NO_CODE fallback or a late single-shot result.
 
@@ -429,6 +476,7 @@ def _build_stopped_record(combined_answer, combined_codes, usage, charts):
             cd = _persistable_chart_data(c.get("chart_data"))
             if cd is not None:
                 rec["chart_data"] = cd
+        _attach_live_fields(rec, live_fields)
         return rec
     return {
         "role": "ai",
@@ -546,6 +594,10 @@ _NEXT_PLOT_MARKER = "###NEXT_PLOT###"
 # history row exists. A count, not a set: two turns in one chat may carry the
 # same code, and one finishing must not unregister the other's.
 _INFLIGHT_CODES: dict[str, dict[str, int]] = {}
+# The live-table SELECTs beside the codes: {chat_id: {normalized code: sql
+# map}}, registered with the code and removed with it, so a refresh of a
+# chart streamed mid-turn finds the query before its history row exists.
+_INFLIGHT_SQL: dict[str, dict[str, dict]] = {}
 _INFLIGHT_LOCK = threading.Lock()
 
 
@@ -567,12 +619,20 @@ def _code_segments(code) -> list[str]:
     return out
 
 
-def _inflight_add(chat_id: str, code) -> None:
+def _inflight_add(chat_id: str, code, sql=None) -> None:
     try:
+        replaced = False
         with _INFLIGHT_LOCK:
             bucket = _INFLIGHT_CODES.setdefault(chat_id, {})
             for seg in _code_segments(code):
                 bucket[seg] = bucket.get(seg, 0) + 1
+                if isinstance(sql, dict) and sql:
+                    sqls = _INFLIGHT_SQL.setdefault(chat_id, {})
+                    if seg in sqls and sqls[seg] != sql:
+                        replaced = True      # two turns on one segment
+                    sqls[seg] = dict(sql)
+        if replaced:
+            log_with_sid(chat_id, "info", "INFLIGHT_SQL_REPLACED")
     except Exception as e:
         log_with_sid(chat_id, "warning",
                      f"INFLIGHT_ADD_FAILED {log_safe_text(type(e).__name__, 80)}")
@@ -591,8 +651,10 @@ def _inflight_discard(chat_id: str, codes) -> None:
                         bucket[seg] = left
                     else:
                         bucket.pop(seg, None)
+                        (_INFLIGHT_SQL.get(chat_id) or {}).pop(seg, None)
             if not bucket:
                 _INFLIGHT_CODES.pop(chat_id, None)
+                _INFLIGHT_SQL.pop(chat_id, None)
     except Exception as e:
         log_with_sid(chat_id, "warning",
                      f"INFLIGHT_DISCARD_FAILED {log_safe_text(type(e).__name__, 80)}")
@@ -601,6 +663,64 @@ def _inflight_discard(chat_id: str, codes) -> None:
 def _inflight_has(chat_id: str, normalized: str) -> bool:
     with _INFLIGHT_LOCK:
         return normalized in (_INFLIGHT_CODES.get(chat_id) or {})
+
+
+def _inflight_sql(chat_id: str, normalized: str):
+    with _INFLIGHT_LOCK:
+        found = (_INFLIGHT_SQL.get(chat_id) or {}).get(normalized)
+        return dict(found) if isinstance(found, dict) else None
+
+
+def stored_sql_for_code(chat_id: str, code) -> dict | None:
+    """The live-table SELECT map (`sql`: df key -> SELECT text, or None for
+    a default read) the chat holds for `code`, or None when the code is not
+    stored with one. Same lookup order as `code_is_stored`: the in-flight
+    turn, then the AI history rows whose code (whole or per segment) holds
+    the code AND carry `sql`, then the durable full-table records. Blocking
+    file I/O — call it off the event loop. Never raises."""
+    try:
+        wanted = _normalize_code(code)
+        if not wanted:
+            return None
+        found = _inflight_sql(chat_id, wanted)
+        if found is not None:
+            return found
+        conv_dir = local_store._data_root() / "chatdata" / chat_id / "conversations"
+        if conv_dir.is_dir():
+            for path in conv_dir.glob("*.jsonl"):
+                try:
+                    lines = path.read_text(encoding="utf-8").splitlines()
+                except Exception as e:
+                    log_with_sid(chat_id, "warning",
+                                 f"SQL_LOOKUP_READ_FAILED "
+                                 f"{log_safe_text(type(e).__name__, 80)}")
+                    continue
+                for line in lines:
+                    if '"code"' not in line or '"sql"' not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(row, dict) and row.get("role") == "ai" \
+                            and isinstance(row.get("sql"), dict) \
+                            and wanted in _code_segments(row.get("code")):
+                        return dict(row["sql"])
+        full_dir = conv_dir / "full"
+        if full_dir.is_dir():
+            for path in full_dir.glob("*.json"):
+                try:
+                    rec = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if isinstance(rec, dict) and isinstance(rec.get("sql"), dict) \
+                        and wanted in _code_segments(rec.get("code")):
+                    return dict(rec["sql"])
+        return None
+    except Exception as e:
+        log_with_sid(chat_id, "error",
+                     f"SQL_LOOKUP_FAILED {log_safe_text(type(e).__name__, 80)}")
+        return None
 
 
 def code_is_stored(chat_id: str, code) -> bool:
@@ -669,6 +789,146 @@ async def code_is_stored_async(chat_id: str, code) -> bool:
 def _code_not_stored(status_code: int) -> JSONResponse:
     return JSONResponse({"error": "This item's code is not part of the chat's history.",
                          "code": "CODE_NOT_STORED"}, status_code=status_code)
+
+
+def _event_sql(event):
+    """The live-table SELECT map an event carries (a partial's / the done
+    event's `sql`, a single answer's `result.sql`), or None."""
+    if not isinstance(event, dict):
+        return None
+    src = (event.get("result") or {}) if event.get("single_response") else event
+    sql = src.get("sql") if isinstance(src, dict) else None
+    return dict(sql) if isinstance(sql, dict) and sql else None
+
+
+def _drop_uncovered_live_keys(email: str, store, dfs: dict, schema_docs: dict,
+                              sid: str) -> list:
+    """Role gate BEFORE the planner: the chat's non-connector LIVE keys whose
+    table the requester's role does not cover are removed from `dfs` and
+    `schema_docs` in place (logged `LIVE_ROLE_DROPPED`), so the planner is
+    never shown a table this user may not query and no brain call is spent
+    on it. A failure inside the gate drops every live key (fail closed);
+    `run_chat_local._ensure_live` checks again before any fetch. Returns the
+    dropped tables' display names (the caller ends the turn with the denial
+    sentence when nothing is left to plan on)."""
+    live_keys = [k for k, d in (schema_docs or {}).items()
+                 if isinstance(d, dict) and d.get("live") and k in (dfs or {})]
+    if not live_keys:
+        return []
+    entries = {}
+    try:
+        import roles_store
+        entries = {e.get("file_name"): e
+                   for e in local_store.db_entries_from_meta(store.read_meta())}
+        allowed = roles_store.allowed_table_ids_for(email)
+        drop = []
+        for key in live_keys:
+            db = (entries.get(key) or {}).get("db") or {}
+            if db.get("is_connector"):
+                continue
+            if db.get("table_id") not in allowed:
+                drop.append(key)
+    except Exception as e:
+        log_with_sid(sid, "warning",
+                     f"LIVE_ROLE_DROP_FAILED error={log_safe_text(type(e).__name__, 80)}",
+                     chat_id=log_safe_text(str(store.chat_id), 80))
+        drop = list(live_keys)
+    names = []
+    for key in drop:
+        dfs.pop(key, None)
+        schema_docs.pop(key, None)
+        db = (entries.get(key) or {}).get("db") or {}
+        names.append(str(db.get("display_name") or key))
+        log_with_sid(sid, "info",
+                     f"LIVE_ROLE_DROPPED table={log_safe_text(str(key), 120)}",
+                     chat_id=log_safe_text(str(store.chat_id), 80))
+    return names
+
+
+def _live_denied_text(dropped: list, chat_id: str, sid: str):
+    """The denial sentence for a turn whose EVERY frame was a live table the
+    requester's role does not cover: the turn ends with it (persisted as the
+    AI row like any answer) and the planner is never called. None when
+    something is left to plan on."""
+    if not dropped:
+        return None
+    text = run_chat_local._LIVE_ROLE_DENIED_TEXT.format(table=", ".join(dropped))
+    log_with_sid(sid, "warning",
+                 f"LIVE_ROLE_DENIED table={log_safe_text(', '.join(dropped), 200)}",
+                 chat_id=log_safe_text(str(chat_id), 80))
+    return text
+
+
+def _denied_events(text: str):
+    """The one-event generator standing in for `run_chat_multi_plot` on a
+    denied turn: a single answer carrying the sentence, so the stream, the
+    persistence and edit-regenerate handle it exactly like any answer."""
+    yield {"single_response": True,
+           "result": {"text": text, "image_base64": None, "table": None,
+                      "code": None, "usage": {}}}
+
+
+def _prefetch_stored_live(store, code: str, dfs: dict, sid: str):
+    """Re-run the live-table SELECTs a stored answer was computed with, for
+    the refresh paths (per-item refresh, full-table re-execution, dashboard
+    tiles). Blocking — call it off the event loop.
+
+    Returns (error, sql_used): `error` is None when every referenced live
+    key is in place, else the `{ok: False, ...}` payload the caller answers
+    with — `code: "LIVE_NO_QUERY"` when a referenced live key has no stored
+    query (the table went live after the answer; a capped default read
+    would silently change what the answer computes), or the value-free
+    class sentence when the fetch failed. A key whose stored value is None
+    was answered from the default read and gets it again. A table back in
+    snapshot mode is not live any more: the loader served its parquet and
+    the stored SQL is ignored. The caller's role gate ran before this
+    (`check_role=False`)."""
+    try:
+        schema_docs = store.schema_docs()
+        specs = run_chat_local._live_specs(schema_docs, dfs)
+        if not specs:
+            return None, {}
+        named, generic = run_chat_local._referenced_live_keys(
+            code, list(specs), list(dfs or {}))
+        referenced = list(dict.fromkeys(named + generic))
+        if not referenced:
+            return None, {}
+        sql_map = stored_sql_for_code(store.chat_id, code) or {}
+        missing = [k for k in referenced if k not in sql_map]
+        if missing:
+            return _live_no_query(store, missing[0]), {}
+        state = run_chat_local._new_live_state()
+        state["sql_map"] = {k: v for k, v in sql_map.items()
+                            if isinstance(v, str) and v.strip()}
+        ok = run_chat_local._ensure_live(sid, dfs, schema_docs, code, state,
+                                         None, check_role=False)
+        if ok:
+            return None, dict(state.get("sql_used") or {})
+        return {"ok": False,
+                "error": state.get("failed_text")
+                or "The database could not run the query."}, {}
+    except Exception as e:
+        log_with_sid(sid, "warning",
+                     f"REFRESH_LIVE_PREFETCH_FAILED "
+                     f"{log_safe_text(type(e).__name__, 80)}",
+                     chat_id=log_safe_text(str(store.chat_id), 80))
+        return {"ok": False, "error": "Refresh failed."}, {}
+
+
+def _live_no_query(store, key: str) -> dict:
+    name = key
+    try:
+        for e in local_store.db_entries_from_meta(store.read_meta()):
+            if e.get("file_name") == key:
+                name = (e.get("db") or {}).get("display_name") or key
+                break
+    except Exception as e:
+        log_with_sid(log_safe_text(str(store.chat_id), 80), "info",
+                     f"LIVE_NO_QUERY_NAME_LOOKUP_FAILED "
+                     f"{log_safe_text(type(e).__name__, 80)}")
+    return {"ok": False, "code": "LIVE_NO_QUERY",
+            "error": f"{name} is now a live table; ask the question again to "
+                     f"re-run it."}
 
 
 def _event_codes(event) -> list:
@@ -775,11 +1035,15 @@ async def get_schema(request: Request, chat_id: str):
                          f"DB_TABLE_MISSING_PROBE_FAILED: {log_safe_text(str(e), 200)}",
                          chat_id=chat_id)
             missing_by_id = {}
+        from db_sources import table_mode
         for entry in db_entries:
             db = entry.get("db") or {}
             tid = db.get("table_id")
             reg = registry.get(tid)
-            refreshed = (reg or {}).get("refreshed_at") or db.get("refreshed_at")
+            live = reg is not None and table_mode(reg) == "live"
+            # A live table is queried at question time: it has no "as of".
+            refreshed = None if live else \
+                ((reg or {}).get("refreshed_at") or db.get("refreshed_at"))
             missing = tid in missing_by_id
             db_tables.append({
                 "df_key": entry.get("file_name"),
@@ -790,10 +1054,12 @@ async def get_schema(request: Request, chat_id: str):
                 "row_count": (reg or {}).get("row_count") or db.get("row_count"),
                 "refreshed_at": refreshed,
                 "missing": missing,
+                "live": live,
                 "allowed": bool(db.get("is_connector")) or allowed_ids is None
                            or tid in allowed_ids,
             })
-        stamps = [t["refreshed_at"] for t in db_tables if t.get("refreshed_at")]
+        stamps = [t["refreshed_at"] for t in db_tables
+                  if t.get("refreshed_at") and not t.get("live")]
         data_as_of = min(stamps) if stamps else None  # oldest data in the chat
     return {
         "chat_id": chat_id,
@@ -1105,10 +1371,18 @@ async def chat_stream(request: Request, chat_id: str):
     # Off the event loop — parsing the source files blocks every other
     # request otherwise (same pattern as _reexecute_full_df / refresh_item).
     loop = asyncio.get_running_loop()
-    dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
+    dfs = await loop.run_in_executor(
+        _EXEC, lambda: store.load_dataframes(include_live=True))
     if not dfs:
         return _empty_dataset_response(store, chat_id)
     schema_docs = await loop.run_in_executor(_EXEC, store.schema_docs)
+    sid = secrets.token_hex(8)
+    # Live tables the requester's role does not cover leave before the
+    # planner sees them; a chat left with NO frame by that drop ends with the
+    # denial sentence instead of a brain call on an empty schema.
+    dropped = await loop.run_in_executor(
+        _EXEC, _drop_uncovered_live_keys, email, store, dfs, schema_docs, sid)
+    denied_text = _live_denied_text(dropped, chat_id, sid) if not dfs else None
     # Dataset profiles (computed facts for the planner). Backfilled from the
     # stored frames when missing/stale; a failure never blocks the chat.
     try:
@@ -1117,7 +1391,6 @@ async def chat_stream(request: Request, chat_id: str):
     except Exception:
         dataset_profiles = {}
 
-    sid = secrets.token_hex(8)
     if not conv_id:
         conv_id = store.new_conversation(title=question[:80])
         local_store.AuthStore().record_conversation(email, chat_id, conv_id, title=question[:80])
@@ -1153,6 +1426,7 @@ async def chat_stream(request: Request, chat_id: str):
             w_full_table_key = None         # durable key for a tabular result
             w_full_table_keys = None        # per-table keys for a multi-table result
             w_combined_tables = None        # tables of a mixed charts+tables answer
+            w_live: dict = {}               # sql / live_truncated / live_rows of the turn
             err_msg = None
             cancelled = False               # STOP requested mid-generation
             w_inflight: list = []           # codes registered for refresh/pin
@@ -1166,11 +1440,12 @@ async def chat_stream(request: Request, chat_id: str):
                 # Use the multi-plot generator: it yields per-chart partials when
                 # the planner emitted ###NEXT_PLOT### blocks, and a single
                 # {single_response, result} for normal one-shot answers.
-                gen = run_chat_local.run_chat_multi_plot(
-                    sid=sid, dfs=dfs, schema_docs=schema_docs,
-                    question=question, history_rows=history_rows,
-                    user_email=email, dataset_profile=dataset_profiles,
-                )
+                gen = _denied_events(denied_text) if denied_text else \
+                    run_chat_local.run_chat_multi_plot(
+                        sid=sid, dfs=dfs, schema_docs=schema_docs,
+                        question=question, history_rows=history_rows,
+                        user_email=email, dataset_profile=dataset_profiles,
+                    )
                 for event in gen:
                     # Durable full-table persistence for a single-shot tabular
                     # result: write {columns, rows, code, total_rows} to disk and
@@ -1182,7 +1457,8 @@ async def chat_stream(request: Request, chat_id: str):
                         _res = event.get("result") or {}
                         _tbl = _res.get("table")
                         if isinstance(_tbl, dict) and _tbl.get("rows"):
-                            _k = _persist_full_table(store, _tbl, _res.get("code"))
+                            _k = _persist_full_table(store, _tbl, _res.get("code"),
+                                                     sql=_res.get("sql"))
                             if _k:
                                 event["full_table_key"] = _k
                                 w_full_table_key = _k
@@ -1195,7 +1471,8 @@ async def chat_stream(request: Request, chat_id: str):
                             for _t in _tbls:
                                 _k = _persist_full_table(
                                     store, _t, _res.get("code"),
-                                    result_key=_t.get("title"))
+                                    result_key=_t.get("title"),
+                                    sql=_res.get("sql"))
                                 _keys.append(_k)
                             event["full_table_keys"] = _keys
                             w_full_table_keys = _keys
@@ -1211,14 +1488,22 @@ async def chat_stream(request: Request, chat_id: str):
                             _keys.append(_persist_full_table(
                                 store, _t,
                                 _codes[_i] if _i < len(_codes) else None,
-                                result_key=_rkeys[_i] if _i < len(_rkeys) else None))
+                                result_key=_rkeys[_i] if _i < len(_rkeys) else None,
+                                sql=event.get("sql")))
                         event["full_table_keys"] = _keys
                     # Register the codes this event shows BEFORE the browser can
                     # see it: its refresh / pin buttons work while the turn is
                     # still being generated. Removed after persistence below.
+                    _event_sql_map = _event_sql(event)
                     for _c in _event_codes(event):
-                        _inflight_add(chat_id, _c)
+                        _inflight_add(chat_id, _c, sql=_event_sql_map)
                         w_inflight.append(_c)
+                    # The turn's live fields ride every event (a partial
+                    # carries `sql`); the last seen values are persisted.
+                    if isinstance(event, dict) and not event.get("single_response"):
+                        for _k in ("sql", "live_truncated", "live_rows"):
+                            if _k in event:
+                                w_live[_k] = event[_k]
                     # Stream live first (UX identical to before), then accumulate.
                     loop.call_soon_threadsafe(queue.put_nowait, ("event", event))
                     try:
@@ -1295,13 +1580,15 @@ async def chat_stream(request: Request, chat_id: str):
                     # charts (if any) or a short "stopped by user" note — never
                     # the planner NO_CODE error or a late single-shot result.
                     record = _build_stopped_record(
-                        w_combined_answer, w_combined_codes, w_usage, w_charts)
+                        w_combined_answer, w_combined_codes, w_usage, w_charts,
+                        live_fields=w_live)
                 else:
                     record = _build_ai_history_record(
                         err_msg, w_single, w_combined_answer, w_combined_codes,
                         w_usage, w_charts, full_table_key=w_full_table_key,
                         full_table_keys=w_full_table_keys,
-                        combined_tables=w_combined_tables)
+                        combined_tables=w_combined_tables,
+                        live_fields=w_live)
                 if record is not None:
                     store.append_history(conv_id, record)
                     if not err_msg and not cancelled:
@@ -1517,17 +1804,21 @@ async def edit_regenerate(request: Request, chat_id: str):
 
     try:
         loop = asyncio.get_running_loop()
-        dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
+        dfs = await loop.run_in_executor(
+            _EXEC, lambda: store.load_dataframes(include_live=True))
         if not dfs:
             return _empty_dataset_response(store, chat_id)
         schema_docs = await loop.run_in_executor(_EXEC, store.schema_docs)
+        sid = secrets.token_hex(8)
+        dropped = await loop.run_in_executor(
+            _EXEC, _drop_uncovered_live_keys, email, store, dfs, schema_docs, sid)
+        denied_text = _live_denied_text(dropped, chat_id, sid) if not dfs else None
         try:
             dataset_profiles = await loop.run_in_executor(
                 _EXEC, local_store.ensure_chat_profiles, store, dfs)
         except Exception:
             dataset_profiles = {}
 
-        sid = secrets.token_hex(8)
         history_rows = store.get_history(conv_id)
         # Append the edited human turn after truncation, before running.
         store.append_history(conv_id, {
@@ -1535,6 +1826,8 @@ async def edit_regenerate(request: Request, chat_id: str):
         })
 
         def _run_blocking():
+            if denied_text:
+                return list(_denied_events(denied_text))
             return list(run_chat_local.run_chat_multi_plot(
                 sid=sid, dfs=dfs, schema_docs=schema_docs,
                 question=edited_question, history_rows=history_rows,
@@ -1584,8 +1877,9 @@ async def edit_regenerate(request: Request, chat_id: str):
     # The answer is persisted inside this loop; its codes count as stored
     # until then (same registry the streaming worker uses).
     inflight = [c for ev in events for c in _event_codes(ev)]
-    for c in inflight:
-        _inflight_add(chat_id, c)
+    for ev in events:
+        for c in _event_codes(ev):
+            _inflight_add(chat_id, c, sql=_event_sql(ev))
     try:
         for ev in events:
             if ev.get("partial"):
@@ -1611,6 +1905,7 @@ async def edit_regenerate(request: Request, chat_id: str):
                     ]
                 elif len(all_images) == 1:
                     history_obj["image_base64"] = all_images[0]
+                _attach_live_fields(history_obj, ev)
                 # Mixed dashboard answer: persist the KPI/table blocks' tables with
                 # per-table durable keys (same as chat_stream's worker).
                 tbls = ev.get("tables") or []
@@ -1620,7 +1915,8 @@ async def edit_regenerate(request: Request, chat_id: str):
                     keys = [
                         _persist_full_table(store, t,
                                             codes_per[i] if i < len(codes_per) else None,
-                                            result_key=rkeys[i] if i < len(rkeys) else None)
+                                            result_key=rkeys[i] if i < len(rkeys) else None,
+                                            sql=ev.get("sql"))
                         for i, t in enumerate(tbls)
                     ]
                     history_obj["tables"] = tbls
@@ -1652,14 +1948,16 @@ async def edit_regenerate(request: Request, chat_id: str):
                 tbl = single_result.get("table")
                 if isinstance(tbl, dict) and tbl.get("rows"):
                     full_table_key = _persist_full_table(
-                        store, tbl, single_result.get("code"))
+                        store, tbl, single_result.get("code"),
+                        sql=single_result.get("sql"))
                 # Multi-table answer: one durable key per table (see chat_stream).
                 full_table_keys = None
                 tbls = single_result.get("tables")
                 if isinstance(tbls, list) and tbls:
                     full_table_keys = [
                         _persist_full_table(store, t, single_result.get("code"),
-                                            result_key=t.get("title"))
+                                            result_key=t.get("title"),
+                                            sql=single_result.get("sql"))
                         for t in tbls
                     ]
                 ai_record = {
@@ -1671,6 +1969,7 @@ async def edit_regenerate(request: Request, chat_id: str):
                     "usage": single_result.get("usage"),
                     "ts": time.time(),
                 }
+                _attach_live_fields(ai_record, single_result)
                 if full_table_key:
                     ai_record["full_table_key"] = full_table_key
                 if tbls:
@@ -2034,7 +2333,8 @@ async def run_item_refresh(chat_id: str, code: str, kind: str, sid: str,
     store = local_store.ChatDataStore(chat_id)
     loop = asyncio.get_running_loop()
     try:
-        dfs = await loop.run_in_executor(_EXEC, store.load_dataframes)
+        dfs = await loop.run_in_executor(
+            _EXEC, lambda: store.load_dataframes(include_live=True))
         if drop_df_keys:
             dfs = {k: v for k, v in dfs.items() if k not in drop_df_keys}
         if not dfs:
@@ -2046,6 +2346,17 @@ async def run_item_refresh(chat_id: str, code: str, kind: str, sid: str,
                 out["code"] = "DB_TABLES_MISSING"
                 out["missing_tables"] = missing
             return out
+        # Live tables: the stored SELECT is re-run first (the caller's role
+        # gate already dropped the denied keys above); no stored query for a
+        # live key, or a failing one, answers the {ok: False} contract.
+        live_err, sql_used = await loop.run_in_executor(
+            _EXEC, lambda: _prefetch_stored_live(store, code, dfs, sid))
+        if live_err is not None:
+            log_with_sid(sid, "info",
+                         f"REFRESH_ITEM_LIVE_REFUSED "
+                         f"code={log_safe_text(str(live_err.get('code') or 'FETCH_FAILED'), 40)}",
+                         chat_id=chat_id)
+            return live_err
 
         if kind == "table":
             from code_exec import safe_execute
@@ -2062,7 +2373,8 @@ async def run_item_refresh(chat_id: str, code: str, kind: str, sid: str,
             if not table or not (table.get("rows") or []):
                 return {"ok": False, "error": "Re-execution did not produce a table."}
             payload = {"ok": True, "kind": "table", "table": table}
-            full_table_key = _persist_full_table(store, table, code)
+            full_table_key = _persist_full_table(store, table, code,
+                                                 sql=sql_used or None)
             if full_table_key:
                 payload["full_table_key"] = full_table_key
             log_with_sid(sid, "info", "REFRESH_ITEM_OK", kind="table",

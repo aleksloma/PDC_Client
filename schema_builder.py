@@ -113,6 +113,14 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
                         if values and isinstance(values, dict):
                             value_descs[str(c)] = values
 
+        # A LIVE database table (queried at question time) is an EMPTY typed
+        # placeholder here: its column types are the dtypes alone — the
+        # sampled hints below would render every text column as
+        # `CATEGORICAL (0 unique values: )`. Decided BEFORE the hint code so
+        # a snapshot or file entry renders byte-identically to before.
+        live_doc = schema_docs.get(fname) if isinstance(schema_docs.get(fname), dict) else None
+        is_live = bool(live_doc and live_doc.get("source") == "database"
+                       and live_doc.get("live"))
         dtype_info = {}
         for c in cols:
             try:
@@ -123,6 +131,9 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
                 dt = str(df[c].dtype)
             except Exception:
                 dtype_info[str(c)] = "object"
+                continue
+            if is_live:
+                dtype_info[str(c)] = dt
                 continue
             if df[c].dtype == object or df[c].dtype.kind == "O" or str(df[c].dtype) in ("str", "string", "object"):
                 try:
@@ -147,7 +158,23 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
             db_table = schema_docs[fname].get("db_table") or ""
             refreshed = schema_docs[fname].get("refreshed_at") or ""
             src_line = f"\nSource: database table {db_table}" if db_table else "\nSource: database table"
-            if refreshed:
+            if is_live:
+                dialect = schema_docs[fname].get("dialect") or ""
+                row_cap = schema_docs[fname].get("row_cap")
+                src_line += f" [LIVE, dialect={dialect}, row_cap={row_cap}]"
+                if schema_docs[fname].get("filtered"):
+                    src_line += (
+                        f"\nQueried at question time with the administrator's row "
+                        f"filter: dfs['{fname}'] holds the pre-fetched rows (at most "
+                        f"{row_cap}); do not write a SELECT for this table.")
+                else:
+                    src_line += (
+                        f"\nQueried at question time: write ONE read-only SELECT for "
+                        f"this table; dfs['{fname}'] will hold the rows YOUR SELECT "
+                        f"returns (the columns below are the table's — if the SELECT "
+                        f"aggregates or projects, the Python must use the SELECT's "
+                        f"own columns)")
+            elif refreshed:
                 src_line += f" (snapshot as of {refreshed})"
             file_info += src_line
         if file_desc and isinstance(file_desc, str) and file_desc.strip():
@@ -221,7 +248,8 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
                 continue
             name = t.get("display_name") or ""
             cols = ", ".join(t.get("columns") or [])
-            ot_lines.append(f"  - {name}: columns [{cols}]")
+            marker = " [LIVE]" if t.get("live") else ""
+            ot_lines.append(f"  - {name}{marker}: columns [{cols}]")
             for rel in t.get("relations") or []:
                 if not isinstance(rel, dict):
                     continue

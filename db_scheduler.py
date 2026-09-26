@@ -346,10 +346,15 @@ def _registry_meta_entry(row: dict, df_key: str, old_db_block: dict) -> dict:
             "indexed": bool(col.get("indexed")),
         }
     db_block = dict(old_db_block or {})
-    db_block.update({
-        "row_count": row.get("row_count"),
-        "refreshed_at": row.get("refreshed_at"),
-    })
+    mode = db_sources.table_mode(row)
+    db_block["row_count"] = row.get("row_count")
+    db_block["mode"] = mode
+    if mode == "live":
+        # A live row took no snapshot: its registry `refreshed_at` is None
+        # and a stamp from a parquet of the snapshot period is never written.
+        db_block["refreshed_at"] = None
+    else:
+        db_block["refreshed_at"] = row.get("refreshed_at")
     return {"file_name": df_key,
             "file_description": row.get("description") or "",
             "source": "database",

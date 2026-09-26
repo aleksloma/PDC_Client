@@ -134,8 +134,8 @@
             <h1>Registered tables</h1>
             <p class="adm-page-sub">Tables users can add to chats. <em>Connector</em> tables are
                hidden from users and auto-included through their relations. A <em>live</em> table
-               is not copied when you save it, and scheduled refreshes skip it. Until the live
-               query path ships it is not offered in chats.</p>
+               is not copied when you save it, and scheduled refreshes skip it. Live tables are
+               queried at question time; each question reads at most the configured row cap.</p>
           </div>
           <button id="btnRegisterTable" class="adm-btn primary">＋ Register table</button>
         </header>
@@ -444,8 +444,8 @@
             </label>
             <div id="tmmHint" class="adm-alert warn hidden"></div>
             <div class="adm-label-note">A live table is not copied when you switch it, and
-              scheduled refreshes skip it. Until the live query path ships it is not offered
-              in chats.</div>
+              scheduled refreshes skip it. Live tables are queried at question time; each
+              question reads at most the configured row cap.</div>
           </div>
           <div class="adm-modal-foot">
             <span class="adm-spacer"></span>
@@ -621,8 +621,8 @@
             </label>
             <div id="twModeHint" class="adm-alert warn hidden"></div>
             <div id="twModeNote" class="adm-label-note hidden">A live table is not copied when
-              you save it, and scheduled refreshes skip it. Until the live query path ships it
-              is not offered in chats.</div>
+              you save it, and scheduled refreshes skip it. Live tables are queried at question
+              time; each question reads at most the configured row cap.</div>
           </div>
 
           <div class="adm-suggest-panel">
