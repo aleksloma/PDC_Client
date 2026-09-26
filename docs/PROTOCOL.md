@@ -99,10 +99,22 @@ the payload above without the field. The planner is expected to answer with
 one read-only SELECT per live table the code references (the `sql` map in
 the response); a `filtered` table gets no SELECT — the client reads it
 itself under the administrator's filter, and a SELECT sent for it is
-ignored. The planner side (writing the SQL) is a separate change; until it
-ships the response carries no `sql` and the client's default capped fetch of
-each referenced live table applies, so the code sees the table's own
-columns.
+ignored. The planner side ships as of brain commit `0908843`: a request
+with a non-empty `live_tables` gets a live-table block in the planner prompt,
+and the response carries `sql` when the model wrote a SELECT for a referenced
+live table. It needs a client at commit `884e27e` or later. An older client
+never sends `live_tables` and gets exactly the earlier prompt and response,
+so the brain and the client can be deployed in either order.
+
+How the brain produces `sql`: it asks the model for one fenced ```` ```sql ````
+block per table whose first line is `-- table: <df key>`, takes the SELECTs
+out of the reply and removes those blocks from `raw_text` before `kind` and
+`code` are extracted, so `raw_text` and `code` carry only the code. It drops
+a SELECT for a filtered or unknown df key, and every SELECT next to an
+`ANSWER` / `CLARIFICATION` / `MISSING_DATA` / `NO_CODE` reply. It does not
+check the SQL itself: the client's gate is the authority, and a refusal comes
+back as a `guard` retry. The brain logs the df keys and a hash of the `sql`
+map, never the SQL text.
 
 **What the planner must avoid, per dialect.** One SELECT per live table,
 naming only that table (joins between live tables are two SELECTs; the
@@ -113,7 +125,12 @@ spelled like a T-SQL command word (`AS [open]`, not `AS open`); and give
 EVERY expression in the SELECT list an alias (`count(*) AS n`), because the
 client places the statement inside a derived table to apply the row cap,
 and SQL Server rejects unnamed columns there. A leading `WITH` block is
-hoisted above the wrapper on every dialect, so CTEs are allowed.
+hoisted above the wrapper on every dialect, so CTEs are allowed. The gate
+also refuses these words wherever they appear as whole words, in string
+literals and identifiers too (comments excepted): INSERT, UPDATE, DELETE,
+MERGE, DROP, CREATE, ALTER, TRUNCATE, GRANT, REVOKE, EXEC, EXECUTE, CALL,
+INTO, ATTACH, PRAGMA, VACUUM, COPY. On ClickHouse it refuses a `SETTINGS`
+clause.
 
 ### Response
 
@@ -139,7 +156,8 @@ connection's database name; CTE aliases exempt) — is wrapped under the row
 cap, and runs in the web application, never in the analysis sandbox. The
 result frame is placed under the df key, so the Python must use the SELECT's
 own columns. A key without an entry gets the client's default capped fetch.
-Unknown fields in the response are ignored.
+A value is always a non-empty string; the brain never sends `null` in the
+response. Unknown fields in the response are ignored.
 
 `kind` semantics: `PYTHON` / `PLOT_CODE` carry executable code in `code`;
 `CLARIFICATION` carries the clarifying question in `code`; `NO_CODE` is
@@ -214,6 +232,18 @@ ignored: then `sql` has `null` for that key and `sql_error` is
 administrator; no SELECT is accepted for it."}`. A SELECT the guard refused
 never reached the database, so it also appears as `null` in `sql`, with the
 refusal in `sql_error`.
+
+On the brain, the retry prompt shows a SELECT's text only for a key whose
+`sql` value is a string. A `null` key is described as a default read or a
+refused SELECT, never as a SELECT that ran. For `guard` the prompt carries
+the gate's message; for the other classes only the class sentence. The brain
+accepts a new SELECT for the failed table, for any unfiltered live table and
+for any key in `sql`, never for a filtered table. It drops a returned SELECT
+identical to the one that already ran for that key, since the client would
+only run it again. It logs the `sql_error` class, not `sql_error.message`.
+For a `guard` refusal that sentence still reaches the log inside
+`error_msg`, which the brain has always logged truncated; it names at most
+an identifier.
 
 ### Response
 
