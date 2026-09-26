@@ -1103,3 +1103,47 @@ def test_refresh_now_on_a_live_table_reports_a_failed_sample(client, conn,
     assert r.json()["live_profile"]["ok"] is False
     assert db_sources.DataSourceStore().get_table(tid)["mode"] == "live"
     assert not local_store.db_snapshot_path(tid).exists()
+
+
+# ===========================================================================
+# the revert after a failed snapshot keeps the live profile stamps, and a
+# table that vanished meanwhile answers 404
+# ===========================================================================
+def test_mode_route_revert_restores_the_live_profile_stamps(client, conn,
+                                                            monkeypatch):
+    """The flip to snapshot clears the five live keys before the snapshot
+    runs; when the snapshot fails and the table goes back to live, the
+    profile stamps of the pre-flip doc must come back with it — a reverted
+    row is not an unprofiled one."""
+    import db_scheduler
+    tid = _register_live(client, conn)
+    before = db_sources.DataSourceStore().get_table(tid)
+    assert before.get("live_profiled_at") and before.get("live_sample_rows")
+    monkeypatch.setattr(db_scheduler, "refresh_one_table",
+                        lambda *a, **k: {"ok": False, "error": "boom"})
+    r = client.post(f"/api/admin/tables/{tid}/mode", json={"mode": "snapshot"})
+    assert r.status_code == 200, r.json()
+    out = r.json()
+    assert out.get("reverted") is True
+    after = db_sources.DataSourceStore().get_table(tid)
+    assert after["mode"] == "live"
+    assert after["live_profiled_at"] == before["live_profiled_at"]
+    assert after["live_sample_rows"] == before["live_sample_rows"]
+    assert out["table"]["live_profiled_at"] == before["live_profiled_at"]
+    assert out["table"]["live_sample_rows"] == before["live_sample_rows"]
+
+
+def test_mode_route_answers_404_when_the_table_vanished_during_the_snapshot(
+        client, conn, monkeypatch):
+    import db_scheduler
+    tid = _register_live(client, conn)
+
+    def vanish(table_id, *a, **k):
+        db_sources.DataSourceStore().delete_table(table_id, actor=ADMIN)
+        return {"ok": False, "error": "boom"}
+
+    monkeypatch.setattr(db_scheduler, "refresh_one_table", vanish)
+    r = client.post(f"/api/admin/tables/{tid}/mode", json={"mode": "snapshot"})
+    assert r.status_code == 404, r.text[:300]
+    assert "reverted" not in r.json()
+    assert db_sources.DataSourceStore().get_table(tid) is None

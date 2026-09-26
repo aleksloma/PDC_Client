@@ -2486,9 +2486,21 @@ async def set_table_mode(request: Request, tid: str):
             reason = doc.get("live_reason")
             if reason not in db_sources.LIVE_REASONS:
                 reason = "manual"
-            store.set_table_mode(tid, "live", actor=email,
-                                 actor_kind=_kind(scope), reason=reason,
-                                 cell_count=verdict["cell_count"])
+            restored = store.set_table_mode(tid, "live", actor=email,
+                                            actor_kind=_kind(scope), reason=reason,
+                                            cell_count=verdict["cell_count"])
+            if not restored:
+                # The table vanished while the snapshot ran: nothing to
+                # revert, and nothing to report as reverted.
+                return JSONResponse({"error": "Unknown table."}, status_code=404)
+            # The flip cleared the profile stamps; a reverted row is not an
+            # unprofiled one, so they come back from the pre-flip doc.
+            if doc.get("live_profiled_at") and isinstance(
+                    doc.get("live_sample_rows"), int):
+                store.mark_live_profiled(
+                    tid, row_count=None, columns=None,
+                    profiled_at=doc["live_profiled_at"],
+                    sample_rows=doc["live_sample_rows"])
             log_with_sid(log_safe_text(f"admin:{email}"), "warning",
                          f"LIVE_MODE_REVERTED table={log_safe_text(tid)}")
             return {"ok": True, "table": store.get_table(tid),

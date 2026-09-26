@@ -178,7 +178,7 @@ def test_snapshot_row_cap_and_where(sqlite_cfg, tmp_path):
     "1=1 UNION SELECT * FROM x INTO OUTFILE '/tmp/x'",
     "EXISTS (SELECT 1 FROM t WHERE DELETE)",
 ])
-def test_assert_single_select_rejects_dml_in_where(sqlite_cfg, tmp_path, bad):
+def test_read_only_guard_rejects_dml_in_where(sqlite_cfg, tmp_path, bad):
     dest = tmp_path / "snap.parquet"
     res = db_connector.snapshot_table(sqlite_cfg, "", schema=None, table="orders",
                                       where=bad, dest=dest, sid="t")
@@ -193,13 +193,13 @@ def test_assert_single_select_rejects_dml_in_where(sqlite_cfg, tmp_path, bad):
     "INSERT INTO x VALUES (1)",
     "SELECT * FROM x INTO y",
 ])
-def test_assert_single_select_rejects(bad_sql):
+def test_read_only_guard_rejects(bad_sql):
     with pytest.raises(ValueError):
         db_connector.assert_read_only_query(bad_sql, allow_cte=False,
                                             strict_parse=True)
 
 
-def test_assert_single_select_allows_plain_select():
+def test_read_only_guard_allows_plain_select():
     db_connector.assert_read_only_query(
         'SELECT "a", "b" FROM "s"."t" WHERE "a" > 1', allow_cte=False,
         strict_parse=True)
@@ -735,8 +735,9 @@ def test_clickhouse_issues_no_session_statement_timeout():
     and they overwrite anything SET on the session (measured against
     ClickHouse 24.8 — after `SET max_execution_time = 7`, system.settings
     still read the URL value). Emitting the SET anyway would be dead weight
-    that reads like a working bound, so this dialect has no
-    apply_stmt_timeout — the same shape as mssql."""
+    that reads like a working bound, so ClickHouse alone has no
+    per-connection hook (SQL Server sets the ODBC query-timeout attribute
+    on the DBAPI connection instead of issuing a SET)."""
     class _Conn:
         def execute(self, stmt):            # pragma: no cover - must not run
             raise AssertionError("clickhouse must not issue a session SET")
@@ -928,3 +929,78 @@ def test_sample_rows_failure_shape(sqlite_cfg):
     assert res["ok"] is False
     assert res["df"] is None
     assert res["error"]
+
+
+# ---------------------------------------------------------------------------
+# SQL Server: the statement bound is the ODBC QUERY timeout, set per
+# connection on the DBAPI object (pyodbc `Connection.timeout`); the
+# `pyodbc.connect(timeout=)` keyword is the LOGIN timeout, not this.
+# ---------------------------------------------------------------------------
+class _FakeDbapiConnection:
+    """A pyodbc-shaped DBAPI connection: `timeout` is a plain attribute."""
+
+
+class _FakeSaConnection:
+    """A SQLAlchemy Connection look-alike over the fake DBAPI connection."""
+
+    def __init__(self, dbapi):
+        import types
+        from sqlalchemy.dialects import mssql as _mssql
+        self.connection = types.SimpleNamespace(dbapi_connection=dbapi)
+        self.dialect = _mssql.dialect()
+
+    def execute(self, stmt):              # pragma: no cover - must not run
+        raise AssertionError("SQL Server must not issue a session SET")
+
+
+class _FakeEngine:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def connect(self):
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            yield self._conn
+        return _cm()
+
+    def dispose(self):
+        pass
+
+
+def test_mssql_statement_timeout_is_not_the_no_op():
+    assert db_connector.get_dialect("mssql").apply_stmt_timeout is not \
+        db_connector._no_op_timeout
+
+
+def test_mssql_apply_stmt_timeout_sets_the_odbc_query_timeout():
+    dbapi = _FakeDbapiConnection()
+    db_connector.get_dialect("mssql").apply_stmt_timeout(_FakeSaConnection(dbapi), 7)
+    assert getattr(dbapi, "timeout", None) == 7
+
+
+def test_run_live_select_on_mssql_sets_the_query_timeout_to_the_bound(monkeypatch):
+    """The live query's bound is min(the connection's statement_timeout,
+    timeout_s); on SQL Server it lands on the DBAPI connection's `timeout`."""
+    dbapi = _FakeDbapiConnection()
+    conn = _FakeSaConnection(dbapi)
+    seen_cfg = []
+
+    def fake_engine(cfg, password, **kw):
+        seen_cfg.append(dict(cfg))
+        return _FakeEngine(conn)
+
+    def fake_read_sql(sql, con, *a, **kw):
+        frame = pd.DataFrame({"n": pd.Series([], dtype="int64")})
+        return iter([frame]) if kw.get("chunksize") else frame
+
+    monkeypatch.setattr(db_connector, "get_engine", fake_engine)
+    monkeypatch.setattr(db_connector.pd, "read_sql", fake_read_sql)
+    cfg = {"db_type": "mssql", "host": "h", "port": 1433, "database": "d",
+           "user": "u", "statement_timeout": 30}
+    res = db_connector.run_live_select(cfg, "pw", "SELECT n FROM r",
+                                       timeout_s=7, sid="t")
+    assert res["ok"] is True, res.get("error")
+    assert seen_cfg and seen_cfg[-1]["statement_timeout"] == 7
+    assert getattr(dbapi, "timeout", None) == 7
