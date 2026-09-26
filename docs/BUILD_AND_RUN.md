@@ -130,6 +130,19 @@ Diagnostic env flags (see `.env.example`):
 A failed brain call always logs its HTTP status + body snippet (~2000 chars)
 regardless of `CLIENT_LLM_DEBUG` — an API rejection is never silently swallowed.
 
+Sign-in and session settings (see `client.env.example`; a value that does not
+parse falls back to the default instead of stopping the boot):
+
+| Var | Purpose |
+|---|---|
+| `PUBLIC_BASE_URL` | The address users type, e.g. `https://pdc.example.local` (default empty). Password-reset and invitation links are built from it. Unset or not `http://`/`https://` ⇒ no link is minted or mailed, and the startup log shows `PUBLIC_BASE_URL_UNSET`. |
+| `PASSWORD_MIN_LENGTH` | Minimum length wherever a password is set (default `8`, never below `4`). Sign-in does not check it. The `LOCAL_ADMIN_PASSWORD` bootstrap value is exempt (warning `LADMIN_BOOTSTRAP_WEAK`). |
+| `REMEMBER_ME_MAX_DAYS` | Absolute session lifetime in days from sign-in, remembered or not (default `30`, minimum `1`). |
+| `AUTH_FAIL_THRESHOLD` | Failed attempts per address inside the window before spacing starts (default `5`). After it, attempts wait 1, 2, 4, 8 s, then the address is locked. |
+| `AUTH_FAIL_THRESHOLD_IP` | Failed attempts per client address before spacing starts (default `20`). The client-address key is spaced, never locked. |
+| `AUTH_FAIL_WINDOW_S` | The counting window in seconds (default `900`). |
+| `AUTH_LOCKOUT_S` | Lockout length in seconds for an address (default `900`). The local admin account is never locked, only spaced (`AUTH_ADMIN_SPACED`). |
+
 ---
 
 ## 3. Local testing — ALWAYS the Docker stack, ALWAYS the persistent data
@@ -358,6 +371,13 @@ Prerequisites (client env, see `client.env.example`):
   `users/ladmin/auth.json` on the volume and restart).
 - The customer's DBA provides a **dedicated SELECT-only database login**
   (ideally on a read replica) — that grant is the real security guarantee.
+- `LIVE_MODE_CELL_THRESHOLD`: size in cells (rows x columns) at or above
+  which the wizard suggests live mode (default `50000000`).
+- `LIVE_MODE_FORCE_THRESHOLD`: size in cells at or above which a snapshot is
+  refused and the table must be registered live (default `500000000`; never
+  effectively below the first value). In this release a live table is
+  registered and profiled but not yet offered in chats. See
+  `docs/LIVE_TABLES_PLAN.md`.
 
 Runbook:
 

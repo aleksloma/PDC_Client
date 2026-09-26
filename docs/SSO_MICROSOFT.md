@@ -109,8 +109,9 @@ The password form is **always** reachable at:
 Use it for the `ladmin` account (which has no Microsoft identity and always
 signs in with its password), for local accounts, and as the recovery path if
 the SSO configuration ever breaks while auto-redirect is on. A user whose
-account was created by Microsoft sign-in cannot use it: that account has no
-local password and cannot get one (below). **Disable SSO** on the
+account has signed in with Microsoft and has no local password (a share or
+invitation placeholder included) cannot use it: that account cannot get a
+password (below), except through the manual recovery described there. **Disable SSO** on the
 ladmin page returns the landing page to the plain password form instantly.
 
 ## Behavior details
@@ -131,8 +132,19 @@ ladmin page returns the landing page to the plain password form instantly.
   with Microsoft and holds no local password cannot obtain one: "Reset
   password" mails it nothing, and a password change or an invitation for it
   is refused ("This account signs in with Microsoft and has no local
-  password."). Multi-factor authentication, conditional access and
-  deprovisioning all live in Entra; a local password would bypass them.
+  password."). Multi-factor authentication and conditional access apply at
+  sign-in, in Entra; a local password would bypass them.
+- **Disabling a user in Entra does not end an open session here.** There is
+  no back-channel logout: an open PowerDataChat session lasts until the
+  browser drops the cookie or its 30-day lifetime (`REMEMBER_ME_MAX_DAYS`)
+  runs out. Restarting the web container is today's forced sign-out.
+- **Recovering a stranded account.** If SSO is switched off, or a user leaves
+  your Entra tenant but still needs access, an account that has signed in
+  with Microsoft and has no local password cannot sign in at all. Recover it
+  by hand: remove the `sso_provider` key from `users/<email>/auth.json` on the
+  data volume, restart the web container, then send the user a reset link
+  (**Invite user** on the Users page, or "Reset password" on the sign-in
+  page).
 - Every Save / Test / Enable / Disable is written to the admin audit log
   (tenant and client IDs only — never the secret).
 

@@ -89,12 +89,26 @@ retry loop, and brain protocol need no changes in Phase 1.
    are snapshot-sized (< ~2M rows). No size checks, no mode flags, no routing.
    Row count and size ARE captured at registration (metadata for the future), but
    nothing acts on them.
+   **Status: SUPERSEDED (registry half shipped).** Size checks now exist. The
+   register wizard counts the rows and derives a cell count (rows x columns).
+   At or above `LIVE_MODE_CELL_THRESHOLD` (default 50M cells) live mode is
+   suggested; at or above `LIVE_MODE_FORCE_THRESHOLD` (default 500M cells) a
+   snapshot is refused with `LIVE_REQUIRED`. Every table doc carries a `mode`
+   field (`snapshot` | `live`; absent reads as snapshot). See
+   `docs/LIVE_TABLES_PLAN.md`.
 7. **Large tables → Phase 2.** Live SQL mode (brain writes dialect-aware
    aggregation SELECTs; client validates + executes; the customer DB does the
    heavy work and only the small result enters pandas) is a separate later phase,
    implemented on client + brain in parallel. A middle "add a WHERE filter" lane
    was considered and rejected (one day of retail transactions can alone be 10M
    rows — filters don't reliably shrink tables).
+   **Status: PARTLY SHIPPED.** The registry half of live mode is in place: the
+   `mode` field, the two size thresholds, `POST /api/admin/tables/{tid}/mode`,
+   a sampled profile for live tables (no parquet) and the admin UI (Storage
+   choice in the wizard, a live badge and a mode switch in the Tables list).
+   A live table is not yet offered in chats. The query path (brain-written
+   SQL, validated and executed by the client) follows. Design and status:
+   `docs/LIVE_TABLES_PLAN.md`.
 
 ## Data model
 
@@ -351,6 +365,11 @@ skill + per-dialect cards on the brain, client-side validation gate (sqlglot AST
 single-SELECT-only, injected LIMIT, statement timeout), SQL retry loop mirroring
 the Python one, per-conversation extract caching. Data boundary preserved: the
 brain emits SQL text only, never touches the DB.
+
+**Status:** the registry half has shipped (mode field, size thresholds in
+cells instead of the row default above, the mode endpoint, the sampled
+profile, the admin UI). The query path follows. The current design, which
+supersedes the details above where they differ, is `docs/LIVE_TABLES_PLAN.md`.
 
 ## Follow-up standalone task (after Phase 1)
 

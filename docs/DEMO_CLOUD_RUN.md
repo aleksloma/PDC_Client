@@ -239,6 +239,12 @@ holds the demo accounts, uploaded demo datasets, chats, and rendered decks.
   demo data only and uses a dedicated demo tenant (kill-switchable from the
   brain admin panel: suspend/revoke the tenant or rotate its token).
 - Never point this instance at a real customer's tenant token.
+- Several pieces of state live in the web process's memory: the sign-in
+  limiter's counters and lockouts, the chart store, the session-generation
+  cache and the reset-link index. Every scale-to-zero resets them, so a lock
+  or a registered chart does not survive an idle period. Each cold start also
+  scans the users directory on the mounted volume to rebuild the reset-link
+  index, which adds to start-up time on the bucket mount.
 - If the demo tenant token is rotated in the admin panel, add a new version to
   the secret and redeploy:
   `gcloud secrets versions add CLIENT_DEMO_TENANT_TOKEN --data-file=<file>`

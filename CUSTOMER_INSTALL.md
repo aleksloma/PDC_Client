@@ -155,6 +155,15 @@ TCPS (the server must offer TCPS on the configured port). A failed refresh
 keeps the previous snapshot, so chats keep answering from it while you fix the
 connection.
 
+**Live tables.** A very large table can be marked **live** instead of being
+snapshotted. The admin panel suggests it above `LIVE_MODE_CELL_THRESHOLD`
+cells (rows x columns) and requires it above `LIVE_MODE_FORCE_THRESHOLD`. In
+this release a live table is registered and profiled from a small sample, but
+it is not yet offered in chats, and the nightly refresh still snapshots it
+unless you give it a disabled per-table schedule. Live tables will be
+queried directly in your database, so the database login must be SELECT-only, ideally on a read
+replica.
+
 ### Users and sign-in
 
 Nobody can create an account by typing an address at the sign-in page.
@@ -200,6 +209,11 @@ browser that made the change stays signed in. Every session ends 30 days
 after sign-in (`REMEMBER_ME_MAX_DAYS`), whether or not "Remember me" was
 ticked and however often it is used; "Remember me" only decides whether the
 session survives closing the browser.
+"Sign out" ends the session of this browser only. A copy of the session
+cookie taken from that browser keeps working until its 30-day end. A password
+set from inside the container by an operator ends the other sessions only
+after the web container restarts. There is no administrator action yet to
+sign a user out; restarting the web container is the forced sign-out today.
 
 **Microsoft accounts have no local password.** An account that has signed in
 with Microsoft and never had a password here cannot get one: "Reset password"
@@ -209,6 +223,15 @@ and has no local password." Such users get multi-factor authentication and
 conditional access from Entra; a local password would let them sign in
 without either. An account that already had a password and later also used
 Microsoft keeps its password.
+Disabling a user in Entra does not end a PowerDataChat session that is
+already open: there is no back-channel logout. The session lasts until the
+browser drops the cookie or its 30 days run out. Restarting the web container
+is today's only forced sign-out.
+If single sign-on is later switched off, or such a user leaves your Entra
+tenant but still needs access, recover the account by hand: remove the
+`sso_provider` key from `users/<email>/auth.json` on the data volume, restart
+the web container, then send the user a reset link (the admin panel's
+**Invite user**, or "Reset password" on the sign-in page).
 The `ladmin` password cannot be reset by mail — to recover it, delete
 `users/ladmin/auth.json` on the data volume and restart with
 `LOCAL_ADMIN_PASSWORD` set.
@@ -225,7 +248,12 @@ out. Because anyone can trigger the per-address lock, a colleague who meets
 it waits 15 minutes or signs in with Microsoft, which is not limited here.
 The `ladmin` account is never locked, so nobody can lock the operator out: its
 attempts are only spaced, one every 8 seconds at most after the first five
-failures. Give it a long `LOCAL_ADMIN_PASSWORD`. Restarting the web container
+failures. Give it a long `LOCAL_ADMIN_PASSWORD`. The password-length rule
+does not apply to that bootstrap value; if it is shorter than
+`PASSWORD_MIN_LENGTH`, the startup log shows the warning
+`LADMIN_BOOTSTRAP_WEAK`. While its sign-in is being spaced the log shows
+`AUTH_ADMIN_SPACED` (once per 15-minute window); watch for it, because
+`AUTH_LOCKOUT` never fires for this account. Restarting the web container
 clears every counter and lifts any lock.
 The numbers are `AUTH_FAIL_THRESHOLD`, `AUTH_FAIL_THRESHOLD_IP`,
 `AUTH_FAIL_WINDOW_S` and `AUTH_LOCKOUT_S` in `client.env`. The counters live in

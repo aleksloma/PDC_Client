@@ -694,8 +694,9 @@ and the local parquet. DB credentials never cross (Fernet-encrypted at rest,
 masked in APIs, never logged).
 
 **Registration** (admin "Data sources" page): add connection → Test →
-introspect (Inspector + catalog-estimate row count/size; never `COUNT(*)` on
-a customer table) → preview → AI-draft English descriptions → **mandatory
+introspect (Inspector + catalog-estimate row count/size; the Inspector step
+itself never runs `COUNT(*)` on a customer table, the size verdict below adds
+one bounded count) → preview → AI-draft English descriptions → **mandatory
 ladmin review/confirm** (server-enforced: `confirm:true`, session-stamped
 confirmation, re-introspection drift check; the draft endpoint has no write
 path) → save + chunked snapshot (per-query statement timeout, atomic
@@ -964,6 +965,29 @@ predicates are read), and the SQL-box UI states this truthfully.
 **Phase 2 (later, client + brain in parallel — NOT built):** live SQL mode
 for large tables (brain writes dialect-aware aggregation SELECTs; client
 validates + executes). Per `docs/DB_TABLES_PLAN.md`.
+
+**Live mode: registry half shipped.** Every registered table now has a
+storage `mode`: `snapshot` (everything above) or `live`. An absent field
+reads as snapshot, so older registry documents load unchanged. The register
+wizard sizes the table with one `COUNT(*)` (a SQLAlchemy construct through
+the same SELECT-only gate, bounded by the connection's statement timeout
+capped at 60 s) and derives a cell count (rows x columns). At or above
+`LIVE_MODE_CELL_THRESHOLD` live mode is suggested; at or above
+`LIVE_MODE_FORCE_THRESHOLD` a snapshot is refused (`LIVE_REQUIRED`), and a
+count that times out counts as above that limit. Registering a table live
+takes no snapshot. Instead the client profiles a bounded sample (at most
+10 000 rows) locally, so the registry and the dataset profile still describe
+it; the raw sample stays on the client and never reaches a log line. An administrator or a scoped
+power user can switch a table between modes (`POST
+/api/admin/tables/{tid}/mode`, audited `table.mode`); switching to live keeps
+any old parquet, switching back always takes a fresh snapshot. What is NOT
+built yet is the query path: a live table is hidden from the chat picker and
+refused by `/session/db_tables`. The scheduled refresh does not skip live
+tables yet either, so a live table on the global schedule still gets a
+parquet at its next scheduled run. When the query path ships, the brain will
+write the SQL and the MAIN APPLICATION will validate and execute it against
+the customer database; the analysis sandbox never gets a database connection or driver.
+Design and status: `docs/LIVE_TABLES_PLAN.md`.
 
 ### 10b. User roles & DB-table privileges (client-side only)
 
