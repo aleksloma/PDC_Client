@@ -39,7 +39,7 @@ lookup; revoked / suspended tenants get **HTTP 403** (the kill-switch).
 | `dataset_profile` (plan/retry, **optional**) | enterprise-only (no B2C equivalent): `{df_key: profile}` of computed FACTS per loaded table — rows, duplicate count, per-column dtype/nunique/null rates/min-max/constant/all-unique flags, truncated top-value hints, detected grain, deterministic warnings. Aggregate metadata only, never row data (Article II — same class as the cardinality hints in `technical_description`). Absent field ⇒ pre-profile behavior everywhere | client (`dataset_profile.compute_profile`, stored as sidecar JSON, compacted by `brain_client._compact_profiles_for_transport`) |
 | `data_caveat` (describe, **optional**) | enterprise-only: the client's DETERMINISTIC post-execution finding about the result it just rendered — `{kind: constant_metric\|identical_series\|constant_table\|matrix_readability, facts[], grain[], catalog}`. Aggregate findings + column names + truncated constant-value hints only (Article II, same class as `dataset_profile`). Makes the flat-result explanation mandatory instead of prompt-dependent; absent field ⇒ byte-identical describe prompt | client (`result_backstop.inspect_outputs`, compacted by `brain_client._compact_caveat_for_transport`) |
 | `live_tables` (plan/retry, **optional**) | enterprise-only (no B2C equivalent): `[{name, dialect, row_cap, filtered}]` — one row per LIVE database table the chat holds (`name` = the df key, `dialect` = the connector registry key such as `postgresql` / `mysql` / `mariadb` / `mssql` / `oracle` / `clickhouse`, `row_cap` = the effective row cap, `filtered` = true when an administrator row filter applies, in which case the client fetches the rows itself and expects no SQL). Metadata only; sent only when the chat holds a live table | client (`run_chat_local._live_tables_for_brain` from `ChatDataStore.schema_docs`) |
-| `sql` (plan/retry response, **optional**; echoed on a retry request) | enterprise-only: `{<df key>: "<one read-only SELECT>"}` written by the brain for the live tables the code references. The client validates it (read-only guard + a per-table allowlist), runs it in the web application, and places the result under the df key; a missing entry ⇒ the client's default capped fetch. On a retry request the same map (the SELECTs that were run) is echoed back — the brain's own text, never a result | brain (planner); echoed by client (`brain_client.retry(sql=)`) |
+| `sql` (plan/retry response, **optional**; echoed on a retry request) | enterprise-only: `{<df key>: "<one read-only SELECT>"}` written by the brain for the live tables the code references. The client validates it (read-only guard + a per-table allowlist), runs it in the web application, and places the result under the df key; a missing entry ⇒ the client's default capped fetch. On a retry request (every retry, the regeneration ones included) the client sends what RAN this turn: the brain's own text for a SELECT that reached the database (also when it failed there), `null` for a default read, for a SELECT ignored on a `filtered` table and for a SELECT the client's guard refused; keys never fetched are absent — never a result | brain (planner); echoed by client (`brain_client.retry(sql=)`) |
 | `sql_error` (retry, **optional**) | enterprise-only: `{table, dialect, class, guard, message}` describing a failed live SELECT — `class` ∈ `syntax` / `unknown_column` / `unknown_table` / `timeout` / `permission` / `guard` / `other`; `guard` true when the client's own SQL gate refused the text, and then `message` is the gate's sentence (naming at most an identifier), otherwise `message` is null. Never the driver message, a literal or a cell value (Article II) | client (`brain_client.live_sql_error`) |
 
 ---
@@ -103,6 +103,17 @@ ignored. The planner side (writing the SQL) is a separate change; until it
 ships the response carries no `sql` and the client's default capped fetch of
 each referenced live table applies, so the code sees the table's own
 columns.
+
+**What the planner must avoid, per dialect.** One SELECT per live table,
+naming only that table (joins between live tables are two SELECTs; the
+client's allowlist refuses any other table, CTE aliases excepted). No DML,
+no procedures, no second statement, no row-locking clause. On SQL Server:
+no table hints (`NOLOCK` included, with or without `WITH`); quote an alias
+spelled like a T-SQL command word (`AS [open]`, not `AS open`); and give
+EVERY expression in the SELECT list an alias (`count(*) AS n`), because the
+client places the statement inside a derived table to apply the row cap,
+and SQL Server rejects unnamed columns there. A leading `WITH` block is
+hoisted above the wrapper on every dialect, so CTEs are allowed.
 
 ### Response
 
@@ -172,8 +183,9 @@ code" prompt and calls the simple (or complex, on later attempts) model.
                                           // classifier runs on the retry path)
   "live_tables": [ ... ],                 // OPTIONAL — same rows as /v1/plan, only when the
                                           //   chat holds a live table
-  "sql": { "transactions": "SELECT ..." },// OPTIONAL — the map of SELECTs that was RUN for
-                                          //   this turn (the brain's own text, echoed back)
+  "sql": { "transactions": "SELECT ..." },// OPTIONAL — what RAN this turn: the brain's text for
+                                          //   a SELECT that reached the database, null for a
+                                          //   default read / an ignored or refused SELECT
   "sql_error": {                          // OPTIONAL — present when a live SELECT failed
     "table": "transactions",              //   the df key
     "dialect": "postgresql",
@@ -196,7 +208,12 @@ may carry `sql` again (a new SELECT for the failed key); without one the
 attempt counts as failed — the client never falls back to its default fetch
 for a SELECT that failed, so a retry cannot silently change what the answer
 computes. A retry after a Python failure carries `sql` (what ran) and no
-`sql_error`.
+`sql_error` — except when a SELECT was sent for a `filtered` table and
+ignored: then `sql` has `null` for that key and `sql_error` is
+`{class: "guard", guard: true, message: "The table is filtered by the
+administrator; no SELECT is accepted for it."}`. A SELECT the guard refused
+never reached the database, so it also appears as `null` in `sql`, with the
+refusal in `sql_error`.
 
 ### Response
 

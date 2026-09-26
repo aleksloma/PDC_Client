@@ -138,6 +138,13 @@ rebuilds the dict in list order, and `code_exec` aliases `df` to the first
 entry, so re-sorting it would silently point historical stored code at another
 table.
 
+An input frame may be the result of a LIVE database query the web service ran
+before the dispatch (bounded by `LIVE_RESULT_ROW_CAP` rows and
+`LIVE_RESULT_MAX_MB`); it is written like any other frame and the sandbox
+cannot tell it from a snapshot. SQL never runs here. The web service's
+pre-fetch treats a `df` reference as naming the first entry, which is why the
+order above also decides which live table a `df`-only block fetches.
+
 Rejections are `400` with `{"code": …, "message": …}`: `BAD_JOB_ID`,
 `BAD_KIND`, `CODE_TOO_LARGE` (1 MiB), `TOO_MANY_FRAMES` (64), `BAD_TIMEOUT`
 (must be in `(0, EXECUTOR_MAX_TIMEOUT_S]`), `BAD_INPUT_PATH`,

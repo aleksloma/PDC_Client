@@ -181,6 +181,19 @@ and a resource group / workload limit for the application account. The
 application's own query guard and caps are a second line, not a replacement
 for that grant.
 
+Size the database side for the capped read. Until the planner writes SQL,
+every question on a live table, every refresh of such an answer and every
+"Download Excel" of it reads up to `LIVE_RESULT_ROW_CAP` rows of the whole
+table (under the administrator's row filter when one is set) — that is the
+load a read replica must carry. What is recorded: the SQL text of each
+answer is stored with the chat's history on the data volume and is visible
+to that chat's users (its owner and the people it was shared with); the
+application log carries only a hash of each statement, row counts and
+timings. There is no administrator-facing log of which user ran which query;
+use the database's own audit for that. A user whose role no longer covers a
+live table cannot re-run it: refresh, "Show full table" and "Download Excel"
+refuse before any query reaches the database.
+
 ### Users and sign-in
 
 Nobody can create an account by typing an address at the sign-in page.

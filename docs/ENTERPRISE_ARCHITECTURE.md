@@ -1019,9 +1019,13 @@ and `sql_error` (the class; the driver's text stays local); a retry that
 brings no new SELECT for that key is a failed attempt, never a default
 read. The AI history row persists `sql` (per key, `null` for a default
 read), `live_truncated` and `live_rows`, and durable full-table records
-carry the `sql` subset their code references; per-item refresh, full-table
-re-execution and dashboard tile refresh re-run the stored SQL under the
-requester's role before the stored Python runs. Results are capped by rows
+carry the `sql` subset their code references (the `df` alias of the
+first frame counts as a reference). Per-item refresh, dashboard tile
+refresh, "Show full table" and "Download Excel" re-run the stored SQL only
+under the requester's role, before the stored Python runs: an item whose
+code references a live table the role does not cover is refused with no
+database query, and the full-table / Excel gate fails closed (an error
+inside it is a refusal). A retry's `sql` carries only what ran. Results are capped by rows
 (`LIVE_RESULT_ROW_CAP`) and by size (`LIVE_RESULT_MAX_MB`) and bounded by
 `LIVE_QUERY_TIMEOUT_S`; a capped result adds a localized note to the answer.
 
@@ -1119,7 +1123,8 @@ break allowed joins.
   and dashboard-view UIs grey refresh buttons proactively.
 - **Not gated by design** (confirmed decisions — no retroactive blocking;
   snapshot data the user could already see stays viewable): `chat/stream`,
-  `edit_regenerate`, full-table/Download-Excel re-execution, Auto Analytics,
+  `edit_regenerate`, full-table/Download-Excel re-execution of SNAPSHOT data
+  (a LIVE fetch on those two routes is gated, fail closed), Auto Analytics,
   `add_data_to_chat` (its DB entries were validated at selection time), and
   the central nightly snapshot scheduler. Shared-chat/dashboard recipients
   keep VIEWING stored snapshots; only their fresh re-execution is gated, keyed
