@@ -88,6 +88,11 @@ def _infrastructure_answer(sid, error_text) -> Optional[str]:
 _LIVE_ROLE_DENIED_TEXT = ("You no longer have access to {table}; ask your "
                           "administrator.")
 _LIVE_FAILED_PREFIX = "Live query for table '{table}' failed: {sentence}"
+# The answer of a turn whose attempts all ended on the live fetch: the table
+# and the value-free class sentence (never a driver's text), instead of the
+# generic line that blames the question.
+_LIVE_EXHAUSTED_TEXT = ("I couldn't run this analysis: the live query for "
+                        "'{table}' failed ({sentence})")
 # The refusal a retry's `sql_error` carries when the planner sent a SELECT for
 # a table the administrator filtered: the SELECT was ignored (the filtered
 # default read ran instead), so it is reported as not run.
@@ -188,6 +193,16 @@ def _live_failure_out(state: dict) -> dict:
                                                 sentence=state.get("failed_text")),
             "result": None, "preview": None, "image_base64": None,
             "live_failed": True}
+
+
+def _live_exhausted_text(state: dict) -> str | None:
+    """`_LIVE_EXHAUSTED_TEXT` for the turn's last live-fetch failure, or
+    None when the state names no failed table (the caller keeps its own
+    text)."""
+    key, sentence = state.get("failed_key"), state.get("failed_text")
+    if not (key and sentence):
+        return None
+    return _LIVE_EXHAUSTED_TEXT.format(table=key, sentence=sentence)
 
 
 def _live_role_denied_result(state: dict, code, usage) -> dict:
@@ -862,8 +877,9 @@ def _run_chat_body(*, sid, dfs, schema_docs, question, history_rows, user_email,
 
     if exec_out.get("error"):
         log_with_sid(sid, "error", f"EXEC_FINAL_ERROR after {retry_count+1} attempts")
+        live_text = _live_exhausted_text(state) if exec_out.get("live_failed") else None
         return {
-            "text": "I couldn't run this analysis with your current data. Try rephrasing or simplifying the request.",
+            "text": live_text or "I couldn't run this analysis with your current data. Try rephrasing or simplifying the request.",
             "image_base64": None, "table": None, "code": code, "usage": usage,
         }
 
@@ -1623,6 +1639,9 @@ def run_chat_multi_plot(
     # dispatch through the same hop and would each wait the same queue for the
     # same answer.
     service_down_text: Optional[str] = None
+    # The live-failure answer of the LAST block that failed, None when that
+    # failure was not a live fetch — used only when nothing was produced.
+    last_live_failure: Optional[str] = None
     log_with_sid(sid, "info", f"MULTI_PLOT_START blocks={len(work)}")
 
     while work:
@@ -1783,6 +1802,8 @@ def run_chat_multi_plot(
 
         if plot_out.get("error"):
             log_with_sid(sid, "warning", "MULTI_PLOT_SKIP after retries")
+            last_live_failure = (_live_exhausted_text(state)
+                                 if plot_out.get("live_failed") else None)
             continue
 
         # ── Interactivity enforcement (standard charts must be Plotly) ──
@@ -1939,6 +1960,8 @@ def run_chat_multi_plot(
                 log_with_sid(sid, "warning",
                              f"MIXED_TABLE_BLOCK_ERROR: "
                              f"{log_safe_text(str(exec_out['error']), 200)}")
+                last_live_failure = (_live_exhausted_text(state)
+                                     if exec_out.get("live_failed") else None)
                 continue
             result_obj = exec_out.get("result")
             t = _build_table_from_result(result_obj)
@@ -1975,7 +1998,8 @@ def run_chat_multi_plot(
     elif combined_tables:
         combined_text = "Analysis complete."
     else:
-        combined_text = "Something went wrong with this analysis. Please try again."
+        combined_text = (last_live_failure
+                         or "Something went wrong with this analysis. Please try again.")
     if state["truncated"] and combined_text:
         combined_text = _append_live_notes(combined_text, state, question)
     log_with_sid(sid, "info", f"MULTI_PLOT_DONE rendered={produced}")
@@ -2092,8 +2116,9 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
     if exec_out.get("live_role_denied"):
         return _live_role_denied_result(state, code, usage)
     if exec_out.get("error"):
+        live_text = _live_exhausted_text(state) if exec_out.get("live_failed") else None
         return {
-            "text": "I couldn't run this analysis with your current data. Try rephrasing.",
+            "text": live_text or "I couldn't run this analysis with your current data. Try rephrasing.",
             "image_base64": None, "table": None, "code": code, "usage": usage,
         }
 

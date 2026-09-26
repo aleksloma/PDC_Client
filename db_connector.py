@@ -1706,24 +1706,34 @@ def default_live_fetch(cfg: dict, password: str, doc: dict, *,
     connection's wins when lower); the in-memory size cap
     (`LIVE_RESULT_MAX_MB`) trims the frame too.
 
-    Returns {ok, df, truncated, truncated_by, rows, error, error_class} —
-    `error` is the class sentence (never the driver's text), `error_class`
-    per `classify_db_error`. Never raises (Article IV)."""
+    Returns {ok, df, truncated, truncated_by, rows, error, error_class,
+    elapsed_ms, timed_out} — `error` is the class sentence (never the
+    driver's text), `error_class` per `classify_db_error`, `elapsed_ms` the
+    wall time of the read (like `run_live_select`), `timed_out` True when
+    the class is `timeout`. Never raises (Article IV)."""
+    t0 = time.perf_counter()
+
+    def _elapsed() -> int:
+        return int((time.perf_counter() - t0) * 1000)
+
     try:
         schema = qname(doc.get("schema") or None, doc.get("schema_quote"))
         table = qname(doc.get("table_name"), doc.get("table_quote"))
         cols = [col_ident(c) for c in (doc.get("columns") or [])
                 if isinstance(c, dict) and c.get("name")]
         cap = max(1, int(cap or settings.LIVE_RESULT_ROW_CAP))
+        t0 = time.perf_counter()
         res = sample_rows(cfg, password, schema, table, columns=cols or None,
                           where=doc.get("where_filter") or None,
                           limit=cap + 1, timeout_s=settings.LIVE_QUERY_TIMEOUT_S,
                           log_driver_text=False, sid=sid)
+        elapsed_ms = _elapsed()
         if not res.get("ok") or res.get("df") is None:
             cls = res.get("error_class") or "other"
             return {"ok": False, "df": None, "truncated": False,
                     "truncated_by": None, "rows": 0,
-                    "error": error_class_text(cls), "error_class": cls}
+                    "error": error_class_text(cls), "error_class": cls,
+                    "elapsed_ms": elapsed_ms, "timed_out": cls == "timeout"}
         df = res["df"]
         df.columns = [str(c) for c in df.columns]
         truncated_by = None
@@ -1738,14 +1748,16 @@ def default_live_fetch(cfg: dict, password: str, doc: dict, *,
             truncated_by = "bytes"
         return {"ok": True, "df": df, "truncated": truncated_by is not None,
                 "truncated_by": truncated_by, "rows": int(len(df)),
-                "error": None, "error_class": None}
+                "error": None, "error_class": None,
+                "elapsed_ms": elapsed_ms, "timed_out": False}
     except Exception as e:
         from exec_transport import log_safe_text
         log_with_sid(sid, "warning",
                      f"LIVE_DEFAULT_FETCH_FAILED error={log_safe_text(type(e).__name__)}")
         return {"ok": False, "df": None, "truncated": False, "truncated_by": None,
                 "rows": 0, "error": error_class_text("other"),
-                "error_class": "other"}
+                "error_class": "other", "elapsed_ms": _elapsed(),
+                "timed_out": False}
 
 
 # ---------------------------------------------------------------------------

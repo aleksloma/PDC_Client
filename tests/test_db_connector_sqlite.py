@@ -1004,3 +1004,40 @@ def test_run_live_select_on_mssql_sets_the_query_timeout_to_the_bound(monkeypatc
     assert res["ok"] is True, res.get("error")
     assert seen_cfg and seen_cfg[-1]["statement_timeout"] == 7
     assert getattr(dbapi, "timeout", None) == 7
+
+
+# ---------------------------------------------------------------------------
+# The statement bound lands on the DBAPI object under SQLAlchemy's pool proxy
+# (2.x `dbapi_connection`), or on the proxy itself when it has no such
+# attribute — pinned directly on the helper, without an engine.
+# ---------------------------------------------------------------------------
+def test_mssql_stmt_timeout_sets_the_dbapi_connection_under_the_pool_proxy():
+    from types import SimpleNamespace
+    raw = SimpleNamespace(timeout=None)
+    conn = SimpleNamespace(connection=SimpleNamespace(dbapi_connection=raw))
+    db_connector._mssql_stmt_timeout(conn, 7)
+    assert raw.timeout == 7
+
+
+def test_mssql_stmt_timeout_falls_back_to_the_proxy_itself():
+    from types import SimpleNamespace
+    proxy = SimpleNamespace(timeout=None)          # no `dbapi_connection`
+    conn = SimpleNamespace(connection=proxy)
+    db_connector._mssql_stmt_timeout(conn, 7)
+    assert proxy.timeout == 7
+
+
+# ---------------------------------------------------------------------------
+# The capped default read of a live table is timed like the live query
+# function: `elapsed_ms` and `timed_out` on its result.
+# ---------------------------------------------------------------------------
+def test_default_live_fetch_reports_elapsed_ms_and_timed_out(sqlite_cfg):
+    doc = {"schema": None, "table_name": "orders",
+           "columns": [{"name": "order_id"}, {"name": "amount"}]}
+    res = db_connector.default_live_fetch(sqlite_cfg, "", doc, cap=10, sid="t")
+    assert res["ok"] is True, res.get("error")
+    assert len(res["df"]) == 7
+    assert list(res["df"].columns) == ["order_id", "amount"]
+    assert res["truncated"] is False
+    assert isinstance(res["elapsed_ms"], int) and res["elapsed_ms"] >= 0
+    assert res["timed_out"] is False

@@ -46,6 +46,10 @@ MARK = "ZQ_MARK_9"
 CODE_SUM = "RESULT = dfs['live t']['a'].sum()"
 CODE_NO_LIVE = "RESULT = 1"
 UNKNOWN_COLUMN_SENTENCE = "The query names a column that does not exist."
+# The answer when every attempt of a turn failed on the live fetch: the
+# table and the value-free class sentence, never the driver's text.
+LIVE_EXHAUSTED_TEXT = ("I couldn't run this analysis: the live query for "
+                       "'{table}' failed ({sentence})")
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +581,11 @@ def test_retry_without_new_sql_after_a_fetch_failure_never_defaults(
     assert seen["exec"] == []
     assert sampled == []
     assert "couldn't" in out["text"] or "could not" in out["text"].lower()
+    # Re-pinned: an answer that failed on the live fetch every time names
+    # the table and the value-free class sentence instead of the generic
+    # "with your current data" line (which blames the question).
+    assert out["text"] == LIVE_EXHAUSTED_TEXT.format(
+        table=KEY, sentence=UNKNOWN_COLUMN_SENTENCE)
     assert out["live_rows"] == {}
     assert out["live_truncated"] is False
 
@@ -1120,6 +1129,189 @@ def test_plan_sql_for_a_key_never_referenced_is_absent_from_the_retry(
     assert kw["sql_error"] is None
     assert out["sql"] == {}
 
+
+# ===========================================================================
+# 23. exhausted retries after a live fetch failure: the multi-plot twin of
+#     test_retry_without_new_sql_after_a_fetch_failure_never_defaults
+# ===========================================================================
+def test_multi_plot_exhausted_live_failure_names_the_table_and_the_class(
+        chat, granted, brain, executor):
+    """The only block's fetch fails on every attempt (the planner's SELECT
+    names a missing column and no retry brings a new one): the combined
+    answer is the live-failure sentence — the table and the value-free
+    class sentence — not the generic "Something went wrong" line."""
+    calls, state = brain
+    seen, _ = executor
+    plot = "fig = px.bar(dfs['live t'], x='a', y='b')"
+    state["plan"] = {"raw_text": _plot_blocks([plot]), "kind": "PLOT_CODE",
+                     "code": "", "usage": {}, "context_decision": {},
+                     "sql": {KEY: "SELECT nope FROM t"}}
+    state["retry"] = {"kind": "PLOT_CODE", "code": plot, "usage": {}}
+    events = _run_multi(chat)
+    assert seen["plot"] == [] and seen["exec"] == []
+    assert len(calls["retry"]) == 3
+    done = [e for e in events if e.get("done")][0]
+    assert done["combined_answer"] == LIVE_EXHAUSTED_TEXT.format(
+        table=KEY, sentence=UNKNOWN_COLUMN_SENTENCE)
+    assert done["sql"] == {KEY: "SELECT nope FROM t"}
+    assert done["live_rows"] == {}
+    assert done["live_truncated"] is False
+    assert [e for e in events if e.get("partial")] == []
+
+
+# ===========================================================================
+# 24. the default read's in-memory size cap
+# ===========================================================================
+WIDE_KEY = "wide t"
+
+
+def _register_wide(tmp_path, *, key=WIDE_KEY):
+    """A second sqlite file with table w(n, s): 3000 rows of 1000-character
+    text (about 3 MB in memory) — under the row cap, over a 1 MB size cap —
+    registered LIVE on its own connection."""
+    db = tmp_path / "wide.db"
+    eng = create_engine(f"sqlite+pysqlite:///{db}")
+    payload = "x" * 1000
+    with eng.begin() as c:
+        c.execute(text("CREATE TABLE w (n INTEGER PRIMARY KEY, s TEXT)"))
+        for i in range(1, 3001):
+            c.execute(text("INSERT INTO w VALUES (:n, :s)"), {"n": i, "s": payload})
+    eng.dispose()
+    store = db_sources.DataSourceStore()
+    cid = store.create_connection(
+        {"name": "W", "db_type": "sqlite",
+         "url_override": f"sqlite+pysqlite:///{db}"}, "pw", actor=ADMIN)["id"]
+    t = store.upsert_table({
+        "connection_id": cid, "schema": "", "table_name": "w",
+        "display_name": key, "description": "wide",
+        "columns": [{"name": "n", "dtype": "INTEGER", "description": "n"},
+                    {"name": "s", "dtype": "TEXT", "description": "s"}],
+        "is_connector": False, "relations": [], "mode": "live"}, actor=ADMIN)
+    return {"cid": cid, "tid": t["id"], "db": db}
+
+
+def test_default_read_byte_cap_truncates_and_appends_the_note(env, brain, executor,
+                                                              monkeypatch):
+    wide = _register_wide(env)
+    _grant(USER, [wide["tid"]])
+    entry = _db_entry(WIDE_KEY, wide["tid"], wide["cid"], table="w")
+    entry["schema"]["fields"] = {"n": {"description": "n", "values": None},
+                                 "s": {"description": "s", "values": None}}
+    chat = _chat_with([entry], chat_id="c_wide1")
+    monkeypatch.setattr(settings, "LIVE_RESULT_MAX_MB", 1)
+    calls, state = brain
+    seen, _ = executor
+    state["plan"]["code"] = "RESULT = dfs['wide t']['n'].sum()"
+    state["plan"].pop("sql", None)
+    out = _run(chat)
+    df = seen["exec"][0]["dfs"][WIDE_KEY]
+    assert 0 < len(df) < 3000
+    assert out["live_truncated"] is True
+    assert out["live_rows"] == {WIDE_KEY: len(df)}
+    assert out["sql"] == {WIDE_KEY: None}
+    assert "live table; only the first" in out["text"]
+    assert out["text"].endswith(
+        result_backstop.live_truncated_sentence("en", WIDE_KEY, len(df)))
+
+
+# ===========================================================================
+# 25. two capped live tables: two notes, sorted by key
+# ===========================================================================
+def _register_second(live, *, key, table, **extra):
+    """Another 25-row table in the same sqlite file, registered LIVE on the
+    same connection under `key`."""
+    eng = create_engine(f"sqlite+pysqlite:///{live['db']}")
+    with eng.begin() as c:
+        c.execute(text(f"CREATE TABLE {table} (a INTEGER PRIMARY KEY, b TEXT)"))
+        for i in range(25):
+            c.execute(text(f"INSERT INTO {table} VALUES (:a, :b)"),
+                      {"a": i, "b": f"w{i}"})
+    eng.dispose()
+    doc = {"connection_id": live["cid"], "schema": "", "table_name": table,
+           "display_name": key, "description": "second",
+           "columns": [{"name": "a", "dtype": "INTEGER", "description": "col a"},
+                       {"name": "b", "dtype": "TEXT", "description": "col b"}],
+           "is_connector": False, "relations": [], "mode": "live"}
+    doc.update(extra)
+    return db_sources.DataSourceStore().upsert_table(doc, actor=ADMIN)["id"]
+
+
+def test_two_capped_live_tables_append_two_notes_in_sorted_key_order(env, brain,
+                                                                     executor):
+    live = _register(env, row_cap=5)
+    tid2 = _register_second(live, key="live u", table="u", row_cap=5)
+    _grant(USER, [live["tid"], tid2])
+    chat = _chat_with([_db_entry(KEY, live["tid"], live["cid"]),
+                       _db_entry("live u", tid2, live["cid"], table="u")])
+    calls, state = brain
+    seen, _ = executor
+    state["plan"]["code"] = "RESULT = len(dfs['live t']) + len(dfs['live u'])"
+    state["plan"].pop("sql", None)
+    out = _run(chat)
+    got = seen["exec"][0]["dfs"]
+    assert len(got[KEY]) == 5 and len(got["live u"]) == 5
+    assert out["live_truncated"] is True
+    assert out["live_rows"] == {KEY: 5, "live u": 5}
+    note_t = result_backstop.live_truncated_sentence("en", KEY, 5)
+    note_u = result_backstop.live_truncated_sentence("en", "live u", 5)
+    assert out["text"].startswith("summarized")
+    assert out["text"].endswith(f"{note_t} {note_u}")
+
+
+# ===========================================================================
+# 26. the role probe itself failing is a denial, never a fetch
+# ===========================================================================
+def test_role_probe_failure_fails_closed_to_the_denial_sentence(
+        chat, granted, brain, executor, monkeypatch, caplog):
+    """`allowed_table_ids_for` raising is logged `LIVE_ROLE_PROBE_FAILED`
+    and treated as an empty grant set: the denial sentence, no fetch, no
+    executor call, no brain retry."""
+    calls, state = brain
+    seen, _ = executor
+
+    def boom(email):
+        raise RuntimeError("roles unreadable")
+    monkeypatch.setattr(roles_store, "allowed_table_ids_for", boom)
+    _no_engine(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        out = _run(chat)
+    assert _records(caplog, "LIVE_ROLE_PROBE_FAILED")
+    assert "no longer have access" in out["text"]
+    assert KEY in out["text"]
+    assert seen["exec"] == [] and seen["plot"] == []
+    assert calls["retry"] == []
+
+
+# ===========================================================================
+# 27. the wire vocabulary is the connector's
+# ===========================================================================
+def test_sql_error_classes_match_the_connectors_vocabulary():
+    assert brain_client.SQL_ERROR_CLASSES == db_connector.ERROR_CLASSES
+
+
+# ===========================================================================
+# 28. Auto Analytics never sees a live key
+# ===========================================================================
+def test_auto_analytics_planner_never_sees_a_live_key(chat, granted, monkeypatch):
+    """The background job loads the chat with the default loader, so the
+    planner's `df_names` carries the file key and not the live table."""
+    import auto_analytics
+    _add_csv(chat)
+    captured = {}
+
+    def fake_plan(**kw):
+        captured.update(kw)
+        return {"instructions": []}
+
+    def boom(*a, **kw):
+        raise AssertionError("no narrative call was expected")
+    monkeypatch.setattr(auto_analytics.brain_client, "auto_analytics_plan", fake_plan)
+    monkeypatch.setattr(auto_analytics.brain_client, "report", boom)
+    auto_analytics._run_job(CHAT, USER)
+    assert captured, "the planner was not called"
+    assert KEY not in captured["df_names"]
+    assert "d.csv" in captured["df_names"]
+    assert auto_analytics.get_auto_analysis_state(chat.read_meta())["status"] == "idle"
 
 
 # ===========================================================================

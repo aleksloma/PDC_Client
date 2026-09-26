@@ -649,6 +649,95 @@ def test_persist_full_table_keeps_the_sql_of_a_df_only_answer(client, live_only_
     assert rec["sql"] == {KEY: SQL}
 
 
+# ===========================================================================
+# 15. a stopped turn keeps the live fields
+# ===========================================================================
+def test_stopped_record_carries_the_live_fields():
+    """`_build_stopped_record(..., live_fields=)` attaches `sql`,
+    `live_truncated` and `live_rows` to the persisted stopped turn, so a
+    chart streamed before Stop stays refreshable with its SELECT."""
+    import routes.chat as chat_mod
+    chart = {"image_base64": "IMG", "answer": "a1", "code": "fig = 1",
+             "chart_data": None}
+    rec = chat_mod._build_stopped_record(
+        "a1", ["fig = 1"], {}, [chart],
+        live_fields={"sql": {KEY: SQL}, "live_truncated": False,
+                     "live_rows": {KEY: 5}})
+    assert rec["role"] == "ai" and rec["stopped"] is True
+    assert rec["code"] == "fig = 1"
+    assert rec["sql"] == {KEY: SQL}
+    assert rec["live_truncated"] is False
+    assert rec["live_rows"] == {KEY: 5}
+
+
+# ===========================================================================
+# 16. edit-regenerate on a live chat persists the live fields
+# ===========================================================================
+def _stub_brain_for_route(monkeypatch, code):
+    """Every brain call `run_chat_local` makes, stubbed on its binding: the
+    planner answers PYTHON `code`, describe/summarize a fixed text, a retry
+    is a test failure (the turn must succeed first time)."""
+    import run_chat_local
+    calls = {"plan": [], "describe": [], "summarize": []}
+
+    def plan(**kw):
+        calls["plan"].append(kw)
+        return {"raw_text": "", "kind": "PYTHON", "code": code, "usage": {},
+                "context_decision": {}}
+
+    def describe(**kw):
+        calls["describe"].append(kw)
+        return {"text": "described", "usage": {}}
+
+    def summarize(**kw):
+        calls["summarize"].append(kw)
+        return {"text": "summarized", "usage": {}}
+
+    def retry(**kw):
+        raise AssertionError("no retry was expected on this turn")
+
+    for name, fn in (("plan", plan), ("describe", describe),
+                     ("summarize", summarize), ("retry", retry)):
+        monkeypatch.setattr(run_chat_local.brain_client, name, fn)
+    monkeypatch.setattr(run_chat_local, "build_schema_text",
+                        lambda *a, **k: "schema")
+    return calls
+
+
+def test_edit_regenerate_persists_the_live_fields_and_the_sql_for_the_code(
+        client, chat, granted, monkeypatch):
+    """The success path of edit-regenerate on a live chat: the default read
+    fills the frame, the persisted AI row carries `sql` (None = default
+    read), `live_rows` and `live_truncated`, the durable full-table record
+    carries the same map, and `stored_sql_for_code` resolves it afterwards."""
+    import routes.chat as chat_mod
+    conv_id = chat.new_conversation("seeded")
+    chat.append_history(conv_id, {"role": "human", "content": "q1", "ts": 1.0})
+    chat.append_history(conv_id, {"role": "ai", "content": "a1", "ts": 2.0})
+    local_store.AuthStore().record_conversation(OWNER, CHAT, conv_id, title="seeded")
+    calls = _stub_brain_for_route(monkeypatch, CODE)
+    r = client.post(f"/api/chat/{CHAT}/edit-regenerate",
+                    json={"edited_question": "show the table", "conv_id": conv_id})
+    assert r.status_code == 200, r.text[:300]
+    body = r.json()
+    assert body["answer"] == "described"
+    assert body["table"]["total_rows"] == 25
+    assert len(calls["plan"]) == 1
+    rows = chat.get_history(conv_id)
+    ai = rows[-1]
+    assert ai["role"] == "ai" and ai["code"] == CODE
+    assert ai["sql"] == {KEY: None}
+    assert ai["live_rows"] == {KEY: 25}
+    assert ai["live_truncated"] is False
+    assert ai["table"]["total_rows"] == 25
+    rec = chat_mod._load_full_table_record(chat, ai["full_table_key"])
+    assert rec["sql"] == {KEY: None}
+    # Persisted: the lookup resolves the map from the history row, and the
+    # in-flight registry is empty again.
+    assert CHAT not in chat_mod._INFLIGHT_CODES
+    assert chat_mod.stored_sql_for_code(CHAT, CODE) == {KEY: None}
+
+
 @pytest.mark.parametrize("route", ["full_table", "download_excel"])
 def test_full_table_gate_fails_closed_when_the_role_lookup_itself_fails(
         client, chat, granted, monkeypatch, caplog, route):
