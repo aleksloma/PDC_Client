@@ -544,3 +544,120 @@ def test_a_no_lockout_key_does_not_shield_another_address(lim):
     clock.advance(16)
     v = _begin(mod)
     assert v.allowed is False and v.retry_after_s > 8, v
+
+
+# ---------------------------------------------------------------------------
+# lockout=False: the would-be lock point is reported, once per window
+#
+# Where a `lockout=True` key would lock, a `lockout=False` key logs one
+# warning `AUTH_ADMIN_SPACED kind=<kind> h=<12 hex>` -- once per
+# AUTH_FAIL_WINDOW_S per key, never the address, never `AUTH_LOCKOUT`.
+# `reset()` forgets the latch too.
+# ---------------------------------------------------------------------------
+_SPACED_RE = r"AUTH_ADMIN_SPACED kind=(\w+) h=([0-9a-f]{12})\b"
+
+
+def _spaced(lines):
+    import re
+    return [ln for ln in lines if re.search(_SPACED_RE, ln)]
+
+
+def _to_the_would_be_lock_point(mod, clock, email=EMAIL, kind="login"):
+    """Five free attempts, the four spaced ones, then the 10th -- the
+    attempt at which a lockout=True key locks."""
+    for i in range(5):
+        assert _begin_nolock(mod, email=email, kind=kind).allowed, i + 1
+    for gap in (1, 2, 4, 8):
+        clock.advance(gap)
+        assert _begin_nolock(mod, email=email, kind=kind).allowed, gap
+    clock.advance(8)
+    assert _begin_nolock(mod, email=email, kind=kind).allowed, "the 10th attempt"
+
+
+def test_without_lockout_the_would_be_lock_point_is_logged(lim, monkeypatch):
+    import re
+    mod, clock = lim
+    lines = _capture_limiter_logs(mod, monkeypatch)
+    for i in range(5):
+        assert _begin_nolock(mod).allowed
+    for gap in (1, 2, 4, 8):
+        clock.advance(gap)
+        assert _begin_nolock(mod).allowed
+    assert not _spaced(lines), ("logged before the would-be lock point", lines)
+    clock.advance(8)
+    assert _begin_nolock(mod).allowed
+    hits = _spaced(lines)
+    assert len(hits) == 1, lines
+    m = re.search(_SPACED_RE, hits[0])
+    assert m.group(1) == "login", hits[0]
+    assert "warning" in hits[0], hits[0]
+    assert EMAIL not in hits[0] and "limited" not in hits[0], hits[0]
+    assert not [ln for ln in lines if "AUTH_LOCKOUT" in ln], lines
+
+
+def test_the_spaced_line_carries_the_kind(lim, monkeypatch):
+    import re
+    mod, clock = lim
+    lines = _capture_limiter_logs(mod, monkeypatch)
+    _to_the_would_be_lock_point(mod, clock, kind="reset")
+    hits = _spaced(lines)
+    assert len(hits) == 1, lines
+    assert re.search(_SPACED_RE, hits[0]).group(1) == "reset", hits[0]
+
+
+def test_the_spaced_line_is_logged_once_per_window(lim, monkeypatch):
+    mod, clock = lim
+    lines = _capture_limiter_logs(mod, monkeypatch)
+    _to_the_would_be_lock_point(mod, clock)
+    assert len(_spaced(lines)) == 1, lines
+    for n in range(20):                       # 160 s of further spaced attempts
+        clock.advance(8)
+        assert _begin_nolock(mod).allowed, n
+    assert len(_spaced(lines)) == 1, ("logged again inside the window", lines)
+    assert not [ln for ln in lines if "AUTH_LOCKOUT" in ln], lines
+
+
+def test_the_spaced_line_is_logged_again_after_the_window(lim, monkeypatch):
+    mod, clock = lim
+    lines = _capture_limiter_logs(mod, monkeypatch)
+    _to_the_would_be_lock_point(mod, clock)
+    assert len(_spaced(lines)) == 1, lines
+    clock.advance(int(settings.AUTH_FAIL_WINDOW_S) + 1)
+    _to_the_would_be_lock_point(mod, clock)
+    assert len(_spaced(lines)) == 2, lines
+
+
+def test_the_spaced_line_is_per_key(lim, monkeypatch):
+    mod, clock = lim
+    lines = _capture_limiter_logs(mod, monkeypatch)
+    _set(monkeypatch, "AUTH_FAIL_THRESHOLD_IP", 1000)
+    _to_the_would_be_lock_point(mod, clock, email="first@x.com")
+    _to_the_would_be_lock_point(mod, clock, email="second@x.com")
+    hits = _spaced(lines)
+    assert len(hits) == 2, lines
+    import re
+    assert re.search(_SPACED_RE, hits[0]).group(2) != re.search(_SPACED_RE, hits[1]).group(2)
+
+
+def test_reset_forgets_the_spaced_latch(lim, monkeypatch):
+    mod, clock = lim
+    lines = _capture_limiter_logs(mod, monkeypatch)
+    _to_the_would_be_lock_point(mod, clock)
+    assert len(_spaced(lines)) == 1, lines
+    mod.reset()
+    _to_the_would_be_lock_point(mod, clock)
+    assert len(_spaced(lines)) == 2, lines
+
+
+def test_a_locking_key_logs_no_spaced_line(lim, monkeypatch):
+    mod, clock = lim
+    lines = _capture_limiter_logs(mod, monkeypatch)
+    for i in range(5):
+        assert mod.begin("login", EMAIL, IP).allowed
+    for gap in (1, 2, 4, 8):
+        clock.advance(gap)
+        assert mod.begin("login", EMAIL, IP).allowed
+    clock.advance(8)
+    mod.begin("login", EMAIL, IP)
+    assert not _spaced(lines), lines
+    assert len([ln for ln in lines if "AUTH_LOCKOUT" in ln]) == 1, lines

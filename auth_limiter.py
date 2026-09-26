@@ -23,7 +23,10 @@ the failure after those locks the address key for `AUTH_LOCKOUT_S`. A call
 with `lockout=False` (the sign-in of the configured local admin account, so
 an anonymous caller cannot lock the operator out) keeps that spacing and,
 where the key would lock, only sets another 8 s not-before: never a lockout,
-never an `AUTH_LOCKOUT` line. The IP
+never an `AUTH_LOCKOUT` line — instead, at the first attempt a locked key
+would have been refused, one `AUTH_ADMIN_SPACED kind=<kind> h=<hash prefix>`
+warning per key per `AUTH_FAIL_WINDOW_S` (a latch bounded like the key
+spaces), so a guessing run against the operator is visible. The IP
 key spaces attempts beyond `AUTH_FAIL_THRESHOLD_IP` the same way (capped at
 8 s) and NEVER locks: behind a proxy that does not forward the client address
 everyone shares one peer, and a lockout there would lock out the company.
@@ -60,6 +63,9 @@ clock = time.monotonic
 
 _LOCK = threading.Lock()
 _SPACES: dict = {}
+# lockout=False keys already reported AUTH_ADMIN_SPACED: (kind, addr) -> the
+# clock value until which the report is not repeated (one per window).
+_SPACED_LOGGED: dict = {}
 
 
 class Verdict(NamedTuple):
@@ -147,6 +153,22 @@ def _hash_prefix(space_name: str, key: str) -> str:
     return hashlib.sha256(f"{space_name}:{key}".encode("utf-8")).hexdigest()[:12]
 
 
+def _spaced_first(key, now: float, window: float) -> bool:
+    """True when `key` has no live AUTH_ADMIN_SPACED report; latches it for
+    one window. Expired entries are dropped and the latch is capped at
+    MAX_KEYS (oldest first). Caller holds _LOCK."""
+    for name in [n for n, until in _SPACED_LOGGED.items() if until <= now]:
+        del _SPACED_LOGGED[name]
+    if key in _SPACED_LOGGED:
+        return False
+    _SPACED_LOGGED[key] = now + window
+    limit = max(1, int(MAX_KEYS))
+    while len(_SPACED_LOGGED) > limit:
+        oldest = next(iter(k for k in _SPACED_LOGGED if k != key))
+        del _SPACED_LOGGED[oldest]
+    return True
+
+
 def begin(kind: str, email, ip, *, lockout: bool = True) -> Verdict:
     """Check the attempt and record it as a failure when it is allowed.
     `lockout=False` replaces the address lockout with an 8 s spacing step;
@@ -157,6 +179,7 @@ def begin(kind: str, email, ip, *, lockout: bool = True) -> Verdict:
     window = float(settings.AUTH_FAIL_WINDOW_S)
     addr_key, ip_key = _keys(kind, email, ip)
     locked = None
+    spaced = None
     with _LOCK:
         waits = [_wait(_lookup(*k), now, window) for k in (addr_key, ip_key) if k]
         wait = max(waits or [0.0])
@@ -168,6 +191,10 @@ def begin(kind: str, email, ip, *, lockout: bool = True) -> Verdict:
             extra = len(entry.failures) - max(1, int(settings.AUTH_FAIL_THRESHOLD))
             if extra >= _SCHEDULE_STEPS and not lockout:
                 entry.not_before = now + 2 ** (_SCHEDULE_STEPS - 1)
+                # Reported at the first attempt a locked key would have been
+                # refused (the one after the lock point), once per window.
+                if extra > _SCHEDULE_STEPS and _spaced_first(addr_key, now, window):
+                    spaced = _hash_prefix(*addr_key)
             elif extra >= _SCHEDULE_STEPS:
                 entry.locked_until = now + max(1, int(settings.AUTH_LOCKOUT_S))
                 locked = _hash_prefix(*addr_key)
@@ -181,6 +208,8 @@ def begin(kind: str, email, ip, *, lockout: bool = True) -> Verdict:
                 entry.not_before = now + 2 ** min(extra, _SCHEDULE_STEPS - 1)
     if locked:
         log_with_sid("auth_limiter", "warning", f"AUTH_LOCKOUT kind={kind} h={locked}")
+    if spaced:
+        log_with_sid("auth_limiter", "warning", f"AUTH_ADMIN_SPACED kind={kind} h={spaced}")
     return Verdict(True, 0)
 
 
@@ -204,3 +233,4 @@ def reset() -> None:
     """Forget every counter (tests)."""
     with _LOCK:
         _SPACES.clear()
+        _SPACED_LOGGED.clear()

@@ -145,6 +145,8 @@ def _peer(request: Request) -> str:
 # account exists) on ONE worker, so a burst of reset requests queues instead
 # of starting a thread each.
 _AUTH_BG_EXEC = ThreadPoolExecutor(max_workers=1, thread_name_prefix="auth_bg")
+# The interpreter has already joined this worker before atexit runs, so queued
+# mails complete at stop and this shutdown finds nothing to cancel (a safety net).
 atexit.register(lambda: _AUTH_BG_EXEC.shutdown(wait=False, cancel_futures=True))
 
 
@@ -704,7 +706,7 @@ async def change_password(request: Request):
     except Exception:
         body = {}
     current = body.get("current_password") or ""
-    new_password = (body.get("new_password") or "").strip()
+    new_password = body.get("new_password") or ""   # as typed, like every set site
     store = AuthStore()
     if store.is_sso_only(email):
         # Without this, an account with no password would set one here

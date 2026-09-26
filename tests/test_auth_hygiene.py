@@ -711,3 +711,16 @@ def test_an_unexpected_record_shape_passes_through(msg, args):
     before = rec.getMessage()
     assert _redactor_cls()().filter(rec) is True
     assert rec.getMessage() == before
+
+
+def test_the_background_executor_shutdown_comment_says_the_worker_is_joined():
+    """By the time `atexit` handlers run, the interpreter has already joined
+    the pool's worker thread, so queued mails have run to completion; the
+    shutdown is a no-op safety net. The comment above the registration must
+    say so rather than suggest it cancels anything."""
+    lines = (ROOT / "routes" / "auth.py").read_text(encoding="utf-8").splitlines()
+    idx = [i for i, ln in enumerate(lines)
+           if re.search(r"atexit\.register\([^\n]*_AUTH_BG_EXEC", ln)]
+    assert idx, "no atexit shutdown for _AUTH_BG_EXEC"
+    above = "\n".join(lines[max(0, idx[0] - 3):idx[0]])
+    assert "joined" in above.lower(), above

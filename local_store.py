@@ -52,11 +52,19 @@ _RESET_KEYS = ("reset_token_hash", "reset_expires_at", "reset_used")
 # Exactly what secrets.token_urlsafe(32) produces.
 _RESET_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 
-# Session generations: auth.json path (DATA_ROOT + the safe email) -> the
-# account's `session_generation`. Filled from auth.json on the first miss and
-# updated by the two password writers, so the per-request session check reads
-# the disk once per account per process (one worker).
+# Session generations: `_session_gen_key(email)` ("<DATA_ROOT>|<safe email>")
+# -> the account's `session_generation`. Filled from auth.json on the first
+# miss and updated by the two password writers, so the per-request session
+# check reads the disk once per account per process (one worker) and a hit
+# builds no path (no `_data_root()` mkdir). Per process: a change written by
+# another process is seen only after a restart.
 _SESSION_GEN_CACHE: dict = {}
+
+
+def _session_gen_key(email: str) -> str:
+    """The `_SESSION_GEN_CACHE` key — the same one at the reader and both
+    writers. Carries DATA_ROOT so a value never crosses data roots."""
+    return f"{settings.DATA_ROOT}|{_safe_email(email)}"
 
 
 def _reset_token_hash(token: str) -> str:
@@ -1102,7 +1110,7 @@ class AuthStore:
             generation = secrets.token_hex(8)
             auth["session_generation"] = generation
             self._write_auth(email, auth)
-            _SESSION_GEN_CACHE[str(self._auth_path(email))] = generation
+            _SESSION_GEN_CACHE[_session_gen_key(email)] = generation
             if old:
                 _RESET_TOKEN_INDEX.pop(old, None)
         log_with_sid(email, "info", "USER_PASSWORD_SET")
@@ -1113,8 +1121,8 @@ class AuthStore:
         (no auth.json, or one written before generations existed). Cached per
         account; the two password writers update the cache. An unreadable
         record answers "" uncached (Article IV) — such an account cannot sign
-        in anyway."""
-        key = str(self._auth_path(email))
+        in anyway — and is logged once per path (the scan latch)."""
+        key = _session_gen_key(email)
         cached = _SESSION_GEN_CACHE.get(key)
         if cached is not None:
             return cached
@@ -1122,15 +1130,21 @@ class AuthStore:
             cached = _SESSION_GEN_CACHE.get(key)
             if cached is not None:
                 return cached
-            p = Path(key)
+            p = self._auth_path(email)          # built only on a miss
             if not p.exists():
                 _SESSION_GEN_CACHE[key] = ""
                 return ""
             try:
                 rec = json.loads(p.read_text(encoding="utf-8"))
             except Exception as e:
-                log_with_sid("auth", "error",
-                             f"SESSION_GENERATION_READ_FAILED {type(e).__name__}")
+                path = str(p)
+                if path not in _UNREADABLE_AUTH_LOGGED:   # once per path
+                    _UNREADABLE_AUTH_LOGGED.add(path)
+                    from exec_transport import log_safe_text
+                    log_with_sid("auth", "error",
+                                 f"SESSION_GENERATION_READ_FAILED "
+                                 f"path={log_safe_text(path, 300)} "
+                                 f"error={log_safe_text(type(e).__name__, 80)}")
                 return ""
             value = rec.get("session_generation") if isinstance(rec, dict) else None
             value = value if isinstance(value, str) else ""
@@ -1317,6 +1331,12 @@ class AuthStore:
                 return
             self.set_password(uname, boot_pw, force_change=True)
             log_with_sid("startup", "info", "LADMIN_BOOTSTRAP_CREATED")
+            min_len = int(settings.PASSWORD_MIN_LENGTH)
+            if len(boot_pw) < min_len:
+                # Exempt from the rule (refusing would lock a fresh install
+                # out), so flag it. Never the password, never its length.
+                log_with_sid("startup", "warning",
+                             f"LADMIN_BOOTSTRAP_WEAK min_length={min_len}")
         except Exception as e:
             log_with_sid("startup", "error", f"LADMIN_BOOTSTRAP_FAILED: {e}")
 
@@ -1433,7 +1453,7 @@ class AuthStore:
             generation = secrets.token_hex(8)
             rec["session_generation"] = generation
             self._write_auth(email, rec)
-            _SESSION_GEN_CACHE[str(self._auth_path(email))] = generation
+            _SESSION_GEN_CACHE[_session_gen_key(email)] = generation
         log_with_sid(email, "info", "USER_PASSWORD_SET")
         return email
 

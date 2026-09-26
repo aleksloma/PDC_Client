@@ -14,8 +14,9 @@ The contract pinned here:
     message, the link NOT consumed;
   - `POST /auth/change_password` (forced change) -> 400, the change form
     with the message, nothing written;
-  - `POST /auth/password` (profile change) -> 400 `{"error": message}`; the
-    route keeps stripping surrounding whitespace before it measures;
+  - `POST /auth/password` (profile change) -> 400 `{"error": message}`;
+  - no set site strips: every one measures and stores the string exactly as
+    typed, surrounding spaces included, like sign-in compares it;
   - the open self-registration branch of `POST /auth/login` (hosted demo
     only) -> 400, the landing page with the message, no account written.
 * Sign-in never checks the rule: an account whose existing password is
@@ -250,14 +251,57 @@ def test_the_profile_change_rejects_seven_characters(world):
     assert local_store.AuthStore().verify_password(USER, USER_PW) == "ok"
 
 
-def test_the_profile_change_measures_after_stripping(world):
-    """The route keeps its `.strip()`: seven characters padded with spaces
-    are still seven characters."""
+PADDED = "  " + SEVEN + "  "     # 11 characters as typed, 7 once stripped
+
+
+def test_the_profile_change_does_not_strip(world):
+    """The profile change measures and stores the password as typed: seven
+    characters padded with two spaces on each side are eleven characters,
+    and the spaces are part of the password afterwards."""
     tc = _signed_in(world)
     r = tc.post("/auth/password",
-                json={"current_password": USER_PW, "new_password": "  " + SEVEN + "  "})
-    assert r.status_code == 400, (r.status_code, r.text[:300])
-    assert r.json() == {"error": _msg(8)}, r.json()
+                json={"current_password": USER_PW, "new_password": PADDED})
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    store = local_store.AuthStore()
+    assert store.verify_password(USER, PADDED) == "ok"
+    assert store.verify_password(USER, SEVEN) is None
+
+
+def _set_via_reset_link(world):
+    token = local_store.AuthStore().create_reset_token(USER)
+    assert token
+    r = world["client"]().post(f"/auth/reset/{token}",
+                               data={"new_password": PADDED, "confirm_password": PADDED},
+                               follow_redirects=False)
+    return r, USER
+
+
+def _set_via_forced_change(world):
+    tc = _forced_session(world)
+    r = tc.post("/auth/change_password",
+                data={"new_password": PADDED, "confirm_password": PADDED},
+                follow_redirects=False)
+    return r, FORCED
+
+
+def _set_via_profile(world):
+    tc = _signed_in(world)
+    r = tc.post("/auth/password",
+                json={"current_password": USER_PW, "new_password": PADDED})
+    return r, USER
+
+
+@pytest.mark.parametrize("setter", [_set_via_reset_link, _set_via_forced_change,
+                                    _set_via_profile],
+                         ids=["reset-link", "forced-change", "profile"])
+def test_every_set_site_measures_the_raw_string(world, setter):
+    """The same padded seven-character value is accepted everywhere a
+    password is set, and is stored with its spaces."""
+    r, email = setter(world)
+    assert r.status_code in (200, 302), (r.status_code, r.text[:300])
+    store = local_store.AuthStore()
+    assert store.verify_password(email, PADDED) == "ok"
+    assert store.verify_password(email, SEVEN) is None
 
 
 def test_the_profile_change_accepts_eight_characters(world):

@@ -154,6 +154,31 @@ def test_callback_success(client, monkeypatch):
     assert local_store.AuthStore().get_profile("user@x.com")
 
 
+def test_callback_session_carries_the_generation_and_issue_time(client, monkeypatch):
+    """The Microsoft sign-in goes through the same session funnel as the
+    password sign-in: the session holds the account's current generation
+    (`gen`) and an integer issue time (`iat`)."""
+    @client.app.get("/_session_stamps")
+    async def _session_stamps(request: Request):
+        return {"email": request.session.get("email"),
+                "gen": request.session.get("gen"),
+                "iat": request.session.get("iat")}
+
+    _save()
+    _enable()
+    _install_fake(monkeypatch, _FakeOAuthClient(
+        token={"userinfo": {"preferred_username": "User@X.com"}}))
+    r = client.get("/auth/microsoft/callback", follow_redirects=False)
+    assert r.status_code == 302, (r.status_code, r.text[:300])
+    stamps = client.get("/_session_stamps").json()
+    assert stamps["email"] == "user@x.com", stamps
+    assert "gen" in stamps and stamps["gen"] is not None, stamps
+    assert stamps["gen"] == local_store.AuthStore().session_generation("user@x.com"), stamps
+    iat = stamps["iat"]
+    assert isinstance(iat, int) and not isinstance(iat, bool), stamps
+    assert iat > 0, stamps
+
+
 def test_callback_email_claim_fallback(client, monkeypatch):
     _save()
     _enable()

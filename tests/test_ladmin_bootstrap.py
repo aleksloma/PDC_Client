@@ -227,3 +227,78 @@ def test_promoted_admin_login_lands_on_lab(client):
                     follow_redirects=False)
     assert r.status_code == 302
     assert r.headers["location"] == "/lab"
+
+
+# ---------------------------------------------------------------------------
+# a bootstrap password shorter than the password rule is flagged in the log
+#
+# The bootstrap password is exempt from the length rule (refusing it would
+# lock a fresh install out), so a short one is created all the same and a
+# `LADMIN_BOOTSTRAP_WEAK` warning is logged -- only when the password is
+# actually CREATED, never when the account already has one, and never with
+# the password in the line.
+# ---------------------------------------------------------------------------
+WEAK_BOOT_PW = "wk-pw-7"          # 7 characters
+LONG_BOOT_PW = "long-enough-boot-pw"
+
+
+def _capture_store_log(monkeypatch):
+    lines = []
+
+    def rec(sid, level, message, **ctx):
+        lines.append((str(level), " ".join([str(sid), str(level), str(message)]
+                                           + [f"{k}={v}" for k, v in ctx.items()])))
+
+    monkeypatch.setattr(local_store, "log_with_sid", rec)
+    return lines
+
+
+def _weak_lines(lines):
+    return [(lvl, ln) for lvl, ln in lines if "LADMIN_BOOTSTRAP_WEAK" in ln]
+
+
+def test_a_short_bootstrap_password_is_created_and_flagged(monkeypatch):
+    monkeypatch.setattr(settings, "PASSWORD_MIN_LENGTH", 8)
+    monkeypatch.setattr(settings, "LOCAL_ADMIN_PASSWORD", WEAK_BOOT_PW)
+    lines = _capture_store_log(monkeypatch)
+    store = local_store.AuthStore()
+    store.ensure_local_admin()
+    assert store.verify_password("ladmin", WEAK_BOOT_PW) == "ok", \
+        "the bootstrap must still happen with a short password"
+    weak = _weak_lines(lines)
+    assert len(weak) == 1, [ln for _, ln in lines]
+    level, line = weak[0]
+    assert level == "warning", weak
+    assert WEAK_BOOT_PW not in line, "the bootstrap password reached the log"
+
+
+def test_a_long_enough_bootstrap_password_is_not_flagged(monkeypatch):
+    monkeypatch.setattr(settings, "PASSWORD_MIN_LENGTH", 8)
+    monkeypatch.setattr(settings, "LOCAL_ADMIN_PASSWORD", LONG_BOOT_PW)
+    lines = _capture_store_log(monkeypatch)
+    store = local_store.AuthStore()
+    store.ensure_local_admin()
+    assert store.verify_password("ladmin", LONG_BOOT_PW) == "ok"
+    assert not _weak_lines(lines), [ln for _, ln in lines]
+
+
+def test_the_weak_line_follows_the_setting(monkeypatch):
+    """The comparison reads PASSWORD_MIN_LENGTH: 19 characters are short
+    under a minimum of 20."""
+    monkeypatch.setattr(settings, "PASSWORD_MIN_LENGTH", 20)
+    monkeypatch.setattr(settings, "LOCAL_ADMIN_PASSWORD", LONG_BOOT_PW)
+    lines = _capture_store_log(monkeypatch)
+    local_store.AuthStore().ensure_local_admin()
+    assert len(_weak_lines(lines)) == 1, [ln for _, ln in lines]
+
+
+def test_no_weak_line_when_the_admin_already_has_a_password(monkeypatch):
+    monkeypatch.setattr(settings, "PASSWORD_MIN_LENGTH", 8)
+    store = local_store.AuthStore()
+    store.ensure_local_admin()                       # created with boot-pw-123
+    store.set_password("ladmin", "chosen-by-admin")
+    monkeypatch.setattr(settings, "LOCAL_ADMIN_PASSWORD", WEAK_BOOT_PW)
+    lines = _capture_store_log(monkeypatch)
+    store.ensure_local_admin()
+    assert not _weak_lines(lines), [ln for _, ln in lines]
+    assert store.verify_password("ladmin", "chosen-by-admin") == "ok"

@@ -195,6 +195,91 @@ def test_a_reset_ends_a_session_that_was_already_open(base_url, session_scoped_e
 
 
 # ---------------------------------------------------------------------------
+# accounts that are not plain password accounts
+# ---------------------------------------------------------------------------
+# Runs INSIDE pdc-client: an account WITHOUT a password that has signed in
+# with Microsoft (the SSO provenance stamp, nothing else).
+_SSO_ACCOUNT_SCRIPT = (
+    "import base64, sys\n"
+    "import local_store\n"
+    "email = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
+    "store = local_store.AuthStore()\n"
+    "store.ensure_user(email)\n"
+    "store.mark_sso_login(email, 'microsoft')\n"
+    "print('SSO_ONLY=' + str(store.is_sso_only(email)))\n"
+)
+
+# Runs INSIDE pdc-client: an account whose password must be changed at the
+# next sign-in.
+_FORCED_ACCOUNT_SCRIPT = (
+    "import base64, sys\n"
+    "import local_store\n"
+    "email = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
+    "password = base64.b64decode(sys.argv[2]).decode('utf-8')\n"
+    "store = local_store.AuthStore()\n"
+    "store.ensure_user(email)\n"
+    "store.set_password(email, password, force_change=True)\n"
+    "print('ok')\n"
+)
+
+# Runs INSIDE pdc-client: whether the account's auth record holds a reset
+# link hash (the value itself is never printed).
+_HAS_RESET_HASH_SCRIPT = (
+    "import base64, sys\n"
+    "import local_store\n"
+    "email = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
+    "auth = local_store.AuthStore().get_auth(email)\n"
+    "print('HAS_RESET_HASH=' + str(bool(auth.get('reset_token_hash'))))\n"
+)
+
+RULE_RE = re.compile(r"Password must be at least \d+ characters")
+
+
+def test_an_sso_only_account_gets_the_neutral_answer_and_no_link(
+        base_url, session_scoped_extra_emails):
+    """A reset request for an account that signs in with Microsoft and has
+    no password answers exactly like one for an unknown address, and no
+    reset link is minted for it."""
+    import time
+    _require_docker()
+    email = f"integration-sso-{secrets.token_hex(4)}@example.invalid"
+    session_scoped_extra_emails.append(email)
+    made = docker_exec(WEB_CONTAINER, "python", "-c", _SSO_ACCOUNT_SCRIPT, _b64(email))
+    assert made.returncode == 0, (made.stdout[-300:], made.stderr[-500:])
+    assert "SSO_ONLY=True" in (made.stdout or ""), made.stdout[-300:]
+    unknown = f"integration-unknown-{secrets.token_hex(4)}@example.invalid"
+    session_scoped_extra_emails.append(unknown)
+    with _client(base_url) as c:
+        a = c.post("/auth/reset_password", data={"email": email})
+        b = c.post("/auth/reset_password", data={"email": unknown})
+    assert (a.status_code, b.status_code) == (200, 200)
+    assert NEUTRAL_RESET in a.text
+    assert _normalise(a.text, email) == _normalise(b.text, unknown)
+    time.sleep(2.0)                    # the mail hand-off runs off the request
+    check = docker_exec(WEB_CONTAINER, "python", "-c", _HAS_RESET_HASH_SCRIPT, _b64(email))
+    assert check.returncode == 0, (check.stdout[-300:], check.stderr[-500:])
+    assert "HAS_RESET_HASH=False" in (check.stdout or ""), check.stdout[-300:]
+
+
+def test_the_forced_change_applies_the_password_rule(base_url, session_scoped_extra_emails):
+    _require_docker()
+    email = f"integration-forced-{secrets.token_hex(4)}@example.invalid"
+    password = f"pw-{secrets.token_hex(8)}"
+    session_scoped_extra_emails.append(email)
+    made = docker_exec(WEB_CONTAINER, "python", "-c", _FORCED_ACCOUNT_SCRIPT,
+                       _b64(email), _b64(password))
+    assert made.returncode == 0, (made.stdout[-300:], made.stderr[-500:])
+    with _client(base_url) as c:
+        signed_in = c.post("/auth/login", data={"email": email, "password": password})
+        assert signed_in.status_code == 302, (signed_in.status_code, signed_in.text[:300])
+        assert signed_in.headers.get("location") == "/auth/change_password"
+        r = c.post("/auth/change_password",
+                   data={"new_password": "Abcde-1", "confirm_password": "Abcde-1"})
+    assert r.status_code == 400, (r.status_code, r.text[:300])
+    assert RULE_RE.search(r.text), r.text[:600]
+
+
+# ---------------------------------------------------------------------------
 # the lockout -- LAST in this module
 # ---------------------------------------------------------------------------
 def test_zz_the_lockout_engages_after_the_ninth_failure(base_url, session_scoped_extra_emails):

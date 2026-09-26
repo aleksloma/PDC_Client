@@ -353,3 +353,121 @@ def test_the_gate_sits_inside_the_session_layer_and_the_guard_stays_outermost():
     assert gate in classes, classes
     assert classes.index(gate) > classes.index(app_mod.RememberMeSessionMiddleware), \
         "the gate must run INSIDE the session middleware"
+
+
+# ===========================================================================
+# an unreadable auth record
+# ===========================================================================
+BROKEN = "gen.broken@corp.example"
+
+
+def _write_unreadable_auth(tmp, email=BROKEN):
+    d = tmp / "users" / email
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "profile.json").write_text(json.dumps({"email": email}), encoding="utf-8")
+    (d / "auth.json").write_text('{"session_generation": "abc', encoding="utf-8")
+
+
+def _capture_store_log(monkeypatch):
+    lines = []
+
+    def rec(sid, level, message, **ctx):
+        lines.append(" ".join([str(sid), str(level), str(message)]
+                              + [f"{k}={v}" for k, v in ctx.items()]))
+
+    monkeypatch.setattr(local_store, "log_with_sid", rec)
+    return lines
+
+
+def test_an_unreadable_record_answers_empty_and_is_logged_once(world, monkeypatch):
+    _write_unreadable_auth(world["tmp"])
+    lines = _capture_store_log(monkeypatch)
+    answers = [_generation(BROKEN) for _ in range(3)]
+    assert answers == ["", "", ""], answers
+    hits = [ln for ln in lines if "SESSION_GENERATION_READ_FAILED" in ln]
+    assert len(hits) == 1, ("not latched per path", lines)
+    assert "auth.json" in hits[0], ("the line does not name the record", hits[0])
+    assert '"session_generation"' not in hits[0], "the record's content reached the log"
+
+
+def test_the_gate_passes_an_empty_generation_on_an_unreadable_record(world):
+    _write_unreadable_auth(world["tmp"])
+    reached, sent, _ = _run_gate({"email": BROKEN, "gen": "", "sid": "s_1"})
+    assert reached == [{"email": BROKEN, "gen": "", "sid": "s_1"}], reached
+    assert sent and sent[0].get("status") == 200, sent
+
+
+def test_the_gate_empties_a_real_generation_on_an_unreadable_record(world):
+    _write_unreadable_auth(world["tmp"])
+    session = {"email": BROKEN, "gen": "0123456789abcdef", "sid": "s_1"}
+    reached, sent, _ = _run_gate(session)
+    assert reached == [{}], reached
+    assert session == {}, session
+    assert sent and sent[0].get("status") == 200, sent
+
+
+# ===========================================================================
+# the cache key
+# ===========================================================================
+def test_a_cached_lookup_touches_no_filesystem_path(world, monkeypatch):
+    """After the first lookup the per-request check is a dictionary read:
+    no `_data_root()` (which mkdirs) on a hit."""
+    first = _generation(USER)
+    assert first
+    calls = []
+    real = local_store._data_root
+
+    def counting():
+        calls.append(1)
+        return real()
+
+    monkeypatch.setattr(local_store, "_data_root", counting)
+    assert _generation(USER) == first
+    assert _generation(USER) == first
+    assert calls == [], f"_data_root() called {len(calls)} time(s) on a cache hit"
+
+
+def test_another_data_root_does_not_see_the_first_roots_value(world, monkeypatch, tmp_path_factory):
+    first = _generation(USER)
+    assert first
+    other = tmp_path_factory.mktemp("other_root")
+    monkeypatch.setattr(settings, "DATA_ROOT", str(other))
+    assert _generation(USER) == "", "a cached value crossed DATA_ROOTs"
+    other2 = tmp_path_factory.mktemp("other_root2")
+    d2 = other2 / "users" / USER
+    d2.mkdir(parents=True)
+    (d2 / "auth.json").write_text(json.dumps({"session_generation": "0011223344556677"}),
+                                  encoding="utf-8")
+    monkeypatch.setattr(settings, "DATA_ROOT", str(other2))
+    assert _generation(USER) == "0011223344556677"
+    monkeypatch.setattr(settings, "DATA_ROOT", str(world["tmp"]))
+    assert _generation(USER) == first
+
+
+def test_set_password_refreshes_the_cached_value_after_a_hit(world):
+    before = _generation(USER)
+    assert _generation(USER) == before                    # a cache hit
+    after = local_store.AuthStore().set_password(USER, NEW_PW)
+    assert _generation(USER) == after != before
+
+
+# ===========================================================================
+# the cache is per process
+# ===========================================================================
+def test_an_out_of_process_change_is_seen_only_after_a_restart(world):
+    """The generation cache lives in the web process. A change written to
+    auth.json by another process (an operator editing the file, a script in
+    the container) is NOT seen by a running web container: an open session
+    keeps working until the web container is restarted, which empties the
+    cache (modelled here by clearing it)."""
+    a = _signed_in()
+    assert a.get("/auth/profile").status_code == 200        # value now cached
+    p = world["tmp"] / "users" / USER / "auth.json"
+    rec = json.loads(p.read_text(encoding="utf-8"))
+    rec["session_generation"] = "feedfacefeedface"
+    p.write_text(json.dumps(rec), encoding="utf-8")
+    still = a.get("/auth/profile")
+    assert still.status_code == 200, (still.status_code, still.text[:200])
+    local_store._SESSION_GEN_CACHE.clear()                  # a restart
+    ended = a.get("/auth/profile")
+    assert ended.status_code == 401, (ended.status_code, ended.text[:200])
