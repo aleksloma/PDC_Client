@@ -678,3 +678,40 @@ async def share_dashboard(request: Request, dash_id: str):
         "smtp_configured": bool(smtp_result.get("smtp_configured")),
         "failed": smtp_result.get("failed") or [],
     }
+
+
+@router.post("/{dash_id}/unshare")
+async def unshare_dashboard(request: Request, dash_id: str):
+    """Body: {email}. Owner-only. Takes the address off the dashboard's
+    shared_with and removes that recipient's pointer row, so the dashboard
+    leaves their list and their saved URL resolves nothing. Idempotent: an
+    address that is not shared answers 200 with the list unchanged.
+
+    The source chats the share granted alongside are NOT touched — that grant
+    is the chat's own sharing (the chat-level contract has no revoke either),
+    and another share of the same chat may rely on it."""
+    email, err = _require_email(request)
+    if err:
+        return err
+    _, err = _require_owned(email, dash_id)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    recipient = str(body.get("email") or "").strip().lower()
+    from routes.auth import _EMAIL_RE   # the one address pattern
+    if not _EMAIL_RE.fullmatch(recipient):
+        return JSONResponse({"error": "Provide a valid email address."}, status_code=400)
+    try:
+        remaining = _dash_store.remove_dashboard_share(email, dash_id, recipient)
+    except Exception as e:
+        log_with_sid(email, "error", f"DASH_UNSHARE_FAILED: {log_safe_text(str(e), 200)}")
+        return JSONResponse({"error": "Could not remove access."}, status_code=500)
+    if remaining is None:
+        # The doc vanished between the owner check and the write.
+        return JSONResponse({"error": "Dashboard not found"}, status_code=404)
+    return {"ok": True, "shared_with": remaining}

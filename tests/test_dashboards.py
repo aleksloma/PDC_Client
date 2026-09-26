@@ -111,7 +111,8 @@ def test_all_endpoints_401_without_session(client):
                  f"/api/dashboards/{dash}/tiles/{tile}/remove",
                  f"/api/dashboards/{dash}/tiles/{tile}/refresh",
                  f"/api/dashboards/{dash}/tiles/{tile}/update",
-                 f"/api/dashboards/{dash}/share"):
+                 f"/api/dashboards/{dash}/share",
+                 f"/api/dashboards/{dash}/unshare"):
         assert client.post(path, json={}).status_code == 401, path
 
 
@@ -653,6 +654,111 @@ def test_owner_delete_prunes_recipient_pointer_on_next_list(client, monkeypatch)
     client.post(f"/_login/{FRIEND}")
     assert client.get("/api/dashboards").json()["dashboards"] == []
     assert client.get(f"/api/dashboards/{dash}").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Unshare (owner only)
+# ---------------------------------------------------------------------------
+
+EVE = "eve@acme.com"
+
+
+def _unshare(client, dash, email):
+    return client.post(f"/api/dashboards/{dash}/unshare", json={"email": email})
+
+
+def _shared_two(client, monkeypatch):
+    _stub_chat(monkeypatch)
+    _stub_share_email(monkeypatch)
+    client.post(f"/_login/{OWNER}")
+    dash = _mk_dash(client, "Team KPIs")
+    assert _share(client, dash, f"{FRIEND}, {EVE}").json()["shared_with"] == [FRIEND, EVE]
+    return dash
+
+
+def test_unshare_owner_removes_one_address(client, monkeypatch):
+    dash = _shared_two(client, monkeypatch)
+    resp = _unshare(client, dash, FRIEND)
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "shared_with": [EVE]}
+    doc = client.get(f"/api/dashboards/{dash}").json()
+    assert doc["sharing"]["shared_with"] == [EVE]
+
+
+def test_unshare_drops_the_recipients_pointer_row_and_access(client, monkeypatch, tmp_path):
+    dash = _shared_two(client, monkeypatch)
+    _unshare(client, dash, FRIEND)
+    idx = tmp_path / "users" / FRIEND / "dashboards" / "index.json"
+    rows = json.loads(idx.read_text("utf-8"))
+    assert all(r.get("dash_id") != dash for r in rows)
+    client.post(f"/_login/{FRIEND}")
+    assert client.get("/api/dashboards").json()["dashboards"] == []
+    # A saved URL resolves nothing any more: the existing not-found path.
+    assert client.get(f"/api/dashboards/{dash}").status_code == 404
+    # The other recipient keeps it.
+    client.post(f"/_login/{EVE}")
+    rows = client.get("/api/dashboards").json()["dashboards"]
+    assert [r["dash_id"] for r in rows] == [dash]
+
+
+def test_unshare_is_idempotent(client, monkeypatch):
+    dash = _shared_two(client, monkeypatch)
+    assert _unshare(client, dash, FRIEND).json()["shared_with"] == [EVE]
+    again = _unshare(client, dash, FRIEND)
+    assert again.status_code == 200
+    assert again.json() == {"ok": True, "shared_with": [EVE]}
+    never = _unshare(client, dash, "nobody@acme.com")
+    assert never.status_code == 200 and never.json()["shared_with"] == [EVE]
+
+
+def test_unshare_of_a_never_shared_address_leaves_no_user_folder(client, monkeypatch, tmp_path):
+    dash = _shared_two(client, monkeypatch)
+    assert _unshare(client, dash, "stranger@acme.com").status_code == 200
+    assert not (tmp_path / "users" / "stranger@acme.com").exists()
+
+
+def test_unshare_matches_the_address_case_insensitively(client, monkeypatch):
+    dash = _shared_two(client, monkeypatch)
+    assert _unshare(client, dash, "  Bob@ACME.com ").json()["shared_with"] == [EVE]
+
+
+def test_unshare_by_a_recipient_is_403(client, monkeypatch):
+    dash = _shared_two(client, monkeypatch)
+    client.post(f"/_login/{FRIEND}")
+    resp = _unshare(client, dash, EVE)
+    assert resp.status_code == 403
+    assert resp.json() == {"error": "Only the dashboard owner can do this."}
+    client.post(f"/_login/{OWNER}")
+    assert client.get(f"/api/dashboards/{dash}").json()["sharing"]["shared_with"] == [FRIEND, EVE]
+
+
+def test_unshare_unknown_dashboard_is_404(client):
+    client.post(f"/_login/{OWNER}")
+    resp = _unshare(client, "f" * 16, FRIEND)
+    assert resp.status_code == 404
+    assert resp.json() == {"error": "Dashboard not found"}
+
+
+@pytest.mark.parametrize("body", [{}, {"email": ""}, {"email": "not-an-address"},
+                                  {"email": ["bob@acme.com"]}, ["bob@acme.com"]])
+def test_unshare_needs_one_valid_address(client, monkeypatch, body):
+    dash = _shared_two(client, monkeypatch)
+    resp = client.post(f"/api/dashboards/{dash}/unshare", json=body)
+    assert resp.status_code == 400
+    assert client.get(f"/api/dashboards/{dash}").json()["sharing"]["shared_with"] == [FRIEND, EVE]
+
+
+def test_unshare_leaves_the_source_chat_grant_alone(client, monkeypatch, tmp_path):
+    _stub_chat(monkeypatch)
+    _stub_share_email(monkeypatch)
+    client.post(f"/_login/{OWNER}")
+    _seed_chart_code("chat42")
+    dash = _mk_dash(client)
+    _pin_chart(client, dash, chat_id="chat42")
+    _share(client, dash)
+    assert _unshare(client, dash, FRIEND).json()["shared_with"] == []
+    meta = json.loads((tmp_path / "chatdata" / "chat42" / "meta.json").read_text("utf-8"))
+    assert FRIEND in meta["sharing"]["shared_with"]
 
 
 # ---------------------------------------------------------------------------

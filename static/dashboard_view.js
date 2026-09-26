@@ -279,6 +279,105 @@
     document.addEventListener('keydown', popEscHandler);
   }
 
+  // ── owner: "Shared with N" + unshare ─────────────────────────────────────
+  // The recipient's "Shared by <owner>" badge is a different element
+  // (#dashSharedBadge) and is filled only on the !isOwner branch of init.
+  function sharedWithList() {
+    return ((dash && dash.sharing && dash.sharing.shared_with) || []).slice();
+  }
+
+  function setSharedWith(list) {
+    if (!dash) return;
+    dash.sharing = Object.assign({}, dash.sharing || {}, { shared_with: list.slice() });
+    renderSharedWith();
+  }
+
+  function renderSharedWith() {
+    const btn = document.getElementById('btnSharedWith');
+    const listEl = document.getElementById('sharedWithList');
+    if (!btn || !listEl || !isOwner) return;
+    const list = sharedWithList();
+    btn.textContent = _t('dash.shared_with', 'Shared with {n}').replace('{n}', String(list.length));
+    btn.classList.toggle('hidden', list.length === 0);
+    listEl.replaceChildren();
+    list.forEach(addr => {
+      const row = document.createElement('label');
+      row.className = 'dash-shared-menu-row';
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = true;
+      box.addEventListener('change', () => { if (!box.checked) unshareAddress(addr, box, row); });
+      const text = document.createElement('span');
+      text.textContent = addr;
+      text.title = addr;
+      row.append(box, text);
+      listEl.appendChild(row);
+    });
+    if (list.length === 0) closeSharedMenu();
+  }
+
+  async function unshareAddress(addr, box, row) {
+    box.disabled = true;
+    try {
+      const res = await fetch(`/api/dashboards/${DASH_ID}/unshare`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: addr }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data || !data.ok || !Array.isArray(data.shared_with)) {
+        throw new Error((data && data.error) || 'unshare failed');
+      }
+      setSharedWith(data.shared_with);
+      showToast(_t('dash.unshare_ok', 'Access removed'));
+    } catch (e) {
+      box.checked = true;
+      box.disabled = false;
+      showToast(_t('dash.unshare_failed', 'Could not remove access'), true);
+    }
+  }
+
+  function sharedMenuEsc(e) {
+    if (e.key === 'Escape') {
+      closeSharedMenu();
+      document.getElementById('btnSharedWith')?.focus();
+    }
+  }
+
+  function closeSharedMenu() {
+    document.querySelectorAll('.dash-shared-menu-backdrop').forEach(el => el.remove());
+    document.removeEventListener('keydown', sharedMenuEsc);
+    const menu = document.getElementById('sharedWithMenu');
+    if (menu) menu.classList.add('hidden');
+    document.getElementById('btnSharedWith')?.setAttribute('aria-expanded', 'false');
+  }
+
+  function openSharedMenu() {
+    closeAllPopovers();
+    closeSharedMenu();
+    // Same reason as the description popover: clicks inside Plotly iframes do
+    // not bubble to document, so outside-click needs a real backdrop.
+    const backdrop = document.createElement('div');
+    backdrop.className = 'dash-shared-menu-backdrop';
+    backdrop.addEventListener('click', closeSharedMenu);
+    document.body.appendChild(backdrop);
+    document.getElementById('sharedWithMenu').classList.remove('hidden');
+    document.getElementById('btnSharedWith').setAttribute('aria-expanded', 'true');
+    // Focus stays on the button: a focused checkbox would unshare on a
+    // single stray Space press.
+    document.addEventListener('keydown', sharedMenuEsc);
+  }
+
+  function wireSharedWith() {
+    const btn = document.getElementById('btnSharedWith');
+    if (!btn || !isOwner) return;
+    btn.addEventListener('click', () => {
+      const open = !document.getElementById('sharedWithMenu').classList.contains('hidden');
+      if (open) closeSharedMenu(); else openSharedMenu();
+    });
+    renderSharedWith();
+    window.addEventListener('languageChanged', renderSharedWith);
+  }
+
   // ── tile actions ─────────────────────────────────────────────────────────
   function actShowData(tile) {
     if (!window.PDCViewers || tile.kind === 'text') return;
@@ -883,6 +982,7 @@
             throw new Error((data && data.error) || 'share failed');
           }
           closeModal('shareDashModal');
+          if (Array.isArray(data.shared_with)) setSharedWith(data.shared_with);
           showToast(_t('dash.shared_ok', 'Dashboard shared'));
         } catch (e) {
           showToast(String(e.message || e), true);
@@ -989,6 +1089,7 @@
     }
 
     wireTopBar();
+    wireSharedWith();
     wireTextTileButtons();
     updateEmptyState();
     initGrid();

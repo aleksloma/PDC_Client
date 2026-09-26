@@ -59,6 +59,68 @@
   white-space: nowrap;
 }
 
+/* This page loads no generic `.hidden` rule (dashboard.css has none), so an
+   element of the title row that starts hidden needs this one — without it the
+   owner saw the recipient badge as an empty green pill, and the ✎ button. */
+.dash-top-bar .hidden { display: none; }
+
+/* Owner: "Shared with N" button + its dropdown of addresses */
+.dash-shared-with-wrap { position: relative; flex: 0 0 auto; }
+.dash-shared-with {
+  font-size: 12px;
+  color: #166534;
+  background: #f0fdf4;
+  border: 1px solid #86efac;
+  border-radius: 999px;
+  padding: 3px 10px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.dash-shared-with:hover { background: #dcfce7; }
+.dash-shared-with:focus-visible { outline: 2px solid #16a34a; outline-offset: 2px; }
+.dash-shared-with::after { content: " \25BE"; }
+.dash-shared-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  min-width: 260px;
+  max-width: min(360px, 90vw);
+  max-height: 320px;
+  overflow: auto;
+  background: var(--bg, #fff);
+  border: 1px solid var(--line, #e7e8ea);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+  padding: 8px 0;
+  z-index: 901;
+}
+.dash-shared-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  background: transparent;
+}
+.dash-shared-menu-hint {
+  font-size: 12px;
+  color: #6b7280;
+  padding: 2px 14px 6px;
+}
+.dash-shared-menu-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  font-size: 13px;
+  color: var(--text, #222);
+  cursor: pointer;
+}
+.dash-shared-menu-row:hover { background: #f9fafb; }
+.dash-shared-menu-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .dash-top-bar .top-bar-actions {
   display: flex;
   align-items: center;

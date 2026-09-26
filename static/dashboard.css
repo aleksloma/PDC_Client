@@ -14,15 +14,18 @@
   width: 100%;
 }
 
-/* Sidebar */
+/* Sidebar. --sidebar-width is set on <html> by the head script of
+   dashboard.html (and by dashboard.js while dragging); the mobile block
+   below overrides the width, so it only ever affects desktop. */
 .sidebar {
-  width: 320px;
-  min-width: 320px;
+  width: var(--sidebar-width, 320px);
+  min-width: var(--sidebar-width, 320px);
   background: #ffffff;
   border-right: 1px solid #e5e7eb;
   display: flex;
   flex-direction: column;
   height: 100vh;
+  position: relative;
 }
 
 .sidebar-header {
@@ -1858,6 +1861,129 @@ button.danger:hover {
 
 .sidebar-backdrop.visible {
   display: block;
+}
+
+/* Desktop-only sidebar controls: hidden unless the desktop block turns
+   them on, so the mobile drawer never shows them. */
+.sidebar-collapse-btn,
+.sidebar-resizer,
+.sidebar-logo-mark {
+  display: none;
+}
+
+@media (min-width: 769px) {
+  .sidebar {
+    transition: width 0.2s ease, min-width 0.2s ease;
+  }
+
+  .sidebar-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .sidebar-collapse-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 6px;
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    color: #6b7280;
+    flex-shrink: 0;
+  }
+
+  .sidebar-collapse-btn:hover {
+    background: #f3f4f6;
+    color: #374151;
+  }
+
+  .sidebar-collapse-btn:focus-visible {
+    outline: 2px solid #374151;
+    outline-offset: 2px;
+  }
+
+  .sidebar-collapse-btn svg {
+    transition: transform 0.2s ease;
+  }
+
+  .sidebar-resizer {
+    display: block;
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 6px;
+    height: 100%;
+    cursor: col-resize;
+    z-index: 5;
+    background: transparent;
+    touch-action: none;
+  }
+
+  .sidebar-resizer:hover,
+  html.sidebar-resizing .sidebar-resizer {
+    background: rgba(55, 65, 81, 0.18);
+  }
+
+  html.sidebar-resizing,
+  html.sidebar-resizing * {
+    cursor: col-resize !important;
+    user-select: none;
+  }
+
+  html.sidebar-resizing .sidebar {
+    transition: none;
+  }
+
+  /* Collapsed: a 56px rail with the logo mark, the expand button and the
+     "new chat" button as an icon. The main content is flex: 1, so it takes
+     the freed width (animated through the width transition above). */
+  html.sidebar-collapsed .sidebar {
+    width: 56px;
+    min-width: 56px;
+  }
+
+  html.sidebar-collapsed .sidebar-header {
+    flex-direction: column;
+    padding: 12px 0;
+    gap: 10px;
+  }
+
+  html.sidebar-collapsed .sidebar-logo {
+    display: none;
+  }
+
+  html.sidebar-collapsed .sidebar-logo-mark {
+    display: block;
+    height: 32px;
+    width: auto;
+  }
+
+  html.sidebar-collapsed .sidebar-collapse-btn svg {
+    transform: rotate(180deg);
+  }
+
+  html.sidebar-collapsed .sidebar-content {
+    padding: 12px 8px;
+    overflow: hidden;
+  }
+
+  html.sidebar-collapsed #chatsList,
+  html.sidebar-collapsed #btnCreateNew .btn-label,
+  html.sidebar-collapsed .sidebar-resizer {
+    display: none;
+  }
+
+  html.sidebar-collapsed #btnCreateNew {
+    justify-content: center;
+    gap: 0;
+    padding: 8px 0;
+  }
 }
 
 /* Responsive */

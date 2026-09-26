@@ -22,6 +22,14 @@
       <h1 id="dashTitle" class="dash-title"></h1>
       <button id="btnRenameDash" class="ghost small dash-title-edit hidden" data-i18n-title="dash.rename" title="Rename">✎</button>
       <span id="dashSharedBadge" class="dash-shared-badge hidden"></span>
+      <div class="dash-shared-with-wrap">
+        <button id="btnSharedWith" class="dash-shared-with hidden" type="button"
+                aria-haspopup="true" aria-expanded="false" aria-controls="sharedWithMenu"></button>
+        <div id="sharedWithMenu" class="dash-shared-menu hidden" role="group" data-i18n-aria-label="dash.shared_with_hint" aria-label="Untick an address to stop sharing">
+          <div class="dash-shared-menu-hint" data-i18n="dash.shared_with_hint">Untick an address to stop sharing</div>
+          <div id="sharedWithList" class="dash-shared-menu-list"></div>
+        </div>
+      </div>
       <div class="top-bar-spacer"></div>
       <div class="top-bar-actions">
         <button id="btnAddHeader" class="ghost small top-action-btn hidden" data-i18n="dash.add_header">＋ Header</button>

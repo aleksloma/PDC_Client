@@ -145,6 +145,7 @@ EXPECTED_ROUTES = [
     ('POST', '/api/dashboards/{dash_id}/tiles/{tile_id}/refresh'),
     ('POST', '/api/dashboards/{dash_id}/tiles/{tile_id}/remove'),
     ('POST', '/api/dashboards/{dash_id}/tiles/{tile_id}/update'),
+    ('POST', '/api/dashboards/{dash_id}/unshare'),
     ('POST', '/api/paddle/subscription/cancel'),
     ('POST', '/api/paddle/subscription/preview'),
     ('POST', '/api/paddle/subscription/reactivate'),

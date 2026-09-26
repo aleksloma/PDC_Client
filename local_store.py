@@ -2658,3 +2658,51 @@ class DashboardStore:
             log_with_sid(owner_email, "info",
                          f"DASHBOARD_SHARED dash={dash_id} added={len(new)}")
         return new
+
+    def remove_dashboard_share(self, owner_email: str, dash_id: str,
+                               recipient: str) -> list[str] | None:
+        """Take one address off the doc's shared_with and drop that
+        recipient's pointer row. Returns the remaining shared_with list, or
+        None when the owner has no such dashboard. Idempotent: an address
+        that is not in the list changes nothing and returns the list as is.
+
+        The source chats that `share` granted alongside the dashboard are NOT
+        touched: that grant is the chat's own sharing, which other shares may
+        rely on. A recipient who still holds the URL resolves nothing
+        (`resolve_dashboard` checks shared_with), so the page sends them to
+        /lab and the API answers 404."""
+        owner_email = _safe_email(owner_email)
+        rcpt = _safe_email(recipient or "")
+        removed = False
+        with _LOCK:
+            doc = self._read_doc(owner_email, dash_id)
+            if doc is None:
+                return None
+            sharing = doc.get("sharing") or {"shared_with": []}
+            current = list(sharing.get("shared_with") or [])
+            remaining = [s for s in current if (s or "").strip().lower() != rcpt]
+            if len(remaining) != len(current):
+                removed = True
+                sharing["shared_with"] = remaining
+                doc["sharing"] = sharing
+                self._write_doc(owner_email, doc)
+            # Look for the recipient's index WITHOUT `_dir()`, which creates
+            # the folder: an address that was never shared must leave no
+            # trace under users/.
+            idx = _data_root() / "users" / rcpt / "dashboards" / "index.json"
+            if rcpt and idx.is_file():
+                try:
+                    rows = self._read_index(rcpt)
+                    kept = [r for r in rows
+                            if not (r.get("dash_id") == dash_id
+                                    and (r.get("shared_by") or "").lower() == owner_email)]
+                    if len(kept) != len(rows):
+                        self._write_index(rcpt, kept)
+                except Exception as e:
+                    log_with_sid(owner_email, "error",
+                                 f"DASH_UNSHARE_POINTER_FAILED dash={dash_id} "
+                                 f"error={type(e).__name__}")
+        if removed:
+            log_with_sid(owner_email, "info",
+                         f"DASHBOARD_UNSHARED dash={dash_id} remaining={len(remaining)}")
+        return remaining

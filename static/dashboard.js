@@ -921,6 +921,89 @@ function closeSidebar() {
   document.body.style.overflow = '';
 }
 
+// Desktop sidebar: collapse to a rail and drag to resize. Every CSS rule for
+// it sits under @media (min-width: 769px), so the mobile drawer is untouched.
+// The state survives reloads in browser storage; the head script of
+// dashboard.html applies it before first paint (same keys, same bounds).
+const SIDEBAR_COLLAPSED_KEY = 'pdc_sidebar_collapsed';
+const SIDEBAR_WIDTH_KEY = 'pdc_sidebar_width';
+const SIDEBAR_MIN_WIDTH = 240;
+const SIDEBAR_MAX_WIDTH = 480;
+
+// The only two places in this file that touch browser storage. It can throw
+// (blocked site data, some private windows), and the page must work anyway.
+function _lsGet(key) {
+  try { return window.localStorage.getItem(key); } catch (e) { return null; }
+}
+
+function _lsSet(key, value) {
+  try { window.localStorage.setItem(key, value); } catch (e) { /* the state then lasts for this page only */ }
+}
+
+function _syncSidebarCollapseButton() {
+  const btn = document.getElementById('btnSidebarCollapse');
+  if (!btn) return;
+  const collapsed = document.documentElement.classList.contains('sidebar-collapsed');
+  const key = collapsed ? 'lab.sidebar_expand' : 'lab.sidebar_collapse';
+  const fallback = collapsed ? 'Expand sidebar' : 'Collapse sidebar';
+  const t = (window.i18n && typeof window.i18n.t === 'function') ? window.i18n.t(key) : '';
+  const label = (t && t !== key) ? t : fallback;
+  btn.setAttribute('aria-label', label);
+  btn.title = label;
+  btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+}
+
+function initDesktopSidebar() {
+  const root = document.documentElement;
+  const btn = document.getElementById('btnSidebarCollapse');
+  const resizer = document.getElementById('sidebarResizer');
+  const sidebar = document.getElementById('sidebar');
+  // The head script already applied the stored state; re-read it here only so
+  // a width outside the bounds (an older build, a hand edit) is ignored.
+  const stored = parseInt(_lsGet(SIDEBAR_WIDTH_KEY), 10);
+  if (!(stored >= SIDEBAR_MIN_WIDTH && stored <= SIDEBAR_MAX_WIDTH)) {
+    root.style.removeProperty('--sidebar-width');
+  }
+  if (btn) {
+    btn.addEventListener('click', () => {
+      const collapsed = root.classList.toggle('sidebar-collapsed');
+      _lsSet(SIDEBAR_COLLAPSED_KEY, collapsed ? '1' : '0');
+      _syncSidebarCollapseButton();
+    });
+    _syncSidebarCollapseButton();
+    window.addEventListener('languageChanged', _syncSidebarCollapseButton);
+  }
+  if (resizer && sidebar) {
+    let dragging = false;
+    let width = 0;
+    const clamp = (w) => Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, Math.round(w)));
+    resizer.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      dragging = true;
+      width = clamp(sidebar.getBoundingClientRect().width);
+      root.classList.add('sidebar-resizing');
+      // Pointer capture keeps the drag alive over the chart iframes of the
+      // main area, which would otherwise swallow the move events.
+      try { resizer.setPointerCapture(e.pointerId); } catch (_) { /* older browser */ }
+      e.preventDefault();
+    });
+    resizer.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      width = clamp(e.clientX - sidebar.getBoundingClientRect().left);
+      root.style.setProperty('--sidebar-width', width + 'px');
+    });
+    const end = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      root.classList.remove('sidebar-resizing');
+      try { resizer.releasePointerCapture(e.pointerId); } catch (_) { /* already released */ }
+      _lsSet(SIDEBAR_WIDTH_KEY, String(width));
+    };
+    resizer.addEventListener('pointerup', end);
+    resizer.addEventListener('pointercancel', end);
+  }
+}
+
 // Setup event listeners
 function setupEventListeners() {
   // Mobile sidebar toggle
@@ -944,6 +1027,9 @@ function setupEventListeners() {
   btnHamburger.addEventListener('click', openSidebar);
   btnCloseSidebar.addEventListener('click', closeSidebar);
   sidebarBackdrop.addEventListener('click', closeSidebar);
+
+  // Desktop sidebar collapse + resize
+  initDesktopSidebar();
 
   // Note: Old dropdown toggle and list item click handlers removed
   // Now handled by attachUnifiedListeners() which is called after rendering

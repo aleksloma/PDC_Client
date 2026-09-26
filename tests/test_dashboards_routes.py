@@ -262,3 +262,20 @@ def test_recipient_tile_from_an_unowned_source_chat_freezes_access_revoked(clien
     # The tile from Bob's own chat stays live for Carol.
     r = client.post(f"/api/dashboards/{dash}/tiles/{tile_z['tile_id']}/refresh", json={})
     assert r.json()["ok"] is True, r.text
+
+
+def test_unshare_keeps_the_source_chat_grant_and_drops_only_the_dashboard(client):
+    dash, _, tile_z = _bob_board_with_tiles_from_x_and_z(client)
+    assert CAROL in _shared_with(CHAT_Z)
+    r = client.post(f"/api/dashboards/{dash}/unshare", json={"email": CAROL})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"ok": True, "shared_with": []}
+    # The chat grant that the share made alongside is untouched.
+    assert CAROL in _shared_with(CHAT_Z)
+    assert _shared_with(CHAT_X) == [BOB]
+    # Carol no longer lists or resolves the dashboard, nor refreshes its tiles.
+    _as(client, CAROL)
+    assert client.get("/api/dashboards").json()["dashboards"] == []
+    assert client.get(f"/api/dashboards/{dash}").status_code == 404
+    r = client.post(f"/api/dashboards/{dash}/tiles/{tile_z['tile_id']}/refresh", json={})
+    assert r.status_code == 404

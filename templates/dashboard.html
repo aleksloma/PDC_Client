@@ -20,6 +20,24 @@
   <link rel="shortcut icon" href="/static/logo.png?v={{ ts }}" />
   <link rel="stylesheet" href="/static/main.css?v={{ ts }}" />
   <link rel="stylesheet" href="/static/dashboard.css?v={{ ts }}" />
+  <script nonce="{{ request.state.csp_nonce }}">
+    /* Desktop sidebar state, applied before the body is parsed so a collapsed
+       or resized sidebar never flashes at its default width. The same keys
+       and bounds live in dashboard.js (_lsGet/_lsSet, SIDEBAR_MIN/MAX_WIDTH);
+       the CSS scopes both to desktop widths, so mobile is unaffected. */
+    (function () {
+      var root = document.documentElement;
+      try {
+        if (window.localStorage.getItem('pdc_sidebar_collapsed') === '1') {
+          root.classList.add('sidebar-collapsed');
+        }
+      } catch (e) {}
+      try {
+        var w = parseInt(window.localStorage.getItem('pdc_sidebar_width'), 10);
+        if (w >= 240 && w <= 480) root.style.setProperty('--sidebar-width', w + 'px');
+      } catch (e) {}
+    })();
+  </script>
 </head>
 <body class="dashboard-page">
   <div class="dashboard-container">
@@ -28,7 +46,18 @@
       <div class="sidebar-header">
         <a href="/" class="logo-link">
           <img src="/static/logo2.png?v={{ ts }}" alt="PowerDataChat" class="sidebar-logo" />
+          <img src="/static/logo.png?v={{ ts }}" alt="PowerDataChat" class="sidebar-logo-mark" />
         </a>
+        <!-- Desktop only: collapse to a rail / expand again. Its label and
+             aria-expanded are set by dashboard.js (they depend on the state). -->
+        <button id="btnSidebarCollapse" class="sidebar-collapse-btn" type="button"
+                aria-label="Collapse sidebar" aria-expanded="true" aria-controls="sidebar"
+                title="Collapse sidebar">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="11 17 6 12 11 7"/>
+            <polyline points="18 17 13 12 18 7"/>
+          </svg>
+        </button>
         <button id="btnCloseSidebar" class="sidebar-close-btn" aria-label="Close menu">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <line x1="18" y1="6" x2="6" y2="18"/>
@@ -41,7 +70,7 @@
         <!-- Create New Button -->
         <button id="btnCreateNew" class="sidebar-btn primary">
           <span class="btn-icon">+</span>
-          <span data-i18n="lab.create_new">Create New</span>
+          <span class="btn-label" data-i18n="lab.create_new">Create New</span>
         </button>
 
         <!-- Unified Chats List -->
@@ -50,6 +79,9 @@
         </div>
       </div>
 
+      <!-- Desktop only: drag to set the sidebar width (240-480 px). -->
+      <div id="sidebarResizer" class="sidebar-resizer" aria-hidden="true"
+           data-i18n-title="lab.sidebar_resize" title="Drag to resize"></div>
     </aside>
 
     <!-- Mobile Sidebar Backdrop -->
