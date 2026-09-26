@@ -163,13 +163,23 @@ exact `SELECT COUNT(*)` against it when it loads the table's structure and
 again at save, each bounded at 60 seconds. Saving or refreshing a live table
 reads a sample of up to 10 000 rows, also bounded at 60 seconds, to profile
 it; no copy is taken. Scheduled refreshes skip live tables. Editing an
-existing table keeps its storage mode. Live tables are not yet offered in
-chats. They will be queried directly in your database, so the database login
-must be SELECT-only, ideally on a read replica, with a database-side
-statement timeout. Revoke EXECUTE from PUBLIC on functions and packages the
-login does not need (a function called inside a SELECT can have side effects
-no query guard can see). The application's own query guard and caps are a
-second line, not a replacement for that grant.
+existing table keeps its storage mode.
+
+A live table is queried directly in your database at question time. Each
+question runs one SELECT per live table it uses — written by the AI planner
+once that part ships; until then a capped read of the whole table, under the
+administrator's row filter when one is set. The SQL is validated against a
+read-only allowlist and may only touch the registered table; the result is
+capped at `LIVE_RESULT_ROW_CAP` rows and `LIVE_RESULT_MAX_MB` megabytes, and
+each read is bounded by `LIVE_QUERY_TIMEOUT_S` and by the connection's
+statement timeout. Users see a note in the answer when a result was
+truncated. The database login must therefore be read-only: SELECT only,
+EXECUTE revoked from PUBLIC on functions and packages the login does not
+need (a function called inside a SELECT can have side effects no query guard
+can see), ideally on a read replica, with a database-side statement timeout
+and a resource group / workload limit for the application account. The
+application's own query guard and caps are a second line, not a replacement
+for that grant.
 
 ### Users and sign-in
 

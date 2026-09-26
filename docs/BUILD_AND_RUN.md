@@ -378,10 +378,16 @@ Prerequisites (client env, see `client.env.example`):
   effectively below the first value).
 - `LIVE_RESULT_ROW_CAP`: the most rows a live query returns (default
   `200000`); one more is read to flag truncation.
+- `LIVE_RESULT_MAX_MB`: the most memory a live query's result may occupy, in
+  megabytes (default `256`), checked while the result is read; past it the
+  read stops and the result is flagged truncated exactly like the row cap
+  (the answer carries the truncation note).
 - `LIVE_QUERY_TIMEOUT_S`: the live query's statement timeout in seconds
   (default `60`), capped by the connection's own statement timeout.
 - A live table is registered, profiled from a sample and skipped by
-  scheduled refreshes; it is not yet offered in chats. See
+  scheduled refreshes; chats query it at question time — one read-only SELECT
+  per live table a question uses, run by the web application, capped by rows
+  and by size, and handed to the analysis sandbox as an ordinary frame. See
   `docs/LIVE_TABLES_PLAN.md`.
 
 Runbook:

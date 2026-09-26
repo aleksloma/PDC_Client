@@ -38,6 +38,9 @@ lookup; revoked / suspended tenants get **HTTP 403** (the kill-switch).
 | `qa_pairs` (report) | the `findings_for_llm` list the B2C `_generate_report_structure` already builds | client |
 | `dataset_profile` (plan/retry, **optional**) | enterprise-only (no B2C equivalent): `{df_key: profile}` of computed FACTS per loaded table — rows, duplicate count, per-column dtype/nunique/null rates/min-max/constant/all-unique flags, truncated top-value hints, detected grain, deterministic warnings. Aggregate metadata only, never row data (Article II — same class as the cardinality hints in `technical_description`). Absent field ⇒ pre-profile behavior everywhere | client (`dataset_profile.compute_profile`, stored as sidecar JSON, compacted by `brain_client._compact_profiles_for_transport`) |
 | `data_caveat` (describe, **optional**) | enterprise-only: the client's DETERMINISTIC post-execution finding about the result it just rendered — `{kind: constant_metric\|identical_series\|constant_table\|matrix_readability, facts[], grain[], catalog}`. Aggregate findings + column names + truncated constant-value hints only (Article II, same class as `dataset_profile`). Makes the flat-result explanation mandatory instead of prompt-dependent; absent field ⇒ byte-identical describe prompt | client (`result_backstop.inspect_outputs`, compacted by `brain_client._compact_caveat_for_transport`) |
+| `live_tables` (plan/retry, **optional**) | enterprise-only (no B2C equivalent): `[{name, dialect, row_cap, filtered}]` — one row per LIVE database table the chat holds (`name` = the df key, `dialect` = the connector registry key such as `postgresql` / `mysql` / `mariadb` / `mssql` / `oracle` / `clickhouse`, `row_cap` = the effective row cap, `filtered` = true when an administrator row filter applies, in which case the client fetches the rows itself and expects no SQL). Metadata only; sent only when the chat holds a live table | client (`run_chat_local._live_tables_for_brain` from `ChatDataStore.schema_docs`) |
+| `sql` (plan/retry response, **optional**; echoed on a retry request) | enterprise-only: `{<df key>: "<one read-only SELECT>"}` written by the brain for the live tables the code references. The client validates it (read-only guard + a per-table allowlist), runs it in the web application, and places the result under the df key; a missing entry ⇒ the client's default capped fetch. On a retry request the same map (the SELECTs that were run) is echoed back — the brain's own text, never a result | brain (planner); echoed by client (`brain_client.retry(sql=)`) |
+| `sql_error` (retry, **optional**) | enterprise-only: `{table, dialect, class, guard, message}` describing a failed live SELECT — `class` ∈ `syntax` / `unknown_column` / `unknown_table` / `timeout` / `permission` / `guard` / `other`; `guard` true when the client's own SQL gate refused the text, and then `message` is the gate's sentence (naming at most an identifier), otherwise `message` is null. Never the driver message, a literal or a cell value (Article II) | client (`brain_client.live_sql_error`) |
 
 ---
 
@@ -72,7 +75,13 @@ the convenience `kind` + `code` from `_extract_code_kind`.
                                 "null_pct": 0.0, "min": 900, "max": 21000,
                                 "constant": false, "all_unique": false } }
     }
-  }
+  },
+  "live_tables": [                         // OPTIONAL — present ONLY when the chat holds
+    { "name": "transactions",              //   a LIVE database table (queried at question time)
+      "dialect": "postgresql",             // connector registry key: postgresql | mysql | mariadb | mssql | oracle | clickhouse
+      "row_cap": 200000,                   // the effective row cap of the SELECT's result
+      "filtered": false }                  // true ⇒ an administrator row filter applies: the client
+  ]                                        //   pre-fetches the rows itself and expects NO SQL for it
 }
 ```
 
@@ -83,6 +92,18 @@ classifies the question as a data task (aggregation / visualization /
 statistical or complex analysis; classifier failure counts as a data task).
 Logs carry only `profile_tables=N`, never the profile body.
 
+**Live tables.** `live_tables` lists the chat's live database tables (their
+`schema_text` entry is marked `[LIVE, dialect=<key>, row_cap=<n>]` and
+carries a one-SELECT contract sentence). A chat without one posts exactly
+the payload above without the field. The planner is expected to answer with
+one read-only SELECT per live table the code references (the `sql` map in
+the response); a `filtered` table gets no SELECT — the client reads it
+itself under the administrator's filter, and a SELECT sent for it is
+ignored. The planner side (writing the SQL) is a separate change; until it
+ships the response carries no `sql` and the client's default capped fetch of
+each referenced live table applies, so the code sees the table's own
+columns.
+
 ### Response
 
 ```jsonc
@@ -92,9 +113,22 @@ Logs carry only `profile_tables=N`, never the profile body.
   "code": "result = df.groupby('department')['salary'].mean()",
   "usage": { "input_tokens": 1234, "output_tokens": 56, "total_tokens": 1290 },
   "context_decision": { "complexity": "simple", "complexity_score": 5, "skills_needed": ["analytics_libraries"], "is_greeting": false, ... },
-  "model_used": "gemini-2.5-pro"
+  "model_used": "gemini-2.5-pro",
+  "sql": {                                // OPTIONAL — one read-only SELECT per live df key the
+    "transactions": "SELECT region, SUM(amount) AS total FROM public.transactions GROUP BY region"
+  }                                       //   code references; unknown fields are ignored
 }
 ```
+
+`sql` (optional): `{<df key>: "<one read-only SELECT>"}`. The client never
+runs it as sent: the text passes the read-only guard (strict parse, CTEs
+allowed) and a per-table allowlist — the SELECT may read only the table it
+was written for (its registered schema, the unqualified name or the
+connection's database name; CTE aliases exempt) — is wrapped under the row
+cap, and runs in the web application, never in the analysis sandbox. The
+result frame is placed under the df key, so the Python must use the SELECT's
+own columns. A key without an entry gets the client's default capped fetch.
+Unknown fields in the response are ignored.
 
 `kind` semantics: `PYTHON` / `PLOT_CODE` carry executable code in `code`;
 `CLARIFICATION` carries the clarifying question in `code`; `NO_CODE` is
@@ -133,11 +167,36 @@ code" prompt and calls the simple (or complex, on later attempts) model.
   "use_pro": false,                       // promotes to complex model on 2nd retry
   "use_search": false,                    // enables Google Search grounding on last retry
   "user_email": "alice@acme.com",
-  "dataset_profile": { ... }              // OPTIONAL — same shape as /v1/plan; retry
+  "dataset_profile": { ... },             // OPTIONAL — same shape as /v1/plan; retry
                                           // injects the micro-summary lines only (no
                                           // classifier runs on the retry path)
+  "live_tables": [ ... ],                 // OPTIONAL — same rows as /v1/plan, only when the
+                                          //   chat holds a live table
+  "sql": { "transactions": "SELECT ..." },// OPTIONAL — the map of SELECTs that was RUN for
+                                          //   this turn (the brain's own text, echoed back)
+  "sql_error": {                          // OPTIONAL — present when a live SELECT failed
+    "table": "transactions",              //   the df key
+    "dialect": "postgresql",
+    "class": "unknown_column",            //   syntax | unknown_column | unknown_table | timeout
+                                          //   | permission | guard | other
+    "guard": false,                       //   true ⇒ the client's SQL gate refused the text
+    "message": null                       //   the gate's own sentence when guard is true
+  }                                       //   (an identifier at most), otherwise null
 }
 ```
+
+**Live tables.** When the failure that triggered the retry is a live SELECT
+(not the Python), `error_msg` is the value-free sentence
+`Live query for table '<df key>' failed: <class sentence>` — one fixed
+sentence per class (e.g. "The query names a column that does not exist.",
+"The live query timed out."), or the guard's own message for `guard` — and
+`sql_error` carries the class. The driver's message never crosses: it can
+quote literals and cell values, and it stays in the client. The response
+may carry `sql` again (a new SELECT for the failed key); without one the
+attempt counts as failed — the client never falls back to its default fetch
+for a SELECT that failed, so a retry cannot silently change what the answer
+computes. A retry after a Python failure carries `sql` (what ran) and no
+`sql_error`.
 
 ### Response
 
@@ -147,9 +206,17 @@ code" prompt and calls the simple (or complex, on later attempts) model.
   "kind": "PYTHON",                       // PYTHON | PLOT_CODE | NO_CODE | CLARIFICATION | ANSWER | MISSING_DATA
   "code": "df.groupby('department')['salary'].mean()",
   "usage": { ... },
-  "model_used": "gemini-2.5-pro"
+  "model_used": "gemini-2.5-pro",
+  "sql": { ... }                          // OPTIONAL — a new SELECT per live df key, same
+                                          //   rules as /v1/plan; a key it names is re-fetched
 }
 ```
+
+**Data boundary (Article II).** Across the whole live path only the brain's
+own SQL text (in the response, echoed on a retry) and an error CLASS cross;
+the rows a SELECT returns never leave the client — they reach the analysis
+sandbox as an ordinary input frame and the brain sees, as always, only the
+code, the schema text and the scalar preview.
 
 ---
 

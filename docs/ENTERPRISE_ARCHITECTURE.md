@@ -962,12 +962,12 @@ counts extracted from the SQL may persist locally as recommendation
 evidence — literals never survive extraction (only Column = Column
 predicates are read), and the SQL-box UI states this truthfully.
 
-**Phase 2 (later, client + brain in parallel — NOT built):** live SQL mode
-for large tables (brain writes dialect-aware aggregation SELECTs; client
-validates + executes). Per `docs/DB_TABLES_PLAN.md`.
+**Phase 2 — live SQL mode for large tables (client side shipped; the
+planner prompt on the brain follows).** The brain writes dialect-aware
+SELECTs; the client validates and executes them. Per
+`docs/DB_TABLES_PLAN.md` and, in full, `docs/LIVE_TABLES_PLAN.md`.
 
-**Live mode: registry, SQL guard and live query shipped; chat pre-fetch
-to come.** Every registered table now has a storage `mode`: `snapshot`
+**Live mode.** Every registered table has a storage `mode`: `snapshot`
 (everything above) or `live`. An absent field reads as snapshot, so older
 registry documents load unchanged. The register wizard sizes the table with
 one `COUNT(*)` (a SQLAlchemy construct through the same read-only gate,
@@ -984,16 +984,64 @@ characters) reach the brain, never rows. An administrator or a scoped power
 user can switch a table between modes (`POST /api/admin/tables/{tid}/mode`,
 audited `table.mode`); switching to live keeps any old parquet, switching
 back counts again and always takes a fresh snapshot (a failed snapshot
-leaves the table live). Scheduled refreshes skip live tables. The SQL guard
-(`db_connector.assert_read_only_query`), the row-limit wrapper
-(`wrap_with_row_limit`) and the live query function (`run_live_select`,
-bounded by `LIVE_RESULT_ROW_CAP` and `LIVE_QUERY_TIMEOUT_S`) now exist in the
-MAIN APPLICATION; what is NOT built yet is the chat pre-fetch that calls
-them, so a live table is hidden from the chat picker and refused by
-`/session/db_tables`. When it ships, the brain will write the SQL and the
-main application will validate and execute it against the customer
-database; the analysis sandbox never gets a database connection or driver.
-Design and status: `docs/LIVE_TABLES_PLAN.md`.
+leaves the table live, its profile stamps restored). Scheduled refreshes
+skip live tables; a resync of a live table writes registry metadata into
+the chat metas only, never a `refreshed_at`.
+
+**The live path, end to end.** A live table is offered by the chat picker
+(`GET /api/db_tables`, rows carry `mode`) and accepted by
+`POST /session/db_tables` like a snapshot table; the chat meta entry is the
+same meta-only entry. At question time `ChatDataStore.load_dataframes
+(include_live=True)` partitions the DB entries by the registry's mode: a
+snapshot entry loads its parquet as before, a live entry NEVER reads a
+parquet (one kept from before the live period is never served) and enters
+`dfs` as an empty typed placeholder under the same df key. `schema_docs`
+marks it `live` with the connector dialect, the effective row cap and
+whether an administrator row filter applies, and `schema_text` renders
+`[LIVE, dialect=<key>, row_cap=<n>]` plus a one-SELECT contract sentence.
+Before the planner is called, live keys the requester's role does not cover
+are dropped from the frames and the schema (`_drop_uncovered_live_keys`; a
+turn left with nothing ends with a denial sentence and no brain call). The
+plan request carries `live_tables` `[{name, dialect, row_cap, filtered}]`;
+the response may carry `sql` `{df key: SELECT}`. Immediately before EVERY
+sandbox call (`run_chat_local._ensure_live`, idempotent, retries and
+regenerations included), each live key the code references is fetched: the
+role gate runs again, the brain's SELECT is checked by
+`assert_read_only_query` (strict parse, CTEs allowed) with a per-table
+allowlist that binds it to the one registered table, wrapped under the row
+cap and run by `run_live_select` in the main application — or, without a
+SELECT or behind an administrator filter, the connector's own capped
+default read (`default_live_fetch`). The result frame takes the placeholder's
+key and is written into the job directory for the sandbox like any other
+input frame. A failed SELECT never runs the sandbox: the attempt fails with
+a value-free class sentence and the retry request carries `sql` (what ran)
+and `sql_error` (the class; the driver's text stays local); a retry that
+brings no new SELECT for that key is a failed attempt, never a default
+read. The AI history row persists `sql` (per key, `null` for a default
+read), `live_truncated` and `live_rows`, and durable full-table records
+carry the `sql` subset their code references; per-item refresh, full-table
+re-execution and dashboard tile refresh re-run the stored SQL under the
+requester's role before the stored Python runs. Results are capped by rows
+(`LIVE_RESULT_ROW_CAP`) and by size (`LIVE_RESULT_MAX_MB`) and bounded by
+`LIVE_QUERY_TIMEOUT_S`; a capped result adds a localized note to the answer.
+
+```
+brain ──(plan: live_tables)──▶ ┌ pdc-client (web) ──────────────────────────┐
+      ◀──(response: sql)────── │ role gate → guard + per-table allowlist    │
+                               │ → wrap under the row cap → run_live_select │──▶ customer DB
+                               │ → frame under the df key → per-job parquet │◀── rows (capped)
+                               └────────────────────────┬───────────────────┘
+                                                        ▼
+                                              pdc-executor (sandbox)
+                                      sees an ordinary input frame; no driver,
+                                      no credential, no route to the database
+```
+
+Still to come: the planner prompt on the brain (until it ships no `sql` is
+returned and every referenced live table takes the default capped read);
+Auto Analytics loads its frames without live tables (`include_live` off) and
+so never queries one; a live connector table is never auto-included by the
+relations closure. Design and status: `docs/LIVE_TABLES_PLAN.md`.
 
 ### 10b. User roles & DB-table privileges (client-side only)
 

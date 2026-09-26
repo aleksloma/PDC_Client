@@ -4,7 +4,7 @@
 > enterprise (on-prem) edition. Adapted from the original B2C constitution
 > for the brain/client split.
 
-**Version:** 1.5 (enterprise)
+**Version:** 1.6 (enterprise)
 **Last Updated:** 2026-09-26
 
 ---
@@ -48,6 +48,15 @@ The split is the whole product. Violating it defeats the on-prem promise.
   hints `schema_text` already carries; never row data. The client's
   `brain_client._compact_profiles_for_transport` is the boundary guard for
   this field; the brain logs only `profile_tables=N`, never the body.
+- Live-table metadata: `live_tables` on `/v1/plan` / `/v1/retry` — per live
+  table its df key, the connector dialect key, the effective row cap and
+  whether an administrator row filter applies; the brain-written `sql` map
+  echoed back on a retry (the brain's own text, never a result); and
+  `sql_error` — the error CLASS of a failed live SELECT (`syntax`,
+  `unknown_column`, `unknown_table`, `timeout`, `permission`, `guard`,
+  `other`) plus, for a guard refusal only, the guard's own sentence, which
+  names at most an identifier. `brain_client.live_sql_error` is the one
+  builder of that shape.
 - Operational events for `/v1/activity` — `event`, `user_email`, lightweight
   metadata.
 
@@ -56,6 +65,10 @@ The split is the whole product. Violating it defeats the on-prem promise.
 - Rendered charts (PNG/HTML).
 - The company's branded templates.
 - Any value that the user uploaded.
+- The driver message of a failed live query (`error_detail` from
+  `run_live_select`): it can quote a literal from the statement or a cell
+  value the database choked on. It stays local — never logged, never sent;
+  only the class sentence reaches the user, the retry request and the log.
 
 ### The guard
 The summarizer's `_safe_preview` helper (in
@@ -300,8 +313,20 @@ client must be closed on FastAPI lifespan shutdown.
    is built by the connector itself; live queries are parsed strictly and
    may use CTEs. A live query is capped by `wrap_with_row_limit` and
    executed only in the main application by `run_live_select`, under
-   `LIVE_RESULT_ROW_CAP` and `LIVE_QUERY_TIMEOUT_S` — never in the sandbox;
-   its SQL text is never logged, only a hash. No route accepts free SQL
+   `LIVE_RESULT_ROW_CAP`, `LIVE_RESULT_MAX_MB` and `LIVE_QUERY_TIMEOUT_S` —
+   never in the sandbox; its SQL text is never logged, only a hash. The
+   live query rules, as built: the requester's role must cover the table
+   BEFORE the planner is called (`routes/chat._drop_uncovered_live_keys`
+   removes uncovered live keys from the frames and the schema, so the brain
+   is never shown them) and AGAIN before every fetch
+   (`run_chat_local._ensure_live`, `roles_store.allowed_table_ids_for`,
+   connectors exempt); the guard's per-table allowlist (`allowed_tables` on
+   `assert_read_only_query`) binds each SELECT to the one registered table
+   it was written for — any other table, CTE aliases excepted, is refused;
+   the result frame is placed under the table's df key and reaches the
+   sandbox as an ordinary input frame; the returned `error` is a fixed class
+   sentence while `error_detail` (the scrubbed driver text) stays local; the
+   SQL text is never logged anywhere on the path. No route accepts free SQL
    from a browser — relation discovery's "Analyze SQL" box PARSES pasted
    SQL, it never executes it.
 10. **Admin-pasted SQL never leaves this client.** The relation-discovery
@@ -592,7 +617,11 @@ rule bounds who writes the bytes, not what they contain.
   reverse proxy must never be trusted to rewrite that address from a header
   for arbitrary peers.
 - SQL never executes in the sandbox. Database results reach it only as
-  frames the web service already fetched and gated.
+  frames the web service already fetched and gated — and that is literally
+  the live-table path: the brain's SELECT is validated and run by the web
+  service (`run_live_select`), and its result is written into the job
+  directory like any other input frame; the sandbox cannot tell a live table
+  from a snapshot.
 - One job at a time per sandbox. The limit is part of the design, not a
   throughput knob: properties 1 and 5 hold BETWEEN the two containers at any
   setting, but they only hold between two JOBS while there is one. With two
@@ -668,7 +697,7 @@ To modify this constitution:
 | Logging      | Escape any text you did not write (`log_safe_text`) — message, context values and the sid. Never log a data value at all. |
 | Resources    | `atexit` for executors; close HTTP clients on lifespan shutdown.          |
 | Security     | Secrets in env only. Never commit `.env`. Brain holds the Gemini key.     |
-| SQL          | Free SELECT only through `assert_read_only_query`, capped by `wrap_with_row_limit`, run by `run_live_select` in the main app (never the sandbox), SQL logged as a hash only. The SELECT-only DB grant is the real guarantee. |
+| SQL          | Free SELECT only through `assert_read_only_query` (bound to the one registered table by its allowlist), capped by `wrap_with_row_limit`, run by `run_live_select` in the main app (never the sandbox), role-gated before the plan and before the fetch, SQL logged as a hash only; a failure crosses as a class, never as the driver text. The SELECT-only DB grant is the real guarantee. |
 | Deploy       | Brain → enterprise GCP. Client → customer LAN. Two independent images.    |
 | Docs         | Five required docs under `docs/`. Fix contradictions in the same PR.      |
 | Exec dtypes  | Sandbox sees standard dtypes only. `sanitize_for_execution` is the gate.  |
