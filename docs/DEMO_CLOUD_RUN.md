@@ -4,7 +4,7 @@
 > client image inside their own LAN (see `BUILD_AND_RUN.md` and
 > `CUSTOMER_INSTALL.md`). This document describes the single demo/showcase
 > instance that PowerDataChat hosts itself for business meetings. It runs the
-> **standard, unmodified client image** against the production brain under a
+> **standard, unmodified client images** against the production brain under a
 > dedicated demo tenant, holding only PowerDataChat's own demo data — so the
 > customer data-boundary model (Constitution Art. II) is unaffected.
 
@@ -15,18 +15,86 @@
 | GCP project | `pdc-enterprise` |
 | Region | `europe-west1` |
 | Cloud Run service | `pdcclient-demo` (public via `--no-invoker-iam-check`) |
-| Image | `europe-west1-docker.pkg.dev/pdc-enterprise/client/pdcclient-demo:<git-sha>` |
-| Data volume | GCS bucket `pdc-enterprise-client-demo-data` mounted at `/data/client` |
+| Containers | ONE revision, TWO containers: `web` (ingress, port 8000) and `executor` (the analysis sandbox, no port) — see "Two containers in one revision" |
+| Images | `europe-west1-docker.pkg.dev/pdc-enterprise/client/pdcclient-demo:<git-sha>` (web) and `…/client/pdcexecutor-demo:<git-sha>` (sandbox), always built together from one commit by `cloudbuild.yaml` |
+| Data volume | GCS bucket `pdc-enterprise-client-demo-data` mounted at `/data/client` in `web` only, mount options `uid=10001,gid=10001` |
+| Jobs volume | in-memory volume `exec-jobs` (1 GiB) at `/jobs` in both containers |
+| Backups | `gs://pdc-enterprise-client-demo-data-backups/<YYYYMMDD-HHMMSS>/` — a full copy of the data bucket taken before every deploy |
 | Upload hop | GCS bucket `pdc-enterprise-demo-uploads` (`GCS_UPLOAD_BUCKET`) — transient home for files > 25 MB between the browser's signed PUT and `/upload/finalize`; objects deleted on finalize, 1-day lifecycle backstop; CORS for the two site origins; runtime SA has `objectAdmin` on it + `iam.serviceAccountTokenCreator` on itself (signBlob). NOT a customer setting |
 | Brain | the production `pdcbrain` service (`BRAIN_URL` = its `status.url`) |
 | Tenant | a dedicated **demo tenant** created in the brain admin panel |
-| Secrets | `CLIENT_DEMO_TENANT_TOKEN` → `BRAIN_TENANT_TOKEN`, `CLIENT_DEMO_SECRET_KEY` → `SECRET_KEY`, `CLIENT_DEMO_LADMIN_PASSWORD` → `LOCAL_ADMIN_PASSWORD`, `CLIENT_DEMO_ENCRYPTION_KEY` → `CLIENT_ENCRYPTION_KEY` (all Secret Manager, pinned `:latest`; verified against the live service 2026-08-30 — the last two were mounted after this doc was first written) |
+| Secrets | `CLIENT_DEMO_TENANT_TOKEN` → `BRAIN_TENANT_TOKEN`, `CLIENT_DEMO_SECRET_KEY` → `SECRET_KEY`, `CLIENT_DEMO_LADMIN_PASSWORD` → `LOCAL_ADMIN_PASSWORD`, `CLIENT_DEMO_ENCRYPTION_KEY` → `CLIENT_ENCRYPTION_KEY` (all Secret Manager, pinned `:latest`, on the `web` container ONLY — the sandbox refuses to start with any of them) |
 | Service URL | `https://pdcclient-demo-873133613631.europe-west1.run.app` |
 | Custom domain | `https://client.powerdatachat.com` (Cloud Run domain mapping; the brain's admin panel is `admin.powerdatachat.com`) |
 
 Do **not** confuse this service with `pdcbrain`; the brain deploy runbook
 (`PDC_Brain/docs/DEPLOY.md` + its `deploy` skill) is unchanged and never
 touches this service, and vice versa.
+
+## Two containers in one revision (demo-only exception)
+
+From the executor release on, generated Python runs only in the `pdc-executor`
+sandbox, and a customer install is two containers on a private Docker network
+(`CUSTOMER_INSTALL.md` §3). This service mirrors that as a Cloud Run
+**multi-container revision**: the sandbox is a sidecar of the web container,
+started first (`run.googleapis.com/container-dependencies: {"web":["executor"]}`,
+with an HTTP startup probe on the sandbox's `/healthz`), and the two exchange
+job files through an in-memory volume.
+
+| Setting | `web` | `executor` |
+|---|---|---|
+| Image | `pdcclient-demo:<sha>` (uid 10001) | `pdcexecutor-demo:<sha>`, the default hardened target (uid 10002, gid 10001) |
+| Port | 8000, the only ingress | none |
+| Resources | 2 CPU / 4 GiB | 1 CPU / 3 GiB (compose's `mem_limit: 3g`) |
+| Volumes | `client-data` at `/data/client`, `exec-jobs` at `/jobs` | `exec-jobs` at `/jobs` only |
+| Executor settings | `EXECUTOR_URL=http://127.0.0.1:8090`, `EXECUTOR_SHARED_DIR=/jobs`, `EXECUTOR_MAX_CONCURRENT=1` | `EXECUTOR_SHARED_DIR=/jobs`, `EXECUTOR_MEM_LIMIT_MB=2048`, `EXECUTOR_MAX_CONCURRENT=1` |
+| Guard settings | `EXECUTOR_NETWORK_CIDR=127.0.0.0/8`, `FORWARDED_ALLOW_IPS=""` | — |
+
+**What the demo keeps of the customer topology's isolation (Constitution
+Art. XIV):**
+
+- two identities: the sandbox runs as uid 10002 and the web process as 10001;
+- no secret in the sandbox: its environment carries only the three
+  `EXECUTOR_*` values, and the service would refuse to start otherwise;
+- no database driver, HTTP client or credential module in the sandbox image;
+- no customer data mounted: only `web` mounts the bucket, the sandbox sees
+  the jobs volume alone, and each job's frames are written per job;
+- one job at a time on both sides;
+- the jobs volume is in memory, so nothing a job leaves there survives the
+  instance (stricter than the customer's disk-backed volume);
+- the web service still treats every sandbox response as hostile;
+- a request from the sandbox to the web service over loopback is refused.
+  `EXECUTOR_NETWORK_CIDR=127.0.0.0/8` makes the web service answer 403 to any
+  peer on loopback, and `FORWARDED_ALLOW_IPS=""` stops uvicorn trusting
+  `X-Forwarded-For` from loopback — its default — which would otherwise let
+  sandbox code present any address. Cloud Run's ingress reaches the web
+  container from `169.254.169.126`, so users are unaffected. The empty value
+  also means no proxy is trusted at all: the sign-in limiter sees every user
+  as that one ingress address, which was already the case before. The loopback
+  refusal would also answer 403 to the web image's own Docker `HEALTHCHECK`
+  (a `curl` of `localhost:8000/health`); Cloud Run ignores that instruction and
+  probes TCP 8000 instead, but under Docker the container would report
+  unhealthy. That is one more reason the setting belongs to this service only.
+
+**What it cannot keep, accepted for a demo holding demo data only:**
+
+- **Network isolation.** Containers of one revision share a network
+  namespace, so the sandbox has the revision's internet egress: generated
+  code can reach the brain URL, the internet, and the web container on the
+  instance's own non-loopback address, which the loopback guard does not
+  cover. There is no `internal: true` network to put it on. This breaks
+  property 4 of Art. XIV for this service only.
+- **Container hardening flags.** Cloud Run offers no read-only root
+  filesystem, `cap_drop`, `no-new-privileges` or `pids_limit`. The runner's
+  own limits (address space, process count, file size) still apply per job.
+- **Jobs-root ownership.** The in-memory volume comes up with Cloud Run's
+  own ownership and mode rather than `root:10001 2770`; job directories are
+  still created `2770` by the web service. Both identities must be able to
+  write its root — the sandbox checks this at startup and exits
+  (`EXECUTOR_SHARED_DIR_NOT_WRITABLE`) if not, so a wrong mode shows up as a
+  revision that never becomes ready, never as a broken live service.
+
+Never copy this layout into a customer install.
 
 ## Why these Cloud Run settings
 
@@ -42,8 +110,14 @@ touches this service, and vice versa.
 - `--no-cpu-throttling` — Auto Analytics runs in a background thread that
   outlives the HTTP request (`auto_analytics.py`); without always-allocated
   CPU the deck job stalls after the response is sent.
-- `--memory=4Gi --cpu=2` — pandas/plotly/kaleido (headless Chromium) plus the
-  ~500 MB df cache (`DF_CACHE_MAX_MB`).
+- `web`: 2 CPU / 4 GiB — pandas/plotly/kaleido (headless Chromium) plus the
+  ~500 MB df cache (`DF_CACHE_MAX_MB`). `executor`: 1 CPU / 3 GiB. The
+  instance is billed for the sum.
+- **Non-root web container on a bucket mount.** A Cloud Storage volume is
+  owned by root unless the mount says otherwise, and `chmod`/`chown` do not
+  work on it, so the uid-10001 web image could not write `/data/client`. The
+  volume carries `uid=10001,gid=10001` in its mount options. The symptom
+  without them is a healthy service that answers 500 on sign-in.
 - Upload size: the container itself sets no request-body limit, but Cloud
   Run's ingress (Google Frontend) caps HTTP/1 request bodies at 32 MiB — a
   multipart `POST /upload` above that gets an HTML 413 that never reaches the
@@ -55,7 +129,8 @@ touches this service, and vice versa.
 - `--timeout=900` — long analyses (60 s exec windows + brain round-trips up to
   `BRAIN_REQUEST_TIMEOUT=180 s` each).
 - `--min-instances=0` — near-zero idle cost; first hit after idle cold-starts
-  in ~15–30 s. Bump to 1 shortly before an important meeting if desired:
+  (two images now, so allow ~30–45 s). Bump to 1 shortly before an important
+  meeting if desired:
   `gcloud run services update pdcclient-demo --region=europe-west1 --min-instances=1`
 - GCS-FUSE caveat: the client does atomic renames / parquet cache / JSONL
   appends; GCS-FUSE is weaker than POSIX. Accepted for a demo. If it misbehaves,
@@ -114,130 +189,168 @@ gcloud secrets add-iam-policy-binding CLIENT_DEMO_SECRET_KEY \
 
 ## Build (every release)
 
-From a clean `PDC_Client/` working tree:
+From a clean `PDC_Client/` working tree, pushed, build BOTH images of the
+commit with the repository's `cloudbuild.yaml` (a `--tag` build cannot build
+the sandbox's Dockerfile or pass build args):
 
 ```bash
-gcloud builds submit . --project=pdc-enterprise \
-  --tag=europe-west1-docker.pkg.dev/pdc-enterprise/client/pdcclient-demo:<git-sha>
+SHA=$(git rev-parse --short HEAD)
+gcloud builds submit . --project=pdc-enterprise --config=cloudbuild.yaml --async \
+  --substitutions=_GIT_SHA=$SHA,_BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+gcloud builds describe <BUILD_ID> --project=pdc-enterprise --format='value(status)'
 ```
 
-Use the short git SHA as an immutable tag (same convention as the brain).
+The short git SHA is the immutable tag of both images (same convention as the
+brain). Both are stamped with `BUILD_COMMIT`/`BUILD_TIME`, so `GET /version`
+reports the commit and the admin sidebar shows it.
 
-`gcloud builds submit --tag` cannot pass Docker build args, so the demo image
-ships **unstamped**: `GET /version` reports `commit: null` and the admin
-sidebar shows the container start time instead of a commit. The image tag is
-the identity here — adding a `cloudbuild.yaml` just to carry two build args
-was judged not worth it. A local `docker build` (see `docs/BUILD_AND_RUN.md`)
-does stamp the image.
+## Backup (before every deploy)
+
+```bash
+STAMP=$(date -u +%Y%m%d-%H%M%S)
+gcloud storage rsync -r gs://pdc-enterprise-client-demo-data \
+  gs://pdc-enterprise-client-demo-data-backups/$STAMP/ --project=pdc-enterprise
+```
+
+Restore is the same command with source and destination swapped (service
+scaled to zero or traffic pinned to a revision that is not writing).
 
 ## Deploy
 
-First-time deploy (full flag set):
+Every deploy goes through a candidate revision that receives **no traffic**
+until it has passed the checks below.
+
+The multi-container spec is kept in the service itself, not in the
+repository, because it names secrets and the service URL. A release changes
+it by exporting it, editing the two image tags (and, only when a release
+needs one, adding a new variable), and replacing it. Everything else —
+secrets, `GCS_UPLOAD_BUCKET`, probes, volumes — carries over verbatim, which
+is the multi-container form of the image-only redeploy rule: never
+`--set-env-vars`, `--set-secrets` or `--clear-*` on this service.
 
 ```bash
-BRAIN=$(gcloud run services describe pdcbrain --project=pdc-enterprise \
-  --region=europe-west1 --format='value(status.url)')
+LIVE=$(gcloud run services describe pdcclient-demo --project=pdc-enterprise \
+  --region=europe-west1 --format='value(status.traffic[0].revisionName)')
 
-gcloud run deploy pdcclient-demo \
-  --project=pdc-enterprise --region=europe-west1 \
-  --image=europe-west1-docker.pkg.dev/pdc-enterprise/client/pdcclient-demo:<git-sha> \
-  --port=8000 \
-  --no-invoker-iam-check \
-  --memory=4Gi --cpu=2 \
-  --min-instances=0 --max-instances=1 \
-  --concurrency=20 --timeout=900 \
-  --no-cpu-throttling \
-  --set-env-vars=DATA_ROOT=/data/client,BRAIN_URL=$BRAIN \
-  --set-secrets=BRAIN_TENANT_TOKEN=CLIENT_DEMO_TENANT_TOKEN:latest,SECRET_KEY=CLIENT_DEMO_SECRET_KEY:latest \
-  --add-volume=name=client-data,type=cloud-storage,bucket=pdc-enterprise-client-demo-data \
-  --add-volume-mount=volume=client-data,mount-path=/data/client
+# 1. Pin traffic to the serving revision, so the candidate gets none.
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise \
+  --region=europe-west1 --to-revisions=$LIVE=100
+
+# 2. Export, edit, replace.
+gcloud run services describe pdcclient-demo --project=pdc-enterprise \
+  --region=europe-west1 --format=export > service.yaml
+#    - both `image:` lines → the new <sha>
+#    - spec.template.metadata.name → pdcclient-demo-<sha>
+#    - spec.traffic → [{revisionName: $LIVE, percent: 100}]
+gcloud run services replace service.yaml --project=pdc-enterprise --region=europe-west1
+
+# 3. Give the candidate its own URL, run the checks against it.
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise \
+  --region=europe-west1 --set-tags=candidate=pdcclient-demo-<sha>
+#    → https://candidate---pdcclient-demo-th2ceoqcba-ew.a.run.app
+
+# 4. Shift traffic once the checks pass.
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise \
+  --region=europe-west1 --to-revisions=pdcclient-demo-<sha>=100
+
+# Rollback: the same command naming the previous revision.
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise \
+  --region=europe-west1 --to-revisions=$LIVE=100
 ```
 
-**Redeploy (new image only)** — same state-preserving rule as the brain: pass
-ONLY the new image so env vars, secrets, and the volume mount carry over.
-Never use `--set-env-vars` / `--set-secrets` / `--clear-*` on the live service.
+The template portion that makes the revision two containers (as first
+applied on the executor release; the export carries it from then on):
 
-> **Check before the next redeploy: the image now runs as a non-root user**
-> (uid/gid 10001, see the `Dockerfile`). The customer topology mounts a Docker
-> volume, whose ownership is handed over once with a `chown`; this service
-> mounts a Cloud Storage bucket at `/data/client` instead, and a gcsfuse mount
-> is not guaranteed to be writable by a non-root container user. That has not
-> been verified against this service. Deploy a new image to a revision with no
-> traffic first, sign in, and confirm a chat writes — a failure looks like a
-> HEALTHY service that returns 500 on login, not like a crash.
->
-> **OPEN ITEM: this demo has no analysis sandbox.** From this release the
-> generated Python runs only in the `pdc-executor` container, and a customer
-> install is two containers on a private network (`CUSTOMER_INSTALL.md` §3).
-> This service is a SINGLE Cloud Run container, so a redeploy of the current
-> image boots with no sandbox reachable: the service comes up, `/health`
-> answers 200 with `executor_reachable: false`, and every question is answered
-> "the analysis service is not reachable". Charts, reports and Auto Analytics
-> all go the same way. That is a demo that looks alive and answers nothing, in
-> front of an audience.
->
-> There is no fix in this document. Closing it needs a decision: either the
-> revision runs a second container in the same service (Cloud Run supports
-> multi-container revisions, and the two would share the jobs directory over
-> an in-memory volume rather than the Docker volume a LAN install uses), or the
-> demo is accepted as an explicit exception and this section records why. Do
-> NOT redeploy this service from a build of this release until that decision
-> is made. The previous revision keeps serving, so there is no hurry.
-
-```bash
-gcloud run deploy pdcclient-demo --project=pdc-enterprise --region=europe-west1 \
-  --image=europe-west1-docker.pkg.dev/pdc-enterprise/client/pdcclient-demo:<new-git-sha>
+```yaml
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/container-dependencies: '{"web":["executor"]}'
+    spec:
+      containers:
+      - name: web
+        image: europe-west1-docker.pkg.dev/pdc-enterprise/client/pdcclient-demo:<sha>
+        ports: [{name: http1, containerPort: 8000}]
+        env:   # existing entries kept, these added
+        - {name: EXECUTOR_URL, value: "http://127.0.0.1:8090"}
+        - {name: EXECUTOR_SHARED_DIR, value: /jobs}
+        - {name: EXECUTOR_MAX_CONCURRENT, value: "1"}
+        - {name: EXECUTOR_NETWORK_CIDR, value: 127.0.0.0/8}
+        - {name: FORWARDED_ALLOW_IPS, value: ""}
+        - {name: ALLOW_SELF_REGISTRATION, value: "true"}
+        - {name: PUBLIC_BASE_URL, value: "https://client.powerdatachat.com"}
+        volumeMounts:
+        - {name: client-data, mountPath: /data/client}
+        - {name: exec-jobs, mountPath: /jobs}
+      - name: executor
+        image: europe-west1-docker.pkg.dev/pdc-enterprise/client/pdcexecutor-demo:<sha>
+        env:
+        - {name: EXECUTOR_SHARED_DIR, value: /jobs}
+        - {name: EXECUTOR_MEM_LIMIT_MB, value: "2048"}
+        - {name: EXECUTOR_MAX_CONCURRENT, value: "1"}
+        resources: {limits: {cpu: "1", memory: 3Gi}}
+        startupProbe:
+          httpGet: {path: /healthz, port: 8090}
+          periodSeconds: 2
+          timeoutSeconds: 2
+          failureThreshold: 60
+        volumeMounts:
+        - {name: exec-jobs, mountPath: /jobs}
+      volumes:
+      - name: client-data
+        csi:
+          driver: gcsfuse.run.googleapis.com
+          volumeAttributes:
+            bucketName: pdc-enterprise-client-demo-data
+            mountOptions: uid=10001,gid=10001
+      - name: exec-jobs
+        emptyDir: {medium: Memory, sizeLimit: 1Gi}
 ```
-
-**Exception — the direct-upload release (first deploy of `GCS_UPLOAD_BUCKET`)
-is NOT image-only.** The new env var is added with `--update-env-vars`, which
-MERGES into the existing set (`--set-env-vars` would REPLACE it and drop
-`DATA_ROOT`/`BRAIN_URL`); secrets and the volume still carry over:
-
-```bash
-gcloud run deploy pdcclient-demo --project=pdc-enterprise --region=europe-west1 \
-  --image=europe-west1-docker.pkg.dev/pdc-enterprise/client/pdcclient-demo:<new-git-sha> \
-  --update-env-vars=GCS_UPLOAD_BUCKET=pdc-enterprise-demo-uploads
-```
-
-Every later release goes back to the image-only form (the variable persists
-on the service).
 
 Never delete or recreate the `pdc-enterprise-client-demo-data` bucket — it
 holds the demo accounts, uploaded demo datasets, chats, and rendered decks.
 
-## Verify after deploy
+## Verify (on the candidate URL, before shifting traffic)
 
-1. `GET <service-url>/health` → `brain_reachable: true`,
-   `tenant_token_configured: true`. It also reports `executor_reachable`,
-   which is `false` on this single-container service until the open item above
-   is resolved. The endpoint answers 200 either way, so the body is the only
+1. `GET <candidate-url>/health` → `brain_reachable: true`,
+   `tenant_token_configured: true` **and `executor_reachable: true`**. The
+   endpoint answers 200 whatever the sandbox's state, so the body is the only
    thing that tells you.
-2. Sign in with the demo account, open an existing chat, ask a question that
-   renders a chart (proves brain round-trip + kaleido inside the container).
-   This is the step the missing sandbox breaks, so it is the one that matters
-   on the first redeploy of a release that has one.
-3. Confirm `pdcbrain` gained no new revision:
+2. Sign in (`/?local=1`), upload a small CSV (`tools/fixtures/sample_sales.csv`),
+   ask a question that renders a chart, create a dashboard and pin the chart.
+   A **500 on sign-in from a healthy service** is the bucket-ownership failure
+   (mount options missing); "the analysis service is not reachable" is the
+   sandbox.
+3. Revision logs: `EXECUTOR_HANDSHAKE_OK`, no `EXECUTOR_SHARED_DIR_*`, no
+   `BACKEND_REQUEST_REFUSED` for the ingress address.
+4. `GET /version` reports the new commit.
+5. After the shift: `https://client.powerdatachat.com/health` shows the same
+   body, and `pdcbrain` gained no new revision:
    `gcloud run revisions list --service=pdcbrain --region=europe-west1 --project=pdc-enterprise`
-4. Direct upload: `GET /lab` HTML carries `window.__DIRECT_UPLOAD__ = true`;
+6. Direct upload: `GET /lab` HTML carries `window.__DIRECT_UPLOAD__ = true`;
    a new chat from a > 32 MiB CSV shows, in the browser's network tab,
    `POST /upload/init` 200 → `PUT storage.googleapis.com/...` 200 →
    `POST /upload/finalize` 200 and no `/upload` multipart; a small CSV still
    goes through `POST /upload`; afterwards
    `gcloud storage ls gs://pdc-enterprise-demo-uploads/**` lists nothing.
 
+Remove the check's throwaway account and dashboard afterwards.
+
 ## Security notes
 
 - The URL is public and the client has **open self-registration** — anyone
   with the URL can create an account. This is NOT the image default: the
-  service must carry `ALLOW_SELF_REGISTRATION=true`
-  (`--update-env-vars=ALLOW_SELF_REGISTRATION=true` once, which merges into
-  the existing set); without it only invited, shared-with or SSO accounts can
-  sign in. Reset and invitation mails also need
+  service carries `ALLOW_SELF_REGISTRATION=true`; without it only invited,
+  shared-with or SSO accounts can sign in. Reset and invitation mails need
   `PUBLIC_BASE_URL=https://client.powerdatachat.com` (the address demo users
-  type); without it no link is mailed. Acceptable because this instance holds
-  demo data only and uses a dedicated demo tenant (kill-switchable from the
-  brain admin panel: suspend/revoke the tenant or rotate its token).
+  type), which the service also carries; without it no link is mailed.
+  Acceptable because this instance holds demo data only and uses a dedicated
+  demo tenant (kill-switchable from the brain admin panel: suspend/revoke the
+  tenant or rotate its token).
+- The analysis sandbox has internet egress here (see "Two containers in one
+  revision"). Generated code could send whatever a demo chat's frames hold to
+  the internet; that is acceptable only because they are demo data.
 - Never point this instance at a real customer's tenant token.
 - Several pieces of state live in the web process's memory: the sign-in
   limiter's counters and lockouts, the chart store, the session-generation

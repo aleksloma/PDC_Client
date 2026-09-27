@@ -1,0 +1,55 @@
+# Cloud Build for the INTERNAL demo only (`pdcclient-demo`, see
+# docs/DEMO_CLOUD_RUN.md). Customers never use this file: their images are
+# built and shipped per docs/BUILD_AND_RUN.md and the release-image skill.
+#
+# Builds BOTH images of one commit — the web application and the analysis
+# sandbox — because the demo runs them as two containers of one Cloud Run
+# revision and the executor protocol assumes a matching pair
+# (docs/EXECUTOR_PROTOCOL.md §10). `gcloud builds submit --tag` cannot build a
+# second Dockerfile or pass build args, hence this file.
+#
+#   gcloud builds submit . --project=pdc-enterprise --config=cloudbuild.yaml \
+#     --substitutions=_GIT_SHA=$(git rev-parse --short HEAD),_BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+#
+# The upload honours .gitignore (gcloud derives its ignore list from it when
+# no .gcloudignore exists), and .dockerignore trims the build context again,
+# so docs/security/, .env files and client_data never reach the build.
+substitutions:
+  _REGISTRY: europe-west1-docker.pkg.dev/pdc-enterprise/client
+  _GIT_SHA: ""
+  _BUILD_TIME: ""
+
+steps:
+  - id: web
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --build-arg=BUILD_COMMIT=${_GIT_SHA}
+      - --build-arg=BUILD_TIME=${_BUILD_TIME}
+      - -t
+      - ${_REGISTRY}/pdcclient-demo:${_GIT_SHA}
+      - -f
+      - Dockerfile
+      - .
+  - id: executor
+    name: gcr.io/cloud-builders/docker
+    waitFor: ["-"]
+    args:
+      - build
+      - --build-arg=BUILD_COMMIT=${_GIT_SHA}
+      - --build-arg=BUILD_TIME=${_BUILD_TIME}
+      - -t
+      - ${_REGISTRY}/pdcexecutor-demo:${_GIT_SHA}
+      - -f
+      - executor/Dockerfile
+      - .
+
+images:
+  - ${_REGISTRY}/pdcclient-demo:${_GIT_SHA}
+  - ${_REGISTRY}/pdcexecutor-demo:${_GIT_SHA}
+
+options:
+  machineType: E2_HIGHCPU_8
+  dynamicSubstitutions: true
+
+timeout: 1800s

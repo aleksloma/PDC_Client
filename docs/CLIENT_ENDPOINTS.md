@@ -1097,7 +1097,8 @@ chars, regex-guarded (path-traversal safe). Old-shape docs load with defaults
 | `POST` | `/api/dashboards/{id}/tiles/{tile_id}/remove` | owner only |
 | `POST` | `/api/dashboards/{id}/layout` | `{tiles: [{tile_id, x, y, w, h}]}` bulk save — owner only; ints validated/clamped, unknown tile_ids ignored (stale client) |
 | `POST` | `/api/dashboards/{id}/tiles/{tile_id}/refresh` | allowed for owner AND shared recipients. Table tiles first **re-resolve + self-heal** their code from the durable full-table record (tiles pinned with a wrong/chart code get the corrected code persisted); tiles with a `result_key` (one table of a multi-table RESULT) re-execute via `_reexecute_full_df` and persist a fresh durable key, others via `run_item_refresh` (Styler results keep `styled_html`). Deleted source chat → persists `frozen/frozen_reason="source_deleted"` on the tile, returns `200 {ok:false, frozen:true, reason}`; a caller without source-chat access gets the same shape with `reason:"access_revoked"` but nothing is persisted (caller-specific). Execution failures → `200 {ok:false, error}`, stored snapshot untouched; a tile whose code references a live table with no stored SELECT → `200 {ok:false, code:"LIVE_NO_QUERY", error}` and a failed live fetch → `200 {ok:false, error:<class sentence>}`, both passed through from `run_item_refresh`, nothing persisted. Success updates the snapshot (+ re-inlined `chart_data` / new `full_table_key`), clears `frozen`, returns `{ok, kind, image_base64\|table, is_plotly?, tile}`. |
-| `POST` | `/api/dashboards/{id}/share` | `{emails: [...]\|"a@x, b@y", message?}` — owner only, mirrors the chat share contract (`{ok, shared_with, added, email_sent, smtp_configured, failed}`). Adds recipients to the doc's `shared_with`, writes a pointer row into each recipient's dashboard index, **and grants them access to every tile's source chat that the dashboard OWNER owns** (`add_share_recipients`, same grant conversation-sharing performs) so their Show-data/refresh work. A tile pinned from a chat the owner merely RECEIVED is not re-shared: those recipients see its stored snapshot, and its refresh answers `{ok:false, frozen:true, reason:"access_revoked"}` for them. An address that has never signed in gets a password-less placeholder account (see Sharing rules). Brain SMTP relay gets only the dashboard name + comment (Article II — never tile content). No revoke exists (parity with chat sharing). |
+| `POST` | `/api/dashboards/{id}/share` | `{emails: [...]\|"a@x, b@y", message?}` — owner only, mirrors the chat share contract (`{ok, shared_with, added, email_sent, smtp_configured, failed}`). Adds recipients to the doc's `shared_with`, writes a pointer row into each recipient's dashboard index, **and grants them access to every tile's source chat that the dashboard OWNER owns** (`add_share_recipients`, same grant conversation-sharing performs) so their Show-data/refresh work. A tile pinned from a chat the owner merely RECEIVED is not re-shared: those recipients see its stored snapshot, and its refresh answers `{ok:false, frozen:true, reason:"access_revoked"}` for them. An address that has never signed in gets a password-less placeholder account (see Sharing rules). Brain SMTP relay gets only the dashboard name + comment (Article II — never tile content). Revoked per address with `/unshare` (next row). |
+| `POST` | `/api/dashboards/{id}/unshare` | `{email}` — owner only (a recipient → `403 {"error": "Only the dashboard owner can do this."}`, an unknown dashboard → `404 {"error": "Dashboard not found"}`, a missing or malformed address → `400`). Takes the address off the doc's `shared_with` (matched case-insensitively) and deletes that recipient's pointer row from their dashboard index (`DashboardStore.remove_dashboard_share`), then answers `200 {ok: true, shared_with: [...]}` with the remaining list. Idempotent: an address that is not shared answers 200 with the list unchanged. The source-chat grants the share made alongside are **not** touched — they are the chat's own sharing, which has no revoke and which another share may rely on. An unshared recipient who kept the URL resolves nothing: the page sends them to `/lab`, the API answers 404, and a tile refresh answers 404. Nothing is mailed. |
 
 **Frontend**: the `/lab` top bar has a Dashboards dropdown at the LEFT corner
 (filled navy `#001E44` bold button with an inline-SVG list icon — rows of
@@ -1141,7 +1142,28 @@ iframes don't bubble), Show data / Show code (PDCViewers), Download
 Refresh, Remove; plus a top-bar "Refresh all" (client-side concurrency-2 queue,
 per-tile failure isolation). Shared recipients see a read-only grid (no
 drag/resize/rename/share/remove-tile) with Delete becoming "Remove from my
-list".
+list", and a green "Shared by <owner>" badge beside the title. The OWNER sees,
+in that place, a "Shared with N" button (hidden while N is 0) that opens a
+dropdown of every address in `sharing.shared_with`, each with a ticked
+checkbox; unticking one calls `/unshare` and, on success, removes the row and
+updates N (on failure the tick comes back with an error toast). The dropdown
+closes on a click outside it or Escape, and a successful Share refreshes the
+list from the share response. The title row has its own `.hidden` rule in
+`dashboard_view.css`, because the page loads no generic one — without it the
+owner used to see the recipient badge as an empty green pill.
+
+**The /lab sidebar on desktop** (wider than 768 px) has a collapse button in
+its header (`#btnSidebarCollapse`, focusable, `aria-label` and
+`aria-expanded` follow the state) that shrinks it to a 56 px rail showing the
+logo mark, the expand button and "Create New" as a `+` icon; the main area
+takes the freed width with a width transition. A drag handle on its right
+edge (`#sidebarResizer`) sets the width between 240 and 480 px. Both are kept
+in the browser's `localStorage` (`pdc_sidebar_collapsed` = `1`/`0`,
+`pdc_sidebar_width` = px; every read and write is in `try/catch`, so blocked
+storage only means the state lasts for the page) and applied by a nonced
+script in `<head>` before the body renders, so there is no flash of the
+default width. Phone widths keep the unchanged drawer (hamburger, close
+button, backdrop) and never show either control.
 
 ---
 
@@ -1202,7 +1224,7 @@ values leave the client.
 ### Sharing rules
 
 - **New addresses.** Sharing a chat, a conversation or a dashboard with an address that has never signed in creates a password-less placeholder account (`AuthStore.ensure_invited_user`, `invited_by`/`invited_at` on the profile). Its sign-in is refused like any failed sign-in, so the recipient sets a password through the mailed reset link — whoever types the address first at the sign-in page cannot claim the share. Recipient addresses must match `routes.auth._EMAIL_RE`.
-- **Dashboards.** A dashboard share grants the recipients access only to the source chats the dashboard OWNER owns. Tiles pinned from a chat the owner merely received show their stored snapshot, and their refresh answers `{ok:false, frozen:true, reason:"access_revoked"}` for those recipients.
+- **Dashboards.** A dashboard share grants the recipients access only to the source chats the dashboard OWNER owns. Tiles pinned from a chat the owner merely received show their stored snapshot, and their refresh answers `{ok:false, frozen:true, reason:"access_revoked"}` for those recipients. The owner can revoke one recipient at a time (`POST /api/dashboards/{id}/unshare`); that removes the dashboard, not the source-chat access the share granted. Chats and conversations still have no revoke.
 - **Conversations.** A conversation share is owner-only, like the chat-level share.
 
 ---
