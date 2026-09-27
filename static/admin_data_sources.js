@@ -3062,6 +3062,7 @@
     const confirmed = await confirmUserAction('Remove user',
       `Remove ${email}? This deletes the account and all of their chats and dashboards, `
       + 'and ends the shares built on them for everyone they were shared with. '
+      + 'The address is also removed from everything shared with it and from the tables it registered. '
       + 'Their sessions end at once. This cannot be undone.',
       'Remove user');
     if (!confirmed) return;

@@ -2337,21 +2337,25 @@ def _role_refresh_block(email: str, chat_id: str, code: str):
       blocked_display_names — the denied tables this item's code actually
         references — non-empty means the refresh must be refused; empty
         means the item only touches allowed tables and proceeds (per-table
-        semantics). Two rules, added together: the `dfs['…']` key regex
-        (the one dashboard.js freezes on) over every denied key, and, for a
-        denied LIVE key, the pre-fetch's own rule
+        semantics). Two rules, added together, over EVERY denied key,
+        snapshot and live alike: the `dfs['…']` key regex (the one
+        dashboard.js freezes on) and the pre-fetch's own rule
         (`run_chat_local._referenced_live_keys`: a quoted key anywhere, a
         generic `dfs` walk, the `df` alias of the first frame) — so a
-        `dfs.get(...)` or `df` refresh of a denied live table is refused
-        instead of computing on whatever frame is left.
+        `dfs.get(...)`, `df` or loop-over-`dfs` refresh of a denied table is
+        refused instead of computing on whatever frame is left. The
+        `denied_df_keys` drop is defence in depth only.
 
     Genuine denials fail CLOSED by construction (.get() defaults resolve to
-    Base → empty grant set). Blocking — it may load the chat's frames; call
-    it off the event loop. An unexpected crash — the registry read below
-    included, which is done directly because the loader's own partition
-    reads a registry failure as "no live table" — is logged ROLE_GATE_FAILED
-    (the exception TYPE only) and answered with the `_GateFailed` marker;
-    the callers decide (`_refresh_role_gate`, `_live_reexec_block`)."""
+    Base → empty grant set; an unreadable registry reads as the default,
+    empty one, so every entry counts as denied). Blocking — it loads the chat's frames
+    whenever a table is denied; call it off the event loop. A failure of
+    that load or of the referencing rule — the denial already known — is
+    logged ROLE_GATE_REFERENCE_FAILED and REFUSES naming every denied table.
+    An earlier unexpected crash (the meta or the roles read) is logged
+    ROLE_GATE_FAILED (the exception TYPE only) and answered
+    with the `_GateFailed` marker; the callers decide
+    (`_refresh_role_gate`, `_live_reexec_block`)."""
     try:
         meta = local_store.ChatDataStore(chat_id).read_meta()
         entries = [e for e in local_store.db_entries_from_meta(meta)
@@ -2366,19 +2370,26 @@ def _role_refresh_block(email: str, chat_id: str, code: str):
                   and (e.get("db") or {}).get("table_id") not in allowed}
         if not denied:
             return frozenset(), []
-        keys = {k for k in _DF_KEY_RE.findall(code or "") if k in denied}
-        import db_sources
-        live_ids = {t.get("id") for t in db_sources.DataSourceStore().list_tables()
-                    if db_sources.table_mode(t) == "live"}
-        denied_live = [e["file_name"] for e in entries
-                       if e.get("file_name") in denied
-                       and (e.get("db") or {}).get("table_id") in live_ids]
-        if denied_live:
-            dfs = local_store.ChatDataStore(chat_id).load_dataframes(include_live=True)
+        try:
+            keys = {k for k in _DF_KEY_RE.findall(code or "") if k in denied}
+            dfs = local_store.ChatDataStore(chat_id).load_dataframes(include_live=True) or {}
+            all_keys = list(dict.fromkeys(
+                list(dfs) + [e["file_name"] for e in local_store.db_entries_from_meta(meta)
+                             if e.get("file_name")]))
+            # `_referenced_live_keys` never checks liveness: its `live_keys`
+            # argument is only the candidate set, here every denied key.
             named, generic = run_chat_local._referenced_live_keys(
-                code or "", denied_live, list(dfs or {}),
-                first_key=next(iter(dfs or {}), None))
-            keys |= set(named) | set(generic)
+                code or "", list(denied), all_keys,
+                first_key=next(iter(dfs), None))
+            keys |= {k for k in set(named) | set(generic) if k in denied}
+        except Exception as e:
+            # The denial is known, only what the code references is not:
+            # refuse naming every denied table (fail closed). The type only.
+            log_with_sid(log_safe_text(str(email), 254), "warning",
+                         f"ROLE_GATE_REFERENCE_FAILED "
+                         f"error={log_safe_text(type(e).__name__, 80)}",
+                         chat_id=log_safe_text(str(chat_id), 80))
+            return frozenset(denied), sorted(set(denied.values()))
         return frozenset(denied), sorted(denied[k] for k in keys)
     except Exception as e:
         # The type only: the gate reads chat meta, the roles and the table

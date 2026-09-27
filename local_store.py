@@ -54,7 +54,8 @@ _RESET_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 
 # Session generations: `_session_gen_key(email)` ("<DATA_ROOT>|<safe email>")
 # -> the account's `session_generation`. Filled from auth.json on the first
-# miss and updated by the two password writers, so the per-request session
+# miss and updated by every writer of the value (account creation, the two
+# password writers, the end-sessions bump), so the per-request session
 # check reads the disk once per account per process (one worker) and a hit
 # builds no path (no `_data_root()` mkdir). Per process: a change written by
 # another process is seen only after a restart.
@@ -1074,20 +1075,82 @@ class AuthStore:
     """Email-only profile storage. The enterprise build has no password,
     no subscription plan upgrades, etc. — just the email as identifier."""
 
-    def ensure_user(self, email: str) -> dict:
-        email = _safe_email(email)
-        udir = _data_root() / "users" / email
-        udir.mkdir(parents=True, exist_ok=True)
-        profile_path = udir / "profile.json"
-        if profile_path.exists():
+    def create_account(self, email: str, *, invited_by: Optional[str] = None) -> bool:
+        """THE account-creation function (every path that makes an address
+        exist: sign-in via Microsoft, self-registration, the local-admin
+        bootstrap, a share placeholder, the admin invite). True when a new
+        account was created.
+
+        A NEW account is one with neither profile.json nor auth.json. Under
+        `_LOCK`: profile.json is written exclusively FIRST (`invited_by` /
+        `invited_at` only when `invited_by` is given), THEN auth.json holding
+        a fresh `session_generation`, which also goes into the cache. So a
+        new account never reads "" — a session stamped "" (or any older
+        value) by an earlier account at the same address can never match
+        it. Accepted mid-creation state: if the auth.json write fails after
+        the profile write, the call raises and the account is profile-only —
+        it reads "" (the pre-existing legacy shape), never an unlisted
+        auth-only folder — and `ensure_invited_user` answers False.
+
+        An EXISTING account is left as it is (False) — except that an
+        auth-only folder gets the missing profile.json (minimal, no
+        invitation stamp, auth.json and its generation untouched), so the
+        address stays listed in User management. Accounts that already exist
+        without a generation keep reading "" (the upgrade rule). An I/O
+        failure raises; the wrappers decide."""
+        safe = _safe_email(email)
+        created_profile = False
+        with _LOCK:
+            udir = _data_root() / "users" / safe
+            profile_path = udir / "profile.json"
+            if self.user_exists(email):
+                if not profile_path.exists():
+                    try:
+                        with profile_path.open("x", encoding="utf-8") as fh:
+                            fh.write(json.dumps({"email": safe, "created_at": _now()},
+                                                indent=2, ensure_ascii=False))
+                        created_profile = True
+                    except FileExistsError:
+                        pass
+                if created_profile:
+                    from exec_transport import log_safe_text
+                    log_with_sid(log_safe_text(safe, 254), "info", "USER_PROFILE_REPAIRED")
+                return False
+            udir.mkdir(parents=True, exist_ok=True)
+            now = _now()
+            profile = {"email": safe, "created_at": now}
+            if invited_by is not None:
+                profile["invited_by"] = (invited_by or "").strip().lower()
+                profile["invited_at"] = now
             try:
-                return json.loads(profile_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        profile = {"email": email, "created_at": _now()}
-        profile_path.write_text(json.dumps(profile, indent=2, ensure_ascii=False), encoding="utf-8")
-        log_with_sid(email, "info", "USER_PROFILE_CREATED")
-        return profile
+                with profile_path.open("x", encoding="utf-8") as fh:
+                    fh.write(json.dumps(profile, indent=2, ensure_ascii=False))
+            except FileExistsError:
+                return False
+            generation = secrets.token_hex(8)
+            self._write_auth(email, {"session_generation": generation})
+            _SESSION_GEN_CACHE[_session_gen_key(email)] = generation
+        from exec_transport import log_safe_text
+        if invited_by is not None:
+            log_with_sid(log_safe_text(invited_by or "share", 254), "info",
+                         "USER_PLACEHOLDER_CREATED")
+        else:
+            log_with_sid(log_safe_text(safe, 254), "info", "USER_PROFILE_CREATED")
+        return True
+
+    def ensure_user(self, email: str) -> dict:
+        """Create the account when the address has none (`create_account`)
+        and return its profile. Never rewrites an existing profile: an
+        unreadable one is answered with a minimal dict and logged (the file
+        stays as it is)."""
+        self.create_account(email)
+        profile = self.get_profile(email)
+        if isinstance(profile, dict):
+            return profile
+        from exec_transport import log_safe_text
+        log_with_sid(log_safe_text(_safe_email(email), 254), "warning",
+                     "USER_PROFILE_UNREADABLE")
+        return {"email": _safe_email(email)}
 
     # --- Password auth (hash-only storage under users/{email}/auth.json) ----
     #
@@ -1114,29 +1177,16 @@ class AuthStore:
         recorded). Its first sign-in is then refused like any existing account
         without a password, and the mailed reset proves the mailbox instead.
         Never touches an existing account: the profile is created exclusively,
-        so a concurrent sign-in or share cannot be overwritten. Returns True
-        when a placeholder was created; never raises (Article IV)."""
+        so a concurrent sign-in or share cannot be overwritten, and the new
+        account carries a fresh session generation (`create_account`).
+        Returns True when a placeholder was created; never raises (Article
+        IV)."""
         try:
-            with _LOCK:
-                if self.user_exists(email):
-                    return False
-                safe = _safe_email(email)
-                udir = _data_root() / "users" / safe
-                udir.mkdir(parents=True, exist_ok=True)
-                now = _now()
-                profile = {"email": safe, "created_at": now,
-                           "invited_by": (invited_by or "").strip().lower(),
-                           "invited_at": now}
-                try:
-                    with (udir / "profile.json").open("x", encoding="utf-8") as fh:
-                        fh.write(json.dumps(profile, indent=2, ensure_ascii=False))
-                except FileExistsError:
-                    return False
-            log_with_sid(invited_by or "share", "info", "USER_PLACEHOLDER_CREATED")
-            return True
+            return self.create_account(email, invited_by=invited_by or "")
         except Exception as e:
-            log_with_sid(invited_by or "share", "warning",
-                         f"USER_PLACEHOLDER_FAILED {type(e).__name__}")
+            from exec_transport import log_safe_text
+            log_with_sid(log_safe_text(invited_by or "share", 254), "warning",
+                         f"USER_PLACEHOLDER_FAILED {log_safe_text(type(e).__name__, 80)}")
             return False
 
     def user_exists(self, email: str) -> bool:
@@ -1170,7 +1220,11 @@ class AuthStore:
         sso_last_login). MERGE-only: password_hash / temp_password_hash /
         must_change_password stay untouched — a password user who also
         signs in via SSO keeps the password. Never raises (Article IV; a
-        stamp failure must not block login)."""
+        stamp failure must not block login). Known edge: the merge goes
+        through `get_auth`, which answers {} for an UNREADABLE auth.json, so
+        on a corrupt record the rewrite drops the stored
+        `session_generation` on disk (the cache keeps the value until a
+        restart)."""
         try:
             with _LOCK:
                 auth = self.get_auth(email)
@@ -1264,11 +1318,13 @@ class AuthStore:
         return ok and not udir.exists()
 
     def session_generation(self, email: str) -> str:
-        """The account's current session generation, "" when it has none
-        (a profile without auth.json, or a record written before generations
-        existed), `SESSION_GEN_REMOVED` — uncached — when neither profile.json
-        nor auth.json exists (never seen, or removed). Cached per account;
-        the writers update the cache and `remove_user` drops it. An
+        """The account's current session generation. Every account created
+        by `create_account` has one from its first moment; "" answers an
+        EXISTING account that has none (a profile without auth.json, or a
+        record written before generations existed — the upgrade rule),
+        `SESSION_GEN_REMOVED` — uncached — when neither profile.json nor
+        auth.json exists (never seen, or removed). Cached per account; the
+        writers update the cache and `remove_user` drops it. An
         unreadable record answers "" uncached (Article IV) — such an account
         cannot sign in anyway — and is logged once per path (the scan
         latch)."""
@@ -2369,6 +2425,117 @@ def delete_chats_owned_by(email: str) -> int:
     if deleted:
         log_with_sid("auth", "info", f"USER_CHATS_DELETED count={deleted}")
     return deleted
+
+
+def _lists_address(doc, target: str) -> bool:
+    """True when `doc["sharing"]["shared_with"]` holds `target` (compared
+    `strip().lower()`)."""
+    if not isinstance(doc, dict):
+        return False
+    sharing = doc.get("sharing")
+    shared = sharing.get("shared_with") if isinstance(sharing, dict) else None
+    if not isinstance(shared, list):
+        return False
+    return any(str(s or "").strip().lower() == target for s in shared)
+
+
+def purge_address_grants(email: str) -> dict:
+    """Take `email` off every OTHER owner's share list — each chat's
+    `sharing.shared_with` in `chatdata/*/meta.json` and each dashboard doc
+    under `users/*/dashboards/` — so an address that is created again
+    inherits none of them. Called by the admin's Remove after the account
+    and the chats it owns are gone.
+
+    Chat metas are read as JSON directly: an unreadable one is skipped and
+    left byte-identical (the `read_meta` fallback would replace it with an
+    empty meta on write), and no `ChatDataStore` is built (its constructor
+    creates folders). A listed chat is re-read and rewritten under `_LOCK`,
+    the other entries keeping their order and casing. Dashboards go through
+    `DashboardStore.remove_dashboard_share`, only when the address is
+    listed. `_LOCK` is taken per item, never across the scan; a failure is
+    logged per item (the exception TYPE only) and the scan goes on.
+    Returns {chats_unshared, dashboards_unshared} — counted per chat and
+    per dashboard actually changed; never raises (Article IV)."""
+    from exec_transport import log_safe_text
+    out = {"chats_unshared": 0, "dashboards_unshared": 0}
+    target = str(email or "").strip().lower()
+    if not target:
+        return out
+    try:
+        root = _data_root()
+        chat_root = root / "chatdata"
+        metas = sorted(chat_root.glob("*/meta.json")) if chat_root.is_dir() else []
+    except Exception as e:
+        log_with_sid("auth", "error",
+                     f"SHARE_PURGE_SCAN_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return out
+    for meta_path in metas:
+        chat = meta_path.parent.name
+        try:
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                log_with_sid("auth", "warning",
+                             f"SHARE_PURGE_META_UNREADABLE chat={log_safe_text(chat, 80)} "
+                             f"error={log_safe_text(type(e).__name__, 80)}")
+                continue
+            if not isinstance(meta, dict):
+                continue
+            if str(meta.get("owner") or "").strip().lower() == target:
+                continue
+            if not _lists_address(meta, target):
+                continue
+            with _LOCK:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if not (isinstance(meta, dict) and _lists_address(meta, target)):
+                    continue
+                shared = meta["sharing"]["shared_with"]
+                meta["sharing"]["shared_with"] = [
+                    s for s in shared if str(s or "").strip().lower() != target]
+                _write_json_atomic(meta_path, meta)
+            out["chats_unshared"] += 1
+        except Exception as e:
+            log_with_sid("auth", "warning",
+                         f"SHARE_PURGE_CHAT_FAILED chat={log_safe_text(chat, 80)} "
+                         f"error={log_safe_text(type(e).__name__, 80)}")
+    try:
+        users_root = root / "users"
+        docs = (sorted(users_root.glob("*/dashboards/*.json"))
+                if users_root.is_dir() else [])
+    except Exception as e:
+        log_with_sid("auth", "error",
+                     f"SHARE_PURGE_SCAN_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        docs = []
+    own_folder = _safe_email(target)
+    store = DashboardStore()
+    for doc_path in docs:
+        dash_id = doc_path.stem
+        folder = doc_path.parent.parent.name
+        try:
+            if folder == own_folder or not _DASH_ID_RE.match(dash_id):
+                continue
+            try:
+                doc = json.loads(doc_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                log_with_sid("auth", "warning",
+                             f"SHARE_PURGE_DASH_UNREADABLE dash={log_safe_text(dash_id, 80)} "
+                             f"error={log_safe_text(type(e).__name__, 80)}")
+                continue
+            if not _lists_address(doc, target):
+                continue
+            remaining = store.remove_dashboard_share(folder, dash_id, target)
+            if remaining is not None and not any(
+                    str(s or "").strip().lower() == target for s in remaining):
+                out["dashboards_unshared"] += 1
+        except Exception as e:
+            log_with_sid("auth", "warning",
+                         f"SHARE_PURGE_DASH_FAILED dash={log_safe_text(dash_id, 80)} "
+                         f"error={log_safe_text(type(e).__name__, 80)}")
+    if out["chats_unshared"] or out["dashboards_unshared"]:
+        log_with_sid("auth", "info",
+                     f"USER_SHARES_PURGED chats={out['chats_unshared']} "
+                     f"dashboards={out['dashboards_unshared']}")
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -29,7 +29,8 @@ Design (docs/ENTERPRISE_ARCHITECTURE.md — roles & permissions):
     placeholder and mails it a reset link (besides a share placeholder and
     Microsoft SSO, the only way an account comes to exist).
   - `POST /users/end_sessions` signs an account out everywhere;
-    `POST /users/remove` deletes it with the chats it owns.
+    `POST /users/remove` deletes it with the chats it owns and takes the
+    address off other owners' share lists and off the tables it registered.
 """
 from __future__ import annotations
 
@@ -43,7 +44,7 @@ import brain_client
 import db_sources
 import roles_store
 from exec_transport import log_safe_text
-from local_store import AuthStore, delete_chats_owned_by
+from local_store import AuthStore, delete_chats_owned_by, purge_address_grants
 from logger_utils import log_with_sid
 from routes.admin_data import _require_admin, _json_body
 from settings import settings
@@ -339,13 +340,40 @@ async def end_user_sessions(request: Request):
     return {"ok": True}
 
 
-def _remove_account(target: str) -> tuple[bool, int]:
+def _remove_account(target: str, actor: str) -> tuple[bool, dict]:
     """The account folder first — it holds the sessions' generation and the
     records a live session could otherwise write back into — then every chat
-    the account owns. Blocking."""
+    the account owns, then the address comes off every other owner's share
+    lists and off the tables it registered. The last three are best effort:
+    once the folder is gone, a step that raises is logged (the type only)
+    and counts 0, so the route still audits the removal and answers with the
+    counts achieved. Blocking."""
+    counts = {"chats_deleted": 0, "chats_unshared": 0, "dashboards_unshared": 0,
+              "registrations_released": 0}
     if not AuthStore().remove_user(target):
-        return False, 0
-    return True, delete_chats_owned_by(target)
+        return False, counts
+
+    def _step(name, fn):
+        try:
+            return fn()
+        except Exception as e:                               # noqa: BLE001
+            log_with_sid(log_safe_text(actor, 254), "error",
+                         f"ADMIN_USER_REMOVE_STEP_FAILED step={name} "
+                         f"user={log_safe_text(target, 254)} "
+                         f"error={log_safe_text(type(e).__name__, 80)}")
+            return None
+
+    counts["chats_deleted"] = int(_step("delete_chats",
+                                        lambda: delete_chats_owned_by(target)) or 0)
+    purged = _step("purge_shares", lambda: purge_address_grants(target))
+    purged = purged if isinstance(purged, dict) else {}
+    counts["chats_unshared"] = int(purged.get("chats_unshared") or 0)
+    counts["dashboards_unshared"] = int(purged.get("dashboards_unshared") or 0)
+    counts["registrations_released"] = int(_step(
+        "release_registrations",
+        lambda: db_sources.DataSourceStore().release_registrations(target, actor=actor))
+        or 0)
+    return True, counts
 
 
 @router.post("/users/remove")
@@ -355,10 +383,14 @@ async def remove_user(request: Request):
     with the index) and every chat whose owner it is, deactivated ones
     included; recipients of its chats and dashboards then meet the existing
     owner-vanished paths. Every session of the account ends on its next
-    request (`SESSION_GEN_REMOVED`). The address stays in other owners'
-    share lists, inert until it is invited again. 400 for the bootstrap
-    local admin and for the caller's own account, 404 for an unknown
-    address. Answers {ok: true, chats_deleted}; audited `user.removed`."""
+    request (`SESSION_GEN_REMOVED`). Then the address is taken off every
+    other owner's chat and dashboard share list and `registered_by` is
+    removed from the tables it registered, so an account created again at
+    the address inherits nothing; audit rows keep their attribution. 400
+    for the bootstrap local admin and for the caller's own account, 404 for
+    an unknown address. Answers {ok: true, chats_deleted, chats_unshared,
+    dashboards_unshared, registrations_released} — the counts achieved;
+    audited `user.removed` with the same counts."""
     email, err = _require_admin(request)
     if err:
         return err
@@ -382,21 +414,24 @@ async def remove_user(request: Request):
     if not auth.user_exists(target):
         return JSONResponse({"error": "Unknown user."}, status_code=404)
     try:
-        removed, chats_deleted = await asyncio.get_running_loop().run_in_executor(
-            None, _remove_account, target)
+        removed, counts = await asyncio.get_running_loop().run_in_executor(
+            None, _remove_account, target, email)
     except Exception as e:
         log_with_sid(email, "error",
                      f"ADMIN_USER_REMOVE_FAILED user={log_safe_text(target, 254)} "
                      f"error={log_safe_text(type(e).__name__, 80)}")
-        removed, chats_deleted = False, 0
+        removed, counts = False, {}
     if not removed:
         return JSONResponse({"error": "Could not remove the user."}, status_code=500)
-    db_sources.audit(email, "user.removed", target=target,
-                     detail={"chats_deleted": chats_deleted},
+    db_sources.audit(email, "user.removed", target=target, detail=dict(counts),
                      ip=(request.client.host if request.client else None))
     log_with_sid(email, "info",
-                 f"ADMIN_USER_REMOVED user={log_safe_text(target, 254)} chats_deleted={chats_deleted}")
-    return {"ok": True, "chats_deleted": chats_deleted}
+                 f"ADMIN_USER_REMOVED user={log_safe_text(target, 254)} "
+                 f"chats_deleted={counts['chats_deleted']} "
+                 f"chats_unshared={counts['chats_unshared']} "
+                 f"dashboards_unshared={counts['dashboards_unshared']} "
+                 f"registrations_released={counts['registrations_released']}")
+    return {"ok": True, **counts}
 
 
 NO_BASE_URL_MAIL_ERROR = "PUBLIC_BASE_URL is not set, so no invitation link can be mailed."

@@ -597,6 +597,35 @@ def test_snapshot_only_answer_stays_served_on_both_routes_without_a_grant(
     assert r.content[:2] == b"PK"
 
 
+@pytest.fixture
+def live_grant_only(registry):
+    """OWNER's role covers the LIVE table but NOT the snapshot `snap u`."""
+    _grant(OWNER, [registry["tid"]])
+
+
+@pytest.mark.parametrize("route", ["full_table", "download_excel"])
+def test_dfs_get_of_a_denied_snapshot_key_is_still_served_on_the_full_table_routes(
+        client, chat, registry, live_grant_only, monkeypatch, route):
+    """Task 14b item 3 keep-green guard (the Task 12b contract): the refresh
+    gate now refuses a denied snapshot table reached through `dfs.get(...)`,
+    but Show full table / Download Excel consume the gate's DROP only — a
+    snapshot reference never denies there, so an answer computed as
+    `dfs.get('snap u')` is still served (200) to a user who holds the live
+    grant and lacks the snapshot one, and no live fetch happens."""
+    _add_snapshot_entry(chat, registry)
+    key = _full_record(CHAT, "RESULT = dfs.get('snap u')")
+    _no_fetch(monkeypatch)
+    if route == "full_table":
+        r = _full_table(client, key)
+        assert r.status_code == 200, r.text[:300]
+        assert r.json()["total_rows"] == 2
+        assert r.json()["columns"] == ["a", "b"]
+    else:
+        r = _excel(client, key)
+        assert r.status_code == 200, r.text[:300]
+        assert r.content[:2] == b"PK"
+
+
 @pytest.mark.parametrize("route", ["full_table", "download_excel"])
 def test_full_table_gate_crash_fails_closed_without_a_fetch(
         client, chat, granted, monkeypatch, caplog, route):

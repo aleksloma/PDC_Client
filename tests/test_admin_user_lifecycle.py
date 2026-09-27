@@ -19,14 +19,31 @@ The contract pinned here (Task 14 items 3 and 4, D14-1..D14-5):
   owner's chat untouched. Answers `{ok: true, chats_deleted: N}`; audited
   `user.removed` with the counts. A recipient of the removed owner's shared
   dashboard gets not-found, and their dashboard list drops the pointer.
-* Sessions of a removed account end on the next request, including an
-  SSO-only session stamped `gen: ""` and after a process restart (the
+* Sessions of a removed account end on the next request, including a
+  legacy session stamped `gen: ""` and after a process restart (the
   generation cache emptied): `AuthStore.session_generation` answers the
   fixed non-hex sentinel `local_store.SESSION_GEN_REMOVED` — UNCACHED — for
-  an address with neither profile.json nor auth.json, while a profile-only
-  account still answers "" (upgrade back-compat). A re-invited address reads
-  "" again, and an SSO account that signs back in after a removal can be
-  removed (and signed out) a second time.
+  an address with neither profile.json nor auth.json, while an EXISTING
+  profile-only account (written before generations existed) still answers
+  "" (upgrade back-compat). An SSO account that signs back in after a
+  removal can be removed (and signed out) a second time.
+* Task 14b item 1 (D14b-1, D14b-3b): EVERY new account is created through
+  `AuthStore.create_account(email, *, invited_by=None) -> bool` — profile.json
+  first, then auth.json holding a fresh 16-hex `session_generation`, cached.
+  `ensure_user` / `ensure_invited_user` delegate to it. An existing account
+  is left byte-identical (an auth-only folder gets a minimal profile.json,
+  its generation untouched). So a re-created address (share placeholder,
+  admin invite, Microsoft sign-in) reads a fresh generation — a `gen: ""`
+  session of the removed account never revives, and `/auth/password` can
+  never set a first password through it.
+* Task 14b item 2 (D14b-3, D14-4 reversed): removal also strips the address
+  from every OTHER owner's `shared_with` (chats and dashboards —
+  `local_store.purge_address_grants`) and POPS `registered_by` from the
+  tables it registered (`DataSourceStore.release_registrations`, connectors
+  included; `descriptions_confirmed_by` untouched). The response and the
+  `user.removed` audit row carry `chats_unshared`, `dashboards_unshared`,
+  `registrations_released`; a `table.registered_by_released` row holds the
+  count. A re-created address inherits nothing and can be shared to again.
 * The admin page carries both actions with a confirmation step and no
   inline handler.
 
@@ -69,6 +86,12 @@ GHOST = "nobody.here@corp.example"
 CHAT_ACTIVE = "c_lifeowned01"
 CHAT_DEACT = "c_lifeowned02"
 CHAT_OTHER = "c_lifeother01"
+CHAT_USER = "c_lifeuser001"
+
+# OWNER as another registrant might have typed it: `registered_by` is
+# stored verbatim, the release compares lower-cased (Task 14b item 2).
+OWNER_MIXED = "Life.OWNER@Corp.Example"
+FAKE_CONN = "0123456789abcdef"      # upsert_table validates no connection
 
 _HEX16 = re.compile(r"[0-9a-f]{16}")
 
@@ -184,18 +207,44 @@ def _chat(chat_id, owner, *, active=True, shared_with=()):
     return store
 
 
+def _register(display: str, *, registered_by: str, connector: bool = False) -> str:
+    """A registry table doc the way the wizard leaves one: `registered_by`
+    stamped from the registrant's session, descriptions confirmed by the
+    admin. `upsert_table` validates no connection and needs no encryption
+    key, so a fake 16-hex connection id is enough."""
+    row = db_sources.DataSourceStore().upsert_table({
+        "connection_id": FAKE_CONN, "schema": "s",
+        "table_name": display.replace(" ", "_"), "display_name": display,
+        "description": "", "is_connector": connector, "relations": [],
+        "columns": [], "registered_by": registered_by,
+        "descriptions_confirmed_by": ADMIN}, actor=ADMIN)
+    return row["id"]
+
+
 @pytest.fixture
 def estate(world):
     """OWNER's estate: an active chat shared with RCPT, a DEACTIVATED chat
-    (meta owner, no active_chats row) and a dashboard shared with RCPT;
-    OTHER owns an unrelated chat."""
+    (meta owner, no active_chats row) and a dashboard shared with RCPT.
+    Plus the REVERSE grants OWNER holds elsewhere (Task 14b item 2): OTHER's
+    chat and OTHER's dashboard are shared WITH OWNER, and OWNER (in mixed
+    case) is the registrant of one normal table and one connector; RCPT
+    registered a third table."""
     _chat(CHAT_ACTIVE, OWNER, shared_with=[RCPT])
     _chat(CHAT_DEACT, OWNER, active=False)
-    _chat(CHAT_OTHER, OTHER)
+    _chat(CHAT_OTHER, OTHER, shared_with=[OWNER])
     ds = local_store.DashboardStore()
     dash = ds.create_dashboard(OWNER, "Owned board")
     assert ds.add_dashboard_share(OWNER, dash["dash_id"], [RCPT]) == [RCPT]
-    return {"dash_id": dash["dash_id"], "tmp": world["tmp"]}
+    other = ds.create_dashboard(OTHER, "Other's board")
+    assert ds.add_dashboard_share(OTHER, other["dash_id"], [OWNER]) == [OWNER]
+    tids = {
+        "owner_plain": _register("owner plain", registered_by=OWNER_MIXED),
+        "owner_connector": _register("owner connector", registered_by=OWNER_MIXED,
+                                     connector=True),
+        "rcpt_plain": _register("rcpt plain", registered_by=RCPT),
+    }
+    return {"dash_id": dash["dash_id"], "other_dash_id": other["dash_id"],
+            "tids": tids, "tmp": world["tmp"]}
 
 
 # ===========================================================================
@@ -364,8 +413,11 @@ def test_a_removed_account_stays_signed_out_after_a_restart(world, estate):
 
 
 def test_a_removed_sso_only_session_ends(world):
-    """An SSO-only account's session carries `gen: ""` — the same value a
-    record-less address would answer without the sentinel."""
+    """An SSO-only account's session carries the account's current
+    generation (Task 14b: a hex value from creation; before it, `gen: ""` —
+    the same value a record-less address would answer without the
+    sentinel). Either way the removed session must end. The legacy `""`
+    shape itself is covered by the Task 14b re-creation tests below."""
     tc = _cookie_session(SSO)
     assert _alive(tc)
     r = _remove(_admin(), SSO)
@@ -402,32 +454,56 @@ def test_a_never_seen_address_answers_the_non_hex_sentinel(world):
     assert local_store.AuthStore().session_generation(GHOST) == sentinel
 
 
+def _profile_only_account(tmp, email):
+    """An account written by a release BEFORE generations existed:
+    profile.json and nothing else. Built by hand on purpose — since Task
+    14b `ensure_user` creates an auth.json with a generation, so the store
+    can no longer produce this (upgrade) shape."""
+    d = tmp / "users" / email
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "profile.json").write_text(
+        json.dumps({"email": email, "created_at": "2026-01-01T00:00:00"}),
+        encoding="utf-8")
+
+
 def test_a_profile_only_account_still_answers_empty(world):
     """Upgrade back-compat: an account created before generations existed
     (profile.json, no auth.json) keeps answering "", so a pre-release cookie
-    without `gen` keeps working."""
-    local_store.AuthStore().ensure_user("profile.only@corp.example")
+    without `gen` keeps working. Task 14b: the account is written by hand
+    (that IS the upgrade case) instead of through `ensure_user`, which now
+    creates a generation — the intent of the pin is unchanged."""
+    _profile_only_account(world["tmp"], "profile.only@corp.example")
     assert local_store.AuthStore().session_generation("profile.only@corp.example") == ""
 
 
 def test_the_sentinel_is_never_cached(world):
-    """A never-seen address answers the sentinel, then — once an account is
-    created for it — the real value at once (no cached sentinel)."""
+    """A never-seen address answers the sentinel, then — once an account
+    exists for it — the real value at once (no cached sentinel). Task 14b:
+    the account is a hand-written profile-only one so the real value is
+    still "", which is what tells a cached sentinel from a read."""
     sentinel = _sentinel()
     store = local_store.AuthStore()
     assert store.session_generation(GHOST) == sentinel
-    store.ensure_user(GHOST)
+    _profile_only_account(world["tmp"], GHOST)
     assert store.session_generation(GHOST) == ""
 
 
-def test_a_removed_address_answers_the_sentinel_and_a_re_invite_reads_empty(world, estate):
+def test_a_removed_address_answers_the_sentinel_and_a_re_invite_reads_a_fresh_generation(
+        world, estate):
+    """Renamed from `..._and_a_re_invite_reads_empty` (Task 14b item 1): the
+    re-invited account is CREATED, so it carries a fresh 16-hex generation —
+    not "" (which a `gen: ""` cookie of the removed account would match) and
+    not the sentinel (which must never be written)."""
     sentinel = _sentinel()
     store = local_store.AuthStore()
     assert _HEX16.fullmatch(store.session_generation(OWNER))   # cached before removal
     assert _remove(_admin(), OWNER).status_code == 200
     assert store.session_generation(OWNER) == sentinel
     assert store.ensure_invited_user(OWNER, ADMIN) is True
-    assert store.session_generation(OWNER) == "", "the sentinel leaked into the re-invited account"
+    gen = store.session_generation(OWNER)
+    assert gen != sentinel, "the sentinel leaked into the re-invited account"
+    assert gen != "", "the re-invited account has no generation — a gen \"\" cookie would match"
+    assert _HEX16.fullmatch(gen), repr(gen)
 
 
 # ===========================================================================
@@ -554,3 +630,402 @@ def test_a_non_email_target_is_refused(world, route):
          else _remove(admin, "not-an-address"))
     assert r.status_code == 400, (r.status_code, r.text[:300])
     assert not (world["tmp"] / "users" / "not-an-address").exists()
+
+
+# ===========================================================================
+# Task 14b item 1 — the ONE creation function writes a session generation
+# ===========================================================================
+def _create_account(store, email, **kw) -> bool:
+    fn = getattr(store, "create_account", None)
+    if fn is None:
+        pytest.fail("AuthStore.create_account is missing (Task 14b item 1)")
+    return fn(email, **kw)
+
+
+def _user_dir(tmp, email):
+    return tmp / "users" / email
+
+
+def _read_json(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_create_account_writes_profile_and_a_fresh_generation_for_a_new_address(world):
+    tmp = world["tmp"]
+    store = local_store.AuthStore()
+    assert _create_account(store, GHOST) is True
+    d = _user_dir(tmp, GHOST)
+    assert (d / "profile.json").is_file(), "no profile.json written"
+    assert (d / "auth.json").is_file(), "no auth.json written — the account has no generation"
+    profile = _read_json(d / "profile.json")
+    assert profile.get("email") == GHOST and profile.get("created_at")
+    assert "invited_by" not in profile, profile
+    gen = _read_json(d / "auth.json").get("session_generation")
+    assert isinstance(gen, str) and _HEX16.fullmatch(gen), repr(gen)
+    assert not (_read_json(d / "auth.json").get("password_hash")), "a credential was invented"
+    assert store.session_generation(GHOST) == gen
+    # Cached by the writer, like set_password's.
+    assert local_store._SESSION_GEN_CACHE.get(local_store._session_gen_key(GHOST)) == gen
+
+
+def test_create_account_leaves_an_existing_account_byte_identical(world):
+    tmp = world["tmp"]
+    d = _user_dir(tmp, USER)
+    before = ((d / "profile.json").read_bytes(), (d / "auth.json").read_bytes())
+    gen = local_store.AuthStore().session_generation(USER)
+    assert _create_account(local_store.AuthStore(), USER) is False
+    assert ((d / "profile.json").read_bytes(), (d / "auth.json").read_bytes()) == before, \
+        "an existing account's files were rewritten"
+    assert local_store.AuthStore().session_generation(USER) == gen
+
+
+def test_create_account_repairs_a_missing_profile_on_an_auth_only_folder(world):
+    """D14b-3b: an auth-only folder (no profile.json) is an EXISTING account
+    — False — but the missing profile is written (minimal: email +
+    created_at, no invitation stamp) so the address stays listed in User
+    management; auth.json and its generation are untouched."""
+    tmp = world["tmp"]
+    addr = "auth.only@corp.example"
+    d = _user_dir(tmp, addr)
+    d.mkdir(parents=True)
+    raw = json.dumps({"session_generation": "0011223344556677",
+                      "sso_provider": "microsoft"}).encode("utf-8")
+    (d / "auth.json").write_bytes(raw)
+    store = local_store.AuthStore()
+    assert _create_account(store, addr, invited_by=ADMIN) is False
+    assert (d / "profile.json").is_file(), "the missing profile.json was not repaired"
+    profile = _read_json(d / "profile.json")
+    assert profile.get("email") == addr and profile.get("created_at"), profile
+    assert "invited_by" not in profile and "invited_at" not in profile, profile
+    assert (d / "auth.json").read_bytes() == raw, "auth.json was rewritten"
+    assert store.session_generation(addr) == "0011223344556677"
+
+
+def test_ensure_invited_user_stamps_the_invitation_and_a_generation(world):
+    tmp = world["tmp"]
+    store = local_store.AuthStore()
+    assert store.ensure_invited_user(GHOST, ADMIN) is True
+    d = _user_dir(tmp, GHOST)
+    profile = _read_json(d / "profile.json")
+    assert profile.get("invited_by") == ADMIN and profile.get("invited_at"), profile
+    assert (d / "auth.json").is_file(), "the placeholder has no auth.json — no generation"
+    gen = _read_json(d / "auth.json").get("session_generation")
+    assert isinstance(gen, str) and _HEX16.fullmatch(gen), repr(gen)
+    assert store.session_generation(GHOST) == gen
+    assert store.has_password(GHOST) is False
+    # Second call: an existing account, nothing created.
+    assert store.ensure_invited_user(GHOST, BOSS) is False
+    assert _read_json(d / "profile.json").get("invited_by") == ADMIN
+
+
+def test_ensure_user_creates_a_generation_for_a_new_address(world):
+    """The SSO callback's store call (`ensure_user`) is a creation too."""
+    tmp = world["tmp"]
+    store = local_store.AuthStore()
+    profile = store.ensure_user(GHOST)
+    assert isinstance(profile, dict) and profile.get("email") == GHOST
+    d = _user_dir(tmp, GHOST)
+    assert (d / "auth.json").is_file(), "ensure_user created no auth.json — no generation"
+    gen = _read_json(d / "auth.json").get("session_generation")
+    assert isinstance(gen, str) and _HEX16.fullmatch(gen), repr(gen)
+    assert store.session_generation(GHOST) == gen
+
+
+def test_ensure_user_never_rewrites_an_unreadable_profile(world):
+    """An unreadable profile.json is an EXISTING account with a damaged
+    record: `ensure_user` answers a minimal dict and logs, it does not
+    replace the customer's file (Article IV — never overwrite state)."""
+    tmp = world["tmp"]
+    addr = "broken.profile@corp.example"
+    d = _user_dir(tmp, addr)
+    d.mkdir(parents=True)
+    garbage = b'{"email": "broken.profile@corp.example", "created_at": '   # truncated
+    (d / "profile.json").write_bytes(garbage)
+    out = local_store.AuthStore().ensure_user(addr)
+    assert isinstance(out, dict), out
+    assert (d / "profile.json").read_bytes() == garbage, \
+        "ensure_user replaced an unreadable profile.json"
+
+
+def test_a_hand_written_profile_only_account_still_answers_empty(world):
+    """The upgrade rule is unchanged: the generation is written at CREATION
+    only, so an account that already exists without one keeps reading ""."""
+    _profile_only_account(world["tmp"], "legacy.profile@corp.example")
+    assert local_store.AuthStore().session_generation("legacy.profile@corp.example") == ""
+
+
+# ===========================================================================
+# Task 14b item 1 — a `gen ""` session of a removed legacy account
+# must not revive when the address is created again
+# ===========================================================================
+LEGACY_SSO = "life.legacy.sso@corp.example"
+LEGACY_PW_ACCT = "life.legacy.pw@corp.example"
+LEGACY_PW = "Legacy-passw0rd"
+HIJACK_PW = "Hijacked-passw0rd"
+
+
+def _legacy_account(tmp, email, auth: dict):
+    """An account written by a release BEFORE generations existed:
+    profile.json plus an auth.json WITHOUT `session_generation`."""
+    d = tmp / "users" / email
+    d.mkdir(parents=True)
+    (d / "profile.json").write_text(
+        json.dumps({"email": email, "created_at": "2026-01-01T00:00:00"}),
+        encoding="utf-8")
+    (d / "auth.json").write_text(json.dumps(auth), encoding="utf-8")
+
+
+def _build_legacy(tmp, shape) -> str:
+    if shape == "sso_only":
+        _legacy_account(tmp, LEGACY_SSO, {"sso_provider": "microsoft",
+                                          "sso_last_login": "2026-01-02T00:00:00"})
+        return LEGACY_SSO
+    from password_utils import generate_password_hash
+    _legacy_account(tmp, LEGACY_PW_ACCT, {"password_hash": generate_password_hash(LEGACY_PW),
+                                          "must_change_password": False})
+    return LEGACY_PW_ACCT
+
+
+def _recreate_by_share(addr, monkeypatch):
+    """(a) another owner shares a chat with the address — the route's
+    `ensure_invited_user` creates the placeholder. The brain relay is a stub
+    answering "nothing configured", so the route answers 200."""
+    monkeypatch.setattr(brain_client, "send_share_email",
+                        lambda **kw: {"smtp_configured": False, "sent": [], "failed": []})
+    _chat(CHAT_USER, USER)
+    user = _signed_in(USER, USER_PW)
+    r = user.post(f"/api/chat/{CHAT_USER}/share", json={"emails": [addr]})
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    assert addr in (r.json().get("added") or []), r.json()
+
+
+def _recreate_by_invite(addr):
+    """(b) the admin invites the address (mail may be unsent — no
+    PUBLIC_BASE_URL in the test env — the account is created all the same)."""
+    r = _admin().post("/api/admin/users/invite", json={"email": addr})
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    assert r.json().get("created") is True, r.json()
+
+
+def _recreate_by_sso(addr):
+    """(c) the Microsoft callback's two store calls."""
+    store = local_store.AuthStore()
+    store.ensure_user(addr)
+    store.mark_sso_login(addr, "microsoft")
+
+
+@pytest.mark.parametrize("path", ["share", "invite", "sso"])
+@pytest.mark.parametrize("shape", ["sso_only", "pre_9b_password"])
+def test_a_gen_empty_session_of_a_removed_legacy_account_never_revives(
+        world, monkeypatch, shape, path):
+    """A legacy account (auth.json without the key)
+    reads generation "", so its cookie carries `gen: ""`. It is removed and
+    makes NO request until the address is created again through one of the
+    three creation paths. Before Task 14b the new account was profile-only
+    and read "" too, so the old cookie matched again and `/auth/password`
+    set a first password with no current-password check. Now every creation
+    writes a fresh generation: the old cookie is signed out (401), the
+    password change is refused and writes no hash, and — the positive
+    control — a cookie built from the NEW generation is alive, proving the
+    refusal is the generation gate and not a broken account."""
+    tmp = world["tmp"]
+    addr = _build_legacy(tmp, shape)
+    store = local_store.AuthStore()
+    assert store.session_generation(addr) == "", "the legacy shape must read the empty generation"
+    old = _cookie_session(addr)
+    assert _alive(old), "the legacy session did not hold before the removal"
+
+    assert _remove(_admin(), addr).status_code == 200
+    assert not (tmp / "users" / addr).exists()
+    # No request from `old` here — that is the whole point.
+
+    if path == "share":
+        _recreate_by_share(addr, monkeypatch)
+    elif path == "invite":
+        _recreate_by_invite(addr)
+    else:
+        _recreate_by_sso(addr)
+    assert store.user_exists(addr), "the re-creation path did not create the account"
+
+    assert not _alive(old), \
+        "the removed account's gen-\"\" session revived on the re-created address"
+    r = old.post("/auth/password", json={"current_password": "",
+                                        "new_password": HIJACK_PW})
+    if path == "sso":
+        # SSO-only: refused either way (the SSO refusal or the gate's 401).
+        assert r.status_code != 200, (r.status_code, r.text[:300])
+    else:
+        assert r.status_code == 401, (r.status_code, r.text[:300])
+    assert not store.get_auth(addr).get("password_hash"), \
+        "the revived session set a first password on the re-created account"
+
+    gen = store.session_generation(addr)
+    assert gen != "" and gen != _sentinel(), repr(gen)
+    assert _HEX16.fullmatch(gen), repr(gen)
+    fresh = _cookie_session(addr)
+    assert _alive(fresh), "a session built from the account's NEW generation must be alive"
+
+
+# ===========================================================================
+# Task 14b item 2 — removal strips the address from every grant it holds
+# elsewhere (D14b-3, D14-4 reversed)
+# ===========================================================================
+def _lower(values):
+    return [str(v or "").strip().lower() for v in values]
+
+
+def test_remove_strips_the_address_from_other_owners_share_lists(world, estate):
+    ds = local_store.DashboardStore()
+    assert OWNER in _lower(local_store.ChatDataStore(CHAT_OTHER).read_meta()
+                           ["sharing"]["shared_with"])
+    assert OWNER in _lower(ds.get_dashboard(OTHER, estate["other_dash_id"])
+                           ["sharing"]["shared_with"])
+    assert _remove(_admin(), OWNER).status_code == 200
+    shared = local_store.ChatDataStore(CHAT_OTHER).read_meta()["sharing"]["shared_with"]
+    assert OWNER not in _lower(shared), \
+        f"the removed address stayed in another owner's chat share list: {shared}"
+    doc = ds.get_dashboard(OTHER, estate["other_dash_id"])
+    assert doc is not None, "OTHER's dashboard vanished"
+    dash_shared = (doc.get("sharing") or {}).get("shared_with") or []
+    assert OWNER not in _lower(dash_shared), \
+        f"the removed address stayed in another owner's dashboard share list: {dash_shared}"
+    assert local_store.get_chat_meta_owner(CHAT_OTHER) == OTHER
+
+
+def test_remove_releases_the_registrations_of_the_address(world, estate):
+    tids = estate["tids"]
+    store = db_sources.DataSourceStore()
+    assert store.get_table(tids["owner_plain"]).get("registered_by") == OWNER_MIXED
+    assert _remove(_admin(), OWNER).status_code == 200
+    for name in ("owner_plain", "owner_connector"):
+        t = store.get_table(tids[name])
+        assert t is not None, f"{name} vanished from the registry"
+        assert "registered_by" not in t, \
+            f"{name} still carries registered_by={t.get('registered_by')!r}"
+        assert t.get("descriptions_confirmed_by") == ADMIN, \
+            f"{name} lost its confirmation: {t}"
+        assert t.get("display_name"), t
+    rcpt = store.get_table(tids["rcpt_plain"])
+    assert rcpt.get("registered_by") == RCPT, "another user's registration was released"
+
+
+def test_remove_answers_and_audits_the_strip_counts(world, estate):
+    r = _remove(_admin(), OWNER)
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    body = r.json()
+    assert body.get("ok") is True and body.get("chats_deleted") == 2, body
+    assert body.get("chats_unshared") == 1, body
+    assert body.get("dashboards_unshared") == 1, body
+    assert body.get("registrations_released") == 2, body
+    rows = [x for x in _audit("user.removed") if x.get("target") == OWNER]
+    assert rows, db_sources.read_audit_tail(20)
+    detail = rows[0].get("detail") or {}
+    assert detail.get("chats_deleted") == 2, detail
+    assert detail.get("chats_unshared") == 1, detail
+    assert detail.get("dashboards_unshared") == 1, detail
+    assert detail.get("registrations_released") == 2, detail
+    released = _audit("table.registered_by_released")
+    assert released, "no table.registered_by_released audit row"
+    assert (released[0].get("detail") or {}).get("count") == 2, released[0]
+    assert released[0].get("actor") == ADMIN, released[0]
+
+
+def test_a_re_created_address_inherits_nothing_and_can_be_shared_to_again(world, estate):
+    """After the strips a fresh placeholder for the same address holds no
+    grant: the other owner's chat answers 403, no registry table is readable
+    through the ownership read, the other owner's dashboard does not
+    resolve — and re-sharing WORKS (the stale entries used to make it a
+    silent no-op)."""
+    tids = estate["tids"]
+    other_id = estate["other_dash_id"]
+    assert _remove(_admin(), OWNER).status_code == 200
+    store = local_store.AuthStore()
+    assert store.ensure_invited_user(OWNER, ADMIN) is True
+    r = _cookie_session(OWNER).get(f"/api/chat/{CHAT_OTHER}/schema")
+    assert r.status_code == 403, (r.status_code, r.text[:300])
+    allowed = roles_store.allowed_table_ids_for(OWNER)
+    assert not (allowed & set(tids.values())), \
+        f"the re-created address still reads a released registration: {allowed}"
+    ds = local_store.DashboardStore()
+    assert ds.resolve_dashboard(OWNER, other_id) == (None, False)
+    assert ds.add_dashboard_share(OTHER, other_id, [OWNER]) == [OWNER], \
+        "re-sharing the dashboard was a silent no-op (stale shared_with entry)"
+    assert local_store.ChatDataStore(CHAT_OTHER).add_share_recipients([OWNER]) == [OWNER], \
+        "re-sharing the chat was a silent no-op (stale shared_with entry)"
+    assert _cookie_session(OWNER).get(f"/api/chat/{CHAT_OTHER}/schema").status_code == 200
+
+
+# --- purge_address_grants, unit level ---------------------------------------
+def _purge(email):
+    fn = getattr(local_store, "purge_address_grants", None)
+    if fn is None:
+        pytest.fail("local_store.purge_address_grants is missing (Task 14b item 2)")
+    return fn(email)
+
+
+def test_purge_leaves_an_unreadable_meta_byte_identical_and_still_counts(world):
+    """A corrupt meta.json is skipped as it is — never replaced by an empty
+    one (the `read_meta` fallback shape) — and the purge goes on with the
+    other chats, answering the counts without raising."""
+    tmp = world["tmp"]
+    garbage = b"\xff\xfe{ not json at all"
+    d = tmp / "chatdata" / "c_garbage0001"
+    d.mkdir(parents=True)
+    (d / "meta.json").write_bytes(garbage)
+    _chat("c_purgeok0001", OTHER, shared_with=[OWNER])
+    out = _purge(OWNER)
+    assert (d / "meta.json").read_bytes() == garbage, "the unreadable meta.json was rewritten"
+    assert isinstance(out, dict), out
+    assert out.get("chats_unshared") == 1, out
+    assert out.get("dashboards_unshared") == 0, out
+    assert OWNER not in _lower(local_store.ChatDataStore("c_purgeok0001").read_meta()
+                               ["sharing"]["shared_with"])
+
+
+def test_purge_keeps_the_other_recipients_with_their_casing_and_order(world):
+    """Only the target address goes (matched `strip().lower()`, so a mixed-
+    case duplicate goes too); every other entry keeps its casing and its
+    position."""
+    store = _chat("c_purgemix0001", OTHER)
+    meta = store.read_meta()
+    meta["sharing"] = {"shared_with": ["Zed.Last@corp.example", OWNER, RCPT,
+                                       "Life.OWNER@corp.example"]}
+    store.write_meta(meta)
+    out = _purge(OWNER)
+    assert out.get("chats_unshared") == 1, out
+    assert store.read_meta()["sharing"]["shared_with"] == ["Zed.Last@corp.example", RCPT]
+    assert local_store.get_chat_meta_owner("c_purgemix0001") == OTHER
+
+
+def test_purge_of_an_address_that_holds_nothing_changes_nothing(world, estate):
+    before = local_store.ChatDataStore(CHAT_OTHER).meta_path.read_bytes()
+    out = _purge(GHOST)
+    assert isinstance(out, dict), out
+    assert out.get("chats_unshared") == 0 and out.get("dashboards_unshared") == 0, out
+    assert local_store.ChatDataStore(CHAT_OTHER).meta_path.read_bytes() == before
+    assert not (world["tmp"] / "users" / GHOST).exists(), "the purge created the address's folder"
+
+
+def test_a_failing_strip_step_still_answers_200_and_audits_the_removal(
+        world, estate, monkeypatch):
+    """Once the account folder is gone the removal has happened: a strip step
+    that raises is logged and counts 0, and the route still answers 200 and
+    writes the `user.removed` audit row with the counts achieved."""
+    import routes.admin_users as admin_users
+
+    def _boom(email):
+        raise RuntimeError("purge failed")
+    monkeypatch.setattr(admin_users, "purge_address_grants", _boom)
+    r = _remove(_admin(), OWNER)
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    body = r.json()
+    assert body.get("ok") is True, body
+    assert body.get("chats_deleted") == 2, body
+    assert body.get("chats_unshared") == 0 and body.get("dashboards_unshared") == 0, body
+    assert body.get("registrations_released") == 2, body
+    assert not local_store.AuthStore().user_exists(OWNER)
+    rows = [x for x in _audit("user.removed") if x.get("target") == OWNER]
+    assert rows, db_sources.read_audit_tail(20)
+    detail = rows[0].get("detail") or {}
+    assert detail.get("chats_unshared") == 0 and detail.get("dashboards_unshared") == 0, detail
+    assert detail.get("chats_deleted") == 2 and detail.get("registrations_released") == 2, detail

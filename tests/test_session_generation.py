@@ -4,9 +4,12 @@ The contract pinned here:
 
 * `auth.json` carries `session_generation` (a string). Both password writers
   replace it: `AuthStore.set_password(...)` RETURNS the new value and
-  `AuthStore.consume_reset_token(...)` writes a new one too.
+  `AuthStore.consume_reset_token(...)` writes a new one too. Since Task 14b
+  (D14b-1) every NEW account gets one at creation (`AuthStore.create_account`,
+  behind `ensure_user` / `ensure_invited_user`).
   `AuthStore().session_generation(email) -> str` answers the stored value,
-  "" when the account has none (or has no auth.json at all).
+  "" for an EXISTING account that has none (a profile-only account or a
+  key-less auth.json written before generations existed — the upgrade rule).
 * Every sign-in stores the account's current value in the session as `gen`;
   sign-out pops `gen` (and `iat`).
 * `app.SessionGenerationGate` (pure ASGI, registered INSIDE the session
@@ -156,7 +159,13 @@ def test_an_account_without_a_generation_answers_empty(world):
     sentinel = getattr(local_store, "SESSION_GEN_REMOVED", None)
     assert isinstance(sentinel, str) and sentinel, "local_store.SESSION_GEN_REMOVED missing"
     assert _generation("never.seen@corp.example") == sentinel
-    local_store.AuthStore().ensure_user("profile.only@corp.example")
+    # Task 14b: the profile-only account is written BY HAND — that is the
+    # upgrade shape this pin is about; `ensure_user` now creates an auth.json
+    # with a generation, so it can no longer produce it. Intent unchanged.
+    d = world["tmp"] / "users" / "profile.only@corp.example"
+    d.mkdir(parents=True)
+    (d / "profile.json").write_text(json.dumps({"email": "profile.only@corp.example"}),
+                                    encoding="utf-8")
     assert _generation("profile.only@corp.example") == ""
 
 

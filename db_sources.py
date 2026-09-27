@@ -892,6 +892,43 @@ class DataSourceStore:
               actor_kind=actor_kind)
         return True
 
+    def release_registrations(self, email: str, *, actor: str) -> int:
+        """Remove `registered_by` from every table the address registered
+        (compared lower-cased; connectors included), so an address created
+        again inherits neither the ownership read on those tables nor the
+        registrant's right to delete them. Absent `registered_by` is the
+        "registered by an administrator" shape every reader already handles.
+        Field-level (the set_table_schedule idiom): the doc is written only
+        when something changed, `descriptions_confirmed_by` and every other
+        attribution field are left alone. One `table.registered_by_released`
+        audit row {count, table_ids} when count > 0. Returns the count;
+        never raises (Article IV)."""
+        target = str(email or "").strip().lower()
+        if not target:
+            return 0
+        released: list = []
+        try:
+            with _LOCK:
+                doc = self.read_doc()
+                for t in doc["tables"]:
+                    if str(t.get("registered_by") or "").strip().lower() == target:
+                        t.pop("registered_by", None)
+                        released.append(t.get("id"))
+                if released:
+                    self._write_doc(doc)
+        except Exception as e:
+            from exec_transport import log_safe_text
+            log_with_sid("db_sources", "error",
+                         f"DB_RELEASE_REGISTRATIONS_FAILED "
+                         f"error={log_safe_text(type(e).__name__, 80)}")
+            return 0
+        if released:
+            audit(actor, "table.registered_by_released", target=target,
+                  detail={"count": len(released), "table_ids": released})
+            log_with_sid("db_sources", "info",
+                         f"DB_REGISTRATIONS_RELEASED count={len(released)}")
+        return len(released)
+
     def mark_live_profiled(self, tid: str, *, row_count: Optional[int],
                            columns: Optional[list], profiled_at: str,
                            sample_rows: int) -> None:

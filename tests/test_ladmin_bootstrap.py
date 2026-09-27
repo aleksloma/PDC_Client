@@ -61,7 +61,12 @@ def test_bootstrap_skipped_without_password(monkeypatch):
     store = local_store.AuthStore()
     store.ensure_local_admin()
     assert store.get_role("ladmin") == "admin"     # role still assigned
-    assert not store.get_auth("ladmin")            # but no credential invented
+    # ...but no credential invented. Task 14b (D14b-2): the account's
+    # auth.json may now exist (it carries the session generation written at
+    # creation — a generation is not a credential), so the pin is "no
+    # password hash, no temp hash" rather than "no auth record at all".
+    auth = store.get_auth("ladmin")
+    assert not auth.get("password_hash") and not auth.get("temp_password_hash"), auth
 
 
 def test_legacy_profile_defaults_to_user_role(tmp_path):
