@@ -31,11 +31,17 @@ steps:
       - -f
       - Dockerfile
       - .
+  # The sandbox Dockerfile's HEALTHCHECK uses --start-interval, which the
+  # legacy builder of Cloud Build's Docker daemon rejects ("Unknown flag").
+  # BuildKit with a current Dockerfile frontend, chosen by the BUILDKIT_SYNTAX
+  # build argument, parses it without touching the Dockerfile itself.
   - id: executor
     name: gcr.io/cloud-builders/docker
     waitFor: ["-"]
+    env: ["DOCKER_BUILDKIT=1"]
     args:
       - build
+      - --build-arg=BUILDKIT_SYNTAX=docker/dockerfile:1
       - --build-arg=BUILD_COMMIT=${_GIT_SHA}
       - --build-arg=BUILD_TIME=${_BUILD_TIME}
       - -t
