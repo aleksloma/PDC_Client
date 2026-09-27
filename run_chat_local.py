@@ -88,6 +88,8 @@ def _infrastructure_answer(sid, error_text) -> Optional[str]:
 _LIVE_ROLE_DENIED_TEXT = ("You no longer have access to {table}; ask your "
                           "administrator.")
 _LIVE_FAILED_PREFIX = "Live query for table '{table}' failed: {sentence}"
+# The same, when the pre-fetch failed before any table was known.
+_LIVE_FAILED_NO_TABLE = "Live query failed: {sentence}"
 # The answer of a turn whose attempts all ended on the live fetch: the table
 # and the value-free class sentence (never a driver's text), instead of the
 # generic line that blames the question.
@@ -146,12 +148,18 @@ def _retry_sql(state: dict) -> dict | None:
 def _retry_sql_error(state: dict) -> dict | None:
     """The retry payload's `sql_error`: the last fetch failure, else the
     refusal of the most recent SELECT ignored on a filtered table, else None
-    (a Python error on a default read is not a query error)."""
+    (a Python error on a default read is not a query error).
+
+    The refusal is CONSUMED by the retry that reports it: a later retry
+    caused by a Python error must not tell the planner to fix SQL again. A
+    planner that resends the ignored SELECT records it anew in
+    `_ensure_live`, so it rides exactly the next retry."""
     if state.get("sql_error"):
         return state["sql_error"]
     ignored = state.get("ignored_sql") or {}
     if ignored:
-        return list(ignored.values())[-1]
+        key = list(ignored)[-1]
+        return ignored.pop(key)
     return None
 
 
@@ -189,8 +197,11 @@ def _live_failure_out(state: dict) -> dict:
         return {"error": _LIVE_ROLE_DENIED_TEXT.format(table=state["role_denied"]),
                 "result": None, "preview": None, "image_base64": None,
                 "live_failed": True, "live_role_denied": True}
-    return {"error": _LIVE_FAILED_PREFIX.format(table=state.get("failed_key"),
-                                                sentence=state.get("failed_text")),
+    key = state.get("failed_key")
+    sentence = state.get("failed_text")
+    error = (_LIVE_FAILED_PREFIX.format(table=key, sentence=sentence) if key
+             else _LIVE_FAILED_NO_TABLE.format(sentence=sentence))
+    return {"error": error,
             "result": None, "preview": None, "image_base64": None,
             "live_failed": True}
 
@@ -293,7 +304,11 @@ def _ensure_live(sid, dfs: dict, schema_docs, code: str, state: dict,
     re-run and never replaced by a default read until the planner sends a
     new one. Logs carry the key, counts and the error CLASS — never the SQL
     text, never a driver message."""
+    current_key = None
     try:
+        # A failure below names only the table THIS call was working on, so a
+        # crash before any table is known never reports an earlier one.
+        state["failed_key"] = None
         specs = _live_specs(schema_docs, dfs)
         if not specs:
             return True
@@ -329,7 +344,6 @@ def _ensure_live(sid, dfs: dict, schema_docs, code: str, state: dict,
                 log_with_sid(sid, "warning",
                              f"LIVE_ROLE_DENIED table={log_safe_text(str(key), 120)}")
                 return False
-        current_key = None
         for key in referenced:
             current_key = key
             spec = specs[key]
@@ -342,6 +356,13 @@ def _ensure_live(sid, dfs: dict, schema_docs, code: str, state: dict,
                     key, spec.get("dialect") or "", "guard", guard=True,
                     message=_FILTERED_SQL_MESSAGE)
                 sql = None
+            if spec["filtered"] and key in state["live_rows"]:
+                # A filtered table is only ever read by the default read, and
+                # this turn already holds that frame (a resent SELECT dropped
+                # the key from `fetched`): the same read again would return
+                # the same rows, so nothing is fetched twice.
+                state["fetched"].add(key)
+                continue
             if sql and state["failed_sql"].get(key) == sql:
                 # The same SELECT failed on an earlier attempt of this turn
                 # and the planner sent no new one: a failed attempt, never a
@@ -414,13 +435,15 @@ def _ensure_live(sid, dfs: dict, schema_docs, code: str, state: dict,
     except Exception as e:                                   # noqa: BLE001
         # Raised about registry rows and frames, so the text could quote a
         # label: the exception TYPE and a fixed reason only.
-        key = locals().get("current_key")
+        key = current_key
         log_with_sid(sid, "error",
-                     f"LIVE_PREFETCH_CRASHED table={log_safe_text(str(key or '?'), 120)} "
+                     f"LIVE_PREFETCH_CRASHED table={log_safe_text(str(key or '-'), 120)} "
                      f"error={log_safe_text(type(e).__name__, 80)} "
                      f"reason=prefetch_helper_failed")
         state["sql_error"] = None
-        state["failed_key"] = key or state.get("failed_key") or "?"
+        # None when no table was reached yet: the failure texts are then
+        # key-less (`_live_failure_out`) or the caller's generic one.
+        state["failed_key"] = key or None
         state["failed_text"] = "The database could not run the query."
         return False
 

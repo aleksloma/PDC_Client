@@ -28,6 +28,8 @@ Design (docs/ENTERPRISE_ARCHITECTURE.md — roles & permissions):
   - Sign-in is invitation-only: `POST /users/invite` creates a password-less
     placeholder and mails it a reset link (besides a share placeholder and
     Microsoft SSO, the only way an account comes to exist).
+  - `POST /users/end_sessions` signs an account out everywhere;
+    `POST /users/remove` deletes it with the chats it owns.
 """
 from __future__ import annotations
 
@@ -40,7 +42,8 @@ from fastapi.responses import JSONResponse
 import brain_client
 import db_sources
 import roles_store
-from local_store import AuthStore
+from exec_transport import log_safe_text
+from local_store import AuthStore, delete_chats_owned_by
 from logger_utils import log_with_sid
 from routes.admin_data import _require_admin, _json_body
 from settings import settings
@@ -290,6 +293,110 @@ async def set_user_permission(request: Request):
         "created_at": prof.get("created_at"),
         "last_login_at": prof.get("last_login_at"),
     }, roles_by_id)}
+
+
+@router.post("/users/end_sessions")
+async def end_user_sessions(request: Request):
+    """End every session of an account: body {email}. Writes a fresh
+    session generation (`AuthStore.bump_session_generation`), so the
+    session-generation gate empties each of that account's sessions on its
+    next request; the password (or the SSO-only state) is untouched and the
+    user can sign in again. 400 for the bootstrap local admin, 404 for an
+    unknown address. The caller's own account is allowed (it signs itself
+    out everywhere). Audited `user.sessions_ended`."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    from routes.auth import _EMAIL_RE
+    body = await _json_body(request)
+    target = str(body.get("email") or "").strip().lower()
+    if not target:
+        return JSONResponse({"error": "email is required."}, status_code=400)
+    auth = AuthStore()
+    if auth.is_bootstrap_admin(target):
+        return JSONResponse(
+            {"error": "The local admin account's sessions cannot be ended here."},
+            status_code=400)
+    if not _EMAIL_RE.fullmatch(target):
+        # Checked after the bootstrap refusal (its username is not an
+        # address) and before any lookup: the store folds `/` and `\` in a
+        # folder name, so an unvalidated string could reach another account.
+        return JSONResponse({"error": "Enter a valid email address."}, status_code=400)
+    if not auth.user_exists(target):
+        return JSONResponse({"error": "Unknown user."}, status_code=404)
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None, auth.bump_session_generation, target)
+    except Exception as e:
+        log_with_sid(email, "error",
+                     f"ADMIN_USER_END_SESSIONS_FAILED user={log_safe_text(target, 254)} "
+                     f"error={log_safe_text(type(e).__name__, 80)}")
+        return JSONResponse({"error": "Could not end the user's sessions."},
+                            status_code=500)
+    db_sources.audit(email, "user.sessions_ended", target=target,
+                     ip=(request.client.host if request.client else None))
+    log_with_sid(email, "info", f"ADMIN_USER_SESSIONS_ENDED user={log_safe_text(target, 254)}")
+    return {"ok": True}
+
+
+def _remove_account(target: str) -> tuple[bool, int]:
+    """The account folder first — it holds the sessions' generation and the
+    records a live session could otherwise write back into — then every chat
+    the account owns. Blocking."""
+    if not AuthStore().remove_user(target):
+        return False, 0
+    return True, delete_chats_owned_by(target)
+
+
+@router.post("/users/remove")
+async def remove_user(request: Request):
+    """Remove an account: body {email}. Deletes `users/{email}/` (profile,
+    credentials, sidebar indexes, dashboards — the shares it received go
+    with the index) and every chat whose owner it is, deactivated ones
+    included; recipients of its chats and dashboards then meet the existing
+    owner-vanished paths. Every session of the account ends on its next
+    request (`SESSION_GEN_REMOVED`). The address stays in other owners'
+    share lists, inert until it is invited again. 400 for the bootstrap
+    local admin and for the caller's own account, 404 for an unknown
+    address. Answers {ok: true, chats_deleted}; audited `user.removed`."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    from routes.auth import _EMAIL_RE
+    body = await _json_body(request)
+    target = str(body.get("email") or "").strip().lower()
+    if not target:
+        return JSONResponse({"error": "email is required."}, status_code=400)
+    auth = AuthStore()
+    if auth.is_bootstrap_admin(target):
+        return JSONResponse({"error": "The local admin account cannot be removed."},
+                            status_code=400)
+    if not _EMAIL_RE.fullmatch(target):
+        # Checked after the bootstrap refusal (its username is not an
+        # address) and before any lookup: the store folds `/` and `\` in a
+        # folder name, so an unvalidated string could reach another account.
+        return JSONResponse({"error": "Enter a valid email address."}, status_code=400)
+    if target == email:
+        return JSONResponse({"error": "You cannot remove your own account."},
+                            status_code=400)
+    if not auth.user_exists(target):
+        return JSONResponse({"error": "Unknown user."}, status_code=404)
+    try:
+        removed, chats_deleted = await asyncio.get_running_loop().run_in_executor(
+            None, _remove_account, target)
+    except Exception as e:
+        log_with_sid(email, "error",
+                     f"ADMIN_USER_REMOVE_FAILED user={log_safe_text(target, 254)} "
+                     f"error={log_safe_text(type(e).__name__, 80)}")
+        removed, chats_deleted = False, 0
+    if not removed:
+        return JSONResponse({"error": "Could not remove the user."}, status_code=500)
+    db_sources.audit(email, "user.removed", target=target,
+                     detail={"chats_deleted": chats_deleted},
+                     ip=(request.client.host if request.client else None))
+    log_with_sid(email, "info",
+                 f"ADMIN_USER_REMOVED user={log_safe_text(target, 254)} chats_deleted={chats_deleted}")
+    return {"ok": True, "chats_deleted": chats_deleted}
 
 
 NO_BASE_URL_MAIL_ERROR = "PUBLIC_BASE_URL is not set, so no invitation link can be mailed."

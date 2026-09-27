@@ -60,6 +60,13 @@ _RESET_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 # another process is seen only after a restart.
 _SESSION_GEN_CACHE: dict = {}
 
+# What `AuthStore.session_generation` answers for an address with NEITHER
+# profile.json NOR auth.json (never seen, or removed by an administrator).
+# Not hex, so it never equals a real generation, and not "", so the session
+# of a removed account that never had a generation (SSO-only, legacy) ends
+# too. Never cached: an account created afterwards reads its real value.
+SESSION_GEN_REMOVED = "-"
+
 
 def _session_gen_key(email: str) -> str:
     """The `_SESSION_GEN_CACHE` key — the same one at the reader and both
@@ -1203,12 +1210,68 @@ class AuthStore:
         log_with_sid(email, "info", "USER_PASSWORD_SET")
         return generation
 
+    def bump_session_generation(self, email: str) -> str:
+        """Write a fresh `session_generation` without touching anything else
+        on the record, so every session of the account ends on its next
+        request (the administrator's "End sessions"). Works for an account
+        without a password too (SSO-only, legacy): its auth.json then holds
+        the generation, and it stays what it was. Returns the new value.
+        Raises when an existing record cannot be read — it is never replaced
+        by one holding only the generation."""
+        with _LOCK:
+            p = self._auth_path(email)
+            auth: dict = {}
+            if p.exists():
+                auth = json.loads(p.read_text(encoding="utf-8"))
+                if not isinstance(auth, dict):
+                    raise ValueError("auth record is not an object")
+            generation = secrets.token_hex(8)
+            auth["session_generation"] = generation
+            self._write_auth(email, auth)
+            _SESSION_GEN_CACHE[_session_gen_key(email)] = generation
+        log_with_sid(email, "info", "USER_SESSIONS_ENDED")
+        return generation
+
+    def remove_user(self, email: str) -> bool:
+        """Delete the account folder `users/{email}/` (profile, auth record,
+        sidebar indexes, dashboards). Under `_LOCK`: the outstanding reset
+        link's hash is read, the folder removed, THEN the session-generation
+        cache entry and the reset-index entries are dropped — dropped, never
+        set, so the next read comes from disk (SESSION_GEN_REMOVED while the
+        folder is absent, the real value once an account is created again).
+        True when the folder is gone; never raises (Article IV)."""
+        safe = _safe_email(email)
+        udir = _data_root() / "users" / safe
+        ok = True
+        with _LOCK:
+            rec = _read_auth_for_scan(udir) or {}
+            token_hash = rec.get("reset_token_hash")
+            try:
+                if udir.exists():
+                    shutil.rmtree(udir)
+            except Exception as e:
+                ok = False
+                from exec_transport import log_safe_text
+                log_with_sid("auth", "error",
+                             f"USER_REMOVE_FAILED error={log_safe_text(type(e).__name__, 80)}")
+            _SESSION_GEN_CACHE.pop(_session_gen_key(email), None)
+            if token_hash:
+                _RESET_TOKEN_INDEX.pop(token_hash, None)
+            for h in [h for h, who in _RESET_TOKEN_INDEX.items() if who == safe]:
+                _RESET_TOKEN_INDEX.pop(h, None)
+        if ok:
+            log_with_sid(email, "info", "USER_REMOVED")
+        return ok and not udir.exists()
+
     def session_generation(self, email: str) -> str:
         """The account's current session generation, "" when it has none
-        (no auth.json, or one written before generations existed). Cached per
-        account; the two password writers update the cache. An unreadable
-        record answers "" uncached (Article IV) — such an account cannot sign
-        in anyway — and is logged once per path (the scan latch)."""
+        (a profile without auth.json, or a record written before generations
+        existed), `SESSION_GEN_REMOVED` — uncached — when neither profile.json
+        nor auth.json exists (never seen, or removed). Cached per account;
+        the writers update the cache and `remove_user` drops it. An
+        unreadable record answers "" uncached (Article IV) — such an account
+        cannot sign in anyway — and is logged once per path (the scan
+        latch)."""
         key = _session_gen_key(email)
         cached = _SESSION_GEN_CACHE.get(key)
         if cached is not None:
@@ -1219,6 +1282,8 @@ class AuthStore:
                 return cached
             p = self._auth_path(email)          # built only on a miss
             if not p.exists():
+                if not (p.parent / "profile.json").exists():
+                    return SESSION_GEN_REMOVED
                 _SESSION_GEN_CACHE[key] = ""
                 return ""
             try:
@@ -2270,6 +2335,42 @@ def chat_exists(chat_id: str) -> bool:
     return (_data_root() / "chatdata" / chat_id / "meta.json").exists()
 
 
+def delete_chats_owned_by(email: str) -> int:
+    """Delete every `chatdata/{chat_id}/` whose meta owner is `email` — a
+    full scan of the chat metas, so a deactivated chat (no sidebar row) goes
+    too. Best effort per chat: a failure is logged (the exception TYPE only)
+    and the scan goes on. Returns the number of chats deleted; never raises
+    (Article IV). Recipients of those chats then meet the existing
+    owner-vanished paths (chat routes 404, dashboard tiles `source_deleted`)."""
+    target = str(email or "").strip().lower()
+    if not target:
+        return 0
+    from exec_transport import log_safe_text
+    deleted = 0
+    try:
+        root = _data_root() / "chatdata"
+        metas = sorted(root.glob("*/meta.json")) if root.is_dir() else []
+    except Exception as e:
+        log_with_sid("auth", "error",
+                     f"CHAT_OWNER_SCAN_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return 0
+    for meta_path in metas:
+        chat_dir = meta_path.parent
+        try:
+            owner = get_chat_meta_owner(chat_dir.name)
+            if str(owner or "").strip().lower() != target:
+                continue
+            shutil.rmtree(chat_dir)
+            deleted += 1
+        except Exception as e:
+            log_with_sid("auth", "warning",
+                         f"CHAT_DELETE_FAILED chat={log_safe_text(chat_dir.name, 80)} "
+                         f"error={log_safe_text(type(e).__name__, 80)}")
+    if deleted:
+        log_with_sid("auth", "info", f"USER_CHATS_DELETED count={deleted}")
+    return deleted
+
+
 # ---------------------------------------------------------------------------
 # DashboardStore — per-user dashboards (pinned charts/tables + grid layout)
 # ---------------------------------------------------------------------------
@@ -2314,9 +2415,16 @@ class DashboardStore:
         return bool(isinstance(value, str) and _DASH_ID_RE.match(value))
 
     def _dir(self, email: str) -> Path:
-        d = _data_root() / "users" / _safe_email(email) / "dashboards"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        # A path only — never created here. Reads (a recipient's listing
+        # checking an owner's doc, a resolve) must not re-create the folder
+        # of an account an administrator removed; every writer creates the
+        # parent itself (`_write_json`).
+        return _data_root() / "users" / _safe_email(email) / "dashboards"
+
+    @staticmethod
+    def _write_json(path: Path, payload) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(path, payload)
 
     def _index_path(self, email: str) -> Path:
         return self._dir(email) / "index.json"
@@ -2337,7 +2445,7 @@ class DashboardStore:
             return []
 
     def _write_index(self, email: str, rows: list[dict]) -> None:
-        _write_json_atomic(self._index_path(email), rows)
+        self._write_json(self._index_path(email), rows)
 
     # ---- docs --------------------------------------------------------------
     def _read_doc(self, owner_email: str, dash_id: str) -> Optional[dict]:
@@ -2355,7 +2463,7 @@ class DashboardStore:
 
     def _write_doc(self, owner_email: str, doc: dict) -> None:
         doc["updated_at"] = _now()
-        _write_json_atomic(self._doc_path(owner_email, doc["dash_id"]), doc)
+        self._write_json(self._doc_path(owner_email, doc["dash_id"]), doc)
 
     # ---- public API --------------------------------------------------------
     def list_dashboards(self, email: str) -> list[dict]:
@@ -2397,7 +2505,7 @@ class DashboardStore:
         row = {"dash_id": dash_id, "name": name, "created_at": now,
                "last_used_at": now, "tile_count": 0}
         with _LOCK:
-            _write_json_atomic(self._doc_path(email, dash_id), doc)
+            self._write_json(self._doc_path(email, dash_id), doc)
             rows = self._read_index(email)
             rows.append(row)
             self._write_index(email, rows)
@@ -2686,10 +2794,9 @@ class DashboardStore:
                 sharing["shared_with"] = remaining
                 doc["sharing"] = sharing
                 self._write_doc(owner_email, doc)
-            # Look for the recipient's index WITHOUT `_dir()`, which creates
-            # the folder: an address that was never shared must leave no
-            # trace under users/.
-            idx = _data_root() / "users" / rcpt / "dashboards" / "index.json"
+            # Only an existing index is rewritten: an address that was never
+            # shared must leave no trace under users/.
+            idx = self._index_path(rcpt)
             if rcpt and idx.is_file():
                 try:
                     rows = self._read_index(rcpt)

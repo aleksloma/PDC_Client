@@ -52,7 +52,9 @@ def test_frontend_branch_is_gated_on_server_flag(js_name):
     for marker in ("LARGE_UPLOAD_THRESHOLD_BYTES", "_directUploadFile", "/upload/init", "/upload/finalize"):
         assert marker in src, f"{js_name} lost {marker!r}"
     # The multipart path is still there for the flag-off (customer) case.
-    assert "fetch('/upload', { method: 'POST', body: formData })" in src
+    # dashboard.js routes every request through the shared 401 helper.
+    call = "pdcFetch" if js_name == "dashboard.js" else "fetch"
+    assert f"{call}('/upload', {{ method: 'POST', body: formData }})" in src
 
 
 def test_template_emits_server_flag():

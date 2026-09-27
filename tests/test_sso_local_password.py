@@ -297,3 +297,194 @@ def test_the_invite_of_a_local_account_that_also_uses_microsoft_is_unchanged(wor
     r = world["client"](ADMIN).post("/api/admin/users/invite", json={"email": MIXED})
     assert r.status_code == 409, (r.status_code, r.text[:300])
     assert r.json().get("code") == "USER_EXISTS", r.json()
+
+
+# ===========================================================================
+# Task 14 item 6 — while SSO is ENABLED, an account whose record carries
+# `sso_provider` cannot use a local password (it would bypass Entra MFA);
+# the bootstrap local admin is exempt; disabling SSO restores the password
+# ===========================================================================
+LADMIN_PW = "Ladmin-passw0rd"
+LOCAL = "local.only@corp.example"
+LOCAL_PW = "Local-passw0rd"
+SSO_TENANT = "11111111-2222-3333-4444-555555555555"
+
+
+def _sso_on():
+    import sso_store
+    sso_store.save({"tenant_id": SSO_TENANT, "client_id": "app-client-id",
+                    "client_secret": "s3cret-sso", "public_base_url": "",
+                    "auto_redirect": False}, ADMIN)
+    sso_store.record_test_ok(ADMIN)
+    sso_store.set_enabled(True, ADMIN)
+    assert sso_store.is_enabled() is True
+
+
+def _sso_off():
+    import sso_store
+    sso_store.set_enabled(False, ADMIN)
+    assert sso_store.is_enabled() is False
+
+
+@pytest.fixture
+def quiet_login(world, monkeypatch):
+    monkeypatch.setattr(brain_client, "post_activity", lambda *a, **k: None)
+    return world
+
+
+def _login(world, email, password):
+    return world["client"]().post("/auth/login",
+                                  data={"email": email, "password": password},
+                                  follow_redirects=False)
+
+
+def _record_auth_logs(world, monkeypatch):
+    """Like `_record_logs`, but tolerant of a `sid=` keyword (the successful
+    sign-in line passes one)."""
+    lines = []
+
+    def rec(*args, **ctx):
+        lines.append(" ".join(str(a) for a in args) + f" {ctx}")
+
+    monkeypatch.setattr(world["auth_mod"], "log_with_sid", rec)
+    return lines
+
+
+def _count_hash_checks(monkeypatch):
+    import password_utils
+    calls = []
+    real = password_utils.check_password_hash
+
+    def counting(*a, **kw):
+        calls.append(1)
+        return real(*a, **kw)
+    monkeypatch.setattr(password_utils, "check_password_hash", counting)
+    return calls
+
+
+def test_a_dual_account_cannot_sign_in_locally_while_sso_is_enabled(
+        quiet_login, monkeypatch):
+    """MIXED has a local password AND `sso_provider`. With SSO enabled the
+    right password is refused with the ONE neutral sign-in failure page
+    (401, the same page a wrong password gets), after exactly one PBKDF2
+    verification; `SSO_ENFORCED_LOCAL_REFUSED` is logged."""
+    world = quiet_login
+    _sso_on()
+    lines = _record_auth_logs(world, monkeypatch)
+    checks = _count_hash_checks(monkeypatch)
+    r = _login(world, MIXED, MIXED_PW)
+    assert r.status_code == 401, (r.status_code, r.headers.get("location"), r.text[:300])
+    assert 'data-i18n="auth.signin_failed"' in r.text
+    assert TEXT not in r.text, "the sign-in page must not reveal the account type"
+    assert len(checks) == 1, f"{len(checks)} password verifications on the refused sign-in"
+    assert any("SSO_ENFORCED_LOCAL_REFUSED" in ln for ln in lines), lines
+    wrong = _login(world, OWNER, "Wrong-passw0rd")
+    assert wrong.status_code == 401
+    assert _normalise(r.text, MIXED) == _normalise(wrong.text, OWNER)
+
+
+def test_the_dual_account_signs_in_again_once_sso_is_disabled(quiet_login):
+    world = quiet_login
+    _sso_on()
+    assert _login(world, MIXED, MIXED_PW).status_code == 401
+    _sso_off()
+    r = _login(world, MIXED, MIXED_PW)
+    assert r.status_code == 302, (r.status_code, r.text[:300])
+    assert r.headers["location"] == "/lab"
+
+
+def test_a_password_only_account_is_unaffected_while_sso_is_enabled(quiet_login):
+    world = quiet_login
+    local_store.AuthStore().ensure_user(LOCAL)
+    local_store.AuthStore().set_password(LOCAL, LOCAL_PW)
+    _sso_on()
+    r = _login(world, LOCAL, LOCAL_PW)
+    assert r.status_code == 302, (r.status_code, r.text[:300])
+    assert r.headers["location"] == "/lab"
+
+
+def test_the_local_admin_signs_in_with_its_password_while_sso_is_enabled(quiet_login):
+    """The bootstrap local admin is exempt — even with an `sso_provider`
+    stamp on its record."""
+    world = quiet_login
+    store = local_store.AuthStore()
+    store.set_password(ADMIN, LADMIN_PW)
+    store.mark_sso_login(ADMIN, "microsoft")
+    _sso_on()
+    r = _login(world, ADMIN, LADMIN_PW)
+    assert r.status_code == 302, (r.status_code, r.text[:300])
+    assert r.headers["location"] == "/admin/data_sources"
+
+
+def test_a_reset_request_for_a_dual_account_mints_nothing_while_sso_is_enabled(
+        quiet_login, monkeypatch):
+    world = quiet_login
+    _sso_on()
+    lines = _record_auth_logs(world, monkeypatch)
+    dual = _request_reset(world, MIXED)
+    unknown = _request_reset(world, UNKNOWN)
+    assert (dual.status_code, unknown.status_code) == (200, 200)
+    assert NEUTRAL_RESET in dual.text
+    assert TEXT not in dual.text
+    assert _normalise(dual.text, MIXED) == _normalise(unknown.text, UNKNOWN)
+    assert not _read_auth(world["tmp"], MIXED).get("reset_token_hash")
+    assert world["sent"] == [], world["sent"]
+    assert any("RESET_REFUSED" in ln for ln in lines), lines
+
+
+def test_a_reset_request_for_a_dual_account_mints_again_once_sso_is_disabled(quiet_login):
+    world = quiet_login
+    _sso_on()
+    _request_reset(world, MIXED)
+    assert world["sent"] == []
+    _sso_off()
+    r = _request_reset(world, MIXED)
+    assert r.status_code == 200
+    assert [to for to, _ in world["sent"]] == [MIXED], world["sent"]
+
+
+def test_an_earlier_link_cannot_set_a_dual_accounts_password_while_sso_is_enabled(
+        quiet_login):
+    """A link minted while SSO was disabled, used after it was enabled: 403
+    with the Task 9b wording (D14-7), and the password is unchanged."""
+    world = quiet_login
+    token = local_store.AuthStore().create_reset_token(MIXED)
+    assert token
+    _sso_on()
+    r = world["client"]().post(f"/auth/reset/{token}",
+                               data={"new_password": NEW_PW, "confirm_password": NEW_PW},
+                               follow_redirects=False)
+    assert r.status_code == 403, (r.status_code, r.headers.get("location"), r.text[:300])
+    assert TEXT in r.text, r.text[:600]
+    store = local_store.AuthStore()
+    assert store.verify_password(MIXED, NEW_PW) is None
+    assert store.verify_password(MIXED, MIXED_PW) == "ok"
+
+
+def test_a_password_only_accounts_reset_is_unaffected_while_sso_is_enabled(quiet_login):
+    world = quiet_login
+    local_store.AuthStore().ensure_user(LOCAL)
+    local_store.AuthStore().set_password(LOCAL, LOCAL_PW)
+    _sso_on()
+    r = _request_reset(world, LOCAL)
+    assert r.status_code == 200
+    assert [to for to, _ in world["sent"]] == [LOCAL], world["sent"]
+    token = local_store.AuthStore().create_reset_token(LOCAL)
+    r = world["client"]().post(f"/auth/reset/{token}",
+                               data={"new_password": NEW_PW, "confirm_password": NEW_PW},
+                               follow_redirects=False)
+    assert r.status_code == 302, (r.status_code, r.text[:300])
+    assert local_store.AuthStore().verify_password(LOCAL, NEW_PW) == "ok"
+
+
+def test_an_sso_only_account_keeps_its_refusals_while_sso_is_enabled(quiet_login):
+    """Unchanged: an SSO-only account's reset link is still refused with the
+    same text when SSO is on."""
+    world = quiet_login
+    token = local_store.AuthStore().create_reset_token(SSO)
+    _sso_on()
+    r = world["client"]().post(f"/auth/reset/{token}",
+                               data={"new_password": NEW_PW, "confirm_password": NEW_PW},
+                               follow_redirects=False)
+    assert r.status_code == 403
+    assert TEXT in r.text

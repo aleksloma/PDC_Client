@@ -65,7 +65,7 @@ const LARGE_UPLOAD_THRESHOLD_BYTES = 25 * 1024 * 1024;
 // Returns the parsed /upload/finalize JSON on success; throws on any failure.
 async function _directUploadFile(file, description) {
   // 1. /upload/init — get a signed PUT URL
-  const initRes = await fetch('/upload/init', {
+  const initRes = await pdcFetch('/upload/init', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -104,7 +104,7 @@ async function _directUploadFile(file, description) {
   // 3. /upload/finalize — pull the GCS object into the user's store and run Steps 2-5
   const finalizeBody = { gcs_path: initData.gcs_path };
   if (description) finalizeBody.file_descriptions = { [_uploadNameOf(file)]: description };
-  const finRes = await fetch('/upload/finalize', {
+  const finRes = await pdcFetch('/upload/finalize', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(finalizeBody),
@@ -212,13 +212,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('aboutModal')?.classList.add('hidden');
   });
 
-  // Check authentication
-  const authRes = await fetch('/auth/me');
-  const authData = await authRes.json();
-  if (!authData.authenticated) {
-    window.location.href = '/';
-    return;
-  }
+  // Check authentication: signed out, /auth/me answers 401 and pdcFetch
+  // (http.js) sends the browser to the sign-in page.
+  await pdcFetch('/auth/me');
 
   // Load lists and profile in parallel for faster loading
   // (profile doesn't block list display)
@@ -253,7 +249,7 @@ window.addEventListener('popstate', (e) => {
 // Load user profile
 async function loadUserProfile() {
   try {
-    const res = await fetch('/auth/profile');
+    const res = await pdcFetch('/auth/profile');
     const profile = await res.json();
     userMaxFiles = getMaxFilesForPlan(profile.subscription_plan || 'Basic');
     currentSubscriptionSource = profile.subscription_source || 'default';
@@ -406,7 +402,7 @@ async function _updatePaymentMethod() {
   _subBody().innerHTML = '<div class="sub-modal-spinner"><p>Loading payment details...</p></div>';
   _subActions().innerHTML = '';
   try {
-    var res = await fetch('/api/paddle/subscription/update-payment', { method: 'POST' });
+    var res = await pdcFetch('/api/paddle/subscription/update-payment', { method: 'POST' });
     var data = await res.json();
     if (data.ok && data.transaction_id && window.Paddle) {
       _closeSubModal();
@@ -445,7 +441,7 @@ async function _doReactivate() {
   _subBody().innerHTML = '<div class="sub-modal-spinner"><p>Reactivating...</p></div>';
   _subActions().innerHTML = '';
   try {
-    var res = await fetch('/api/paddle/subscription/reactivate', { method: 'POST' });
+    var res = await pdcFetch('/api/paddle/subscription/reactivate', { method: 'POST' });
     var data = await res.json();
     if (data.ok) {
       _openSubModal('Plan Reactivated',
@@ -506,7 +502,7 @@ async function loadConversations(forceRefresh = false) {
 
 async function fetchConversations() {
   try {
-    const res = await fetch('/auth/conversations');
+    const res = await pdcFetch('/auth/conversations');
     const data = await res.json();
     const conversations = data.conversations || [];
     listCache.set('conversations', conversations);
@@ -569,7 +565,7 @@ async function loadActiveChats(forceRefresh = false) {
 
 async function fetchActiveChats() {
   try {
-    const res = await fetch('/auth/active_chats');
+    const res = await pdcFetch('/auth/active_chats');
     const data = await res.json();
     const chats = data.active_chats || [];
     listCache.set('activeChats', chats);
@@ -658,13 +654,7 @@ async function fetchActiveChats(forceRefresh = false) {
     return cached;
   }
   try {
-    const res = await fetch('/auth/active_chats');
-    // Handle authentication failure - redirect to login
-    if (res.status === 401) {
-      console.warn('Session expired, redirecting to login');
-      window.location.href = '/';
-      return [];
-    }
+    const res = await pdcFetch('/auth/active_chats');
     const data = await res.json();
     const chats = data.active_chats || [];
     listCache.set('activeChats', chats);
@@ -681,13 +671,7 @@ async function fetchConversations(forceRefresh = false) {
     return cached;
   }
   try {
-    const res = await fetch('/auth/conversations');
-    // Handle authentication failure - redirect to login
-    if (res.status === 401) {
-      console.warn('Session expired, redirecting to login');
-      window.location.href = '/';
-      return [];
-    }
+    const res = await pdcFetch('/auth/conversations');
     const data = await res.json();
     const conversations = data.conversations || [];
     listCache.set('conversations', conversations);
@@ -1100,7 +1084,7 @@ function setupEventListeners() {
   // Logout button
   document.getElementById('btnLogout').addEventListener('click', async () => {
     profileDropdown.classList.add('hidden');
-    await fetch('/auth/logout', { method: 'POST' });
+    await pdcFetch('/auth/logout', { method: 'POST' });
     window.location.href = '/';
   });
 
@@ -1369,7 +1353,7 @@ const AutoAnalytics = (function () {
     pollTimer = setInterval(async () => {
       if (pollChatId !== currentChatId) { stopPolling(); return; }
       try {
-        const res = await fetch(`/api/chat/${chatId}/auto_analysis/status`);
+        const res = await pdcFetch(`/api/chat/${chatId}/auto_analysis/status`);
         if (!res.ok) return;
         const data = await res.json();
         if (pollChatId !== currentChatId) { stopPolling(); return; }
@@ -1395,7 +1379,7 @@ const AutoAnalytics = (function () {
 
   async function start(chatId) {
     try {
-      const res = await fetch(`/api/chat/${chatId}/auto_analysis/start`, { method: 'POST' });
+      const res = await pdcFetch(`/api/chat/${chatId}/auto_analysis/start`, { method: 'POST' });
       const data = await res.json().catch(() => ({}));
       if (data.status === 'done') {
         setState('done');
@@ -1413,7 +1397,7 @@ const AutoAnalytics = (function () {
 
   async function download(chatId) {
     try {
-      const res = await fetch(`/api/chat/${chatId}/auto_analysis/download`);
+      const res = await pdcFetch(`/api/chat/${chatId}/auto_analysis/download`);
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: 'Download failed' }));
         showToast(err.error || 'Download failed', true);
@@ -1451,7 +1435,7 @@ const AutoAnalytics = (function () {
   async function refresh(chatId) {
     setState('idle');
     try {
-      const res = await fetch(`/api/chat/${chatId}/auto_analysis/status`);
+      const res = await pdcFetch(`/api/chat/${chatId}/auto_analysis/status`);
       if (!res.ok) return;
       const data = await res.json();
       if (chatId !== currentChatId) return;       // user already navigated away
@@ -1549,7 +1533,7 @@ async function downloadReport(format) {
   btn.textContent = 'Generating Report...';
 
   try {
-    const res = await fetch(`/api/chat/${currentChatId}/conversation/${currentConvId}/${endpoint}`, {
+    const res = await pdcFetch(`/api/chat/${currentChatId}/conversation/${currentConvId}/${endpoint}`, {
       method: 'POST'
     });
 
@@ -1599,7 +1583,7 @@ async function openChat(chatId) {
     // no rendered items yet, live messages arrive long after this resolves.
     _loadCurrentDfKeys(chatId);
     // Get welcome message with pre-generated questions (stored in metadata - fast)
-    const welcomeRes = await fetch(`/api/chat/${chatId}/welcome`);
+    const welcomeRes = await pdcFetch(`/api/chat/${chatId}/welcome`);
     const welcomeData = await welcomeRes.json();
     let welcomeMessage = welcomeData.message || 'Hello! I\'m ready to help you analyze your data. Ask me anything!';
     const suggestedQuestions = welcomeData.suggested_questions || [];
@@ -1799,7 +1783,7 @@ function _exitReloadGeneratingUI() {
 async function _resumeIfGenerating(chatId, convId) {
   let generating = false;
   try {
-    const res = await fetch(`/api/chat/${chatId}/conversation/${convId}/status`);
+    const res = await pdcFetch(`/api/chat/${chatId}/conversation/${convId}/status`);
     if (res.ok) generating = !!(await res.json()).generating;
   } catch (e) { /* treat as not generating */ }
   if (!generating) return;
@@ -1825,7 +1809,7 @@ async function _resumeIfGenerating(chatId, convId) {
     }
     let stillGenerating = true;
     try {
-      const res = await fetch(`/api/chat/${chatId}/conversation/${convId}/status`);
+      const res = await pdcFetch(`/api/chat/${chatId}/conversation/${convId}/status`);
       if (res.ok) stillGenerating = !!(await res.json()).generating;
     } catch (e) { return; /* transient — keep polling */ }
     if (!stillGenerating) {
@@ -1850,7 +1834,7 @@ async function openConversation(chatId, convId) {
   showLoading('Loading conversation...');
   
   try {
-    const res = await fetch(`/api/chat/${chatId}/conversation/${convId}/history`);
+    const res = await pdcFetch(`/api/chat/${chatId}/conversation/${convId}/history`);
     const data = await res.json();
     const history = data.history || [];
 
@@ -1874,7 +1858,7 @@ async function openConversation(chatId, convId) {
     let welcomeText = '';
     let welcomeQuestions = [];
     try {
-      const welcomeRes = await fetch(`/api/chat/${chatId}/welcome`);
+      const welcomeRes = await pdcFetch(`/api/chat/${chatId}/welcome`);
       if (welcomeRes.ok) {
         const welcomeData = await welcomeRes.json();
         welcomeText = (welcomeData.message || '').trim();
@@ -2022,9 +2006,16 @@ function _appendResponseActions(contentDiv, extras) {
         return;
       }
       const win = window.PDCViewers.openBlankWindow('Chart data');
-      fetch(`/api/chat/${currentChatId}/full_table/${extras.chartDataKey}`)
-        .then(r => r.ok ? r.json() : Promise.reject(r.status))
-        .then(t => window.PDCViewers.renderData(win, t))
+      pdcFetch(`/api/chat/${currentChatId}/full_table/${extras.chartDataKey}`)
+        .then(async (r) => {
+          if (r.ok) return { table: await r.json() };
+          const denied = await _roleDeniedText(r);
+          if (!denied) return Promise.reject(r.status);
+          if (win) win.close();
+          alert(denied);
+          return null;
+        })
+        .then(out => { if (out) window.PDCViewers.renderData(win, out.table); })
         .catch(() => window.PDCViewers.renderData(win, null));
     });
     bar.appendChild(dataBtn);
@@ -2077,7 +2068,7 @@ let currentChatBlockedKeys = null;
 async function _loadCurrentDfKeys(chatId) {
   currentChatIsOwner = null;
   try {
-    const res = await fetch(`/api/chat/${chatId}/schema`);
+    const res = await pdcFetch(`/api/chat/${chatId}/schema`);
     if (!res.ok) { currentChatDfKeys = null; currentChatBlockedKeys = null; _updateDataAsOfBadge(null); return; }
     const data = await res.json();
     if (chatId === currentChatId && typeof data.is_owner === 'boolean') {
@@ -2203,10 +2194,23 @@ function _showRefreshError(anchorEl, msg) {
   } catch (e) { /* non-fatal */ }
 }
 
+// The localized text for a `ROLE_DENIED` answer of the full-table / Excel
+// routes (403 — the server's `code` is the contract, its `error` is English
+// only), else null. Reads the body only of a 403.
+async function _roleDeniedText(res) {
+  if (!res || res.status !== 403) return null;
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = null; }
+  return data && data.code === 'ROLE_DENIED'
+    ? _t('lab.refresh_no_access',
+         "Your role doesn't include this table's data — refresh is unavailable. Showing the last saved result.")
+    : null;
+}
+
 async function _postRefreshItem(code, kind) {
   // Returns the parsed payload on success, or {__error: msg} on any failure.
   try {
-    const res = await fetch(`/api/chat/${currentChatId}/refresh_item`, {
+    const res = await pdcFetch(`/api/chat/${currentChatId}/refresh_item`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ code, kind }),
@@ -2490,7 +2494,7 @@ function createImageWithFullscreen(base64Data, messageContext = '') {
       downloadBtn.textContent = 'Generating name...';
       let filename = 'chart';
       try {
-        const response = await fetch(`/api/chat/${currentChatId}/generate_filename`, {
+        const response = await pdcFetch(`/api/chat/${currentChatId}/generate_filename`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content: messageContext, type: 'image' })
@@ -2605,7 +2609,7 @@ function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
 
       let filename = 'chart';
       try {
-        const nameRes = await fetch(`/api/chat/${chatIdRef}/generate_filename`, {
+        const nameRes = await pdcFetch(`/api/chat/${chatIdRef}/generate_filename`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content: messageContext, type: 'image' })
@@ -2614,7 +2618,7 @@ function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
         if (nameData && nameData.filename) filename = nameData.filename;
       } catch (_) {}
 
-      const res = await fetch(`/api/chat/${chatIdRef}/export_plotly_png`, {
+      const res = await pdcFetch(`/api/chat/${chatIdRef}/export_plotly_png`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ html: currentHtml, filename, scale: 3 })
@@ -2884,14 +2888,14 @@ function appendTableTo(div, table, fullKey, messageContext = '') {
 
       if (fullKey) {
         // Use new endpoint: re-executes code server-side for full data
-        excelResponse = await fetch(`/api/chat/${currentChatId}/download_excel/${fullKey}`, {
+        excelResponse = await pdcFetch(`/api/chat/${currentChatId}/download_excel/${fullKey}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ filename: filename })
         });
       } else {
         // No full key — export the preview table directly
-        excelResponse = await fetch(`/api/chat/${currentChatId}/export_excel`, {
+        excelResponse = await pdcFetch(`/api/chat/${currentChatId}/export_excel`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -2902,7 +2906,15 @@ function appendTableTo(div, table, fullKey, messageContext = '') {
         });
       }
 
-      if (!excelResponse.ok) throw new Error('Export failed');
+      if (!excelResponse.ok) {
+        const denied = await _roleDeniedText(excelResponse);
+        if (denied) {
+          alert(denied);
+          downloadBtn.textContent = '📥 Download Excel';
+          return;
+        }
+        throw new Error('Export failed');
+      }
 
       const blob = await excelResponse.blob();
       const url = window.URL.createObjectURL(blob);
@@ -2984,7 +2996,7 @@ function stopGeneration() {
   // Fire-and-forget server cancel — do NOT block the UI on it.
   if (chatId && convId) {
     try {
-      fetch(`/api/chat/${chatId}/conversation/${convId}/stop`, { method: 'POST' }).catch(() => {});
+      pdcFetch(`/api/chat/${chatId}/conversation/${convId}/stop`, { method: 'POST' }).catch(() => {});
     } catch (e) { /* ignore */ }
   }
   // Live-stream path: the active send registered a synchronous handler that
@@ -3011,7 +3023,7 @@ async function _tryRecoverResponse(chatId, convId, loadingDiv) {
   for (let attempt = 0; attempt < delays.length; attempt++) {
     try {
       await new Promise(r => setTimeout(r, delays[attempt]));
-      const res = await fetch(`/api/chat/${chatId}/conversation/${convId}/history`);
+      const res = await pdcFetch(`/api/chat/${chatId}/conversation/${convId}/history`);
       if (!res.ok) continue;
       const data = await res.json();
       const history = data.history || [];
@@ -3105,7 +3117,7 @@ async function sendMessage() {
 
   try {
     // Use SSE streaming endpoint
-    const res = await fetch(`/api/chat/${currentChatId}/chat/stream`, {
+    const res = await pdcFetch(`/api/chat/${currentChatId}/chat/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ question, conv_id: currentConvId }),
@@ -3115,13 +3127,6 @@ async function sendMessage() {
     // NOTE: Do NOT clearTimeout(timeoutId) here.
     // The SSE body hasn't been read yet — loading bubble must stay visible.
     // Cleanup happens when real content arrives or in the finally block.
-
-    // Handle authentication failure - redirect to login
-    if (res.status === 401) {
-      console.warn('Session expired, redirecting to login');
-      window.location.href = '/';
-      return;
-    }
 
     // Check if response is SSE stream
     const contentType = res.headers.get('content-type') || '';
@@ -3491,7 +3496,7 @@ async function editAndRegenerate(messageDiv, editedQuestion) {
   const editTimeoutId = setTimeout(() => editController.abort(), 240000);
 
   try {
-    const res = await fetch(`/api/chat/${currentChatId}/edit-regenerate`, {
+    const res = await pdcFetch(`/api/chat/${currentChatId}/edit-regenerate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -3582,7 +3587,7 @@ function openCreateWizard() {
   _updateWizardGenerateBtn();
   _loadDbTablesList();
   // Reset session so the wizard always starts fresh
-  fetch('/new_session', { method: 'POST' });
+  pdcFetch('/new_session', { method: 'POST' });
   document.getElementById('createNewModal').classList.remove('hidden');
 }
 
@@ -3604,7 +3609,7 @@ let _dbPanelWired = false;   // one-time document-level open/close wiring
 async function _fetchDbTables() {
   // → true on a 200 (cache updated), false otherwise (cache untouched).
   try {
-    const res = await fetch('/api/db_tables');
+    const res = await pdcFetch('/api/db_tables');
     if (!res.ok) return false;
     const data = await res.json();
     _dbTablesCache = data.tables || [];
@@ -3790,7 +3795,7 @@ function openAddDataWizard() {
   _updateWizardGenerateBtn();
   _loadDbTablesList();
   // Fresh temp session for this upload batch (same as Create New)
-  fetch('/new_session', { method: 'POST' });
+  pdcFetch('/new_session', { method: 'POST' });
   document.getElementById('createNewModal').classList.remove('hidden');
 }
 
@@ -3798,7 +3803,7 @@ function openAddDataWizard() {
 // (which the picker's marking needs but _loadCurrentDfKeys doesn't retain).
 async function _fetchAddDataDbTableIds(chatId) {
   try {
-    const res = await fetch(`/api/chat/${chatId}/schema`);
+    const res = await pdcFetch(`/api/chat/${chatId}/schema`);
     if (!res.ok) return;
     const data = await res.json();
     const ids = (data.db_tables || [])
@@ -3918,14 +3923,14 @@ async function _sameLocalContent(a, b) {
 // (contents unknown → dialog) even if the fingerprint endpoint fails.
 async function _fetchChatFingerprints(chatId) {
   try {
-    const res = await fetch(`/api/chat/${chatId}/file_fingerprints`);
+    const res = await pdcFetch(`/api/chat/${chatId}/file_fingerprints`);
     if (res.ok) {
       const data = await res.json();
       if (data && data.files) return data.files;
     }
   } catch (e) { console.warn('fingerprints fetch failed:', e); }
   try {
-    const res = await fetch(`/api/chat/${chatId}/schema`);
+    const res = await pdcFetch(`/api/chat/${chatId}/schema`);
     if (res.ok) {
       const data = await res.json();
       const out = {};
@@ -3951,7 +3956,7 @@ async function _probeCollisionStructure(fileObj, fileName) {
     const timer = setTimeout(() => ctrl.abort(), 3000);
     const fd = new FormData();
     fd.append('file', fileObj, fileName);
-    const res = await fetch(`/api/chat/${addDataTargetChatId}/probe_columns`, {
+    const res = await pdcFetch(`/api/chat/${addDataTargetChatId}/probe_columns`, {
       method: 'POST', body: fd, signal: ctrl.signal,
     });
     clearTimeout(timer);
@@ -4185,7 +4190,7 @@ async function runFrictionlessFlow(files, opts) {
     if (filesArr.length > 0) {
       // Reset session unless caller already did so (the wizard resets on open)
       if (opts.resetSession !== false) {
-        try { await fetch('/new_session', { method: 'POST' }); } catch (e) { /* non-fatal */ }
+        try { await pdcFetch('/new_session', { method: 'POST' }); } catch (e) { /* non-fatal */ }
       }
 
       // Direct-to-GCS only when the server enabled it (GCS_UPLOAD_BUCKET, the
@@ -4212,7 +4217,7 @@ async function runFrictionlessFlow(files, opts) {
         // No `file_descriptions` field — backend now accepts upload without descriptions and the
         // /schema_autofill_full step generates them.
 
-        const upRes = await fetch('/upload', { method: 'POST', body: formData });
+        const upRes = await pdcFetch('/upload', { method: 'POST', body: formData });
         let upData = {};
         try { upData = await upRes.json(); } catch (e) { upData = {}; }
         if (!upRes.ok || upData.error) {
@@ -4235,7 +4240,7 @@ async function runFrictionlessFlow(files, opts) {
     // closure into the session meta; no snapshot is read here.
     if (dbTableIds.length > 0) {
       try {
-        const dbRes = await fetch('/session/db_tables', {
+        const dbRes = await pdcFetch('/session/db_tables', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ table_ids: dbTableIds }),
@@ -4257,7 +4262,7 @@ async function runFrictionlessFlow(files, opts) {
     // Step 2: AI auto-fill of file + column descriptions in one call per file
     _updateFrictionlessStatus('lab.flow_analyzing');
     try {
-      const afRes = await fetch('/schema_autofill_full', { method: 'POST' });
+      const afRes = await pdcFetch('/schema_autofill_full', { method: 'POST' });
       if (!afRes.ok) {
         // Continue — chat can still be created with empty descriptions
         console.warn('[FRICTIONLESS] schema_autofill_full HTTP', afRes.status);
@@ -4274,7 +4279,7 @@ async function runFrictionlessFlow(files, opts) {
       _updateFrictionlessStatus('lab.flow_adding');
       let addData = null;
       try {
-        const addRes = await fetch('/add_data_to_chat', {
+        const addRes = await pdcFetch('/add_data_to_chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ chat_id: opts.addToChatId }),
@@ -4313,7 +4318,7 @@ async function runFrictionlessFlow(files, opts) {
     _updateFrictionlessStatus('lab.flow_creating');
     let genData = null;
     try {
-      const genRes = await fetch('/generate_chatdata', {
+      const genRes = await pdcFetch('/generate_chatdata', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
@@ -4360,7 +4365,7 @@ async function importFromGoogleUrl() {
   showLoading('Importing from Google...');
   
   try {
-    const res = await fetch('/upload_from_url', {
+    const res = await pdcFetch('/upload_from_url', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url, description: 'Shared Google Sheet' })
@@ -4412,7 +4417,7 @@ async function saveProfile() {
     document.getElementById('pwMatchError').classList.add('hidden');
     try {
       const current = document.getElementById('profCurrentPw').value;
-      const res = await fetch('/auth/password', {
+      const res = await pdcFetch('/auth/password', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ current_password: current, new_password: newPw })
@@ -4434,7 +4439,7 @@ async function saveProfile() {
   }
 
   try {
-    await fetch('/auth/profile/update', {
+    await pdcFetch('/auth/profile/update', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -4471,7 +4476,7 @@ async function changePassword() {
   showLoading('Changing password...');
 
   try {
-    const res = await fetch('/auth/password', {
+    const res = await pdcFetch('/auth/password', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ current_password: current, new_password: newPw })
@@ -4512,7 +4517,7 @@ async function submitChangePassword() {
 
   showLoading('Changing password...');
   try {
-    const res = await fetch('/auth/password', {
+    const res = await pdcFetch('/auth/password', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ current_password: current, new_password: newPw })
@@ -4549,7 +4554,7 @@ async function selectPlan(plan) {
     '<div class="sub-modal-spinner"><p>Calculating your price...</p></div>', '');
 
   try {
-    var res = await fetch('/api/paddle/subscription/preview', {
+    var res = await pdcFetch('/api/paddle/subscription/preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ plan: plan })
@@ -4664,7 +4669,7 @@ async function _confirmPlanChange(changeType, plan) {
       body = { plan: plan };
     }
 
-    var res = await fetch(endpoint, {
+    var res = await pdcFetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
@@ -4712,7 +4717,7 @@ async function _confirmAdminChange(plan) {
   _subBody().innerHTML = '<div class="sub-modal-spinner"><p>Processing...</p></div>';
   _subActions().innerHTML = '';
   try {
-    var res = await fetch('/auth/subscription', {
+    var res = await pdcFetch('/auth/subscription', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ plan: plan })
@@ -4774,7 +4779,7 @@ async function openSchemaViewer() {
   if (!currentChatId) return;
   showLoading('Loading schema...');
   try {
-    const res = await fetch(`/api/chat/${currentChatId}/schema`);
+    const res = await pdcFetch(`/api/chat/${currentChatId}/schema`);
     if (!res.ok) {
       showToast('Failed to load schema', true);
       hideLoading();
@@ -4974,7 +4979,7 @@ async function _persistChatSchema() {
   });
 
   try {
-    const res = await fetch(`/api/chat/${currentChatId}/schema`, {
+    const res = await pdcFetch(`/api/chat/${currentChatId}/schema`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ files: filesPayload }),
@@ -5116,7 +5121,7 @@ function showItemMenu(btn) {
 
       if (action === 'pin') {
         try {
-          const res = await fetch('/auth/active_chats/pin', {
+          const res = await pdcFetch('/auth/active_chats/pin', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ chat_id: chatId, pinned: !isPinned }),
@@ -5195,7 +5200,7 @@ async function handleRename(type, chatId, convId, currentName) {
           ? { conv_id: convId, title: newName }
           : { chat_id: chatId, title: newName };
         
-        const res = await fetch(endpoint, {
+        const res = await pdcFetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body)
@@ -5300,7 +5305,7 @@ async function handleShare(type, chatId, convId, title) {
         if (comment) body.comment = comment;
       }
 
-      const res = await fetch(endpoint, {
+      const res = await pdcFetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
@@ -5342,7 +5347,7 @@ async function handlePublish(type, chatId, convId, title) {
     } else {
       endpoint = `/api/chat/${chatId}/publish`;
     }
-    const res = await fetch(endpoint, { method: 'POST' });
+    const res = await pdcFetch(endpoint, { method: 'POST' });
     const data = await res.json();
     if (res.ok) {
       showToast(`${itemType.charAt(0).toUpperCase() + itemType.slice(1)} published successfully`);
@@ -5368,7 +5373,7 @@ async function handleUnpublish(type, chatId, convId, title) {
     } else {
       endpoint = `/api/chat/${chatId}/unpublish`;
     }
-    const res = await fetch(endpoint, { method: 'POST' });
+    const res = await pdcFetch(endpoint, { method: 'POST' });
     const data = await res.json();
     if (res.ok) {
       showToast(`${itemType.charAt(0).toUpperCase() + itemType.slice(1)} unpublished`);
@@ -5465,7 +5470,7 @@ async function handleDelete(type, chatId, convId, title) {
         : {};
 
       try {
-        const resp = await fetch(endpoint, {
+        const resp = await pdcFetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body)
@@ -5506,7 +5511,7 @@ async function _dashList(forceRefresh = false) {
     return _dashListCache.rows;
   }
   try {
-    const res = await fetch('/api/dashboards');
+    const res = await pdcFetch('/api/dashboards');
     if (!res.ok) {
       console.warn('Dashboard list fetch failed: HTTP', res.status);
       _dashListCache.error = true;
@@ -5523,7 +5528,7 @@ async function _dashList(forceRefresh = false) {
 }
 
 async function _createDashboard(name) {
-  const res = await fetch('/api/dashboards', {
+  const res = await pdcFetch('/api/dashboards', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name }),
@@ -5610,7 +5615,7 @@ function initDashboardsDropdown() {
     // failures into an empty list): success is the only source of the
     // empty-state; failure shows the reason instead of "No dashboards yet".
     try {
-      const res = await fetch('/api/dashboards');
+      const res = await pdcFetch('/api/dashboards');
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       _dashListCache = { rows: (data && data.dashboards) || [], ts: Date.now(), error: false };
@@ -5743,7 +5748,7 @@ function _openDashPicker(anchorEl, payloadBuilder, onAdded) {
       return;
     }
     try {
-      const res = await fetch(`/api/dashboards/${dashId}/tiles`, {
+      const res = await pdcFetch(`/api/dashboards/${dashId}/tiles`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),

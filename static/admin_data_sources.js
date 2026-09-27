@@ -2926,7 +2926,7 @@
           ${(u.permission || 'standard') === v ? 'selected' : ''}>${l}</option>`).join('')}
       </select>`;
     box.innerHTML = `<div class="adm-card adm-table-scroll"><table class="adm-table">
-      <thead><tr><th>Email</th><th>Roles</th><th>Permission</th><th>First login</th><th>Last login</th></tr></thead>
+      <thead><tr><th>Email</th><th>Roles</th><th>Permission</th><th>First login</th><th>Last login</th><th></th></tr></thead>
       <tbody>${rows.map((u) => `
         <tr data-email="${esc(u.email)}">
           <td>${esc(u.email)}</td>
@@ -2938,7 +2938,17 @@
           <td>${permSel(u)}</td>
           <td class="adm-cell-mono">${fmt(u.created_at)}</td>
           <td class="adm-cell-mono">${fmt(u.last_login_at)}</td>
+          <td class="adm-actions-cell adm-user-actions">
+            <button type="button" class="adm-btn ghost small adm-user-end-sessions">End sessions</button>
+            <button type="button" class="adm-btn danger small adm-user-remove">Remove</button>
+          </td>
         </tr>`).join('')}</tbody></table></div>`;
+    box.querySelectorAll('.adm-user-end-sessions').forEach((btn) => {
+      btn.addEventListener('click', () => endUserSessions(btn.closest('tr').dataset.email));
+    });
+    box.querySelectorAll('.adm-user-remove').forEach((btn) => {
+      btn.addEventListener('click', () => removeUser(btn.closest('tr').dataset.email));
+    });
 
     box.querySelectorAll('.adm-user-roles-btn').forEach((btn) => {
       btn.addEventListener('click', (e) => {
@@ -3008,6 +3018,62 @@
     if (!_userRolesDocClose) {
       _userRolesDocClose = true;
       document.addEventListener('click', closeUserRolePanels);
+    }
+  }
+
+  // End sessions / Remove: each asks first in #userActionModal (the
+  // role-delete chrome). The promise settles on the modal's buttons —
+  // true for the action button, false for Cancel / ✕. Text only.
+  let _userActionResolve = null;
+
+  function confirmUserAction(title, text, goLabel) {
+    if (_userActionResolve) _userActionResolve(false);   // a stale prompt
+    $('userActionTitle').textContent = title;
+    $('userActionText').textContent = text;
+    $('btnUserActionGo').textContent = goLabel;
+    $('userActionModal').classList.remove('hidden');
+    return new Promise((resolve) => { _userActionResolve = resolve; });
+  }
+
+  function settleUserAction(confirmed) {
+    $('userActionModal').classList.add('hidden');
+    const resolve = _userActionResolve;
+    _userActionResolve = null;
+    if (resolve) resolve(confirmed);
+  }
+
+  async function endUserSessions(email) {
+    const confirmed = await confirmUserAction('End sessions',
+      `Sign ${email} out everywhere? Every open session ends on its next request; `
+      + 'their password and data are unchanged and they can sign in again.',
+      'End sessions');
+    if (!confirmed) return;
+    const r = await api('/api/admin/users/end_sessions', {
+      method: 'POST', body: JSON.stringify({ email }),
+    });
+    if (r.ok && r.data.ok) {
+      toast(`Sessions ended for ${email}`);
+    } else {
+      toast(r.data.error || 'Could not end the sessions', true);
+    }
+  }
+
+  async function removeUser(email) {
+    const confirmed = await confirmUserAction('Remove user',
+      `Remove ${email}? This deletes the account and all of their chats and dashboards, `
+      + 'and ends the shares built on them for everyone they were shared with. '
+      + 'Their sessions end at once. This cannot be undone.',
+      'Remove user');
+    if (!confirmed) return;
+    const r = await api('/api/admin/users/remove', {
+      method: 'POST', body: JSON.stringify({ email }),
+    });
+    if (r.ok && r.data.ok) {
+      const n = r.data.chats_deleted || 0;
+      toast(`Removed ${email} — ${n} chat${n === 1 ? '' : 's'} deleted`);
+      loadUsers();
+    } else {
+      toast(r.data.error || 'Could not remove the user', true);
     }
   }
 
@@ -3573,6 +3639,9 @@
     $('closeRoleDelete').addEventListener('click', () => $('roleDeleteModal').classList.add('hidden'));
     $('btnRoleDeleteCancel').addEventListener('click', () => $('roleDeleteModal').classList.add('hidden'));
     $('btnRoleDeleteGo').addEventListener('click', runRoleDelete);
+    $('closeUserAction')?.addEventListener('click', () => settleUserAction(false));
+    $('btnUserActionCancel')?.addEventListener('click', () => settleUserAction(false));
+    $('btnUserActionGo')?.addEventListener('click', () => settleUserAction(true));
 
     $('btnSaveSchedule')?.addEventListener('click', saveSchedule);
     $('btnTsmSave').addEventListener('click', saveTableSchedule);

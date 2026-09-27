@@ -406,6 +406,11 @@ async def login(request: Request):
         return _refuse()
 
     outcome = store.verify_password(email, password)
+    if _sso_enforced_for(email, auth):
+        # Decided AFTER the one real verification, whatever its result, so
+        # the page and the timing match a wrong password.
+        log_with_sid(email, "warning", "SSO_ENFORCED_LOCAL_REFUSED")
+        return _refuse()
     if outcome is None:
         log_with_sid(email, "warning", "USER_LOGIN_BAD_PASSWORD")
         return _refuse()
@@ -422,6 +427,29 @@ async def login(request: Request):
                      f"LOGIN_ACTIVITY_FAILED {log_safe_text(type(e).__name__, 80)}")
     target = "/auth/change_password" if must_change else _post_login_target(email)
     return RedirectResponse(url=target, status_code=302)
+
+
+def _sso_enforced_for(email: str, auth: dict = None) -> bool:
+    """True while Microsoft sign-in is ENABLED on this install and the
+    account's record carries `sso_provider`: such an account signs in with
+    Microsoft only, because its local password would bypass the identity
+    provider's MFA. The bootstrap local admin is exempt. Read per request,
+    so disabling SSO gives every such account its local password back. A
+    failed SSO check is logged and reads as not enabled — the `_landing`
+    precedent, and the state before this check existed."""
+    store = AuthStore()
+    if store.is_bootstrap_admin(email):
+        return False
+    record = auth if auth is not None else store.get_auth(email)
+    if not (record or {}).get("sso_provider"):
+        return False
+    try:
+        import sso_store      # function-local, like `_landing`
+        return bool(sso_store.is_enabled())
+    except Exception as e:
+        log_with_sid("sso", "warning",
+                     f"SSO_ENFORCEMENT_CHECK_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return False
 
 
 def _send_reset_link(email: str, base: str) -> None:
@@ -442,6 +470,11 @@ def _send_reset_link(email: str, base: str) -> None:
             # nothing. The caller already has the neutral page, which must
             # not reveal the account type.
             log_with_sid(email, "info", "SSO_ACCOUNT_RESET_REFUSED")
+            return
+        if _sso_enforced_for(email):
+            # A local account that also uses Microsoft, while SSO is enabled:
+            # the same — no link, the neutral page.
+            log_with_sid(email, "info", "SSO_ENFORCED_RESET_REFUSED")
             return
         if not base:
             # No trusted address to build a link from (D9-26): mint nothing,
@@ -555,6 +588,10 @@ async def reset_link_submit(request: Request, token: str):
     if AuthStore().is_sso_only(link_email):
         # A link minted before the account moved to Microsoft sign-in.
         log_with_sid(log_safe_text(link_email, 254), "warning", "SSO_ACCOUNT_RESET_REFUSED")
+        return _reset_page(request, token, SSO_NO_LOCAL_PASSWORD_TEXT, 403)
+    if _sso_enforced_for(link_email):
+        # A link minted while SSO was off, used after it was enabled.
+        log_with_sid(log_safe_text(link_email, 254), "warning", "SSO_ENFORCED_RESET_REFUSED")
         return _reset_page(request, token, SSO_NO_LOCAL_PASSWORD_TEXT, 403)
     form = await request.form()
     new_password = form.get("new_password") or ""

@@ -163,6 +163,13 @@ async def _reexecute_full_df(chat_id: str, code: str | None, result_key: str | N
     post-load on purpose — _load_dataframes_cached's cache key is per-chat,
     not per-user, so the cache must always hold the full set.
 
+    The returned frame carries `attrs["pdc_sql_used"]` (the live SELECTs
+    that ran: df key -> SQL text, None for a default read; {} when none)
+    and `attrs["pdc_first_key"]` (the first frame's key), always set here —
+    a caller persisting a fresh full-table record passes them on as `sql=` /
+    `first_key=` (the dashboard multi-table tile). Carried on the frame so
+    the signature every caller uses stays as it is.
+
     Article II: execution is local — nothing here touches the brain.
     Article V: reads local DataFrames only. Article IV: never raises."""
     if not code:
@@ -180,7 +187,8 @@ async def _reexecute_full_df(chat_id: str, code: str | None, result_key: str | N
             return None
         # Live tables: re-run the SELECT the answer was computed with (the
         # role gate — when the caller has one — ran before this call).
-        live_err, _sql_used = await loop.run_in_executor(
+        first_key = next(iter(dfs), None)
+        live_err, sql_used = await loop.run_in_executor(
             _EXEC, lambda: _prefetch_stored_live(store, code, dfs, chat_id))
         if live_err is not None:
             log_with_sid(chat_id, "warning",
@@ -198,12 +206,18 @@ async def _reexecute_full_df(chat_id: str, code: str | None, result_key: str | N
         # full-table view / Excel download match what the chat rendered (QA 2.2)
         from run_chat_local import _normalize_df_for_table
         if isinstance(obj, pd.DataFrame):
-            return _normalize_df_for_table(obj)
-        if isinstance(obj, pd.Series):
-            return _normalize_df_for_table(obj.reset_index())
-        if hasattr(obj, "data") and isinstance(obj.data, pd.DataFrame):
-            return _normalize_df_for_table(obj.data)
-        return None
+            out = _normalize_df_for_table(obj)
+        elif isinstance(obj, pd.Series):
+            out = _normalize_df_for_table(obj.reset_index())
+        elif hasattr(obj, "data") and isinstance(obj.data, pd.DataFrame):
+            out = _normalize_df_for_table(obj.data)
+        else:
+            return None
+        # Overwritten unconditionally: the frame came back from the sandbox,
+        # and only this process decides what ran.
+        out.attrs["pdc_sql_used"] = dict(sql_used or {})
+        out.attrs["pdc_first_key"] = first_key
+        return out
     except Exception as e:
         # The re-executed RESULT is normalized here (`_normalize_df_for_table`),
         # and pandas quotes the label it choked on WITHOUT `repr` — a label the
@@ -2256,9 +2270,10 @@ async def suggested_questions_stub(request: Request, chat_id: str):
 
 @router.get("/{chat_id}/full_table/{key}")
 async def full_table_get(request: Request, chat_id: str, key: str):
-    """Return the FULL row set for this key ("Show full table"). The chat stream
-    sets `full_table_key` on responses that contain a tabular result; the
-    frontend fetches the full rows via this endpoint.
+    """Return the FULL row set for this key. The chat stream sets
+    `full_table_key` on responses that contain a tabular result; a chart's or
+    a dashboard tile's "Show data" fetches the full rows via this endpoint
+    (the /lab table block shows a row-count cue, not a full-table action).
 
     Re-executes the stored code locally to return the complete (uncapped)
     result, falling back to the stored preview rows if re-execution yields
@@ -2298,9 +2313,10 @@ _DF_KEY_RE = re.compile(r"dfs\[\s*['\"]([^'\"]+)['\"]\s*\]")
 
 class _GateFailed(tuple):
     """The `(frozenset(), [])` answer `_role_refresh_block` gives when it
-    crashed. Unpacks exactly like the ordinary answer, so `refresh_item` and
-    the dashboard tile keep failing open; `_live_reexec_block` recognises it
-    and fails closed. `error_type` is the caught exception's type name."""
+    crashed. Unpacks exactly like the ordinary answer; the refresh paths
+    (`_refresh_role_gate`) and `_live_reexec_block` recognise it and refuse
+    on a chat holding a live table. `error_type` is the caught exception's
+    type name."""
     error_type = ""
 
 
@@ -2319,14 +2335,23 @@ def _role_refresh_block(email: str, chat_id: str, code: str):
         connectors are exempt by design). Passed as drop_df_keys so denied
         frames never enter the exec namespace even when unreferenced.
       blocked_display_names — the denied tables this item's code actually
-        references (the same dfs['…'] key regex dashboard.js freezes on) —
-        non-empty means the refresh must be refused; empty means the item
-        only touches allowed tables and proceeds (per-table semantics).
+        references — non-empty means the refresh must be refused; empty
+        means the item only touches allowed tables and proceeds (per-table
+        semantics). Two rules, added together: the `dfs['…']` key regex
+        (the one dashboard.js freezes on) over every denied key, and, for a
+        denied LIVE key, the pre-fetch's own rule
+        (`run_chat_local._referenced_live_keys`: a quoted key anywhere, a
+        generic `dfs` walk, the `df` alias of the first frame) — so a
+        `dfs.get(...)` or `df` refresh of a denied live table is refused
+        instead of computing on whatever frame is left.
 
     Genuine denials fail CLOSED by construction (.get() defaults resolve to
-    Base → empty grant set). An unexpected crash inside the helper fails OPEN
-    (logged ROLE_GATE_FAILED) — a bug here must not freeze every refresh
-    fleet-wide for data the user can already see as a snapshot."""
+    Base → empty grant set). Blocking — it may load the chat's frames; call
+    it off the event loop. An unexpected crash — the registry read below
+    included, which is done directly because the loader's own partition
+    reads a registry failure as "no live table" — is logged ROLE_GATE_FAILED
+    (the exception TYPE only) and answered with the `_GateFailed` marker;
+    the callers decide (`_refresh_role_gate`, `_live_reexec_block`)."""
     try:
         meta = local_store.ChatDataStore(chat_id).read_meta()
         entries = [e for e in local_store.db_entries_from_meta(meta)
@@ -2341,16 +2366,91 @@ def _role_refresh_block(email: str, chat_id: str, code: str):
                   and (e.get("db") or {}).get("table_id") not in allowed}
         if not denied:
             return frozenset(), []
-        referenced = set(_DF_KEY_RE.findall(code or ""))
-        return frozenset(denied), sorted(denied[k] for k in referenced if k in denied)
+        keys = {k for k in _DF_KEY_RE.findall(code or "") if k in denied}
+        import db_sources
+        live_ids = {t.get("id") for t in db_sources.DataSourceStore().list_tables()
+                    if db_sources.table_mode(t) == "live"}
+        denied_live = [e["file_name"] for e in entries
+                       if e.get("file_name") in denied
+                       and (e.get("db") or {}).get("table_id") in live_ids]
+        if denied_live:
+            dfs = local_store.ChatDataStore(chat_id).load_dataframes(include_live=True)
+            named, generic = run_chat_local._referenced_live_keys(
+                code or "", denied_live, list(dfs or {}),
+                first_key=next(iter(dfs or {}), None))
+            keys |= set(named) | set(generic)
+        return frozenset(denied), sorted(denied[k] for k in keys)
     except Exception as e:
-        # The gate reads chat meta and the roles registry; a failure there is
-        # raised about table names and df keys.
+        # The type only: the gate reads chat meta, the roles and the table
+        # registry, so a message could quote table names and df keys.
         log_with_sid(email, "warning",
-                     f"ROLE_GATE_FAILED chat={chat_id}: {log_safe_text(str(e), 200)}")
-        # Same value as "nothing denied" for the fail-open callers; the
-        # marker lets the full-table gate fail closed instead.
+                     f"ROLE_GATE_FAILED error={log_safe_text(type(e).__name__, 80)} "
+                     f"reason=role_gate_helper_failed",
+                     chat_id=log_safe_text(str(chat_id), 80))
         return _gate_failed(type(e).__name__)
+
+
+def _chat_holds_live_entry(chat_id: str) -> bool:
+    """True when the chat holds a non-connector database entry whose table
+    is registered LIVE (a connector never feeds a refresh's own gate).
+    Blocking. Reads the registry directly; any failure answers True — the
+    caller then refuses, because whether a stored SELECT could run is
+    unknown."""
+    try:
+        meta = local_store.ChatDataStore(chat_id).read_meta()
+        tids = {(e.get("db") or {}).get("table_id")
+                for e in local_store.db_entries_from_meta(meta)
+                if not (e.get("db") or {}).get("is_connector")}
+        tids.discard(None)
+        if not tids:
+            return False
+        import db_sources
+        return any(t.get("id") in tids and db_sources.table_mode(t) == "live"
+                   for t in db_sources.DataSourceStore().list_tables())
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid(log_safe_text(str(chat_id), 80), "warning",
+                     f"CHAT_LIVE_PROBE_FAILED error={log_safe_text(type(e).__name__, 80)} "
+                     f"reason=live_probe_failed")
+        return True
+
+
+async def _refresh_role_gate(email: str, chat_id: str, code: str):
+    """The role gate of the two refresh paths (`refresh_item`, the
+    dashboard tile). Returns (drop_df_keys, blocked_display_names, refused).
+
+    `_role_refresh_block` runs off the event loop (it may load the chat's
+    frames). A gate crash — its `_GateFailed` marker, or the gate raising —
+    REFUSES when the chat holds a live table or that cannot be told
+    (`refused`, no table named): a fail-open there would let the stored
+    SELECT run for a requester whose role was never checked. A chat without
+    a live table keeps the fail-open answer (nothing denied), so a gate bug
+    never freezes refreshes of data the user can already see."""
+    loop = asyncio.get_running_loop()
+    try:
+        gate = await loop.run_in_executor(_EXEC, _role_refresh_block,
+                                          email, chat_id, code)
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid(email, "warning",
+                     f"ROLE_GATE_FAILED error={log_safe_text(type(e).__name__, 80)} "
+                     f"reason=role_gate_raised",
+                     chat_id=log_safe_text(str(chat_id), 80))
+        gate = _gate_failed(type(e).__name__)
+    if isinstance(gate, _GateFailed):
+        try:
+            live = await loop.run_in_executor(_EXEC, _chat_holds_live_entry, chat_id)
+        except Exception as e:                               # noqa: BLE001
+            log_with_sid(email, "warning",
+                         f"CHAT_LIVE_PROBE_FAILED error={log_safe_text(type(e).__name__, 80)} "
+                         f"reason=live_probe_raised",
+                         chat_id=log_safe_text(str(chat_id), 80))
+            live = True
+        if live:
+            log_with_sid(email, "warning", "REFRESH_ROLE_GATE_REFUSED",
+                         chat_id=log_safe_text(str(chat_id), 80))
+            return frozenset(), [], True
+        return frozenset(), [], False
+    drop, blocked = gate
+    return frozenset(drop or ()), list(blocked or []), False
 
 
 _ROLE_DENIED_REFRESH_TEXT = ("Your role does not include this table's data — "
@@ -2373,8 +2473,14 @@ def _live_reexec_block(email: str, chat_id: str, code: str | None):
     call, the loader, the schema read or the referencing rule — and a gate
     answer marked `_GateFailed` (the gate swallowed its own crash) are a
     denial naming no table (`LIVE_REEXEC_GATE_FAILED`, the exception type
-    only)."""
+    only). Neither applies where no live fetch can happen: a record without
+    code (nothing is re-run) and a chat holding no live table are served
+    before the gate is consulted."""
     try:
+        if not (code or "").strip():
+            return False, []
+        if not _chat_holds_live_entry(chat_id):
+            return False, []
         gate = _role_refresh_block(email, chat_id, code)
         if isinstance(gate, _GateFailed):
             log_with_sid(email, "warning",
@@ -2555,15 +2661,19 @@ async def refresh_item(request: Request, chat_id: str):
     if not await code_is_stored_async(chat_id, code):
         log_with_sid(email, "warning", "REFRESH_CODE_NOT_STORED", chat_id=chat_id)
         return _code_not_stored(403)
-    drop, blocked = _role_refresh_block(email, chat_id, code)
+    drop, blocked, refused = await _refresh_role_gate(email, chat_id, code)
+    if refused:
+        # The gate failed on a chat holding a live table: refused, no table
+        # named (the gate could not tell which).
+        return {"ok": False, "code": "ROLE_DENIED", "blocked_tables": [],
+                "error": _ROLE_DENIED_REFRESH_TEXT}
     if blocked:
         # Role denial follows the EXECUTION-failure contract (200 {ok:false})
         # — the frontend keeps the previous render and fail-freezes the button.
         log_with_sid(email, "info", "REFRESH_ROLE_DENIED",
                      chat_id=chat_id, tables=blocked)
         return {"ok": False, "code": "ROLE_DENIED", "blocked_tables": blocked,
-                "error": "Your role does not include this table's data — "
-                         "refresh is unavailable."}
+                "error": _ROLE_DENIED_REFRESH_TEXT}
     return await run_item_refresh(chat_id, code, kind, secrets.token_hex(8),
                                   drop_df_keys=drop)
 

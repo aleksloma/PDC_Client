@@ -147,7 +147,15 @@ def test_consuming_a_reset_link_writes_a_new_generation(world):
 
 
 def test_an_account_without_a_generation_answers_empty(world):
-    assert _generation("never.seen@corp.example") == ""
+    """Updated for Task 14 (D14-5): an address with NEITHER profile.json nor
+    auth.json (never seen, or removed) answers the fixed non-hex sentinel
+    `local_store.SESSION_GEN_REMOVED`, so a `gen: ""` session of a removed
+    account cannot survive. An account that EXISTS without a generation
+    (profile only) still answers "" — the upgrade back-compat this test
+    was written for."""
+    sentinel = getattr(local_store, "SESSION_GEN_REMOVED", None)
+    assert isinstance(sentinel, str) and sentinel, "local_store.SESSION_GEN_REMOVED missing"
+    assert _generation("never.seen@corp.example") == sentinel
     local_store.AuthStore().ensure_user("profile.only@corp.example")
     assert _generation("profile.only@corp.example") == ""
 
@@ -308,9 +316,11 @@ def _run_gate(session: dict):
     return reached, sent, scope
 
 
-def test_the_gate_passes_a_session_whose_account_has_no_record(world):
+def test_the_gate_ends_a_session_whose_account_has_no_record(world):
+    # A signed-in address with neither profile nor auth record is a removed
+    # account: its session must not survive, whatever generation it carries.
     reached, sent, _ = _run_gate({"email": "a@b.c"})
-    assert reached == [{"email": "a@b.c"}], reached
+    assert reached == [{}], reached
     assert sent and sent[0].get("status") == 200, sent
 
 
@@ -432,7 +442,10 @@ def test_another_data_root_does_not_see_the_first_roots_value(world, monkeypatch
     assert first
     other = tmp_path_factory.mktemp("other_root")
     monkeypatch.setattr(settings, "DATA_ROOT", str(other))
-    assert _generation(USER) == "", "a cached value crossed DATA_ROOTs"
+    # Task 14 (D14-5): the account does not exist under this root, so it
+    # answers the removed-account sentinel — any value but `first` proves the
+    # cache did not cross roots.
+    assert _generation(USER) != first, "a cached value crossed DATA_ROOTs"
     other2 = tmp_path_factory.mktemp("other_root2")
     d2 = other2 / "users" / USER
     d2.mkdir(parents=True)

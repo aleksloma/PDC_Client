@@ -498,6 +498,12 @@ body.admin-ds-page {
   font-size: 13px; background: #fff; color: inherit;
 }
 .adm-user-roles-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.adm-user-roles-btn { white-space: normal; text-align: left; max-width: 220px; }
+
+/* Users table row actions: stacked, so the table stays inside the section */
+.adm-user-actions { white-space: normal; }
+.adm-user-actions button { display: block; width: 100%; margin: 0 0 4px; }
+.adm-user-actions button:last-child { margin-bottom: 0; }
 
 /* Live-mode storage: the LIVE badge in the tables list (the amber pair of
    .adm-alert.warn) and the step-3 storage block of the register wizard. */

@@ -2573,6 +2573,9 @@ button.danger:hover {
   padding: 4px 10px;
   white-space: nowrap;
 }
+/* This file has no generic `.hidden`: without this rule a file-only chat
+   showed the badge as an empty pill. */
+.data-as-of-badge.hidden { display: none; }
 
 /* Styled (pandas Styler) tables: the sanitised markup is inserted into the
    page, so its box is clipped here — whatever it draws stays inside the

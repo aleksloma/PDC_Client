@@ -758,12 +758,14 @@ def test_full_table_gate_fails_closed_when_the_role_lookup_itself_fails(
     assert _records(caplog, "LIVE_PREFETCH") == []
 
 
-def test_refresh_item_keeps_its_fail_open_gate_when_the_role_lookup_fails(
+def test_refresh_item_fails_closed_when_the_role_lookup_fails_on_a_live_chat(
         client, chat, granted, monkeypatch, caplog):
-    """Companion, unchanged behaviour: `refresh_item`'s gate fails OPEN on
-    the same crash (`ROLE_GATE_FAILED`) and the refresh proceeds to its own
-    pre-fetch — here `_no_fetch` makes that pre-fetch fail, so the answer
-    is the execution-failure shape (200, ok false), not a role denial."""
+    """Task 14 item 1 (INVERTED from the earlier fail-open pin
+    `test_refresh_item_keeps_its_fail_open_gate_when_the_role_lookup_fails`):
+    the chat holds a live table, so a crash of the roles lookup inside
+    `refresh_item`'s gate is a REFUSAL — 200 with the denial shape naming no
+    table (`blocked_tables: []`), `ROLE_GATE_FAILED` logged, and no live
+    fetch is attempted."""
     _seed_row(CHAT, CODE, sql={KEY: SQL})
 
     def boom(email):
@@ -776,6 +778,322 @@ def test_refresh_item_keeps_its_fail_open_gate_when_the_role_lookup_fails(
     assert r.status_code == 200, r.text[:300]
     body = r.json()
     assert body["ok"] is False
-    assert body.get("code") != "ROLE_DENIED"
+    assert body.get("code") == "ROLE_DENIED", body
+    assert body.get("blocked_tables") == [], body
+    assert body.get("error") == ROLE_DENIED_TEXT, body
     assert _records(caplog, "ROLE_GATE_FAILED")
+    assert _records(caplog, "LIVE_PREFETCH") == []
     assert _records(caplog, "LIVE_REEXEC_GATE_FAILED") == []
+
+
+# ===========================================================================
+# 17. Task 14 item 1 — the refresh gates fail closed on a live chat and use
+#     the pre-fetch's referencing rule (`_referenced_live_keys` with the
+#     `df` alias of the first frame), like the full-table gate
+# ===========================================================================
+SNAP_CHAT = "c_snaponlyr1"
+SNAP_CODE = "RESULT = dfs['snap u']"
+MARK_GATE = "ZQ_GATE_SECRET_41"
+
+
+@pytest.fixture
+def snapshot_chat(registry):
+    """A chat owned by OWNER holding one csv file and the SNAPSHOT table
+    `snap u` — no live entry at all."""
+    store = local_store.ChatDataStore(SNAP_CHAT)
+    (store.files_dir / "d.csv").write_text("x\n1\n2\n", encoding="utf-8")
+    meta = store.read_meta()
+    meta["owner"] = OWNER
+    meta["files"] = [
+        {"file_name": "d.csv", "file_description": "",
+         "schema": {"file_name": "d.csv", "fields": {}}},
+        _db_entry("snap u", registry["snap_tid"], registry["cid"], table="u"),
+    ]
+    store.write_meta(meta)
+    local_store._DATAFRAME_CACHE.invalidate()
+    return store
+
+
+def _refresh_in(client, chat_id, code, kind="table"):
+    return client.post(f"/api/chat/{chat_id}/refresh_item",
+                       json={"code": code, "kind": kind})
+
+
+def _tile(chat_id, code, kind="table", **extra):
+    """A dashboard of OWNER holding one tile pinned from `chat_id`."""
+    ds = local_store.DashboardStore()
+    row = ds.create_dashboard(OWNER, "D")
+    tile = {"chat_id": chat_id, "kind": kind, "code": code,
+            "snapshot": {"table": dict(PREVIEW)}}
+    tile.update(extra)
+    saved = ds.add_tile(OWNER, row["dash_id"], tile)
+    return ds, row["dash_id"], saved["tile_id"]
+
+
+def _refresh_tile(client, dash_id, tile_id):
+    return client.post(f"/api/dashboards/{dash_id}/tiles/{tile_id}/refresh")
+
+
+def _stored_tile(ds, dash_id):
+    return ds.get_dashboard(OWNER, dash_id)["tiles"][0]
+
+
+def _roles_crash(monkeypatch, message="roles unreadable"):
+    def boom(email):
+        raise RuntimeError(message)
+    monkeypatch.setattr(roles_store, "allowed_table_ids_for", boom)
+
+
+def _assert_refresh_denied(r, blocked):
+    assert r.status_code == 200, r.text[:300]
+    body = r.json()
+    assert body["ok"] is False, body
+    assert body.get("code") == "ROLE_DENIED", body
+    assert body.get("blocked_tables") == blocked, body
+    assert body.get("error") == ROLE_DENIED_TEXT, body
+
+
+def _assert_tile_denied(r, blocked):
+    assert r.status_code == 200, r.text[:300]
+    body = r.json()
+    assert body == {"ok": False, "frozen": True, "reason": "role_denied",
+                    "blocked_tables": blocked}, body
+
+
+@pytest.mark.parametrize("which, code", [
+    ("chat", "RESULT = dfs.get('live t')"),
+    ("chat", 'RESULT = dfs.get("live t")'),
+    ("live_only_chat", "RESULT = dfs.get('live t')"),
+    ("live_only_chat", "RESULT = df"),
+], ids=["dfs-get-single", "dfs-get-double", "live-only-dfs-get", "live-only-df"])
+def test_refresh_item_refuses_a_denied_live_key_named_without_a_subscript(
+        client, request, monkeypatch, caplog, which, code):
+    """OWNER holds only Base. Code that reaches the denied live table through
+    `dfs.get(...)` or through `df` (the first frame of a live-only chat) is
+    refused exactly like the `dfs['live t']` form: the denial shape naming
+    the table's DISPLAY name, and no live fetch."""
+    store = request.getfixturevalue(which)
+    _seed_row(store.chat_id, code, sql={KEY: SQL})
+    _no_fetch(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        r = _refresh_in(client, store.chat_id, code)
+    _assert_refresh_denied(r, [KEY])
+    assert _records(caplog, "LIVE_PREFETCH") == []
+
+
+@pytest.mark.parametrize("which, code", [
+    ("chat", "RESULT = dfs.get('live t')"),
+    ("live_only_chat", "RESULT = df"),
+], ids=["dfs-get", "live-only-df"])
+def test_dashboard_tile_refuses_a_denied_live_key_named_without_a_subscript(
+        client, request, monkeypatch, caplog, which, code):
+    """The tile route: the same referencing rule, the caller-specific
+    `role_denied` freeze naming the table — never persisted into the doc."""
+    store = request.getfixturevalue(which)
+    _seed_row(store.chat_id, code, sql={KEY: SQL})
+    ds, dash_id, tile_id = _tile(store.chat_id, code)
+    _no_fetch(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        r = _refresh_tile(client, dash_id, tile_id)
+    _assert_tile_denied(r, [KEY])
+    assert _records(caplog, "LIVE_PREFETCH") == []
+    stored = _stored_tile(ds, dash_id)
+    assert stored.get("frozen") is False, stored
+    assert stored["snapshot"]["table"]["total_rows"] == 1
+
+
+def test_df_on_a_snapshot_first_chat_is_not_a_reference_to_the_live_key(
+        client, chat, monkeypatch):
+    """The twin: with the csv loaded FIRST, `df` is that file — the denied
+    live table is not referenced, so the refresh runs (on the file) and no
+    live fetch happens."""
+    dfs = chat.load_dataframes(include_live=True)
+    assert next(iter(dfs)) == "d.csv" and KEY in dfs
+    code = "RESULT = df"
+    _seed_row(CHAT, code)
+    _no_fetch(monkeypatch)
+    body = _refresh_in(client, CHAT, code).json()
+    assert body.get("code") != "ROLE_DENIED", body
+    assert body["ok"] is True, body
+    assert body["table"]["total_rows"] == 2
+
+
+def test_dashboard_tile_gate_crash_on_a_live_chat_refuses_without_persisting(
+        client, chat, granted, monkeypatch, caplog):
+    """A crash of the roles lookup on a chat holding a live table: the tile
+    answers the caller-specific `role_denied` freeze naming no table, the
+    stored tile stays live (not frozen) with its snapshot, and nothing is
+    fetched."""
+    _seed_row(CHAT, CODE, sql={KEY: SQL})
+    ds, dash_id, tile_id = _tile(CHAT, CODE)
+    _roles_crash(monkeypatch)
+    _no_fetch(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        r = _refresh_tile(client, dash_id, tile_id)
+    _assert_tile_denied(r, [])
+    assert _records(caplog, "ROLE_GATE_FAILED")
+    assert _records(caplog, "LIVE_PREFETCH") == []
+    stored = _stored_tile(ds, dash_id)
+    assert stored.get("frozen") is False, stored
+    assert stored.get("frozen_reason") is None, stored
+    assert stored["snapshot"]["table"]["total_rows"] == 1
+
+
+def test_gate_crash_on_a_snapshot_only_chat_keeps_the_fail_open_refresh(
+        client, snapshot_chat, monkeypatch, caplog):
+    """Unchanged behaviour for a chat WITHOUT a live table: the same crash
+    still fails OPEN on both refresh paths (the item re-runs on the parquet)
+    — a gate bug must not freeze every snapshot refresh."""
+    _seed_row(SNAP_CHAT, SNAP_CODE)
+    ds, dash_id, tile_id = _tile(SNAP_CHAT, SNAP_CODE)
+    _roles_crash(monkeypatch)
+    _no_fetch(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        body = _refresh_in(client, SNAP_CHAT, SNAP_CODE).json()
+        tile_body = _refresh_tile(client, dash_id, tile_id).json()
+    assert body.get("code") != "ROLE_DENIED", body
+    assert body["ok"] is True, body
+    assert body["table"]["total_rows"] == 2
+    assert tile_body.get("reason") != "role_denied", tile_body
+    assert tile_body["ok"] is True, tile_body
+    assert tile_body["table"]["total_rows"] == 2
+    assert _records(caplog, "ROLE_GATE_FAILED")
+
+
+@pytest.mark.parametrize("route", ["refresh_item", "tile"])
+def test_registry_read_failure_on_a_live_chat_refuses(
+        client, chat, granted, monkeypatch, caplog, route):
+    """The registry itself cannot be read: whether the chat's table is live
+    is unknown, so the refresh is refused (never a fail-open that lets a
+    stored SELECT through)."""
+    _seed_row(CHAT, CODE, sql={KEY: SQL})
+    ds, dash_id, tile_id = _tile(CHAT, CODE)
+
+    def boom(self, *a, **kw):
+        raise RuntimeError("registry unreadable")
+    monkeypatch.setattr(db_sources.DataSourceStore, "list_tables", boom)
+    _no_fetch(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        if route == "refresh_item":
+            _assert_refresh_denied(_refresh_in(client, CHAT, CODE), [])
+        else:
+            _assert_tile_denied(_refresh_tile(client, dash_id, tile_id), [])
+    assert _records(caplog, "LIVE_PREFETCH") == []
+
+
+@pytest.mark.parametrize("route", ["full_table", "download_excel"])
+def test_full_table_gate_serves_a_snapshot_only_chat_under_a_role_crash(
+        client, snapshot_chat, monkeypatch, route):
+    """The fail-closed marker applies to chats holding a live table only: a
+    snapshot-only chat's record is served under a crashing roles read."""
+    key = _full_record(SNAP_CHAT, SNAP_CODE)
+    _roles_crash(monkeypatch)
+    _no_fetch(monkeypatch)
+    if route == "full_table":
+        r = _full_table(client, key, chat_id=SNAP_CHAT)
+        assert r.status_code == 200, r.text[:300]
+        assert r.json()["total_rows"] == 2
+    else:
+        r = _excel(client, key, chat_id=SNAP_CHAT)
+        assert r.status_code == 200, r.text[:300]
+        assert r.content[:2] == b"PK"
+
+
+@pytest.mark.parametrize("route", ["full_table", "download_excel"])
+def test_full_table_gate_serves_a_code_less_record_under_a_role_crash(
+        client, chat, monkeypatch, route):
+    """A chart-data record carries no code: nothing can be re-run, so the
+    stored rows are served even on a live chat under a crashing roles read."""
+    import routes.chat as chat_mod
+    key = chat_mod._persist_full_table(chat, PREVIEW, None)
+    assert key
+    _roles_crash(monkeypatch)
+    _no_fetch(monkeypatch)
+    if route == "full_table":
+        r = _full_table(client, key)
+        assert r.status_code == 200, r.text[:300]
+        assert r.json()["rows"] == PREVIEW["rows"]
+    else:
+        r = _excel(client, key)
+        assert r.status_code == 200, r.text[:300]
+        assert r.content[:2] == b"PK"
+
+
+def test_role_gate_failed_logs_the_exception_type_not_its_text(
+        client, chat, granted, monkeypatch, caplog):
+    """Part A #10: `ROLE_GATE_FAILED` names the exception TYPE and a fixed
+    reason — the exception's own text (which can quote table names or df
+    keys) never reaches the log."""
+    _seed_row(CHAT, CODE, sql={KEY: SQL})
+    _roles_crash(monkeypatch, message=f"roles unreadable {MARK_GATE}")
+    _no_fetch(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        _refresh_in(client, CHAT, CODE)
+    failed = _records(caplog, "ROLE_GATE_FAILED")
+    assert failed
+    assert any("RuntimeError" in x.getMessage() for x in failed), \
+        [x.getMessage() for x in failed]
+    for rec in caplog.records:
+        assert MARK_GATE not in rec.getMessage(), rec.getMessage()
+
+
+@pytest.mark.parametrize("route", ["refresh_item", "tile"])
+def test_a_raising_gate_refuses_on_a_live_chat_instead_of_a_500(
+        client, chat, granted, monkeypatch, caplog, route):
+    """`_role_refresh_block` itself raising (not the swallowed-crash marker)
+    is treated as a gate failure: on a chat holding a live table the refresh
+    is refused with the denial shape — never an unhandled 500, never a
+    fetch."""
+    import routes.chat as chat_mod
+    _seed_row(CHAT, CODE, sql={KEY: SQL})
+    ds, dash_id, tile_id = _tile(CHAT, CODE)
+
+    def boom(email, chat_id, code):
+        raise RuntimeError("gate unavailable")
+    monkeypatch.setattr(chat_mod, "_role_refresh_block", boom)
+    _no_fetch(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        try:
+            if route == "refresh_item":
+                r = _refresh_in(client, CHAT, CODE)
+            else:
+                r = _refresh_tile(client, dash_id, tile_id)
+        except RuntimeError as e:
+            pytest.fail(f"the refresh route raised instead of refusing: {e!r}")
+    if route == "refresh_item":
+        _assert_refresh_denied(r, [])
+    else:
+        _assert_tile_denied(r, [])
+    assert _records(caplog, "LIVE_PREFETCH") == []
+
+
+# ===========================================================================
+# 18. Part A #9 — a multi-table tile refresh keeps the SELECT on the record
+# ===========================================================================
+MULTI_CODE = ("RESULT = {'first': dfs['live t'], "
+              "'second': dfs['live t'].head(2)}")
+
+
+def test_multi_table_tile_refresh_persists_a_full_table_record_with_its_sql(
+        client, chat, registry, granted):
+    """A tile pinned from one table of a multi-table live answer (kind
+    `table` + `result_key`) re-runs through `_reexecute_full_df`; the fresh
+    full-table record it persists carries the referenced `sql` subset, so a
+    later Download Excel / refresh of THAT record re-runs the same SELECT."""
+    import routes.chat as chat_mod
+    _seed_row(CHAT, MULTI_CODE, sql={KEY: SQL})
+    rec_key = chat_mod._persist_full_table(chat, PREVIEW, MULTI_CODE,
+                                           result_key="first", sql={KEY: SQL})
+    assert rec_key
+    ds, dash_id, tile_id = _tile(CHAT, MULTI_CODE, result_key="first",
+                                 full_table_key=rec_key)
+    _insert_rows(registry["db"], 2)
+    body = _refresh_tile(client, dash_id, tile_id).json()
+    assert body["ok"] is True, body
+    assert body["table"]["total_rows"] == 27
+    new_key = body.get("full_table_key")
+    assert new_key and new_key != rec_key, body
+    rec = chat_mod._load_full_table_record(chat, new_key)
+    assert rec["code"] == MULTI_CODE
+    assert rec.get("result_key") == "first"
+    assert rec.get("sql") == {KEY: SQL}, rec

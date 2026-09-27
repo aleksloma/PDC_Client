@@ -319,7 +319,7 @@
   async function unshareAddress(addr, box, row) {
     box.disabled = true;
     try {
-      const res = await fetch(`/api/dashboards/${DASH_ID}/unshare`, {
+      const res = await pdcFetch(`/api/dashboards/${DASH_ID}/unshare`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: addr }),
       });
@@ -387,7 +387,7 @@
     }
     if (tile.full_table_key) {
       const win = window.PDCViewers.openBlankWindow('Table data');
-      fetch(`/api/chat/${tile.chat_id}/full_table/${tile.full_table_key}`)
+      pdcFetch(`/api/chat/${tile.chat_id}/full_table/${tile.full_table_key}`)
         .then(r => r.ok ? r.json() : Promise.reject(r.status))
         .then(t => window.PDCViewers.renderData(win, t))
         .catch(() => window.PDCViewers.renderData(win, (tile.snapshot || {}).table || null));
@@ -411,13 +411,13 @@
         const snapTable = (tile.snapshot || {}).table || {};
         let res;
         if (tile.full_table_key) {
-          res = await fetch(`/api/chat/${tile.chat_id}/download_excel/${tile.full_table_key}`, {
+          res = await pdcFetch(`/api/chat/${tile.chat_id}/download_excel/${tile.full_table_key}`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ filename }),
           });
         }
         if (!res || !res.ok) {
-          res = await fetch(`/api/chat/${tile.chat_id}/export_excel`, {
+          res = await pdcFetch(`/api/chat/${tile.chat_id}/export_excel`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ columns: snapTable.columns || [], rows: snapTable.rows || [], filename }),
           });
@@ -437,7 +437,7 @@
       // chart
       let filename = 'chart';
       try {
-        const nameRes = await fetch(`/api/chat/${tile.chat_id}/generate_filename`, {
+        const nameRes = await pdcFetch(`/api/chat/${tile.chat_id}/generate_filename`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content: tile.description || tile.title || '', type: 'image' }),
         });
@@ -446,7 +446,7 @@
       } catch (_) { /* keep default */ }
       const content = (tile.snapshot || {}).image_base64 || '';
       if (isPlotlySnapshot(tile)) {
-        const res = await fetch(`/api/chat/${tile.chat_id}/export_plotly_png`, {
+        const res = await pdcFetch(`/api/chat/${tile.chat_id}/export_plotly_png`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ html: content, filename, scale: 3 }),
         });
@@ -515,7 +515,7 @@
     btn.disabled = true;
     btn.classList.add('spinning');
     try {
-      const res = await fetch(`/api/dashboards/${DASH_ID}/tiles/${tile.tile_id}/refresh`, {
+      const res = await pdcFetch(`/api/dashboards/${DASH_ID}/tiles/${tile.tile_id}/refresh`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
       });
       let data = null;
@@ -556,7 +556,7 @@
 
   async function actRemove(tile, tileEl) {
     try {
-      const res = await fetch(`/api/dashboards/${DASH_ID}/tiles/${tile.tile_id}/remove`, {
+      const res = await pdcFetch(`/api/dashboards/${DASH_ID}/tiles/${tile.tile_id}/remove`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
       });
       const data = await res.json().catch(() => null);
@@ -574,7 +574,7 @@
   async function loadChatDfKeys(chatId) {
     if (chatId in chatDfKeys) return chatDfKeys[chatId];
     try {
-      const res = await fetch(`/api/chat/${chatId}/schema`);
+      const res = await pdcFetch(`/api/chat/${chatId}/schema`);
       if (!res.ok) { chatDfKeys[chatId] = null; return null; }
       const data = await res.json();
       chatDfKeys[chatId] = {
@@ -759,7 +759,7 @@
       .map(n => ({ tile_id: n.id, x: n.x || 0, y: n.y || 0, w: n.w || 1, h: n.h || 1 }));
     if (!tiles.length) return;
     try {
-      await fetch(`/api/dashboards/${DASH_ID}/layout`, {
+      await pdcFetch(`/api/dashboards/${DASH_ID}/layout`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tiles }),
       });
@@ -873,7 +873,7 @@
       if (textModalState) {
         // edit in place
         const { tile, item } = textModalState;
-        const res = await fetch(`/api/dashboards/${DASH_ID}/tiles/${tile.tile_id}/update`, {
+        const res = await pdcFetch(`/api/dashboards/${DASH_ID}/tiles/${tile.tile_id}/update`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(fields),
         });
@@ -882,7 +882,7 @@
         Object.assign(tile, fields);
         renderTileBody(item.querySelector('.pdc-tile-body'), tile);
       } else {
-        const res = await fetch(`/api/dashboards/${DASH_ID}/tiles`, {
+        const res = await pdcFetch(`/api/dashboards/${DASH_ID}/tiles`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ kind: 'text', ...fields }),
         });
@@ -933,7 +933,7 @@
         const name = document.getElementById('renameDashInput').value.trim();
         if (!name) return;
         try {
-          const res = await fetch(`/api/dashboards/${DASH_ID}/rename`, {
+          const res = await pdcFetch(`/api/dashboards/${DASH_ID}/rename`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name }),
           });
@@ -973,7 +973,7 @@
         const saveBtn = document.getElementById('btnSaveShareDash');
         saveBtn.disabled = true;
         try {
-          const res = await fetch(`/api/dashboards/${DASH_ID}/share`, {
+          const res = await pdcFetch(`/api/dashboards/${DASH_ID}/share`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ emails, message: document.getElementById('shareDashComment').value.trim() }),
           });
@@ -1007,7 +1007,7 @@
     delBtn.addEventListener('click', () => openModal('deleteDashModal'));
     document.getElementById('btnConfirmDeleteDash').addEventListener('click', async () => {
       try {
-        const res = await fetch(`/api/dashboards/${DASH_ID}/delete`, {
+        const res = await pdcFetch(`/api/dashboards/${DASH_ID}/delete`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
         });
         const data = await res.json().catch(() => null);
@@ -1046,7 +1046,7 @@
       const logout = document.getElementById('btnLogout');
       if (logout) {
         logout.addEventListener('click', async () => {
-          try { await fetch('/auth/logout', { method: 'POST' }); } catch (_) {}
+          try { await pdcFetch('/auth/logout', { method: 'POST' }); } catch (_) {}
           window.location.href = '/';
         });
       }
@@ -1057,17 +1057,14 @@
   document.addEventListener('DOMContentLoaded', async () => {
     if (window.i18n) window.i18n.init();
     try {
-      const authRes = await fetch('/auth/me');
-      const authData = await authRes.json();
-      if (!authData.authenticated) {
-        window.location.href = '/';
-        return;
-      }
+      // Signed out, /auth/me answers 401 and pdcFetch (http.js) sends the
+      // browser to the sign-in page.
+      await pdcFetch('/auth/me');
     } catch (_) { /* keep going — the doc fetch will 401 if truly logged out */ }
 
     let res;
     try {
-      res = await fetch(`/api/dashboards/${DASH_ID}`);
+      res = await pdcFetch(`/api/dashboards/${DASH_ID}`);
     } catch (e) {
       window.location.href = '/lab';
       return;

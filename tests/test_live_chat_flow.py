@@ -1343,3 +1343,151 @@ def test_plotly_regen_retry_sql_holds_only_the_selects_that_ran(chat, granted,
     assert "other key" not in kw["sql"]
     assert kw["sql"][KEY] == select
     assert kw["sql_error"] is None
+
+
+# ===========================================================================
+# 30. Task 14 item 2 — the filtered-table refusal rides ONE retry only, and
+#     a resent SELECT for a filtered key re-runs nothing (Part A #4)
+# ===========================================================================
+def _filtered_chat(env):
+    live = _register(env, where_filter="a >= 20")
+    _grant(USER, [live["tid"]])
+    return _chat_with([_db_entry(KEY, live["tid"], live["cid"])])
+
+
+def _count_default_reads(monkeypatch):
+    reads = []
+    real = db_connector.default_live_fetch
+
+    def counting(*a, **kw):
+        reads.append(1)
+        return real(*a, **kw)
+    monkeypatch.setattr(db_connector, "default_live_fetch", counting)
+    return reads
+
+
+def _refusal():
+    return {"table": KEY, "dialect": "sqlite", "class": "guard", "guard": True,
+            "message": FILTERED_SQL_MESSAGE}
+
+
+def test_filtered_refusal_rides_the_first_python_error_retry_only(
+        env, brain, executor, monkeypatch):
+    """The planner's SELECT was ignored on the filtered table. Two Python
+    errors follow: retry 1 reports the ignored SELECT (the guard-shaped
+    refusal), retry 2 — caused by a second Python error, with no SELECT sent
+    since — carries `sql_error: None` (the refusal was consumed)."""
+    chat = _filtered_chat(env)
+    calls, state = brain
+    seen, behaviour = executor
+    state["plan"]["sql"] = {KEY: "SELECT a, b FROM t WHERE a > 5"}
+    behaviour["errors"] = ["NameError: name 'x' is not defined",
+                           "NameError: name 'y' is not defined"]
+    reads = _count_default_reads(monkeypatch)
+    out = _run(chat)
+    assert len(calls["retry"]) == 2, [kw["error_msg"][:40] for kw in calls["retry"]]
+    assert calls["retry"][0]["sql_error"] == _refusal()
+    assert calls["retry"][1]["sql_error"] is None, calls["retry"][1]["sql_error"]
+    assert calls["retry"][1]["error_msg"].startswith("NameError")
+    assert [kw["sql"] for kw in calls["retry"]] == [{KEY: None}, {KEY: None}]
+    assert len(reads) == 1
+    assert out["text"] == "summarized"
+
+
+def test_a_resent_select_on_a_filtered_table_is_refused_once_and_never_re_read(
+        env, brain, executor, monkeypatch, caplog):
+    """Part A #4 + item 2: retry 1 answers code AND the same SELECT again.
+    The filtered key was already served by the default read, so nothing is
+    fetched a second time over the whole turn; the resent SELECT is recorded
+    again and its refusal rides exactly the NEXT retry, then no later one."""
+    chat = _filtered_chat(env)
+    calls, state = brain
+    seen, behaviour = executor
+    select = "SELECT a, b FROM t WHERE a > 5"
+    state["plan"]["sql"] = {KEY: select}
+
+    def retry(kw):
+        n = len(calls["retry"])
+        out = {"kind": "PYTHON", "code": CODE_SUM, "usage": {}}
+        if n == 1:
+            out["sql"] = {KEY: select}          # the planner insists
+        return out
+    state["retry"] = retry
+    behaviour["errors"] = ["NameError: name 'x' is not defined",
+                           "NameError: name 'y' is not defined",
+                           "NameError: name 'z' is not defined"]
+    reads = _count_default_reads(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        out = _run(chat)
+    assert len(calls["retry"]) == 3
+    errs = [kw["sql_error"] for kw in calls["retry"]]
+    assert errs == [_refusal(), _refusal(), None], errs
+    assert len(reads) == 1, f"the filtered table was read {len(reads)} times"
+    assert len(seen["exec"]) == 4
+    for call in seen["exec"]:
+        assert sorted(call["dfs"][KEY]["a"].tolist()) == [20, 21, 22, 23, 24]
+    assert out["sql"] == {KEY: None}
+    assert out["text"] == "summarized"
+
+
+GENERIC_EXHAUSTED_TEXT = ("I couldn't run this analysis with your current data. "
+                          "Try rephrasing or simplifying the request.")
+
+
+# ===========================================================================
+# 31. Part A #5 — `_ensure_live` crashing before any table is known names
+#     no table ("?" is never shown)
+# ===========================================================================
+def test_prefetch_crash_before_a_key_is_known_names_no_table(
+        chat, granted, brain, executor, monkeypatch, caplog):
+    """The registry read inside `_ensure_live` raises before the fetch loop
+    reaches a key. `LIVE_PREFETCH_CRASHED` is logged; neither the retry
+    prompt nor the final answer names a table as `'?'` — the exhausted
+    answer is the generic text, not the live-failure sentence."""
+    calls, state = brain
+    seen, _ = executor
+
+    def boom(self, *a, **kw):
+        raise RuntimeError("registry row unreadable")
+    monkeypatch.setattr(db_sources.DataSourceStore, "get_table", boom)
+    with caplog.at_level(logging.INFO):
+        out = _run(chat)
+    assert _records(caplog, "LIVE_PREFETCH_CRASHED")
+    assert seen["exec"] == []
+    assert calls["retry"], "the crash never reached the retry loop"
+    for kw in calls["retry"]:
+        assert "'?'" not in kw["error_msg"], kw["error_msg"]
+    assert "'?'" not in out["text"], out["text"]
+    assert out["text"] == GENERIC_EXHAUSTED_TEXT, out["text"]
+
+
+# ===========================================================================
+# 32. Part A structural — the retry payload's `sql` is never the planned map
+# ===========================================================================
+def test_no_retry_call_sends_the_planned_sql_map():
+    """`sql` on every `brain_client.retry(` call is what RAN (`_retry_sql`),
+    never `state["sql_map"]` (what was PLANNED) — an AST scan over
+    run_chat_local.py."""
+    import ast
+    from pathlib import Path
+    src = Path(run_chat_local.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    retry_calls = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "retry"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "brain_client"):
+            retry_calls.append(node)
+    assert len(retry_calls) >= 7, len(retry_calls)
+    for call in retry_calls:
+        for sub in ast.walk(call):
+            if isinstance(sub, ast.Subscript):
+                key = sub.slice
+                if isinstance(key, ast.Constant) and key.value == "sql_map":
+                    pytest.fail(f"retry call at line {call.lineno} passes "
+                                f"state['sql_map']")
+        for kw in call.keywords:
+            if kw.arg == "sql":
+                text_ = ast.get_source_segment(src, kw.value) or ""
+                assert "sql_map" not in text_, (call.lineno, text_)

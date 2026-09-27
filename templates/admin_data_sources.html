@@ -793,6 +793,25 @@
     </div>
   </div>
 
+  <!-- ── User action confirm (End sessions / Remove user): the same narrow
+       chrome; title, text and button label are set per action (textContent) ── -->
+  <div id="userActionModal" class="adm-modal-backdrop hidden">
+    <div class="adm-modal adm-modal-narrow">
+      <div class="adm-modal-head">
+        <h3 id="userActionTitle">Confirm</h3>
+        <button id="closeUserAction" class="adm-x">✕</button>
+      </div>
+      <div class="adm-modal-body">
+        <p id="userActionText" class="adm-muted"></p>
+      </div>
+      <div class="adm-modal-foot">
+        <span class="adm-spacer"></span>
+        <button id="btnUserActionCancel" class="adm-btn ghost">Cancel</button>
+        <button id="btnUserActionGo" class="adm-btn danger">Confirm</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Busy overlay for operations that hit the customer DB (snapshot /
        refresh / test) — large tables can take a while; the page must never
        look dead during them. -->

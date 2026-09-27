@@ -32,7 +32,7 @@ from logger_utils import log_with_sid
 from routes.chat import (_FULL_KEY_RE, _code_not_stored, _json_safe,
                          _load_full_table_record, _persist_full_table,
                          _persistable_chart_data, _reexecute_full_df,
-                         _require_chat, _role_refresh_block,
+                         _refresh_role_gate, _require_chat,
                          code_is_stored_async, run_item_refresh)
 
 router = APIRouter(prefix="/api/dashboards", tags=["client-dashboards"])
@@ -538,14 +538,15 @@ async def refresh_tile(request: Request, dash_id: str, tile_id: str):
 
     # Role gate — BEFORE the branch split so both execution paths are covered.
     # Caller-specific like access_revoked above: never persisted, the tile
-    # stays live for viewers whose role covers the table.
-    drop, blocked = _role_refresh_block(email, chat_id, code)
-    if blocked:
+    # stays live for viewers whose role covers the table. A gate failure on
+    # a chat holding a live table refuses too, naming no table.
+    drop, blocked, refused = await _refresh_role_gate(email, chat_id, code)
+    if refused or blocked:
         log_with_sid(email, "info",
                      f"DASH_TILE_ROLE_DENIED dash={log_safe_text(dash_id, 80)} "
                      f"tile={log_safe_text(tile_id, 80)}")
         return {"ok": False, "frozen": True, "reason": "role_denied",
-                "blocked_tables": blocked}
+                "blocked_tables": [] if refused else blocked}
 
     if kind == "table" and result_key is not None:
         # Multi-table answers: the code's RESULT is a dict of tables; the
@@ -561,8 +562,13 @@ async def refresh_tile(request: Request, dash_id: str, tile_id: str):
                 "total_rows": int(len(df)),
             })
             result = {"ok": True, "kind": "table", "table": table}
+            # What the re-execution ran (see `_reexecute_full_df`), so the
+            # fresh record keeps its SELECT like the refresh_item one does.
+            attrs = getattr(df, "attrs", None) or {}
             new_key = _persist_full_table(local_store.ChatDataStore(chat_id), table,
-                                          code, result_key=result_key)
+                                          code, result_key=result_key,
+                                          sql=attrs.get("pdc_sql_used") or None,
+                                          first_key=attrs.get("pdc_first_key"))
             if new_key:
                 result["full_table_key"] = new_key
     else:
