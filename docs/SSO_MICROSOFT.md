@@ -107,12 +107,13 @@ The password form is **always** reachable at:
 ```
 
 Use it for the `ladmin` account (which has no Microsoft identity and always
-signs in with its password), for local accounts, and as the recovery path if
-the SSO configuration ever breaks while auto-redirect is on. A user whose
-account has signed in with Microsoft and has no local password (a share or
-invitation placeholder included) cannot use it: that account cannot get a
-password (below), except through the manual recovery described there. **Disable SSO** on the
-ladmin page returns the landing page to the plain password form instantly.
+signs in with its password), for local accounts that have never signed in
+with Microsoft, and as the recovery path if the SSO configuration ever breaks
+while auto-redirect is on. While SSO is enabled, an account that has signed
+in with Microsoft cannot use it, whether or not it holds a local password
+(below). **Disable SSO** on the ladmin page returns the landing page to the
+plain password form instantly and gives every account that holds a local
+password its password back.
 
 ## Behavior details
 
@@ -125,26 +126,38 @@ ladmin page returns the landing page to the plain password form instantly.
   sign out of Microsoft 365 or use a private window.
 - **First SSO login auto-provisions** the local profile — the one way an
   account comes to exist without an invitation or a share, since a password
-  sign-in never creates one. Existing password accounts with the same email
-  simply gain SSO — their password keeps working, and password reset flows
-  are untouched.
+  sign-in never creates one. An existing password account with the same
+  email becomes a Microsoft account at its first Microsoft sign-in (below).
 - **No local password for Microsoft accounts.** An account that has signed in
   with Microsoft and holds no local password cannot obtain one: "Reset
   password" mails it nothing, and a password change or an invitation for it
   is refused ("This account signs in with Microsoft and has no local
   password."). Multi-factor authentication and conditional access apply at
   sign-in, in Entra; a local password would bypass them.
+- **While SSO is enabled, Microsoft accounts sign in with Microsoft only.**
+  Once an account has signed in with Microsoft, a local password it also
+  holds is refused at the password form (the same "Sign-in failed" line as a
+  wrong password), "Reset password" mails it nothing, and a reset link mailed
+  before is refused with "This account signs in with Microsoft and has no
+  local password." The `ladmin` account is exempt. Nothing is deleted:
+  **Disable SSO** and the password works again. Such a user can still set a
+  local password through **Change Password** in the profile menu, but it
+  stays unusable while SSO is enabled.
 - **Disabling a user in Entra does not end an open session here.** There is
   no back-channel logout: an open PowerDataChat session lasts until the
   browser drops the cookie or its 30-day lifetime (`REMEMBER_ME_MAX_DAYS`)
-  runs out. Restarting the web container is today's forced sign-out.
-- **Recovering a stranded account.** If SSO is switched off, or a user leaves
-  your Entra tenant but still needs access, an account that has signed in
-  with Microsoft and has no local password cannot sign in at all. Recover it
-  by hand: remove the `sso_provider` key from `users/<email>/auth.json` on the
-  data volume, restart the web container, then send the user a reset link
-  (**Invite user** on the Users page, or "Reset password" on the sign-in
-  page).
+  runs out. To end it at once, use **End sessions** on that user's row of the
+  admin panel's **Users** page; **Remove** deletes the account and everything it
+  owns, and a user still assigned in Entra would get a new, empty account at
+  the next Microsoft sign-in.
+- **Recovering a stranded account.** If SSO is switched off, an account that
+  has signed in with Microsoft and has no local password cannot sign in at
+  all; while SSO stays on, the same is true of any Microsoft user who leaves
+  your Entra tenant but still needs access. Recover it by hand: remove the
+  `sso_provider` key from `users/<email>/auth.json` on the data volume,
+  restart the web container, then — unless the account already had a
+  password — send the user a reset link (**Invite user** on the Users page,
+  or "Reset password" on the sign-in page).
 - Every Save / Test / Enable / Disable is written to the admin audit log
   (tenant and client IDs only — never the secret).
 

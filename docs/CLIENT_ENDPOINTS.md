@@ -146,7 +146,26 @@ changed since keeps it, and its lifetime is counted from its last renewal.
 The generation is cached in the one web process, so a password written by
 another process (an operator script) ends other sessions only after the next
 restart; and a request the changing browser had already sent before the
-change completed can sign that browser out too (it signs in again).
+change completed can sign that browser out too (it signs in again). An
+administrator's **End sessions** (`POST /api/admin/users/end_sessions`)
+writes a new generation and nothing else, so every session of the account
+ends on its next request while its password stays as it was. After
+**Remove** (`POST /api/admin/users/remove`) the account has neither profile
+nor auth record, and its sessions fail the same check — including an
+SSO-only or legacy account that never had a generation.
+
+On the `/lab`, `/c/…` and `/dashboards/…` pages every request of the page
+scripts (`static/dashboard.js`, `static/dashboard_view.js`) goes through
+`window.pdcFetch` (`static/http.js`, loaded before the other page scripts),
+a pass-through to `fetch` that hands every response back untouched except
+a 401: then the browser goes to `/?next=<path>` and the caller never sees
+an answer, so a session that ended elsewhere shows the sign-in page instead
+of a failing page. The one exception is `/auth/password`, whose 401 means a
+wrong current password and reaches the caller. The chart-frame
+registration in `static/vendor/viewers.js` (`POST /api/charts`) keeps its
+own `fetch`: a 401 there leaves the frame blank, and the page script's own
+next request redirects. The sign-in page ignores `next`; a successful
+sign-in lands where it always does.
 
 Microsoft-only accounts (`sso_provider` set, no local hash —
 `AuthStore.is_sso_only`) never get a local password: the anonymous reset
@@ -155,12 +174,25 @@ forced change and `/auth/password` answer 403 with "This account signs in with
 Microsoft and has no local password." (`/auth/password`: `{error, code:
 "SSO_ACCOUNT"}`); the invite answers 409 with the same code.
 
+While Microsoft SSO is ENABLED (`sso_store.is_enabled()`, read per request),
+an account whose `auth.json` carries `sso_provider` — it has signed in with
+Microsoft at least once — cannot use a local password even when it holds
+one (`routes.auth._sso_enforced_for`): the sign-in form answers the same
+neutral 401 as a wrong password, decided after the one hash verification so
+neither the page nor the timing differs; a reset request mints nothing and
+answers the neutral page; and a reset link, one minted while SSO was off
+included, is refused with 403 and the sentence above. The bootstrap local
+admin is exempt. Disabling SSO gives such an account its local password
+back; nothing is deleted. `/auth/password` still lets a signed-in account
+of this kind set a local password, which stays unusable while SSO is
+enabled.
+
 | Method | Path | Behavior |
 |---|---|---|
-| `POST` | `/auth/login` | form-encoded `email=`, `password=`, `remember?`. Every failure — unknown address, an account without a password (invited, shared with, legacy) and a wrong password — answers `401` with the SAME page and line, "Sign-in failed. Check your email and password, or use “Reset password” if you have not set one yet.", plus the Reset action, after exactly one password-hash verification (a fixed dummy hash where there is none), so neither the body nor the time says which case it was; nothing is created. The exceptions are the unbootstrapped `ladmin` (403, the server-side fix) and `ALLOW_SELF_REGISTRATION=true`, where a NEW email adopts the entered password + welcome mail. A malformed form → 400; over the attempt limit → 429 + `Retry-After`. A temporary password from a release before this one → session flagged and redirected to `/auth/change_password`. Success target: `/lab` for everyone — promoted admins included — except the bootstrap ladmin account → `/admin/data_sources` (`_post_login_target`, keyed on `AuthStore.is_bootstrap_admin`, 19g). `remember` → persistent session cookie whose `Max-Age` is the time left of the 30-day lifetime (RememberMeSessionMiddleware in app.py); otherwise browser-session cookie; either way the session ends 30 days after sign-in. |
-| `POST` | `/auth/reset_password` | form-encoded `email=`. Every well-formed address — known, unknown, or an email-shaped `ladmin` — answers `200` with the same page: "If an account exists for this address, a reset link has been sent. It expires in 30 minutes." Everything that depends on the account runs in a background thread: for an existing account a token (`secrets.token_urlsafe(32)`) is minted, only its SHA-256 stored in `auth.json` (`reset_token_hash`, `reset_expires_at`, `reset_used`; a new request replaces the old token) and the link `<PUBLIC_BASE_URL>/auth/reset/<token>` brain-relayed; a failed send discards the token. With `PUBLIC_BASE_URL` unset or not an http(s) URL nothing is minted or sent (`PASSWORD_RESET_NO_BASE_URL` logged) — the link is never built from the request's `Host`, which the caller controls. The user's own password stays valid until the link is used. A non-email id → 400; over the attempt limit → 429 + `Retry-After`. |
+| `POST` | `/auth/login` | form-encoded `email=`, `password=`, `remember?`. Every failure — unknown address, an account without a password (invited, shared with, legacy) and a wrong password — answers `401` with the SAME page and line, "Sign-in failed. Check your email and password, or use “Reset password” if you have not set one yet.", plus the Reset action, after exactly one password-hash verification (a fixed dummy hash where there is none), so neither the body nor the time says which case it was; nothing is created. While Microsoft SSO is enabled, an account that has signed in with Microsoft gets the same answer whatever the password (see above; the bootstrap admin is exempt). The exceptions are the unbootstrapped `ladmin` (403, the server-side fix) and `ALLOW_SELF_REGISTRATION=true`, where a NEW email adopts the entered password + welcome mail. A malformed form → 400; over the attempt limit → 429 + `Retry-After`. A temporary password from a release before this one → session flagged and redirected to `/auth/change_password`. Success target: `/lab` for everyone — promoted admins included — except the bootstrap ladmin account → `/admin/data_sources` (`_post_login_target`, keyed on `AuthStore.is_bootstrap_admin`, 19g). `remember` → persistent session cookie whose `Max-Age` is the time left of the 30-day lifetime (RememberMeSessionMiddleware in app.py); otherwise browser-session cookie; either way the session ends 30 days after sign-in. |
+| `POST` | `/auth/reset_password` | form-encoded `email=`. Every well-formed address — known, unknown, or an email-shaped `ladmin` — answers `200` with the same page: "If an account exists for this address, a reset link has been sent. It expires in 30 minutes." Everything that depends on the account runs in a background thread: for an existing account a token (`secrets.token_urlsafe(32)`) is minted, only its SHA-256 stored in `auth.json` (`reset_token_hash`, `reset_expires_at`, `reset_used`; a new request replaces the old token) and the link `<PUBLIC_BASE_URL>/auth/reset/<token>` brain-relayed; a failed send discards the token. With `PUBLIC_BASE_URL` unset or not an http(s) URL nothing is minted or sent (`PASSWORD_RESET_NO_BASE_URL` logged) — the link is never built from the request's `Host`, which the caller controls. The user's own password stays valid until the link is used. A Microsoft-only account — and, while SSO is enabled, any account that has signed in with Microsoft — gets nothing minted (same page). A non-email id → 400; over the attempt limit → 429 + `Retry-After`. |
 | `GET` | `/auth/reset/{token}` | the set-new-password form (`reset_password.html`, no script) with `Cache-Control: no-store` and `Referrer-Policy: no-referrer`; no side effect. A malformed, unknown, expired or used token → the sign-in page with "This reset link is invalid or has expired. Request a new one." (404). Invalid tokens count per peer address. |
-| `POST` | `/auth/reset/{token}` | form-encoded `new_password=`, `confirm_password=` (the password rule above, matching; a rule failure re-renders the form, 400; a Microsoft-only account → 403). Validates and consumes the token in one locked step, sets the password (which also clears any temporary password and pending forced change), `302` → `/?reset=done` ("Your password has been updated. Sign in with it."). No automatic sign-in; every open session of the account ends. A second use → 404; a 429 here carries the same no-store / no-referrer headers. |
+| `POST` | `/auth/reset/{token}` | form-encoded `new_password=`, `confirm_password=` (the password rule above, matching; a rule failure re-renders the form, 400; a Microsoft-only account — and, while SSO is enabled, any account that has signed in with Microsoft — → 403, checked before the password rule). Validates and consumes the token in one locked step, sets the password (which also clears any temporary password and pending forced change), `302` → `/?reset=done` ("Your password has been updated. Sign in with it."). No automatic sign-in; every open session of the account ends. A second use → 404; a 429 here carries the same no-store / no-referrer headers. |
 | `POST` | `/auth/change_password` | form-encoded `new_password=`, `confirm_password=` — the forced-change submit (session required; the password rule above, 400; a Microsoft-only account → 403). Ends the account's other sessions; this one stays signed in. |
 | `POST` | `/auth/logout` | clears session, redirects to `/`. |
 | `GET`  | `/auth/me` | `{authenticated, email}` |
@@ -664,6 +696,8 @@ skipped at read time, no profile rewrites. Emails are always body-carried
 | `POST` | `/api/admin/users/invite` | ladmin only. `{email}` → `200 {ok, email, created, mail_sent[, mail_error]}`: creates a password-less account when the address has none (`created: true`; an existing password-less account is re-invited, `created: false`), mints a reset token and mails the link (`<PUBLIC_BASE_URL>/auth/reset/<token>`) through the brain, waiting up to `BRAIN_DRAFT_TIMEOUT`; with `PUBLIC_BASE_URL` unset the account is still created and the answer is `mail_sent: false` with that reason. A failed mail discards the token and answers `mail_sent: false` with the reason; the account stays. 400 invalid address / the bootstrap account; 409 `{code: "USER_EXISTS"}` when the account already has a password; 409 `{code: "SSO_ACCOUNT"}` for a Microsoft-only account. The mail is sent with `kind: "invite"` (invitation wording). Audited `user.invite` with `{created, mail_sent}` — never the link. Not attempt-limited (admin-guarded) |
 | `POST` | `/api/admin/users/set_role` | Sets the user's HELD ROLE LIST (19c): `{email, role_ids: [...]}` → `{ok, user}`; the legacy `{email, role_id}` shape is still accepted (→ one-element list); empty list reverts to Base. 400 missing email / the bootstrap ladmin account / any unknown role id (19g: PROMOTED admins take roles like anyone — only the bootstrap identity is refused); 404 unknown user. Audited `user.set_roles` with `{role_ids, role_names}` |
 | `POST` | `/api/admin/users/set_permission` | 19e — sets the per-user PERMISSION: `{email, permission: "standard"\|"power"\|"admin"}` ("standard" stored as "user") → `{ok, user}`. 400 missing email / invalid value / the bootstrap ladmin account / the CALLER's own account (no self-demotion); 404 unknown user. Never touches `data_roles` — and since 19g a promoted admin's roles stay ACTIVE (full analysis user), so promote/demote round-trips are lossless. Audited `user.set_permission` with `{old, new}` |
+| `POST` | `/api/admin/users/end_sessions` | `{email}` → `{ok: true}`: signs the account out everywhere by writing a new session generation (see "Sessions" above); the password, or an SSO-only account's password-less state, is untouched and the user can sign in again. Checked in this order: missing email → 400; the bootstrap local-admin account → 400; an address `routes.auth._EMAIL_RE` refuses → 400 "Enter a valid email address."; unknown user → 404. The caller's own account is allowed (it signs itself out everywhere). A failed write → 500, nothing audited. Audited `user.sessions_ended` |
+| `POST` | `/api/admin/users/remove` | `{email}` → `{ok: true, chats_deleted}`: deletes `users/<email>/` (profile, credentials, chat and conversation lists, dashboards — the dashboard shares it received go with its index) and then every chat whose owner it is (`chatdata/<chat_id>/`, found by a scan of every chat meta, so deactivated chats go too; `chats_deleted` counts them). Every session of the account ends on its next request, an SSO-only account's included. Recipients of its chats and dashboards meet the existing owner-vanished paths (chat routes 404, a tile from a deleted chat freezes as `source_deleted`, a shared dashboard resolves nothing). The address stays in other owners' share lists, inert until the address is invited again. Checked in this order: missing email → 400; the bootstrap local-admin account → 400; an invalid address → 400 "Enter a valid email address."; the caller's own account → 400; unknown user → 404. A failure removing the account folder → 500, nothing audited. Audited `user.removed` with `{chats_deleted}`. Cannot be undone |
 | `GET` | `/api/admin/roles` | `{roles:[{…, is_base, is_builtin, member_count}]}` — Base first, the rest by name; `member_count` counts users HOLDING the role (a user with 3 roles counts in all 3) |
 | `POST` | `/api/admin/roles` | create: `{name, description?, table_ids?, scope_grants?, manage_grants?}` → 201 `{role}` (a stray 19c-era `power_user` key is silently ignored). 400: empty/duplicate name (case-insensitive, "base" reserved), unknown table id, **connector table id** (exempt from role checks — ungrantable), unknown connection / malformed entry in EITHER grant list (`manage_grants` validate exactly like `scope_grants`). Audited `role.create` (grant + manage counts) |
 | `POST` | `/api/admin/roles/{rid}` | edit (fields present ⇒ replace, absent ⇒ keep — `scope_grants` and `manage_grants` replace independently). 404 unknown; 400 renaming Base — but a RESTATED IDENTICAL name is ignored, not a 400 (19c fix: the UI save payload always carries the unchanged name, which used to make every built-in edit fail); description/grants stay editable. Audited `role.update` |
@@ -674,7 +708,10 @@ The wizard save's `access_role_ids` writes through `roles_store.set_table_roles`
 19c multi-role checkbox picker — every toggle POSTs the full held list — and
 the 19e per-row Permission dropdown Standard / Power user / Local admin with a
 confirm dialog before promoting to admin; the roles picker stays enabled on
-admin rows — promoted admins hold roles like anyone) + **Roles** section (cards + a tri-state access tree
+admin rows — promoted admins hold roles like anyone; each row ends with
+**End sessions** and **Remove**, each confirmed in a dialog first — the
+Remove text names the account, its chats and dashboards and the shares
+built on them) + **Roles** section (cards + a tri-state access tree
 connection → schema → tables; checking a schema/connection stores a scope
 grant and locks its descendants "via schema/connection").
 
@@ -683,11 +720,13 @@ grant and locks its descendants "via schema/connection").
 · `POST /api/chat/{id}/refresh_item` + dashboard tile refresh (per-table
 block, below) · `GET /api/chat/{id}/schema` (advisory `allowed` flag).
 · `GET /api/chat/{id}/full_table/{key}` + `POST .../download_excel/{key}`
-(a LIVE fetch only — 403 `ROLE_DENIED`, fail closed; see those rows).
+(a LIVE fetch only — 403 `ROLE_DENIED`; fails closed on a chat holding a
+live table; see those rows).
 Deliberately NOT gated (decision: no retroactive blocking — snapshots stay
 viewable): `chat/stream`, `edit_regenerate` (both drop an uncovered live
-table before the planner instead), full-table/Download-Excel re-execution of
-snapshot data, Auto Analytics, and the central nightly scheduler.
+table before the planner instead), full-table/Download-Excel re-execution
+that touches no uncovered live table, Auto Analytics, and the central
+nightly scheduler.
 
 **Security invariants** (stated in code — `db_connector.py`, `sandbox_guard.py`):
 the connector only ever issues SELECT/introspection statements
@@ -844,8 +883,8 @@ additively persists `sql` (`{df key: SELECT text}`, `null` for a key served
 by the default read), `live_truncated` (bool) and `live_rows`
 (`{df key: rows}`); a streamed partial and the done event carry `sql` as
 well, and the durable full-table records (`full_table_key(s)`) store the
-`sql` subset their code references, so Download Excel / Show full table
-re-run the same query. A capped result appends a localized note to the
+`sql` subset their code references, so Download Excel / Show data re-run
+the same query. A capped result appends a localized note to the
 answer text ("Note: <table> is a live table; only the first N rows of the
 query result were used."). A failed SELECT never runs the sandbox: the
 attempt counts against the same three retries with a value-free class
@@ -970,7 +1009,7 @@ calls the brain.
 | Method | Path | Behavior |
 |---|---|---|
 | `POST` | `/api/chat/{chat_id}/export_plotly_png` | Body `{html, filename, scale}`. Renders the interactive chart's raw Plotly HTML to a high-resolution PNG server-side (via `routes/report._plotly_html_to_png`, kaleido) and returns `image/png` as an attachment. `400` when `html` is missing; `502` if the chart cannot be rendered. |
-| `POST` | `/api/chat/{chat_id}/download_excel/{key}` | Body `{filename}`. Streams the full result table for `{key}` (the `full_table_key` / `chart_data_key` the chat stream emits — the same durable record as `full_table`) as an `.xlsx` spreadsheet: the record's stored code is re-executed (a live table re-fetched with the stored SQL) and the stored preview rows are the fallback when that yields nothing. Returns `404 {"error": "Table not found or expired."}` when the key is missing/expired; `502` on build failure. **Live-table gate:** before any re-execution, an item whose stored code references a LIVE table the requester's role does not cover (by the pre-fetch's own rule: a quoted df key, a generic `dfs` walk, or the `df` alias of the first frame) → `403 {"ok": false, "code": "ROLE_DENIED", "blocked_tables": [<display names>], "error": "Your role does not include this table's data — refresh is unavailable."}`, logged `FULL_TABLE_ROLE_DENIED` / `DOWNLOAD_EXCEL_ROLE_DENIED`; no database query is issued. The gate FAILS CLOSED: any error inside it (including a failing role read) answers the same 403 with `blocked_tables: []`, logged `LIVE_REEXEC_GATE_FAILED error=<type>`. Snapshot re-execution is not gated (viewing existing data is never blocked retroactively). 403 rather than the refresh path's 200 because the success answer of `download_excel` is a byte stream. |
+| `POST` | `/api/chat/{chat_id}/download_excel/{key}` | Body `{filename}`. Streams the full result table for `{key}` (the `full_table_key` / `chart_data_key` the chat stream emits — the same durable record as `full_table`) as an `.xlsx` spreadsheet: the record's stored code is re-executed (a live table re-fetched with the stored SQL) and the stored preview rows are the fallback when that yields nothing. Returns `404 {"error": "Table not found or expired."}` when the key is missing/expired; `502` on build failure. **Live-table gate:** before any re-execution, an item whose stored code references a LIVE table the requester's role does not cover (by the pre-fetch's own rule: a quoted df key, a generic `dfs` walk, or the `df` alias of the first frame) → `403 {"ok": false, "code": "ROLE_DENIED", "blocked_tables": [<display names>], "error": "Your role does not include this table's data — refresh is unavailable."}`, logged `FULL_TABLE_ROLE_DENIED` / `DOWNLOAD_EXCEL_ROLE_DENIED`; no database query is issued. The gate is consulted only where a live fetch can happen: a record without stored code, or a chat that holds no live table, is served without it, and a table the role does not cover that is a SNAPSHOT is served too (viewing existing data is never blocked retroactively). On a chat holding a live table — or when that cannot be determined — the gate FAILS CLOSED: any error inside it (including a failing role read) answers the same 403 with `blocked_tables: []`, logged `LIVE_REEXEC_GATE_FAILED error=<type>`. 403 rather than the refresh path's 200 because the success answer of `download_excel` is a byte stream. |
 | `POST` | `/api/chat/{chat_id}/export_excel` | Body `{columns, rows, filename}`. Builds an `.xlsx` directly from the posted preview table and returns the spreadsheet mime. `400` when no table data is posted. |
 
 All three require an authenticated session with access to `{chat_id}`. `.xlsx`
@@ -1041,19 +1080,30 @@ refreshed to reflect the new data.
   since switched back to snapshot is served from its parquet and the stored
   SQL is ignored. The dashboard tile refresh and `_reexecute_full_df` follow
   the same rules.
-- **Role gate** (`_role_refresh_block`, shared with the dashboard tile
-  refresh): when the item's code references (same `dfs['…']` key regex as the
-  freeze below) a non-connector DB table the REQUESTER's role does not cover,
-  the refresh returns `200 {ok:false, code:"ROLE_DENIED", blocked_tables,
-  error}` — per-table semantics: an item touching only allowed tables still
-  refreshes even when the chat holds denied ones. Denied frames are ALSO
-  dropped from the exec namespace (`drop_df_keys`, filtered AFTER the per-chat
-  cached load) so unreferenced access is impossible. For shared chats the gate
-  keys on the requester, not the owner. The dashboard tile variant returns the
+- **Role gate** (`_role_refresh_block` through `_refresh_role_gate`, shared
+  with the dashboard tile refresh, run off the event loop): when the item's
+  code references a non-connector DB table the REQUESTER's role does not
+  cover, the refresh returns `200 {ok:false, code:"ROLE_DENIED",
+  blocked_tables, error}` and nothing runs — no database query either.
+  "References" is the `dfs['…']` key regex of the freeze below for every
+  denied table, plus, for a denied LIVE table, the pre-fetch's own rule (the
+  key quoted anywhere in the code, a generic `dfs` walk, or `df` when that
+  table is the first frame), so a `dfs.get(…)` or `df` item on a denied live
+  table is refused rather than computed on whatever is left. Per-table
+  semantics: an item touching only allowed tables still refreshes even when
+  the chat holds denied ones. Denied frames are ALSO dropped from the exec
+  namespace (`drop_df_keys`, filtered AFTER the per-chat cached load) so
+  unreferenced access is impossible. For shared chats the gate keys on the
+  requester, not the owner. The dashboard tile variant returns the
   caller-specific `{ok:false, frozen:true, reason:"role_denied",
   blocked_tables}` — never persisted (mirror of `access_revoked`). File-only
-  chats perform zero role reads. An unexpected gate crash fails OPEN (logged
-  `ROLE_GATE_FAILED`); genuine denials fail closed through Base-role defaults.
+  chats perform zero role reads. Genuine denials fail closed through
+  Base-role defaults. When the gate itself fails (logged `ROLE_GATE_FAILED`),
+  a chat that holds a live table — or whose live status cannot be read — is
+  refused with no table named (`refresh_item`: `200 {ok:false,
+  code:"ROLE_DENIED", blocked_tables: [], error}`; tile: `{ok:false,
+  frozen:true, reason:"role_denied", blocked_tables: []}`, not persisted);
+  a chat without a live table keeps the fail-open answer and refreshes.
 - **Refresh freezing** (frontend): a button whose stored code subscripts a df
   key (`dfs['…']` / `dfs["…"]` — exact keys only, no column analysis) that no
   longer exists in `/api/chat/{id}/schema` renders **disabled** (greyed, not
@@ -1096,7 +1146,7 @@ chars, regex-guarded (path-traversal safe). Old-shape docs load with defaults
 | `POST` | `/api/dashboards/{id}/tiles/{tile_id}/update` | owner only; TEXT tiles only (chart/table tiles → 400 — their content changes via refresh, never free edits). Body: any subset of `{text, style, color, size, align, valign}`, same validation as create; empty body → 400. Returns `{ok, tile}`. |
 | `POST` | `/api/dashboards/{id}/tiles/{tile_id}/remove` | owner only |
 | `POST` | `/api/dashboards/{id}/layout` | `{tiles: [{tile_id, x, y, w, h}]}` bulk save — owner only; ints validated/clamped, unknown tile_ids ignored (stale client) |
-| `POST` | `/api/dashboards/{id}/tiles/{tile_id}/refresh` | allowed for owner AND shared recipients. Table tiles first **re-resolve + self-heal** their code from the durable full-table record (tiles pinned with a wrong/chart code get the corrected code persisted); tiles with a `result_key` (one table of a multi-table RESULT) re-execute via `_reexecute_full_df` and persist a fresh durable key, others via `run_item_refresh` (Styler results keep `styled_html`). Deleted source chat → persists `frozen/frozen_reason="source_deleted"` on the tile, returns `200 {ok:false, frozen:true, reason}`; a caller without source-chat access gets the same shape with `reason:"access_revoked"` but nothing is persisted (caller-specific). Execution failures → `200 {ok:false, error}`, stored snapshot untouched; a tile whose code references a live table with no stored SELECT → `200 {ok:false, code:"LIVE_NO_QUERY", error}` and a failed live fetch → `200 {ok:false, error:<class sentence>}`, both passed through from `run_item_refresh`, nothing persisted. Success updates the snapshot (+ re-inlined `chart_data` / new `full_table_key`), clears `frozen`, returns `{ok, kind, image_base64\|table, is_plotly?, tile}`. |
+| `POST` | `/api/dashboards/{id}/tiles/{tile_id}/refresh` | allowed for owner AND shared recipients. Table tiles first **re-resolve + self-heal** their code from the durable full-table record (tiles pinned with a wrong/chart code get the corrected code persisted); tiles with a `result_key` (one table of a multi-table RESULT) re-execute via `_reexecute_full_df` and persist a fresh durable key (carrying the live SELECTs that ran, like a `refresh_item` record), others via `run_item_refresh` (Styler results keep `styled_html`). Deleted source chat → persists `frozen/frozen_reason="source_deleted"` on the tile, returns `200 {ok:false, frozen:true, reason}`; a caller without source-chat access gets the same shape with `reason:"access_revoked"` but nothing is persisted (caller-specific). Execution failures → `200 {ok:false, error}`, stored snapshot untouched; a tile whose code references a table the caller's role does not cover → the caller-specific `200 {ok:false, frozen:true, reason:"role_denied", blocked_tables}`, never persisted (`blocked_tables: []` when the role check failed on a chat holding a live table — see the refresh role gate); a tile whose code references a live table with no stored SELECT → `200 {ok:false, code:"LIVE_NO_QUERY", error}` and a failed live fetch → `200 {ok:false, error:<class sentence>}`, both passed through from `run_item_refresh`, nothing persisted. Success updates the snapshot (+ re-inlined `chart_data` / new `full_table_key`), clears `frozen`, returns `{ok, kind, image_base64\|table, is_plotly?, tile}`. |
 | `POST` | `/api/dashboards/{id}/share` | `{emails: [...]\|"a@x, b@y", message?}` — owner only, mirrors the chat share contract (`{ok, shared_with, added, email_sent, smtp_configured, failed}`). Adds recipients to the doc's `shared_with`, writes a pointer row into each recipient's dashboard index, **and grants them access to every tile's source chat that the dashboard OWNER owns** (`add_share_recipients`, same grant conversation-sharing performs) so their Show-data/refresh work. A tile pinned from a chat the owner merely RECEIVED is not re-shared: those recipients see its stored snapshot, and its refresh answers `{ok:false, frozen:true, reason:"access_revoked"}` for them. An address that has never signed in gets a password-less placeholder account (see Sharing rules). Brain SMTP relay gets only the dashboard name + comment (Article II — never tile content). Revoked per address with `/unshare` (next row). |
 | `POST` | `/api/dashboards/{id}/unshare` | `{email}` — owner only (a recipient → `403 {"error": "Only the dashboard owner can do this."}`, an unknown dashboard → `404 {"error": "Dashboard not found"}`, a missing or malformed address → `400`). Takes the address off the doc's `shared_with` (matched case-insensitively) and deletes that recipient's pointer row from their dashboard index (`DashboardStore.remove_dashboard_share`), then answers `200 {ok: true, shared_with: [...]}` with the remaining list. Idempotent: an address that is not shared answers 200 with the list unchanged. The source-chat grants the share made alongside are **not** touched — they are the chat's own sharing, which has no revoke and which another share may rely on. An unshared recipient who kept the URL resolves nothing: the page sends them to `/lab`, the API answers 404, and a tile refresh answers 404. Nothing is mailed. |
 
@@ -1213,7 +1263,7 @@ values leave the client.
 | `POST /api/chat/{id}/share` | owner only (`403 {"error": "Access denied"}` for a share recipient); adds recipients to `meta.json["sharing"]["shared_with"]` (a never-signed-in address gets a placeholder account — see Sharing rules), lists the chat in each recipient's chat list (`AuthStore.record_shared_chat`, a row with `shared_by`; idempotent), asks brain `/v1/send_share_email` to SMTP-relay invites using this tenant's SMTP config |
 | `GET  /api/chat/{id}/share` | returns the current sharing record (`{shared_with, owner}`) |
 | `POST /auth/conversations/{conv_id}/share` | **conversation-level share** — only the chat's OWNER may share (sharing a conversation also grants access to its chat): anyone else → `403 {"error": "Access denied"}`. For each recipient, snapshot the conversation history into a fresh `conv_id` via `ChatDataStore.copy_conv_to_new`, add them to the chat's `sharing.shared_with`, record the new conv in the recipient's `conversations.jsonl` with title prefix "(Shared) …" and `shared_by` field, then SMTP-relay an invite. Recipients access the chat through `_require_chat`'s shared-recipient check |
-| `GET  /api/chat/{id}/full_table/{key}` | returns the full result table for `key`. The chat stream sets `full_table_key` on responses that contain a tabular result; the key names a durable record (`conversations/full/{key}.json`: preview rows, `code`, optional `result_key` and `sql`). The route re-executes the stored code (a live table re-fetched with the stored SQL) and answers `{columns, rows, total_rows}`; when that yields nothing it answers the stored record. **Live-table gate:** before any re-execution, an item whose stored code references a LIVE table the requester's role does not cover (by the pre-fetch's own rule: a quoted df key, a generic `dfs` walk, or the `df` alias of the first frame) → `403 {"ok": false, "code": "ROLE_DENIED", "blocked_tables": [<display names>], "error": "Your role does not include this table's data — refresh is unavailable."}`, logged `FULL_TABLE_ROLE_DENIED` / `DOWNLOAD_EXCEL_ROLE_DENIED`; no database query is issued. The gate FAILS CLOSED: any error inside it (including a failing role read) answers the same 403 with `blocked_tables: []`, logged `LIVE_REEXEC_GATE_FAILED error=<type>`. Snapshot re-execution is not gated (viewing existing data is never blocked retroactively). 403 rather than the refresh path's 200 because the success answer of `download_excel` is a byte stream. |
+| `GET  /api/chat/{id}/full_table/{key}` | returns the full result table for `key`. The chat stream sets `full_table_key` on responses that contain a tabular result; the key names a durable record (`conversations/full/{key}.json`: preview rows, `code`, optional `result_key` and `sql`). The route re-executes the stored code (a live table re-fetched with the stored SQL) and answers `{columns, rows, total_rows}`; when that yields nothing it answers the stored record. **Live-table gate:** before any re-execution, an item whose stored code references a LIVE table the requester's role does not cover (by the pre-fetch's own rule: a quoted df key, a generic `dfs` walk, or the `df` alias of the first frame) → `403 {"ok": false, "code": "ROLE_DENIED", "blocked_tables": [<display names>], "error": "Your role does not include this table's data — refresh is unavailable."}`, logged `FULL_TABLE_ROLE_DENIED` / `DOWNLOAD_EXCEL_ROLE_DENIED`; no database query is issued. The gate is consulted only where a live fetch can happen: a record without stored code, or a chat that holds no live table, is served without it, and a table the role does not cover that is a SNAPSHOT is served too (viewing existing data is never blocked retroactively). On a chat holding a live table — or when that cannot be determined — the gate FAILS CLOSED: any error inside it (including a failing role read) answers the same 403 with `blocked_tables: []`, logged `LIVE_REEXEC_GATE_FAILED error=<type>`. 403 rather than the refresh path's 200 because the success answer of `download_excel` is a byte stream. |
 | Conversation title generation | After the 2nd human message, the chat stream fires a background `brain_client.title()` call and renames the conversation via `AuthStore.rename_conversation` |
 | Activity logging | `auth.py` (login), `upload.py` (file_uploaded), `chat.py` (plot_generated, per chart), `report.py` (report_exported), `auto_analytics.py` (auto_analytics_completed) all call `brain_client.post_activity` → brain `/v1/activity`. Fire-and-forget: the post runs on a single background worker thread (ordered), so a slow brain can never block a request or the event loop — telemetry lags instead. |
 | **Auto Analytics** | `POST /api/chat/{id}/auto_analysis/start` kicks a background job → brain `/v1/auto_analytics_plan` (planner returns 3-15 natural-language analytical instructions) → client executes each via `run_chat_local.run_chat` against the local dataframes (bounded 4-worker pool; loaded WITHOUT live tables — `include_live` off — so a live table is never queried by the job and its findings cover the snapshot and file tables only) → brain `/v1/report` for narrative → client renders PPTX via `routes/report._render_pptx` → persists to `chatdata/{id}/auto_analysis.pptx`. `GET /auto_analysis/status` reports `{status: idle|processing|done, progress, error, pptx_path}`. `GET /auto_analysis/download` streams the deck. Raw row data never leaves the client |

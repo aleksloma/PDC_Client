@@ -191,8 +191,11 @@ to that chat's users (its owner and the people it was shared with); the
 application log carries only a hash of each statement, row counts and
 timings. There is no administrator-facing log of which user ran which query;
 use the database's own audit for that. A user whose role no longer covers a
-live table cannot re-run it: refresh, "Show full table" and "Download Excel"
-refuse before any query reaches the database.
+live table cannot re-run an answer that reads it: a chart or table refresh,
+a dashboard tile refresh, "Show data" (on a chart or a dashboard tile) and
+"Download Excel" refuse before any query reaches the database. If the role
+check itself fails, these are refused on every chat that holds a live table
+(on a chat without one they keep working).
 
 ### Users and sign-in
 
@@ -210,6 +213,19 @@ Accounts come to exist in three ways:
 - **Single sign-on.** When Microsoft Entra ID sign-in is enabled, the first
   Microsoft sign-in creates the account (who may sign in is decided in
   Entra).
+
+**Ending sessions and removing users.** Each row of the **Users** page has
+two more actions, both confirmed in a dialog first. **End sessions** signs
+the user out everywhere, on their next click; their password and their data
+stay as they are, and they can sign in again. **Remove** deletes the account
+together with every chat and dashboard it owns; the shares built on them
+end (colleagues lose the chats and dashboards it shared with them, and a
+tile pinned from one of its chats keeps its last picture but no longer
+refreshes), and it cannot be undone — take a backup of the data volume first if you may
+need anything back. A removed address can be invited again later as a new,
+empty account; a Microsoft user who is still assigned in Entra creates one
+simply by signing in again, so unassign them in Entra as well. Neither
+action can target the `ladmin` account, and you cannot remove your own.
 
 **Passwords** must be at least 8 characters (`PASSWORD_MIN_LENGTH` in
 `client.env`; it cannot be set below 4). The rule applies whenever a password
@@ -242,8 +258,9 @@ session survives closing the browser.
 "Sign out" ends the session of this browser only. A copy of the session
 cookie taken from that browser keeps working until its 30-day end. A password
 set from inside the container by an operator ends the other sessions only
-after the web container restarts. There is no administrator action yet to
-sign a user out; restarting the web container is the forced sign-out today.
+after the web container restarts. To sign one user out everywhere — a lost
+laptop, a copied cookie — use **End sessions** on the **Users** page; a
+browser whose session has ended shows the sign-in page on its next action.
 
 **Microsoft accounts have no local password.** An account that has signed in
 with Microsoft and never had a password here cannot get one: "Reset password"
@@ -251,17 +268,25 @@ sends it nothing (the page answers as for any address), and a password change
 or an invitation for it is refused with "This account signs in with Microsoft
 and has no local password." Such users get multi-factor authentication and
 conditional access from Entra; a local password would let them sign in
-without either. An account that already had a password and later also used
-Microsoft keeps its password.
+without either. The same holds, while single sign-on is enabled, for an
+account that had a password here and has since signed in with Microsoft:
+its password is refused at the sign-in page (the same "Sign-in failed" line
+as a wrong password), "Reset password" sends it nothing, and a reset link
+mailed earlier is refused. Such users sign in with Microsoft. The `ladmin`
+account is exempt. The password is not deleted: switching single sign-on
+off makes it work again.
 Disabling a user in Entra does not end a PowerDataChat session that is
 already open: there is no back-channel logout. The session lasts until the
-browser drops the cookie or its 30 days run out. Restarting the web container
-is today's only forced sign-out.
-If single sign-on is later switched off, or such a user leaves your Entra
-tenant but still needs access, recover the account by hand: remove the
+browser drops the cookie or its 30 days run out, unless you also use **End
+sessions** for that user on the **Users** page.
+If single sign-on is later switched off, an account that signed in with
+Microsoft and never had a password here cannot sign in at all; while it stays
+on, the same is true of any Microsoft user who leaves your Entra tenant but
+still needs access. Recover such an account by hand: remove the
 `sso_provider` key from `users/<email>/auth.json` on the data volume, restart
-the web container, then send the user a reset link (the admin panel's
-**Invite user**, or "Reset password" on the sign-in page).
+the web container, then — unless the account already had a password — send
+the user a reset link (the admin panel's **Invite user**, or "Reset
+password" on the sign-in page).
 The `ladmin` password cannot be reset by mail — to recover it, delete
 `users/ladmin/auth.json` on the data volume and restart with
 `LOCAL_ADMIN_PASSWORD` set.
@@ -743,7 +768,10 @@ decks, and your branded templates.
   tenant, so have an administrator complete one Microsoft sign-in immediately
   after upgrading rather than discovering it on Monday morning. If it fails,
   `https://<your-host>/?local=1` always shows the email-and-password form, so
-  administrators can still get in while you contact PowerDataChat. The log line
+  `ladmin` can still get in and switch single sign-on off (which gives every
+  account that had a password here its password back) while you contact
+  PowerDataChat. While single sign-on stays on, that form refuses the
+  password of any account that has signed in with Microsoft. The log line
   to quote is `SSO_CALLBACK_FAILED` in `/data/client/logs/datachat.log`.
 - **Security fixes in the Python layer arrive only as a new image tag.** Both
   container filesystems are read-only and both run as unprivileged users, so

@@ -1021,11 +1021,15 @@ read. The AI history row persists `sql` (per key, `null` for a default
 read), `live_truncated` and `live_rows`, and durable full-table records
 carry the `sql` subset their code references (the `df` alias of the
 first frame counts as a reference). Per-item refresh, dashboard tile
-refresh, "Show full table" and "Download Excel" re-run the stored SQL only
-under the requester's role, before the stored Python runs: an item whose
-code references a live table the role does not cover is refused with no
-database query, and the full-table / Excel gate fails closed (an error
-inside it is a refusal). A retry's `sql` carries only what ran. Results are capped by rows
+refresh, "Show data" (a chart's or a dashboard tile's) and "Download Excel"
+re-run the stored SQL only under the requester's role, before the stored
+Python runs: an item whose code references a live table the role does not
+cover — by the same rule the pre-fetch uses (the key quoted anywhere, a
+generic `dfs` walk, the `df` alias of the first frame) — is refused with no
+database query. When the role check itself fails, all four refuse on a chat
+that holds a live table (or whose live status cannot be read) and keep
+working on a chat without one; "Show data" and "Download Excel" also serve
+a record that carries no code. A retry's `sql` carries only what ran. Results are capped by rows
 (`LIVE_RESULT_ROW_CAP`) and by size (`LIVE_RESULT_MAX_MB`) and bounded by
 `LIVE_QUERY_TIMEOUT_S`; a capped result adds a localized note to the answer.
 
@@ -1113,18 +1117,24 @@ break allowed joins.
   connector closure stays exempt.
 - Per-item refresh (chat `refresh_item` + BOTH dashboard tile branches) —
   blocked per-table via `routes.chat._role_refresh_block`: the item's code is
-  scanned with the same `dfs['…']` key regex the frontend freeze uses; an
-  item touching only allowed tables still refreshes. Denied frames are also
-  dropped from the exec namespace after the (per-chat, user-agnostic) cached
-  load. Dashboard denials are caller-specific and never persisted (mirror of
-  `access_revoked`). Genuine denials fail CLOSED (Base defaults); an
-  unexpected gate crash fails OPEN with `ROLE_GATE_FAILED` logged.
+  scanned with the same `dfs['…']` key regex the frontend freeze uses, and
+  for a denied LIVE table also with the pre-fetch's own referencing rule (a
+  quoted key anywhere, a generic `dfs` walk, the `df` alias of the first
+  frame); an item touching only allowed tables still refreshes. Denied
+  frames are also dropped from the exec namespace after the (per-chat,
+  user-agnostic) cached load. Dashboard denials are caller-specific and
+  never persisted (mirror of `access_revoked`). Genuine denials fail CLOSED
+  (Base defaults). An unexpected gate crash (`ROLE_GATE_FAILED` logged)
+  refuses, naming no table, on a chat that holds a live table or whose live
+  status cannot be read — a stored SELECT must never run for a requester
+  whose role was not checked — and fails OPEN on a chat without one.
 - `GET /api/chat/{id}/schema` — advisory per-table `allowed` flag so the /lab
   and dashboard-view UIs grey refresh buttons proactively.
 - **Not gated by design** (confirmed decisions — no retroactive blocking;
   snapshot data the user could already see stays viewable): `chat/stream`,
   `edit_regenerate`, full-table/Download-Excel re-execution of SNAPSHOT data
-  (a LIVE fetch on those two routes is gated, fail closed), Auto Analytics,
+  (a LIVE fetch on those two routes is gated, and fails closed on a chat
+  holding a live table), Auto Analytics,
   `add_data_to_chat` (its DB entries were validated at selection time), and
   the central nightly snapshot scheduler. Shared-chat/dashboard recipients
   keep VIEWING stored snapshots; only their fresh re-execution is gated, keyed
@@ -1145,7 +1155,8 @@ silent drop) and limits the power user's reconcile to that held subset, so
 a role they do NOT hold keeps its ladmin-granted membership (ladmin's
 reconcile stays exact). Admin surface: `routes/admin_users.py` (`/api/admin/users*`,
 `/api/admin/roles*`, same `_require_admin` guard, audited `user.set_roles` /
-`user.set_permission` / `role.*`), plus the Users + Roles sections on the
+`user.set_permission` / `user.sessions_ended` / `user.removed` / `role.*`),
+plus the Users + Roles sections on the
 admin page (searchable user list with the 19c multi-role checkbox picker —
 every toggle POSTs the full held list — and the 19e per-row Permission
 dropdown; role cards + ONE tri-state access tree connection → schema →
@@ -1156,7 +1167,14 @@ grant on a still-empty schema takes a connection-level grant or the API).
 The bootstrap ladmin account is config-only and is excluded from the Users
 window; other admin-permission users ARE listed (they must stay demotable)
 with their roles picker ENABLED (19g — promoted admins hold roles like
-anyone).
+anyone). Each row also offers, after a confirmation, **End sessions**
+(`POST /api/admin/users/end_sessions`: a new session generation, so every
+session of the account ends on its next request; the password is untouched)
+and **Remove** (`POST /api/admin/users/remove`: deletes `users/<email>/` and
+every chat the account owns, deactivated ones included; its sessions end,
+recipients of its chats and dashboards meet the existing owner-vanished
+paths, and the address stays inert in other owners' share lists). Neither
+targets the bootstrap account, and an admin cannot remove their own.
 `roles_store` is denied inside the code-exec sandbox (grant tampering =
 privilege escalation). Downgrade caveat: an OLD build's `set_data_role`
 rewrites only the mirrored `data_role`, leaving `data_roles` stale — a
@@ -1250,6 +1268,12 @@ always-on escape hatch when auto-redirect is enabled). An account that
 signed in with Microsoft and holds no local password can never obtain one
 (reset, password change and invite all refuse it, `AuthStore.is_sso_only`),
 because a local password would bypass Entra's MFA and conditional access.
+For the same reason, while SSO is ENABLED an account whose record carries
+`sso_provider` cannot use a local password it also holds
+(`routes.auth._sso_enforced_for`, read per request): the sign-in form
+answers the neutral failure, a reset request mints nothing and a reset
+link is refused. The bootstrap ladmin is exempt, and disabling SSO restores
+those passwords — nothing is deleted.
 Customer guide: `docs/SSO_MICROSOFT.md`.
 
 ---
