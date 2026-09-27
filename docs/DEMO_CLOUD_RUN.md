@@ -215,6 +215,11 @@ gcloud storage rsync -r gs://pdc-enterprise-client-demo-data \
 Restore is the same command with source and destination swapped (service
 scaled to zero or traffic pinned to a revision that is not writing).
 
+Check a backup by object list, not by line count: the data bucket also holds
+0-byte "folder" objects (names ending in `/`, left by the gcsfuse mount) that
+`rsync` does not copy. A complete backup has the same total size
+(`gcloud storage du -s`) and the same object names once those are ignored.
+
 ## Deploy
 
 Every deploy goes through a candidate revision that receives **no traffic**
@@ -242,7 +247,13 @@ gcloud run services describe pdcclient-demo --project=pdc-enterprise \
 #    - both `image:` lines → the new <sha>
 #    - spec.template.metadata.name → pdcclient-demo-<sha>
 #    - spec.traffic → [{revisionName: $LIVE, percent: 100}]
-gcloud run services replace service.yaml --project=pdc-enterprise --region=europe-west1
+#    `gcloud run services replace service.yaml` needs the Cloud Resource
+#    Manager API, which is disabled in pdc-enterprise, and refuses the
+#    numeric project. The same call through the Cloud Run Admin API:
+python -c "import yaml,json;json.dump(yaml.safe_load(open('service.yaml')),open('service.json','w'))"
+curl -X PUT -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  -H "Content-Type: application/json" --data-binary @service.json \
+  https://europe-west1-run.googleapis.com/apis/serving.knative.dev/v1/namespaces/873133613631/services/pdcclient-demo
 
 # 3. Give the candidate its own URL, run the checks against it.
 gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise \
@@ -362,6 +373,40 @@ Remove the check's throwaway account and dashboard afterwards.
   the secret and redeploy:
   `gcloud secrets versions add CLIENT_DEMO_TENANT_TOKEN --data-file=<file>`
   then a no-op redeploy (secrets pinned to `:latest` are resolved at instance start).
+
+## Deploy history
+
+**2026-09-27 — first two-container revision.** Commit `cef5e17` (images
+`pdcclient-demo:cef5e17` and `pdcexecutor-demo:cef5e17`, both stamped),
+revision `pdcclient-demo-cef5e17`, serving 100 %. It replaced
+`pdcclient-demo-00015-wvd` (image `9d399c2`, single container, no sandbox),
+which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise \
+  --region=europe-west1 --to-revisions=pdcclient-demo-00015-wvd=100
+```
+
+Rolling back also rolls back the image to one that predates the non-root
+user, the sandbox and invitation-only sign-in; the env vars added here are
+harmless to it. Backup taken before the deploy:
+`gs://pdc-enterprise-client-demo-data-backups/20260927-000444/`.
+
+This deploy closed the two items that had blocked any redeploy since the
+executor release:
+
+- **No sandbox.** Closed by the sidecar. On the candidate URL `/health`
+  answered `executor_reachable: true` on the first request, the web log showed
+  `EXECUTOR_HANDSHAKE_OK`, and a chart question ran as a sandbox job
+  (`EXEC_JOB_END status=ok`). Cloud Run's in-memory volume was writable by the
+  sandbox's uid 10002 as it comes up, so no ownership step is needed for it.
+- **Non-root web container on the bucket mount.** Closed by the
+  `uid=10001,gid=10001` mount options. With them the candidate signed in a new
+  account, stored an upload, answered a chart question, created a dashboard
+  and pinned the chart, with no 5xx and no permission error in the log.
+
+Also observed: one gcsfuse `429` retry warning on the mount right after
+start-up, retried by the driver without an error reaching the app.
 
 ## Custom domain
 
