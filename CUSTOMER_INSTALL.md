@@ -222,10 +222,19 @@ together with every chat and dashboard it owns; the shares built on them
 end (colleagues lose the chats and dashboards it shared with them, and a
 tile pinned from one of its chats keeps its last picture but no longer
 refreshes), and it cannot be undone — take a backup of the data volume first if you may
-need anything back. A removed address can be invited again later as a new,
-empty account; a Microsoft user who is still assigned in Entra creates one
-simply by signing in again, so unassign them in Entra as well. Neither
-action can target the `ladmin` account, and you cannot remove your own.
+need anything back. The address is also taken off every chat and dashboard
+other users shared with it, and loses its roles. Tables a removed power user
+registered stay registered and keep working for everyone who has access, but
+from then on count as registered by an administrator: only an administrator
+can delete them. Who confirmed the descriptions and the audit log keep the
+removed address. If the address is later used again — invited, shared with,
+or signing in with Microsoft — it becomes a new account that inherits none of
+this (the removal answer lists what was deleted and unshared; if a count is
+lower than you expected, check the log before reusing the address), and no
+session of the removed account works for it. A
+Microsoft user who is still assigned in Entra gets such an account simply by
+signing in again, so unassign them in Entra as well. Neither action can
+target the `ladmin` account, and you cannot remove your own.
 
 **Passwords** must be at least 8 characters (`PASSWORD_MIN_LENGTH` in
 `client.env`; it cannot be set below 4). The rule applies whenever a password
@@ -275,6 +284,12 @@ as a wrong password), "Reset password" sends it nothing, and a reset link
 mailed earlier is refused. Such users sign in with Microsoft. The `ladmin`
 account is exempt. The password is not deleted: switching single sign-on
 off makes it work again.
+This rule starts at an account's first Microsoft sign-in and not before.
+Enabling single sign-on does not stop anyone who has a password here and has
+never signed in with Microsoft: they keep signing in with that password, and
+Entra's multi-factor authentication and conditional access do not apply to
+them until they sign in with Microsoft once. If every user must go through
+Entra, ask them to sign in with Microsoft once after you enable it.
 Disabling a user in Entra does not end a PowerDataChat session that is
 already open: there is no back-channel logout. The session lasts until the
 browser drops the cookie or its 30 days run out, unless you also use **End

@@ -1116,15 +1116,23 @@ break allowed joins.
 - `POST /session/db_tables` — non-allowed SEEDS → 403 `ROLE_DENIED`; the
   connector closure stays exempt.
 - Per-item refresh (chat `refresh_item` + BOTH dashboard tile branches) —
-  blocked per-table via `routes.chat._role_refresh_block`: the item's code is
-  scanned with the same `dfs['…']` key regex the frontend freeze uses, and
-  for a denied LIVE table also with the pre-fetch's own referencing rule (a
-  quoted key anywhere, a generic `dfs` walk, the `df` alias of the first
-  frame); an item touching only allowed tables still refreshes. Denied
-  frames are also dropped from the exec namespace after the (per-chat,
-  user-agnostic) cached load. Dashboard denials are caller-specific and
-  never persisted (mirror of `access_revoked`). Genuine denials fail CLOSED
-  (Base defaults). An unexpected gate crash (`ROLE_GATE_FAILED` logged)
+  blocked per-table via `routes.chat._role_refresh_block`: for EVERY denied
+  table, snapshot and live alike, the item's code is scanned with the
+  pre-fetch's own referencing rule (the `dfs['…']` key regex the frontend
+  freeze uses, a quoted key anywhere, a generic `dfs` walk, the `df` alias
+  of the first frame) and a reference refuses with `ROLE_DENIED` naming the
+  table; an item touching only allowed tables still refreshes. The rule errs
+  toward refusing — `df` counts as the first frame even when the code
+  rebinds it, and a quoted string equal to a denied table's df key counts
+  as a reference. The frontend's pre-freeze recognises only `dfs['…']`, so
+  other references are refused at click time with the same role message.
+  Denied frames are also dropped from the exec namespace after the
+  (per-chat, user-agnostic) cached load, as defence in depth. Dashboard
+  denials are caller-specific and never persisted (mirror of
+  `access_revoked`). Genuine denials fail CLOSED (Base defaults). Once a
+  denial is known, a failure loading the chat's frames or applying the rule
+  (`ROLE_GATE_REFERENCE_FAILED`) refuses naming every denied table. An
+  earlier unexpected gate crash (`ROLE_GATE_FAILED` logged)
   refuses, naming no table, on a chat that holds a live table or whose live
   status cannot be read — a stored SELECT must never run for a requester
   whose role was not checked — and fails OPEN on a chat without one.
@@ -1170,11 +1178,26 @@ with their roles picker ENABLED (19g — promoted admins hold roles like
 anyone). Each row also offers, after a confirmation, **End sessions**
 (`POST /api/admin/users/end_sessions`: a new session generation, so every
 session of the account ends on its next request; the password is untouched)
-and **Remove** (`POST /api/admin/users/remove`: deletes `users/<email>/` and
-every chat the account owns, deactivated ones included; its sessions end,
-recipients of its chats and dashboards meet the existing owner-vanished
-paths, and the address stays inert in other owners' share lists). Neither
-targets the bootstrap account, and an admin cannot remove their own.
+and **Remove** (`POST /api/admin/users/remove`: deletes `users/<email>/` —
+held roles included — and every chat the account owns, deactivated ones
+included; its sessions end, and recipients of its chats and dashboards meet
+the existing owner-vanished paths. It then takes the address off every
+other owner's chat and dashboard share list and removes `registered_by`
+from every table it registered, connectors included — such a table reads
+as administrator-registered from then on — while `descriptions_confirmed_by`
+and the audit rows keep their attribution; these steps are best-effort —
+each logs its own per-item failures and reports what it achieved in the
+response and the `user.removed` audit row, so a partial failure shows as a
+lower count, not an error).
+Every account is created with a fresh session generation
+(`AuthStore.create_account`, behind invitation, share placeholder, first
+Microsoft sign-in, demo self-registration and the bootstrap admin), so no
+session of a removed account matches an account created again at the same
+address, and that account normally starts empty (a step that failed —
+e.g. an owned chat that could not be deleted — is visible in the counts);
+an account created by an earlier release without a generation keeps
+reading `""` until its first password write or End sessions.
+Neither targets the bootstrap account, and an admin cannot remove their own.
 `roles_store` is denied inside the code-exec sandbox (grant tampering =
 privilege escalation). Downgrade caveat: an OLD build's `set_data_role`
 rewrites only the mirrored `data_role`, leaving `data_roles` stale — a
@@ -1227,7 +1250,8 @@ from a power user must be a subset of their held roles
 requires ownership — the doc's
 `registered_by` (stamped from the session at FIRST save by
 `_build_table_doc`, carried through edit-saves like the schedule override;
-absent = ladmin-registered/legacy) must equal the power user
+absent = ladmin-registered/legacy, or released when the registrant's
+account was removed) must equal the power user
 (`403 NOT_OWNER`). Connection lifecycle, the global refresh schedule,
 users/roles/permissions and the audit tail stay strictly ladmin-only
 (`_require_admin`). Power-user writes are labeled
@@ -1245,7 +1269,8 @@ speaks standard OIDC (authorization-code flow via authlib in
 `routes/sso.py`): PDC never sees a password, and the ONLY claim it reads
 from the validated ID token is the user's email (`preferred_username`,
 fallback `email`), which becomes the same local identity an invited password
-account has (`ensure_user` auto-provisioning; who may sign in at all is
+account has (`ensure_user` → `AuthStore.create_account` on the first
+Microsoft sign-in — profile plus a fresh session generation; who may sign in at all is
 decided in Entra via "Assignment required" — there is no client-side
 allow-list). SSO is therefore one of the three ways an account comes to
 exist; the others are an administrator's invitation and a share, since a
@@ -1273,7 +1298,11 @@ For the same reason, while SSO is ENABLED an account whose record carries
 (`routes.auth._sso_enforced_for`, read per request): the sign-in form
 answers the neutral failure, a reset request mints nothing and a reset
 link is refused. The bootstrap ladmin is exempt, and disabling SSO restores
-those passwords — nothing is deleted.
+those passwords — nothing is deleted. The enforcement starts at an
+account's FIRST Microsoft sign-in: a password account that has never
+signed in with Microsoft keeps signing in with its local password while
+SSO is enabled, and is not subject to Entra's MFA or conditional access
+until it signs in with Microsoft once.
 Customer guide: `docs/SSO_MICROSOFT.md`.
 
 ---

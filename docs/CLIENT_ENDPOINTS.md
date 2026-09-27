@@ -134,7 +134,12 @@ least N characters". Sign-in never checks it, so an older, shorter password
 keeps working until it is changed.
 
 Sessions: sign-in stamps the session with `iat` (sign-in time) and `gen` (the
-account's `session_generation` from `auth.json`). Every password write gives
+account's `session_generation` from `auth.json`). Every account gets its
+generation the moment it is created (`AuthStore.create_account`, behind
+every creation path: invitation, share placeholder, first Microsoft sign-in,
+the demo's self-registration, the bootstrap admin); an account that already
+existed without one — created by an earlier release — answers `""` until its
+first password write or End sessions (the upgrade rule). Every password write gives
 the account a new generation; `SessionGenerationGate` (app.py, inside the
 session middleware) empties a session whose `gen` no longer matches, so the
 request continues signed out (pages → `/`, APIs → 401) and the response clears
@@ -152,7 +157,9 @@ writes a new generation and nothing else, so every session of the account
 ends on its next request while its password stays as it was. After
 **Remove** (`POST /api/admin/users/remove`) the account has neither profile
 nor auth record, and its sessions fail the same check — including an
-SSO-only or legacy account that never had a generation.
+SSO-only or legacy account that never had a generation. An account created
+again at that address starts with a fresh generation, so a session of the
+removed account never matches it.
 
 On the `/lab`, `/c/…` and `/dashboards/…` pages every request of the page
 scripts (`static/dashboard.js`, `static/dashboard_view.js`) goes through
@@ -185,7 +192,12 @@ included, is refused with 403 and the sentence above. The bootstrap local
 admin is exempt. Disabling SSO gives such an account its local password
 back; nothing is deleted. `/auth/password` still lets a signed-in account
 of this kind set a local password, which stays unusable while SSO is
-enabled.
+enabled. Enforcement starts at an account's FIRST Microsoft sign-in and
+covers nothing before it: a password account that has never signed in with
+Microsoft keeps signing in with its local password while SSO is enabled,
+and Entra's multi-factor authentication and conditional access do not apply
+to it until it signs in with Microsoft once. No setting applies the
+enforcement to such an account in advance.
 
 | Method | Path | Behavior |
 |---|---|---|
@@ -222,7 +234,7 @@ guide: [`docs/SSO_MICROSOFT.md`](SSO_MICROSOFT.md).
 | Method | Path | Behavior |
 |---|---|---|
 | `GET` | `/auth/microsoft` | starts the flow: 302 to `login.microsoftonline.com` with state+nonce in the session. **404 while SSO is not enabled** (unconfigured installs look pre-SSO). Enabled but secret unreadable (encryption key rotated away) → landing with the generic failure message (503). |
-| `GET` | `/auth/microsoft/callback` | exchanges the code, validates the ID token (authlib — signature/issuer/audience/nonce), lower-cases the email claim, auto-provisions the local profile (`ensure_user` — access control is Entra's "Assignment required", no client-side allow-list), stamps `sso_provider`/`sso_last_login` on auth.json (`mark_sso_login` — merge-only, password hashes untouched), starts the session via the SAME `_start_session` as password login but with `remember=False` (browser-session cookie — Entra re-auth is silent) and never `must_change`, logs `USER_LOGIN_SSO`, posts the normal `login` activity event, 302 → `/lab`. Any failure (state mismatch, token error, missing email claim) → landing with "Microsoft sign-in failed…" (401/400), token contents never logged. 404 while disabled. |
+| `GET` | `/auth/microsoft/callback` | exchanges the code, validates the ID token (authlib — signature/issuer/audience/nonce), lower-cases the email claim, creates the account when the address has none (`ensure_user` → `AuthStore.create_account`: profile plus an `auth.json` holding a fresh session generation; an existing account keeps its records, an auth-only folder only gaining its missing profile — access control is Entra's "Assignment required", no client-side allow-list), stamps `sso_provider`/`sso_last_login` on auth.json (`mark_sso_login` — merge-only, password hashes untouched), starts the session via the SAME `_start_session` as password login but with `remember=False` (browser-session cookie — Entra re-auth is silent) and never `must_change`, logs `USER_LOGIN_SSO`, posts the normal `login` activity event, 302 → `/lab`. Any failure (state mismatch, token error, missing email claim) → landing with "Microsoft sign-in failed…" (401/400), token contents never logged. 404 while disabled. |
 
 ---
 
@@ -541,7 +553,10 @@ never feeds `data_as_of`, and is never `missing` for lacking a parquet. `allowed
 `true`; a role-probe failure reports `true` — the server-side refresh gate is
 the enforcement): dashboard.js / dashboard_view.js pre-freeze refresh buttons
 whose code references an `allowed:false` table with a role tooltip instead of
-letting the click fail.
+letting the click fail. The pre-freeze recognises only a `dfs['…']`
+subscript; code that reaches a denied table another way (`df`, a quoted key,
+a walk over `dfs`) is refused by the server gate at click time, with the same
+role message.
 
 `GET /api/chat/{chat_id}/schema` also returns an additive `is_owner` (bool —
 `true` only for the chat's recorded owner, fails closed to `false`). The
@@ -620,7 +635,9 @@ Table docs carry **`registered_by`** (ownership): stamped from the SESSION
 identity at FIRST save only (wizard save and recommendation Accept, via
 `_build_table_doc`), carried through every edit-save like the schedule
 override — an edit never changes or introduces it; docs written before the
-field exist without it and read as ladmin-registered.
+field exist without it and read as ladmin-registered. Removing the
+registrant's account (`POST /api/admin/users/remove`) takes the field off
+every table it registered, which then reads as ladmin-registered too.
 
 Both guards: 401 unauthenticated; 403 while `must_change_password` is
 pending; 403 + one `admin.denied` audit row per denial (the source-manager
@@ -697,7 +714,7 @@ skipped at read time, no profile rewrites. Emails are always body-carried
 | `POST` | `/api/admin/users/set_role` | Sets the user's HELD ROLE LIST (19c): `{email, role_ids: [...]}` → `{ok, user}`; the legacy `{email, role_id}` shape is still accepted (→ one-element list); empty list reverts to Base. 400 missing email / the bootstrap ladmin account / any unknown role id (19g: PROMOTED admins take roles like anyone — only the bootstrap identity is refused); 404 unknown user. Audited `user.set_roles` with `{role_ids, role_names}` |
 | `POST` | `/api/admin/users/set_permission` | 19e — sets the per-user PERMISSION: `{email, permission: "standard"\|"power"\|"admin"}` ("standard" stored as "user") → `{ok, user}`. 400 missing email / invalid value / the bootstrap ladmin account / the CALLER's own account (no self-demotion); 404 unknown user. Never touches `data_roles` — and since 19g a promoted admin's roles stay ACTIVE (full analysis user), so promote/demote round-trips are lossless. Audited `user.set_permission` with `{old, new}` |
 | `POST` | `/api/admin/users/end_sessions` | `{email}` → `{ok: true}`: signs the account out everywhere by writing a new session generation (see "Sessions" above); the password, or an SSO-only account's password-less state, is untouched and the user can sign in again. Checked in this order: missing email → 400; the bootstrap local-admin account → 400; an address `routes.auth._EMAIL_RE` refuses → 400 "Enter a valid email address."; unknown user → 404. The caller's own account is allowed (it signs itself out everywhere). A failed write → 500, nothing audited. Audited `user.sessions_ended` |
-| `POST` | `/api/admin/users/remove` | `{email}` → `{ok: true, chats_deleted}`: deletes `users/<email>/` (profile, credentials, chat and conversation lists, dashboards — the dashboard shares it received go with its index) and then every chat whose owner it is (`chatdata/<chat_id>/`, found by a scan of every chat meta, so deactivated chats go too; `chats_deleted` counts them). Every session of the account ends on its next request, an SSO-only account's included. Recipients of its chats and dashboards meet the existing owner-vanished paths (chat routes 404, a tile from a deleted chat freezes as `source_deleted`, a shared dashboard resolves nothing). The address stays in other owners' share lists, inert until the address is invited again. Checked in this order: missing email → 400; the bootstrap local-admin account → 400; an invalid address → 400 "Enter a valid email address."; the caller's own account → 400; unknown user → 404. A failure removing the account folder → 500, nothing audited. Audited `user.removed` with `{chats_deleted}`. Cannot be undone |
+| `POST` | `/api/admin/users/remove` | `{email}` → `{ok: true, chats_deleted, chats_unshared, dashboards_unshared, registrations_released}`: deletes `users/<email>/` (profile, credentials, held roles, chat and conversation lists, dashboards — the dashboard shares it received go with its index) and then every chat whose owner it is (`chatdata/<chat_id>/`, found by a scan of every chat meta, so deactivated chats go too; `chats_deleted` counts them). Then the address is taken off every other owner's chat `sharing.shared_with` (`chats_unshared`) and dashboard share list (`dashboards_unshared`, through `remove_dashboard_share`), and `registered_by` is removed from every table it registered, connectors included (`registrations_released`; one `table.registered_by_released` audit row with the count and the table ids): such a table then reads as ladmin-registered — nobody reads it through ownership and no power user may delete it. `descriptions_confirmed_by`, audit rows and every other attribution stay. An account created again at the address therefore starts with a fresh session generation and, normally, empty: no chats, shares, roles or registrations (a step that failed shows in the counts below). Every session of the account ends on its next request, an SSO-only account's included. Recipients of its chats and dashboards meet the existing owner-vanished paths (chat routes 404, a tile from a deleted chat freezes as `source_deleted`, a shared dashboard resolves nothing). Everything after the account folder — the owned chats, the share lists, the registrations — is best-effort, step by step: each step logs its own per-item failures (`CHAT_DELETE_FAILED`, `SHARE_PURGE_*`, `DB_RELEASE_REGISTRATIONS_FAILED`) and reports the count it achieved, so a partial failure shows as a lower count; `ADMIN_USER_REMOVE_STEP_FAILED` (count 0) is only the backstop for a step that raises. The removal is still audited and answered 200 with the counts achieved, and one `table.registered_by_released` audit row is written when any registration was released. Checked in this order: missing email → 400; the bootstrap local-admin account → 400; an invalid address → 400 "Enter a valid email address."; the caller's own account → 400; unknown user → 404. A failure removing the account folder → 500, nothing audited. Audited `user.removed` with the four counts. Cannot be undone |
 | `GET` | `/api/admin/roles` | `{roles:[{…, is_base, is_builtin, member_count}]}` — Base first, the rest by name; `member_count` counts users HOLDING the role (a user with 3 roles counts in all 3) |
 | `POST` | `/api/admin/roles` | create: `{name, description?, table_ids?, scope_grants?, manage_grants?}` → 201 `{role}` (a stray 19c-era `power_user` key is silently ignored). 400: empty/duplicate name (case-insensitive, "base" reserved), unknown table id, **connector table id** (exempt from role checks — ungrantable), unknown connection / malformed entry in EITHER grant list (`manage_grants` validate exactly like `scope_grants`). Audited `role.create` (grant + manage counts) |
 | `POST` | `/api/admin/roles/{rid}` | edit (fields present ⇒ replace, absent ⇒ keep — `scope_grants` and `manage_grants` replace independently). 404 unknown; 400 renaming Base — but a RESTATED IDENTICAL name is ignored, not a 400 (19c fix: the UI save payload always carries the unchanged name, which used to make every built-in edit fail); description/grants stay editable. Audited `role.update` |
@@ -711,7 +728,8 @@ confirm dialog before promoting to admin; the roles picker stays enabled on
 admin rows — promoted admins hold roles like anyone; each row ends with
 **End sessions** and **Remove**, each confirmed in a dialog first — the
 Remove text names the account, its chats and dashboards and the shares
-built on them) + **Roles** section (cards + a tri-state access tree
+built on them, and says the address also comes off everything shared with
+it and off the tables it registered) + **Roles** section (cards + a tri-state access tree
 connection → schema → tables; checking a schema/connection stores a scope
 grant and locks its descendants "via schema/connection").
 
@@ -1085,20 +1103,26 @@ refreshed to reflect the new data.
   code references a non-connector DB table the REQUESTER's role does not
   cover, the refresh returns `200 {ok:false, code:"ROLE_DENIED",
   blocked_tables, error}` and nothing runs — no database query either.
-  "References" is the `dfs['…']` key regex of the freeze below for every
-  denied table, plus, for a denied LIVE table, the pre-fetch's own rule (the
-  key quoted anywhere in the code, a generic `dfs` walk, or `df` when that
-  table is the first frame), so a `dfs.get(…)` or `df` item on a denied live
-  table is refused rather than computed on whatever is left. Per-table
-  semantics: an item touching only allowed tables still refreshes even when
-  the chat holds denied ones. Denied frames are ALSO dropped from the exec
-  namespace (`drop_df_keys`, filtered AFTER the per-chat cached load) so
-  unreferenced access is impossible. For shared chats the gate keys on the
-  requester, not the owner. The dashboard tile variant returns the
-  caller-specific `{ok:false, frozen:true, reason:"role_denied",
+  "References" is the pre-fetch's own rule, applied to EVERY denied table,
+  snapshot and live alike: the `dfs['…']` key regex of the freeze below,
+  the key quoted anywhere in the code, a generic `dfs` walk, or `df` when
+  the denied table is the chat's first frame — so a `dfs.get(…)`, `df` or
+  loop-over-`dfs` item on a denied table is refused rather than computed on
+  whatever is left. The rule errs toward refusing: `df` counts as the first
+  frame even when the code rebinds it, and a quoted string equal to a denied
+  table's df key (a column literal, say) counts as a reference — both refuse
+  rather than run. Per-table semantics: an item touching only allowed
+  tables still refreshes even when the chat holds denied ones. Denied frames
+  are ALSO dropped from the exec namespace (`drop_df_keys`, filtered AFTER
+  the per-chat cached load) as defence in depth. For shared chats the gate
+  keys on the requester, not the owner. The dashboard tile variant returns
+  the caller-specific `{ok:false, frozen:true, reason:"role_denied",
   blocked_tables}` — never persisted (mirror of `access_revoked`). File-only
   chats perform zero role reads. Genuine denials fail closed through
-  Base-role defaults. When the gate itself fails (logged `ROLE_GATE_FAILED`),
+  Base-role defaults. Once a denial is known the gate loads the chat's
+  frames to apply the rule; when that load or the rule fails (logged
+  `ROLE_GATE_REFERENCE_FAILED`), the refresh is refused naming EVERY denied
+  table. When the gate fails before that (logged `ROLE_GATE_FAILED`),
   a chat that holds a live table — or whose live status cannot be read — is
   refused with no table named (`refresh_item`: `200 {ok:false,
   code:"ROLE_DENIED", blocked_tables: [], error}`; tile: `{ok:false,
@@ -1146,7 +1170,7 @@ chars, regex-guarded (path-traversal safe). Old-shape docs load with defaults
 | `POST` | `/api/dashboards/{id}/tiles/{tile_id}/update` | owner only; TEXT tiles only (chart/table tiles → 400 — their content changes via refresh, never free edits). Body: any subset of `{text, style, color, size, align, valign}`, same validation as create; empty body → 400. Returns `{ok, tile}`. |
 | `POST` | `/api/dashboards/{id}/tiles/{tile_id}/remove` | owner only |
 | `POST` | `/api/dashboards/{id}/layout` | `{tiles: [{tile_id, x, y, w, h}]}` bulk save — owner only; ints validated/clamped, unknown tile_ids ignored (stale client) |
-| `POST` | `/api/dashboards/{id}/tiles/{tile_id}/refresh` | allowed for owner AND shared recipients. Table tiles first **re-resolve + self-heal** their code from the durable full-table record (tiles pinned with a wrong/chart code get the corrected code persisted); tiles with a `result_key` (one table of a multi-table RESULT) re-execute via `_reexecute_full_df` and persist a fresh durable key (carrying the live SELECTs that ran, like a `refresh_item` record), others via `run_item_refresh` (Styler results keep `styled_html`). Deleted source chat → persists `frozen/frozen_reason="source_deleted"` on the tile, returns `200 {ok:false, frozen:true, reason}`; a caller without source-chat access gets the same shape with `reason:"access_revoked"` but nothing is persisted (caller-specific). Execution failures → `200 {ok:false, error}`, stored snapshot untouched; a tile whose code references a table the caller's role does not cover → the caller-specific `200 {ok:false, frozen:true, reason:"role_denied", blocked_tables}`, never persisted (`blocked_tables: []` when the role check failed on a chat holding a live table — see the refresh role gate); a tile whose code references a live table with no stored SELECT → `200 {ok:false, code:"LIVE_NO_QUERY", error}` and a failed live fetch → `200 {ok:false, error:<class sentence>}`, both passed through from `run_item_refresh`, nothing persisted. Success updates the snapshot (+ re-inlined `chart_data` / new `full_table_key`), clears `frozen`, returns `{ok, kind, image_base64\|table, is_plotly?, tile}`. |
+| `POST` | `/api/dashboards/{id}/tiles/{tile_id}/refresh` | allowed for owner AND shared recipients. Table tiles first **re-resolve + self-heal** their code from the durable full-table record (tiles pinned with a wrong/chart code get the corrected code persisted); tiles with a `result_key` (one table of a multi-table RESULT) re-execute via `_reexecute_full_df` and persist a fresh durable key (carrying the live SELECTs that ran, like a `refresh_item` record), others via `run_item_refresh` (Styler results keep `styled_html`). Deleted source chat → persists `frozen/frozen_reason="source_deleted"` on the tile, returns `200 {ok:false, frozen:true, reason}`; a caller without source-chat access gets the same shape with `reason:"access_revoked"` but nothing is persisted (caller-specific). Execution failures → `200 {ok:false, error}`, stored snapshot untouched; a tile whose code references a table the caller's role does not cover — snapshot or live, by the refresh role gate's rule (`df`, a quoted key and a walk over `dfs` included) — → the caller-specific `200 {ok:false, frozen:true, reason:"role_denied", blocked_tables}`, never persisted (every denied table named when the gate could not apply its rule; `blocked_tables: []` when the role check itself failed on a chat holding a live table — see the refresh role gate); a tile whose code references a live table with no stored SELECT → `200 {ok:false, code:"LIVE_NO_QUERY", error}` and a failed live fetch → `200 {ok:false, error:<class sentence>}`, both passed through from `run_item_refresh`, nothing persisted. Success updates the snapshot (+ re-inlined `chart_data` / new `full_table_key`), clears `frozen`, returns `{ok, kind, image_base64\|table, is_plotly?, tile}`. |
 | `POST` | `/api/dashboards/{id}/share` | `{emails: [...]\|"a@x, b@y", message?}` — owner only, mirrors the chat share contract (`{ok, shared_with, added, email_sent, smtp_configured, failed}`). Adds recipients to the doc's `shared_with`, writes a pointer row into each recipient's dashboard index, **and grants them access to every tile's source chat that the dashboard OWNER owns** (`add_share_recipients`, same grant conversation-sharing performs) so their Show-data/refresh work. A tile pinned from a chat the owner merely RECEIVED is not re-shared: those recipients see its stored snapshot, and its refresh answers `{ok:false, frozen:true, reason:"access_revoked"}` for them. An address that has never signed in gets a password-less placeholder account (see Sharing rules). Brain SMTP relay gets only the dashboard name + comment (Article II — never tile content). Revoked per address with `/unshare` (next row). |
 | `POST` | `/api/dashboards/{id}/unshare` | `{email}` — owner only (a recipient → `403 {"error": "Only the dashboard owner can do this."}`, an unknown dashboard → `404 {"error": "Dashboard not found"}`, a missing or malformed address → `400`). Takes the address off the doc's `shared_with` (matched case-insensitively) and deletes that recipient's pointer row from their dashboard index (`DashboardStore.remove_dashboard_share`), then answers `200 {ok: true, shared_with: [...]}` with the remaining list. Idempotent: an address that is not shared answers 200 with the list unchanged. The source-chat grants the share made alongside are **not** touched — they are the chat's own sharing, which has no revoke and which another share may rely on. An unshared recipient who kept the URL resolves nothing: the page sends them to `/lab`, the API answers 404, and a tile refresh answers 404. Nothing is mailed. |
 
@@ -1273,7 +1297,7 @@ values leave the client.
 
 ### Sharing rules
 
-- **New addresses.** Sharing a chat, a conversation or a dashboard with an address that has never signed in creates a password-less placeholder account (`AuthStore.ensure_invited_user`, `invited_by`/`invited_at` on the profile). Its sign-in is refused like any failed sign-in, so the recipient sets a password through the mailed reset link — whoever types the address first at the sign-in page cannot claim the share. Recipient addresses must match `routes.auth._EMAIL_RE`.
+- **New addresses.** Sharing a chat, a conversation or a dashboard with an address that has never signed in creates a password-less placeholder account (`AuthStore.ensure_invited_user` → `create_account`: `invited_by`/`invited_at` on the profile, a fresh session generation in `auth.json`). Its sign-in is refused like any failed sign-in, so the recipient sets a password through the mailed reset link — whoever types the address first at the sign-in page cannot claim the share. Recipient addresses must match `routes.auth._EMAIL_RE`. Removing an account (`POST /api/admin/users/remove`) takes its address off every share list, so a placeholder created later at the same address inherits none of the old shares.
 - **Dashboards.** A dashboard share grants the recipients access only to the source chats the dashboard OWNER owns. Tiles pinned from a chat the owner merely received show their stored snapshot, and their refresh answers `{ok:false, frozen:true, reason:"access_revoked"}` for those recipients. The owner can revoke one recipient at a time (`POST /api/dashboards/{id}/unshare`); that removes the dashboard, not the source-chat access the share granted. Chats and conversations still have no revoke.
 - **Conversations.** A conversation share is owner-only, like the chat-level share.
 

@@ -143,13 +143,23 @@ password its password back.
   **Disable SSO** and the password works again. Such a user can still set a
   local password through **Change Password** in the profile menu, but it
   stays unusable while SSO is enabled.
+- **The enforcement starts at the first Microsoft sign-in, not before.**
+  Enabling SSO does not stop an account that has a local password and has
+  never signed in with Microsoft: it keeps signing in with that password,
+  and Entra's multi-factor authentication and conditional access do not
+  apply to it until the user signs in with Microsoft once. If every user
+  must go through Entra, have each of them sign in with Microsoft once after
+  SSO is enabled.
 - **Disabling a user in Entra does not end an open session here.** There is
   no back-channel logout: an open PowerDataChat session lasts until the
   browser drops the cookie or its 30-day lifetime (`REMEMBER_ME_MAX_DAYS`)
   runs out. To end it at once, use **End sessions** on that user's row of the
   admin panel's **Users** page; **Remove** deletes the account and everything it
-  owns, and a user still assigned in Entra would get a new, empty account at
-  the next Microsoft sign-in.
+  owns and takes the address off everything shared with it and off the
+  tables it registered. A user still assigned in Entra gets a new, empty
+  account at the next Microsoft sign-in — none of the old chats, shares,
+  roles or registrations, and no old session works for it — so unassign
+  them in Entra as well.
 - **Recovering a stranded account.** If SSO is switched off, an account that
   has signed in with Microsoft and has no local password cannot sign in at
   all; while SSO stays on, the same is true of any Microsoft user who leaves
