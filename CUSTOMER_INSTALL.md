@@ -231,7 +231,12 @@ removed address. If the address is later used again — invited, shared with,
 or signing in with Microsoft — it becomes a new account that inherits none of
 this (the removal answer lists what was deleted and unshared; if a count is
 lower than you expected, check the log before reusing the address), and no
-session of the removed account works for it. A
+session of the removed account works for it. A sign-in or password change
+the removed user still had under way at that moment is refused too and cannot
+bring the account back. (One exception: a dashboard change still under way
+can leave that dashboard's folder behind, which an account created later at
+the same address would find — remove such a folder by hand before reusing
+the address if it matters.) A
 Microsoft user who is still assigned in Entra gets such an account simply by
 signing in again, so unassign them in Entra as well. Neither action can
 target the `ladmin` account, and you cannot remove your own.

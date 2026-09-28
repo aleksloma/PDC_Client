@@ -1197,6 +1197,15 @@ address, and that account normally starts empty (a step that failed —
 e.g. an owned chat that could not be deleted — is visible in the counts);
 an account created by an earlier release without a generation keeps
 reading `""` until its first password write or End sessions.
+Every other `AuthStore` writer of the account's records and sidebar rows
+refuses, under the store lock the removal also holds, an address with
+neither profile nor auth record (writes nothing, logs
+`ACCOUNT_WRITE_REFUSED`), so a request still in flight at the removal cannot
+re-create the account, and a sign-in finishing after it starts no session
+(or one the gate ends on its next request). Dashboard writes are not
+guarded: an in-flight dashboard change can re-create
+`users/<email>/dashboards/`, which an account created later at that address
+would find.
 Neither targets the bootstrap account, and an admin cannot remove their own.
 `roles_store` is denied inside the code-exec sandbox (grant tampering =
 privilege escalation). Downgrade caveat: an OLD build's `set_data_role`
