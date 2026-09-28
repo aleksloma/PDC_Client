@@ -1029,3 +1029,297 @@ def test_a_failing_strip_step_still_answers_200_and_audits_the_removal(
     detail = rows[0].get("detail") or {}
     assert detail.get("chats_unshared") == 0 and detail.get("dashboards_unshared") == 0, detail
     assert detail.get("chats_deleted") == 2 and detail.get("registrations_released") == 2, detail
+
+
+# ===========================================================================
+# Task 14c — a request already past the session gate when the account is
+# removed must not re-create it (D14c-1..D14c-3)
+# ===========================================================================
+# Every AuthStore writer but `create_account` refuses an address with
+# neither profile.json nor auth.json. `set_password` / `bump_session_
+# generation` raise `local_store.AccountMissing`; `/auth/password` answers
+# 401 `{"error": "Not authenticated"}` and clears its session, the forced
+# change clears the session and redirects to `/`, self-registration answers
+# the neutral sign-in failure, the admin routes answer 404 `Unknown user.`
+# without an audit row. The gate also ends a session whose account reads
+# `SESSION_GEN_REMOVED`, and `_start_session` refuses such an account.
+#
+# The race is reproduced by wrapping ONE AuthStore method at class level so
+# it removes the account (`remove_user`, the admin's removal) at exactly the
+# point where the route has passed its own checks.
+HIJACK_NEW_PW = "Hijack-passw0rd-1"
+FORCED = "life.forced@corp.example"
+FORCED_PW = "Forced-temp-passw0rd"
+SELFREG = "life.selfreg@corp.example"
+SSO_NEW = "life.sso.race@corp.example"
+
+
+def _race(monkeypatch, name, *, after=False, calls=None):
+    """Wrap `AuthStore.<name>` so the account is removed BEFORE (default) or
+    AFTER the original runs. Returns a function that restores the original,
+    so the follow-up request of the test runs unpatched."""
+    orig = getattr(local_store.AuthStore, name)
+
+    def racing(self, email, *args, **kwargs):
+        if calls is not None:
+            calls.append(email)
+        if after:
+            out = orig(self, email, *args, **kwargs)
+            self.remove_user(email)
+            return out
+        self.remove_user(email)
+        return orig(self, email, *args, **kwargs)
+
+    monkeypatch.setattr(local_store.AuthStore, name, racing)
+    return lambda: monkeypatch.setattr(local_store.AuthStore, name, orig)
+
+
+def _assert_account_gone(tmp, email):
+    store = local_store.AuthStore()
+    assert not (tmp / "users" / email).exists(), \
+        "the racing request re-created the removed account's folder"
+    assert not store.user_exists(email), "the removed account exists again"
+    assert not store.get_auth(email).get("password_hash"), "a password hash was written"
+    assert not (tmp / "users" / email / "auth.json").exists()
+
+
+# --- /auth/password -----------------------------------------------------------
+def test_password_change_racing_a_removal_writes_nothing_and_answers_401(world, monkeypatch):
+    """THE OWNER'S TEST. The removal lands after the gate and `is_sso_only`
+    (inside `has_password`): the folder is gone, so today the current-
+    password check is skipped and `set_password` re-creates the account with
+    a working password and re-stamps the session."""
+    tmp = world["tmp"]
+    tc = _signed_in(USER, USER_PW)
+    calls = []
+    restore = _race(monkeypatch, "has_password", calls=calls)
+    r = tc.post("/auth/password", json={"current_password": "",
+                                       "new_password": HIJACK_NEW_PW})
+    restore()
+    assert calls, "the race seam was never reached"
+    assert r.status_code == 401, (r.status_code, r.text[:300])
+    assert r.json() == {"error": "Not authenticated"}, r.json()
+    _assert_account_gone(tmp, USER)
+    assert not _alive(tc), "the removed account's session survived the racing change"
+    assert not (tmp / "users" / USER).exists(), "the follow-up request re-created the folder"
+
+
+def test_password_change_with_the_right_current_password_racing_a_removal(world, monkeypatch):
+    """The twin for a user who knows the current password: the removal lands
+    right AFTER the current password verified (inside `verify_password`),
+    i.e. just before `set_password`."""
+    tmp = world["tmp"]
+    tc = _signed_in(USER, USER_PW)
+    calls = []
+    restore = _race(monkeypatch, "verify_password", after=True, calls=calls)
+    r = tc.post("/auth/password", json={"current_password": USER_PW,
+                                       "new_password": HIJACK_NEW_PW})
+    restore()
+    assert calls, "the race seam was never reached"
+    assert r.status_code == 401, (r.status_code, r.text[:300])
+    assert r.json() == {"error": "Not authenticated"}, r.json()
+    _assert_account_gone(tmp, USER)
+    assert not _alive(tc), "the removed account's session survived the racing change"
+
+
+def test_forced_password_change_racing_a_removal_writes_nothing_and_redirects_home(
+        world, monkeypatch):
+    """`/auth/change_password` (the forced change after a force_change
+    sign-in): the removal lands after the route's SSO check, inside the
+    password rule — the last seam before `set_password`. The session is
+    cleared and the answer is the redirect to `/`."""
+    import routes.auth as auth_mod
+    tmp = world["tmp"]
+    store = local_store.AuthStore()
+    store.ensure_user(FORCED)
+    store.set_password(FORCED, FORCED_PW, force_change=True)
+    tc = _signed_in(FORCED, FORCED_PW, expect="/auth/change_password")
+
+    orig = auth_mod.password_rule_error
+    calls = []
+
+    def racing(password):
+        calls.append(password)
+        local_store.AuthStore().remove_user(FORCED)
+        return orig(password)
+    monkeypatch.setattr(auth_mod, "password_rule_error", racing)
+    r = tc.post("/auth/change_password",
+                data={"new_password": HIJACK_NEW_PW, "confirm_password": HIJACK_NEW_PW},
+                follow_redirects=False)
+    monkeypatch.setattr(auth_mod, "password_rule_error", orig)
+    assert calls, "the race seam was never reached"
+    assert r.status_code in (302, 303), (r.status_code, r.text[:300])
+    assert r.headers["location"] == "/", r.headers["location"]
+    _assert_account_gone(tmp, FORCED)
+    assert not _alive(tc), "the forced-change session survived the removal"
+
+
+# --- the SESSION_GEN_REMOVED sentinel (D14c-3) --------------------------------
+@pytest.mark.parametrize("shape", ["never_seen", "removed"])
+def test_a_session_stamped_with_the_sentinel_is_ended_by_the_gate(world, shape):
+    """A cookie carrying `gen: "-"` for an address with no records: today
+    `"-" == "-"` and the gate lets it through. It must be emptied (401)
+    whatever the session carries, and nothing may be created."""
+    tmp = world["tmp"]
+    addr = GHOST
+    if shape == "removed":
+        addr = OTHER
+        assert _remove(_admin(), OTHER).status_code == 200
+    assert local_store.AuthStore().session_generation(addr) == _sentinel()
+    tc = _cookie_session(addr)                   # gen = the sentinel
+    r = tc.get("/auth/profile")
+    assert r.status_code == 401, (r.status_code, r.text[:300])
+    assert tc.get("/auth/me").status_code == 401
+    assert not (tmp / "users" / addr).exists(), "a sentinel session created the folder"
+
+
+def test_a_sign_in_racing_a_removal_starts_no_session(world, monkeypatch):
+    """The removal lands between the password verification and
+    `_start_session` (which would stamp `"-"`). The sign-in answers the
+    neutral failure, nothing is re-created (today `touch_last_login` writes a
+    profile back) and the client holds no session."""
+    tmp = world["tmp"]
+    tc = _client()
+    calls = []
+    restore = _race(monkeypatch, "verify_password", after=True, calls=calls)
+    r = tc.post("/auth/login", data={"email": USER, "password": USER_PW},
+                follow_redirects=False)
+    restore()
+    assert calls, "the race seam was never reached"
+    assert r.status_code == 401, (r.status_code, r.headers.get("location"), r.text[:200])
+    assert 'data-i18n="auth.signin_failed"' in r.text, r.text[:500]
+    assert not (tmp / "users" / USER).exists(), "the racing sign-in re-created the folder"
+    assert not local_store.AuthStore().user_exists(USER)
+    assert tc.get("/auth/me").status_code == 401
+    assert not _alive(tc)
+    assert not (tmp / "users" / USER).exists()
+
+
+def test_a_self_registration_racing_a_removal_answers_the_neutral_failure(world, monkeypatch):
+    """Demo self-registration: `ensure_user` then `set_password` (no try
+    today). The account is removed right after its creation; `set_password`
+    refuses (AccountMissing) and the sign-in answers the neutral failure —
+    no auth-only folder, no session."""
+    tmp = world["tmp"]
+    monkeypatch.setattr(settings, "ALLOW_SELF_REGISTRATION", True)
+    tc = _client()
+    calls = []
+    restore = _race(monkeypatch, "ensure_user", after=True, calls=calls)
+    r = tc.post("/auth/login", data={"email": SELFREG, "password": "Selfreg-passw0rd-1"},
+                follow_redirects=False)
+    restore()
+    assert calls, "the race seam was never reached"
+    assert r.status_code == 401, (r.status_code, r.headers.get("location"), r.text[:200])
+    assert 'data-i18n="auth.signin_failed"' in r.text, r.text[:500]
+    _assert_account_gone(tmp, SELFREG)
+    assert not _alive(tc)
+    assert not (tmp / "users" / SELFREG).exists()
+
+
+@pytest.mark.parametrize("who", ["new", "existing"])
+def test_a_microsoft_sign_in_racing_a_removal_leaves_no_session(world, monkeypatch, who):
+    """The SSO callback: `ensure_user`, then `mark_sso_login` — here the
+    removal lands just before the stamp. Today the stamp writes auth.json
+    back (an auth-only folder with no generation → `""`), `_start_session`
+    stamps `""` and the session works. The stamp must refuse, `_start_session`
+    must refuse the `"-"` account, and nothing may exist afterwards."""
+    from cryptography.fernet import Fernet
+    import routes.sso as sso_mod
+    import sso_store
+    tmp = world["tmp"]
+    monkeypatch.setattr(settings, "CLIENT_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.setattr(settings, "CLIENT_ENCRYPTION_KEY_OLD", "")
+    sso_store.save({"tenant_id": "11111111-2222-3333-4444-555555555555",
+                    "client_id": "app-client-id", "client_secret": "s3cret-sso",
+                    "public_base_url": "", "auto_redirect": False}, ADMIN)
+    sso_store.record_test_ok(ADMIN)
+    sso_store.set_enabled(True, ADMIN)
+    addr = SSO_NEW if who == "new" else SSO
+
+    class _Fake:
+        async def authorize_access_token(self, request):
+            return {"userinfo": {"preferred_username": addr}}
+    monkeypatch.setattr(sso_mod, "_oauth_client", lambda: _Fake())
+
+    calls = []
+    restore = _race(monkeypatch, "mark_sso_login", calls=calls)
+    tc = _client()
+    r = tc.get("/auth/microsoft/callback", follow_redirects=False)
+    restore()
+    assert calls, (r.status_code, r.text[:300])
+    # The callback's answer on a refused session is the coder's choice (the
+    # plan fixes only the outcome): no account and no working session.
+    assert not (tmp / "users" / addr).exists(), "the racing SSO stamp re-created the folder"
+    assert not local_store.AuthStore().user_exists(addr)
+    assert tc.get("/auth/me").status_code == 401
+    assert not _alive(tc), "the racing Microsoft sign-in left a working session"
+    assert not (tmp / "users" / addr).exists()
+
+
+# --- admin routes racing a removal ------------------------------------------
+def test_end_sessions_racing_a_removal_answers_404_and_audits_nothing(world, monkeypatch):
+    tmp = world["tmp"]
+    admin = _admin()
+    calls = []
+    restore = _race(monkeypatch, "bump_session_generation", calls=calls)
+    r = _end_sessions(admin, USER)
+    restore()
+    assert calls, "the race seam was never reached"
+    assert r.status_code == 404, (r.status_code, r.text[:300])
+    assert r.json() == {"error": "Unknown user."}, r.json()
+    assert not [x for x in _audit("user.sessions_ended") if x.get("target") == USER], \
+        "an audit row was written for sessions that were never ended"
+    assert not (tmp / "users" / USER).exists(), "end_sessions re-created the removed account"
+    assert not local_store.AuthStore().user_exists(USER)
+
+
+def test_set_role_racing_a_removal_answers_404_and_audits_nothing(world, monkeypatch):
+    tmp = world["tmp"]
+    admin = _admin()
+    calls = []
+    restore = _race(monkeypatch, "set_data_roles", calls=calls)
+    r = admin.post("/api/admin/users/set_role", json={"email": USER, "role_ids": ["base"]})
+    restore()
+    assert calls, (r.status_code, r.text[:300])
+    assert r.status_code == 404, (r.status_code, r.text[:300])
+    assert r.json() == {"error": "Unknown user."}, r.json()
+    assert not [x for x in _audit("user.set_roles") if x.get("target") == USER], \
+        "an audit row was written for a role change that did not happen"
+    assert not (tmp / "users" / USER).exists(), "set_role re-created the removed account"
+    assert not local_store.AuthStore().user_exists(USER)
+
+
+def test_set_permission_racing_a_removal_answers_404_and_audits_nothing(world, monkeypatch):
+    tmp = world["tmp"]
+    admin = _admin()
+    calls = []
+    restore = _race(monkeypatch, "set_role", calls=calls)
+    r = admin.post("/api/admin/users/set_permission",
+                   json={"email": USER, "permission": "power"})
+    restore()
+    assert calls, (r.status_code, r.text[:300])
+    assert r.status_code == 404, (r.status_code, r.text[:300])
+    assert r.json() == {"error": "Unknown user."}, r.json()
+    assert not [x for x in _audit("user.set_permission") if x.get("target") == USER], \
+        "an audit row was written for a permission change that did not happen"
+    assert not (tmp / "users" / USER).exists(), "set_permission re-created the removed account"
+    assert not local_store.AuthStore().user_exists(USER)
+
+
+# --- keep-green: the same routes on a live account ---------------------------
+def test_live_account_password_change_and_admin_writes_are_unchanged(world):
+    """No race: the routes behave exactly as before on a live account."""
+    tc = _signed_in(USER, USER_PW)
+    r = tc.post("/auth/password", json={"current_password": USER_PW,
+                                       "new_password": "Life-user-passw0rd-2"})
+    assert r.status_code == 200 and r.json() == {"ok": True}, (r.status_code, r.text[:300])
+    assert _alive(tc), "the session that changed the password must carry on"
+    admin = _admin()
+    assert admin.post("/api/admin/users/set_role",
+                      json={"email": USER, "role_ids": ["base"]}).status_code == 200
+    assert admin.post("/api/admin/users/set_permission",
+                      json={"email": USER, "permission": "power"}).status_code == 200
+    assert local_store.AuthStore().get_role(USER) == "power"
+    assert _end_sessions(admin, USER).status_code == 200
+    assert not _alive(tc)
+    assert _alive(_signed_in(USER, "Life-user-passw0rd-2"))

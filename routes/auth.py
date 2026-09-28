@@ -67,7 +67,7 @@ from pathlib import Path as _P
 import auth_limiter
 import password_utils
 from exec_transport import log_safe_text
-from local_store import AuthStore, reset_record_live
+from local_store import SESSION_GEN_REMOVED, AccountMissing, AuthStore, reset_record_live
 from logger_utils import log_with_sid
 from settings import settings
 import brain_client
@@ -289,7 +289,16 @@ def _too_many(request: Request, verdict, *, email: str = "", headers: dict = Non
 
 
 def _start_session(request: Request, email: str, *, remember: bool,
-                   must_change: bool = False) -> None:
+                   must_change: bool = False) -> bool:
+    """Sign `email` in on this session. False — the session untouched, the
+    caller answers its sign-in failure — when the account no longer exists
+    (it reads `SESSION_GEN_REMOVED`: an administrator removed it while the
+    sign-in was under way)."""
+    generation = AuthStore().session_generation(email)
+    if generation == SESSION_GEN_REMOVED:
+        log_with_sid(log_safe_text(email, 254), "warning", "SESSION_START_REFUSED",
+                     reason="account_missing")
+        return False
     request.session["email"] = email
     if remember:
         request.session["remember"] = True
@@ -305,12 +314,14 @@ def _start_session(request: Request, email: str, *, remember: bool,
     # The account's current generation (a later password change or reset
     # ends this session) and the sign-in time (the absolute lifetime starts
     # again at every sign-in).
-    request.session["gen"] = AuthStore().session_generation(email)
+    request.session["gen"] = generation
     request.session["iat"] = _session_now()
     # Single funnel for every sign-in branch (password, self-registration,
     # SSO) — the one place to stamp last_login_at. touch_last_login never
-    # raises.
+    # raises (a removal landing after the check above: it writes nothing and
+    # the session gate ends this session on its next request).
     AuthStore().touch_last_login(email)
+    return True
 
 
 def _send_welcome_email_async(email: str) -> None:
@@ -382,9 +393,16 @@ async def login(request: Request):
                 return _landing(request, password_error=rule_error,
                                 email=email, status_code=400)
             store.ensure_user(email)
-            store.set_password(email, password)
+            try:
+                store.set_password(email, password)
+            except AccountMissing:
+                # Removed by an administrator right after its creation.
+                log_with_sid(email, "warning", "USER_LOGIN_SELF_REGISTRATION_REFUSED",
+                             reason="account_missing")
+                return _refuse()
+            if not _start_session(request, email, remember=remember):
+                return _refuse()
             auth_limiter.success("login", email, ip)
-            _start_session(request, email, remember=remember)
             log_with_sid(email, "info", "USER_LOGIN_FIRST_PASSWORD_SET",
                          sid=log_safe_text(request.session.get("sid"), 40))
             _send_welcome_email_async(email)
@@ -415,9 +433,10 @@ async def login(request: Request):
         log_with_sid(email, "warning", "USER_LOGIN_BAD_PASSWORD")
         return _refuse()
 
-    auth_limiter.success("login", email, ip)
     must_change = (outcome == "temp") or bool(store.get_auth(email).get("must_change_password"))
-    _start_session(request, email, remember=remember, must_change=must_change)
+    if not _start_session(request, email, remember=remember, must_change=must_change):
+        return _refuse()
+    auth_limiter.success("login", email, ip)
     log_with_sid(email, "info", "USER_LOGIN", sid=log_safe_text(request.session.get("sid"), 40),
                  must_change=bool(must_change))
     try:
@@ -667,6 +686,12 @@ async def change_password_submit(request: Request):
         return _page("Passwords do not match")
     try:
         generation = AuthStore().set_password(email, new_password)
+    except AccountMissing:
+        # The account was removed while this request was under way.
+        request.session.clear()
+        log_with_sid(log_safe_text(email, 254), "warning", "FORCED_PASSWORD_CHANGE_REFUSED",
+                     reason="account_missing")
+        return RedirectResponse(url="/", status_code=302)
     except Exception as e:
         log_with_sid(email, "error", f"FORCED_PASSWORD_CHANGE_FAILED: {log_safe_text(str(e), 200)}")
         return _page("Could not save the new password. Please try again.", 500)
@@ -762,6 +787,13 @@ async def change_password(request: Request):
             return JSONResponse({"error": "Incorrect current password"}, status_code=401)
     try:
         generation = store.set_password(email, new_password)
+    except AccountMissing:
+        # The account was removed while this request was under way: nothing
+        # was written, and this session ends here.
+        request.session.clear()
+        log_with_sid(log_safe_text(email, 254), "warning", "PASSWORD_CHANGE_REFUSED",
+                     reason="account_missing")
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
     except Exception as e:
         log_with_sid(email, "error", f"PASSWORD_CHANGE_FAILED: {log_safe_text(str(e), 200)}")
         return JSONResponse({"error": "Could not save the new password"}, status_code=500)

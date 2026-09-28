@@ -180,7 +180,9 @@ async def microsoft_callback(request: Request):
     # Browser-session cookie on purpose (remember=False): Entra re-auth is
     # silent on joined devices, so a 30-day persistent cookie would add risk
     # with no UX benefit. must_change is never set for an SSO login.
-    _start_session(request, email, remember=False)
+    if not _start_session(request, email, remember=False):
+        # Removed by an administrator while this sign-in was under way.
+        return _landing(request, error=_SIGNIN_FAILED, status_code=401)
     log_with_sid(email, "info", "USER_LOGIN_SSO", sid=request.session.get("sid"))
     try:
         brain_client.post_activity("login", email)

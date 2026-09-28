@@ -25,6 +25,9 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "CLIENT_ENCRYPTION_KEY",
                         Fernet.generate_key().decode())
     local_store._DATAFRAME_CACHE.invalidate()
+    # Task 14c (D14c-4): the sidebar writers refuse an account that does not
+    # exist, so the owner is created first (the assertions are unchanged).
+    local_store.AuthStore().ensure_user(OWNER)
 
     import routes.upload as upload_mod
     # Brain calls stubbed — offline.

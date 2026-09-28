@@ -31,7 +31,7 @@ from starlette.datastructures import MutableHeaders
 from settings import settings
 from logger_utils import log_with_sid
 from exec_transport import log_safe_text
-from local_store import AuthStore
+from local_store import SESSION_GEN_REMOVED, AuthStore
 import sso_store
 import gcs_upload
 
@@ -460,8 +460,10 @@ class SessionGenerationGate:
     EMPTIES the session in place: the request continues as anonymous (pages
     redirect to `/`, APIs answer 401) and the session middleware sends the
     clearing cookie. A cookie without `gen` on an account that has no
-    generation matches, so an upgrade signs nobody out. The account's value
-    is cached in-process (local_store), never read per request.
+    generation matches, so an upgrade signs nobody out. An account that no
+    longer exists (it reads `SESSION_GEN_REMOVED`) ends the session whatever
+    `gen` it carries — a live account never reads that value. The account's
+    value is cached in-process (local_store), never read per request.
 
     Pure ASGI, registered INSIDE the session middleware (which fills
     `scope["session"]`) and outside the password-change gate. A failure is
@@ -476,7 +478,9 @@ class SessionGenerationGate:
             try:
                 session = scope.get("session")
                 email = session.get("email") if session else None
-                if email and session.get("gen", "") != AuthStore().session_generation(email):
+                current = AuthStore().session_generation(email) if email else None
+                if email and (current == SESSION_GEN_REMOVED
+                              or session.get("gen", "") != current):
                     session.clear()
                     log_with_sid("session", "info",
                                  f"SESSION_ENDED_BY_PASSWORD_CHANGE "

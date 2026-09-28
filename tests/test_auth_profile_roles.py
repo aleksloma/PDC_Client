@@ -74,6 +74,8 @@ def test_set_data_roles_writes_list_and_legacy_mirror():
     prof = auth.get_profile("m@x.com")
     assert prof["data_roles"] == [] and prof["data_role"] == "base"
     # A LEGACY single-role profile reads as a one-element list.
+    # Task 14c (D14c-4): a writer refuses a missing account — create it first.
+    auth.ensure_user("l@x.com")
     auth.set_data_role("l@x.com", "bb22cc33dd44ee55")
     p = auth.get_profile("l@x.com")
     del p["data_roles"]                       # simulate a pre-19c write

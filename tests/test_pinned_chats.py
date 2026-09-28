@@ -23,6 +23,9 @@ OWNER = "alice@acme.com"
 @pytest.fixture
 def data_root(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "DATA_ROOT", str(tmp_path))
+    # Task 14c (D14c-4): the sidebar writers refuse an account that does not
+    # exist, so the owner is created first (the assertions are unchanged).
+    AuthStore().ensure_user(OWNER)
     return tmp_path
 
 
@@ -72,7 +75,7 @@ def test_pin_unknown_chat_returns_false(data_root):
 def test_old_shape_rows_sort_exactly_as_before(data_root):
     # Hand-written pre-feature rows (no pinned key anywhere).
     p = data_root / "users" / OWNER / "active_chats.jsonl"
-    p.parent.mkdir(parents=True)
+    p.parent.mkdir(parents=True, exist_ok=True)   # the fixture created the account (14c)
     p.write_text(
         json.dumps({"chat_id": "c1", "title": "first", "files": [],
                     "created_at": "2026-01-01T00:00:00+00:00"}) + "\n" +

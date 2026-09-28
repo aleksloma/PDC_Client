@@ -44,7 +44,8 @@ import brain_client
 import db_sources
 import roles_store
 from exec_transport import log_safe_text
-from local_store import AuthStore, delete_chats_owned_by, purge_address_grants
+from local_store import (AccountMissing, AuthStore, delete_chats_owned_by,
+                         purge_address_grants)
 from logger_utils import log_with_sid
 from routes.admin_data import _require_admin, _json_body
 from settings import settings
@@ -228,7 +229,12 @@ async def set_user_role(request: Request):
     # 19g: no permission check here — PROMOTED admins take roles through the
     # same machinery as everyone else (only the bootstrap account is
     # roleless, refused by the identity check above).
-    auth.set_data_roles(target, role_ids)
+    if auth.set_data_roles(target, role_ids) is False:
+        # Removed while this request was under way: nothing was written.
+        log_with_sid(email, "warning",
+                     f"ADMIN_USER_SET_ROLES_REFUSED user={log_safe_text(target, 254)} "
+                     f"reason=account_missing")
+        return JSONResponse({"error": "Unknown user."}, status_code=404)
     db_sources.audit(email, "user.set_roles", target=target,
                      detail={"role_ids": role_ids,
                              "role_names": [r.get("name") for r in roles]},
@@ -278,7 +284,12 @@ async def set_user_permission(request: Request):
     if auth.get_profile(target) is None:
         return JSONResponse({"error": "Unknown user."}, status_code=404)
     old = _PERM_OUT.get(auth.get_role(target), "standard")
-    auth.set_role(target, _PERM_IN[perm])
+    if auth.set_role(target, _PERM_IN[perm]) is False:
+        # Removed while this request was under way: nothing was written.
+        log_with_sid(email, "warning",
+                     f"ADMIN_USER_SET_PERMISSION_REFUSED user={log_safe_text(target, 254)} "
+                     f"reason=account_missing")
+        return JSONResponse({"error": "Unknown user."}, status_code=404)
     db_sources.audit(email, "user.set_permission", target=target,
                      detail={"old": old, "new": perm},
                      ip=(request.client.host if request.client else None))
@@ -328,6 +339,12 @@ async def end_user_sessions(request: Request):
     try:
         await asyncio.get_running_loop().run_in_executor(
             None, auth.bump_session_generation, target)
+    except AccountMissing:
+        # Removed while this request was under way: nothing was written.
+        log_with_sid(email, "warning",
+                     f"ADMIN_USER_END_SESSIONS_REFUSED user={log_safe_text(target, 254)} "
+                     f"reason=account_missing")
+        return JSONResponse({"error": "Unknown user."}, status_code=404)
     except Exception as e:
         log_with_sid(email, "error",
                      f"ADMIN_USER_END_SESSIONS_FAILED user={log_safe_text(target, 254)} "

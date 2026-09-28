@@ -66,7 +66,16 @@ _SESSION_GEN_CACHE: dict = {}
 # Not hex, so it never equals a real generation, and not "", so the session
 # of a removed account that never had a generation (SSO-only, legacy) ends
 # too. Never cached: an account created afterwards reads its real value.
+# The session gate ends any session of an address that reads it, whatever
+# `gen` the session carries, and a sign-in never starts one for it.
 SESSION_GEN_REMOVED = "-"
+
+
+class AccountMissing(Exception):
+    """Raised by the AuthStore writers whose return value is stamped into a
+    session (`set_password`, `bump_session_generation`) when the account has
+    neither profile.json nor auth.json: nothing was written. The other
+    writers answer False instead."""
 
 
 def _session_gen_key(email: str) -> str:
@@ -1194,6 +1203,21 @@ class AuthStore:
         udir = _data_root() / "users" / _safe_email(email)
         return (udir / "profile.json").exists() or (udir / "auth.json").exists()
 
+    def _account_present(self, email: str, writer: str) -> bool:
+        """The write guard of every writer except `create_account`: True for
+        an existing account (profile.json or auth.json). False — logged as
+        `ACCOUNT_WRITE_REFUSED writer=<writer>`, no path — for an address
+        with neither, so a request still in flight when an administrator
+        removes the account cannot write it back. Called inside the writer's
+        `_LOCK` section; `remove_user` deletes under the same lock, so the
+        check and the write cannot interleave with a removal."""
+        if self.user_exists(email):
+            return True
+        from exec_transport import log_safe_text
+        log_with_sid(log_safe_text(_safe_email(email), 254), "warning",
+                     f"ACCOUNT_WRITE_REFUSED writer={log_safe_text(writer, 60)}")
+        return False
+
     def get_auth(self, email: str) -> dict:
         p = self._auth_path(email)
         if not p.exists():
@@ -1215,22 +1239,26 @@ class AuthStore:
     def has_password(self, email: str) -> bool:
         return bool(self.get_auth(email).get("password_hash"))
 
-    def mark_sso_login(self, email: str, provider: str) -> None:
+    def mark_sso_login(self, email: str, provider: str):
         """Stamp the SSO provenance on auth.json (sso_provider +
         sso_last_login). MERGE-only: password_hash / temp_password_hash /
         must_change_password stay untouched — a password user who also
         signs in via SSO keeps the password. Never raises (Article IV; a
-        stamp failure must not block login). Known edge: the merge goes
+        stamp failure must not block login). False, nothing written, for a
+        missing account (`_account_present`). Known edge: the merge goes
         through `get_auth`, which answers {} for an UNREADABLE auth.json, so
         on a corrupt record the rewrite drops the stored
         `session_generation` on disk (the cache keeps the value until a
         restart)."""
         try:
             with _LOCK:
+                if not self._account_present(email, "mark_sso_login"):
+                    return False
                 auth = self.get_auth(email)
                 auth["sso_provider"] = provider
                 auth["sso_last_login"] = _now()
                 self._write_auth(email, auth)
+            return True
         except Exception as e:
             log_with_sid(email, "warning", f"SSO_MARK_LOGIN_FAILED: {e}")
 
@@ -1248,10 +1276,13 @@ class AuthStore:
         ladmin bootstrap) keeps the must_change_password flag ON so the first
         login forces a change. Writes a fresh `session_generation` (every
         other session of the account ends) and RETURNS it, so the session
-        that made the change can re-stamp itself."""
+        that made the change can re-stamp itself. Raises `AccountMissing`,
+        nothing written, for a missing account (`_account_present`)."""
         from password_utils import generate_password_hash
         new_hash = generate_password_hash(password)   # PBKDF2 outside the lock
         with _LOCK:
+            if not self._account_present(email, "set_password"):
+                raise AccountMissing()
             auth = self.get_auth(email)
             old = auth.get("reset_token_hash")
             self._apply_password_hash(auth, new_hash, force_change)
@@ -1271,8 +1302,11 @@ class AuthStore:
         without a password too (SSO-only, legacy): its auth.json then holds
         the generation, and it stays what it was. Returns the new value.
         Raises when an existing record cannot be read — it is never replaced
-        by one holding only the generation."""
+        by one holding only the generation — and `AccountMissing`, nothing
+        written, for a missing account (`_account_present`)."""
         with _LOCK:
+            if not self._account_present(email, "bump_session_generation"):
+                raise AccountMissing()
             p = self._auth_path(email)
             auth: dict = {}
             if p.exists():
@@ -1384,17 +1418,23 @@ class AuthStore:
         role = (self.get_profile(email) or {}).get("role")
         return role if role in self._KNOWN_ROLES else "user"
 
-    def set_role(self, email: str, role: str) -> None:
+    def set_role(self, email: str, role: str) -> bool:
+        """True when the account holds `role` afterwards; False, nothing
+        written, for a missing account (`_account_present`, checked before
+        the unchanged-role shortcut)."""
         email = _safe_email(email)
         with _LOCK:
+            if not self._account_present(email, "set_role"):
+                return False
             prof = self.get_profile(email) or {"email": email, "created_at": _now()}
             if prof.get("role") == role:
-                return
+                return True
             prof["role"] = role
             p = _data_root() / "users" / email / "profile.json"
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps(prof, indent=2, ensure_ascii=False), encoding="utf-8")
         log_with_sid(email, "info", f"USER_ROLE_SET role={role}")
+        return True
 
     def is_admin(self, email: str) -> bool:
         return self.get_role(email) == "admin"
@@ -1435,41 +1475,50 @@ class AuthStore:
         legacy = prof.get("data_role")
         return [legacy] if isinstance(legacy, str) and legacy else []
 
-    def set_data_roles(self, email: str, role_ids: list) -> None:
+    def set_data_roles(self, email: str, role_ids: list) -> bool:
+        """True when the account holds `role_ids` afterwards; False, nothing
+        written, for a missing account (`_account_present`)."""
         email = _safe_email(email)
         ids = list(dict.fromkeys(r for r in (role_ids or [])
                                  if isinstance(r, str) and r))
         with _LOCK:
+            if not self._account_present(email, "set_data_roles"):
+                return False
             prof = self.get_profile(email) or {"email": email, "created_at": _now()}
             if prof.get("data_roles") == ids and prof.get("data_role") == (
                     ids[0] if ids else "base"):
-                return
+                return True
             prof["data_roles"] = ids
             prof["data_role"] = ids[0] if ids else "base"   # downgrade mirror
             p = _data_root() / "users" / email / "profile.json"
             p.parent.mkdir(parents=True, exist_ok=True)
             _write_json_atomic(p, prof)
         log_with_sid(email, "info", f"USER_DATA_ROLES_SET role_ids={ids}")
+        return True
 
     # Single-role shims — many call sites/tests predate the multi-role model.
     def get_data_role(self, email: str) -> str:
         ids = self.get_data_roles(email)
         return ids[0] if ids else "base"
 
-    def set_data_role(self, email: str, role_id: str) -> None:
-        self.set_data_roles(email, [role_id])
+    def set_data_role(self, email: str, role_id: str) -> bool:
+        return self.set_data_roles(email, [role_id])
 
-    def touch_last_login(self, email: str) -> None:
+    def touch_last_login(self, email: str):
         """Stamp last_login_at on the profile. Best-effort — a failed stamp
-        must never break a login (Article IV)."""
+        must never break a login (Article IV). False, nothing written, for a
+        missing account (`_account_present`)."""
         try:
             email = _safe_email(email)
             with _LOCK:
+                if not self._account_present(email, "touch_last_login"):
+                    return False
                 prof = self.get_profile(email) or {"email": email, "created_at": _now()}
                 prof["last_login_at"] = _now()
                 p = _data_root() / "users" / email / "profile.json"
                 p.parent.mkdir(parents=True, exist_ok=True)
                 _write_json_atomic(p, prof)
+            return True
         except Exception as e:
             log_with_sid(email, "warning", f"LAST_LOGIN_STAMP_FAILED: {e}")
 
@@ -1714,10 +1763,13 @@ class AuthStore:
         except Exception:
             return None
 
-    def update_profile(self, email: str, *, new_email: str = None) -> dict:
-        """Only the email is editable. Anything else is ignored."""
+    def update_profile(self, email: str, *, new_email: str = None):
+        """Only the email is editable. Anything else is ignored. False,
+        nothing written, for a missing account (`_account_present`)."""
         with _LOCK:
             email = _safe_email(email)
+            if not self._account_present(email, "update_profile"):
+                return False
             prof = self.get_profile(email) or {"created_at": _now()}
             if new_email and _safe_email(new_email) != email:
                 # Cannot change identity — the email IS the identity.
@@ -1779,9 +1831,13 @@ class AuthStore:
     def get_active_chat_names(self, email: str) -> set[str]:
         return {row.get("title", "") for row in self.list_active_chats(email) if row.get("title")}
 
-    def record_active_chat(self, email: str, chat_id: str, title: str, files: list[str]) -> None:
+    def record_active_chat(self, email: str, chat_id: str, title: str, files: list[str]) -> bool:
+        """False, nothing written, for a missing account (`_account_present`)
+        — as for the two recorders below."""
         with _LOCK:
             email = _safe_email(email)
+            if not self._account_present(email, "record_active_chat"):
+                return False
             p = _data_root() / "users" / email / "active_chats.jsonl"
             p.parent.mkdir(parents=True, exist_ok=True)
             with p.open("a", encoding="utf-8") as fh:
@@ -1789,11 +1845,14 @@ class AuthStore:
                     "chat_id": chat_id, "title": title, "files": files,
                     "created_at": _now(),
                 }, ensure_ascii=False) + "\n")
+        return True
 
     def record_conversation(self, email: str, chat_id: str, conv_id: str, title: str,
-                             *, shared_by: str = "") -> None:
+                             *, shared_by: str = "") -> bool:
         with _LOCK:
             email = _safe_email(email)
+            if not self._account_present(email, "record_conversation"):
+                return False
             p = _data_root() / "users" / email / "conversations.jsonl"
             p.parent.mkdir(parents=True, exist_ok=True)
             row = {
@@ -1804,15 +1863,18 @@ class AuthStore:
                 row["shared_by"] = shared_by
             with p.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return True
 
     def record_shared_chat(self, email: str, chat_id: str, title: str,
-                            files: list[str], shared_by: str) -> None:
+                            files: list[str], shared_by: str) -> bool:
         """Record a chat in the recipient's active_chats so they can open it."""
         with _LOCK:
             email = _safe_email(email)
+            if not self._account_present(email, "record_shared_chat"):
+                return False
             existing_ids = {row.get("chat_id") for row in self.list_active_chats(email)}
             if chat_id in existing_ids:
-                return
+                return True
             p = _data_root() / "users" / email / "active_chats.jsonl"
             p.parent.mkdir(parents=True, exist_ok=True)
             with p.open("a", encoding="utf-8") as fh:
@@ -1821,6 +1883,7 @@ class AuthStore:
                     "created_at": _now(),
                     "shared_by": shared_by,
                 }, ensure_ascii=False) + "\n")
+        return True
 
     def rename_active_chat(self, email: str, chat_id: str, new_title: str) -> bool:
         with _LOCK:
