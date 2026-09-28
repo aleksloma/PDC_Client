@@ -161,6 +161,7 @@ PDC_Client/
 | [`docs/BUILD_AND_RUN.md`](docs/BUILD_AND_RUN.md) | Build, run, configure, logs |
 | [`docs/LIVE_TABLES_PLAN.md`](docs/LIVE_TABLES_PLAN.md) | Live mode for large database tables: the registry half that has shipped (mode field, cell thresholds, mode endpoint, sampled profile, admin UI) and the design of the query path that follows |
 | [`docs/EXECUTOR_PROTOCOL.md`](docs/EXECUTOR_PROTOCOL.md) | The `pdc-client` ↔ `pdc-executor` contract: trust model, job-dir ownership, request/response, serialization matrix, status→error mapping, what the main app refuses to read |
+| [`RELEASES.md`](RELEASES.md) | One entry per tagged release: commit, both image digests, scope, release-gate results and any accepted scan findings with their reasons |
 
 ## Before committing
 

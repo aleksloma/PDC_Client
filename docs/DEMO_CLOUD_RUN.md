@@ -376,6 +376,51 @@ Remove the check's throwaway account and dashboard afterwards.
 
 ## Deploy history
 
+**2026-09-28 — release `v1.0-security-r1`.** Commit `2089883`, built from the
+tag by Cloud Build `2d763656-5fc4-474b-81c8-f4319e9ca989` (both images stamped
+`2089883`, `BUILD_TIME=2026-09-28T19:22:00Z`):
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:2089883` | `sha256:a5119234aadaba1f883b0b1566601ce8070113c8e58003938e2f31a3cade7351` |
+| `pdcexecutor-demo:2089883` | `sha256:1931cb7588d510ceef60680a728218ce2ce1c621bfedd768abbfc7dfc2b88b04` |
+
+Revision `pdcclient-demo-2089883`, serving 100 % since 2026-09-28 ~19:47 UTC;
+it resolved exactly the two digests above. It replaced
+`pdcclient-demo-cef5e17`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise \
+  --region=europe-west1 --to-revisions=pdcclient-demo-cef5e17=100
+```
+
+Both revisions run the same spec apart from the two image tags, so a rollback
+needs no environment change. Backup taken before the deploy:
+`gs://pdc-enterprise-client-demo-data-backups/20260928-192244/`, which matched
+the data bucket in size (365,661,341 bytes) and in its 470 object names.
+
+The spec change was an image-only edit (two `image:` lines and the template
+name), checked by a diff against the export before the Admin API `PUT`.
+Candidate checks (`candidate---…` URL) all passed:
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`, and `/version` reported `2089883`.
+- `/lab` carried `window.__DIRECT_UPLOAD__ = true`.
+- A self-registered throwaway account signed in, uploaded
+  `sample_sales.csv`, got an interactive Plotly chart from a question (sandbox
+  job `EXEC_JOB_END status=ok`), then created a dashboard, pinned the chart,
+  read it back and deleted it.
+- Revision log: `EXECUTOR_HANDSHAKE_OK version=2089883`; no
+  `EXECUTOR_SHARED_DIR_*`, no `BACKEND_REQUEST_REFUSED`, no errors, no 5xx.
+- After the shift, `client.powerdatachat.com` reported the same `/version` and
+  `/health`, and `pdcbrain` gained no revision (`pdcbrain-00016-95f` still serving).
+
+The throwaway accounts (and their chats) were removed afterwards through
+`/api/admin/users/remove`.
+
+A check script reading the chat stream must take the chart from the `partial`
+event: a chart answer arrives as `partial` (with `image_base64` and `code`),
+and the closing `done` event carries `image_base64: null`.
+
 **2026-09-27 — first two-container revision.** Commit `cef5e17` (images
 `pdcclient-demo:cef5e17` and `pdcexecutor-demo:cef5e17`, both stamped),
 revision `pdcclient-demo-cef5e17`, serving 100 %. It replaced
