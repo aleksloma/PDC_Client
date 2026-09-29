@@ -343,6 +343,15 @@ client must be closed on FastAPI lifespan shutdown.
    Column = Column predicates are read at all, and the SQL-box UI states
    this truthfully. Snapshot verification emits aggregates only
    (uniqueness, overlap %, orphan counts) — never cell values.
+11. **State-changing requests are JSON or a token-carrying form.** Every
+   state-changing request is JSON (`application/json`, which a cross-site
+   page cannot send without a CORS preflight) or one of the four HTML forms
+   (sign-in, reset request, reset link, forced change), which carry a
+   session-bound token. `JsonContentTypeGate` (`app.py`) enforces the first,
+   `routes/auth.py` the second. The two multipart upload routes (`/upload`,
+   `/api/chat/{chat_id}/probe_columns`) are the only other exception. A new
+   state-changing route takes a JSON body, and browser code sends the JSON
+   header even when there is no body.
 
 ---
 

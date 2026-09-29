@@ -34,6 +34,9 @@ Read these before you upgrade an existing install to this release.
 - Uploads are limited: 100 MB per upload request (MAX_UPLOAD_BYTES) and, for
   Excel workbooks, 500 MB uncompressed, 100:1 compression per part and 20
   million cells; a workbook over a limit is refused with a message.
+- Browser tabs opened before the upgrade must be reloaded: forms now carry a
+  security token and scripts must send JSON; an old tab's sign-in or action
+  may be refused once.
 
 ## 1. Get the images
 
@@ -637,6 +640,14 @@ If you must run plain HTTP on the LAN, set `SESSION_HTTPS_ONLY=false` in
 `client.env`. Sessions then travel unencrypted and can be captured on your
 network; only do this on an isolated segment or for a short evaluation.
 
+**"The form has expired" at every sign-in.** The sign-in form carries a
+security token that is kept in the session cookie. If you serve plain HTTP
+while `SESSION_HTTPS_ONLY` is true, the browser drops the cookie, so the token
+never comes back and every sign-in shows "The form has expired. Please try
+again." The log shows `CSRF_FORM_TOKEN_REFUSED`. Serve the site over HTTPS, or
+set `SESSION_HTTPS_ONLY=false` as described above. Opening the page over
+`http://localhost` does not show the problem, because browsers exempt it.
+
 **Forward your users' addresses.** The sign-in limits count failures per
 network address as well as per account. Behind a proxy that address is the
 proxy's own unless `FORWARDED_ALLOW_IPS` names the proxy and the proxy sets
@@ -872,8 +883,9 @@ decks, and your branded templates.
   the volume.
 - **BREAKING on upgrade if you serve plain HTTP.** From this release the
   session cookie is marked `Secure`, so a browser will not send it back over
-  `http://`. Users on an HTTP install see the login form again after signing in
-  — an endless login loop with nothing in the log. It does NOT reproduce on the
+  `http://`. Users on an HTTP install see "The form has expired. Please try
+  again." every time they sign in (the log shows `CSRF_FORM_TOKEN_REFUSED`).
+  It does NOT reproduce on the
   installer's own laptop, because browsers exempt `http://localhost`. Before
   upgrading, either front the container with TLS (see "Serve it over HTTPS") or
   add `SESSION_HTTPS_ONLY=false` to `client.env`.
