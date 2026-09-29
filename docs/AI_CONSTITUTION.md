@@ -33,9 +33,12 @@ The split is the whole product. Violating it defeats the on-prem promise.
 
 ### What MAY cross to the brain
 - The question text (natural language).
-- `schema_text` — column names, dtypes, descriptions, and the same sampled
-  metadata the B2C `_schema_text` already produces (truncated unique values,
-  cardinality hints).
+- `schema_text` — column names, dtypes, descriptions, and per-column
+  metadata under a stricter policy than the B2C `_schema_text`: a text column
+  with at most 20 distinct values lists them, each cut to 40 characters; any
+  other text column carries its distinct count only; a numeric or date column
+  carries no value. Stored `technical_description` strings are filtered to the
+  same rule when the text is built (`schema_builder._safe_technical_description`).
 - Conversation history of past **text** turns (role/content/code), never
   values.
 - Generated code (Python) and execution error text.
@@ -44,8 +47,9 @@ The split is the whole product. Violating it defeats the on-prem promise.
 - The aggregate dataset profile (`dataset_profile` on `/v1/plan` /
   `/v1/retry`) — row counts, duplicate counts, null rates, min/max,
   constant/all-unique flags, detected grain, deterministic warnings, and
-  top-value hints truncated to 40 chars. Same class as the cardinality
-  hints `schema_text` already carries; never row data. The client's
+  top-value hints truncated to 40 chars — only for a column with at most 20
+  distinct values. Same class as the cardinality hints `schema_text` already
+  carries; never row data. The client's
   `brain_client._compact_profiles_for_transport` is the boundary guard for
   this field; the brain logs only `profile_tables=N`, never the body.
 - Live-table metadata: `live_tables` on `/v1/plan` / `/v1/retry` — per live
@@ -57,6 +61,7 @@ The split is the whole product. Violating it defeats the on-prem promise.
   `other`) plus, for a guard refusal only, the guard's own sentence, which
   names at most an identifier. `brain_client.live_sql_error` is the one
   builder of that shape.
+- The first 300 characters of an answer, for `/v1/title`.
 - Operational events for `/v1/activity` — `event`, `user_email`, lightweight
   metadata.
 
@@ -73,9 +78,23 @@ The split is the whole product. Violating it defeats the on-prem promise.
 ### The guard
 The summarizer's `_safe_preview` helper (in
 [`client/run_chat_local.py`](../client/run_chat_local.py)) is the hard guard
-against accidental row leakage in `/v1/summarize`: only `str | int | float |
-bool` pass through; dicts, lists, DataFrames are dropped to `None`. Do not
-weaken or bypass this.
+against accidental row leakage in `/v1/summarize`: a `str | int | float |
+bool` passes, and so does a flat dict whose keys and values are all such
+scalars (numpy scalars are converted first, `None` values allowed); lists,
+DataFrames and any dict holding anything else are dropped to `None`.
+`brain_client._compact_preview_for_transport` then caps what passed: a string
+at 500 characters, a dict at its first 20 keys (the number dropped is sent as
+`_truncated_keys`), each string key or value at 500 characters. Do not weaken
+or bypass either.
+
+`SCHEMA_VALUE_DENY_COLUMNS` (client setting, comma-separated column names,
+case-insensitive) is the per-column switch for values that must not cross
+even as low-cardinality categories (account numbers, national ids): such a
+column reaches the brain as its name, dtype and counts only — in the schema
+text (no category list, no value descriptions), the technical description,
+the dataset profile (no min/max, no top values, a constant warning without
+its value) and the schema-autofill hints. It does not filter computed results
+(preview, answer text, report findings).
 
 ### Brain-side mirror
 The brain must NOT log full payloads. Use truncated logging

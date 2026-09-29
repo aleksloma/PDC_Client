@@ -35,16 +35,30 @@ the chat UI surfaces a single "service unavailable" error.
 ## Data boundary (the whole point)
 
 No uploaded file, DataFrame, query result set, or rendered chart is ever
-transmitted. What does cross to the brain over HTTPS: the question text, schema
-and column names and descriptions, capped aggregate profile statistics (at most
-5 top values per column, 40 characters each), scalar result previews, and answer
-text truncated to 500 characters for reports. These can contain individual
-values derived from your data. User email is sent for tenant routing.
+transmitted. What does cross to the brain over HTTPS is listed in the table
+below: the question text, the schema text (names, dtypes, descriptions and the
+values of low-cardinality text columns), capped profile statistics, a capped
+result preview for the summarize step, and truncated answer text for titles
+and reports. Some of these carry individual values from your data: the
+categories of a text column with at most 20 distinct values, a column's
+minimum and maximum, a constant value, a scalar result. A column named in
+`SCHEMA_VALUE_DENY_COLUMNS` sends its name, dtype and counts only, never a
+value. User email is sent for tenant routing.
 
 - The summarizer's `_safe_preview` helper in
-  [`run_chat_local.py`](run_chat_local.py) is the hard guard: only
-  `str | int | float | bool` pass through; dicts, lists, and
-  DataFrames become `None`. Do not weaken it.
+  [`run_chat_local.py`](run_chat_local.py) is the hard guard: a
+  `str | int | float | bool` passes, and so does a flat dict whose keys and
+  values are all such scalars (numpy scalars are converted first); a list, a
+  DataFrame, or a dict holding anything else becomes `None`. What passes is
+  capped in transport by `brain_client`: a string at 500 characters, a dict at
+  its first 20 keys (the number dropped is sent as `_truncated_keys`), each
+  string value at 500 characters. Do not weaken either.
+- `SCHEMA_VALUE_DENY_COLUMNS` (comma-separated column names, case-insensitive,
+  empty by default) removes a column's values from the schema text, the
+  technical descriptions, the dataset profile and the schema-autofill hints.
+  Use it for columns such as account numbers or national ids. It does not
+  filter what an analysis computes: result previews, answer text and past
+  answers in the conversation history can still carry values.
 - The `/lab` page loads **no third-party script** by default (no analytics, no
   billing widget): `settings.ENABLE_THIRD_PARTY_SCRIPTS` is False, so the
   browser talks only to this server. The analysis sandbox transmits nothing at
@@ -56,13 +70,18 @@ values derived from your data. User email is sent for tenant routing.
 |---|---|---|
 | Question text | Every question | Verbatim, as typed |
 | Conversation history | Every question | Past turns: role, content, generated code |
-| Schema text and column metadata | Every question | Table/sheet names, column names, dtypes, descriptions, cardinality and truncated unique-value hints |
-| Dataset profile | Every question | Row/duplicate counts, null rates, min/max, constant and all-unique flags, up to 5 top values per column truncated to 40 characters |
+| Schema text and column metadata | Every question | Table/sheet names, column names, dtypes, business descriptions and a technical line per column (dtype, fill count). A text column with at most 20 distinct values lists those values, each cut to 40 characters; any other text column sends its distinct count only; numeric and date columns send no value. Value descriptions written for categorical values (keyed by the value). A `SCHEMA_VALUE_DENY_COLUMNS` column sends dtype and fill count only, and no value descriptions. Technical lines stored by an earlier release are cut to the same rule when the text is built. For a database table: its qualified name, snapshot date or, for a live table, dialect and row cap |
+| Other registered tables | Every question on a chat that uses database tables | Display names, column NAMES and declared join keys of registered tables the user's role may add but that are not loaded in the chat — never values |
+| Live-table fields | Plan and retry, only when the chat has a live table | `live_tables` (name, dialect, row cap, filtered flag); on retry `sql` (the SELECT the planner wrote, as run) and `sql_error` (table, dialect, error class, and the client's own refusal sentence — never the database's error text) |
+| Dataset profile | Every question | Row/duplicate counts, per-column distinct and null counts, null rates, min/max of numeric and date columns, constant and all-unique flags, grain (column names), up to 6 warnings (a constant column's warning names its value). Up to 5 top values, each cut to 40 characters, only for a column with at most 20 distinct values. A `SCHEMA_VALUE_DENY_COLUMNS` column sends dtype, distinct and null counts and the two flags only. Profiles stored by an earlier release are filtered to this rule before sending |
 | Generated code and execution errors | Every question and retry | Python source, traceback text |
 | Excel header text above a table | Upload, when a sheet has text above the table and no description | The extracted text VERBATIM, truncated to 2000 characters — it is read from your file, so treat it as content |
 | File and sheet names | Upload and every question | The name as STORED after sanitization, plus sheet names |
 | Share invitations | Sharing a chat or dashboard | Recipient addresses, the item title, and the note the sender types |
-| Scalar result previews | Summarize step | Single `str`/`int`/`float`/`bool` values only — dicts, lists and DataFrames are dropped |
+| Schema-autofill hints | Upload, Add Data, database-table registration (AI descriptions) | Column names and dtypes. A column with at most 10 distinct values (`SCHEMA_AUTOFILL_UNIQUE_THRESHOLD`) sends those values, each cut to 60 characters; any other column sends one `[profile: …]` summary (dtype, distinct count, null share; for text a character mask, lengths and frequent first words; for numbers min/max/mean at two significant figures; for dates the year-month range). A `SCHEMA_VALUE_DENY_COLUMNS` column sends `[profile: dtype=…, distinct=…, nulls=…%]` only |
+| Result preview | Summarize step | A single `str`/`int`/`float`/`bool` value or a flat dict of such values; a string capped at 500 characters, a dict at its first 20 keys plus `_truncated_keys` (the count dropped). Lists and DataFrames are dropped |
+| Result caveat | Describe step, only when the client's result check fires (a constant metric, identical series, or a count matrix that reads better as a bar chart) | Finding kind and up to 6 short facts naming result columns; a constant metric's fact includes its value |
+| Answer text | Conversation title | Question and the first 300 characters of the answer |
 | Answer text | Report generation | Question and answer truncated to 500 characters, code snippet to 300 |
 | Table column names | Report generation | Column NAMES only, first 10 — never rows |
 | User email | Every call | Tenant routing and per-user activity |
@@ -138,6 +157,7 @@ To run the stack you need:
 | `BRAIN_TENANT_TOKEN` | Per-tenant bearer token issued by PowerDataChat (shown ONCE in the operator's admin panel). |
 | `SECRET_KEY` | **Required.** Local session-cookie signing secret, at least 32 characters. Generate once with `python -c "import secrets; print(secrets.token_hex(32))"`. The app refuses to start (`SECRET_KEY_UNSET`) without it. |
 | `DATA_ROOT` | Local-disk root for raw data + chats. Mount a volume. |
+| `SCHEMA_VALUE_DENY_COLUMNS` | Optional. Comma-separated column names (case-insensitive) whose values never reach the brain: those columns send name, dtype and counts only. Empty by default. |
 
 The `EXECUTOR_*` topology values are set by the compose file, not by the env
 file. `EXECUTOR_NETWORK_CIDR` is mandatory while `EXECUTOR_URL` is set: the

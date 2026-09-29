@@ -37,6 +37,12 @@ Read these before you upgrade an existing install to this release.
 - Browser tabs opened before the upgrade must be reloaded: forms now carry a
   security token and scripts must send JSON; an old tab's sign-in or action
   may be refused once.
+- Schema hints to the AI service are narrower: numeric sample values are no
+  longer sent, text columns with more than 20 distinct values send a count
+  only, and the new SCHEMA_VALUE_DENY_COLUMNS setting removes a column's
+  values entirely (see "Columns whose values never leave" in §2). Hints
+  stored by an earlier release are filtered the same way; nothing needs to
+  be re-uploaded.
 
 ## 1. Get the images
 
@@ -122,6 +128,22 @@ uncompressed size in memory. At the default of 500 MB one workbook can
 therefore need about 3 GB, against the web container's 4 GB `mem_limit`.
 Either lower `XLSX_MAX_UNCOMPRESSED_MB` (about 150 is a safe value for the
 shipped 4 GB) or raise `mem_limit` to match.
+
+**Columns whose values never leave.** `SCHEMA_VALUE_DENY_COLUMNS` is an
+optional, comma-separated list of column names (matched case-insensitively,
+in every file and database table). For a listed column the AI service
+receives its name, its data type and counts (filled, distinct, empty) and
+nothing derived from its values: no category list, no most-frequent values,
+no minimum or maximum, no value descriptions, no hints for the AI column
+descriptions. Use it for columns such as account numbers or national ids
+whose values must not reach the AI service even when they look like a short
+list of categories (a column with at most 20 distinct values otherwise sends
+those values). Example: `SCHEMA_VALUE_DENY_COLUMNS=account_no,national_id,iban`.
+Restart the web container after changing it; it then applies to existing
+chats too, including column details and profiles stored before it was set.
+It does not filter what an analysis computes, so an answer that reports such
+a value still contains it, and a column description the AI wrote before the
+column was listed is kept as it is.
 
 Two more settings are worth knowing about, both optional:
 
@@ -754,11 +776,15 @@ responses, and do not rewrite the header.
 ## What leaves your network
 
 No uploaded file, DataFrame, query result set, or rendered chart is ever
-transmitted. What does cross to the brain over HTTPS: the question text, schema
-and column names and descriptions, capped aggregate profile statistics (at most
-5 top values per column, 40 characters each), scalar result previews, and answer
-text truncated to 500 characters for reports. These can contain individual
-values derived from your data. User email is sent for tenant routing.
+transmitted. What does cross to the brain over HTTPS is listed in the table
+below: the question text, the schema text (names, data types, descriptions
+and the values of text columns with at most 20 distinct values), capped
+profile statistics, a capped result preview for the summarize step, and
+truncated answer text for titles and reports. Some of these carry individual
+values from your data: a short category list, a column's minimum and maximum,
+a constant value, a single computed result. A column named in
+`SCHEMA_VALUE_DENY_COLUMNS` sends its name, data type and counts only. User
+email is sent for tenant routing.
 
 Everything in the list below is sent by the web application. Two things are
 worth stating plainly:
@@ -778,13 +804,18 @@ worth stating plainly:
 |---|---|---|
 | Question text | Every question | Verbatim, as typed |
 | Conversation history | Every question | Past turns: role, content, generated code |
-| Schema text and column metadata | Every question | Table/sheet names, column names, dtypes, the descriptions your admin confirms, cardinality and truncated unique-value hints |
-| Dataset profile | Every question | Row/duplicate counts, null rates, min/max, constant and all-unique flags, up to 5 top values per column truncated to 40 characters |
+| Schema text and column metadata | Every question | Table/sheet names, column names, data types, the descriptions your admin confirms, and per column its fill count. A text column with at most 20 distinct values lists those values, each cut to 40 characters; any other text column sends its distinct count only; number and date columns send no value. Descriptions written for individual category values. A `SCHEMA_VALUE_DENY_COLUMNS` column sends data type and fill count only. For a database table: its name and snapshot date, or for a live table its database type and row cap |
+| Other registered tables | Every question in a chat that uses database tables | Names, column NAMES and declared join keys of registered tables the user may add but has not loaded — never values |
+| Live-table fields | Every question and retry in a chat with a live table | The live table's name, database type, row cap and whether it is filtered; on a retry the SELECT the AI wrote and the class of its failure (syntax, unknown column, timeout, …) — never the database's own error text |
+| Dataset profile | Every question | Row/duplicate counts, per-column distinct and empty counts, min/max of number and date columns, constant and all-unique flags, up to 6 warnings (a constant column's warning names its value). Up to 5 most frequent values, each cut to 40 characters, only for a column with at most 20 distinct values. A `SCHEMA_VALUE_DENY_COLUMNS` column sends its data type, counts and the two flags only |
 | Generated code and execution errors | Every question and retry | Python source, traceback text |
 | Excel header text above a table | Upload, when a sheet has text above the table and no description | The extracted text VERBATIM, truncated to 2000 characters — it is read from your file, so treat it as content |
 | File and sheet names | Upload and every question | The name as STORED after sanitization, plus sheet names |
 | Share invitations | Sharing a chat or dashboard | Recipient addresses, the item title, and the note the sender types |
-| Scalar result previews | Summarize step | Single text/number/true-false values only — tables and DataFrames are dropped |
+| Hints for the AI column descriptions | Upload, Add Data, registering a database table | Column names and data types. A column with at most 10 distinct values sends those values, each cut to 60 characters; any other column sends one summary line (data type, distinct count, empty share, and a value-free shape: character pattern and lengths for text, range and mean at two significant figures for numbers, year-month range for dates). A `SCHEMA_VALUE_DENY_COLUMNS` column sends data type, distinct count and empty share only |
+| Result preview | Summarize step | One text/number/true-false value, or a flat list of named such values; text cut to 500 characters, at most 20 named values (the number left out is sent as a count). Tables and DataFrames are dropped |
+| Result caveat | Describe step, only when the client's own result check fires | The kind of finding and up to 6 short sentences naming result columns; a constant metric's sentence includes its value |
+| Answer text | Conversation title | The question and the first 300 characters of the answer |
 | Answer text | Report generation | Question and answer truncated to 500 characters, code snippet to 300 |
 | Table column names | Report generation | Column NAMES only, first 10 — never rows |
 | User email | Every call | Tenant routing and per-user activity |

@@ -27,16 +27,16 @@ lookup; revoked / suspended tenants get **HTTP 403** (the kill-switch).
 
 | Brain field          | Same field in B2C | Built by |
 |---------------------|-------------------|----------|
-| `schema_text`       | return value of `_schema_text(schema_docs, dfs, common_fields)` | client (`schema_builder.schema_text`) |
+| `schema_text`       | return value of `_schema_text(schema_docs, dfs, common_fields)`. VALUE POLICY (enterprise, stricter than B2C): a text column with at most 20 distinct values lists them, each cut to 40 characters; any other text column carries its distinct COUNT only (`object (N unique)`); a numeric or date column carries its dtype only, never a value. The stored per-column `technical_description` is filtered to the same rule as a string when the text is built (a `sample:` list written by an earlier release is dropped, a categorical list of more than 20 values becomes its count). A column named in the client setting `SCHEMA_VALUE_DENY_COLUMNS` (comma-separated, case-insensitive) carries its dtype only, a technical line of dtype + fill count, and no `Value Descriptions` entry | client (`schema_builder.schema_text`, `_safe_technical_description`) |
 | `df_names`          | `list(dfs.keys())` | client |
 | `df_columns`        | `{name: list(df.columns)}` (only sent on retry, for column self-correction) | client |
 | `history_rows`      | the `history_rows` arg to `generate_pandas_code` / `summarize_answer`. Each row carries **only** `role`, `content`, and (when present) `code` — the client's `brain_client._sanitize_history_rows` strips every other persisted field (`image_base64`, `chart_data`, `table`, `usage`, `full_table_key`, `ts`, …) before the POST, so raw data values in locally persisted records never cross the boundary (Article II) | client (`local_store.get_history`, sanitized in `brain_client.plan/retry/summarize`) |
 | `common_fields`     | the `common_fields` arg to `generate_pandas_code` | client |
 | `error_msg`         | `exec_out["error"]` from `safe_execute` | client |
 | `failed_code`       | the failed code block | client |
-| `preview` (summarize) | the `safe_preview` value the B2C code already restricts to scalars | client |
+| `preview` (summarize) | the `_safe_preview` value: a `str`/`int`/`float`/`bool`, a flat object whose keys and values are all such scalars (or null values), or `null` — lists, tables and objects holding anything else become `null`. Capped in transport: a string at 500 characters + `…[truncated]`; an object at its first 20 keys, each string key/value cut the same way, plus `"_truncated_keys": <number dropped>` when more existed | client (`run_chat_local._safe_preview`, capped by `brain_client._compact_preview_for_transport`) |
 | `qa_pairs` (report) | the `findings_for_llm` list the B2C `_generate_report_structure` already builds | client |
-| `dataset_profile` (plan/retry, **optional**) | enterprise-only (no B2C equivalent): `{df_key: profile}` of computed FACTS per loaded table — rows, duplicate count, per-column dtype/nunique/null rates/min-max/constant/all-unique flags, truncated top-value hints, detected grain, deterministic warnings. Aggregate metadata only, never row data (Article II — same class as the cardinality hints in `technical_description`). Absent field ⇒ pre-profile behavior everywhere | client (`dataset_profile.compute_profile`, stored as sidecar JSON, compacted by `brain_client._compact_profiles_for_transport`) |
+| `dataset_profile` (plan/retry, **optional**) | enterprise-only (no B2C equivalent): `{df_key: profile}` of computed FACTS per loaded table — rows, duplicate count, per-column dtype/nunique/null rates/min-max/constant/all-unique flags, truncated top-value hints, detected grain, deterministic warnings. Aggregate metadata only, never row data (Article II — same class as the cardinality hints in `technical_description`). `top_values` (≤ 5 pairs, each value cut to 40 characters) only for a column with `nunique` ≤ 20; a column on `SCHEMA_VALUE_DENY_COLUMNS` carries only `dtype`, `nunique`, `null_count`, `null_pct`, `constant`, `all_unique`, and its constant-column warning reads `<col> is constant` without the value. The transport compaction applies both rules to profiles stored by an earlier release too. Absent field ⇒ pre-profile behavior everywhere | client (`dataset_profile.compute_profile`, stored as sidecar JSON, compacted by `brain_client._compact_profiles_for_transport`) |
 | `data_caveat` (describe, **optional**) | enterprise-only: the client's DETERMINISTIC post-execution finding about the result it just rendered — `{kind: constant_metric\|identical_series\|constant_table\|matrix_readability, facts[], grain[], catalog}`. Aggregate findings + column names + truncated constant-value hints only (Article II, same class as `dataset_profile`). Makes the flat-result explanation mandatory instead of prompt-dependent; absent field ⇒ byte-identical describe prompt | client (`result_backstop.inspect_outputs`, compacted by `brain_client._compact_caveat_for_transport`) |
 | `live_tables` (plan/retry, **optional**) | enterprise-only (no B2C equivalent): `[{name, dialect, row_cap, filtered}]` — one row per LIVE database table the chat holds (`name` = the df key, `dialect` = the connector registry key such as `postgresql` / `mysql` / `mariadb` / `mssql` / `oracle` / `clickhouse`, `row_cap` = the effective row cap, `filtered` = true when an administrator row filter applies, in which case the client fetches the rows itself and expects no SQL). Metadata only; sent only when the chat holds a live table | client (`run_chat_local._live_tables_for_brain` from `ChatDataStore.schema_docs`) |
 | `sql` (plan/retry response, **optional**; echoed on a retry request) | enterprise-only: `{<df key>: "<one read-only SELECT>"}` written by the brain for the live tables the code references. The client validates it (read-only guard + a per-table allowlist), runs it in the web application, and places the result under the df key; a missing entry ⇒ the client's default capped fetch. On a retry request (every retry, the regeneration ones included) the client sends what RAN this turn: the brain's own text for a SELECT that reached the database (also when it failed there), `null` for a default read, for a SELECT ignored on a `filtered` table and for a SELECT the client's guard refused; keys never fetched are absent — never a result | brain (planner); echoed by client (`brain_client.retry(sql=)`) |
@@ -279,7 +279,7 @@ an identifier.
 own SQL text (in the response, echoed on a retry) and an error CLASS cross;
 the rows a SELECT returns never leave the client — they reach the analysis
 sandbox as an ordinary input frame and the brain sees, as always, only the
-code, the schema text and the scalar preview.
+code, the schema text and the capped summarize preview.
 
 ---
 
@@ -352,10 +352,12 @@ LLM can mention the user's uploaded file names in the reply — no data.
 
 ## `POST /v1/summarize`
 
-Mirror of `agent.summarize_answer`. Used only for **scalar** results
-(non-table, non-image). The client is responsible for filtering `preview`
-to scalar-safe values — the same `safe_preview` guard the B2C code
-already enforces.
+Mirror of `agent.summarize_answer`. Used only for results without a table
+or image. The client is responsible for filtering `preview`: its
+`_safe_preview` guard passes a scalar or a flat object of scalars and turns
+anything else into `null`, and `brain_client` then caps it — a string at 500
+characters (+ `…[truncated]`), an object at its first 20 keys plus
+`"_truncated_keys": <number dropped>`.
 
 ### Request
 
@@ -365,7 +367,7 @@ already enforces.
   "question": "what is the highest salary?",
   "schema_text": "...",
   "history_rows": [ ... ],
-  "preview": 162000,                      // scalar ONLY; DataFrames are stripped client-side
+  "preview": 162000,                      // scalar or flat object of scalars; capped (500 chars / 20 keys)
   "context_decision": { "complexity": "simple", ... },
   "user_email": "..."
 }
@@ -591,6 +593,9 @@ human message in a conversation (matches global's UX). Uses the Light model.
 { "sid": "...", "question": "...", "answer": "...", "lang": "English", "user_email": "..." }
 ```
 
+`answer` carries at most the first 300 characters of the answer text (cut by
+`brain_client.title`).
+
 Returns `{ "title": "Compensation Overview" }` (2-3 words, language-aware).
 
 ---
@@ -740,7 +745,10 @@ with min/avg/max length, uniqueness and structural prefixes (text), two-
 significant-figure min/max/mean with integer/non-negative/increasing flags
 (numeric), year-month bounds and granularity (datetime), or the true share
 (boolean). No sampled row value of a high-cardinality column crosses the
-boundary.
+boundary. A column on the client's `SCHEMA_VALUE_DENY_COLUMNS` list always
+takes the profile form, reduced to
+`[profile: dtype=…, distinct=…, nulls=…%]` — no values even when it has few
+distinct ones, and no mask, prefix, length or magnitude.
 
 ### Request
 

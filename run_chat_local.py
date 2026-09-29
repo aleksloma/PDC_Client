@@ -11,11 +11,16 @@ logic of this flow — only split it across the client and brain containers."):
      corrected code → Client retries execution (up to 3 attempts, matching
      the B2C retry policy).
   5. Client → POST /v1/describe to get the natural-language intro,
-     OR POST /v1/summarize when the result is scalar (no chart/table).
+     OR POST /v1/summarize when the result is a scalar or a flat dict of
+     scalars (no chart/table).
 
-Raw data values stay on the client. The brain only sees: question, schema
-text (column-level), generated code, execution error text, and scalar-safe
-previews.
+Raw data rows stay on the client. The brain sees: the question, the schema
+text (column names, dtypes, descriptions, and the values of text columns
+with at most 20 distinct values — none for a SCHEMA_VALUE_DENY_COLUMNS
+column), the dataset profile, generated code, execution error text, and the
+summarize preview. `_safe_preview` lets through a scalar or a flat dict whose
+values are all plain scalars; `brain_client` caps it in transport (a string
+at 500 characters, a dict at 20 keys plus `_truncated_keys`).
 """
 from __future__ import annotations
 
