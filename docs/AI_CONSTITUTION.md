@@ -675,6 +675,10 @@ runs with the page's origin.**
    `/charts/{token}` (rule 1), never on a page that holds the session.
 4. Text that reaches the page through `innerHTML` is escaped first, as the
    existing renderers do; new renderers use `textContent` where they can.
+5. The server renders chart markup to an image (kaleido) only from a chart
+   it produced itself — a stored conversation row, a tile snapshot written
+   by the tile refresh, or a reference it minted — never from markup in a
+   request, and blanks every URL-bearing value first.
 
 ---
 

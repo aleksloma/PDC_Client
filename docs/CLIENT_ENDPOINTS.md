@@ -883,6 +883,13 @@ data: {"done": true, "partial": false, "conv_id": "cv_...",
 contract (for multi-chart responses) — the on-prem build currently emits a
 single final event but the frontend handles both paths identically.
 
+Each `partial` event and the single-shot `done` event also carry `chart_ref`:
+the server's reference to that chart for the PNG export (`null` for a
+matplotlib chart, or when registering it failed). The edit-regenerate JSON
+carries it too: top-level beside `image_base64`, and on each entry of
+`images`. See "Chart
+references" under Downloads.
+
 **Chart HTML is offline-safe.** Interactive Plotly charts travel as a full HTML
 document in `image_base64` (the frontend sniffs the leading `<`). Generated
 HTML references the locally served `/static/vendor/plotly/plotly.min.js`
@@ -1064,13 +1071,39 @@ calls the brain.
 
 | Method | Path | Behavior |
 |---|---|---|
-| `POST` | `/api/chat/{chat_id}/export_plotly_png` | Body `{html, filename, scale}`. Renders the interactive chart's raw Plotly HTML to a high-resolution PNG server-side (via `routes/report._plotly_html_to_png`, kaleido) and returns `image/png` as an attachment. `400` when `html` is missing; `502` if the chart cannot be rendered. |
+| `POST` | `/api/chat/{chat_id}/export_plotly_png` | Renders one of this chat's Plotly charts to a high-resolution PNG (kaleido, via `routes/report._plotly_html_to_png`, run off the event loop) and returns `image/png` as an attachment. The body NAMES a chart the server produced; it never carries chart markup. Two shapes: `{chart_ref, filename?}` for a chart the server just sent (the `chart_ref` of a stream event, an edit-regenerate response or a refresh — see "Chart references" below), or `{conv_id, ai_index, image_index?, filename?}` for a chart stored in the conversation. `ai_index` is the row's position in the history `GET .../conversation/{conv_id}/history` serves; `image_index` (default `0`) picks one chart of a multi-chart row. A `chart_ref` wins when both are sent. An `html` field is ignored (the first such body per process logs `EXPORT_PNG_LEGACY_BODY`); `scale` is no longer read. No reference → `400 {"error": "A chart reference is required."}`. A reference that is unknown, expired, another user's or another chat's, or a row with no Plotly chart → `404 {"error": "Chart not found. Reload the conversation and try again."}`. A `conv_id` the caller may not use (the chat stream's conversation-access rule) → `403 {"error": "Access denied"}`. Render failure → `502 {"error": "Could not render chart image."}`; the log line carries the exception type only. |
 | `POST` | `/api/chat/{chat_id}/download_excel/{key}` | Body `{filename}`. Streams the full result table for `{key}` (the `full_table_key` / `chart_data_key` the chat stream emits — the same durable record as `full_table`) as an `.xlsx` spreadsheet: the record's stored code is re-executed (a live table re-fetched with the stored SQL) and the stored preview rows are the fallback when that yields nothing. Returns `404 {"error": "Table not found or expired."}` when the key is missing/expired; `502` on build failure. **Live-table gate:** before any re-execution, an item whose stored code references a LIVE table the requester's role does not cover (by the pre-fetch's own rule: a quoted df key, a generic `dfs` walk, or the `df` alias of the first frame) → `403 {"ok": false, "code": "ROLE_DENIED", "blocked_tables": [<display names>], "error": "Your role does not include this table's data — refresh is unavailable."}`, logged `FULL_TABLE_ROLE_DENIED` / `DOWNLOAD_EXCEL_ROLE_DENIED`; no database query is issued. The gate is consulted only where a live fetch can happen: a record without stored code, or a chat that holds no live table, is served without it, and a table the role does not cover that is a SNAPSHOT is served too (viewing existing data is never blocked retroactively). On a chat holding a live table — or when that cannot be determined — the gate FAILS CLOSED: any error inside it (including a failing role read) answers the same 403 with `blocked_tables: []`, logged `LIVE_REEXEC_GATE_FAILED error=<type>`. 403 rather than the refresh path's 200 because the success answer of `download_excel` is a byte stream. |
 | `POST` | `/api/chat/{chat_id}/export_excel` | Body `{columns, rows, filename}`. Builds an `.xlsx` directly from the posted preview table and returns the spreadsheet mime. `400` when no table data is posted. |
 
 All three require an authenticated session with access to `{chat_id}`. `.xlsx`
 files are built with pandas + openpyxl. Matplotlib/seaborn charts are already
-PNGs, so their Download is a pure client-side save (no route).
+PNGs, so their Download is a pure client-side save (no route). A dashboard
+tile's chart has its own export route (`/api/dashboards/{id}/tiles/{tile_id}/export_png`,
+see "Dashboards").
+
+**Chart references.** Kaleido drives a Chromium inside the web container, so
+the server renders only chart markup it produced itself. Every Plotly chart
+the server sends carries a `chart_ref`: each SSE `partial` event, the
+single-shot `done` event, the edit-regenerate response (and each entry of its
+`images` list), and a successful chart `refresh_item` response. The reference
+is random, minted by the server, bound to the user and the chat, and kept in
+memory for 30 minutes (at most 256 entries and 200 MB; oldest first; one web
+worker; a restart empties it). A matplotlib chart gets no reference
+(`chart_ref: null` in stream and edit-regenerate answers, no key on a refresh);
+its Download needs no route. If registering a chart fails, only that chart has
+no reference; the page then disables its Download button with a tooltip.
+After a reload the page names the stored row (`conv_id`, `ai_index`,
+`image_index`) instead.
+
+**URL values are blanked before rendering.** `routes/report._plotly_html_to_png`
+(also used by the PDF and PPTX reports and Auto Analytics) walks the figure's
+data and layout first: a string under `source`, `src`, `url`, `href`,
+`sourceurl` or `geojson` is blanked unless it is a `data:` URI; a list under
+those keys is emptied; a map subplot (`mapbox`, `map`, …) gets the style
+`"white-bg"` and loses its access token; a `style` attribute inside any
+pseudo-HTML text is removed (a CSS `url(...)` there is a real fetch). A chart
+that needed any of this logs `PLOTLY_REMOTE_REF_STRIPPED count=N`. The PNG
+then lacks those images, map tiles and custom geometry.
 
 ---
 
@@ -1095,9 +1128,12 @@ code against the chat's **current** dataframes (the server enforces this — see
 Purpose: after updating a file via Add Data (overwrite), existing items can be
 refreshed to reflect the new data.
 
-- Charts return `{ok, image_base64, is_plotly, chart_data_key?}` — the fresh
-  `chart_data_key` re-points "Show data" at the refreshed values; Plotly
-  "View Larger" / "Download" follow the updated HTML automatically.
+- Charts return `{ok, image_base64, is_plotly, chart_data_key?, chart_ref?}` —
+  the fresh `chart_data_key` re-points "Show data" at the refreshed values;
+  Plotly "View Larger" follows the updated HTML. `chart_ref` is present only
+  when the server registered the refreshed Plotly chart; "Download" then
+  exports that chart, and without it the button is disabled (see "Chart
+  references" under Downloads).
 - Tables return `{ok, table, full_table_key?}` — the block is re-rendered
   (styled_html included when the code yields a pandas Styler) and "Download
   Excel" is rebound to the new durable key.
@@ -1208,7 +1244,8 @@ chars, regex-guarded (path-traversal safe). Old-shape docs load with defaults
 | `POST` | `/api/dashboards/{id}/tiles/{tile_id}/update` | owner only; TEXT tiles only (chart/table tiles → 400 — their content changes via refresh, never free edits). Body: any subset of `{text, style, color, size, align, valign}`, same validation as create; empty body → 400. Returns `{ok, tile}`. |
 | `POST` | `/api/dashboards/{id}/tiles/{tile_id}/remove` | owner only |
 | `POST` | `/api/dashboards/{id}/layout` | `{tiles: [{tile_id, x, y, w, h}]}` bulk save — owner only; ints validated/clamped, unknown tile_ids ignored (stale client) |
-| `POST` | `/api/dashboards/{id}/tiles/{tile_id}/refresh` | allowed for owner AND shared recipients. Table tiles first **re-resolve + self-heal** their code from the durable full-table record (tiles pinned with a wrong/chart code get the corrected code persisted); tiles with a `result_key` (one table of a multi-table RESULT) re-execute via `_reexecute_full_df` and persist a fresh durable key (carrying the live SELECTs that ran, like a `refresh_item` record), others via `run_item_refresh` (Styler results keep `styled_html`). Deleted source chat → persists `frozen/frozen_reason="source_deleted"` on the tile, returns `200 {ok:false, frozen:true, reason}`; a caller without source-chat access gets the same shape with `reason:"access_revoked"` but nothing is persisted (caller-specific). Execution failures → `200 {ok:false, error}`, stored snapshot untouched; a tile whose code references a table the caller's role does not cover — snapshot or live, by the refresh role gate's rule (`df`, a quoted key and a walk over `dfs` included) — → the caller-specific `200 {ok:false, frozen:true, reason:"role_denied", blocked_tables}`, never persisted (every denied table named when the gate could not apply its rule; `blocked_tables: []` when the role check itself failed on a chat holding a live table — see the refresh role gate); a tile whose code references a live table with no stored SELECT → `200 {ok:false, code:"LIVE_NO_QUERY", error}` and a failed live fetch → `200 {ok:false, error:<class sentence>}`, both passed through from `run_item_refresh`, nothing persisted. Success updates the snapshot (+ re-inlined `chart_data` / new `full_table_key`), clears `frozen`, returns `{ok, kind, image_base64\|table, is_plotly?, tile}`. |
+| `POST` | `/api/dashboards/{id}/tiles/{tile_id}/refresh` | allowed for owner AND shared recipients. Table tiles first **re-resolve + self-heal** their code from the durable full-table record (tiles pinned with a wrong/chart code get the corrected code persisted); tiles with a `result_key` (one table of a multi-table RESULT) re-execute via `_reexecute_full_df` and persist a fresh durable key (carrying the live SELECTs that ran, like a `refresh_item` record), others via `run_item_refresh` (Styler results keep `styled_html`). Deleted source chat → persists `frozen/frozen_reason="source_deleted"` on the tile, returns `200 {ok:false, frozen:true, reason}`; a caller without source-chat access gets the same shape with `reason:"access_revoked"` but nothing is persisted (caller-specific). Execution failures → `200 {ok:false, error}`, stored snapshot untouched; a tile whose code references a table the caller's role does not cover — snapshot or live, by the refresh role gate's rule (`df`, a quoted key and a walk over `dfs` included) — → the caller-specific `200 {ok:false, frozen:true, reason:"role_denied", blocked_tables}`, never persisted (every denied table named when the gate could not apply its rule; `blocked_tables: []` when the role check itself failed on a chat holding a live table — see the refresh role gate); a tile whose code references a live table with no stored SELECT → `200 {ok:false, code:"LIVE_NO_QUERY", error}` and a failed live fetch → `200 {ok:false, error:<class sentence>}`, both passed through from `run_item_refresh`, nothing persisted. Success updates the snapshot (+ re-inlined `chart_data` / new `full_table_key`), clears `frozen`, returns `{ok, kind, image_base64\|table, is_plotly?, tile}`. A chart snapshot written here carries the additive `server_rendered: true` (the server produced this markup, not a browser pin); the tile PNG export relies on it. Older snapshots and pinned ones have no such key. |
+| `POST` | `/api/dashboards/{id}/tiles/{tile_id}/export_png` | PNG of a chart tile. Owner AND shared recipients; the caller must also have access to the tile's source chat (`_require_chat`). Body `{filename?}` — no chart markup. Renders the tile snapshot only when the tile refresh wrote it (`snapshot.server_rendered` and `is_plotly`); otherwise the source chat's stored Plotly chart for the tile's `code` (`routes.chat.stored_chart_for_code`, which reads the chat's conversation files). A snapshot the browser posted at pin time is never rendered. Same kaleido path and URL blanking as `export_plotly_png`, off the event loop. Unknown dashboard → `404 {"error": "Dashboard not found"}`; unknown or non-chart tile → `404 {"error": "Tile not found"}`; deleted source chat → `404 {"error": "The source chat of this tile no longer exists."}`; neither a refreshed snapshot nor a stored chart → `404 {"error": "This chart is not stored in its source chat; refresh the tile first."}`; render failure → `502 {"error": "Could not render chart image."}`. |
 | `POST` | `/api/dashboards/{id}/share` | `{emails: [...]\|"a@x, b@y", message?}` — owner only, mirrors the chat share contract (`{ok, shared_with, added, email_sent, smtp_configured, failed}`). Adds recipients to the doc's `shared_with`, writes a pointer row into each recipient's dashboard index, **and grants them access to every tile's source chat that the dashboard OWNER owns** (`add_share_recipients`, same grant conversation-sharing performs) so their Show-data/refresh work. A tile pinned from a chat the owner merely RECEIVED is not re-shared: those recipients see its stored snapshot, and its refresh answers `{ok:false, frozen:true, reason:"access_revoked"}` for them. An address that has never signed in gets a password-less placeholder account (see Sharing rules). Brain SMTP relay gets only the dashboard name + comment (Article II — never tile content). Revoked per address with `/unshare` (next row). |
 | `POST` | `/api/dashboards/{id}/unshare` | `{email}` — owner only (a recipient → `403 {"error": "Only the dashboard owner can do this."}`, an unknown dashboard → `404 {"error": "Dashboard not found"}`, a missing or malformed address → `400`). Takes the address off the doc's `shared_with` (matched case-insensitively) and deletes that recipient's pointer row from their dashboard index (`DashboardStore.remove_dashboard_share`), then answers `200 {ok: true, shared_with: [...]}` with the remaining list. Idempotent: an address that is not shared answers 200 with the list unchanged. The source-chat grants the share made alongside are **not** touched — they are the chat's own sharing, which has no revoke and which another share may rely on. An unshared recipient who kept the URL resolves nothing: the page sends them to `/lab`, the API answers 404, and a tile refresh answers 404. Nothing is mailed. |
 
@@ -1250,7 +1287,8 @@ one shared tile renderer, so owner and shared views always agree. Text tiles get
 an owner-only ✏ edit button (same modal) instead of the data/code/download/refresh actions.
 Tile toolbar: description popover (backdrop-dismissed — clicks inside Plotly
 iframes don't bubble), Show data / Show code (PDCViewers), Download
-(`export_plotly_png` / client-side PNG / `download_excel`), View larger,
+(the tile's own `export_png` route for a Plotly chart / client-side PNG /
+`download_excel`), View larger,
 Refresh, Remove; plus a top-bar "Refresh all" (client-side concurrency-2 queue,
 per-tile failure isolation). Shared recipients see a read-only grid (no
 drag/resize/rename/share/remove-tile) with Delete becoming "Remove from my

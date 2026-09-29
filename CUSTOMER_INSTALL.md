@@ -26,6 +26,9 @@ Read these before you upgrade an existing install to this release.
   or a MariaDB server older than 10.0 is now refused. A SQL Server connection
   behind an Always On listener with read-only routing now connects to a
   readable secondary.
+- Chart PNG download renders only charts stored by the server; a chart shown
+  in a browser tab opened before the upgrade may need a page reload before
+  its Download button works.
 
 ## 1. Get the images
 
