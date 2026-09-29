@@ -376,6 +376,49 @@ Remove the check's throwaway account and dashboard afterwards.
 
 ## Deploy history
 
+**2026-09-29 — `main` at `b7527a6`.** Profile autofill hints and AI drafts
+for added columns (not a tagged release). Built by Cloud Build
+`6410995c-14da-4f13-a285-43b6f1899a20` (both images stamped `b7527a6`,
+`BUILD_TIME=2026-09-29T08:19:01Z`):
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:b7527a6` | `sha256:02898e1d0298edc702742a9069357623d513345f6bb8cb9b9ac736c5b8129038` |
+| `pdcexecutor-demo:b7527a6` | `sha256:516bb98072ef2744facc405779a0749643b57f9a07a395ee34c95b9587641d8d` |
+
+Revision `pdcclient-demo-b7527a6`, serving 100 % since 2026-09-29 ~08:35 UTC;
+it resolved exactly the two digests above. It replaced
+`pdcclient-demo-2089883`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise \
+  --region=europe-west1 --to-revisions=pdcclient-demo-2089883=100
+```
+
+Backup taken before the deploy:
+`gs://pdc-enterprise-client-demo-data-backups/20260929-081941/`, which matched
+the data bucket in size (365,693,516 bytes) and in its 480 object names.
+
+The spec change was image-only (two `image:` lines and the template name),
+checked by a diff against the export before the Admin API `PUT`. Candidate
+checks (`candidate---…` URL) all passed:
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`, and `/version` reported `b7527a6`.
+- `/lab` carried `window.__DIRECT_UPLOAD__ = true`.
+- A self-registered throwaway account signed in, uploaded
+  `sample_sales.csv`, got a chart from a question (sandbox job
+  `EXEC_JOB_END status=ok`), then created a dashboard, pinned the chart,
+  read it back and deleted it.
+- Revision log: `EXECUTOR_HANDSHAKE_OK version=b7527a6`; no
+  `EXECUTOR_SHARED_DIR_*`, no `BACKEND_REQUEST_REFUSED`, no errors, no 5xx.
+- After the shift, `client.powerdatachat.com` reported the same `/version` and
+  `/health`, and `pdcbrain` gained no revision (`pdcbrain-00016-95f` still serving).
+
+The throwaway account (and its chat) was removed afterwards through
+`/api/admin/users/remove`. `tools/canary_check.py` cannot run here (Cloud Run
+has no exec into a container); it passed 8/8 inside the local stack's web
+container on the same commit.
+
 **2026-09-28 — release `v1.0-security-r1`.** Commit `2089883`, built from the
 tag by Cloud Build `2d763656-5fc4-474b-81c8-f4319e9ca989` (both images stamped
 `2089883`, `BUILD_TIME=2026-09-28T19:22:00Z`):
