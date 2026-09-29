@@ -1,0 +1,22 @@
+# Changes to these paths need the code owner's review (enforced when branch
+# protection requires code-owner review — docs/BUILD_AND_RUN.md section 9).
+# They are the isolation boundary, the data store, the SQL guard, the
+# rendering sanitisers, the log hygiene and the build and deploy files.
+
+/sandbox_guard.py                           @aleksloma
+/executor/                                  @aleksloma
+/exec_transport.py                          @aleksloma
+/executor_client.py                         @aleksloma
+/docker-compose*.yml                        @aleksloma
+/Dockerfile*                                @aleksloma
+/local_store.py                             @aleksloma
+/db_connector.py                            @aleksloma
+/html_sanitize.py                           @aleksloma
+/routes/charts.py                           @aleksloma
+/routes/report.py                           @aleksloma
+/logger_utils.py                            @aleksloma
+/.github/                                   @aleksloma
+/.dockerignore                              @aleksloma
+/.trivyignore                               @aleksloma
+/tests/test_container_hardening_config.py   @aleksloma
+/docs/AI_CONSTITUTION.md                    @aleksloma

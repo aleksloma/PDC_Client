@@ -22,3 +22,5 @@ docs/security/
 # the last person to open the repository happened to have.
 .pytest_cache/
 .vscode/
+# Local-only re-assessment package material (like docs/security/).
+claude/

@@ -142,3 +142,7 @@ temp/
 # Security remediation working folder (temporary, local only, deleted after re-assessment). Never commit.
 # ============================================================================
 docs/security/
+
+# Local-only working files for the September 2026 re-assessment package
+# (never committed, like docs/security/).
+claude/

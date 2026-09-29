@@ -1,0 +1,9 @@
+# Accepted Trivy findings (read by CI: .github/workflows/ci.yml). Each entry
+# is recorded in RELEASES.md ("Accepted findings") with its reason; remove it
+# when the reason no longer holds.
+
+# msgpack 1.1.2 and setuptools 70.3.0 are copies VENDORED inside pip
+# (pip/_vendor), not packages the application installs or imports. They go
+# when a pip release vendors newer copies.
+GHSA-6v7p-g79w-8964
+CVE-2025-47273

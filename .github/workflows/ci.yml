@@ -1,0 +1,110 @@
+# PDC_Client continuous integration: every push and pull request.
+#
+#   tests           the full pytest suite, as the runner's own non-root user
+#   executor-tests  the sandbox image's suite, as root AND as the sandbox uid
+#   images          both images built; pip-audit (PyPI + OSV) on each image's
+#                   installed set; Trivy (HIGH, CRITICAL) on each image
+#
+# Branch protection for main (require these three checks, CODEOWNERS review)
+# is a GitHub setting, not a file: docs/BUILD_AND_RUN.md section 9.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"        # the images' Python
+      - name: System libraries (unixODBC, needed to import pyodbc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends unixodbc
+      - name: Install the pinned runtime set and the test tools
+        run: |
+          python -m pip install --upgrade pip==26.2.1
+          python -m pip install -r requirements.txt pytest==9.1.1 pyyaml==6.0.3
+      - name: The suite must not run as root
+        run: test "$(id -u)" != "0"
+      - name: Full test suite
+        env:
+          PYTHONUTF8: "1"
+          MPLBACKEND: Agg
+        run: python -m pytest tests/ -q -p no:cacheprovider
+
+  executor-tests:
+    name: executor-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the sandbox test image
+        run: docker build --target test -f executor/Dockerfile -t pdc-executor-test .
+      - name: Executor suite as the sandbox user (uid 10002)
+        run: >
+          docker run --rm --user 10002:10001 --tmpfs /jobs:mode=1777
+          pdc-executor-test python -m pytest executor/tests -q -p no:cacheprovider
+      - name: Executor suite as root
+        run: >
+          docker run --rm --tmpfs /jobs
+          pdc-executor-test python -m pytest executor/tests -q -p no:cacheprovider
+
+  images:
+    name: images
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the web image
+        run: docker build -t powerdatachat-client:ci .
+      - name: Build the sandbox image
+        run: docker build -f executor/Dockerfile -t powerdatachat-executor:ci .
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Installed package sets of both images
+        run: |
+          docker run --rm --entrypoint sh powerdatachat-client:ci -c "pip list --format=freeze" > web-freeze.txt
+          docker run --rm --entrypoint sh powerdatachat-executor:ci -c "pip list --format=freeze" > executor-freeze.txt
+          wc -l web-freeze.txt executor-freeze.txt
+      - name: pip-audit (PyPI and OSV advisories)
+        run: |
+          python -m pip install pip-audit==2.10.1
+          for f in web-freeze.txt executor-freeze.txt; do
+            for s in pypi osv; do
+              echo "== $f ($s)"
+              pip-audit -r "$f" --no-deps --disable-pip -s "$s"
+            done
+          done
+      # Trivy fails the job on a HIGH or CRITICAL finding that HAS a fix.
+      # Findings without a published fix (--ignore-unfixed) are recorded by the
+      # release scan, not blocking here (docs/BUILD_AND_RUN.md section 8).
+      # .trivyignore lists the accepted findings, each with its reason.
+      - name: Trivy — web image
+        run: >
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
+          -v "$PWD/.trivyignore:/work/.trivyignore:ro"
+          aquasec/trivy:0.74.0 image --scanners vuln --severity HIGH,CRITICAL
+          --ignore-unfixed --ignorefile /work/.trivyignore --exit-code 1
+          powerdatachat-client:ci
+      - name: Trivy — sandbox image
+        run: >
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
+          -v "$PWD/.trivyignore:/work/.trivyignore:ro"
+          aquasec/trivy:0.74.0 image --scanners vuln --severity HIGH,CRITICAL
+          --ignore-unfixed --ignorefile /work/.trivyignore --exit-code 1
+          powerdatachat-executor:ci
