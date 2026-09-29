@@ -158,6 +158,7 @@ To run the stack you need:
 | `SECRET_KEY` | **Required.** Local session-cookie signing secret, at least 32 characters. Generate once with `python -c "import secrets; print(secrets.token_hex(32))"`. The app refuses to start (`SECRET_KEY_UNSET`) without it. |
 | `DATA_ROOT` | Local-disk root for raw data + chats. Mount a volume. |
 | `SCHEMA_VALUE_DENY_COLUMNS` | Optional. Comma-separated column names (case-insensitive) whose values never reach the brain: those columns send name, dtype and counts only. Empty by default. |
+| `SHARE_ALLOWED_DOMAINS` | Optional. Comma-separated recipient domains a chat, conversation or dashboard may be shared with. Empty by default: the domains of the administrator accounts are used. |
 
 The `EXECUTOR_*` topology values are set by the compose file, not by the env
 file. `EXECUTOR_NETWORK_CIDR` is mandatory while `EXECUTOR_URL` is set: the
@@ -189,6 +190,17 @@ caps) and the jobs volume with the ownership both uids require. See
 Skip it and the container still starts and still reports healthy — but every
 write fails: `LADMIN_BOOTSTRAP_FAILED` / `Permission denied` in the log, and
 users get a 500 when they try to sign in.
+
+**Sharing.** A chat, a conversation or a dashboard can be shared only with
+addresses in the allowed domains (`SHARE_ALLOWED_DOMAINS`, else the domains of
+the administrator accounts). One address outside them refuses the whole share
+(`400 RECIPIENT_DOMAIN_NOT_ALLOWED`): nothing is shared and no account is
+created. An allowed address without an account gets a password-less account
+(Microsoft-only while single sign-on is enabled). A chat's owner can remove a
+recipient from the share dialog, and unsharing a dashboard also ends the chat
+access that share gave. A recipient whose data role does not cover a chat's
+database tables gets no answers from those tables. See
+[`CUSTOMER_INSTALL.md`](CUSTOMER_INSTALL.md), "Sharing".
 
 
 ## Key docs

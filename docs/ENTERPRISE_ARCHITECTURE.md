@@ -1022,9 +1022,12 @@ parquet (one kept from before the live period is never served) and enters
 marks it `live` with the connector dialect, the effective row cap and
 whether an administrator row filter applies, and `schema_text` renders
 `[LIVE, dialect=<key>, row_cap=<n>]` plus a one-SELECT contract sentence.
-Before the planner is called, live keys the requester's role does not cover
-are dropped from the frames and the schema (`_drop_uncovered_live_keys`; a
-turn left with nothing ends with a denial sentence and no brain call). The
+Before the planner is called, the database keys (snapshot and live alike;
+connectors exempt, uploaded files ungated) the requester's role does not
+cover are dropped from the frames and the schema (`_drop_uncovered_db_keys`;
+a turn left with nothing ends with a denial sentence and no brain call) — so
+a share recipient without the data role gets no answers from the chat's
+snapshot tables either. The
 plan request carries `live_tables` `[{name, dialect, row_cap, filtered}]`;
 the response may carry `sql` `{df key: SELECT}`. Immediately before EVERY
 sandbox call (`run_chat_local._ensure_live`, idempotent, retries and
@@ -1161,15 +1164,21 @@ break allowed joins.
   whose role was not checked — and fails OPEN on a chat without one.
 - `GET /api/chat/{id}/schema` — advisory per-table `allowed` flag so the /lab
   and dashboard-view UIs grey refresh buttons proactively.
+- `chat/stream` and `edit_regenerate` — not refused, but every
+  non-connector database table (snapshot and live) the requester's role does
+  not cover is dropped from the frames and the schema before the planner
+  (`_drop_uncovered_db_keys`; nothing left → the denial sentence, no brain
+  call). Uploaded files are not gated. So a share recipient without the data
+  role cannot compute new answers from the chat's snapshot tables.
 - **Not gated by design** (confirmed decisions — no retroactive blocking;
-  snapshot data the user could already see stays viewable): `chat/stream`,
-  `edit_regenerate`, full-table/Download-Excel re-execution of SNAPSHOT data
+  snapshot data the user could already see stays viewable):
+  full-table/Download-Excel re-execution of SNAPSHOT data
   (a LIVE fetch on those two routes is gated, and fails closed on a chat
   holding a live table), Auto Analytics,
   `add_data_to_chat` (its DB entries were validated at selection time), and
   the central nightly snapshot scheduler. Shared-chat/dashboard recipients
-  keep VIEWING stored snapshots; only their fresh re-execution is gated, keyed
-  on the requester.
+  keep VIEWING stored answers and snapshots; fresh computation is gated,
+  keyed on the requester.
 
 **Canonical storage on the role record, never the table doc:** the register
 wizard's step-3 Access panel posts `access_role_ids`, which the save
@@ -1341,17 +1350,33 @@ Customer guide: `docs/SSO_MICROSOFT.md`.
 
 ## 11. Sharing restriction
 
-The original intent was to restrict sharing to the company's own domain.
-**It is not implemented:** no per-tenant domain list exists on either side,
-and the share routes (`POST /api/chat/{id}/share`,
-`POST /auth/conversations/{conv_id}/share`, `POST /api/dashboards/{id}/share`)
-accept any syntactically valid address. What they do enforce: only the owner
-of a chat can share it or one of its conversations, a dashboard share grants
-only the chats the dashboard's owner owns, and an address that has never
-signed in gets a password-less placeholder account, so the share cannot be
-claimed by whoever types that address at the sign-in page first. Password
-sign-in never creates an account at all; the placeholder's owner sets a
-password through a mailed single-use link.
+Sharing is restricted to the company's own domains, enforced by the client
+alone (no brain-side list is consulted). The share routes
+(`POST /api/chat/{id}/share`, `POST /auth/conversations/{conv_id}/share`,
+`POST /api/dashboards/{id}/share`) check every recipient against the allowed
+domains before anything is written (`routes.auth.share_recipient_refusal`):
+the client setting `SHARE_ALLOWED_DOMAINS` when set, otherwise the domains of
+the existing administrator accounts, derived at call time. One recipient
+outside them refuses the whole request (`400`, code
+`RECIPIENT_DOMAIN_NOT_ALLOWED`): nothing is shared, no account is created, no
+mail is sent; with no allowed domain at all every share is refused. Beyond
+that: only the owner of a chat can share it or one of its conversations, a
+dashboard share grants only the chats the dashboard's owner owns, and an
+allowed address that has never signed in gets a password-less placeholder
+account, so the share cannot be claimed by whoever types that address at the
+sign-in page first. Password sign-in never creates an account at all; the
+placeholder's owner sets a password through a mailed single-use link — or,
+for a placeholder created while Microsoft SSO is enabled, signs in with
+Microsoft (the placeholder is SSO-only and the reset page refuses it).
+
+Shares can be revoked: the chat owner removes one recipient with
+`DELETE /api/chat/{id}/share/{recipient}`, and a dashboard unshare also
+revokes the source-chat grants that dashboard's share created (recorded on
+the dashboard as `sharing.chat_grants`), keeping any grant that predates it,
+that another of the owner's dashboards still shared with the recipient
+needs, or that the owner has since made by sharing the chat directly. A
+recipient's own data role gates the chat's database tables on every new
+question (see the role-gate list above).
 
 ### 11a. Rendered content isolation
 
@@ -1417,8 +1442,8 @@ Items still undecided. Do not invent or assume:
 - Auth/token rotation policy (lifetime, automatic rotation cadence).
 - How the client server reaches the brain at the network level (public
   HTTPS endpoint + token vs. VPN/private link — likely tenant-specific).
-- Whether to restrict sharing by recipient domain at all (see §11; nothing
-  enforces a domain today).
+- Whether to enforce the sharing domain rule on the brain side too, as
+  defence in depth (see §11; today the client alone enforces it).
 - Whether the dashboard top-bar should expose a "tenant ID" badge for
   operator support.
 

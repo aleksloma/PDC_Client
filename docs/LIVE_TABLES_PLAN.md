@@ -290,10 +290,11 @@ Shipped in the chat pre-fetch phase, as built:
   referenced key takes the planner's SELECT when the turn's `sql` map has
   one, else the default read.
 - The role gates. Before the planner is called, the stream and
-  edit-regenerate drop every non-connector live key the requester's role
-  does not cover from `dfs` and `schema_docs` in place
-  (`routes/chat._drop_uncovered_live_keys`, `LIVE_ROLE_DROPPED`; a gate
-  failure drops every live key), so the brain is never shown such a table;
+  edit-regenerate drop every non-connector database key — live, and since
+  the sharing change snapshot too — the requester's role does not cover
+  from `dfs` and `schema_docs` in place (`routes/chat._drop_uncovered_db_keys`,
+  `LIVE_ROLE_DROPPED` / `SNAPSHOT_ROLE_DROPPED`; a gate failure drops every
+  database key, `DB_ROLE_DROP_FAILED`), so the brain is never shown such a table;
   a turn left with no frame ends with "You no longer have access to
   <table>; ask your administrator." persisted as the AI row, with no brain
   call. `_ensure_live` checks again per referenced key

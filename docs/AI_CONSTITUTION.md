@@ -337,9 +337,10 @@ client must be closed on FastAPI lifespan shutdown.
    `LIVE_RESULT_ROW_CAP`, `LIVE_RESULT_MAX_MB` and `LIVE_QUERY_TIMEOUT_S` —
    never in the sandbox; its SQL text is never logged, only a hash. The
    live query rules, as built: the requester's role must cover the table
-   BEFORE the planner is called (`routes/chat._drop_uncovered_live_keys`
-   removes uncovered live keys from the frames and the schema, so the brain
-   is never shown them) and AGAIN before every fetch
+   BEFORE the planner is called (`routes/chat._drop_uncovered_db_keys`
+   removes every uncovered non-connector database key, snapshot and live,
+   from the frames and the schema, so the brain is never shown them and the
+   sandbox never receives them) and AGAIN before every fetch
    (`run_chat_local._ensure_live`, `roles_store.allowed_table_ids_for`,
    connectors exempt); the guard's per-table allowlist (`allowed_tables` on
    `assert_read_only_query`) binds each SELECT to the one registered table

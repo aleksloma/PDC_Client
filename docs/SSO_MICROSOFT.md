@@ -134,6 +134,13 @@ password its password back.
   is refused ("This account signs in with Microsoft and has no local
   password."). Multi-factor authentication and conditional access apply at
   sign-in, in Entra; a local password would bypass them.
+- **Share recipients while SSO is enabled.** Sharing a chat, conversation or
+  dashboard with an address in an allowed domain that has no account creates
+  a Microsoft-only placeholder (no local password; "Reset password" mails it
+  nothing); the person signs in with Microsoft. Placeholders created by a
+  share before SSO was enabled keep the reset-link path. Such an account
+  stays Microsoft-only if SSO is later switched off; recover it as described
+  below.
 - **While SSO is enabled, Microsoft accounts sign in with Microsoft only.**
   Once an account has signed in with Microsoft, a local password it also
   holds is refused at the password form (the same "Sign-in failed" line as a

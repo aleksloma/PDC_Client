@@ -43,6 +43,18 @@ Read these before you upgrade an existing install to this release.
   values entirely (see "Columns whose values never leave" in §2). Hints
   stored by an earlier release are filtered the same way; nothing needs to
   be re-uploaded.
+- Sharing is limited to allowed domains: set SHARE_ALLOWED_DOMAINS, or the
+  domains of your administrator accounts are used; an out-of-domain share is
+  refused and creates no account. With neither (only the `ladmin` account and
+  no promoted administrator), every share is refused until you set it or
+  promote one (see "Sharing" in §2).
+- A share recipient whose data role does not cover a chat's database tables
+  no longer gets those tables (snapshot or live) when asking a new question or
+  editing one in the shared chat; uploaded files are unaffected.
+- Unsharing a dashboard now also ends the chat access that share gave. Access
+  the recipient had before the dashboard share, or got from a direct share of
+  the chat, is kept. Dashboards shared before the upgrade carry no such record
+  and their unshare revokes no chat access.
 
 ## 1. Get the images
 
@@ -303,8 +315,9 @@ Accounts come to exist in three ways:
   cannot be sent, the page says so; the colleague can still click **Reset
   password** on the sign-in page.
 - **Sharing.** Sharing a chat, a conversation or a dashboard with a new
-  address creates the same password-less account. The colleague sets a
-  password through **Reset password**.
+  address in an allowed domain creates the same password-less account. The
+  colleague sets a password through **Reset password** (or, while single
+  sign-on is enabled, signs in with Microsoft — see "Sharing" below).
 - **Single sign-on.** When Microsoft Entra ID sign-in is enabled, the first
   Microsoft sign-in creates the account (who may sign in is decided in
   Entra).
@@ -436,6 +449,57 @@ reverse proxy as well.
 apostrophe, can no longer sign in with a password or receive a share; give
 that user a new address. Single sign-on lets such a user sign in, but shares
 and invitations to that address are still refused.
+
+### Sharing
+
+**Allowed domains.** Chats, conversations and dashboards can be shared only
+with addresses in the allowed domains. `SHARE_ALLOWED_DOMAINS` in
+`client.env` is an optional, comma-separated list of domains, e.g.
+`SHARE_ALLOWED_DOMAINS=bank.example,partner.example` (case-insensitive; a
+leading `@` is accepted). Left empty, the allowed domains are those of your
+administrator accounts: every user whose permission is **Local admin**, plus
+`ladmin` when its username is an address. The derived list is read at each
+share, so a promotion counts at once; a change to the setting needs a restart
+of the web container. With no setting and no administrator address (the default
+`ladmin` username is not one), every share is refused with "Sharing is not
+configured: the administrator must set SHARE_ALLOWED_DOMAINS (or promote an
+administrator account)."
+
+If any recipient of a share is outside the allowed domains, the whole share
+is refused (`400`, code `RECIPIENT_DOMAIN_NOT_ALLOWED`): nothing is shared,
+no account is created and no mail is sent. This holds for existing accounts
+too; inviting such an address from the **Users** page does not make it
+shareable — only adding its domain does.
+
+**New recipients.** A recipient in an allowed domain who has no account gets
+a password-less account and activates it through **Reset password** (a mailed
+link). While Microsoft single sign-on is enabled, such an account is created
+as a Microsoft-only account instead: **Reset password** sends it nothing and
+the person signs in with Microsoft. That account stays Microsoft-only if
+single sign-on is later switched off; recover it as described under
+"Microsoft accounts have no local password" above. Password-less accounts
+created by an earlier share keep working as recipients and keep the reset
+path.
+
+**Removing a recipient.** In a chat's **Share** dialog the owner sees the
+current recipients and can **Remove** each one. The address leaves the
+chat's list and the chat leaves that person's chat list; their next request
+for the chat is refused. Only the owner can do this.
+
+**Unsharing a dashboard.** Sharing a dashboard also gives its recipients
+access to the chats behind its tiles (those the dashboard's owner owns).
+Unsharing the dashboard ends the chat access that share created. It keeps
+access the recipient already had before the dashboard share, access another
+of the owner's dashboards still shared with that person needs, and access the
+owner later gave by sharing the chat itself. A dashboard shared by a release
+before this one has no record of what it granted, so its unshare removes no
+chat access.
+
+**Data roles still apply.** A shared chat's database tables (snapshot and
+live) are gated by the recipient's own data role. A recipient whose role does
+not cover a table asks new questions, or edits earlier ones, without that
+table; when the chat has nothing else to answer from, the answer says they
+have no access and the AI service is not called. Uploaded files are the owner's and are not gated.
 
 ### Single sign-on with Microsoft Entra ID (optional)
 
@@ -834,9 +898,12 @@ decks, and your branded templates.
   the `/data/client` volume on your server and are never transmitted. See
   "What leaves your network" for exactly what does reach the brain.
 - **Sharing rules your users will meet.**
+  - Sharing works only with addresses in the allowed domains (see "Sharing"
+    in §2); one address outside them refuses the whole share.
   - Sharing with a colleague who has never signed in creates an account for
     that address with no password. The colleague signs in by clicking "Reset
-    password" first and setting a password through the mailed link; typing a
+    password" first and setting a password through the mailed link (or, while
+    single sign-on is enabled, by signing in with Microsoft); typing a
     password at the sign-in page is refused. Nobody else can claim the share
     by signing in with that address first.
   - Sharing a dashboard gives the recipients access only to the chats the
@@ -847,7 +914,10 @@ decks, and your branded templates.
   - A colleague a chat is shared with can read it, ask new questions in it,
     refresh its charts and pin them, but cannot edit its descriptions, add
     data, start Auto Analytics or share it on. The shared chat appears in
-    their chat list.
+    their chat list. Its database tables are available to them only as far
+    as their own data role covers them.
+  - A chat's owner can remove a recipient from the chat's Share dialog;
+    unsharing a dashboard also ends the chat access that share gave.
   - Charts and styled tables that anyone shares are shown in an isolated
     frame or reduced to plain table formatting, so what one user shares
     cannot act in another user's browser session.
