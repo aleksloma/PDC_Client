@@ -131,6 +131,11 @@ class Settings(BaseModel):
     # case-insensitive): schema text, technical descriptions, dataset
     # profiles and schema autofill send the column's name and dtype only.
     SCHEMA_VALUE_DENY_COLUMNS: str = Field(default_factory=lambda: os.getenv("SCHEMA_VALUE_DENY_COLUMNS", ""))
+    # Sharing: the recipient domains a chat / dashboard / conversation share
+    # may reach (comma-separated, e.g. "bank.ge,partner.ge"). Empty = the
+    # domains of the existing administrator accounts, derived at call time
+    # (routes.auth.share_allowed_domains).
+    SHARE_ALLOWED_DOMAINS: str = Field(default_factory=lambda: os.getenv("SHARE_ALLOWED_DOMAINS", ""))
 
     # Schema autofill — same defaults as global (backend/routes/schema.py).
     # These shape the per-file context the client builds BEFORE posting to the

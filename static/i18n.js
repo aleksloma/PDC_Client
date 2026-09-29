@@ -189,6 +189,10 @@ window.I18N_TRANSLATIONS = {
     // Share modal
     'share.title': 'Share Chat',
     'share.emails_label': 'Share with specific emails (comma-separated)',
+    'share.current_label': 'Shared with',
+    'share.remove': 'Remove',
+    'share.unshare_ok': 'Access removed',
+    'share.unshare_failed': 'Could not remove access',
     'share.emails_placeholder': 'email1@example.com, email2@example.com',
     'share.emails_hint': 'The chat will appear in their "Shared with Me" list',
     'share.comment_label': 'Add a comment (optional)',
@@ -591,6 +595,10 @@ window.I18N_TRANSLATIONS = {
     // Share modal
     'share.title': 'ჩატის გაზიარება',
     'share.emails_label': 'გაუზიარეთ კონკრეტულ ელ.ფოსტებს (მძიმით გამოყოფილი)',
+    'share.current_label': 'გაზიარებულია',
+    'share.remove': 'წაშლა',
+    'share.unshare_ok': 'წვდომა გაუქმდა',
+    'share.unshare_failed': 'წვდომის გაუქმება ვერ მოხერხდა',
     'share.emails_placeholder': 'email1@example.com, email2@example.com',
     'share.emails_hint': 'ჩატი გამოჩნდება მათ "გაზიარებული ჩემთან" სიაში',
     'share.comment_label': 'დაამატეთ კომენტარი (არასავალდებულო)',
@@ -993,6 +1001,10 @@ window.I18N_TRANSLATIONS = {
     // Share modal
     'share.title': 'Поделиться чатом',
     'share.emails_label': 'Поделиться с конкретными email (через запятую)',
+    'share.current_label': 'Доступ открыт',
+    'share.remove': 'Удалить',
+    'share.unshare_ok': 'Доступ отозван',
+    'share.unshare_failed': 'Не удалось отозвать доступ',
     'share.emails_placeholder': 'email1@example.com, email2@example.com',
     'share.emails_hint': 'Чат появится в их списке "Поделено со мной"',
     'share.comment_label': 'Добавить комментарий (необязательно)',

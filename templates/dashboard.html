@@ -428,6 +428,10 @@
           <textarea id="shareComment" rows="3" placeholder="Add a note for the recipient..." data-i18n-placeholder="share.comment_placeholder" style="width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; resize: vertical;"></textarea>
           <p style="font-size: 12px; color: #9ca3af; margin-top: 6px; font-style: italic;" data-i18n="share.comment_hint">This comment will be sent via email notification only</p>
         </div>
+        <div id="shareCurrentWrap" class="form-group share-current hidden" style="margin-top: 16px;">
+          <label data-i18n="share.current_label">Shared with</label>
+          <div id="shareCurrentList"></div>
+        </div>
       </div>
       <div class="modal-actions">
         <button id="btnCancelShare" class="ghost" data-i18n="common.cancel">Cancel</button>

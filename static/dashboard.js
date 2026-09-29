@@ -5302,8 +5302,59 @@ async function handleShare(type, chatId, convId, title) {
   modal.classList.remove('hidden');
   shareEmails.focus();
 
+  // The chat owner sees who the chat is shared with and can remove an
+  // address (DELETE /api/chat/{id}/share/{email}). Text only (textContent).
+  const currentWrap = document.getElementById('shareCurrentWrap');
+  const currentList = document.getElementById('shareCurrentList');
+  const renderShared = (list) => {
+    if (!currentWrap || !currentList) return;
+    currentList.textContent = '';
+    (list || []).forEach(addr => {
+      const row = document.createElement('div');
+      row.className = 'share-current-row';
+      row.style.cssText = 'display:flex; justify-content:space-between; align-items:center; gap:8px; padding:4px 0;';
+      const label = document.createElement('span');
+      label.textContent = addr;
+      const btn = document.createElement('button');
+      btn.className = 'ghost';
+      btn.type = 'button';
+      btn.textContent = _t('share.remove', 'Remove');
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          const res = await pdcFetch(`/api/chat/${chatId}/share/${encodeURIComponent(addr)}`, {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' }
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || 'failed');
+          renderShared(data.shared_with || []);
+          showToast(_t('share.unshare_ok', 'Access removed'));
+        } catch (e) {
+          btn.disabled = false;
+          showToast(_t('share.unshare_failed', 'Could not remove access'), true);
+        }
+      });
+      row.appendChild(label);
+      row.appendChild(btn);
+      currentList.appendChild(row);
+    });
+    currentWrap.classList.toggle('hidden', !(list && list.length));
+  };
+  renderShared([]);
+  if (chatId) {
+    // A late answer for a chat the modal no longer shows is dropped.
+    modal.dataset.shareChatId = chatId;
+    pdcFetch(`/api/chat/${chatId}/share`).then(r => r.ok ? r.json() : null).then(data => {
+      if (modal.dataset.shareChatId !== chatId) return;
+      if (data && data.is_owner) renderShared(data.shared_with || []);
+    }).catch(() => {});
+  }
+
   const closeModal = () => {
     modal.classList.add('hidden');
+    delete modal.dataset.shareChatId;
+    renderShared([]);
     // Clean up event handlers
     btnSave.onclick = null;
     btnCancelShare.onclick = null;

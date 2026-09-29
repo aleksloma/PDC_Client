@@ -48,6 +48,12 @@ if _ROOT not in sys.path:
 # carries, and `load_dotenv` never overrides one that is set.
 os.environ.setdefault("SECRET_KEY", "0123456789abcdef" * 4)
 os.environ.setdefault("EXECUTOR_NETWORK_CIDR", "192.168.255.240/28")
+# Sharing is limited to allowed recipient domains (routes.auth.
+# share_allowed_domains). The fixture domains the older share tests use are
+# allowed here; tests/test_share_policy.py sets its own value, empty included.
+os.environ.setdefault("SHARE_ALLOWED_DOMAINS",
+                      "acme.com,corp.example,example.com,x.com,b.co,else.com,"
+                      "mail.example.org,sub-domain.example.com")
 
 import pytest  # noqa: E402
 

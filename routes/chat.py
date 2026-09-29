@@ -996,18 +996,23 @@ def _event_sql(event):
     return dict(sql) if isinstance(sql, dict) and sql else None
 
 
-def _drop_uncovered_live_keys(email: str, store, dfs: dict, schema_docs: dict,
-                              sid: str) -> list:
-    """Role gate BEFORE the planner: the chat's non-connector LIVE keys whose
-    table the requester's role does not cover are removed from `dfs` and
-    `schema_docs` in place (logged `LIVE_ROLE_DROPPED`), so the planner is
-    never shown a table this user may not query and no brain call is spent
-    on it. A failure inside the gate drops every live key (fail closed);
-    `run_chat_local._ensure_live` checks again before any fetch. Returns the
-    dropped tables' display names (the caller ends the turn with the denial
-    sentence when nothing is left to plan on)."""
+def _drop_uncovered_db_keys(email: str, store, dfs: dict, schema_docs: dict,
+                            sid: str) -> list:
+    """Role gate BEFORE the planner: the chat's non-connector DATABASE keys —
+    snapshot and live alike — whose table the requester's role does not
+    cover are removed from `dfs` and `schema_docs` in place (logged
+    `SNAPSHOT_ROLE_DROPPED` / `LIVE_ROLE_DROPPED`), so the planner is never
+    shown, and the sandbox never receives, a table this user may not read.
+    That is what stops a share recipient without the data role from running
+    new questions over the chat's snapshot tables (refresh already refused
+    them, `_role_refresh_block`). Uploaded files are the owner's and stay
+    ungated. A failure inside the gate drops every database key (fail
+    closed); `run_chat_local._ensure_live` checks live tables again before
+    any fetch. Returns the dropped tables' display names (the caller ends
+    the turn with the denial sentence when nothing is left to plan on)."""
     live_keys = [k for k, d in (schema_docs or {}).items()
-                 if isinstance(d, dict) and d.get("live") and k in (dfs or {})]
+                 if isinstance(d, dict) and d.get("source") == "database"
+                 and k in (dfs or {})]
     if not live_keys:
         return []
     entries = {}
@@ -1025,18 +1030,23 @@ def _drop_uncovered_live_keys(email: str, store, dfs: dict, schema_docs: dict,
                 drop.append(key)
     except Exception as e:
         log_with_sid(sid, "warning",
-                     f"LIVE_ROLE_DROP_FAILED error={log_safe_text(type(e).__name__, 80)}",
+                     f"DB_ROLE_DROP_FAILED error={log_safe_text(type(e).__name__, 80)}",
                      chat_id=log_safe_text(str(store.chat_id), 80))
         drop = list(live_keys)
     names = []
     for key in drop:
+        doc = schema_docs.pop(key, None)
         dfs.pop(key, None)
-        schema_docs.pop(key, None)
         db = (entries.get(key) or {}).get("db") or {}
         names.append(str(db.get("display_name") or key))
-        log_with_sid(sid, "info",
-                     f"LIVE_ROLE_DROPPED table={log_safe_text(str(key), 120)}",
-                     chat_id=log_safe_text(str(store.chat_id), 80))
+        if isinstance(doc, dict) and doc.get("live"):
+            log_with_sid(sid, "info",
+                         f"LIVE_ROLE_DROPPED table={log_safe_text(str(key), 120)}",
+                         chat_id=log_safe_text(str(store.chat_id), 80))
+        else:
+            log_with_sid(sid, "info",
+                         f"SNAPSHOT_ROLE_DROPPED table={log_safe_text(str(key), 120)}",
+                         chat_id=log_safe_text(str(store.chat_id), 80))
     return names
 
 
@@ -1581,7 +1591,7 @@ async def chat_stream(request: Request, chat_id: str):
     # planner sees them; a chat left with NO frame by that drop ends with the
     # denial sentence instead of a brain call on an empty schema.
     dropped = await loop.run_in_executor(
-        _EXEC, _drop_uncovered_live_keys, email, store, dfs, schema_docs, sid)
+        _EXEC, _drop_uncovered_db_keys, email, store, dfs, schema_docs, sid)
     denied_text = _live_denied_text(dropped, chat_id, sid) if not dfs else None
     # Dataset profiles (computed facts for the planner). Backfilled from the
     # stored frames when missing/stale; a failure never blocks the chat.
@@ -2018,7 +2028,7 @@ async def edit_regenerate(request: Request, chat_id: str):
         schema_docs = await loop.run_in_executor(_EXEC, store.schema_docs)
         sid = secrets.token_hex(8)
         dropped = await loop.run_in_executor(
-            _EXEC, _drop_uncovered_live_keys, email, store, dfs, schema_docs, sid)
+            _EXEC, _drop_uncovered_db_keys, email, store, dfs, schema_docs, sid)
         denied_text = _live_denied_text(dropped, chat_id, sid) if not dfs else None
         try:
             dataset_profiles = await loop.run_in_executor(
@@ -2276,10 +2286,44 @@ async def share_get(request: Request, chat_id: str):
     store = local_store.ChatDataStore(chat_id)
     meta = store.read_meta()
     sharing = meta.get("sharing") or {}
+    owner = local_store.get_chat_meta_owner(chat_id) or ""
     return {
         "shared_with": sharing.get("shared_with") or [],
-        "owner": email,
+        "owner": owner,
+        "is_owner": str(owner).strip().lower() == str(email).strip().lower(),
     }
+
+
+@router.delete("/{chat_id}/share/{recipient}")
+async def share_delete(request: Request, chat_id: str, recipient: str):
+    """Owner-only: take one address off the chat's sharing list and out of
+    the recipient's sidebar. The recipient's next request for the chat is
+    refused (`_require_chat` checks the list). Idempotent."""
+    email, err = _require_chat_owner(request, chat_id)
+    if err:
+        return err
+    from routes.auth import _EMAIL_RE   # the one address pattern
+    rec = str(recipient or "").strip().lower()
+    if not _EMAIL_RE.fullmatch(rec):
+        return JSONResponse({"error": "Provide a valid email address."}, status_code=400)
+    loop = asyncio.get_running_loop()
+    try:
+        remaining = await loop.run_in_executor(
+            _EXEC, lambda: local_store.ChatDataStore(chat_id).remove_share_recipient(rec))
+    except Exception as e:
+        log_with_sid(email, "error",
+                     f"CHAT_UNSHARE_FAILED error={log_safe_text(type(e).__name__, 80)}",
+                     chat_id=chat_id)
+        return JSONResponse({"error": "Could not remove access."}, status_code=500)
+    try:
+        await loop.run_in_executor(_EXEC, local_store.AuthStore().deactivate_chat, rec, chat_id)
+    except Exception as e:
+        log_with_sid(email, "warning",
+                     f"SHARE_REVOKE_SIDEBAR_FAILED error={log_safe_text(type(e).__name__, 80)}",
+                     chat_id=chat_id)
+    log_with_sid(email, "info", "CHAT_UNSHARED", chat_id=chat_id,
+                 recipient=log_safe_text(rec, 120), remaining=len(remaining))
+    return {"ok": True, "shared_with": remaining}
 
 
 @router.post("/{chat_id}/share")
@@ -2306,22 +2350,34 @@ async def share_post(request: Request, chat_id: str):
             recipients.append(e)
     if not recipients:
         return JSONResponse({"error": "Provide at least one valid recipient email."}, status_code=400)
+    # Only addresses of the organisation's own domains; checked before
+    # anything is written, so a refused share creates no account.
+    from routes.auth import ensure_share_recipient, share_recipient_refusal
+    refusal = share_recipient_refusal(recipients)
+    if refusal:
+        return JSONResponse(refusal, status_code=400)
     message_text = (body.get("message") or "").strip()
 
     store = local_store.ChatDataStore(chat_id)
-    meta = store.read_meta()
-    sharing = meta.get("sharing") or {"shared_with": []}
-    existing = set(sharing.get("shared_with") or [])
-    new_recipients = [r for r in recipients if r not in existing]
-    existing.update(new_recipients)
-    sharing["shared_with"] = sorted(existing)
-    meta["sharing"] = sharing
-    store.write_meta(meta)
+    # A direct share makes the access deliberate: a dashboard share that
+    # granted this chat earlier must not revoke it at its unshare. Forget
+    # those records first, then add the addresses, both under the store
+    # lock that the dashboard revocation also holds.
+    with local_store._LOCK:
+        local_store.DashboardStore().forget_chat_grants(email, chat_id, recipients)
+        meta = store.read_meta()
+        sharing = meta.get("sharing") or {"shared_with": []}
+        existing = set(sharing.get("shared_with") or [])
+        new_recipients = [r for r in recipients if r not in existing]
+        existing.update(new_recipients)
+        sharing["shared_with"] = sorted(existing)
+        meta["sharing"] = sharing
+        store.write_meta(meta)
     # An address that has never signed in gets a password-less placeholder,
     # so whoever types it first at the sign-in page cannot claim the share.
     auth = local_store.AuthStore()
     for rec in recipients:
-        auth.ensure_invited_user(rec, email)
+        ensure_share_recipient(rec, email)
     # List the chat in each recipient's sidebar, as the conversation-level
     # share does (the store skips a chat the recipient already lists).
     sidebar_title = meta.get("title") or "Chat"

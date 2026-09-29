@@ -698,27 +698,37 @@ async def share_dashboard(request: Request, dash_id: str):
     if not recipients:
         return JSONResponse({"error": "Provide at least one valid recipient email."},
                             status_code=400)
+    # Only the organisation's own domains; refused before anything is written.
+    from routes.auth import ensure_share_recipient, share_recipient_refusal
+    refusal = share_recipient_refusal(recipients)
+    if refusal:
+        return JSONResponse(refusal, status_code=400)
     message_text = (body.get("message") or "").strip()
 
     new_recipients = _dash_store.add_dashboard_share(email, dash_id, recipients)
-    # An address that has never signed in gets a password-less placeholder,
-    # so whoever types it first at the sign-in page cannot claim the share.
-    auth = local_store.AuthStore()
+    # An allowed address that has never signed in gets a password-less
+    # placeholder (SSO-only while Microsoft sign-in is on).
     for rec in recipients:
-        auth.ensure_invited_user(rec, email)
+        ensure_share_recipient(rec, email)
 
     # Grant the recipients access to every tile's source chat that the
     # dashboard owner OWNS, so those tiles are live for them, not just the
     # stored snapshots. Best-effort per chat.
     chat_ids = {t.get("chat_id") for t in (doc.get("tiles") or []) if t.get("chat_id")}
+    created_grants: dict = {}
     for cid in chat_ids:
         try:
             if (local_store.chat_exists(cid)
                     and local_store.get_chat_meta_owner(cid) == email):
-                local_store.ChatDataStore(cid).add_share_recipients(recipients)
+                # Only grants this share CREATES are recorded, so an unshare
+                # never revokes access the recipient already had.
+                for rec in local_store.ChatDataStore(cid).add_share_recipients(recipients):
+                    created_grants.setdefault(rec, []).append(cid)
         except Exception as e:
             log_with_sid(email, "warning", f"DASH_SHARE_CHAT_GRANT_FAILED chat={log_safe_text(str(cid), 80)}: "
                          f"{log_safe_text(str(e), 200)}")
+    if created_grants:
+        _dash_store.record_chat_grants(email, dash_id, created_grants)
 
     smtp_result = {"smtp_configured": False, "sent": [], "failed": []}
     if new_recipients:
@@ -751,9 +761,11 @@ async def unshare_dashboard(request: Request, dash_id: str):
     leaves their list and their saved URL resolves nothing. Idempotent: an
     address that is not shared answers 200 with the list unchanged.
 
-    The source chats the share granted alongside are NOT touched — that grant
-    is the chat's own sharing (the chat-level contract has no revoke either),
-    and another share of the same chat may rely on it."""
+    The source-chat grants THIS share created are revoked with it (recorded
+    in `sharing.chat_grants` at share time), except a chat another of the
+    owner's dashboards, still shared with the recipient, needs. A grant that
+    existed before the share, or a doc from before the record existed, is
+    left alone."""
     email, err = _require_email(request)
     if err:
         return err
@@ -771,6 +783,7 @@ async def unshare_dashboard(request: Request, dash_id: str):
     if not _EMAIL_RE.fullmatch(recipient):
         return JSONResponse({"error": "Provide a valid email address."}, status_code=400)
     try:
+        _dash_store.revoke_chat_grants(email, dash_id, recipient)
         remaining = _dash_store.remove_dashboard_share(email, dash_id, recipient)
     except Exception as e:
         log_with_sid(email, "error", f"DASH_UNSHARE_FAILED: {log_safe_text(str(e), 200)}")

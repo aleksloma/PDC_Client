@@ -1126,3 +1126,71 @@ def test_multi_table_tile_refresh_persists_a_full_table_record_with_its_sql(
     assert rec["code"] == MULTI_CODE
     assert rec.get("result_key") == "first"
     assert rec.get("sql") == {KEY: SQL}, rec
+
+
+# ===========================================================================
+# snapshot tables get the same role gate before the planner
+# ===========================================================================
+FRIEND = "friend@x.com"
+
+
+@pytest.fixture
+def shared_snapshot_chat(registry):
+    """A chat of OWNER on the SNAPSHOT table plus a csv file, shared with
+    FRIEND, who holds no data role."""
+    store = local_store.ChatDataStore(CHAT)
+    (store.files_dir / "d.csv").write_text("x\n1\n2\n", encoding="utf-8")
+    meta = store.read_meta()
+    meta["owner"] = OWNER
+    meta["files"] = [
+        {"file_name": "d.csv", "file_description": "",
+         "schema": {"file_name": "d.csv", "fields": {}}},
+        _db_entry("snap u", registry["snap_tid"], registry["cid"], table="u"),
+    ]
+    meta["sharing"] = {"shared_with": [FRIEND]}
+    store.write_meta(meta)
+    local_store.AuthStore().ensure_user(FRIEND)
+    return store
+
+
+def test_a_recipient_without_the_role_never_gets_the_snapshot_table(
+        client, shared_snapshot_chat, monkeypatch, caplog):
+    captured = {}
+    _capture_multi_plot(monkeypatch, captured)
+    client.post(f"/_login/{FRIEND}")
+    with caplog.at_level(logging.INFO):
+        r = client.post(f"/api/chat/{CHAT}/chat/stream", json={"question": "q"})
+    assert r.status_code == 200, r.text[:300]
+    assert "d.csv" in captured["dfs"]
+    assert "snap u" not in captured["dfs"]
+    assert "snap u" not in captured["schema_docs"]
+    assert _records(caplog, "SNAPSHOT_ROLE_DROPPED")
+
+
+def test_a_recipient_whose_only_table_is_denied_gets_the_denial_and_no_brain_call(
+        client, shared_snapshot_chat, monkeypatch):
+    import routes.chat as chat_mod
+    meta = shared_snapshot_chat.read_meta()
+    meta["files"] = [f for f in meta["files"] if f.get("source") == "database"]
+    shared_snapshot_chat.write_meta(meta)
+    (shared_snapshot_chat.files_dir / "d.csv").unlink()   # the loader reads the folder
+
+    def must_not_plan(**kw):
+        raise AssertionError("the planner was called for a denied table")
+
+    monkeypatch.setattr(chat_mod.run_chat_local, "run_chat_multi_plot", must_not_plan)
+    client.post(f"/_login/{FRIEND}")
+    r = client.post(f"/api/chat/{CHAT}/chat/stream", json={"question": "q"})
+    assert r.status_code == 200, r.text[:300]
+    assert "no longer have access to snap u" in r.text
+
+
+def test_the_owner_holding_the_role_keeps_the_snapshot_table(
+        client, shared_snapshot_chat, granted, monkeypatch, caplog):
+    captured = {}
+    _capture_multi_plot(monkeypatch, captured)
+    with caplog.at_level(logging.INFO):
+        r = client.post(f"/api/chat/{CHAT}/chat/stream", json={"question": "q"})
+    assert r.status_code == 200, r.text[:300]
+    assert "snap u" in captured["dfs"] and len(captured["dfs"]["snap u"]) == 2
+    assert _records(caplog, "SNAPSHOT_ROLE_DROPPED") == []

@@ -58,6 +58,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -104,6 +105,75 @@ _DUMMY_LOCK = threading.Lock()
 
 def _local_admin_username() -> str:
     return (settings.LOCAL_ADMIN_USERNAME or "").strip().lower()
+
+
+SHARE_DOMAIN_REFUSED_TEXT = ("Sharing is limited to your organisation's addresses; "
+                             "the administrator must invite this user first.")
+SHARE_DOMAINS_UNSET_TEXT = ("Sharing is not configured: the administrator must set "
+                            "SHARE_ALLOWED_DOMAINS (or promote an administrator account).")
+
+
+def _address_domain(address) -> str:
+    text = str(address or "").strip().lower()
+    return text.rsplit("@", 1)[1] if "@" in text else ""
+
+
+def share_allowed_domains() -> frozenset:
+    """The domains a share may reach, read at call time.
+
+    SHARE_ALLOWED_DOMAINS (comma-separated) when set; otherwise the domains of
+    the existing administrator accounts (permission "admin", plus the
+    bootstrap admin when its username is an address), so an install shares
+    within its own organisation without configuration. Never raises; a
+    failure answers the empty set (every share refused)."""
+    try:
+        raw = str(settings.SHARE_ALLOWED_DOMAINS or "")
+        configured = {p.strip().lower().lstrip("@") for p in raw.split(",") if p.strip()}
+        if configured:
+            return frozenset(configured)
+        derived = set()
+        for row in AuthStore().list_users():
+            if str(row.get("role") or "") == "admin":
+                domain = _address_domain(row.get("email"))
+                if domain:
+                    derived.add(domain)
+        admin_domain = _address_domain(_local_admin_username())
+        if admin_domain:
+            derived.add(admin_domain)
+        return frozenset(derived)
+    except Exception as e:
+        log_with_sid("share", "error",
+                     f"SHARE_DOMAINS_FAILED {log_safe_text(type(e).__name__, 80)}")
+        return frozenset()
+
+
+def share_recipient_refusal(recipients) -> Optional[dict]:
+    """None when every recipient's domain may be shared with, else the 400
+    body naming the refusal (the whole request is refused; no account is
+    created and nothing is shared)."""
+    allowed = share_allowed_domains()
+    if not allowed:
+        return {"error": SHARE_DOMAINS_UNSET_TEXT, "code": "RECIPIENT_DOMAIN_NOT_ALLOWED"}
+    outside = [r for r in recipients if _address_domain(r) not in allowed]
+    if outside:
+        log_with_sid("share", "warning", f"SHARE_DOMAIN_REFUSED count={len(outside)}")
+        return {"error": SHARE_DOMAIN_REFUSED_TEXT, "code": "RECIPIENT_DOMAIN_NOT_ALLOWED"}
+    return None
+
+
+def ensure_share_recipient(recipient: str, sharer: str) -> None:
+    """An allowed recipient without an account gets the password-less
+    placeholder (as before). While Microsoft SSO is enabled the placeholder
+    is SSO-only: it cannot be activated through a reset link, only by
+    signing in with Microsoft (which binds it). Never raises."""
+    sso_on = False
+    try:
+        import sso_store
+        sso_on = bool(sso_store.is_enabled())
+    except Exception as e:
+        log_with_sid("share", "warning",
+                     f"SHARE_SSO_CHECK_FAILED {log_safe_text(type(e).__name__, 80)}")
+    AuthStore().ensure_invited_user(recipient, sharer, sso_only=sso_on)
 
 
 def _valid_login_id(value: str) -> bool:
@@ -1024,6 +1094,9 @@ async def share_conversation(request: Request, conv_id: str):
             recipients.append(e)
     if not recipients:
         return JSONResponse({"error": "Provide at least one valid recipient email."}, status_code=400)
+    refusal = share_recipient_refusal(recipients)
+    if refusal:
+        return JSONResponse(refusal, status_code=400)
 
     message_text = (body.get("message") or body.get("comment") or "").strip()
 
@@ -1051,7 +1124,7 @@ async def share_conversation(request: Request, conv_id: str):
     # An address that has never signed in gets a password-less placeholder,
     # so whoever types it first at the sign-in page cannot claim the share.
     for rec in recipients:
-        AuthStore().ensure_invited_user(rec, email)
+        ensure_share_recipient(rec, email)
 
     snapshot_conv_ids: dict[str, str] = {}
     for rec in recipients:

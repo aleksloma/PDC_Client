@@ -33,6 +33,7 @@ from settings import settings
 from tests.conftest import csrf_form
 
 EXPECTED_ROUTES = [
+    ('DELETE', '/api/chat/{chat_id}/share/{recipient}'),
     ('GET', '/'),
     ('GET', '/admin/data_sources'),
     ('GET', '/api/admin/audit'),

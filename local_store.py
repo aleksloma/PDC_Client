@@ -1201,7 +1201,7 @@ class AuthStore:
     def _auth_path(self, email: str) -> Path:
         return _data_root() / "users" / _safe_email(email) / "auth.json"
 
-    def ensure_invited_user(self, email: str, invited_by: str) -> bool:
+    def ensure_invited_user(self, email: str, invited_by: str, *, sso_only: bool = False) -> bool:
         """Create a PASSWORD-LESS placeholder profile for an address that was
         shared something before it ever signed in (`invited_by`/`invited_at`
         recorded). Its first sign-in is then refused like any existing account
@@ -1212,7 +1212,17 @@ class AuthStore:
         Returns True when a placeholder was created; never raises (Article
         IV)."""
         try:
-            return self.create_account(email, invited_by=invited_by or "")
+            created = self.create_account(email, invited_by=invited_by or "")
+            if created and sso_only:
+                # A share placeholder while Microsoft SSO is on: it signs in
+                # through SSO (and is bound there), never through a mailed
+                # password link — `is_sso_only` makes the reset page refuse it.
+                with _LOCK:
+                    auth = self.get_auth(email)
+                    auth["sso_provider"] = "microsoft"
+                    auth["sso_share_placeholder"] = True
+                    self._write_auth(email, auth)
+            return created
         except Exception as e:
             from exec_transport import log_safe_text
             log_with_sid(log_safe_text(invited_by or "share", 254), "warning",
@@ -2436,6 +2446,22 @@ class ChatDataStore:
             self.write_meta(meta)
         return new
 
+    def remove_share_recipient(self, email: str) -> list[str]:
+        """Take one address (case-insensitive) off `sharing.shared_with`.
+        Returns the remaining list; idempotent (an absent address changes
+        nothing)."""
+        target = str(email or "").strip().lower()
+        with _LOCK:
+            meta = self.read_meta()
+            sharing = meta.get("sharing") or {"shared_with": []}
+            current = list(sharing.get("shared_with") or [])
+            remaining = [s for s in current if str(s or "").strip().lower() != target]
+            if len(remaining) != len(current):
+                sharing["shared_with"] = remaining
+                meta["sharing"] = sharing
+                self.write_meta(meta)
+        return remaining
+
     def append_history(self, conv_id: str, message: dict) -> None:
         if not valid_conv_id(conv_id):
             log_with_sid(self.chat_id, "warning",
@@ -3047,6 +3073,149 @@ class DashboardStore:
                          f"DASHBOARD_SHARED dash={dash_id} added={len(new)}")
         return new
 
+    def record_chat_grants(self, owner_email: str, dash_id: str, grants: dict) -> None:
+        """Remember, on the dashboard doc, which source-chat grants a share
+        CREATED: `sharing.chat_grants = {recipient: [chat_id, ...]}` (merged).
+        Only grants that did not exist before the share are recorded, so an
+        unshare never revokes access the recipient had for another reason.
+        Additive key; a doc without it revokes nothing. Never raises."""
+        owner_email = _safe_email(owner_email)
+        try:
+            with _LOCK:
+                doc = self._read_doc(owner_email, dash_id)
+                if doc is None:
+                    return
+                sharing = doc.get("sharing") or {"shared_with": []}
+                recorded = dict(sharing.get("chat_grants") or {})
+                changed = False
+                for rcpt, chat_ids in (grants or {}).items():
+                    key = str(rcpt or "").strip().lower()
+                    have = list(recorded.get(key) or [])
+                    for cid in chat_ids or []:
+                        if cid and cid not in have:
+                            have.append(cid)
+                            changed = True
+                    if have:
+                        recorded[key] = have
+                if changed:
+                    sharing["chat_grants"] = recorded
+                    doc["sharing"] = sharing
+                    self._write_doc(owner_email, doc)
+        except Exception as e:
+            log_with_sid(owner_email, "error",
+                         f"DASH_CHAT_GRANTS_RECORD_FAILED dash={dash_id} error={type(e).__name__}")
+
+    def forget_chat_grants(self, owner_email: str, chat_id: str, recipients) -> None:
+        """A direct share of `chat_id` to `recipients` makes their access
+        deliberate: drop that chat from the grant records of every dashboard
+        of `owner_email`, so no dashboard unshare revokes it later. Called by
+        the chat share route BEFORE it adds the addresses. Never raises."""
+        owner_email = _safe_email(owner_email)
+        targets = {str(r or "").strip().lower() for r in recipients or [] if r}
+        if not chat_id or not targets:
+            return
+        try:
+            with _LOCK:
+                for row in self._read_index(owner_email):
+                    dash_id = row.get("dash_id")
+                    if row.get("shared_by") or not dash_id:
+                        continue
+                    doc = self._read_doc(owner_email, dash_id)
+                    if not doc:
+                        continue
+                    sharing = doc.get("sharing") or {}
+                    grants = dict(sharing.get("chat_grants") or {})
+                    changed = False
+                    for rcpt in targets:
+                        have = list(grants.get(rcpt) or [])
+                        if chat_id in have:
+                            have = [c for c in have if c != chat_id]
+                            changed = True
+                            if have:
+                                grants[rcpt] = have
+                            else:
+                                grants.pop(rcpt, None)
+                    if changed:
+                        sharing["chat_grants"] = grants
+                        doc["sharing"] = sharing
+                        self._write_doc(owner_email, doc)
+        except Exception as e:
+            log_with_sid(owner_email, "error",
+                         f"DASH_CHAT_GRANTS_FORGET_FAILED error={type(e).__name__}")
+
+    def revoke_chat_grants(self, owner_email: str, dash_id: str, recipient: str) -> list[str]:
+        """Revoke the source-chat grants THIS dashboard's share created for
+        `recipient`, and forget them. A grant is kept when another dashboard
+        of the same owner, still shared with the recipient, holds a tile of
+        that chat — and the record then moves to that dashboard, so ITS
+        unshare revokes the grant later. Returns the revoked chat ids; never
+        raises (per-chat failures are logged and skipped)."""
+        owner_email = _safe_email(owner_email)
+        rcpt = str(recipient or "").strip().lower()
+        revoked: list[str] = []
+        try:
+            with _LOCK:
+                doc = self._read_doc(owner_email, dash_id)
+                if doc is None:
+                    return []
+                sharing = doc.get("sharing") or {}
+                grants = dict(sharing.get("chat_grants") or {})
+                candidates = list(grants.pop(rcpt, []) or [])
+                if not candidates:
+                    return []
+                still_needed = set()
+                for row in self._read_index(owner_email):
+                    other_id = row.get("dash_id")
+                    if row.get("shared_by") or not other_id or other_id == dash_id:
+                        continue
+                    other = self._read_doc(owner_email, other_id)
+                    if not other:
+                        continue
+                    other_sharing = other.get("sharing") or {}
+                    shared = [str(s or "").strip().lower()
+                              for s in other_sharing.get("shared_with") or []]
+                    if rcpt not in shared:
+                        continue
+                    needed = {t.get("chat_id") for t in other.get("tiles") or []}
+                    kept = [c for c in candidates if c in needed and c not in still_needed]
+                    if kept:
+                        # Hand the record over: the grant now lives for THAT
+                        # dashboard, and its own unshare revokes it later.
+                        other_grants = dict(other_sharing.get("chat_grants") or {})
+                        have = list(other_grants.get(rcpt) or [])
+                        have.extend(c for c in kept if c not in have)
+                        other_grants[rcpt] = have
+                        other_sharing["chat_grants"] = other_grants
+                        other["sharing"] = other_sharing
+                        self._write_doc(owner_email, other)
+                        still_needed.update(kept)
+                sharing["chat_grants"] = grants
+                doc["sharing"] = sharing
+                self._write_doc(owner_email, doc)
+        except Exception as e:
+            log_with_sid(owner_email, "error",
+                         f"DASH_CHAT_GRANTS_REVOKE_FAILED dash={dash_id} error={type(e).__name__}")
+            return []
+        # Under the same (reentrant) lock as a direct chat share, which
+        # forgets the record before it adds the address: a grant the owner
+        # re-shares on purpose can never be revoked between the two.
+        with _LOCK:
+            for cid in candidates:
+                if cid in still_needed:
+                    continue
+                try:
+                    ChatDataStore(cid).remove_share_recipient(rcpt)
+                    AuthStore().deactivate_chat(rcpt, cid)
+                    revoked.append(cid)
+                except Exception as e:
+                    log_with_sid(owner_email, "warning",
+                                 f"DASH_UNSHARE_CHAT_REVOKE_FAILED dash={dash_id} "
+                                 f"error={type(e).__name__}")
+        if revoked:
+            log_with_sid(owner_email, "info",
+                         f"DASHBOARD_CHAT_GRANTS_REVOKED dash={dash_id} count={len(revoked)}")
+        return revoked
+
     def remove_dashboard_share(self, owner_email: str, dash_id: str,
                                recipient: str) -> list[str] | None:
         """Take one address off the doc's shared_with and drop that
@@ -3054,11 +3223,11 @@ class DashboardStore:
         None when the owner has no such dashboard. Idempotent: an address
         that is not in the list changes nothing and returns the list as is.
 
-        The source chats that `share` granted alongside the dashboard are NOT
-        touched: that grant is the chat's own sharing, which other shares may
-        rely on. A recipient who still holds the URL resolves nothing
-        (`resolve_dashboard` checks shared_with), so the page sends them to
-        /lab and the API answers 404."""
+        The source-chat grants the share created are revoked separately, by
+        `revoke_chat_grants` (the route calls it first). A recipient who still
+        holds the URL resolves nothing (`resolve_dashboard` checks
+        shared_with), so the page sends them to /lab and the API answers
+        404."""
         owner_email = _safe_email(owner_email)
         rcpt = _safe_email(recipient or "")
         removed = False

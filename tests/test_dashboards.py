@@ -748,7 +748,9 @@ def test_unshare_needs_one_valid_address(client, monkeypatch, body):
     assert client.get(f"/api/dashboards/{dash}").json()["sharing"]["shared_with"] == [FRIEND, EVE]
 
 
-def test_unshare_leaves_the_source_chat_grant_alone(client, monkeypatch, tmp_path):
+def test_unshare_revokes_the_source_chat_grant_the_share_created(client, monkeypatch, tmp_path):
+    """Since the sharing revision the unshare also ends the chat grant the
+    dashboard share made (it used to leave it in place)."""
     _stub_chat(monkeypatch)
     _stub_share_email(monkeypatch)
     client.post(f"/_login/{OWNER}")
@@ -756,9 +758,11 @@ def test_unshare_leaves_the_source_chat_grant_alone(client, monkeypatch, tmp_pat
     dash = _mk_dash(client)
     _pin_chart(client, dash, chat_id="chat42")
     _share(client, dash)
-    assert _unshare(client, dash, FRIEND).json()["shared_with"] == []
     meta = json.loads((tmp_path / "chatdata" / "chat42" / "meta.json").read_text("utf-8"))
     assert FRIEND in meta["sharing"]["shared_with"]
+    assert _unshare(client, dash, FRIEND).json()["shared_with"] == []
+    meta = json.loads((tmp_path / "chatdata" / "chat42" / "meta.json").read_text("utf-8"))
+    assert FRIEND not in meta["sharing"]["shared_with"]
 
 
 # ---------------------------------------------------------------------------
