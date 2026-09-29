@@ -171,6 +171,8 @@ parse falls back to the default instead of stopping the boot):
 | `AUTH_FAIL_THRESHOLD_IP` | Failed attempts per client address before spacing starts (default `20`). The client-address key is spaced, never locked. |
 | `AUTH_FAIL_WINDOW_S` | The counting window in seconds (default `900`). |
 | `AUTH_LOCKOUT_S` | Lockout length in seconds for an address (default `900`). The local admin account is never locked, only spaced (`AUTH_ADMIN_SPACED`). |
+| `SSO_ALLOW_GUESTS` | Microsoft SSO: `true` admits a guest of the Entra tenant (`#EXT#` in `upn` or `preferred_username`), identified by `preferred_username` only (default `false` ⇒ refused, `SSO_GUEST_REFUSED`). See [`SSO_MICROSOFT.md`](SSO_MICROSOFT.md). |
+| `SSO_AUTO_PROVISION` | Microsoft SSO: `true` creates and binds an account for an Entra identity that has none (`SSO_ACCOUNT_PROVISIONED`); default `false` ⇒ refused, nothing created (`SSO_UNKNOWN_ACCOUNT`). Set it only with "Assignment required? = Yes" on the Entra enterprise application. |
 | `SHARE_ALLOWED_DOMAINS` | Recipient domains a chat, conversation or dashboard share may reach (comma-separated, case-insensitive, a leading `@` tolerated; default empty). Empty ⇒ the domains of the administrator accounts, derived at call time (`routes.auth.share_allowed_domains`); none at all ⇒ every share is refused. An out-of-domain recipient refuses the whole share with `400 RECIPIENT_DOMAIN_NOT_ALLOWED` and creates no account. |
 
 ---

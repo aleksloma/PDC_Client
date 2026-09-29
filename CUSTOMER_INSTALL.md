@@ -55,6 +55,12 @@ Read these before you upgrade an existing install to this release.
   the recipient had before the dashboard share, or got from a direct share of
   the chat, is kept. Dashboards shared before the upgrade carry no such record
   and their unshare revokes no chat access.
+- Microsoft sign-in no longer creates accounts or admits guests: an identity
+  without an account, and a guest of your tenant, is refused unless
+  SSO_AUTO_PROVISION / SSO_ALLOW_GUESTS is set; each account is bound to its
+  Entra identity at its next Microsoft sign-in. If you use single sign-on,
+  make sure "Assignment required?" is Yes on the Entra enterprise application
+  (see "Single sign-on with Microsoft Entra ID" in §2).
 
 ## 1. Get the images
 
@@ -307,7 +313,7 @@ snapshot and live query) is made read-only where the database allows it:
 ### Users and sign-in
 
 Nobody can create an account by typing an address at the sign-in page.
-Accounts come to exist in three ways:
+Accounts come to exist in two ways, plus a third you can switch on:
 
 - **Invitation.** On the admin panel's **Users** page, `ladmin` enters an
   address and clicks **Invite user**. The account is created without a
@@ -318,9 +324,10 @@ Accounts come to exist in three ways:
   address in an allowed domain creates the same password-less account. The
   colleague sets a password through **Reset password** (or, while single
   sign-on is enabled, signs in with Microsoft — see "Sharing" below).
-- **Single sign-on.** When Microsoft Entra ID sign-in is enabled, the first
-  Microsoft sign-in creates the account (who may sign in is decided in
-  Entra).
+- **Single sign-on.** A Microsoft sign-in does NOT create an account: an
+  identity with no account here is refused. Only with
+  `SSO_AUTO_PROVISION=true` in `client.env` does the first Microsoft sign-in
+  create one (see "Single sign-on with Microsoft Entra ID" below).
 
 **Ending sessions and removing users.** Each row of the **Users** page has
 two more actions, both confirmed in a dialog first. **End sessions** signs
@@ -336,7 +343,7 @@ registered stay registered and keep working for everyone who has access, but
 from then on count as registered by an administrator: only an administrator
 can delete them. Who confirmed the descriptions and the audit log keep the
 removed address. If the address is later used again — invited, shared with,
-or signing in with Microsoft — it becomes a new account that inherits none of
+or signing in with Microsoft under `SSO_AUTO_PROVISION` — it becomes a new account that inherits none of
 this (the removal answer lists what was deleted and unshared; if a count is
 lower than you expected, check the log before reusing the address), and no
 session of the removed account works for it. A sign-in or password change
@@ -344,7 +351,7 @@ the removed user still had under way at that moment is refused too and cannot
 bring the account back. (One exception: a dashboard change still under way
 can leave that dashboard's folder behind, which an account created later at
 the same address would find — remove such a folder by hand before reusing
-the address if it matters.) A
+the address if it matters.) With `SSO_AUTO_PROVISION=true`, a
 Microsoft user who is still assigned in Entra gets such an account simply by
 signing in again, so unassign them in Entra as well. Neither action can
 target the `ladmin` account, and you cannot remove your own.
@@ -507,6 +514,36 @@ After install, the `ladmin` account can connect your Microsoft Entra ID
 (Azure AD) tenant from the admin panel's **Single sign-on** page so employees
 sign in with their Microsoft 365 identity — see
 [`docs/SSO_MICROSOFT.md`](docs/SSO_MICROSOFT.md).
+
+**Mandatory Entra step.** In the Entra admin center, open the *Enterprise
+application* for PowerDataChat → **Properties**, set **Assignment
+required?** to **Yes**, and under **Users and groups** assign only the users
+or groups who may use PowerDataChat. Without it, any member of your tenant
+whose address matches an account here that has not yet signed in with
+Microsoft (an invited colleague, a share recipient, a password account) can
+sign in to it — and with `SSO_AUTO_PROVISION=true`, any member at all gets an
+account.
+
+**Who gets in.** Each account is bound to its Entra identity (tenant id +
+object id) at its first Microsoft sign-in; afterwards the same person reaches
+the same account even if their username changes, and a different Entra
+identity using that address is refused. Two optional settings in
+`client.env` (both default `false`; restart the web container after changing
+them):
+
+- `SSO_ALLOW_GUESTS=true` admits guests (B2B, `#EXT#`) of your tenant, who
+  are refused otherwise.
+- `SSO_AUTO_PROVISION=true` creates an account for a Microsoft identity that
+  has none, which is refused otherwise. Set it only together with
+  "Assignment required? = Yes".
+
+If a user is deleted and re-created in Entra, or the wrong person was bound
+to an account, that user's Microsoft sign-in is refused until you re-bind
+the account: remove the `sso_tid` and `sso_oid` keys from
+`users/<email>/auth.json` on the data volume and restart the web container
+(or remove the account on the **Users** page and invite it again, which
+deletes its chats). See [`docs/SSO_MICROSOFT.md`](docs/SSO_MICROSOFT.md) for
+the log lines of each refusal.
 
 ## 3. Run
 
@@ -698,12 +735,15 @@ logs pdc-executor` before restarting anything if you need the job timings.
 
 ### Restrict what the containers can reach (recommended)
 
-The web application needs outbound HTTPS to your `BRAIN_URL` and, if you
-register database tables, TCP to those database hosts. Nothing else. On a
+The web application needs outbound HTTPS to your `BRAIN_URL`, HTTPS to
+`login.microsoftonline.com` if you enable Microsoft single sign-on, and, if
+you register database tables, TCP to those database hosts. Nothing else. On a
 security-sensitive network apply a default-deny egress rule on the host or
 firewall and allow only:
 
 - `BRAIN_URL` on port 443,
+- `login.microsoftonline.com` on port 443, only if you enable Microsoft
+  single sign-on,
 - each registered database host on its configured port,
 - your internal DNS and NTP servers.
 

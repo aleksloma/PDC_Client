@@ -141,7 +141,9 @@ Passwords never leave this container — only a HASH is stored, at
 `password_utils.py` (stdlib PBKDF2-HMAC-SHA256, werkzeug-compatible
 format). Sign-in is by INVITATION: an account exists only after an
 administrator's invite (`POST /api/admin/users/invite`), a share (password-less
-placeholder) or a Microsoft SSO sign-in. An account without a password —
+placeholder) or — only with `SSO_AUTO_PROVISION=true` — a Microsoft SSO
+sign-in (otherwise a Microsoft identity without an account is refused). An
+account without a password —
 invited, shared with, or a LEGACY user from the old email-only build — sets
 one through the mailed reset link, which proves mailbox ownership.
 `ALLOW_SELF_REGISTRATION=true` (public demo only) restores the old rule that a
@@ -175,7 +177,7 @@ keeps working until it is changed.
 Sessions: sign-in stamps the session with `iat` (sign-in time) and `gen` (the
 account's `session_generation` from `auth.json`). Every account gets its
 generation the moment it is created (`AuthStore.create_account`, behind
-every creation path: invitation, share placeholder, first Microsoft sign-in,
+every creation path: invitation, share placeholder, an auto-provisioned Microsoft sign-in,
 the demo's self-registration, the bootstrap admin); an account that already
 existed without one — created by an earlier release — answers `""` until its
 first password write or End sessions (the upgrade rule). Every password write gives
@@ -275,18 +277,22 @@ enforcement to such an account in advance.
 
 OIDC authorization-code login against the customer's own Entra tenant,
 driven entirely by `DATA_ROOT/sso_config.json` (managed from the ladmin
-"Single sign-on" panel — no env vars, no restart; the client secret is
+"Single sign-on" panel — no restart; the client secret is
 Fernet-encrypted with the SAME `CLIENT_ENCRYPTION_KEY` the DB credentials
-use). Authlib does discovery/JWKS/ID-token validation and keeps state+nonce
-in the cookie session; PDC never sees a password and reads ONLY the email
-(`preferred_username`, fallback `email` claim) from the ID token. Logout
+use). Two env settings decide who is admitted: `SSO_ALLOW_GUESTS` and
+`SSO_AUTO_PROVISION` (both default false, read at start). Authlib does
+discovery/JWKS/ID-token validation and keeps state+nonce in the cookie
+session; PDC never sees a password and reads from the ID token only the
+address (`preferred_username`, fallback `email` claim for a member — never
+for a guest), `tid` + `oid` (the identity an account is bound to, `auth.json`
+`sso_tid`/`sso_oid`) and `upn` (guest detection). Logout
 stays local-only by design (no Microsoft front-channel logout). Customer
 guide: [`docs/SSO_MICROSOFT.md`](SSO_MICROSOFT.md).
 
 | Method | Path | Behavior |
 |---|---|---|
 | `GET` | `/auth/microsoft` | starts the flow: 302 to `login.microsoftonline.com` with state+nonce in the session. **404 while SSO is not enabled** (unconfigured installs look pre-SSO). Enabled but secret unreadable (encryption key rotated away) → landing with the generic failure message (503). |
-| `GET` | `/auth/microsoft/callback` | exchanges the code, validates the ID token (authlib — signature/issuer/audience/nonce), lower-cases the email claim, creates the account when the address has none (`ensure_user` → `AuthStore.create_account`: profile plus an `auth.json` holding a fresh session generation; an existing account keeps its records, an auth-only folder only gaining its missing profile — access control is Entra's "Assignment required", no client-side allow-list), stamps `sso_provider`/`sso_last_login` on auth.json (`mark_sso_login` — merge-only, password hashes untouched), starts the session via the SAME `_start_session` as password login but with `remember=False` (browser-session cookie — Entra re-auth is silent) and never `must_change`, logs `USER_LOGIN_SSO`, posts the normal `login` activity event, 302 → `/lab`. Any failure (state mismatch, token error, missing email claim, the account removed by an administrator while the sign-in was under way — no session is started) → landing with "Microsoft sign-in failed…" (401/400), token contents never logged. 404 while disabled. |
+| `GET` | `/auth/microsoft/callback` | exchanges the code, validates the ID token (authlib — signature/issuer/audience/nonce), takes the address from `preferred_username` (falling back to `email` for a member; a GUEST — `#EXT#` in `upn` or `preferred_username`, `_is_guest` — from `preferred_username` only), lower-cased. Refusals, each the landing with "Microsoft sign-in failed…" and no session: no usable address → 400 (`SSO_CALLBACK_NO_EMAIL`); the bootstrap `ladmin` → 403 (`SSO_BOOTSTRAP_ADMIN_REFUSED`, checked on the claimed address and again on the resolved account); `tid`/`oid` not both GUIDs → 401 (`SSO_CLAIMS_MISSING`); a guest while `SSO_ALLOW_GUESTS` is false → 403 (`SSO_GUEST_REFUSED`). IDENTITY BINDING (`auth.json` `sso_tid`/`sso_oid`, additive): `AuthStore.find_sso_account(tid, oid)` first — a bound account is signed in whatever address the token now carries (`SSO_USERNAME_CHANGED` when it differs); else an EXISTING account at the address (invited, share placeholder incl. the SSO-only one, pre-binding account) is bound once through `bind_sso_identity` — an account already bound to ANOTHER identity → 403 (`SSO_BIND_CONFLICT`), an unreadable `auth.json` → 403 (`SSO_BIND_REFUSED_UNREADABLE`); else, with `SSO_AUTO_PROVISION` true, the account is created (`ensure_user` → `create_account`) and bound (`SSO_ACCOUNT_PROVISIONED`); else 401 (`SSO_UNKNOWN_ACCOUNT`) and NOTHING is created. Who may sign in at all is Entra's "Assignment required? = Yes" (mandatory, `docs/SSO_MICROSOFT.md`). Then stamps `sso_provider`/`sso_last_login` on auth.json (`mark_sso_login` — merge-only, password hashes untouched), starts the session via the SAME `_start_session` as password login but with `remember=False` (browser-session cookie — Entra re-auth is silent) and never `must_change`, logs `USER_LOGIN_SSO`, posts the normal `login` activity event, 302 → `/lab`. Other failures (state mismatch, token error → 401 `SSO_CALLBACK_FAILED`; the account removed by an administrator while the sign-in was under way → 401) start no session; token contents never logged. 404 while disabled. |
 
 ---
 

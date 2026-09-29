@@ -1307,18 +1307,29 @@ access) / `scope_covers`, all fail-closed.
 
 The identity provider is the **customer's own Entra tenant**. The client
 speaks standard OIDC (authorization-code flow via authlib in
-`routes/sso.py`): PDC never sees a password, and the ONLY claim it reads
-from the validated ID token is the user's email (`preferred_username`,
-fallback `email`), which becomes the same local identity an invited password
-account has (`ensure_user` → `AuthStore.create_account` on the first
-Microsoft sign-in — profile plus a fresh session generation; who may sign in at all is
-decided in Entra via "Assignment required" — there is no client-side
-allow-list). SSO is therefore one of the three ways an account comes to
-exist; the others are an administrator's invitation and a share, since a
-password sign-in never creates an account. Nothing about SSO crosses to the brain except the normal
-`login` activity event that password logins already post.
+`routes/sso.py`): PDC never sees a password. From the validated ID token it
+reads the address (`preferred_username`, fallback `email` for a member of
+the tenant; a guest — `#EXT#` in `upn` or `preferred_username` — is
+addressed by `preferred_username` only), and the tenant id + object id
+(`tid`, `oid`, both required GUIDs). An account is BOUND to that tid+oid at
+its first Microsoft sign-in (`auth.json` `sso_tid`/`sso_oid`,
+`AuthStore.bind_sso_identity`); afterwards the identity reaches the same
+account whatever username it presents (`find_sso_account`), and a different
+identity presenting a bound address is refused (403). Invited users, share
+placeholders and accounts from before binding are bound at their next
+Microsoft sign-in. A Microsoft sign-in does NOT create an account: an
+identity matching none is refused (401) unless `SSO_AUTO_PROVISION` is set,
+and a guest is refused (403) unless `SSO_ALLOW_GUESTS` is set (both env
+settings, default false). SSO is therefore a way an account comes to exist
+only under `SSO_AUTO_PROVISION`; otherwise accounts come from an
+administrator's invitation or a share, since a password sign-in never
+creates one either. Who may complete a Microsoft sign-in at all is decided
+in Entra — "Assignment required? = Yes" on the enterprise application is a
+mandatory install step; the client holds no allow-list. Nothing about SSO
+crosses to the brain except the normal `login` activity event that password
+logins already post.
 
-Configuration is DATA, not env: `DATA_ROOT/sso_config.json`
+The connection configuration is DATA, not env: `DATA_ROOT/sso_config.json`
 (`sso_store.py`), managed entirely from the ladmin "Single sign-on" panel —
 the client secret is Fernet-encrypted at rest with the SAME
 `CLIENT_ENCRYPTION_KEY` as DB credentials (no key ⇒ refuse to save, never

@@ -7,14 +7,19 @@ and land in the workspace already signed in with their Windows / Microsoft
 365 identity — the browser's existing Microsoft session handles the silent
 part.
 
-Everything is configured from the local-admin web UI. **No `.env` editing,
-no code changes, no container restart.**
+The connection is configured from the local-admin web UI — no code
+changes, no container restart. Two optional settings in `client.env`
+(`SSO_ALLOW_GUESTS`, `SSO_AUTO_PROVISION`, see "Who can sign in with
+Microsoft" below) widen who is admitted; they are read at start, so changing
+them needs a restart of the web container.
 
-What stays local: PowerDataChat never sees a password. The only thing read
-from the ID token is the user's email (`preferred_username`, falling back
-to the `email` claim). Nothing about SSO is sent to the PowerDataChat
-brain except the same anonymous "login" activity event a password login
-already emits.
+What stays local: PowerDataChat never sees a password. From the ID token it
+reads the user's address (`preferred_username`, falling back to the `email`
+claim for a member of your tenant, never for a guest), the Entra tenant id
+and object id (`tid`, `oid`) that bind the account to one Entra identity,
+and `upn` to recognise a guest. Nothing about SSO is sent to the
+PowerDataChat brain except the same anonymous "login" activity event a
+password login already emits.
 
 ---
 
@@ -64,12 +69,17 @@ In the [Microsoft Entra admin center](https://entra.microsoft.com):
    > otherwise sign-in stops with `AADSTS7000222`.
 5. Copy the **Directory (tenant) ID** and **Application (client) ID** from
    the registration's Overview page.
-6. **Restrict who can sign in** (recommended): open the matching
-   *Enterprise application* → Properties → set **Assignment required** to
-   Yes, then assign the users or groups that may use PowerDataChat.
-   PowerDataChat itself auto-provisions a local profile for every identity
-   Entra lets through — access control is done in Entra, not in
-   PowerDataChat.
+6. **Require assignment — mandatory.** Open the matching *Enterprise
+   application* (Enterprise applications → the app's name) → **Properties**
+   → set **Assignment required?** to **Yes** and save; then, under **Users
+   and groups**, assign only the users or groups who may use PowerDataChat.
+   Without it every member of your tenant can complete a Microsoft sign-in
+   to PowerDataChat: any member whose address matches an existing account
+   that has not yet signed in with Microsoft (an invited colleague, a share
+   recipient, a password account) can sign in to that account, and with
+   `SSO_AUTO_PROVISION=true` any member at all gets an account.
+   PowerDataChat checks that an account exists for the identity; who is
+   allowed to use the application is decided in Entra.
 
 ## Step 2 — Connect from the ladmin panel
 
@@ -115,6 +125,62 @@ in with Microsoft cannot use it, whether or not it holds a local password
 plain password form instantly and gives every account that holds a local
 password its password back.
 
+## Who can sign in with Microsoft
+
+A Microsoft sign-in reaches an account only when every check below passes.
+A refusal shows the same "Microsoft sign-in failed" page; the log line
+(`/data/client/logs/datachat.log`) says which check refused it.
+
+- **The token must carry the Entra identity.** A token without a GUID
+  tenant id (`tid`) and object id (`oid`) is refused (`SSO_CLAIMS_MISSING`,
+  HTTP 401).
+- **Guests are refused by default.** A B2B guest of your tenant (`#EXT#` in
+  its `upn` or `preferred_username`) is refused (`SSO_GUEST_REFUSED`, 403)
+  unless `SSO_ALLOW_GUESTS=true`. When guests are allowed, a guest is
+  identified by `preferred_username` only, never by the `email` claim, which
+  comes from the guest's home directory and is not verified by your tenant.
+- **Each account is bound to one Entra identity.** At its first Microsoft
+  sign-in the account is bound to the tenant id + object id it signed in
+  with (`sso_tid` / `sso_oid` in `users/<email>/auth.json`,
+  `SSO_IDENTITY_BOUND`). From then on:
+  - the same identity reaches the same account even after its username
+    changes in Entra (`SSO_USERNAME_CHANGED`) — the account keeps its
+    original address;
+  - a different Entra identity presenting an address that is already bound
+    is refused (`SSO_BIND_CONFLICT`, 403).
+- **Existing accounts are bound once.** Invited users, share placeholders
+  (including the Microsoft-only placeholder a share creates while SSO is
+  on) and accounts created before this binding existed are bound at their
+  next Microsoft sign-in. A binding is refused when the account's
+  `auth.json` cannot be read (`SSO_BIND_REFUSED_UNREADABLE`, 403), so a
+  damaged record is never overwritten.
+- **An identity without an account is refused.** Nothing is created
+  (`SSO_UNKNOWN_ACCOUNT`, 401): add the person with **Invite user** on the
+  admin panel's **Users** page, or share with them. With
+  `SSO_AUTO_PROVISION=true` the account is created and bound instead
+  (`SSO_ACCOUNT_PROVISIONED`). Before this release every successful
+  Microsoft sign-in created an account.
+- The `ladmin` account never signs in with Microsoft
+  (`SSO_BOOTSTRAP_ADMIN_REFUSED`, 403).
+
+| Setting (`client.env`) | Default | Effect |
+|---|---|---|
+| `SSO_ALLOW_GUESTS` | `false` | `true` lets guests of your tenant sign in (subject to the other checks). |
+| `SSO_AUTO_PROVISION` | `false` | `true` creates an account for any identity Entra lets through that has none. Use it only with **Assignment required? = Yes** (Step 1.6). |
+
+**Removing a user** (admin panel → **Users** → **Remove**) also removes the
+account's binding. Invited again, the address is bound afresh at its next
+Microsoft sign-in.
+
+**Re-binding an account.** If a user is deleted and re-created in Entra (a
+new object id), or the wrong person was bound to an account, the next
+sign-in is refused with `SSO_BIND_CONFLICT`. To fix it, an operator removes
+the `sso_tid` and `sso_oid` keys from that user's `users/<email>/auth.json`
+on the data volume and restarts the web container (the identity lookup is
+cached per process); the next Microsoft sign-in binds the account again.
+Alternatively the admin removes the account and invites it again — that
+deletes the user's chats and dashboards.
+
 ## Behavior details
 
 - **Sessions**: an SSO sign-in uses a browser-session cookie — the session
@@ -124,10 +190,10 @@ password its password back.
   session but not the Microsoft browser session — PowerDataChat performs no
   Microsoft front-channel logout. On a shared machine, users should also
   sign out of Microsoft 365 or use a private window.
-- **First SSO login auto-provisions** the local profile — the one way an
-  account comes to exist without an invitation or a share, since a password
-  sign-in never creates one. An existing password account with the same
-  email becomes a Microsoft account at its first Microsoft sign-in (below).
+- **A Microsoft sign-in does not create an account** unless
+  `SSO_AUTO_PROVISION=true` (above); accounts come from an invitation or a
+  share. An existing password account with the same email becomes a
+  Microsoft account at its first Microsoft sign-in (below).
 - **No local password for Microsoft accounts.** An account that has signed in
   with Microsoft and holds no local password cannot obtain one: "Reset
   password" mails it nothing, and a password change or an invitation for it
@@ -163,10 +229,11 @@ password its password back.
   runs out. To end it at once, use **End sessions** on that user's row of the
   admin panel's **Users** page; **Remove** deletes the account and everything it
   owns and takes the address off everything shared with it and off the
-  tables it registered. A user still assigned in Entra gets a new, empty
-  account at the next Microsoft sign-in — none of the old chats, shares,
-  roles or registrations, and no old session works for it — so unassign
-  them in Entra as well.
+  tables it registered. The removed user's next Microsoft sign-in is refused
+  as an unknown account — unless `SSO_AUTO_PROVISION=true`, in which case a
+  user still assigned in Entra gets a new, empty account (none of the old
+  chats, shares, roles or registrations, and no old session works for it);
+  unassign them in Entra as well.
 - **Recovering a stranded account.** If SSO is switched off, an account that
   has signed in with Microsoft and has no local password cannot sign in at
   all; while SSO stays on, the same is true of any Microsoft user who leaves
@@ -187,8 +254,8 @@ password its password back.
 | `AADSTS90002` on Test | Tenant not found — wrong Tenant ID. |
 | `AADSTS7000215` on Test | Invalid client secret — you likely pasted the secret's *ID* instead of its *Value*, or the secret expired. Create a new one and rotate it here. |
 | `AADSTS500011` / `AADSTS65001` on Test (yellow) | Tenant policy blocks the app-only test token. Credentials are fine; Enable still works — try a real browser sign-in. |
-| "Microsoft sign-in failed" after the Microsoft page | Check the container log (`/data/client/logs/datachat.log`, events `SSO_CALLBACK_FAILED` / `SSO_CALLBACK_NO_EMAIL`). A guest account without a usable `preferred_username`/`email` claim cannot sign in. |
+| "Microsoft sign-in failed" after the Microsoft page | Check the container log (`/data/client/logs/datachat.log`). `SSO_CALLBACK_FAILED`: the token exchange or validation failed. `SSO_CALLBACK_NO_EMAIL`: the token carried no usable address (a guest needs a `preferred_username`). `SSO_CLAIMS_MISSING`: no `tid`/`oid` in the token. `SSO_GUEST_REFUSED`: a guest, and `SSO_ALLOW_GUESTS` is off. `SSO_UNKNOWN_ACCOUNT`: no account for this identity — invite the user (or set `SSO_AUTO_PROVISION`). `SSO_BIND_CONFLICT`: the address is bound to another Entra identity — see "Re-binding an account". `SSO_BIND_REFUSED_UNREADABLE`: the account's `auth.json` is damaged. `SSO_BOOTSTRAP_ADMIN_REFUSED`: the `ladmin` account, which signs in with its password only. |
 | Token validation errors mentioning `iat`/`exp`/`nbf` | Clock skew — the container's clock must be NTP-accurate (JWT validation allows only small leeway). |
 | Sign-in fails right after an image upgrade, at the return from Microsoft | The library that verifies the identity token changed with the dependency set, so an upgrade is the moment to re-test SSO. Grep `SSO_CALLBACK_FAILED` in `/data/client/logs/datachat.log` for the reason; `/?local=1` (above) keeps the password form reachable meanwhile. Report the log line rather than re-entering the credentials — a validation failure is not a configuration problem. |
-| Everyone in the tenant can sign in | Enable **Assignment required** on the enterprise application (Step 1.6). |
+| Members of the tenant who should not use PowerDataChat can sign in | Set **Assignment required? = Yes** on the enterprise application and assign only the intended users or groups (Step 1.6, mandatory). |
 | SSO stopped working after a key rotation | Rotating `CLIENT_ENCRYPTION_KEY` without `CLIENT_ENCRYPTION_KEY_OLD` makes the stored secret unreadable — the ladmin page shows "re-enter it"; paste the secret again. |

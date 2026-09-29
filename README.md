@@ -159,6 +159,8 @@ To run the stack you need:
 | `DATA_ROOT` | Local-disk root for raw data + chats. Mount a volume. |
 | `SCHEMA_VALUE_DENY_COLUMNS` | Optional. Comma-separated column names (case-insensitive) whose values never reach the brain: those columns send name, dtype and counts only. Empty by default. |
 | `SHARE_ALLOWED_DOMAINS` | Optional. Comma-separated recipient domains a chat, conversation or dashboard may be shared with. Empty by default: the domains of the administrator accounts are used. |
+| `SSO_ALLOW_GUESTS` | Optional, default `false`. `true` lets guests (`#EXT#`) of your Entra tenant sign in with Microsoft. See [`docs/SSO_MICROSOFT.md`](docs/SSO_MICROSOFT.md). |
+| `SSO_AUTO_PROVISION` | Optional, default `false`. `true` creates an account at the Microsoft sign-in of an identity that has none; otherwise such a sign-in is refused. Requires "Assignment required? = Yes" on the Entra enterprise application. |
 
 The `EXECUTOR_*` topology values are set by the compose file, not by the env
 file. `EXECUTOR_NETWORK_CIDR` is mandatory while `EXECUTOR_URL` is set: the
