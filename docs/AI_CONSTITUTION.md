@@ -536,8 +536,8 @@ rule bounds who writes the bytes, not what they contain.
    on disk and survives restarts and image upgrades. Both were verified by
    running two separate jobs and reading the first one's file back from the
    second. The sweeps on both sides remove aged entries of the jobs root
-   that are not job directories, so a stash there lasts about an hour rather
-   than forever; nothing bounds the scratch directory at all.
+   that are not job directories, so a stash there lasts about five minutes
+   rather than forever; nothing bounds the scratch directory at all.
 
    Be exact about what that bound rests on, because the obvious reasoning is
    wrong and was MEASURED to be wrong. The web sweep deliberately skips what
@@ -637,7 +637,7 @@ the container's limits, can read anything the image itself contains, and can
 write into `/tmp`, into its own job directory AND into the jobs volume's
 root — the last two both shared, as property 5 records, so they are channels
 between consecutive jobs rather than private space, the volume one bounded
-to about an hour by the sweeps and the scratch directory not bounded at all.
+to about five minutes by the sweeps and the scratch directory not bounded at all.
 A job can also RENAME an entry in that root, which is why the sandbox sweep
 cannot use ownership to decide what to remove. What it cannot do is
 reach the customer's network, its data at rest, or its credentials:

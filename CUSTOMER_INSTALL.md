@@ -466,8 +466,9 @@ Two things follow that are worth knowing before you plan backups. The
 directory has to be writable by the sandbox, because the sandbox deletes its
 own finished jobs — so analysis code can also write straight into it, and a
 file it leaves there is visible to the next question and to the web container
-until a sweep removes it (both sides sweep strays on the same hourly schedule
-as abandoned job directories). And this volume is on disk, not in memory, so
+until a sweep removes it (both sides sweep strays on the same schedule as
+abandoned job directories: anything older than five minutes, checked every
+minute). And this volume is on disk, not in memory, so
 unlike the container's scratch space a restart does not clear it. Treat it as
 shared working space for questions in flight: **do not** include it in a
 backup you intend to restore elsewhere, because it can contain fragments of
@@ -476,7 +477,7 @@ it.
 
 The volume can also hold one question's input tables for a while after the
 question ends — for example a job directory the sandbox locked, which its own
-sweep removes within about an hour. So exclude `pdc_client_exec_jobs` from host
+sweep removes within about five minutes. So exclude `pdc_client_exec_jobs` from host
 backups, and remove it with `docker volume rm pdc_client_exec_jobs` (stack
 stopped) after a failed upgrade or when decommissioning the install; it is
 recreated empty on the next start (check the ownership note below).

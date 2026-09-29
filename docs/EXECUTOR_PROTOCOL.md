@@ -102,7 +102,13 @@ result write fail. The setgid bit keeps the group on everything created
 inside. Both executor processes run with `umask 007`.
 
 Group write on `in/` is deliberate: it is what lets the executor remove an
-abandoned job directory during the orphan sweep.
+abandoned job directory during the orphan sweep. It also means the job
+directory is NOT private to the web service: the sandbox uid can write into
+it and, with no sticky bit, replace any entry in `in/`. So the web service
+never reads anything back from a job directory it wrote. The pickle fallback
+(`<n>.pkl`, for the few frames a parquet round trip cannot reproduce) is
+serialised and verified in memory and only then written. Only the runner,
+inside the sandbox, unpickles an input.
 
 A freshly created named volume first mounted by the executor image inherits
 `root:<shared-gid> 2770` from the image, so both identities can create job
@@ -270,8 +276,10 @@ reaches the Brain's retry prompt.
 Every reference is opened through a directory-handle chain that refuses to
 follow symlinks at any component and requires a regular file, so a symlinked
 `out/` cannot redirect a read into the customer-data mount and a planted FIFO
-cannot block a web worker forever. Pickles are never read in this direction —
-only into the executor, where both writer and reader are this codebase.
+cannot block a web worker forever. The web service never unpickles anything:
+a `.pkl` result reference is refused even when the file exists, and the input
+pickle it writes is verified in memory before the write, never read back from
+the job directory (§3). Only the runner unpickles, and only inputs.
 
 Result parquet is accepted only when **every column chunk is uncompressed**,
 then under row, column, file-size and decoded-byte caps, read in batches that
@@ -315,8 +323,8 @@ group-writable — necessarily, since this service deletes its own finished job
 directories — so a job can write straight into it, and that volume is
 disk-backed, visible from the web container, and survives restarts and image
 upgrades. Both sweeps remove aged entries of the jobs root that are not job
-directories, which bounds a stash there to roughly an hour; `/tmp` has no
-such bound.
+directories, which bounds a stash there to roughly five minutes; `/tmp` has
+no such bound.
 
 The two sides decide differently, and the asymmetry is the point. The web
 service removes only what it did NOT write, because everything under its own
@@ -331,7 +339,7 @@ Nothing of the customer's is mounted in this container, so removing a
 web-owned stray here costs nothing that the ownership rule protects on the
 other side. Neither sweep follows a symlink.
 
-"Aged" means older than an hour on both sides — and an entry whose
+"Aged" means older than five minutes on both sides — and an entry whose
 modification time lies more than five minutes in the FUTURE counts as aged
 too: generated code can set any mtime on what it creates, and a negative age
 would otherwise keep a forward-dated stash forever. This service's removal
@@ -407,9 +415,29 @@ operator's `docker exec`. A single killed probe is absorbed by the health
 check's retries; an interactive command may simply die mid-job. That is the
 cost of guaranteeing no process of the job survives it.
 
-Abandoned job directories older than an hour are removed at startup and every
-ten minutes. The web service owns the normal deletion; this only covers a web
-service that died holding a job.
+Abandoned job directories older than five minutes are removed at startup and
+every minute. The web service owns the normal deletion; this only covers a web
+service that died holding a job. An abandoned directory holds another
+question's input frames and is readable through the shared group, which is
+why the threshold is short.
+
+A running job is never swept: each side skips the job ids in flight on its
+own side by name (`_ACTIVE_JOBS`). On the web side a job id is in flight from
+its creation until its directory is removed; here, for the whole `/execute`
+call, queueing included. The name check is needed because the threshold is
+shorter than the longest job and a running job does not touch its directory's
+modification time. When a job finishes, this service sets the directory's
+modification time to now, so the web side can still read `out/` however long
+the job ran.
+
+At startup, before the first job runs, this service sets mode `000` on every
+job directory already present that it owns, and logs
+`EXEC_ORPHAN_LOCKED count=<locked> not_owned=<refused>`. Job directories are
+created by the web uid, and only the owner may chmod, so in production the
+expected line is `count=0 not_owned=N`: the lock only catches a directory
+generated code renamed into a job-id shape. The web-owned ones stay readable
+to the shared group until a sweep removes them; the real bound is the
+five-minute threshold.
 
 ## 8. Logging
 
@@ -421,7 +449,9 @@ time and exit code, with the job id as the session id. The process sweep logs
 `EXEC_STRAY_KILLED`, and the orphan sweep `EXEC_ORPHAN_REMOVED` for an
 abandoned job directory and `EXEC_STRAY_ENTRY_REMOVED kind=file|dir|link|other`
 for something generated code left in the jobs root (with
-`EXEC_STRAY_ENTRY_REMOVE_FAILED` when it cannot). The web service adds
+`EXEC_STRAY_ENTRY_REMOVE_FAILED` when it cannot). At startup the service
+logs `EXEC_ORPHAN_LOCKED count=… not_owned=…` for the job directories it
+found (§7; `count=0` is normal). The web service adds
 `EXEC_STRAY_SWEEP_REFUSED reason=encloses_data_root|inside_data_root|unresolved`
 (once per process) on the configurations where it declines to look at strays
 at all, and `EXEC_ORPHAN_LEFT_TO_SANDBOX reason=owned_by_another_uid` (once
@@ -559,7 +589,7 @@ an operator must not read a healthy container as a working stack.
 
 **A job directory the sandbox locked.** Generated code can `chmod` a
 directory it created under `out/`. The sandbox's own sweep opens the modes
-and removes it within the hour; the web service cannot, because it may not
+and removes it within about five minutes; the web service cannot, because it may not
 chmod what the sandbox uid owns. When the entry that blocked the removal
 belongs to that other identity it logs `EXEC_ORPHAN_LEFT_TO_SANDBOX` at INFO,
 once per path per process; any other failure is `EXEC_ORPHAN_REMOVE_FAILED`,
@@ -570,8 +600,9 @@ frames, so the jobs volume is worth a glance after a failed upgrade.
 **Job directory lifecycle.** The web service creates it, writes the inputs,
 and removes it in a `finally` — success, failure and refusal alike. A removal
 that fails is logged, not retried, because the sweeps cover it: this side
-sweeps job-id-shaped directories older than an hour at startup and
-opportunistically after a dispatch, and the sandbox does the same on its own
+sweeps job-id-shaped directories older than five minutes at startup and
+opportunistically after a dispatch (at most once a minute), skipping the job
+ids it still has in flight, and the sandbox does the same on its own
 schedule (§7). Beyond 32-hex job directories, the only entries either side
 touches are the aged strays of the jobs root described in §7 — on this side
 never one it owns, and never at all when the jobs directory is refused.

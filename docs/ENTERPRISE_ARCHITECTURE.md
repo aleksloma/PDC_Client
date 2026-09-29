@@ -78,6 +78,15 @@ one thing that must not run next to the data and the credentials.
 - Answers are treated as untrusted input by the client, because the code
   that produced them is untrusted by definition.
 
+*Amendment 2026-09-29 (job directory).* Rationale: a job directory is mode
+2770 with the shared group and no sticky bit, so the sandbox can replace its
+entries, and an abandoned one holds another question's input frames.
+Impact: the client never reads back or unpickles anything from a job
+directory (the input pickle is verified in memory before it is written);
+both sides sweep abandoned job directories after five minutes, every minute,
+skipping jobs still in flight; the sandbox locks the job directories it owns
+at startup. Article XIV's "stash lasts about five minutes" follows from this.
+
 `docs/AI_CONSTITUTION.md` Article XIV is the normative version of this
 boundary, and `docs/EXECUTOR_PROTOCOL.md` is the field-level contract between
 the two containers.
