@@ -487,6 +487,19 @@ def test_an_input_write_failure_is_reported_as_a_preparation_error(dispatcher, e
     assert left == [], left
 
 
+def test_an_unhealthy_sandbox_is_an_infrastructure_error(dispatcher, exec_env, monkeypatch):
+    """A sandbox whose process sweep could not clear the job uid answers 503
+    EXECUTOR_UNHEALTHY to every job; the chat must not ask the planner to
+    rewrite code over it, so the text counts as an infrastructure error."""
+    calls = []
+    _install(monkeypatch, _body_handler({"code": "EXECUTOR_UNHEALTHY", "message": "no"},
+                                        calls, status=503))
+    out = dispatcher.execute("PYTHON", "RESULT = 1", _dfs(), sid="t", timeout_s=60)
+    text = REJECTED_TEXT.format(code="EXECUTOR_UNHEALTHY")
+    _assert_error_shape(out, "PYTHON", text)
+    assert dispatcher.is_infrastructure_error(text) is True
+
+
 @pytest.mark.parametrize("kind", ["PYTHON", "PLOT"])
 @pytest.mark.parametrize("status_code,code", [(400, "JOB_DIR_INVALID"),
                                               (503, "EXECUTOR_NOT_READY")])

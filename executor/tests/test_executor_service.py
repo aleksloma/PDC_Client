@@ -700,6 +700,124 @@ def test_orphan_sweep_removes_old_job_dirs_and_old_strays(executor_env):
         assert not old_uid.exists(), "old job dir with uid-10001 inputs survived the sweep"
 
 
+# ---------------------------------------------------------------------------
+# the same-uid process sweep: to exhaustion, bounded, with an unhealthy latch
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def healthy():
+    from executor import app as app_module
+    app_module._UNHEALTHY["reason"] = None
+    yield app_module
+    app_module._UNHEALTHY["reason"] = None
+
+
+def test_the_sweep_repeats_until_a_pass_finds_nothing(healthy, monkeypatch):
+    app_module = healthy
+    passes = [{4242, 4243}, {4244}, {4245}, set()]
+    killed = []
+    assert app_module._SWEEP_PAUSE_S * app_module._SWEEP_MAX_PASSES >= 2.0
+    monkeypatch.setattr(app_module, "_same_uid_pids", lambda: passes.pop(0))
+    monkeypatch.setattr(app_module, "_kill_pid", killed.append)
+    monkeypatch.setattr(app_module, "_SWEEP_PAUSE_S", 0)
+    assert app_module._sweep_same_uid_processes() is True
+    assert killed == [4242, 4243, 4244, 4245]
+    assert app_module._UNHEALTHY["reason"] is None
+
+
+def test_an_exhausted_sweep_marks_the_service_unhealthy(healthy, executor_env, monkeypatch):
+    app_module = healthy
+    calls = {"n": 0}
+
+    def forever():
+        calls["n"] += 1
+        return {4242}
+
+    monkeypatch.setattr(app_module, "_same_uid_pids", forever)
+    monkeypatch.setattr(app_module, "_kill_pid", lambda pid: None)
+    monkeypatch.setattr(app_module, "_SWEEP_PAUSE_S", 0)
+    assert app_module._sweep_same_uid_processes() is False
+    assert calls["n"] == app_module._SWEEP_MAX_PASSES + 1     # bounded
+    assert app_module._UNHEALTHY["reason"] == "stray_processes"
+    with _client() as client:
+        health = client.get("/healthz")
+        assert health.status_code == 503, health.text
+        job_id, _, manifest = _new_job(executor_env)
+        resp = client.post("/execute", json=_body(job_id, "RESULT = 1", manifest))
+        assert resp.status_code == 503, resp.text
+        assert "EXECUTOR_UNHEALTHY" in resp.text
+
+
+def test_a_pid_the_sweep_killed_is_recognised_once(healthy, monkeypatch):
+    app_module = healthy
+    monkeypatch.setattr(app_module.os, "kill", lambda pid, sig: None)
+    app_module._kill_pid(424242)
+    assert app_module._swept_by_us(424242) is True
+    assert app_module._swept_by_us(424242) is False
+    assert app_module._swept_by_us(99) is False
+
+
+def test_a_tampered_font_template_file_is_not_copied(healthy, executor_env, monkeypatch, tmp_path):
+    """The template is writable by the job uid: a file changed or added after
+    warm-up must never reach another job's scratch."""
+    app_module = healthy
+    template = tmp_path / "tpl"
+    template.mkdir()
+    (template / "fontlist-v390.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(app_module, "_mpl_template", lambda: template)
+    monkeypatch.setattr(app_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    app_module._MPL_TEMPLATE_FILES.clear()
+    app_module._MPL_TEMPLATE_FILES["fontlist-v390.json"] = app_module._file_digest(
+        template / "fontlist-v390.json")
+    good = app_module._make_scratch("a" * 32)
+    assert (good / "mpl" / "fontlist-v390.json").read_text(encoding="utf-8") == "{}"
+    (template / "fontlist-v390.json").write_text('{"poison": 1}', encoding="utf-8")
+    (template / "added.json").write_text("{}", encoding="utf-8")
+    bad = app_module._make_scratch("b" * 32)
+    assert sorted(p.name for p in (bad / "mpl").iterdir()) == []
+    app_module._MPL_TEMPLATE_FILES.clear()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_a_zombie_is_not_counted_as_a_live_process(healthy):
+    """A killed escapee stays a zombie until reaped; it runs nothing, so it
+    must not keep the sweep looping into an unhealthy verdict."""
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    try:
+        time.sleep(0.3)
+        assert pid not in healthy._same_uid_pids()
+    finally:
+        os.waitpid(pid, 0)
+
+
+def test_each_job_gets_a_private_scratch_that_is_removed(executor_env):
+    """TMPDIR, HOME, XDG_CACHE_HOME and MPLCONFIGDIR point into a fresh 0700
+    directory per job, removed after the job; the next job cannot see it."""
+    NL = chr(10)
+    code = NL.join([
+        "import os, stat, tempfile",
+        "d = os.environ['TMPDIR']",
+        "open(os.path.join(d, 'left.txt'), 'w').write('x')",
+        "RESULT = {'tmp': d, 'gettempdir': tempfile.gettempdir(), 'home': os.environ['HOME'],"
+        " 'cache': os.environ['XDG_CACHE_HOME'], 'mpl': os.environ['MPLCONFIGDIR'],"
+        " 'mode': oct(stat.S_IMODE(os.stat(d).st_mode))}",
+    ])
+    with _client() as client:
+        job_dir, response, _ = _submit(client, executor_env, code)
+        first = _decode(response, job_dir)["result"]
+        probe = NL.join(["import os", f"RESULT = os.path.exists({first['tmp']!r})"])
+        job_dir2, response2, _ = _submit(client, executor_env, probe)
+        second = _decode(response2, job_dir2)["result"]
+    assert "/pdcjob-" in first["tmp"], first
+    assert first["gettempdir"] == first["tmp"] == first["home"] == first["cache"], first
+    assert first["mpl"] == first["tmp"] + "/mpl", first
+    assert first["mode"] == "0o700", first
+    assert not os.path.exists(first["tmp"]), "the scratch outlived its job"
+    assert second is False, "a later job saw the previous job's scratch"
+
+
+
 def test_startup_locks_the_job_dirs_already_present(executor_env):
     """A job directory present when the service starts is chmod 000 before the
     first job runs (this uid can do that only to what it owns — here the test
@@ -1141,7 +1259,12 @@ def test_the_default_concurrency_is_not_reported_as_unsafe(executor_env, monkeyp
     assert unsafe == [], logged
 
 
-def test_two_jobs_at_once_both_answer_with_the_stray_sweep_skipped(executor_env, monkeypatch):
+def test_two_jobs_at_once_both_answer_and_the_stray_sweep_still_runs(executor_env, monkeypatch):
+    """REWRITTEN on purpose: the stray sweep used to be SKIPPED while a
+    sibling job was in flight, which let one job's escapee run on into the
+    next user's job. It now runs at every concurrency: the first job's sweep
+    may kill the second job's runner (EXECUTOR_MAX_CONCURRENT > 1 is
+    documented as forfeiting the isolation), and the service answers both."""
     import executor.app as executor_app
 
     monkeypatch.setenv("EXECUTOR_MAX_CONCURRENT", "2")
@@ -1171,15 +1294,19 @@ def test_two_jobs_at_once_both_answer_with_the_stray_sweep_skipped(executor_env,
         first.join(timeout=180)
         second.join(timeout=180)
 
-    for tag, job_dir in (("a", dir_a), ("b", dir_b)):
-        status_code, response = results.get(tag, (None, None))
-        assert status_code == 200, (tag, status_code, response)
-        assert response.get("status") == "ok", (tag, response)
-        decoded = _decode(response, job_dir)
-        assert decoded.get("result") == "done", (tag, decoded)
-
-    skipped = [m for m in logged if m.startswith("EXEC_STRAY_SWEEP_SKIPPED")]
-    assert skipped, "the stray sweep ran while a sibling job was in flight"
+    status_a, response_a = results.get("a", (None, None))
+    assert status_a == 200, (status_a, response_a)
+    assert response_a.get("status") == "ok", response_a
+    assert _decode(response_a, dir_a).get("result") == "done"
+    status_b, response_b = results.get("b", (None, None))
+    assert status_b == 200, (status_b, response_b)
+    # Killed by the first job's sweep (the service's own kill) => `crashed`
+    # with reason `signal`, never `killed` (that verdict means the OOM killer).
+    assert response_b.get("status") in ("ok", "crashed"), response_b
+    if response_b.get("status") == "crashed":
+        assert response_b.get("reason") == "signal", response_b
+    assert not [m for m in logged if m.startswith("EXEC_STRAY_SWEEP_SKIPPED")], logged
+    assert [m for m in logged if m.startswith("EXEC_STRAY_SWEEP_CONCURRENT")], logged
 
 
 # ---------------------------------------------------------------------------

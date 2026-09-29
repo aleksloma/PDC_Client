@@ -947,3 +947,34 @@ def test_the_runner_env_marks_the_sandbox_for_the_logger():
     text = _read(EXEC_APP)
     fn = text[text.index("def _runner_env"):text.index("def _enter_job")]
     assert '"PDC_EXECUTOR": "1"' in fn
+
+
+# ---------------------------------------------------------------------------
+# the stray-process sweep loops to exhaustion; each job has private scratch
+# ---------------------------------------------------------------------------
+def test_the_process_sweep_loops_within_its_bound_and_always_runs():
+    text = _read(EXEC_APP)
+    assert _module_constant(EXEC_APP, "_SWEEP_MAX_PASSES") == 10
+    fn = text[text.index("def _sweep_same_uid_processes"):text.index("# ----", text.index("def _sweep_same_uid_processes"))]
+    assert "for _ in range(_SWEEP_MAX_PASSES):" in fn, fn[:400]
+    assert "_same_uid_pids()" in fn and '_UNHEALTHY["reason"] = "stray_processes"' in fn
+    # never skipped: no concurrency branch around the call, no SKIPPED line
+    assert "EXEC_STRAY_SWEEP_SKIPPED" not in text
+    call = text.index("    _sweep_same_uid_processes()\n")
+    preceding = text[text.rfind("\n", 0, call - 1):call]
+    assert "if " not in preceding and "else" not in preceding, preceding
+    # zombies do not count as live processes
+    assert '("Z", "X")' in text[text.index("def _same_uid_pids"):text.index("def _kill_pid")]
+    # unhealthy is visible on /healthz and refuses /execute
+    assert 'status_code=503' in text[text.index("async def healthz"):text.index("def _bad_request")]
+    assert '"EXECUTOR_UNHEALTHY"' in text
+
+
+def test_every_job_runs_with_private_temp_and_cache_directories():
+    text = _read(EXEC_APP)
+    fn = text[text.index("def _runner_env"):text.index("def _enter_job")]
+    for name in ("TMPDIR", "MPLCONFIGDIR", "XDG_CACHE_HOME"):
+        assert f'"{name}": str(scratch' in fn, name
+    run = text[text.index("def _run_job"):text.index("def _mpl_template")]
+    assert "_make_scratch(request.job_id)" in run and "_remove_scratch(scratch" in run
+    assert 'scratch.mkdir(mode=0o700)' in text

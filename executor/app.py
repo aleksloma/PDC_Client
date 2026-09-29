@@ -29,6 +29,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -82,6 +83,18 @@ _ORPHAN_MAX_AGE_S = 300
 # the job in flight.
 _FUTURE_MTIME_TOLERANCE_S = 300
 _ORPHAN_SWEEP_INTERVAL_S = 60
+# The same-uid process sweep after every job repeats until a pass over /proc
+# finds nothing, at most this many passes this far apart.
+_SWEEP_MAX_PASSES = 10
+# 10 x 0.25 s: long enough for a SIGKILLed process to finish exiting (a large
+# address space takes a moment to tear down), so only a real survivor latches
+# the service unhealthy.
+_SWEEP_PAUSE_S = 0.25
+# Each job gets a private scratch directory (TMPDIR, HOME, XDG_CACHE_HOME,
+# MPLCONFIGDIR), created fresh and removed after the job. matplotlib's font
+# cache is built ONCE into this template at startup and copied per job.
+_SCRATCH_PREFIX = "pdcjob-"
+_MPL_TEMPLATE_NAME = "pdc-mpl-template"
 _VERSION_MODULES = ("matplotlib", "numpy", "pandas", "plotly", "pyarrow")
 
 _STATE: dict = {}
@@ -100,6 +113,18 @@ _ACTIVE_JOBS: set = set()
 # One-shot latch for the EXECUTOR_NOT_READY log line (no lock needed: the
 # route that sets it runs on the event loop).
 _NOT_READY_LOGGED = {"logged": False}
+# Set when the process sweep could not clear the job uid: the service then
+# refuses every job (and /healthz says so) until it is restarted.
+_UNHEALTHY: dict = {"reason": None}
+# Pids THIS service's sweep killed. A runner that dies of one of them is
+# reported `crashed` (reason `signal`), never `killed` — `killed` means a
+# SIGKILL the service did not send (the OOM killer), which tells the planner
+# to use less memory. Only reachable with EXECUTOR_MAX_CONCURRENT > 1.
+_SWEPT_PIDS: set = set()
+# The font-cache template's files as warmed: {name: (size, sha256)}. Only a
+# file that still matches is copied into a job's scratch.
+_MPL_TEMPLATE_FILES: dict = {}
+_MPL_TAMPER_LOGGED = {"logged": False}
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +255,7 @@ async def lifespan(app: FastAPI):
     # for the next sweeps: the web service may be about to post that job.
     _lock_preexisting_job_dirs(config.shared_dir)
     _sweep_orphans(config.shared_dir)
+    _warm_mpl_template()
     sweeper = threading.Thread(target=_orphan_loop, args=(config.shared_dir, _STATE["stop"]),
                                daemon=True, name="orphan_sweep")
     sweeper.start()
@@ -500,21 +526,22 @@ def _orphan_loop(shared_dir: Path, stop: threading.Event) -> None:
 # ---------------------------------------------------------------------------
 # same-uid process sweep
 # ---------------------------------------------------------------------------
-def _sweep_same_uid_processes() -> None:
-    """SIGKILL every process of our own euid except this process and its parent.
+def _same_uid_pids() -> set:
+    """Live processes of our own euid other than this process and its parent.
 
-    A `setsid()` escapee survives the job's process-group kill; this is what
-    catches it and what makes "no other process exists during an exec" true.
+    A zombie (`Z`) or dead (`X`) entry is not counted: it runs nothing, and an
+    escapee killed by an earlier pass stays a zombie until whoever it was
+    reparented to reaps it — this service, when it is pid 1, never does.
     The PARENT exclusion is load-bearing: the app is not always pid 1 (a
     supervisor, `--reload`, a future multi-worker uvicorn), and the process
-    above it shares this uid — killing it would take the service down
-    mid-request.
+    above it shares this uid — killing it would take the service down.
     """
     geteuid = getattr(os, "geteuid", None)
     if geteuid is None or not os.path.isdir("/proc"):
-        return
+        return set()
     me = geteuid()
     spare = {os.getpid(), os.getppid()}
+    found = set()
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
@@ -526,18 +553,63 @@ def _sweep_same_uid_processes() -> None:
         except OSError:
             continue
         uid = None
+        state = ""
         for line in status.splitlines():
-            if line.startswith("Uid:"):
+            if line.startswith("State:"):
+                state = line.split(":", 1)[1].strip()[:1]
+            elif line.startswith("Uid:"):
                 with suppress(IndexError, ValueError):
                     uid = int(line.split()[1])
-                break
-        if uid != me:
-            continue
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            continue
-        log_with_sid("executor", "warning", f"EXEC_STRAY_KILLED pid={int(pid)}")
+        if uid == me and state not in ("Z", "X"):
+            found.add(pid)
+    return found
+
+
+def _kill_pid(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        return
+    with _INFLIGHT_LOCK:
+        if len(_SWEPT_PIDS) > 4096:
+            _SWEPT_PIDS.clear()
+        _SWEPT_PIDS.add(int(pid))
+    log_with_sid("executor", "warning", f"EXEC_STRAY_KILLED pid={int(pid)}")
+
+
+def _sweep_same_uid_processes() -> bool:
+    """SIGKILL every process of our own euid except this process and its
+    parent, REPEATING until a full pass over /proc finds none.
+
+    A `setsid()` escapee survives the job's process-group kill; this is what
+    catches it and what makes "no other process exists during an exec" true.
+    One snapshot is not enough: a process forked after it was taken would
+    survive into the next user's job. The loop is bounded
+    (`_SWEEP_MAX_PASSES`, `_SWEEP_PAUSE_S` apart); if it is exhausted the
+    service marks itself unhealthy (`_UNHEALTHY`) — `/healthz` answers 503 and
+    `/execute` refuses every further job until the container is restarted.
+    Returns True when the uid is clean.
+    """
+    if _alone_in_flight():
+        # No sibling runner can be in the record: stale escapee pids go, so a
+        # reused pid can never turn a real OOM kill into `crashed`.
+        with _INFLIGHT_LOCK:
+            _SWEPT_PIDS.clear()
+    for _ in range(_SWEEP_MAX_PASSES):
+        pids = _same_uid_pids()
+        if not pids:
+            return True
+        for pid in sorted(pids):
+            _kill_pid(pid)
+        time.sleep(_SWEEP_PAUSE_S)
+    if not _same_uid_pids():
+        return True
+    if _UNHEALTHY["reason"] is None:
+        _UNHEALTHY["reason"] = "stray_processes"
+        log_with_sid("executor", "error",
+                     "EXECUTOR_UNHEALTHY reason=stray_processes: processes of the job uid "
+                     "survived every sweep pass; refusing further jobs until restarted")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -565,11 +637,14 @@ class ExecuteRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # the job subprocess
 # ---------------------------------------------------------------------------
-def _runner_env(config: Config, response_fd: int) -> dict:
+def _runner_env(config: Config, response_fd: int, scratch: Optional[Path] = None) -> dict:
     """The runner's environment, built from scratch as an ALLOWLIST.
 
     `ARROW_DEFAULT_MEMORY_POOL=system` matters: jemalloc/mimalloc reserve large
-    virtual ranges that `RLIMIT_AS` counts against the job.
+    virtual ranges that `RLIMIT_AS` counts against the job. With a `scratch`
+    directory, every temp/cache location points into it (TMPDIR, TMP, TEMP,
+    HOME, XDG_CACHE_HOME, MPLCONFIGDIR), so what a job writes there is removed
+    with it instead of waiting in the shared /tmp for the next job.
     """
     env = {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
@@ -591,6 +666,10 @@ def _runner_env(config: Config, response_fd: int) -> dict:
         # log FILE that a later job (same uid) could read.
         "PDC_EXECUTOR": "1",
     }
+    if scratch is not None:
+        env.update({"TMPDIR": str(scratch), "TMP": str(scratch), "TEMP": str(scratch),
+                    "HOME": str(scratch), "XDG_CACHE_HOME": str(scratch),
+                    "MPLCONFIGDIR": str(scratch / "mpl")})
     for optional in ("LANG", "LC_ALL"):
         value = os.environ.get(optional)
         if value:
@@ -647,17 +726,113 @@ def _decode(raw: bytes) -> str:
 def _run_job(config: Config, request: ExecuteRequest, job_dir: Path, remaining: float) -> dict:
     """Run one job; the stray sweep lives INSIDE `_execute_job` (see there).
 
-    This wrapper only owns the in-flight accounting the sweep consults.
+    This wrapper owns the in-flight accounting the sweep consults and the
+    job's private scratch directory (created before, removed after).
     """
     _enter_job()
+    scratch = None
     try:
-        return _execute_job(config, request, job_dir, remaining)
+        scratch = _make_scratch(request.job_id)
+        return _execute_job(config, request, job_dir, remaining, scratch)
     finally:
+        if scratch is not None:
+            _remove_scratch(scratch, request.job_id)
         _leave_job()
 
 
+def _swept_by_us(pid: int) -> bool:
+    with _INFLIGHT_LOCK:
+        if pid in _SWEPT_PIDS:
+            _SWEPT_PIDS.discard(pid)
+            return True
+    return False
+
+
+def _file_digest(path: Path) -> tuple:
+    data = path.read_bytes()
+    return (len(data), hashlib.sha256(data).hexdigest())
+
+
+def _mpl_template() -> Path:
+    return Path(tempfile.gettempdir()) / _MPL_TEMPLATE_NAME
+
+
+def _warm_mpl_template() -> None:
+    """Build matplotlib's font cache ONCE into the template directory, so a
+    job's fresh MPLCONFIGDIR starts from a copy instead of rebuilding it (a
+    rebuild costs seconds per job). Never raises; without a template each job
+    simply builds its own."""
+    template = _mpl_template()
+    try:
+        template.mkdir(mode=0o700, exist_ok=True)
+        subprocess.run([sys.executable, "-I", "-c", "import matplotlib.font_manager"],
+                       env={"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                            "HOME": str(template), "MPLCONFIGDIR": str(template),
+                            "MPLBACKEND": "Agg"},
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=180, check=False)
+        # Record what was built: the template is writable by the job uid, so a
+        # file a job later adds or rewrites there is never copied into
+        # another job's scratch.
+        _MPL_TEMPLATE_FILES.clear()
+        for item in template.glob("*.json"):
+            if item.is_file() and not item.is_symlink():
+                _MPL_TEMPLATE_FILES[item.name] = _file_digest(item)
+    except Exception as e:
+        log_with_sid("executor", "warning",
+                     f"EXEC_MPL_TEMPLATE_FAILED {exec_transport.log_safe_text(type(e).__name__, 80)}")
+
+
+def _make_scratch(job_id: str) -> Path:
+    """A fresh 0700 directory for one job, seeded with the font-cache files.
+
+    Only template files whose size and hash still match the warm-up record are
+    copied: the template lives in the shared /tmp and is writable by the job
+    uid, so it must not become a channel into later jobs' scratch. Residuals,
+    stated: the job uid can still write the template (a changed file is then
+    skipped, not copied), and a path pre-planted as a symlink at this job's
+    scratch name is unreachable in practice (job ids are random) — were it
+    there, the removal below would touch only entries this uid owns.
+    Raises OSError when it cannot be created (the job then fails to spawn)."""
+    scratch = Path(tempfile.gettempdir()) / f"{_SCRATCH_PREFIX}{job_id}"
+    if scratch.exists() or scratch.is_symlink():
+        _rmtree_repairing_modes(scratch)
+    scratch.mkdir(mode=0o700)
+    mpl = scratch / "mpl"
+    mpl.mkdir(mode=0o700)
+    try:
+        for name, expected in _MPL_TEMPLATE_FILES.items():
+            item = _mpl_template() / name
+            # Size first (lstat): a job-planted huge file is skipped unread.
+            if (item.is_symlink() or not item.is_file()
+                    or os.lstat(item).st_size != expected[0]
+                    or _file_digest(item) != expected):
+                if not _MPL_TAMPER_LOGGED["logged"]:
+                    _MPL_TAMPER_LOGGED["logged"] = True
+                    log_with_sid(job_id, "warning",
+                                 "EXEC_MPL_TEMPLATE_TAMPERED a font-cache template file "
+                                 "changed after warm-up; it is no longer copied")
+                continue
+            (mpl / name).write_bytes(item.read_bytes())
+    except OSError as e:
+        log_with_sid(job_id, "warning",
+                     f"EXEC_MPL_TEMPLATE_COPY_FAILED {exec_transport.log_safe_text(type(e).__name__, 80)}")
+    return scratch
+
+
+def _remove_scratch(scratch: Path, job_id: str) -> None:
+    """Remove a job's scratch directory; never raises."""
+    try:
+        _rmtree_repairing_modes(scratch)
+    except Exception as e:
+        log_with_sid(job_id, "warning",
+                     f"EXEC_SCRATCH_REMOVE_FAILED {exec_transport.log_safe_text(type(e).__name__, 80)}")
+    if _still_present(scratch):
+        log_with_sid(job_id, "warning", "EXEC_SCRATCH_REMOVE_FAILED entry still present")
+
+
 def _execute_job(config: Config, request: ExecuteRequest, job_dir: Path,
-                 remaining: float) -> dict:
+                 remaining: float, scratch: Optional[Path] = None) -> dict:
     """Spawn the runner, wait for it, and turn its exit into ONE response."""
     job_id = request.job_id
     body = {
@@ -694,7 +869,7 @@ def _execute_job(config: Config, request: ExecuteRequest, job_dir: Path,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 pass_fds=(write_fd,),
-                env=_runner_env(config, write_fd),
+                env=_runner_env(config, write_fd, scratch),
                 cwd=str(_APP_ROOT),
                 start_new_session=True,
             )
@@ -743,15 +918,13 @@ def _execute_job(config: Config, request: ExecuteRequest, job_dir: Path,
     # already-written response is LOST, and a perfectly successful job is
     # reported as `crashed`. Killing the escapee FIRST closes those fds, so
     # the join returns at once with the real response.
-    if _alone_in_flight():
-        _sweep_same_uid_processes()
-    else:
-        # EXECUTOR_MAX_CONCURRENT > 1 (non-default) makes the sweep unsafe —
-        # it would kill a sibling job's runner — so it is skipped. Cost of
-        # that setting, on top of the shared-uid isolation it already gives
-        # up: a `setsid()` escapee can hold the pipes open and cost THIS
-        # job its response (reported `crashed` after the reader-join grace).
-        log_with_sid(job_id, "warning", "EXEC_STRAY_SWEEP_SKIPPED concurrent_job")
+    # The sweep runs at EVERY concurrency. With EXECUTOR_MAX_CONCURRENT > 1
+    # (non-default, documented as forfeiting the isolation) it can kill a
+    # sibling job's runner, which then answers `crashed`; skipping it instead
+    # would let one job's escapee run on into the next user's job.
+    if not _alone_in_flight():
+        log_with_sid(job_id, "warning", "EXEC_STRAY_SWEEP_CONCURRENT sibling jobs may be killed")
+    _sweep_same_uid_processes()
     for reader in readers:
         reader.join(timeout=_READER_JOIN_S)
 
@@ -776,6 +949,14 @@ def _execute_job(config: Config, request: ExecuteRequest, job_dir: Path,
             response["exit_code"] = exit_code
             response.setdefault("signal", signal_no)
             response.setdefault("reason", None)
+        elif exit_code == -signal.SIGKILL and _swept_by_us(process.pid):
+            # A sibling job's sweep killed this runner (EXECUTOR_MAX_CONCURRENT
+            # > 1): the service's own kill, not a memory problem of the code.
+            response = {"status": "crashed", "kind": request.kind, "payload": None,
+                        "elapsed_ms": elapsed_ms, "peak_rss_mb": None,
+                        "stdout": stdout_text, "stderr": stderr_text,
+                        "traceback": stderr_text, "exit_code": exit_code,
+                        "signal": signal_no, "reason": "signal"}
         elif exit_code == -signal.SIGKILL:
             # We only ever kill AFTER `wait` returned, so a SIGKILL exit is
             # somebody else's: the cgroup OOM killer (or the code itself).
@@ -836,8 +1017,12 @@ async def healthz() -> Response:
     """Liveness plus the versions the main app's handshake needs.
 
     Answers while a job runs: the job wait happens on a worker thread, never
-    on the event loop.
+    on the event loop. 503 once the process sweep could not clear the job uid
+    (`_UNHEALTHY`): the container's healthcheck then reports it.
     """
+    if _UNHEALTHY["reason"]:
+        return _json({"ok": False, "unhealthy": _UNHEALTHY["reason"], "version": BUILD_COMMIT,
+                      "build_time": BUILD_TIME}, status_code=503)
     return _json({"ok": True, "version": BUILD_COMMIT, "build_time": BUILD_TIME,
                   "versions": _library_versions()})
 
@@ -891,6 +1076,10 @@ async def execute(request: ExecuteRequest) -> Response:
     config = _STATE.get("config")
     if config is None:
         return _not_ready()
+    if _UNHEALTHY["reason"]:
+        return _json({"code": "EXECUTOR_UNHEALTHY",
+                      "message": "the executor could not clear a previous job's processes"},
+                     status_code=503)
     invalid = _validate(request, config)
     if invalid is not None:
         return invalid
