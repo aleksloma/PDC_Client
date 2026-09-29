@@ -193,9 +193,9 @@ exist, so the shape must not be normalized.
 
 `stdout`, `stderr` and `traceback` are for the local log only, and the web
 service now writes a truncated tail of the last two onto its own
-`EXEC_ERROR` / `EXEC_TIMEOUT` lines — in-process, a failing block's traceback
-landed in the client log, and the sandbox's own file log sits on a tmpfs that
-a restart wipes. **Nothing new crosses to the Brain**: the retry text stays
+`EXEC_ERROR` / `EXEC_TIMEOUT` lines. That tail is the only durable copy of a
+failing block's traceback: the sandbox has no log file and logs no job text
+(§8). **Nothing new crosses to the Brain**: the retry text stays
 exactly `payload["error"]`.
 
 ### Serialization matrix (`result`)
@@ -441,11 +441,20 @@ five-minute threshold.
 
 ## 8. Logging
 
-The executor logs to stdout and to a rotating file under a `DATA_ROOT` that is
-a throwaway tmpfs (5 MiB × 2) — it keeps no state, so **`docker logs
-pdc-executor` is the evidence path**, not a file on a volume. Each job logs
-one `EXEC_JOB_START` and one `EXEC_JOB_END` line carrying the status, elapsed
-time and exit code, with the job id as the session id. The process sweep logs
+The executor logs to stdout ONLY. Its image sets `PDC_EXECUTOR=1`, and the
+service passes it to every runner; with it, `logger_utils` attaches no file
+handler. Every job runs as the same uid, so a log file in the sandbox would be
+readable by the next user's job. `LOG_MAX_BYTES` / `LOG_BACKUP_COUNT` are
+therefore unused there. `docker logs pdc-executor` holds the service
+process's lines; where the runner's lines go is below.
+
+No line written inside the sandbox carries job text: no exception message,
+no code, no frame names, no stderr or stdout. Each job logs one
+`EXEC_JOB_START` and one `EXEC_JOB_END` line carrying the status, elapsed
+time, exit code, `reason`, and `stderr_len` / `stdout_len`, with the job id as
+the session id. There is no `EXEC_JOB_STDERR` line any more. The full error,
+traceback, stderr and stdout still travel in the response (§4); the web
+service's `EXEC_ERROR` / `EXEC_TIMEOUT` line is the durable record. The process sweep logs
 `EXEC_STRAY_KILLED`, and the orphan sweep `EXEC_ORPHAN_REMOVED` for an
 abandoned job directory and `EXEC_STRAY_ENTRY_REMOVED kind=file|dir|link|other`
 for something generated code left in the jobs root (with
@@ -475,10 +484,13 @@ inside the job — are written on its inherited stdout, which is a pipe the
 parent reads but keeps only when the job produced no usable response. On a
 normal job the runner's own response already carries `stdout` (the generated
 code's output, captured separately), so the pipe tail is dropped. Those lines
-therefore reach **neither** the response nor `docker logs`: they exist only in
-the runner's rotating file under its throwaway `DATA_ROOT`, readable with
-`docker exec` until the container restarts. Do not expect a per-job `EXEC_OK`
-in the container log, and do not treat the absence of one as a failure.
+therefore reach **no sink** in normal operation — not the response, not
+`docker logs`, and no file, because the runner writes none. They carry no job
+text either (`EXEC_ERROR` has only `code_hash`, `status`, `error_len` and, for
+a setup failure, `error_type`; `EXEC_RUNNER_FAILED` and the plot-rendering
+error line carry the exception type only). Do not expect a per-job `EXEC_OK`
+in the container log, and do not treat the absence of one as a failure. The
+web log is the record of a job's outcome.
 
 ## 9. Image
 
@@ -494,7 +506,8 @@ The image copies **only** the modules the runner imports — the two execution
 modules, the dtype gate, the sandbox guard, the outlier helpers, the logger,
 the settings module and the transport — plus the Georgian font and the offline
 plotly bundle. Never `COPY . .`. There is no `local_store`, no `db_*`, no
-brain client, no route, no template.
+brain client, no route, no template. The image sets `PDC_EXECUTOR=1`, which
+makes the shared logger write to stdout only (§8).
 
 Its pin set is an **identical-version subset** of the audited root
 requirements: same versions, nothing added. A structural test asserts both

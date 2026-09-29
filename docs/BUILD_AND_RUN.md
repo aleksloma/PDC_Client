@@ -610,21 +610,24 @@ The data comes from `tenants/{tenant_id}/users.jsonl` and
   (`52428800`, not `50MB` and not `50_000_000`); anything else falls back to
   the default instead of raising, and both are clamped to a minimum, so
   rotation cannot be switched off from the environment.
+  The traceback of a failing analysis block is here too: the web service's
+  `EXEC_ERROR` line carries capped `traceback=` / `stderr=` tails from the
+  sandbox's response. This is the only durable copy.
 - **Sandbox logs** (`docker logs pdc-executor`): one `EXEC_JOB_START` and one
-  `EXEC_JOB_END` line per job with the status and elapsed time, the traceback
-  of a failing analysis block, and anything the generated code printed. The
-  two containers' lines join on `code_hash`, so one answer can be followed
-  across both.
+  `EXEC_JOB_END` line per job with the status, elapsed time, exit code and the
+  `stderr_len` / `stdout_len` of the job's output — lengths, never the text.
+  The two containers' lines join on `code_hash`, so one answer can be
+  followed across both.
 
-  The sandbox writes a rotating file log too, but its `DATA_ROOT` is a
-  throwaway tmpfs (5 MiB × 2). It keeps no state and mounts no data volume, so
-  **that file is lost on restart and is on no volume**. `docker logs
-  pdc-executor` is the evidence path. Capture it before restarting anything;
-  a traceback from generated code exists nowhere else.
+  The sandbox has **no log file**, by design (`PDC_EXECUTOR=1` in its image
+  makes the logger write to stdout only). Every job runs as the same user, so
+  a file there could be read by the next user's job. For the same reason no
+  sandbox line carries an error message, code or anything the generated code
+  printed. `LOG_MAX_BYTES` / `LOG_BACKUP_COUNT` have no effect in the sandbox.
 
-Diagnosing a failed question therefore means collecting BOTH: the web log for
-the request, the brain call and the dispatch, and the sandbox output for what
-the code actually did.
+Diagnosing a failed question therefore means the web log first: it holds the
+request, the brain call, the dispatch and the error with its traceback. The
+sandbox output adds the job's status and timings.
 
 ---
 

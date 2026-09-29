@@ -573,12 +573,13 @@ needs both.
 
 | Where | What is in it | Survives a restart |
 |---|---|---|
-| `/data/client/logs/datachat.log` on the data volume | The web application: uploads, brain calls, errors. Rotated, so collect `datachat.log*` | Yes |
-| `docker logs pdc-executor` | The sandbox: one line per job, the traceback of a failing analysis block, and anything the generated code printed | Only as long as Docker keeps the container's output |
+| `/data/client/logs/datachat.log` on the data volume (also `docker logs pdc-client`) | The web application: uploads, brain calls, errors — and the traceback of a failing analysis block, on its `EXEC_ERROR` line (`traceback=` / `stderr=` tails). Rotated, so collect `datachat.log*` | Yes |
+| `docker logs pdc-executor` | The sandbox: one start and one end line per job, with status, timings and lengths. No error text, no code, nothing the generated code printed | Only as long as Docker keeps the container's output |
 
-The sandbox writes a file log too, but it lands on its RAM-backed `/tmp` and
-is on no volume, so it is **lost on restart**. Treat `docker logs
-pdc-executor` as the evidence path and capture it before restarting anything.
+The sandbox has no log file, by design: every job runs as the same user, so a
+file there could be read by the next job. It also writes no job text to its
+output. The web log is the record of what failed and why. Capture `docker
+logs pdc-executor` before restarting anything if you need the job timings.
 
 ### Restrict what the containers can reach (recommended)
 

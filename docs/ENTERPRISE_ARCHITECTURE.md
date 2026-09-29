@@ -96,7 +96,7 @@ the two containers.
 | Boundary | Out | In |
 |---|---|---|
 | client → brain | question text, schema and column metadata, aggregate profiles, generated code, error text, scalar previews. **Never rows, tables or charts.** | generated Python, narrative text |
-| client → sandbox | the code to run, and the input frames as parquet written per job | the result (parquet, chart HTML or PNG, a scalar preview), plus a capped tail of the sandbox's stderr and traceback for the local log. A job's stdout crosses in the same response but is NOT written to the web log; what a job printed lives only in the sandbox's own output |
+| client → sandbox | the code to run, and the input frames as parquet written per job | the result (parquet, chart HTML or PNG, a scalar preview), plus a capped tail of the sandbox's stderr and traceback for the local log. A job's stdout crosses in the same response but is NOT written to the web log. The sandbox keeps no log file and logs only the lengths of a job's stdout and stderr, so what a job printed is logged nowhere |
 | sandbox → anywhere else | nothing. It has no network route and no credentials. | — |
 
 ### Brain (PowerDataChat GCP — enterprise only)

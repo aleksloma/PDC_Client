@@ -19,11 +19,12 @@ Where to look, in order:
    `logs/datachat.log` next to the code when DATA_ROOT is not writable (dev
    server history in `logs/uvicorn_dev.log`).
 2. Sandbox container: `docker logs pdc-executor --tail 200` — `EXEC_JOB_START`
-   / `EXEC_JOB_END` per job, the traceback of a failing analysis block, and
-   anything the code printed. **The sandbox's file log is on its tmpfs
-   `DATA_ROOT`, on no volume, and is LOST on restart**, so capture
-   `docker logs` BEFORE restarting anything. Join the two containers' lines on
-   `code_hash` to follow one answer across both.
+   / `EXEC_JOB_END` per job with status, timings and `stderr_len` /
+   `stdout_len` only. **The sandbox has no log file and logs no job text**
+   (`PDC_EXECUTOR=1`): the traceback of a failing analysis block is on the
+   WEB log's `EXEC_ERROR` / `EXEC_TIMEOUT` line (`traceback=` / `stderr=`
+   tails). Join the two containers' lines on `code_hash` to follow one answer
+   across both.
 3. Log format: `[sid] LEVEL message key=value ...` via `log_with_sid` —
    grep by `sid` (chat/session id) to follow one request.
 4. Health: `curl -s http://localhost:8091/health` — must show

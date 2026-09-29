@@ -57,8 +57,9 @@ upgrading the image against their existing data. Never native `uvicorn` runs.
    (those mean the volume ownership or a write path regressed, and the app
    degrades quietly rather than crashing). `docker exec pdc-client id` must
    report uid 10001 and `docker exec pdc-executor id` must report uid 10002.
-   Capture the sandbox's `docker logs` before any restart: its file log sits
-   on a tmpfs and does not survive one.
+   The sandbox has no log file: a failing block's traceback is on the web
+   log's `EXEC_ERROR` line, and `docker logs pdc-executor` holds only job
+   status, timings and lengths.
 8. **Unit tests**: `python -m pytest tests/ -q` — must be fully green.
 
 Any failing step blocks the commit. NEVER run `docker compose down -v` and
