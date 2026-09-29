@@ -6,7 +6,11 @@ logic of this flow — only split it across the client and brain containers."):
 
   1. Client builds schema_text from local dfs.
   2. Client → POST /v1/plan → Brain returns generated code.
-  3. Client executes code locally with safe_execute / render_plot_safe.
+  3. Client runs the code in its analysis sandbox — safe_execute /
+     render_plot_safe dispatch it to the separate pdc-executor container
+     (executor_client); the web process runs no generated code. A live
+     table's SELECT, when the plan wrote one, runs in the web process
+     before that (_ensure_live).
   4. On error: Client → POST /v1/retry with error text → Brain returns
      corrected code → Client retries execution (up to 3 attempts, matching
      the B2C retry policy).

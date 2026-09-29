@@ -214,3 +214,4 @@ database tables gets no answers from those tables. See
 | [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | The brain `/v1/*` API this client consumes |
 | [`docs/CLIENT_ENDPOINTS.md`](docs/CLIENT_ENDPOINTS.md) | The endpoints this client exposes (dashboard contract) |
 | [`docs/AI_CONSTITUTION.md`](docs/AI_CONSTITUTION.md) | Engineering rules — read before any code change |
+| [`docs/DATA_PROCESSING.md`](docs/DATA_PROCESSING.md) | Where the AI service runs, the language model, retention on the brain, sub-processors, administrator access |

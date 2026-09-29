@@ -10,7 +10,37 @@ where the Python that answers a question runs. Both come from PowerDataChat,
 both are started together by Docker Compose, and neither is useful alone.
 
 This is the short, operational quickstart. For build internals and the full
-endpoint contract see [`docs/BUILD_AND_RUN.md`](docs/BUILD_AND_RUN.md).
+endpoint contract see [`docs/BUILD_AND_RUN.md`](docs/BUILD_AND_RUN.md). Where
+the AI service runs, which sub-processors it uses and how long it keeps what
+it receives is in [`docs/DATA_PROCESSING.md`](docs/DATA_PROCESSING.md).
+
+## Intended use
+
+PowerDataChat answers questions about tabular data in natural language, with
+charts, tables and reports. It is meant for this, within these limits:
+
+- **Users** are analysts your administrator has invited (or who sign in
+  through your single sign-on) and given a data role. The role decides which
+  registered database tables they may use; a file a user uploads is visible
+  to that user and to the people they share the chat with.
+- **Permitted data** is data your Data Governance function has classified as
+  permitted for processing by a third-party language model in this form:
+  column names, data types, the values of text columns with at most 20
+  distinct values, aggregate statistics, and short computed results (see
+  "What leaves your network"). The raw rows stay in your network, but those
+  derived facts do not.
+- **Do not upload or register** data whose classification forbids that
+  processing, for example: special-category personal data, card numbers or
+  authentication data, national identifiers, account numbers or other
+  columns whose individual values are themselves sensitive — unless those
+  columns are named in `SCHEMA_VALUE_DENY_COLUMNS` and your governance
+  accepts that computed answers about them can still quote a value. Do not
+  put such data in column names, sheet names, file names or questions either:
+  those are sent as they are.
+- **Purpose** is natural-language analysis of tabular data: exploring it,
+  charting it, and producing PDF / PowerPoint reports for people who are
+  entitled to see the underlying data. It is not a system of record, and its
+  answers should be checked before they are used for a decision.
 
 ## Upgrade notes
 
@@ -240,7 +270,11 @@ anything.
 The form has no field for your own CA certificate today, so a verified
 connection needs a server certificate issued by a CA the container already
 trusts. If the database server's identity matters to you, ask your DBA for such
-a certificate.
+a certificate. For PostgreSQL and MySQL / MariaDB this release offers no
+certificate verification at all: there is no `verify-full` / `VERIFY_IDENTITY`
+mode and no CA setting, so a ticked box protects against eavesdropping but
+not against a machine in the network path that impersonates the database.
+Keep those connections on a network path you control.
 
 **Upgrade note for stored connections.** Two kinds of connection behave
 differently from their next refresh on: a MySQL/MariaDB connection with SSL
@@ -261,9 +295,10 @@ it; no copy is taken. Scheduled refreshes skip live tables. Editing an
 existing table keeps its storage mode.
 
 A live table is queried directly in your database at question time. Each
-question runs one SELECT per live table it uses — written by the AI planner
-once that part ships; until then a capped read of the whole table, under the
-administrator's row filter when one is set. The SQL is validated against a
+question runs one SELECT per live table it uses. The AI planner writes that
+SELECT; when it writes none, or when the administrator set a row filter on
+the table, the application runs its own capped read of the table instead
+(under the row filter when one is set). The SQL is validated against a
 read-only allowlist and may only touch the registered table; the result is
 capped at `LIVE_RESULT_ROW_CAP` rows and `LIVE_RESULT_MAX_MB` megabytes, and
 each read is bounded by `LIVE_QUERY_TIMEOUT_S` and by the connection's
@@ -276,11 +311,11 @@ and a resource group / workload limit for the application account. The
 application's own query guard and caps are a second line, not a replacement
 for that grant.
 
-Size the database side for the capped read. Until the planner writes SQL,
-every question on a live table, every refresh of such an answer and every
-"Download Excel" of it reads up to `LIVE_RESULT_ROW_CAP` rows of the whole
-table (under the administrator's row filter when one is set) — that is the
-load a read replica must carry. What is recorded: the SQL text of each
+Size the database side for the capped read. Every question on a live
+table, every refresh of such an answer and every "Download Excel" of it can
+read up to `LIVE_RESULT_ROW_CAP` rows (the AI's SELECT, or the application's
+own read of the whole table under the administrator's row filter) — that is
+the load a read replica must carry. What is recorded: the SQL text of each
 answer is stored with the chat's history on the data volume and is visible
 to that chat's users (its owner and the people it was shared with); the
 application log carries only a hash of each statement, row counts and

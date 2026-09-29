@@ -91,3 +91,36 @@ Revisit when a pip release vendors newer copies. The release gate
 ### Deployed
 Internal demo `pdcclient-demo`, revision `pdcclient-demo-2089883`, serving
 100 % from 2026-09-28. The record and rollback are in `docs/DEMO_CLOUD_RUN.md`.
+
+### Errata (2026-09-29)
+Three statements in this entry were wrong. They are corrected here rather
+than rewritten above, so the record of what was claimed stays visible.
+
+- **"All dependencies are pinned."** Every DIRECT dependency is pinned in
+  `requirements.txt`, and the installed versions of those match their pins.
+  The installed set of the web image has 43 more packages that are pulled in
+  transitively and pinned nowhere (among them `lxml`, `requests`, `urllib3`,
+  `certifi`, `pydantic-core`, `pyyaml`, `packaging`). A rebuild of the same
+  commit can therefore install different versions of those. The base image
+  is referenced by tag, not by digest.
+- **"Untrusted text is escaped in every log line."** Escaping covered the
+  modules listed in the structural log guard, not every module. Other log
+  lines still carried raw text, for example an upload's sheet names and
+  exception texts in parts of the upload route and the account store, so a
+  newline in a workbook's sheet name could start a forged log line.
+- **"Unit suite: 3676 passed, 73 skipped, 0 failed."** The audit of
+  2026-09-29 found that at this commit four tests in
+  `tests/test_export_plotly_png.py` failed (they still posted the old
+  request body) and six executor sweep tests failed when the executor suite
+  ran as root. The figure came from a run that did not include those.
+
+Also: the one CRITICAL web finding (libxml2, CVE-2026-6653) concerns the
+Debian `libxml2` package in the image. The application does parse XML: every
+.xlsx upload is read by openpyxl, which uses `lxml`. `lxml` 6.1.3 bundles and
+statically links its own libxml2 2.14.6, so the Debian package is not on the
+.xlsx path.
+
+Current state of the working tree on 2026-09-29, before the next release:
+web suite 3938 passed, 74 skipped, 0 failed (`tests/test_export_plotly_png.py`
+run separately in a Linux container: 8 passed); executor suite as uid 10002
+79 passed, 5 skipped, and as root 83 passed, 1 skipped.
