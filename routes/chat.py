@@ -1335,6 +1335,10 @@ def _probe_structure(data: bytes, filename: str) -> dict | None:
     try:
         if ext in ("xlsx", "xlsm"):
             from openpyxl import load_workbook
+            from excel_table_detector import inspect_workbook_if_zip
+            # A decompression bomb is refused before openpyxl opens it (the
+            # raise lands in the except below: no comparison, never a crash).
+            inspect_workbook_if_zip(_io.BytesIO(data), filename)
             wb = load_workbook(_io.BytesIO(data), read_only=True, data_only=True)
             out: dict = {}
             try:

@@ -14,6 +14,8 @@ Backend:
 from __future__ import annotations
 
 import ipaddress
+import json
+import re
 import secrets
 import sys
 import time
@@ -21,7 +23,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -646,10 +648,88 @@ class ContentSecurityPolicy:
         await self.app(scope, receive, send_with_policy)
 
 
+class UploadTooLarge(HTTPException):
+    """Raised from UploadByteCap's counting receive. An HTTPException subclass
+    because FastAPI re-raises those unchanged out of body parsing (anything
+    else becomes a generic 400); its own handler answers the same body as the
+    Content-Length refusal."""
+
+    def __init__(self, max_bytes: int):
+        super().__init__(status_code=413, detail="Upload too large")
+        self.max_bytes = int(max_bytes)
+
+
+async def upload_too_large_handler(request: Request, exc: UploadTooLarge):
+    return JSONResponse({"error": "Upload too large", "max_bytes": exc.max_bytes},
+                        status_code=413, headers={"connection": "close"})
+
+
+# The multipart routes whose body UploadByteCap bounds.
+_UPLOAD_CAP_PATH_RE = re.compile(r"^/(?:upload|api/chat/[^/]+/probe_columns)$")
+
+
+class UploadByteCap:
+    """Pure ASGI: bounds the request body of the multipart upload routes at
+    `settings.MAX_UPLOAD_BYTES` (read per request).
+
+    A declared `Content-Length` above the cap is answered 413 before the app
+    (or the multipart parser) runs; uvicorn never delivers more bytes than a
+    declared length. A body without one (chunked) is counted as it is read,
+    and crossing the cap raises a 413 `HTTPException`, which FastAPI passes
+    through its body parsing unchanged.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (scope.get("type") != "http" or scope.get("method") != "POST"
+                or not _UPLOAD_CAP_PATH_RE.match(_routed_path(scope))):
+            await self.app(scope, receive, send)
+            return
+        try:
+            cap = int(settings.MAX_UPLOAD_BYTES)
+        except Exception as e:
+            log_with_sid("upload", "error",
+                         f"UPLOAD_CAP_SETTING_INVALID {log_safe_text(type(e).__name__, 80)}")
+            cap = 100 * 1024 * 1024
+        declared = None
+        for name, value in scope.get("headers") or []:
+            if name == b"content-length":
+                try:
+                    declared = int(value.decode("latin-1").strip())
+                except ValueError:
+                    declared = None
+        if declared is not None and declared > cap:
+            log_with_sid("upload", "warning",
+                         f"UPLOAD_TOO_LARGE declared_bytes={int(declared)} cap={int(cap)}")
+            body = json.dumps({"error": "Upload too large", "max_bytes": cap}).encode()
+            await send({"type": "http.response.start", "status": 413,
+                        "headers": [(b"content-type", b"application/json"),
+                                    (b"content-length", str(len(body)).encode()),
+                                    (b"connection", b"close")]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        seen = {"bytes": 0}
+
+        async def counted_receive():
+            message = await receive()
+            if message.get("type") == "http.request":
+                seen["bytes"] += len(message.get("body") or b"")
+                if seen["bytes"] > cap:
+                    log_with_sid("upload", "warning",
+                                 f"UPLOAD_TOO_LARGE streamed_bytes={int(seen['bytes'])} cap={int(cap)}")
+                    raise UploadTooLarge(cap)
+            return message
+
+        await self.app(scope, counted_receive, send)
+
+
 # The absolute session lifetime (seconds): RememberMeSessionMiddleware's cap.
 _REMEMBER_ME_MAX_AGE = settings.REMEMBER_ME_MAX_DAYS * 86400
 
 app = FastAPI(title="PowerDataChat Client (enterprise)", version="1.0", lifespan=lifespan)
+app.add_exception_handler(UploadTooLarge, upload_too_large_handler)
 # Registered FIRST, so it sits INSIDE the session middleware below and sees
 # the unsigned session.
 app.add_middleware(PasswordChangeGate)
@@ -659,6 +739,9 @@ app.add_middleware(SessionGenerationGate)
 app.add_middleware(RememberMeSessionMiddleware, secret_key=settings.SECRET_KEY,
                    same_site="lax", max_age=_REMEMBER_ME_MAX_AGE,
                    https_only=settings.SESSION_HTTPS_ONLY)
+# Outside the session (needs none): an oversized upload is refused before a
+# session is unsigned or the multipart body is parsed.
+app.add_middleware(UploadByteCap)
 # Inside the guard, outside the session: adds the page policy to every HTML
 # response (and so also covers the password gate and the session layer).
 app.add_middleware(ContentSecurityPolicy)

@@ -67,6 +67,15 @@ SECRET_KEY_MIN_CHARS = 32
 class Settings(BaseModel):
     DATA_ROOT: str = Field(default_factory=lambda: os.getenv("DATA_ROOT", "./client_data"))
     MAX_FILES: int = Field(default_factory=lambda: int(os.getenv("MAX_FILES", "5")))
+    # Upload limits (defence against a single request or workbook exhausting
+    # the web process): the whole multipart body of /upload and of the Add
+    # Data column probe (413 above it), and, BEFORE any .xlsx/.xlsm is parsed,
+    # the zip's total uncompressed size, any entry's compression ratio and the
+    # declared cell count (excel_table_detector.inspect_xlsx_archive).
+    MAX_UPLOAD_BYTES: int = Field(default_factory=lambda: _int_env("MAX_UPLOAD_BYTES", 100 * 1024 * 1024, 1024 * 1024))
+    XLSX_MAX_UNCOMPRESSED_MB: int = Field(default_factory=lambda: _int_env("XLSX_MAX_UNCOMPRESSED_MB", 500, 1))
+    XLSX_MAX_COMPRESSION_RATIO: int = Field(default_factory=lambda: _int_env("XLSX_MAX_COMPRESSION_RATIO", 100, 2))
+    XLSX_MAX_CELLS: int = Field(default_factory=lambda: _int_env("XLSX_MAX_CELLS", 20_000_000, 1000))
     SECRET_KEY: str = Field(default_factory=lambda: os.getenv("SECRET_KEY", SECRET_KEY_PLACEHOLDER))
 
     # Build identity — baked in as Docker build args (see the Dockerfile).

@@ -35,6 +35,7 @@ import pandas as pd
 from settings import settings
 from logger_utils import log_with_sid
 from excel_table_detector import load_excel_sheets, _EXTRACTED_TEXT_ABOVE_TABLE  # noqa: F401 — re-exported
+from excel_table_detector import ARCHIVE_REJECTED_TEXT, ExcelArchiveRejected
 
 
 _LOCK = threading.RLock()
@@ -312,6 +313,10 @@ def _load_one_file(path: Path, report: Optional[list] = None) -> dict[str, pd.Da
             out[path.name] = pd.read_json(path)
         elif ext == ".parquet":
             out[path.name] = pd.read_parquet(path)
+    except ExcelArchiveRejected:
+        # Logged by the inspector (numbers only); the user sees why.
+        _report({"file": path.name, "status": "error",
+                 "message": ARCHIVE_REJECTED_TEXT})
     except Exception as e:
         log_with_sid(path.name, "warning", f"FILE_LOAD_ERROR {path}: {e}")
         _report({"file": path.name, "status": "error",

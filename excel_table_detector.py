@@ -31,6 +31,7 @@ sync. Raw data values still never leave this server.
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
 from collections import Counter
 from io import BytesIO
@@ -637,6 +638,166 @@ def _is_valid_table(df: pd.DataFrame, min_rows: int = 1, min_cols: int = 1) -> b
     return True
 
 
+class ExcelArchiveRejected(ValueError):
+    """An .xlsx/.xlsm whose zip would expand beyond the configured limits."""
+
+
+ARCHIVE_REJECTED_TEXT = "This workbook exceeds the size limits and was not loaded."
+_DIMENSION_RE = re.compile(rb'<dimension\s+ref="(?:[A-Z]+[0-9]+:)?([A-Z]+)([0-9]+)"')
+_SHEET_ENTRY_RE = re.compile(r"^xl/worksheets/[^/]+\.xml$", re.IGNORECASE)
+
+
+def _column_number(letters: bytes) -> int:
+    n = 0
+    for ch in letters:
+        n = n * 26 + (ch - 64)
+    return n
+
+
+_MAX_ARCHIVE_ENTRIES = 10_000
+_RATIO_MIN_ENTRY_BYTES = 1_000_000
+_INFLATE_CHUNK = 1024 * 1024
+
+
+def _entry_spans(archive, raw) -> list:
+    """(info, data_start, data_end) for every entry: the entry's PHYSICAL
+    bytes, from the end of its local header to the next entry's local header
+    (or the central directory). No declared size is used."""
+    import struct
+    infos = sorted(archive.infolist(), key=lambda i: i.header_offset)
+    starts = [i.header_offset for i in infos] + [archive.start_dir]
+    spans = []
+    for n, info in enumerate(infos):
+        raw.seek(info.header_offset)
+        header = raw.read(30)
+        if len(header) < 30 or header[:4] != b"PK\x03\x04":
+            raise ValueError("local header")
+        name_len, extra_len = struct.unpack("<HH", header[26:30])
+        data_start = info.header_offset + 30 + name_len + extra_len
+        data_end = starts[n + 1]
+        if data_end < data_start:
+            raise ValueError("overlapping entries")
+        spans.append((info, data_start, data_end))
+    return spans
+
+
+def _inflated_size(raw, info, start, end, budget: int) -> int:
+    """Bytes the entry actually expands to, counted by decompressing its
+    physical span ourselves; stops as soon as `budget` is exceeded."""
+    import zlib
+    if info.compress_type == 0:
+        # Stored: it cannot expand beyond its physical bytes (which the upload
+        # cap bounds); the span may also hold a trailing data descriptor.
+        span = end - start
+        return int(info.file_size) if 0 <= info.file_size <= span else span
+    if info.compress_type != 8:                  # xlsx uses stored/deflate only
+        raise ValueError("compression method")
+    raw.seek(start)
+    inflater = zlib.decompressobj(-15)
+    produced = 0
+    remaining = end - start
+    while remaining > 0 and not inflater.eof:
+        chunk = raw.read(min(_INFLATE_CHUNK, remaining))
+        if not chunk:
+            break
+        remaining -= len(chunk)
+        data = chunk
+        while data and not inflater.eof:
+            out = inflater.decompress(data, _INFLATE_CHUNK)
+            produced += len(out)
+            if produced > budget:
+                return produced
+            data = inflater.unconsumed_tail
+    return produced
+
+
+def inspect_xlsx_archive(source, *, max_uncompressed_bytes: int, max_ratio: float,
+                         max_cells: int, name: str = "") -> None:
+    """Refuse an .xlsx/.xlsm BEFORE any parser opens it (a decompression bomb:
+    a small zip whose sheet XML expands to hundreds of MB).
+
+    MEASURED, not trusted: the sizes in a zip's headers are written by the
+    uploader, and a parser does not necessarily stop at them, so every entry's
+    physical bytes are decompressed here with a running counter (streamed,
+    nothing kept). Refused: more than `_MAX_ARCHIVE_ENTRIES` entries, a
+    compression method other than stored/deflate, a measured total above
+    `max_uncompressed_bytes`, an entry (> 1 MB) expanding more than
+    `max_ratio`:1, a measured size that differs from the declared one, a
+    declared cell count (each sheet's `<dimension>`) above `max_cells`, and
+    any error while inspecting (fail closed). The cell count is best effort
+    (a sheet can omit or misstate `<dimension>`); the measured size is the
+    bound. `source` is a path or a binary file object. Raises
+    `ExcelArchiveRejected` with a fixed, value-free message; logs numbers only.
+    A file that is not a zip at all is left to the parser (which fails on it).
+    """
+    import zipfile
+    from exec_transport import log_safe_text
+    from logger_utils import log_with_sid
+    reason, total = None, 0
+    try:
+        archive = zipfile.ZipFile(source)
+    except zipfile.BadZipFile:
+        log_with_sid("upload", "info",
+                     f"XLSX_ARCHIVE_NOT_A_ZIP file={log_safe_text(str(name), 200)}")
+        return
+    try:
+        with archive:
+            raw = archive.fp
+            infos = archive.infolist()
+            if len(infos) > _MAX_ARCHIVE_ENTRIES:
+                reason = "entries"
+            spans = [] if reason else _entry_spans(archive, raw)
+            for info, start, end in spans:
+                budget = max_uncompressed_bytes - total
+                actual = _inflated_size(raw, info, start, end, budget)
+                total += actual
+                if total > max_uncompressed_bytes:
+                    reason = "size"
+                    break
+                if actual != info.file_size:
+                    reason = "size_mismatch"
+                    break
+                if actual > _RATIO_MIN_ENTRY_BYTES and actual > max_ratio * max(1, end - start):
+                    reason = "ratio"
+                    break
+            cells = 0
+            if not reason:
+                for info in infos:
+                    if not _SHEET_ENTRY_RE.match(info.filename):
+                        continue
+                    with archive.open(info) as fh:
+                        head = fh.read(4096)
+                    m = _DIMENSION_RE.search(head)
+                    if m:
+                        cells += _column_number(m.group(1)) * int(m.group(2))
+                    if cells > max_cells:
+                        reason = "cells"
+                        break
+    except ExcelArchiveRejected:
+        raise
+    except Exception as e:
+        reason = "unreadable"
+        log_with_sid("upload", "warning",
+                     f"XLSX_ARCHIVE_INSPECT_FAILED error={log_safe_text(type(e).__name__, 80)}")
+    if reason:
+        log_with_sid("upload", "warning",
+                     f"XLSX_ARCHIVE_REJECTED file={log_safe_text(str(name), 200)} "
+                     f"reason={reason} measured_bytes={int(total)}")
+        raise ExcelArchiveRejected(ARCHIVE_REJECTED_TEXT)
+
+
+
+def inspect_workbook_if_zip(source, name: str) -> None:
+    """`inspect_xlsx_archive` with the configured limits, for .xlsx/.xlsm."""
+    from settings import settings
+    if not str(name).lower().endswith((".xlsx", ".xlsm")):
+        return
+    inspect_xlsx_archive(source,
+                         max_uncompressed_bytes=int(settings.XLSX_MAX_UNCOMPRESSED_MB) * 1024 * 1024,
+                         max_ratio=float(settings.XLSX_MAX_COMPRESSION_RATIO),
+                         max_cells=int(settings.XLSX_MAX_CELLS), name=name)
+
+
 def load_excel_sheets(file_path: Path, filename: str) -> Dict[str, pd.DataFrame]:
     """Load every Excel sheet through the validated 6-stage detection pipeline.
 
@@ -650,6 +811,10 @@ def load_excel_sheets(file_path: Path, filename: str) -> Dict[str, pd.DataFrame]
     """
     import time as _time
     import openpyxl
+
+    # A decompression bomb is refused here, before openpyxl or calamine opens
+    # the file (raises ExcelArchiveRejected).
+    inspect_workbook_if_zip(str(file_path), str(file_path))
 
     total_start = _time.time()
     print(f"[EXCEL] Loading {filename} via validated detection pipeline...", flush=True)

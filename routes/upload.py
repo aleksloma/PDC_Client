@@ -143,9 +143,18 @@ async def upload(request: Request, files: List[UploadFile] = File(...), file_des
         return JSONResponse({"error": "Session invalid"}, status_code=401)
 
     saved = []
+    received = 0
     try:
         for f in files:
             content = await f.read()
+            # Belt and braces under app.UploadByteCap: the files' own bytes.
+            received += len(content)
+            if received > int(settings.MAX_UPLOAD_BYTES):
+                log_with_sid(email, "warning",
+                             f"UPLOAD_TOO_LARGE received_bytes={int(received)}")
+                return JSONResponse({"error": "Upload too large",
+                                     "max_bytes": int(settings.MAX_UPLOAD_BYTES)},
+                                    status_code=413)
             # The multipart filename is attacker-controlled; save_upload
             # sanitizes it, so everything downstream (meta, response, logs,
             # activity) must use the name actually STORED on disk.
@@ -294,6 +303,10 @@ async def _finish_upload(store: UserStore, email: str, sid: str, saved: list[str
             "error": (f"{len(failed)} of {len(saved)} file(s) could not be read: "
                       f"{', '.join(failed)}. Please fix or remove them and try again."),
         }
+        # A workbook refused by the archive check says so (the per-file row
+        # carries the fixed text; the browser shows only `error`).
+        if any(r.get("message") == local_store.ARCHIVE_REJECTED_TEXT for r in file_results):
+            payload["error"] += " " + local_store.ARCHIVE_REJECTED_TEXT
         # every file failed → hard 400; partial failure → 200 with ok:false so
         # the frontend's existing error branch aborts the dialog with the message
         return payload, (400 if len(failed) == len(saved) else 200)
