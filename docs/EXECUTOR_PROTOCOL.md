@@ -440,6 +440,22 @@ passes, until a full pass finds no live process of the job uid other than
 the service and its parent. Zombie and dead entries do not count; they run
 nothing. Each kill logs `EXEC_STRAY_KILLED pid=<n>`.
 
+**The sweep also reaps.** When the service is pid 1 (the container's init),
+every process a job leaves behind is reparented to it. A killed escapee, a
+child that died with the runner's process group, or one that exited on its
+own then becomes a zombie of the service. A zombie runs nothing, but it keeps
+a pid slot counted against the uid's limits (`RLIMIT_NPROC`, the container's
+`pids_limit`). Measured on the stack: after one job left about 120 processes,
+the next user's job failed with `can't start new thread`. So the service
+collects them with a non-blocking `waitpid`: every pid it killed, plus every
+zombie whose parent is the service. It reaps at the start of every pass,
+before a clean return and after the last pass. A job runner is never reaped
+by the sweep: it is spawned and registered under one lock, so its exit status
+stays with its own `Popen` (a sibling runner killed at concurrency above one
+still reports `crashed` with `reason: "signal"`). When the service is not
+pid 1 (a supervisor, `--reload`), orphans go to that parent instead; that
+happens only in development.
+
 **If the passes run out, the service latches unhealthy.** It logs
 `EXECUTOR_UNHEALTHY reason=stray_processes` once. From then on `/execute`
 answers `503 EXECUTOR_UNHEALTHY` to every job and `/healthz` answers 503, so
