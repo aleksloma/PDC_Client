@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +21,7 @@ from typing import Any, Optional
 
 import httpx
 
-from settings import settings
+from settings import settings, value_denied
 from logger_utils import log_with_sid
 from exec_transport import log_safe_text
 
@@ -217,6 +218,57 @@ def _sanitize_history_rows(history_rows: list | None) -> list[dict]:
 _PROFILE_TRANSPORT_MAX_CHARS = 150_000
 
 
+_PREVIEW_STR_MAX = 500
+_PREVIEW_DICT_MAX_KEYS = 20
+_TITLE_ANSWER_MAX = 300
+_TRUNCATED_MARK = "…[truncated]"
+
+
+def _compact_preview_for_transport(preview):
+    """The boundary guard for `preview` on /v1/summarize.
+
+    `run_chat_local._safe_preview` already drops everything but scalars and a
+    flat dict of scalars; this caps what is left: a string at 500 characters,
+    a dict at its first 20 keys (the rest counted in `_truncated_keys`), each
+    string value at 500 characters, each marked when cut. Never raises."""
+    try:
+        if isinstance(preview, str):
+            if len(preview) <= _PREVIEW_STR_MAX:
+                return preview
+            return preview[:_PREVIEW_STR_MAX] + _TRUNCATED_MARK
+        if isinstance(preview, dict):
+            items = list(preview.items())
+            out = {}
+            for key, value in items[:_PREVIEW_DICT_MAX_KEYS]:
+                if isinstance(key, str) and len(key) > _PREVIEW_STR_MAX:
+                    key = key[:_PREVIEW_STR_MAX] + _TRUNCATED_MARK
+                if isinstance(value, str) and len(value) > _PREVIEW_STR_MAX:
+                    value = value[:_PREVIEW_STR_MAX] + _TRUNCATED_MARK
+                out[key] = value
+            if len(items) > _PREVIEW_DICT_MAX_KEYS:
+                out["_truncated_keys"] = len(items) - _PREVIEW_DICT_MAX_KEYS
+            return out
+        return preview
+    except Exception as e:
+        log_with_sid("preview-transport", "warning",
+                     f"PREVIEW_COMPACT_FAILED {log_safe_text(type(e).__name__, 80)}")
+        return None
+
+
+_PROFILE_VALUE_FREE_KEYS = frozenset({"dtype", "nunique", "null_count", "null_pct",
+                                      "constant", "all_unique"})
+_CONSTANT_WARNING_RE = re.compile(r"^(?P<col>.*?) is constant: every value = .*$", re.DOTALL)
+
+
+def _safe_profile_warning(text: str) -> str:
+    """A stored profile warning with the constant value removed for a
+    deny-listed column."""
+    m = _CONSTANT_WARNING_RE.match(text)
+    if m and value_denied(m.group("col")):
+        return f"{m.group('col')} is constant"
+    return text
+
+
 def _compact_profiles_for_transport(profiles: dict | None) -> dict | None:
     """Boundary guard for the dataset_profile payload field (Article II class:
     aggregate metadata only — counts, rates, flags, truncated top-value hints;
@@ -233,7 +285,7 @@ def _compact_profiles_for_transport(profiles: dict | None) -> dict | None:
             p = dict(prof)
             p.pop("src", None)
             if isinstance(p.get("warnings"), list):
-                p["warnings"] = [str(w)[:200] for w in p["warnings"][:6]]
+                p["warnings"] = [_safe_profile_warning(str(w)[:200]) for w in p["warnings"][:6]]
             cols = p.get("columns")
             if isinstance(cols, dict):
                 slim_cols = {}
@@ -241,9 +293,17 @@ def _compact_profiles_for_transport(profiles: dict | None) -> dict | None:
                     if not isinstance(cprof, dict):
                         continue
                     c = dict(cprof)
+                    if value_denied(cname):
+                        # SCHEMA_VALUE_DENY_COLUMNS: counts and flags only.
+                        c = {k: v for k, v in c.items() if k in _PROFILE_VALUE_FREE_KEYS}
                     tv = c.get("top_values")
-                    if isinstance(tv, list):
+                    nunique = c.get("nunique")
+                    if isinstance(tv, list) and isinstance(nunique, int) and nunique <= 20:
                         c["top_values"] = [[str(v)[:40], n] for v, n in tv[:5]]
+                    else:
+                        # A profile stored by an earlier release may carry the
+                        # top values of a high-cardinality column (row data).
+                        c.pop("top_values", None)
                     slim_cols[str(cname)] = c
                 p["columns"] = slim_cols
             out[str(key)] = p
@@ -399,7 +459,7 @@ def summarize(sid: str, question: str, schema_text: str, history_rows: list,
         "question": question,
         "schema_text": schema_text,
         "history_rows": _sanitize_history_rows(history_rows),
-        "preview": preview,
+        "preview": _compact_preview_for_transport(preview),
         "context_decision": context_decision or {},
         "user_email": user_email,
     }, sid)
@@ -584,7 +644,8 @@ def title(sid: str, question: str, answer: str, lang: str = "English",
           user_email: str | None = None) -> dict:
     """Calls /v1/title. Returns {title}."""
     return _post("/v1/title", {
-        "sid": sid, "question": question, "answer": answer,
+        # The first 300 characters are enough to title a conversation.
+        "sid": sid, "question": question, "answer": (answer or "")[:_TITLE_ANSWER_MAX],
         "lang": lang, "user_email": user_email,
     }, sid)
 

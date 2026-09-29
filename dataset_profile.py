@@ -35,15 +35,24 @@ LOW_CARDINALITY_MAX = 20       # top_values emitted when nunique <= this
 NULL_PCT_WARN = 30.0
 
 
-def _generate_technical_description(series, total: int) -> str:
-    """Verbatim port of global `_generate_technical_description`.
+def _generate_technical_description(series, total: int, *, name=None) -> str:
+    """The column's technical description, computed once at upload / admin
+    refresh and stored in the chat meta (it reaches the brain inside the
+    schema text).
 
-    Pure-pandas; runs on the client. Stored alongside the LLM-generated
-    `description` so the prompt-builder can include both when the chat runs.
+    What it may carry (the data-boundary policy: no row data, low-cardinality
+    categorical values are acceptable): dtype and fill count always; for a
+    text column with at most LOW_CARDINALITY_MAX distinct values the values
+    themselves, each cut to TOP_VALUE_MAXLEN characters; for any other text
+    column the distinct COUNT only; never a numeric value. A column on the
+    SCHEMA_VALUE_DENY_COLUMNS list gets dtype and fill count only.
     """
+    from settings import value_denied
     dtype = str(series.dtype)
     non_null = int(series.count())
     tech_parts = [dtype, f"{non_null}/{total} filled"]
+    if name is not None and value_denied(name):
+        return ", ".join(tech_parts)
 
     is_text = dtype in ("object", "str", "string", "category") or series.dtype.kind == "O"
 
@@ -51,28 +60,30 @@ def _generate_technical_description(series, total: int) -> str:
         try:
             uniq = series.dropna().unique()
             n_unique = len(uniq)
-            if n_unique <= 20:
+            if n_unique <= LOW_CARDINALITY_MAX:
                 tech_parts.append(
-                    f"CATEGORICAL ({n_unique} unique: {', '.join(str(v) for v in uniq)})"
+                    f"CATEGORICAL ({n_unique} unique: "
+                    f"{', '.join(str(v)[:TOP_VALUE_MAXLEN] for v in uniq)})"
                 )
             else:
-                sample = uniq[:5].tolist()
-                tech_parts.append(
-                    f"{n_unique} unique, sample: {', '.join(str(v) for v in sample)}"
-                )
-        except Exception:
-            pass
+                tech_parts.append(f"{n_unique} unique")
+        except Exception as e:
+            _log_type("TECH_DESC_FAILED", e)
     elif dtype == "bool":
         tech_parts.append("boolean")
-    else:
-        try:
-            sample = series.dropna().head(3).tolist()
-            if sample:
-                tech_parts.append(f"sample: {', '.join(str(v) for v in sample)}")
-        except Exception:
-            pass
 
     return ", ".join(tech_parts)
+
+
+def _log_type(event: str, error: Exception) -> None:
+    """A value-free log line (the exception TYPE only: a pandas message can
+    quote a cell value). Never raises."""
+    try:
+        from exec_transport import log_safe_text
+        from logger_utils import log_with_sid
+        log_with_sid("profile", "warning", f"{event} error={log_safe_text(type(error).__name__, 80)}")
+    except Exception:
+        pass
 
 
 def _is_numeric_kind(series: pd.Series) -> bool:
@@ -83,9 +94,14 @@ def _is_datetime_kind(series: pd.Series) -> bool:
     return getattr(series.dtype, "kind", "") == "M"
 
 
-def _column_profile(series: pd.Series, total: int) -> dict:
+def _column_profile(series: pd.Series, total: int, *, name=None) -> dict:
     """Stats for one column. Best-effort: a failing stat is omitted, the
-    partial dict is still returned (Art. IV — never raise)."""
+    partial dict is still returned (Art. IV — never raise).
+
+    `top_values` (the only field that carries values) is emitted only for a
+    column with at most LOW_CARDINALITY_MAX distinct values and never for a
+    column on the SCHEMA_VALUE_DENY_COLUMNS list: the most frequent values of
+    a high-cardinality column (names, ids) are row data."""
     out: dict = {"dtype": str(series.dtype)}
     try:
         non_null = int(series.count())
@@ -99,6 +115,9 @@ def _column_profile(series: pd.Series, total: int) -> dict:
     except Exception:
         return out
     try:
+        from settings import value_denied as _denied
+        if name is not None and _denied(name):
+            return out            # SCHEMA_VALUE_DENY_COLUMNS: counts and flags only
         if _is_numeric_kind(series) or _is_datetime_kind(series):
             clean = series.dropna()
             if len(clean):
@@ -107,10 +126,9 @@ def _column_profile(series: pd.Series, total: int) -> dict:
     except Exception:
         pass
     try:
-        dtype = str(series.dtype)
-        is_texty = (dtype in ("object", "str", "string", "category", "bool")
-                    or getattr(series.dtype, "kind", "") == "O")
-        if is_texty or out.get("nunique", 0) <= LOW_CARDINALITY_MAX:
+        from settings import value_denied
+        denied = name is not None and value_denied(name)
+        if not denied and out.get("nunique", 0) <= LOW_CARDINALITY_MAX:
             vc = series.value_counts(dropna=True).head(TOP_VALUES_N)
             if len(vc):
                 out["top_values"] = [[str(v)[:TOP_VALUE_MAXLEN], int(c)]
@@ -166,6 +184,10 @@ def _build_warnings(work: pd.DataFrame, col_profiles: dict,
     for col in work.columns:
         prof = col_profiles.get(str(col)) or {}
         if prof.get("constant"):
+            from settings import value_denied
+            if value_denied(col):
+                warnings.append(f"{col} is constant")
+                continue
             try:
                 v = work[col].dropna().iloc[0]
             except Exception:
@@ -217,7 +239,7 @@ def compute_profile(df: pd.DataFrame, *, total_rows: int | None = None) -> dict:
     col_profiles: dict = {}
     for col in work.columns:
         try:
-            col_profiles[str(col)] = _column_profile(work[col], total)
+            col_profiles[str(col)] = _column_profile(work[col], total, name=str(col))
         except Exception:
             col_profiles[str(col)] = {"dtype": str(work[col].dtype)}
 

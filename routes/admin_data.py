@@ -1713,7 +1713,7 @@ def _profile_live_table(tid: str, cfg: dict, password: str, doc: dict,
         tech = {}
         try:
             tech = {str(c): dataset_profile._generate_technical_description(
-                        df[c], n_sample) for c in df.columns}
+                        df[c], n_sample, name=str(c)) for c in df.columns}
         except Exception as e:
             log_with_sid(sid, "warning",
                          f"LIVE_TECH_DESC_FAILED table={log_safe_text(tid)} "

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Dict
 
 import pandas as pd
@@ -87,8 +88,53 @@ def schema_text(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFrame], comm
     return result
 
 
+_VALUE_MAXLEN = 40
+_CATEGORICAL_MAX = 20
+_TECH_SAMPLE_RE = re.compile(r",\s*sample:.*$", re.DOTALL)
+_TECH_CATEGORICAL_RE = re.compile(r"CATEGORICAL \((\d+) unique: (.*)\)\s*$", re.DOTALL)
+
+
+def _safe_technical_description(stored: str, denied: bool) -> str:
+    """A STORED technical description as it may reach the brain.
+
+    Descriptions written at upload / admin refresh by the current code carry
+    no sample values; ones written earlier can ("sample: 1, 2, 3" for numeric
+    columns, the first 5 values of a high-cardinality text column,
+    uncut categorical values). They are filtered here as plain strings — no
+    frame is read, so nothing is recomputed per question: every `sample:`
+    list is dropped, a categorical list is kept only when it has at most 20
+    values, each cut to 40 characters, and a deny-listed column keeps its
+    dtype and fill count only."""
+    if not isinstance(stored, str) or not stored:
+        return ""
+    parts = stored.split(", ")
+    if denied:
+        return ", ".join(parts[:2])
+    text = _TECH_SAMPLE_RE.sub("", stored)
+    m = _TECH_CATEGORICAL_RE.search(text)
+    if m:
+        head = text[:m.start()].rstrip(", ")
+        n = int(m.group(1))
+        if n > _CATEGORICAL_MAX:
+            return f"{head}, {n} unique" if head else f"{n} unique"
+        values = ", ".join(v[:_VALUE_MAXLEN] for v in m.group(2).split(", "))
+        tail = f"CATEGORICAL ({n} unique: {values})"
+        return f"{head}, {tail}" if head else tail
+    return text
+
+
 def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFrame], common_fields: list | None = None,
                           other_tables: list | None = None) -> str:
+    """The per-file schema block sent to the brain with every question.
+
+    Values it may carry (data-boundary policy: no row data; low-cardinality
+    categorical values are acceptable): for a text column with at most 20
+    distinct values, those values, each cut to 40 characters; for any other
+    text column its distinct COUNT only; never a numeric value (dtype only).
+    Columns on SCHEMA_VALUE_DENY_COLUMNS render their dtype only and skip
+    their value descriptions."""
+    from settings import schema_value_deny_columns
+    deny = schema_value_deny_columns()
     parts: list[str] = []
     for fname, df in dfs.items():
         cols = list(df.columns)
@@ -107,10 +153,13 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
                         # str(c): display keys must be JSON-safe even if a
                         # legacy cached parse still carries non-str column
                         # names (Timestamps, ints from read_json).
+                        denied = str(c).strip().lower() in deny
                         descs[str(c)] = d.get("description", "")
-                        tech_descs[str(c)] = d.get("technical_description", "")
+                        tech_descs[str(c)] = _safe_technical_description(
+                            d.get("technical_description", ""), denied)
                         values = d.get("values", {}) or {}
-                        if values and isinstance(values, dict):
+                        # Value descriptions are keyed by the values themselves.
+                        if values and isinstance(values, dict) and not denied:
                             value_descs[str(c)] = values
 
         # A LIVE database table (queried at question time) is an EMPTY typed
@@ -132,19 +181,21 @@ def _schema_text_uncached(schema_docs: Dict[str, Dict], dfs: Dict[str, pd.DataFr
             except Exception:
                 dtype_info[str(c)] = "object"
                 continue
-            if is_live:
+            if is_live or str(c).strip().lower() in deny:
                 dtype_info[str(c)] = dt
                 continue
             if df[c].dtype == object or df[c].dtype.kind == "O" or str(df[c].dtype) in ("str", "string", "object"):
                 try:
                     uniq = df[c].dropna().unique()
                     n_unique = len(uniq)
-                    if n_unique <= 20:
+                    if n_unique <= _CATEGORICAL_MAX:
                         sample = uniq.tolist()
-                        dtype_info[str(c)] = f"CATEGORICAL ({n_unique} unique values: {', '.join(str(v) for v in sample)})"
+                        dtype_info[str(c)] = (f"CATEGORICAL ({n_unique} unique values: "
+                                              f"{', '.join(str(v)[:_VALUE_MAXLEN] for v in sample)})")
                     else:
-                        sample = uniq[:10].tolist()
-                        dtype_info[str(c)] = f"object ({n_unique} unique, sample: {', '.join(str(v) for v in sample)})"
+                        # The count only: sample values of a high-cardinality
+                        # column are row data.
+                        dtype_info[str(c)] = f"object ({n_unique} unique)"
                 except Exception:
                     dtype_info[str(c)] = "object"
             else:

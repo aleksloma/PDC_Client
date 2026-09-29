@@ -127,6 +127,10 @@ class Settings(BaseModel):
     FIGURE_DPI: int = Field(default_factory=lambda: int(os.getenv("FIGURE_DPI", "150")))
     SCHEMA_MAX_UNIQUE_LIST: int = Field(default_factory=lambda: int(os.getenv("SCHEMA_MAX_UNIQUE_LIST", "30")))
     SCHEMA_CAT_LIMIT: int = Field(default_factory=lambda: int(os.getenv("SCHEMA_CAT_LIMIT", "20")))
+    # Columns whose VALUES never reach the brain (comma-separated names,
+    # case-insensitive): schema text, technical descriptions, dataset
+    # profiles and schema autofill send the column's name and dtype only.
+    SCHEMA_VALUE_DENY_COLUMNS: str = Field(default_factory=lambda: os.getenv("SCHEMA_VALUE_DENY_COLUMNS", ""))
 
     # Schema autofill — same defaults as global (backend/routes/schema.py).
     # These shape the per-file context the client builds BEFORE posting to the
@@ -313,3 +317,19 @@ class Settings(BaseModel):
 
 
 settings = Settings()
+
+
+def schema_value_deny_columns() -> frozenset:
+    """SCHEMA_VALUE_DENY_COLUMNS as a set of lowercased, stripped names, read
+    at call time. Never raises (an unreadable value denies nothing and the
+    caller's default policy still applies)."""
+    try:
+        raw = str(settings.SCHEMA_VALUE_DENY_COLUMNS or "")
+        return frozenset(p.strip().lower() for p in raw.split(",") if p.strip())
+    except Exception:
+        return frozenset()
+
+
+def value_denied(column) -> bool:
+    """True when `column`'s values must never be sent (the deny list)."""
+    return str(column).strip().lower() in schema_value_deny_columns()

@@ -365,7 +365,7 @@ def _stats_from_snapshot(dest: Path) -> tuple[dict, Optional[dict]]:
         df = pd.read_parquet(dest)
         total = len(df)
         try:
-            tech = {str(c): _generate_technical_description(df[c], total)
+            tech = {str(c): _generate_technical_description(df[c], total, name=str(c))
                     for c in df.columns}
         except Exception as e:
             log_with_sid("db_refresh", "warning", f"DB_TECH_DESC_FAILED: {e}")

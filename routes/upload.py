@@ -36,7 +36,7 @@ from excel_table_detector import _EXTRACTED_TEXT_ABOVE_TABLE
 from exec_transport import log_safe_text
 from logger_utils import log_with_sid
 from routes.chat import _EXEC
-from settings import settings
+from settings import settings, value_denied
 from schema_builder import (
     columns_to_human_map,
     build_context_for_questions,
@@ -373,7 +373,7 @@ def _two_sig(x) -> str:
     return f"{float(f'{float(x):.2g}'):g}"
 
 
-def _column_profile(full_ser, sample, nun, dtype_str: str) -> str:
+def _column_profile(full_ser, sample, nun, dtype_str: str, *, denied: bool = False) -> str:
     """ONE value-free description of a high-cardinality column for the
     schema-autofill prompt (Article II: no real row value leaves the client).
 
@@ -396,7 +396,11 @@ def _column_profile(full_ser, sample, nun, dtype_str: str) -> str:
         parts.append(f"nulls={null_pct:.1f}%")
         dt = full_ser.dtype
         n = len(sample)
-        if n == 0:
+        if denied:
+            # SCHEMA_VALUE_DENY_COLUMNS: no mask, prefix, length or magnitude —
+            # nothing derived from the values themselves.
+            pass
+        elif n == 0:
             pass
         elif ptypes.is_bool_dtype(dt):
             parts.append(f"true_share={float(sample.astype(bool).mean()) * 100.0:.1f}%")
@@ -490,7 +494,10 @@ def _prepare_file_context(fname: str, df, entry: dict, notes_text: str) -> dict:
                 sample = ser
                 nun = ser.nunique()
 
-            if nun is not None and 0 < nun <= settings.SCHEMA_AUTOFILL_UNIQUE_THRESHOLD:
+            # A column on SCHEMA_VALUE_DENY_COLUMNS never sends its values: it
+            # takes the value-free profile branch below.
+            if (nun is not None and 0 < nun <= settings.SCHEMA_AUTOFILL_UNIQUE_THRESHOLD
+                    and not value_denied(col)):
                 if len(ser) > SAMPLE_SIZE:
                     uniq = sample.unique().tolist()
                 else:
@@ -504,7 +511,8 @@ def _prepare_file_context(fname: str, df, entry: dict, notes_text: str) -> dict:
                 # (index-sorted) for the "increasing" check.
                 prof_src = sample.sort_index() if len(ser) > SAMPLE_SIZE else ser
                 unique_hints[col] = [
-                    _column_profile(df[col], prof_src, nun, str(df[col].dtype))
+                    _column_profile(df[col], prof_src, nun, str(df[col].dtype),
+                                    denied=value_denied(col))
                 ]
         except Exception:
             unique_hints[col] = []
@@ -709,7 +717,7 @@ async def schema_autofill_full(request: Request):
                 if isinstance(fields[col], str):
                     fields[col] = {"description": fields[col]}
                 try:
-                    fields[col]["technical_description"] = _generate_technical_description(df[col], total)
+                    fields[col]["technical_description"] = _generate_technical_description(df[col], total, name=str(col))
                 except Exception as e:
                     log_with_sid(email, "warning",
                                  f"AUTOFILL_TECH_DESC_FAIL file={fname} col={col}: {e}")
