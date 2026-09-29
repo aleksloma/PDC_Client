@@ -177,15 +177,26 @@ cp client.env.example client.env      # fill BRAIN_TENANT_TOKEN + SECRET_KEY
 docker compose up -d
 ```
 
-Open `http://localhost:8000` and sign in as `ladmin` with `LOCAL_ADMIN_PASSWORD`,
-then invite users from the admin panel's **Users** page; each sets a password
-through the mailed link and lands in `/lab`.
-`curl http://localhost:8000/health` must report `executor_reachable: true`;
-it stays 200 either way, so read the body.
+The web port 8000 is published on the host's loopback address only
+(`127.0.0.1:8000`): your users reach the application through a reverse proxy
+that terminates TLS on the same host and forwards to `http://127.0.0.1:8000`.
+The compose-level variable `PDC_WEB_BIND_HOST` (default `127.0.0.1`) changes
+that address; set it only when the proxy runs on another machine, and then
+firewall the port to the proxy's address, because the application itself
+speaks plain HTTP. See [`CUSTOMER_INSTALL.md`](CUSTOMER_INSTALL.md) §3,
+"Serve it over HTTPS".
+
+On the Docker host itself, open `http://localhost:8000` and sign in as
+`ladmin` with `LOCAL_ADMIN_PASSWORD`, then invite users from the admin panel's
+**Users** page; each sets a password through the mailed link and lands in
+`/lab`. `curl http://127.0.0.1:8000/health`, run on the host, must report
+`executor_reachable: true`; it stays 200 either way, so read the body.
 
 The compose files carry the hardening both containers need (read-only rootfs,
 tmpfs `/tmp`, all capabilities dropped, `no-new-privileges`, memory and pid
-caps) and the jobs volume with the ownership both uids require. See
+caps, a 2-CPU cap per container — the host needs at least 2 vCPUs — and
+Docker log rotation of 5 × 20 MB) and the jobs volume with the ownership both
+uids require. See
 [`CUSTOMER_INSTALL.md`](CUSTOMER_INSTALL.md) §3. A HOST BIND MOUNT for
 `/data/client` must be writable by uid 10001 (`chown -R 10001:10001
 ./client_data`, or use a named volume, which inherits the image's ownership).

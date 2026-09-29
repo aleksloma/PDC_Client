@@ -69,6 +69,23 @@ from `executor/`. A plain build produces the hardened runtime image (uid
 10002, no pytest); `--target test` is the only way to get the root+pytest
 image, and it is never what ships.
 
+**The web image copies named files only, too.** Its Dockerfile lists what
+reaches the image: every root `*.py` module, `routes/`, `templates/`,
+`static/`, and the post-release canary — `tools/canary_check.py`,
+`tools/canary_expected.json` and its one fixture
+`tools/fixtures/sample_sales.csv`. Nothing else from the checkout is copied:
+no `tests/`, no `docs/`, no env templates (`*.env.example`), no compose files,
+no `executor/`, no other `tools/` content, whatever `.dockerignore` says. **A
+new root module must be added to the Dockerfile's `COPY` list**, or the image
+starts without it; `tests/test_container_hardening_config.py` fails when a
+root module is missing from the list or when development material is copied.
+
+The web image installs no system `libxml2` package: nothing in it links the
+library (the SQL Server ODBC driver, `libodbc` and `pyodbc` were checked with
+`ldd`), and the `.xlsx` path uses `lxml`, which bundles its own libxml2
+(2.14.6). The same test fails if `libxml2` is added back to the `apt-get
+install` line.
+
 **The sandbox image needs a reasonably current Docker engine.** Its
 `HEALTHCHECK` uses `--start-interval`, which requires Engine 25 or newer.
 Older builders reject the flag outright; older runtimes simply ignore it, and
@@ -116,6 +133,29 @@ the development stack (§3); `docker-compose.yml` is what customers get
 no sandbox reachable, a chat turn is answered "The analysis service is not
 available right now." and the log carries the internal
 `ExecutorUnavailable: the analysis service is not reachable`.
+
+Both compose files also set, for both services:
+
+- **Loopback port.** The web port is published as
+  `${PDC_WEB_BIND_HOST:-127.0.0.1}:8000:8000` (local stack:
+  `…:8091:8000`), i.e. on the host's loopback address only. The reverse
+  proxy that terminates TLS runs on the same host and forwards to
+  `http://127.0.0.1:8000`. `PDC_WEB_BIND_HOST` is a compose-level variable
+  (the shell, or a `.env` next to the compose file, like
+  `PDC_BACKEND_SUBNET`), not a `client.env` setting; compose's `:-` also
+  treats an empty value as unset, so an empty value stays on loopback. Set it
+  only when the proxy runs on another machine — the application speaks plain
+  HTTP, so a reachable address serves it without TLS to anyone who can reach
+  it, and the port must then be firewalled to the proxy's address.
+- **CPU cap.** `cpus: "2.0"` on each service. Docker refuses to start a
+  container whose `cpus` is above the host's CPU count, so the host needs at
+  least 2 vCPUs, or lower the value in both services.
+- **Docker log rotation.** The `json-file` driver with `max-size: 20m`,
+  `max-file: 5`: at most 5 files of 20 MB of `docker logs` output per
+  container. The application log on the data volume rotates on its own
+  (`LOG_MAX_BYTES` / `LOG_BACKUP_COUNT`, §7).
+
+`tests/test_container_hardening_config.py` pins all three.
 
 Open `http://localhost:8091` (local stack) → sign in with an invited account
 (the admin panel's **Users** page invites; the invitee sets a password through
@@ -632,6 +672,9 @@ The data comes from `tenants/{tenant_id}/users.jsonl` and
   The traceback of a failing analysis block is here too: the web service's
   `EXEC_ERROR` line carries capped `traceback=` / `stderr=` tails from the
   sandbox's response. This is the only durable copy.
+- **Docker's own log** (`docker logs pdc-client` / `docker logs pdc-executor`)
+  is rotated by the compose files: `json-file`, at most 5 files of 20 MB per
+  container. It is separate from the `datachat.log` rotation above.
 - **Sandbox logs** (`docker logs pdc-executor`): one `EXEC_JOB_START` and one
   `EXEC_JOB_END` line per job with the status, elapsed time, exit code and the
   `stderr_len` / `stdout_len` of the job's output — lengths, never the text.

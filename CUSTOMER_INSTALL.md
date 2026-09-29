@@ -98,6 +98,13 @@ Read these before you upgrade an existing install to this release.
   chat is created (the chat keeps its own copy).
 - The interactive API documentation (`/docs`, `/redoc`, `/openapi.json`) is
   no longer served; those addresses answer 404.
+- The web port is now published on 127.0.0.1 only: your reverse proxy must
+  run on the same host and forward to http://127.0.0.1:8000 (see
+  PDC_WEB_BIND_HOST under "Serve it over HTTPS" in §3 if it cannot).
+- Each container is now capped at 2 CPUs (`cpus: "2.0"`). Docker refuses to
+  start a container whose `cpus` value is above the host's CPU count, so the
+  host needs at least 2 vCPUs; on a smaller host lower the value in both
+  services of `docker-compose.yml`.
 
 ## 1. Get the images
 
@@ -200,7 +207,7 @@ It does not filter what an analysis computes, so an answer that reports such
 a value still contains it, and a column description the AI wrote before the
 column was listed is kept as it is.
 
-Two more settings are worth knowing about, both optional:
+A few more settings are worth knowing about, all optional:
 
 - **`PDC_BACKEND_SUBNET`** — the address range of the private network the web
   application and the sandbox share, `192.168.255.240/28` by default. It is a
@@ -210,6 +217,10 @@ Two more settings are worth knowing about, both optional:
   described under "The two networks" in §3. One variable feeds both the
   network definition and the application setting that refuses traffic from it,
   so the two can never drift apart.
+- **`PDC_WEB_BIND_HOST`** — the host address the web port is published on,
+  `127.0.0.1` (loopback) by default. Also a **compose-level** variable. Leave
+  it unset unless your reverse proxy runs on another machine; see "Serve it
+  over HTTPS" in §3.
 - **`ENABLE_THIRD_PARTY_SCRIPTS`** — leave it unset. By default the `/lab` page
   loads no third-party script at all: no browser analytics, no billing widget.
   Setting it to `true` restores them, which no on-premise install needs.
@@ -604,12 +615,16 @@ to.
 ```
 docker compose up -d
 docker compose ps        # both services up, `executor` reported healthy
-curl http://localhost:8000/health
+curl http://127.0.0.1:8000/health
 ```
 
-The web container listens on port **8000** and keeps all state in
-**`/data/client`**, mounted from the persistent `pdc_client_data` volume so
-nothing is lost on restart or upgrade. The sandbox publishes no port.
+Run these on the host itself. The web container's port **8000** is published
+on the host's loopback address **127.0.0.1** only, so it is not reachable from
+other machines: your users reach the application through the reverse proxy
+that terminates TLS on the same host (see "Serve it over HTTPS" below). The
+web container keeps all state in **`/data/client`**, mounted from the
+persistent `pdc_client_data` volume so nothing is lost on restart or upgrade.
+The sandbox publishes no port.
 
 ### How the two containers are locked down
 
@@ -624,8 +639,10 @@ enforce it at run time. Keep them.
 | All Linux capabilities dropped | Yes | Yes |
 | `no-new-privileges` | Yes | Yes |
 | Memory and process caps | 4 GB, 512 processes | 3 GB, 256 processes; each job's own address space is capped at `EXECUTOR_MEM_LIMIT_MB` (2048) |
+| CPU cap | 2.0 CPUs | 2.0 CPUs |
 | Persistent state | Uploads, chats, history, snapshots, rendered decks **and the application log** under `/data/client` only | No data volume. Its only mount is the shared jobs volume at `/jobs`, which holds work in flight (see "The shared jobs volume") |
-| Network | The published port, outbound HTTPS to the brain, TCP to your databases | The private sandbox network only, which has no gateway |
+| Network | The published port (on 127.0.0.1 by default), outbound HTTPS to the brain, TCP to your databases | The private sandbox network only, which has no gateway |
+| Docker's own log (`docker logs`) | Rotated: at most 5 files of 20 MB | Rotated: at most 5 files of 20 MB |
 
 Both `/tmp` filesystems are RAM-backed and charged against the container's own
 memory cap, and both are wiped on every restart.
@@ -636,7 +653,11 @@ stored, so a single batch of uploaded files must fit in that 512 MB; users
 uploading larger files get an upload error. Keep `/tmp` well below `mem_limit`.
 
 **Host sizing.** Both containers run at once, so size the host for the sum:
-roughly **8 GB** of headroom, rather than the 4 GB a single container needed.
+roughly **8 GB** of headroom, rather than the 4 GB a single container needed,
+and at least **2 vCPUs**. Each container is capped at 2 CPUs, and Docker
+refuses to start a container whose `cpus` value is above the host's CPU count.
+On a host with fewer CPUs, lower `cpus` in both services of
+`docker-compose.yml`; on a bigger host you can raise it.
 
 The log is at `/data/client/logs/datachat.log` on the volume, so it survives
 restarts and upgrades. The sandbox keeps no log on any volume. See
@@ -656,9 +677,10 @@ The web container joins two networks. The sandbox joins only one:
   another network.
 
 Nothing but these two services may join the internal sandbox network
-(`backend` in `docker-compose.yml`). Point monitoring at `/health` over the
-normal network: a monitoring sidecar attached to `backend` gets HTTP 403, like
-anything else in that range.
+(`backend` in `docker-compose.yml`). Point monitoring at `/health` on the
+host (`http://127.0.0.1:8000/health`) or through your reverse proxy: a
+monitoring sidecar attached to `backend` gets HTTP 403, like anything else in
+that range.
 
 `PDC_BACKEND_SUBNET` pins the sandbox network's address range
 (`192.168.255.240/28` by default) and the same value reaches the web
@@ -775,6 +797,11 @@ needs both.
 | `/data/client/logs/datachat.log` on the data volume (also `docker logs pdc-client`) | The web application: uploads, brain calls, errors — and the traceback of a failing analysis block, on its `EXEC_ERROR` line (`traceback=` / `stderr=` tails). Rotated, so collect `datachat.log*` | Yes |
 | `docker logs pdc-executor` | The sandbox: one start and one end line per job, with status, timings and lengths. No error text, no code, nothing the generated code printed | Only as long as Docker keeps the container's output |
 
+Docker's own log of each container (what `docker logs` shows) is rotated by
+the compose files: at most 5 files of 20 MB per container, the oldest dropped
+first. The application log on the data volume is rotated separately, by its
+own `LOG_MAX_BYTES` / `LOG_BACKUP_COUNT` settings.
+
 The sandbox has no log file, by design: every job runs as the same user, so a
 file there could be read by the next job. It also writes no job text to its
 output. The web log is the record of what failed and why. Capture `docker
@@ -798,16 +825,35 @@ That allow-list applies to the **web container only**. The sandbox needs no
 egress rule at all, because it has no route to anywhere: its only network is
 internal and has no gateway. There is nothing to permit and nothing to block.
 
-Inbound, only the port you publish needs to be reachable by your users — 8000,
-or the HTTPS port of the reverse proxy in front of it. The sandbox publishes
-no port.
+Inbound, only the HTTPS port of the reverse proxy needs to be reachable by
+your users. Port 8000 is published on 127.0.0.1 only and should stay
+unreachable from other machines. The sandbox publishes no port.
 
 ### Serve it over HTTPS
 
 The session cookie is marked `Secure`, so browsers return it only over HTTPS
 (`http://localhost` is exempt). Put the container behind your own TLS
-terminator — a reverse proxy or load balancer with your certificate — and
-publish that HTTPS address to your users.
+terminator — a reverse proxy with your certificate — and publish that HTTPS
+address to your users.
+
+**Run the proxy on the same host.** The compose files publish the web port on
+the loopback address only (`127.0.0.1:8000`), so the proxy must run on the
+Docker host and forward to `http://127.0.0.1:8000`. In nginx:
+
+```
+proxy_pass http://127.0.0.1:8000;
+```
+
+The address comes from the compose-level variable `PDC_WEB_BIND_HOST`
+(default `127.0.0.1`; an empty value also means `127.0.0.1`). Set it, in your
+shell or in a `.env` file next to `docker-compose.yml` like
+`PDC_BACKEND_SUBNET`, only when the proxy or load balancer runs on another
+machine — for example to the host's LAN address. Do not change it otherwise:
+the application itself speaks plain HTTP, so once the port is published on a
+reachable address anyone who can reach that address can use the application
+without TLS, and sessions and passwords cross the network unencrypted. If you
+do set it, restrict port 8000 with a host firewall so that only the proxy's
+address can connect.
 
 The application sends `Strict-Transport-Security` (browsers then refuse
 plain HTTP for the site for a year) only on requests that reached it as HTTPS.
@@ -816,8 +862,10 @@ proxy's address and the proxy sets `X-Forwarded-Proto` (see "Forward your
 users' addresses" below); otherwise the header is simply not sent.
 
 If you must run plain HTTP on the LAN, set `SESSION_HTTPS_ONLY=false` in
-`client.env`. Sessions then travel unencrypted and can be captured on your
-network; only do this on an isolated segment or for a short evaluation.
+`client.env`, and `PDC_WEB_BIND_HOST` to the host's LAN address (without a
+proxy, the loopback default leaves the port unreachable from other machines).
+Sessions then travel unencrypted and can be captured on your network; only do
+this on an isolated segment or for a short evaluation.
 
 **"The form has expired" at every sign-in.** The sign-in form carries a
 security token that is kept in the session cookie. If you serve plain HTTP
@@ -828,19 +876,34 @@ set `SESSION_HTTPS_ONLY=false` as described above. Opening the page over
 `http://localhost` does not show the problem, because browsers exempt it.
 
 **Forward your users' addresses.** The sign-in limits count failures per
-network address as well as per account. Behind a proxy that address is the
-proxy's own unless `FORWARDED_ALLOW_IPS` names the proxy and the proxy sets
-`X-Forwarded-For`. Without that, every user shares one address, which only
-slows everyone down after 20 failures in 15 minutes; it never locks anyone
-out.
+network address as well as per account, and the HSTS header above depends on
+`X-Forwarded-Proto`. The application reads those forwarded headers only from
+a peer listed in `FORWARDED_ALLOW_IPS`. A proxy on the same host that forwards
+to `127.0.0.1:8000` does NOT reach the application from 127.0.0.1: Docker
+delivers the connection from the gateway of the stack's default network (an
+address such as `172.21.0.1`). So with the variable unset — which trusts only
+127.0.0.1 — the proxy's headers are ignored: every user shares the gateway's
+address (which only slows everyone down after 20 failures in 15 minutes; it
+never locks anyone out) and HSTS is never sent. Set it to that gateway:
+
+```bash
+# The network is <project>_default; the project name is the lowercased name
+# of the folder holding docker-compose.yml (`docker network ls` lists it).
+docker network inspect <project>_default -f '{{(index .IPAM.Config 0).Gateway}}'
+# then in client.env:   FORWARDED_ALLOW_IPS=172.21.0.1   (the address printed)
+```
+
+and have the proxy set `X-Forwarded-For` and `X-Forwarded-Proto`. The gateway
+address belongs to the host, so any process on the host can then present a
+forwarded address; the sandbox cannot (it sits on the backend network only).
+Re-check the address if the stack's networks are ever re-created.
 
 **Do not tell the application to trust every proxy.** uvicorn rewrites the
 client address of a request from its `X-Forwarded-For` header for any peer
 listed in `FORWARDED_ALLOW_IPS`. With `FORWARDED_ALLOW_IPS=*` the sandbox
 could present any address it likes and slip past the refusal described under
-"The two networks". Leave the variable unset, which trusts only localhost, or
-list your proxy's own address explicitly. Never include the backend subnet,
-and never use the wildcard.
+"The two networks". List the one gateway (or proxy) address explicitly.
+Never include the backend subnet, and never use the wildcard.
 
 **Give the proxy a long read timeout.** A question can wait up to
 `EXECUTOR_QUEUE_MAX_S` (600 seconds by default) for a free analysis slot with
@@ -871,13 +934,14 @@ responses, and do not rewrite the header.
 
 ## 4. Verify
 
-- Open `http://<host>:8000` → sign in as `ladmin` with `LOCAL_ADMIN_PASSWORD`
+- Open your HTTPS address (`PUBLIC_BASE_URL`, served by the reverse proxy)
+  → sign in as `ladmin` with `LOCAL_ADMIN_PASSWORD`
   → you land on the admin panel; invite a first user from **Users** and check
   that the invitation mail arrives with a link to your `PUBLIC_BASE_URL`.
-- Check the health endpoint:
+- Check the health endpoint, on the host itself:
 
   ```
-  curl http://<host>:8000/health
+  curl http://127.0.0.1:8000/health
   ```
 
   A healthy install shows:
