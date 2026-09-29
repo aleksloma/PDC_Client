@@ -121,7 +121,10 @@ def _pg_connect_args(cfg: dict, timeout: int) -> dict:
     args = {"connect_timeout": timeout,
             # Session-level statement timeout (ms) as a second layer under the
             # per-snapshot SET; SELECT-only workload.
-            "options": f"-c statement_timeout={int(cfg.get('statement_timeout') or settings.DB_STATEMENT_TIMEOUT) * 1000}"}
+            # default_transaction_read_only makes every transaction of the
+            # session read-only (defence in depth under the SELECT-only grant).
+            "options": (f"-c statement_timeout={int(cfg.get('statement_timeout') or settings.DB_STATEMENT_TIMEOUT) * 1000}"
+                        " -c default_transaction_read_only=on")}
     if cfg.get("ssl"):
         args["sslmode"] = "require"
     else:
@@ -141,6 +144,14 @@ class TLSNotNegotiated(Exception):
 
 _TLS_NOT_NEGOTIATED_MSG = ("TLS is required for this connection but the "
                            "server did not offer it")
+
+
+class ReadOnlySessionRefused(Exception):
+    """The MySQL/MariaDB session could not be made read-only."""
+
+
+_READ_ONLY_REFUSED_MSG = ("The database session could not be made read-only; "
+                          "the connection was not used")
 
 
 def _mysql_require_tls(dbapi_connection, connection_record) -> None:
@@ -178,6 +189,33 @@ def _mysql_require_tls(dbapi_connection, connection_record) -> None:
             log_with_sid("db", "warning",
                          f"DB_TLS_PROBE_CLOSE_FAILED error={type(e).__name__}")
         raise TLSNotNegotiated(_TLS_NOT_NEGOTIATED_MSG)
+
+
+def _mysql_read_only(dbapi_connection, connection_record) -> None:
+    """`connect` listener for MySQL/MariaDB: every session is made read-only
+    before SQLAlchemy uses it (defence in depth under the SELECT-only grant;
+    the grant stays the real guarantee). A session that refuses the setting is
+    closed and refused like a plaintext one — never used as it is."""
+    try:
+        cur = dbapi_connection.cursor()
+        try:
+            cur.execute("SET SESSION TRANSACTION READ ONLY")
+        finally:
+            try:
+                cur.close()
+            except Exception as e:
+                log_with_sid("db", "warning",
+                             f"DB_READ_ONLY_CURSOR_CLOSE_FAILED error={type(e).__name__}")
+    except Exception as e:
+        errno = e.args[0] if e.args and isinstance(e.args[0], int) else None
+        log_with_sid("db", "warning",
+                     f"DB_READ_ONLY_SET_FAILED error={type(e).__name__} errno={errno}")
+        try:
+            dbapi_connection.close()
+        except Exception as close_error:
+            log_with_sid("db", "warning",
+                         f"DB_READ_ONLY_CLOSE_FAILED error={type(close_error).__name__}")
+        raise ReadOnlySessionRefused(_READ_ONLY_REFUSED_MSG) from None
 
 
 def _mysql_connect_args(cfg: dict, timeout: int) -> dict:
@@ -226,6 +264,10 @@ def _mssql_query_args(cfg: dict) -> dict:
         "Encrypt": "yes" if cfg.get("ssl") else "no",
         "TrustServerCertificate": "yes" if cfg.get("trust_server_certificate") else "no",
         "LoginTimeout": str(int(cfg.get("connect_timeout") or settings.DB_CONNECT_TIMEOUT)),
+        # Declares a read-only workload. Enforced by an Always On
+        # availability group (routes to / only admits a readable secondary);
+        # advisory on a standalone instance, where the grant is the control.
+        "ApplicationIntent": "ReadOnly",
     }
 
 
@@ -288,6 +330,12 @@ def _clickhouse_query_args(cfg: dict) -> dict:
         # This IS the statement timeout for this dialect — a session-level
         # SET cannot replace it (see the registry entry).
         "max_execution_time": str(stmt),
+        # Server-side read-only mode: level 2 refuses every write and DDL but
+        # still lets the session carry settings (the bounds above are sent as
+        # settings with every query). 2 rather than 1 also keeps the standard
+        # ClickHouse read-only login working: a profile already at readonly=2
+        # refuses a client asking for readonly=1, while 2 is a no-op there.
+        "readonly": "2",
     }
     if cfg.get("ssl"):
         args["secure"] = "true"
@@ -696,6 +744,9 @@ _DENIED_FUNCTIONS = frozenset({
     "pg_notify", "pg_reload_conf", "pg_switch_wal", "pg_create_restore_point",
     "lo_unlink", "set_config", "release_lock", "fn_xe_file_target_read_file",
     "fn_get_audit_file", "dbms_network_acl_admin", "utl_dbws",
+    # PostgreSQL large-object readers/writers: lo_get(oid) returns an
+    # object's content from outside the registered table.
+    "lo_get", "loread", "lo_put",
 })
 
 _DENIED_FUNCTION_PREFIXES = ("dblink", "iceberg", "deltalake", "hudi")
@@ -1158,9 +1209,13 @@ def get_engine(cfg: dict, password: str, *, connect_timeout: Optional[int] = Non
     if ca:
         kwargs["connect_args"] = ca
     engine = create_engine(url, **kwargs)
-    if d.key in ("mysql", "mariadb") and cfg.get("ssl"):
+    if d.key in ("mysql", "mariadb"):
         from sqlalchemy import event
-        event.listen(engine, "connect", _mysql_require_tls)
+        if cfg.get("ssl"):
+            # Registered FIRST: a plaintext session is refused before any
+            # statement of ours is sent on it.
+            event.listen(engine, "connect", _mysql_require_tls)
+        event.listen(engine, "connect", _mysql_read_only)
     return engine
 
 

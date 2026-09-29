@@ -1430,20 +1430,26 @@ NEGATIVE_MORE += [
      "SELECT DBMS_NETWORK_ACL_ADMIN.check_privilege('a', 'b', 'c') FROM dual",
      "oracle"),
     ("oracle-utl-dbws", "SELECT UTL_DBWS.create_service('x') FROM dual", "oracle"),
+    ("pg-lo-get", "SELECT lo_get(16384)", "postgresql"),
+    ("pg-lo-get-slice", "SELECT lo_get(16384, 0, 100)", "postgresql"),
+    ("pg-loread", "SELECT loread(0, 100)", "postgresql"),
+    ("pg-lo-put", "SELECT lo_put(16384, 0, 'x')", "postgresql"),
 ]
 
 _ADDED_IDS = {"pg-notify", "pg-reload-conf", "pg-switch-wal",
               "pg-create-restore-point", "pg-lo-unlink", "pg-set-config",
               "mysql-release-lock", "tsql-fn-xe-file-target-read-file",
               "tsql-fn-get-audit-file", "oracle-dbms-network-acl-admin",
-              "oracle-utl-dbws"}
+              "oracle-utl-dbws", "pg-lo-get", "pg-lo-get-slice", "pg-loread",
+              "pg-lo-put"}
 
 
 def test_denylist_additions_are_present():
     for name in ("pg_notify", "pg_reload_conf", "pg_switch_wal",
                  "pg_create_restore_point", "lo_unlink", "set_config",
                  "release_lock", "fn_xe_file_target_read_file",
-                 "fn_get_audit_file", "dbms_network_acl_admin", "utl_dbws"):
+                 "fn_get_audit_file", "dbms_network_acl_admin", "utl_dbws",
+                 "lo_get", "loread", "lo_put"):
         assert db_connector._is_denied_function(name), name
         assert db_connector._is_denied_function(name.upper()), name
 

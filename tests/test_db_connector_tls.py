@@ -46,7 +46,8 @@ def test_postgres_ssl_requires_tls():
         {"ssl": True, "statement_timeout": 300}, 8)
     assert args["sslmode"] == "require"
     assert args["connect_timeout"] == 8
-    assert args["options"] == "-c statement_timeout=300000"
+    assert args["options"] == ("-c statement_timeout=300000"
+                               " -c default_transaction_read_only=on")
 
 
 def test_postgres_without_ssl_prefers():
@@ -132,6 +133,76 @@ def test_mysql_listener_registered_only_with_ssl(db_type):
         off.dispose()
 
 
+@pytest.mark.parametrize("db_type", ["mysql", "mariadb"])
+@pytest.mark.parametrize("ssl_on", [True, False])
+def test_mysql_read_only_listener_always_registered(db_type, ssl_on):
+    pytest.importorskip("pymysql")
+    from sqlalchemy import event
+    eng = _engine(db_type, ssl_on)
+    try:
+        assert event.contains(eng, "connect", db_connector._mysql_read_only) is True
+    finally:
+        eng.dispose()
+
+
+class _Cursor:
+    def __init__(self, log, fail=False):
+        self.log, self.fail = log, fail
+
+    def execute(self, sql):
+        self.log.append(sql)
+        if self.fail:
+            raise RuntimeError("refused")
+
+    def close(self):
+        self.log.append("close-cursor")
+
+
+class _Conn:
+    def __init__(self, fail=False):
+        self.log, self.fail, self.closed = [], fail, False
+
+    def cursor(self):
+        return _Cursor(self.log, self.fail)
+
+    def close(self):
+        self.closed = True
+
+
+def test_the_tls_probe_runs_before_the_read_only_set():
+    """A plaintext session must be refused before any statement of ours is
+    sent on it, so the TLS listener is registered first."""
+    pytest.importorskip("pymysql")
+    eng = _engine("mysql", True)
+    try:
+        order = [fn for fn in eng.pool.dispatch.connect
+                 if fn in (db_connector._mysql_require_tls, db_connector._mysql_read_only)]
+        assert order == [db_connector._mysql_require_tls, db_connector._mysql_read_only], order
+    finally:
+        eng.dispose()
+
+
+def test_mysql_read_only_listener_issues_the_set():
+    conn = _Conn()
+    db_connector._mysql_read_only(conn, None)
+    assert conn.log == ["SET SESSION TRANSACTION READ ONLY", "close-cursor"]
+    assert conn.closed is False
+
+
+def test_mysql_read_only_failure_refuses_and_closes_the_connection():
+    conn = _Conn(fail=True)
+    with pytest.raises(db_connector.ReadOnlySessionRefused):
+        db_connector._mysql_read_only(conn, None)
+    assert conn.closed is True
+
+
+def test_sqlite_test_dialect_gets_no_read_only_arguments():
+    """The hidden test-only sqlite dialect writes its fixtures; nothing here
+    applies to it."""
+    d = db_connector.DIALECTS["sqlite"]
+    assert d.connect_args({}, 8) in ({}, None)
+
+
 def test_postgres_never_gets_the_mysql_listener():
     pytest.importorskip("psycopg2")
     from sqlalchemy import event
@@ -196,27 +267,32 @@ def test_oracle_without_ssl_is_plain_tcp():
 # SQL Server / ClickHouse — pin current values
 # ---------------------------------------------------------------------------
 
-def test_mssql_args_unchanged():
+def test_mssql_args_declare_a_read_only_workload():
     d = db_connector.DIALECTS["mssql"]
     assert d.connect_args({"statement_timeout": 300}, 8) == {"timeout": 300}
     assert d.query_args({"ssl": True, "connect_timeout": 8}) == {
         "driver": "ODBC Driver 18 for SQL Server", "Encrypt": "yes",
-        "TrustServerCertificate": "no", "LoginTimeout": "8"}
+        "TrustServerCertificate": "no", "LoginTimeout": "8",
+        "ApplicationIntent": "ReadOnly"}
+    assert d.query_args({})["ApplicationIntent"] == "ReadOnly"
     assert d.query_args({"ssl": True, "trust_server_certificate": True,
                          "connect_timeout": 8})["TrustServerCertificate"] == "yes"
     assert d.query_args({"connect_timeout": 8})["Encrypt"] == "no"
 
 
-def test_clickhouse_args_unchanged():
+def test_clickhouse_args_carry_read_only_mode():
     d = db_connector.DIALECTS["clickhouse"]
     assert d.connect_args({"ssl": True}, 8) == {}
     base = {"connect_timeout": 8, "statement_timeout": 300}
+    # readonly=2: refuses writes and DDL, still accepts the settings (the
+    # bounds below) the driver sends, and is a no-op on a readonly=2 login.
     assert d.query_args(base) == {"connect_timeout": "8",
                                   "send_receive_timeout": "330",
-                                  "max_execution_time": "300"}
+                                  "max_execution_time": "300",
+                                  "readonly": "2"}
     assert d.query_args({**base, "ssl": True}) == {
         "connect_timeout": "8", "send_receive_timeout": "330",
-        "max_execution_time": "300", "secure": "true"}
+        "max_execution_time": "300", "readonly": "2", "secure": "true"}
     assert d.query_args({**base, "ssl": True, "trust_server_certificate": True})[
         "verify"] == "false"
 

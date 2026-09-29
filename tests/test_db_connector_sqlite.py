@@ -707,7 +707,7 @@ def test_clickhouse_bounds_survive_into_the_dsn_the_driver_parses():
     assert client_kwargs["send_receive_timeout"] == 330.0
     assert client_kwargs["secure"] is True
     assert client_kwargs["verify"] is False
-    assert client_kwargs["settings"] == {"max_execution_time": "300"}
+    assert client_kwargs["settings"] == {"max_execution_time": "300", "readonly": "2"}
     assert client_kwargs["database"] == "analytics"
 
 
