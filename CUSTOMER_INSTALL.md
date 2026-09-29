@@ -21,6 +21,11 @@ Read these before you upgrade an existing install to this release.
 - EXECUTOR_NETWORK_CIDR is now mandatory while the analysis sandbox is
   enabled; the shipped compose files set it from PDC_BACKEND_SUBNET, but an
   older or hand-edited compose file without that line will not start.
+- Database sessions are now opened read-only where the database supports it
+  (see "Read-only database sessions" below). A MySQL server older than 5.6.5
+  or a MariaDB server older than 10.0 is now refused. A SQL Server connection
+  behind an Always On listener with read-only routing now connects to a
+  readable secondary.
 
 ## 1. Get the images
 
@@ -217,6 +222,24 @@ a dashboard tile refresh, "Show data" (on a chart or a dashboard tile) and
 "Download Excel" refuse before any query reaches the database. If the role
 check itself fails, these are refused on every chat that holds a live table
 (on a chat without one they keep working).
+
+**Where the AI's SQL runs.** The SELECT the AI writes for a live table runs
+in the web container, not in the analysis sandbox. It runs there with the
+connection's decrypted credential. The query guard and the table allowlist
+check it first, but the SELECT-only grant your DBA provisions is the hard
+guarantee.
+
+**Read-only database sessions.** As a second line under that grant, every
+connection the client opens (preview, structure, count, change check,
+snapshot and live query) is made read-only where the database allows it:
+
+| Database | Setting | Effect |
+|---|---|---|
+| PostgreSQL | `default_transaction_read_only=on` | Every transaction of the session is read-only |
+| MySQL / MariaDB | `SET SESSION TRANSACTION READ ONLY` on connect | A server that refuses it (MySQL older than 5.6.5, MariaDB older than 10.0) is refused: "The database session could not be made read-only; the connection was not used" |
+| SQL Server | `ApplicationIntent=ReadOnly` | Advisory on a standalone instance. Behind an Always On availability-group listener with read-only routing, the connection goes to a readable secondary, which can lag behind the primary on an asynchronous replica |
+| ClickHouse | `readonly=2` | Writes and DDL are refused; the timeout settings the client sends still work. No change for a login whose profile is already `readonly=2` |
+| Oracle | Not applied | Oracle has no session-level read-only setting for an ordinary login. The grant and the query guard are the controls |
 
 ### Users and sign-in
 

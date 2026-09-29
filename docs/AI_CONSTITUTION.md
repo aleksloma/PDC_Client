@@ -304,7 +304,9 @@ client must be closed on FastAPI lifespan shutdown.
    driver, HTTP client or credential module in its image at all, so the
    denylist now guards what is mostly absent anyway. Alongside it: the
    dedicated SELECT-only database login the customer provisions (the grant is
-   the real guarantee), plus rules 8 above
+   the real guarantee), plus a session-level read-only mode where the dialect
+   offers one (PostgreSQL, MySQL/MariaDB, ClickHouse; advisory on SQL Server;
+   not available on Oracle), plus rules 8 above
    and the connector's read-only statement gate. Free-form SELECT text is
    accepted only through `db_connector.assert_read_only_query`: a regex
    layer plus a sqlglot parse under the connection's dialect. The
