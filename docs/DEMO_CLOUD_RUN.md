@@ -126,14 +126,16 @@ Never copy this layout into a customer install.
   work on it, so the uid-10001 web image could not write `/data/client`. The
   volume carries `uid=10001,gid=10001` in its mount options. The symptom
   without them is a healthy service that answers 500 on sign-in.
-- Upload size: the container itself sets no request-body limit, but Cloud
+- Upload size: the container caps a multipart upload body at
+  `MAX_UPLOAD_BYTES` (100 MiB by default, a 413 from the app), but Cloud
   Run's ingress (Google Frontend) caps HTTP/1 request bodies at 32 MiB — a
   multipart `POST /upload` above that gets an HTML 413 that never reaches the
   app or its request log (verified 2026-09-03: 31 MiB → app 401, 34 MiB →
   GFE 413). Hence `GCS_UPLOAD_BUCKET`: with it set, `dashboard.js` sends any
   batch containing a file > 25 MB through `/upload/init` → signed PUT straight
-  to the bucket → `/upload/finalize` (500 MB cap). Customer LAN installs have
-  no such cap and leave the variable unset.
+  to the bucket → `/upload/finalize` (500 MB cap; that path is not under
+  `MAX_UPLOAD_BYTES`, but its workbooks still pass the xlsx archive check).
+  Customer LAN installs have no ingress cap and leave the variable unset.
 - `--timeout=900` — long analyses (60 s exec windows + brain round-trips up to
   `BRAIN_REQUEST_TIMEOUT=180 s` each).
 - `--min-instances=0` — near-zero idle cost; first hit after idle cold-starts

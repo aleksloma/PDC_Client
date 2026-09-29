@@ -280,10 +280,21 @@ customer install the flag is false and step 2 handles every size:
 1. **`POST /new_session`** — resets the per-session temp `UserStore`.
    Returns `{ok: true}`. Issues a fresh SID into the session cookie.
 
-2. **`POST /upload`** (multipart, field `files`; EVERY file regardless of
-   size whenever direct upload is off — the server sets no request-body
-   limit) — saves uploads to the
+2. **`POST /upload`** (multipart, field `files`; EVERY file goes this way
+   whenever direct upload is off) — saves uploads to the
    per-session temp area (under `<DATA_ROOT>/sessions/<sid>/files/`).
+   **Body cap:** the whole request body is bounded by `MAX_UPLOAD_BYTES`
+   (default 100 MiB). `app.UploadByteCap` answers
+   `413 {"error": "Upload too large", "max_bytes": N}` before the route runs
+   when the declared `Content-Length` is above the cap; a body without a
+   length is counted as it is read and gets the same 413. The route also sums
+   the files' own bytes against the cap (same 413). Logged `UPLOAD_TOO_LARGE`.
+   **Workbook check:** before any `.xlsx`/`.xlsm` is parsed,
+   `excel_table_detector.inspect_xlsx_archive` measures the zip (see
+   `excel_table_detector.py` in `CLAUDE.md`). A refused workbook is a
+   per-file `error` whose `message` is "This workbook exceeds the size limits
+   and was not loaded."; that sentence is also appended to the top-level
+   `error`. Logged `XLSX_ARCHIVE_REJECTED reason=<entries|size|size_mismatch|ratio|cells|unreadable>`.
    **The multipart filename is SANITIZED before it touches the filesystem**
    (`local_store.sanitize_upload_filename`, re-checked for containment inside
    `files_dir` by `UserStore.save_upload`): path components, control
@@ -409,7 +420,8 @@ file, after the usual `POST /new_session`:
   the object (best effort, also on failure; the bucket's 1-day lifecycle rule
   is the backstop) and runs the SAME post-save pipeline as `/upload`
   (`_finish_upload`), returning the same `{ok, saved, dataframes, files}` shape
-  and the same `ok:false`/400 semantics. It never resets the session, so a
+  and the same `ok:false`/400 semantics — the workbook check included (this
+  path has its own 500 MB cap and is not under `MAX_UPLOAD_BYTES`). It never resets the session, so a
   multi-file batch accumulates one finalize per file (DB-table selections
   survive). Log lines: `UPLOAD_INIT`, `FILE_SAVED via=gcs`, `UPLOAD_OK`, `UPLOAD_FINALIZE_UNSAFE_PATH`.
 
@@ -498,7 +510,10 @@ EXISTING same-named file WITHOUT running the detection pipeline:
 (.xlsx/.xlsm via openpyxl read_only — visible sheets, first non-empty row
 within the first 50 rows; .csv/.tsv — the header line). Behind
 `_require_chat`; parsing runs in the executor; any failure (unsupported
-format, no same-named file, parse error) returns `{ok: false}`. Served by the
+format, no same-named file, parse error, an `.xlsx`/`.xlsm` refused by the
+workbook check before openpyxl opens it) returns `{ok: false}`. The body is
+under the same `MAX_UPLOAD_BYTES` cap as `/upload`: above it,
+`413 {"error": "Upload too large", "max_bytes": N}`. Served by the
 client container only — nothing reaches the brain; cell values are never
 logged (filename + match/mismatch only).
 

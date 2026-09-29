@@ -31,6 +31,9 @@ Read these before you upgrade an existing install to this release.
   its Download button works.
 - The analysis sandbox now refuses jobs and reports unhealthy if a job leaves
   processes it cannot stop; restart the executor container to recover.
+- Uploads are limited: 100 MB per upload request (MAX_UPLOAD_BYTES) and, for
+  Excel workbooks, 500 MB uncompressed, 100:1 compression per part and 20
+  million cells; a workbook over a limit is refused with a message.
 
 ## 1. Get the images
 
@@ -95,9 +98,27 @@ Edit `client.env` and fill in:
 `BRAIN_URL` is pre-filled and `DATA_ROOT=/data/client` should stay as-is.
 `GCS_UPLOAD_BUCKET` is optional and should stay **unset**: it exists only for
 PowerDataChat's own cloud-hosted demo (an ingress with a request-body cap);
-on your installation every upload goes straight to the container, with no
-size threshold.
+on your installation every upload goes straight to the container.
 **Never commit or share the filled-in `client.env`.**
+
+**Upload limits.** Four optional settings in `client.env` bound what one
+upload can cost the web container:
+
+| Setting | Default | What it limits |
+|---|---|---|
+| `MAX_UPLOAD_BYTES` | `104857600` (100 MB) | The whole body of one upload request, all files together. A larger request is refused with `413`. |
+| `XLSX_MAX_UNCOMPRESSED_MB` | `500` | The total size an `.xlsx`/`.xlsm` expands to. The app measures it before opening the workbook. |
+| `XLSX_MAX_COMPRESSION_RATIO` | `100` | How far one part of a workbook (over 1 MB) may expand, as a ratio to its compressed size. |
+| `XLSX_MAX_CELLS` | `20000000` | The cell count the workbook's sheets declare (best effort: a sheet may not declare it). |
+
+A workbook over a limit is not loaded; the user sees "This workbook exceeds
+the size limits and was not loaded."
+
+Size these to your memory. Reading a workbook costs roughly 5 to 6 times its
+uncompressed size in memory. At the default of 500 MB one workbook can
+therefore need about 3 GB, against the web container's 4 GB `mem_limit`.
+Either lower `XLSX_MAX_UNCOMPRESSED_MB` (about 150 is a safe value for the
+shipped 4 GB) or raise `mem_limit` to match.
 
 Two more settings are worth knowing about, both optional:
 
@@ -642,6 +663,15 @@ proxy_read_timeout 900s;
 
 Set it comfortably above `EXECUTOR_QUEUE_MAX_S`, or lower that setting to fit
 the timeout you already have.
+
+**Let the proxy accept a full upload.** The application refuses an upload
+request above `MAX_UPLOAD_BYTES` (100 MB by default). Set the proxy's own
+body limit at least that high, or users get the proxy's error instead of the
+application's. In nginx:
+
+```
+client_max_body_size 100m;
+```
 
 **Pass the application's security headers through unchanged.** Every page
 carries a `Content-Security-Policy` header with a value that changes on each

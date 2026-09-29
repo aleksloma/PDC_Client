@@ -143,6 +143,22 @@ Diagnostic env flags (see `.env.example`):
 A failed brain call always logs its HTTP status + body snippet (~2000 chars)
 regardless of `CLIENT_LLM_DEBUG` — an API rejection is never silently swallowed.
 
+Upload limits (see `CUSTOMER_INSTALL.md` §2, "Upload limits"; a value that
+does not parse falls back to the default):
+
+| Var | Purpose |
+|---|---|
+| `MAX_UPLOAD_BYTES` | Body cap of `POST /upload` and `POST /api/chat/{id}/probe_columns` (default `104857600` = 100 MiB, minimum 1 MiB). Above it: `413 {"error": "Upload too large", "max_bytes": N}`, logged `UPLOAD_TOO_LARGE`. The direct-to-GCS path keeps its own 500 MB cap. |
+| `XLSX_MAX_UNCOMPRESSED_MB` | Measured total an `.xlsx`/`.xlsm` may expand to before it is parsed (default `500`). |
+| `XLSX_MAX_COMPRESSION_RATIO` | Largest expansion ratio of one archive entry over 1 MB (default `100`). |
+| `XLSX_MAX_CELLS` | Largest cell count the sheets' `<dimension>` declare (default `20000000`, best effort). |
+
+A refused workbook reads "This workbook exceeds the size limits and was not
+loaded." and logs `XLSX_ARCHIVE_REJECTED reason=…`. Parsing costs roughly 5–6×
+the uncompressed XML in memory, so the 500 MB default can need about 3 GB in
+the web container (compose `mem_limit` 4g). Lower
+`XLSX_MAX_UNCOMPRESSED_MB` (about 150) or raise the memory to match.
+
 Sign-in and session settings (see `client.env.example`; a value that does not
 parse falls back to the default instead of stopping the boot):
 
