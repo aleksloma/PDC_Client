@@ -162,6 +162,13 @@ particular it has not run the secret self-check. Under its own start command
 the startup hook always runs, so this is a guard against being driven in a way
 that skips it rather than an expected response.
 
+`503 EXECUTOR_UNHEALTHY`, same body shape, means a previous job left
+processes the service could not stop (§7). The service refuses every job
+with it until the container is restarted. The web service reports it as
+`ExecutorError: the analysis service rejected the job (EXECUTOR_UNHEALTHY)`,
+an infrastructure error, so the chat answers "not available" without asking
+the brain for a rewrite.
+
 Input paths must match `in/<name>` with a plain name, resolve inside the job
 directory, be regular files and carry a known format — checked in the route
 before anything spawns and again in `read_inputs`, because a pickle is
@@ -251,7 +258,7 @@ matrix of scalars, numpy types, keys and container shapes.
 | `ok` / `error` | the job ran; `error` means the code raised or a guard refused | the payload, key for key as today |
 | `timeout` | the job exceeded `timeout_s`, including time spent queued INSIDE this service | `TimeoutError: Code execution exceeded N seconds limit` — byte-identical to the in-process text |
 | `killed` | a SIGKILL the executor did not send, i.e. the cgroup out-of-memory killer | `MemoryError: execution exceeded the memory limit` |
-| `crashed` | any other abnormal exit: a segfault, a failed import, or exit 0 with an unusable response | `ExecutorCrashError: the analysis process exited unexpectedly (…)` |
+| `crashed` | any other abnormal exit: a segfault, a failed import, exit 0 with an unusable response, or (only with `EXECUTOR_MAX_CONCURRENT` > 1) a runner killed by a sibling job's process sweep, reported with `reason: "signal"` (§7) | `ExecutorCrashError: the analysis process exited unexpectedly (…)` |
 
 `killed` and `crashed` are separate on purpose. Reporting a segfault as a
 memory error tells the model to optimise memory after a crash it cannot fix,
@@ -318,7 +325,12 @@ running two separate jobs and reading the first one's file back from the
 second.
 
 `/tmp` is a single world-writable directory on a tmpfs; every job runs as the
-same user and only a restart clears it. The jobs volume's ROOT is
+same user and only a restart clears it. Each job now gets its own scratch
+directory for the DEFAULT temp and cache locations (see "Per-job scratch"
+below), removed after the job, so a library that writes to `$TMPDIR` or
+`$HOME` no longer leaves anything for the next job. That removes the default
+locations, not the reach: a job can still name an absolute path in `/tmp`,
+and the `/tmp` root stays writable by the job uid. The jobs volume's ROOT is
 group-writable — necessarily, since this service deletes its own finished job
 directories — so a job can write straight into it, and that volume is
 disk-backed, visible from the web container, and survives restarts and image
@@ -362,7 +374,8 @@ can deposit on the way out, so read that property as applying to the input
 path and treat both locations as scratch space shared between consecutive
 analyses. Closing it properly needs a private scratch namespace or a distinct
 identity per job: redirecting the temporary directory would not, because
-generated code can name an absolute path, and the jobs root cannot be made
+generated code can name an absolute path (the per-job scratch below is that
+redirect, and no more), and the jobs root cannot be made
 unwritable without disabling this service's own cleanup.
 
 **Raising `EXECUTOR_MAX_CONCURRENT` forfeits guarantees, it does not just add
@@ -370,8 +383,11 @@ throughput.** Generated code keeps filesystem access and every job runs as the
 same user, so with two jobs in flight one can read the other's inputs during
 its load window, plant a symlink where the other's result will be written, or
 signal its process. The stray sweep, which is what catches a job that detaches
-itself, is also skipped while a sibling job is running — so a leaked pipe can
-additionally cost a job its response. Concurrency above one is only defensible
+itself, runs at every setting: with a sibling in flight it logs
+`EXEC_STRAY_SWEEP_CONCURRENT` and kills the sibling's runner too, because
+skipping it would let one job's escapee run on into the next user's job. The
+killed sibling answers `crashed` with `reason: "signal"` — never `killed`,
+which keeps meaning only a SIGKILL the service did not send. Concurrency above one is only defensible
 with a separate identity per job, which this service does not do. Treat the
 default as part of the design.
 
@@ -389,7 +405,9 @@ field has a default, so nothing else would have failed loudly.
 — the five library versions the web service needs to detect an image mismatch
 between the two containers. **It answers while a job runs**: the job wait is
 on a worker thread, never on the event loop, so a health check cannot be
-starved by a 120-second render.
+starved by a 120-second render. Once the service is unhealthy (below) it
+answers `503 {"ok": false, "unhealthy": "stray_processes", "version",
+"build_time"}` instead, with no `versions`.
 
 **Each job runs in a fresh subprocess** started with `python -I -u` in a new
 session, with an environment built from scratch as an allowlist — so even a
@@ -414,6 +432,35 @@ the service's own user at that moment — a Docker `HEALTHCHECK` probe, or an
 operator's `docker exec`. A single killed probe is absorbed by the health
 check's retries; an interactive command may simply die mid-job. That is the
 cost of guaranteeing no process of the job survives it.
+
+**The sweep repeats until the uid is clean.** One snapshot of `/proc` is not
+enough: a process forked after it was taken would survive into the next
+user's job. So the sweep kills, pauses 0.25 s and looks again, up to 10
+passes, until a full pass finds no live process of the job uid other than
+the service and its parent. Zombie and dead entries do not count; they run
+nothing. Each kill logs `EXEC_STRAY_KILLED pid=<n>`.
+
+**If the passes run out, the service latches unhealthy.** It logs
+`EXECUTOR_UNHEALTHY reason=stray_processes` once. From then on `/execute`
+answers `503 EXECUTOR_UNHEALTHY` to every job and `/healthz` answers 503, so
+the container's Docker healthcheck reports it unhealthy. Nothing clears the
+latch but a restart, and nothing restarts the container automatically: the
+operator runs `docker compose restart executor`. Refusing is the point — a
+survivor could otherwise read the next user's input frames.
+
+**Per-job scratch.** Each job gets a fresh mode-0700 directory
+`/tmp/pdcjob-<job_id>`, created before the runner starts and removed after
+the job (`EXEC_SCRATCH_REMOVE_FAILED` when that fails). `TMPDIR`, `TMP`,
+`TEMP`, `HOME` and `XDG_CACHE_HOME` point at it, and `MPLCONFIGDIR` at its
+`mpl` subdirectory. matplotlib's font cache is built once at startup into
+`/tmp/pdc-mpl-template` (`EXEC_MPL_TEMPLATE_FAILED` if that fails; each job
+then builds its own). The service records each template file's size and
+SHA-256 at warm-up and copies into a job's scratch only files that still
+match. The template is writable by the job uid, so a changed file is skipped,
+and `EXEC_MPL_TEMPLATE_TAMPERED` is logged once. Residuals, stated: jobs
+still run as the service's uid, the template and the `/tmp` root remain
+writable by that uid, and an absolute path in `/tmp` is still reachable by a
+job. The scratch removes the default locations, not the identity.
 
 Abandoned job directories older than five minutes are removed at startup and
 every minute. The web service owns the normal deletion; this only covers a web
@@ -455,7 +502,12 @@ time, exit code, `reason`, and `stderr_len` / `stdout_len`, with the job id as
 the session id. There is no `EXEC_JOB_STDERR` line any more. The full error,
 traceback, stderr and stdout still travel in the response (§4); the web
 service's `EXEC_ERROR` / `EXEC_TIMEOUT` line is the durable record. The process sweep logs
-`EXEC_STRAY_KILLED`, and the orphan sweep `EXEC_ORPHAN_REMOVED` for an
+`EXEC_STRAY_KILLED`, `EXEC_STRAY_SWEEP_CONCURRENT` when it runs with a sibling
+job in flight, and `EXECUTOR_UNHEALTHY reason=stray_processes` (once) when
+its passes ran out (§7). The per-job scratch adds
+`EXEC_SCRATCH_REMOVE_FAILED`, `EXEC_MPL_TEMPLATE_FAILED`,
+`EXEC_MPL_TEMPLATE_COPY_FAILED` and `EXEC_MPL_TEMPLATE_TAMPERED` (once).
+The orphan sweep logs `EXEC_ORPHAN_REMOVED` for an
 abandoned job directory and `EXEC_STRAY_ENTRY_REMOVED kind=file|dir|link|other`
 for something generated code left in the jobs root (with
 `EXEC_STRAY_ENTRY_REMOVE_FAILED` when it cannot). At startup the service
@@ -582,7 +634,10 @@ another wait for a slot. A `TimeoutError`, a `MemoryError` and a
 write cheaper code — and neither is a crash the generated code caused
 (`reason=exit` or `reason=signal`), for the same reason. That carve-out
 applies only to a text that STARTS with `ExecutorCrashError`: another
-`Executor*` text that merely quotes `reason=exit` stays infrastructure. Without this split
+`Executor*` text that merely quotes `reason=exit` stays infrastructure. A
+runner killed by a sibling job's sweep (only with `EXECUTOR_MAX_CONCURRENT`
+> 1, §7) also carries `reason=signal`, so it is retried like a code crash.
+Without this split
 one unreachable sandbox turned a single question into three pro-tier planner
 calls and three further waits.
 
@@ -599,6 +654,13 @@ before any HTTP timeout applies, which would block the event loop and fail
 the container's own health probe at the exact moment the field exists to
 report. `/health` therefore stays 200 with `executor_reachable: false`, and
 an operator must not read a healthy container as a working stack.
+
+An UNHEALTHY sandbox (§7) is not reliably shown there. Its `/healthz` 503
+makes the background probe read `false`, but a dispatch's `503
+EXECUTOR_UNHEALTHY` is still an HTTP answer and reads `true`, so the field
+can flip between the two. `docker compose ps executor` and the
+`EXECUTOR_UNHEALTHY` line in `docker logs pdc-executor` are the reliable
+signs.
 
 **A job directory the sandbox locked.** Generated code can `chmod` a
 directory it created under `out/`. The sandbox's own sweep opens the modes

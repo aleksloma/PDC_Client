@@ -29,6 +29,8 @@ Read these before you upgrade an existing install to this release.
 - Chart PNG download renders only charts stored by the server; a chart shown
   in a browser tab opened before the upgrade may need a page reload before
   its Download button works.
+- The analysis sandbox now refuses jobs and reports unhealthy if a job leaves
+  processes it cannot stop; restart the executor container to recover.
 
 ## 1. Get the images
 
@@ -693,6 +695,20 @@ responses, and do not rewrite the header.
   then ask one question in `/lab` that produces a number or a chart. That is
   the only check that exercises the whole path: a table is written to the jobs
   volume, the sandbox runs the code, and the result comes back.
+
+- **An `unhealthy` executor.** After every job the sandbox stops any process
+  the job left running. If one survives every attempt, the sandbox logs
+  `EXECUTOR_UNHEALTHY` in `docker logs pdc-executor`, refuses every further
+  job, and `docker compose ps executor` shows it `unhealthy`. Users see "The
+  analysis service is not available right now." Nothing restarts it for you.
+  Recover with:
+
+  ```
+  docker compose restart executor
+  ```
+
+  `executor_reachable` on `/health` is not a reliable sign of this state:
+  it can read `true`, because the sandbox still answers.
 
 ## What leaves your network
 

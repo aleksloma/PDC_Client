@@ -39,7 +39,10 @@ sandbox, and a customer install is two containers on a private Docker network
 **multi-container revision**: the sandbox is a sidecar of the web container,
 started first (`run.googleapis.com/container-dependencies: {"web":["executor"]}`,
 with an HTTP startup probe on the sandbox's `/healthz`), and the two exchange
-job files through an in-memory volume.
+job files through an in-memory volume. There is no liveness probe, so a
+sandbox that latched unhealthy (`EXECUTOR_UNHEALTHY` in its log: a job left
+processes it could not stop) keeps refusing jobs until its instance is
+replaced — deploy a new revision to recover.
 
 | Setting | `web` | `executor` |
 |---|---|---|

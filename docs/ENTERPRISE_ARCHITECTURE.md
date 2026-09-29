@@ -87,6 +87,16 @@ both sides sweep abandoned job directories after five minutes, every minute,
 skipping jobs still in flight; the sandbox locks the job directories it owns
 at startup. Article XIV's "stash lasts about five minutes" follows from this.
 
+*Amendment 2026-09-29 (stray processes and scratch).* Rationale: one `/proc`
+snapshot let a process forked after it survive into the next user's job.
+Impact: the sandbox's same-uid sweep repeats until the uid is clean (at most
+10 passes), runs at every concurrency setting, and on failure latches the
+sandbox unhealthy (`/healthz` and `/execute` 503 `EXECUTOR_UNHEALTHY`) until
+the operator restarts it. Each job gets a private scratch directory for the
+default temp and cache locations; the `/tmp` root stays shared by the job uid.
+Article XIV property 5, its "One job at a time" rule and its honest limits
+record this.
+
 `docs/AI_CONSTITUTION.md` Article XIV is the normative version of this
 boundary, and `docs/EXECUTOR_PROTOCOL.md` is the field-level contract between
 the two containers.
