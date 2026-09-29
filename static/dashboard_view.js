@@ -1047,7 +1047,7 @@
       const logout = document.getElementById('btnLogout');
       if (logout) {
         logout.addEventListener('click', async () => {
-          try { await pdcFetch('/auth/logout', { method: 'POST' }); } catch (_) {}
+          try { await pdcFetch('/auth/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' } }); } catch (_) {}
           window.location.href = '/';
         });
       }

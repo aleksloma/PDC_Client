@@ -66,6 +66,7 @@ import db_sources
 import local_store
 import roles_store
 from settings import settings
+from tests.conftest import csrf_form
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -142,7 +143,7 @@ def _client():
 
 def _signed_in(email, password, expect="/lab"):
     tc = _client()
-    r = tc.post("/auth/login", data={"email": email, "password": password},
+    r = tc.post("/auth/login", data=csrf_form(tc, {"email": email, "password": password}),
                 follow_redirects=False)
     assert r.status_code == 302, (r.status_code, r.text[:300])
     assert r.headers["location"] == expect, r.headers["location"]
@@ -1134,6 +1135,7 @@ def test_forced_password_change_racing_a_removal_writes_nothing_and_redirects_ho
     store.ensure_user(FORCED)
     store.set_password(FORCED, FORCED_PW, force_change=True)
     tc = _signed_in(FORCED, FORCED_PW, expect="/auth/change_password")
+    form = csrf_form(tc, {"new_password": HIJACK_NEW_PW, "confirm_password": HIJACK_NEW_PW})
 
     orig = auth_mod.password_rule_error
     calls = []
@@ -1143,9 +1145,7 @@ def test_forced_password_change_racing_a_removal_writes_nothing_and_redirects_ho
         local_store.AuthStore().remove_user(FORCED)
         return orig(password)
     monkeypatch.setattr(auth_mod, "password_rule_error", racing)
-    r = tc.post("/auth/change_password",
-                data={"new_password": HIJACK_NEW_PW, "confirm_password": HIJACK_NEW_PW},
-                follow_redirects=False)
+    r = tc.post("/auth/change_password", data=form, follow_redirects=False)
     monkeypatch.setattr(auth_mod, "password_rule_error", orig)
     assert calls, "the race seam was never reached"
     assert r.status_code in (302, 303), (r.status_code, r.text[:300])
@@ -1180,10 +1180,10 @@ def test_a_sign_in_racing_a_removal_starts_no_session(world, monkeypatch):
     profile back) and the client holds no session."""
     tmp = world["tmp"]
     tc = _client()
+    form = csrf_form(tc, {"email": USER, "password": USER_PW})
     calls = []
     restore = _race(monkeypatch, "verify_password", after=True, calls=calls)
-    r = tc.post("/auth/login", data={"email": USER, "password": USER_PW},
-                follow_redirects=False)
+    r = tc.post("/auth/login", data=form, follow_redirects=False)
     restore()
     assert calls, "the race seam was never reached"
     assert r.status_code == 401, (r.status_code, r.headers.get("location"), r.text[:200])
@@ -1203,10 +1203,10 @@ def test_a_self_registration_racing_a_removal_answers_the_neutral_failure(world,
     tmp = world["tmp"]
     monkeypatch.setattr(settings, "ALLOW_SELF_REGISTRATION", True)
     tc = _client()
+    form = csrf_form(tc, {"email": SELFREG, "password": "Selfreg-passw0rd-1"})
     calls = []
     restore = _race(monkeypatch, "ensure_user", after=True, calls=calls)
-    r = tc.post("/auth/login", data={"email": SELFREG, "password": "Selfreg-passw0rd-1"},
-                follow_redirects=False)
+    r = tc.post("/auth/login", data=form, follow_redirects=False)
     restore()
     assert calls, "the race seam was never reached"
     assert r.status_code == 401, (r.status_code, r.headers.get("location"), r.text[:200])

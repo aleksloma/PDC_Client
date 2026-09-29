@@ -45,6 +45,8 @@ import subprocess
 import httpx
 import pytest
 
+from tests.conftest import JSON_HEADERS, csrf_form
+
 STACK_URL_ENV = "PDC_STACK_URL"
 STACK_BRAIN_ENV = "PDC_STACK_BRAIN"
 WEB_CONTAINER = "pdc-client"
@@ -256,8 +258,8 @@ def session(base_url, account):
     client = httpx.Client(base_url=base_url, follow_redirects=True,
                           timeout=REQUEST_TIMEOUT_S)
     response = client.post("/auth/login",
-                           data={"email": account["email"],
-                                 "password": account["password"]})
+                           data=csrf_form(client, {"email": account["email"],
+                                                   "password": account["password"]}))
     status = response.status_code
     assert status == 200, (
         f"login for {account['email']} failed: {status} {response.text[:300]}")
@@ -331,7 +333,7 @@ def chat(session, repo_root, session_scoped_chat_ids,
     too — which is what makes the deterministic sandbox probes runnable
     without an LLM.
     """
-    reset = session.post("/new_session")
+    reset = session.post("/new_session", headers=JSON_HEADERS)
     assert reset.status_code == 200, (reset.status_code, reset.text[:300])
     # Recorded here, and again after the upload: the id rotates on
     # `/new_session`, and every value it held owns a directory.

@@ -28,6 +28,7 @@ from starlette.testclient import TestClient
 
 import local_store
 from settings import settings
+from tests.conftest import csrf_form
 
 OWNER = "owner@acme.com"
 FRIEND = "friend@acme.com"
@@ -87,6 +88,12 @@ def app_client(tmp_path, monkeypatch):
     app.include_router(auth_mod.router)
     app.include_router(chat_mod.router)
     app.include_router(dash_mod.router)
+
+    @app.get("/")
+    async def _landing(request: Request):
+        # The real app's landing mints the form token (tests.conftest.csrf_form).
+        auth_mod.csrf_token(request)
+        return {"ok": True}
 
     @app.post("/_login/{email}")
     async def _login(request: Request, email: str):
@@ -163,7 +170,8 @@ def test_share_to_an_unknown_address_creates_a_placeholder(app_client, route):
 def test_placeholder_address_cannot_be_claimed_at_first_sign_in(app_client, route):
     assert _share_via(route, app_client, [NEWBIE]).status_code == 200
     stranger = TestClient(app_client["app"])
-    r = stranger.post("/auth/login", data={"email": NEWBIE, "password": "attacker-pw"},
+    r = stranger.post("/auth/login",
+                      data=csrf_form(stranger, {"email": NEWBIE, "password": "attacker-pw"}),
                       follow_redirects=False)
     assert r.status_code == 401, (r.status_code, r.headers.get("location"))
     assert NEUTRAL_FAILURE in r.text
@@ -179,7 +187,8 @@ def test_share_leaves_an_existing_account_untouched(app_client, route):
     assert _share_via(route, app_client, [EXISTING]).status_code == 200
     assert _profile_path(tmp, EXISTING).read_text(encoding="utf-8") == before
     other = TestClient(app_client["app"])
-    r = other.post("/auth/login", data={"email": EXISTING, "password": EXISTING_PW},
+    r = other.post("/auth/login",
+                   data=csrf_form(other, {"email": EXISTING, "password": EXISTING_PW}),
                    follow_redirects=False)
     assert r.status_code == 302, r.text[:200]
 
@@ -233,7 +242,8 @@ def test_a_legacy_email_only_profile_gets_the_neutral_refusal(app_client):
     path.write_text(json.dumps({"email": legacy, "created_at": "2025-01-01T00:00:00Z"}),
                     encoding="utf-8")
     stranger = TestClient(app_client["app"])
-    r = stranger.post("/auth/login", data={"email": legacy, "password": "typed-pw"},
+    r = stranger.post("/auth/login",
+                      data=csrf_form(stranger, {"email": legacy, "password": "typed-pw"}),
                       follow_redirects=False)
     assert r.status_code == 401
     assert NEUTRAL_FAILURE in r.text
@@ -258,9 +268,11 @@ def test_every_sign_in_failure_renders_the_same_page(app_client):
     lp.write_text(json.dumps({"email": legacy, "created_at": "2025-01-01T00:00:00Z"}),
                   encoding="utf-8")
 
+    # One browser for every case: one session, so one form token in each page.
+    tc = TestClient(app_client["app"])
+
     def attempt(email, password):
-        tc = TestClient(app_client["app"])
-        r = tc.post("/auth/login", data={"email": email, "password": password},
+        r = tc.post("/auth/login", data=csrf_form(tc, {"email": email, "password": password}),
                     follow_redirects=False)
         # The typed address is echoed into the form; neutralise it so only
         # the refusal itself is compared.

@@ -725,6 +725,60 @@ class UploadByteCap:
         await self.app(scope, counted_receive, send)
 
 
+# The four HTML forms (their POSTs are form-encoded and carry a session-bound
+# CSRF token, checked by routes/auth.py) and the two multipart upload routes.
+_FORM_POST_PATHS = frozenset({"/auth/login", "/auth/reset_password", "/auth/change_password"})
+_FORM_POST_PREFIX = "/auth/reset/"
+_STATE_CHANGING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_MEDIA_REFUSED: set = set()
+
+
+class JsonContentTypeGate:
+    """Pure ASGI CSRF control for everything that is not an HTML form.
+
+    A cross-site page can send a POST with a "simple" content type
+    (text/plain, form-encoded, multipart) without a CORS preflight, and the
+    browser attaches the cookie wherever SameSite allows it. So every
+    state-changing request must declare `application/json` — a type a
+    cross-site page cannot send without a preflight this app never answers —
+    except the four HTML forms (form-encoded, token-checked in routes/auth.py)
+    and the two multipart upload routes. Anything else: 415, logged once per
+    path.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("method") not in _STATE_CHANGING:
+            await self.app(scope, receive, send)
+            return
+        path = _routed_path(scope)
+        ctype = ""
+        for name, value in scope.get("headers") or []:
+            if name == b"content-type":
+                ctype = value.decode("latin-1").split(";", 1)[0].strip().lower()
+        if path in _FORM_POST_PATHS or path.startswith(_FORM_POST_PREFIX):
+            allowed = ctype in ("application/x-www-form-urlencoded", "multipart/form-data")
+        elif _UPLOAD_CAP_PATH_RE.match(path):
+            allowed = ctype == "multipart/form-data"
+        else:
+            allowed = ctype == "application/json"
+        if allowed:
+            await self.app(scope, receive, send)
+            return
+        if path not in _MEDIA_REFUSED and len(_MEDIA_REFUSED) < 1000:
+            _MEDIA_REFUSED.add(path)
+            log_with_sid("csrf", "warning",
+                         f"CSRF_MEDIA_TYPE_REFUSED path={log_safe_text(path, 200)} "
+                         f"content_type={log_safe_text(ctype or '-', 80)}")
+        body = json.dumps({"error": "Unsupported Media Type"}).encode()
+        await send({"type": "http.response.start", "status": 415,
+                    "headers": [(b"content-type", b"application/json"),
+                                (b"content-length", str(len(body)).encode())]})
+        await send({"type": "http.response.body", "body": body})
+
+
 # The absolute session lifetime (seconds): RememberMeSessionMiddleware's cap.
 _REMEMBER_ME_MAX_AGE = settings.REMEMBER_ME_MAX_DAYS * 86400
 
@@ -742,6 +796,9 @@ app.add_middleware(RememberMeSessionMiddleware, secret_key=settings.SECRET_KEY,
 # Outside the session (needs none): an oversized upload is refused before a
 # session is unsigned or the multipart body is parsed.
 app.add_middleware(UploadByteCap)
+# Outside the session too: a state-changing request of the wrong media type
+# never reaches a session or a route.
+app.add_middleware(JsonContentTypeGate)
 # Inside the guard, outside the session: adds the page policy to every HTML
 # response (and so also covers the password gate and the session layer).
 app.add_middleware(ContentSecurityPolicy)
@@ -787,12 +844,14 @@ async def landing(request: Request):
         return RedirectResponse(url="/auth/microsoft", status_code=302)
     info = ("Your password has been updated. Sign in with it."
             if request.query_params.get("reset") == "done" else None)
+    from routes.auth import csrf_token
     return templates.TemplateResponse(
         request,
         "auth_landing.html",
         {"request": request, "error": None, "password_error": None,
          "info": info, "email": "", "sso_enabled": sso_enabled,
-         "self_registration": bool(settings.ALLOW_SELF_REGISTRATION)},
+         "self_registration": bool(settings.ALLOW_SELF_REGISTRATION),
+         "csrf": csrf_token(request)},
     )
 
 

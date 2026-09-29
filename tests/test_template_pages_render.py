@@ -32,6 +32,7 @@ import app as app_mod
 import brain_client
 import local_store
 from settings import settings
+from tests.conftest import csrf_form
 
 EMAIL = "render-user@x.com"
 PASSWORD = "render-pw-123"
@@ -66,7 +67,7 @@ def client(tmp_path, monkeypatch):
 
 
 def _login(client, email, password):
-    r = client.post("/auth/login", data={"email": email, "password": password},
+    r = client.post("/auth/login", data=csrf_form(client, {"email": email, "password": password}),
                     follow_redirects=False)
     assert r.status_code == 302, (r.status_code, r.text[:300])
     return r
@@ -130,7 +131,7 @@ def test_change_password_error_rerenders_html_with_400(client, form, expected_er
     template with the error text and status 400 — the second TemplateResponse
     site in routes/auth.py (the `_page` closure with `status_code=`)."""
     _login(client, TEMP_EMAIL, TEMP_PASSWORD)
-    r = client.post("/auth/change_password", data=form, follow_redirects=False)
+    r = client.post("/auth/change_password", data=csrf_form(client, form), follow_redirects=False)
     _assert_html(r, 400, CHANGE_PASSWORD_MARKER)
     text = r.text
     assert expected_error in text, text[:300]
@@ -174,7 +175,7 @@ def test_reset_link_error_rerenders_html_with_400(client):
     failure consumes nothing)."""
     token = _mint_reset_token(EMAIL)
     r = client.post(f"/auth/reset/{token}",
-                    data={"new_password": "abcd-1234", "confirm_password": "abcd-9999"},
+                    data=csrf_form(client, {"new_password": "abcd-1234", "confirm_password": "abcd-9999"}),
                     follow_redirects=False)
     _assert_html(r, 400, RESET_MARKER)
     text = r.text

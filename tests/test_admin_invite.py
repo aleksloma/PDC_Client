@@ -40,6 +40,7 @@ import db_sources
 import local_store
 import roles_store
 from settings import settings
+from tests.conftest import csrf_form
 
 ADMIN = "ladmin"
 USER = "user@corp.example"
@@ -90,6 +91,12 @@ def world(tmp_path, monkeypatch):
     app.add_middleware(SessionMiddleware, secret_key="test-secret")
     app.include_router(users_mod.router)
     app.include_router(auth_mod.router)
+
+    @app.get("/")
+    async def _landing(request: Request):
+        # The real app's landing mints the form token (tests.conftest.csrf_form).
+        auth_mod.csrf_token(request)
+        return {"ok": True}
 
     @app.post("/_login/{email}")
     async def _login(request: Request, email: str):
@@ -159,8 +166,9 @@ def test_the_invite_mail_is_of_kind_invite(world):
 
 def test_a_reset_requested_by_the_invitee_is_of_kind_reset(world):
     assert _invite(world, INVITEE).status_code == 200
-    r = world["client"]().post("/auth/reset_password", data={"email": INVITEE},
-                               follow_redirects=False)
+    tc = world["client"]()
+    r = tc.post("/auth/reset_password", data=csrf_form(tc, {"email": INVITEE}),
+                follow_redirects=False)
     assert r.status_code == 200
     assert len(world["sent_kwargs"]) == 2, world["sent_kwargs"]
     assert world["sent_kwargs"][-1].get("kind", "reset") == "reset", world["sent_kwargs"]
@@ -189,19 +197,22 @@ def test_the_invitee_signs_in_through_the_link(world):
     token = world["sent"][-1][1].rsplit("/", 1)[1]
     tc = world["client"]()
     r = tc.post(f"/auth/reset/{token}",
-                data={"new_password": "Invitee-pw1", "confirm_password": "Invitee-pw1"},
+                data=csrf_form(tc, {"new_password": "Invitee-pw1",
+                                    "confirm_password": "Invitee-pw1"}),
                 follow_redirects=False)
     assert r.status_code == 302 and r.headers["location"] == "/?reset=done"
-    login = world["client"]().post("/auth/login",
-                                   data={"email": INVITEE, "password": "Invitee-pw1"},
-                                   follow_redirects=False)
+    fresh = world["client"]()
+    login = fresh.post("/auth/login",
+                       data=csrf_form(fresh, {"email": INVITEE, "password": "Invitee-pw1"}),
+                       follow_redirects=False)
     assert login.status_code == 302 and login.headers["location"] == "/lab"
 
 
 def test_an_uninvited_address_cannot_sign_in_and_leaves_nothing(world):
-    r = world["client"]().post("/auth/login",
-                               data={"email": "stranger@corp.example", "password": "pw-123"},
-                               follow_redirects=False)
+    tc = world["client"]()
+    r = tc.post("/auth/login",
+                data=csrf_form(tc, {"email": "stranger@corp.example", "password": "pw-123"}),
+                follow_redirects=False)
     assert r.status_code == 401
     assert not (world["tmp"] / "users" / "stranger@corp.example").exists()
 
@@ -293,8 +304,9 @@ def test_a_failed_mail_still_answers_200_and_keeps_the_account(world):
     assert _profile(world["tmp"], INVITEE) is not None
     # The invitee can still ask for a link from the sign-in page.
     world["fail"]["on"] = False
-    again = world["client"]().post("/auth/reset_password", data={"email": INVITEE},
-                                   follow_redirects=False)
+    tc = world["client"]()
+    again = tc.post("/auth/reset_password", data=csrf_form(tc, {"email": INVITEE}),
+                    follow_redirects=False)
     assert again.status_code == 200
     assert [to for to, _ in world["sent"]] == [INVITEE]
 

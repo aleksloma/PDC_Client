@@ -17,6 +17,7 @@ import db_sources
 import local_store
 import sso_store
 from settings import settings
+from tests.conftest import csrf_form
 
 ADMIN = "ladmin"
 USER = "user@x.com"
@@ -448,7 +449,7 @@ def test_auto_redirect_and_local_escape(real_app_client):
     # An authenticated session never bounces to Microsoft.
     local_store.AuthStore().ensure_user(USER)
     local_store.AuthStore().set_password(USER, "pw12345")
-    r = tc.post("/auth/login", data={"email": USER, "password": "pw12345"},
+    r = tc.post("/auth/login", data=csrf_form(tc, {"email": USER, "password": "pw12345"}),
                 follow_redirects=False)
     assert r.status_code == 302
     r = tc.get("/", follow_redirects=False)

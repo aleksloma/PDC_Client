@@ -12,6 +12,7 @@ from starlette.testclient import TestClient
 
 import local_store
 from settings import settings
+from tests.conftest import csrf_form
 
 
 @pytest.fixture(autouse=True)
@@ -29,6 +30,13 @@ def client(monkeypatch):
     app = FastAPI()
     app.add_middleware(SessionMiddleware, secret_key="test-secret")
     app.include_router(auth_mod.router)
+
+    @app.get("/")
+    async def _landing(request: Request):
+        # The real app's landing mints the form token (tests.conftest.csrf_form).
+        auth_mod.csrf_token(request)
+        return {"ok": True}
+
     return TestClient(app)
 
 
@@ -91,7 +99,7 @@ def test_set_role_preserves_profile_keys(tmp_path):
 def test_login_accepts_ladmin_and_forces_change(client):
     local_store.AuthStore().ensure_local_admin()
     r = client.post("/auth/login",
-                    data={"email": "ladmin", "password": "boot-pw-123"},
+                    data=csrf_form(client, {"email": "ladmin", "password": "boot-pw-123"}),
                     follow_redirects=False)
     assert r.status_code == 302
     assert r.headers["location"] == "/auth/change_password"
@@ -99,7 +107,7 @@ def test_login_accepts_ladmin_and_forces_change(client):
 
 def test_login_still_rejects_non_email_for_others(client):
     r = client.post("/auth/login",
-                    data={"email": "notanemail", "password": "x"},
+                    data=csrf_form(client, {"email": "notanemail", "password": "x"}),
                     follow_redirects=False)
     assert r.status_code == 400
 
@@ -123,7 +131,7 @@ def test_reset_password_refuses_ladmin(client, monkeypatch):
     nothing minted (no reset token, no temp password), no mail attempted."""
     sent = _reset_seams(monkeypatch)
     local_store.AuthStore().ensure_local_admin()
-    r = client.post("/auth/reset_password", data={"email": "ladmin"},
+    r = client.post("/auth/reset_password", data=csrf_form(client, {"email": "ladmin"}),
                     follow_redirects=False)
     assert r.status_code == 400, r.status_code
     assert "Please enter a valid email" in r.text
@@ -140,7 +148,7 @@ def test_reset_password_for_an_email_shaped_ladmin_is_neutral(client, monkeypatc
     sent = _reset_seams(monkeypatch)
     monkeypatch.setattr(settings, "LOCAL_ADMIN_USERNAME", "admin@corp.example")
     local_store.AuthStore().ensure_local_admin()
-    r = client.post("/auth/reset_password", data={"email": "admin@corp.example"},
+    r = client.post("/auth/reset_password", data=csrf_form(client, {"email": "admin@corp.example"}),
                     follow_redirects=False)
     assert r.status_code == 200, r.status_code
     assert NEUTRAL_RESET in r.text
@@ -153,7 +161,7 @@ def test_reset_password_for_an_email_shaped_ladmin_is_neutral(client, monkeypatc
 def test_ladmin_login_without_bootstrap_password_gets_server_hint(client, monkeypatch):
     monkeypatch.setattr(settings, "LOCAL_ADMIN_PASSWORD", "")
     local_store.AuthStore().ensure_local_admin()
-    r = client.post("/auth/login", data={"email": "ladmin", "password": "x"},
+    r = client.post("/auth/login", data=csrf_form(client, {"email": "ladmin", "password": "x"}),
                     follow_redirects=False)
     assert r.status_code == 403
     assert b"LOCAL_ADMIN_PASSWORD" in r.content
@@ -164,7 +172,7 @@ def test_ladmin_login_lands_on_admin_page(client):
     straight to /admin/data_sources, never the /lab chat UI."""
     local_store.AuthStore().ensure_local_admin()
     local_store.AuthStore().set_password("ladmin", "final-pw")
-    r = client.post("/auth/login", data={"email": "ladmin", "password": "final-pw"},
+    r = client.post("/auth/login", data=csrf_form(client, {"email": "ladmin", "password": "final-pw"}),
                     follow_redirects=False)
     assert r.status_code == 302
     assert r.headers["location"] == "/admin/data_sources"
@@ -173,10 +181,10 @@ def test_ladmin_login_lands_on_admin_page(client):
 def test_ladmin_forced_change_lands_on_admin_page(client):
     """Completing the forced bootstrap change also targets the admin page."""
     local_store.AuthStore().ensure_local_admin()
-    client.post("/auth/login", data={"email": "ladmin", "password": "boot-pw-123"},
+    client.post("/auth/login", data=csrf_form(client, {"email": "ladmin", "password": "boot-pw-123"}),
                 follow_redirects=False)
     r = client.post("/auth/change_password",
-                    data={"new_password": "final-pw", "confirm_password": "final-pw"},
+                    data=csrf_form(client, {"new_password": "final-pw", "confirm_password": "final-pw"}),
                     follow_redirects=False)
     assert r.status_code == 302
     assert r.headers["location"] == "/admin/data_sources"
@@ -186,7 +194,7 @@ def test_normal_user_login_still_lands_on_lab(client):
     store = local_store.AuthStore()
     store.ensure_user("u@x.com")
     store.set_password("u@x.com", "user-pw")
-    r = client.post("/auth/login", data={"email": "u@x.com", "password": "user-pw"},
+    r = client.post("/auth/login", data=csrf_form(client, {"email": "u@x.com", "password": "user-pw"}),
                     follow_redirects=False)
     assert r.status_code == 302
     assert r.headers["location"] == "/lab"
@@ -195,7 +203,7 @@ def test_normal_user_login_still_lands_on_lab(client):
 def test_profile_exposes_is_local_admin_not_is_admin(client):
     local_store.AuthStore().ensure_local_admin()
     local_store.AuthStore().set_password("ladmin", "final-pw")
-    client.post("/auth/login", data={"email": "ladmin", "password": "final-pw"},
+    client.post("/auth/login", data=csrf_form(client, {"email": "ladmin", "password": "final-pw"}),
                 follow_redirects=False)
     prof = client.get("/auth/profile").json()
     assert prof["is_local_admin"] is True
@@ -228,7 +236,7 @@ def test_promoted_admin_login_lands_on_lab(client):
     store.set_password("promoted@x.com", "admin-pw")
     store.set_role("promoted@x.com", "admin")
     r = client.post("/auth/login",
-                    data={"email": "promoted@x.com", "password": "admin-pw"},
+                    data=csrf_form(client, {"email": "promoted@x.com", "password": "admin-pw"}),
                     follow_redirects=False)
     assert r.status_code == 302
     assert r.headers["location"] == "/lab"

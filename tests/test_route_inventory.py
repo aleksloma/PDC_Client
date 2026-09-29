@@ -30,6 +30,7 @@ import app as app_mod
 import brain_client
 import local_store
 from settings import settings
+from tests.conftest import csrf_form
 
 EXPECTED_ROUTES = [
     ('GET', '/'),
@@ -297,7 +298,7 @@ def flagged(tmp_path, monkeypatch):
 
     def login():
         tc.cookies.clear()
-        r = tc.post("/auth/login", data={"email": FLAGGED, "password": FLAGGED_PW},
+        r = tc.post("/auth/login", data=csrf_form(tc, {"email": FLAGGED, "password": FLAGGED_PW}),
                     follow_redirects=False)
         assert r.status_code == 302, r.text[:300]
         assert r.headers["location"] == "/auth/change_password"
@@ -305,6 +306,26 @@ def flagged(tmp_path, monkeypatch):
     login()
     yield {"client": tc, "login": login}
     local_store._DATAFRAME_CACHE.invalidate()
+
+
+# app.JsonContentTypeGate (outside the password gate) lets a state-changing
+# request through only with the media type its route takes: form-encoded for
+# the four HTML forms, multipart for the two upload routes, JSON elsewhere.
+# The walk sends each route that type, so the answer it judges is the
+# password gate's (or the route's), never the media-type 415.
+FORM_POST_PATHS = frozenset({"/auth/login", "/auth/reset_password", "/auth/change_password"})
+FORM_POST_PREFIX = "/auth/reset/"
+MULTIPART_POST_PATHS = frozenset({"/upload", "/api/chat/x/probe_columns"})
+
+
+def _body_kwargs(method: str, url: str) -> dict:
+    if method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return {}
+    if url in FORM_POST_PATHS or url.startswith(FORM_POST_PREFIX):
+        return {"data": {"x": "1"}}
+    if url in MULTIPART_POST_PATHS:
+        return {"files": {"files": ("t.csv", b"a,b\n1,2\n", "text/csv")}}
+    return {"json": {}}
 
 
 def _is_gate_refusal(r) -> bool:
@@ -321,8 +342,10 @@ def test_every_route_outside_the_open_set_is_refused_and_no_open_route_is(flagge
     wrong = []
     for method, path in _live_routes():
         url = _concrete(path)
-        kwargs = {"json": {}} if method in ("POST", "PUT", "PATCH", "DELETE") else {}
+        kwargs = _body_kwargs(method, url)
         r = tc.request(method, url, follow_redirects=False, **kwargs)
+        if r.status_code == 415:
+            wrong.append(("media type refused", method, path))
         refused = _is_gate_refusal(r)
         if _is_open(url):
             if refused:

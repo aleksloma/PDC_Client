@@ -42,6 +42,7 @@ import app as app_mod
 import brain_client
 import local_store
 from settings import settings
+from tests.conftest import JSON_HEADERS, csrf_form
 
 USER = "gen.user@corp.example"
 USER_PW = "Gen-user-passw0rd"
@@ -87,7 +88,7 @@ def _client():
 
 def _signed_in(email=USER, password=USER_PW, expect="/lab"):
     tc = _client()
-    r = tc.post("/auth/login", data={"email": email, "password": password},
+    r = tc.post("/auth/login", data=csrf_form(tc, {"email": email, "password": password}),
                 follow_redirects=False)
     assert r.status_code == 302, (r.status_code, r.text[:300])
     assert r.headers["location"] == expect, r.headers["location"]
@@ -182,7 +183,7 @@ def test_sign_in_stamps_the_generation_into_the_session(world):
 def test_sign_out_pops_the_generation(world):
     tc = _signed_in()
     assert "gen" in _session_of(tc), "sign-in stamped no generation"
-    r = tc.post("/auth/logout", follow_redirects=False)
+    r = tc.post("/auth/logout", headers=JSON_HEADERS, follow_redirects=False)
     assert r.status_code == 302
     _assert_cleared(r)
 
@@ -215,7 +216,7 @@ def test_a_forced_change_ends_the_other_sessions_and_keeps_the_changer(world):
     a = _signed_in(FORCED, FORCED_PW, expect="/auth/change_password")
     b = _signed_in(FORCED, FORCED_PW, expect="/auth/change_password")
     r = b.post("/auth/change_password",
-               data={"new_password": NEW_PW, "confirm_password": NEW_PW},
+               data=csrf_form(b, {"new_password": NEW_PW, "confirm_password": NEW_PW}),
                follow_redirects=False)
     assert r.status_code == 302, (r.status_code, r.text[:300])
     assert b.get("/auth/profile").status_code == 200, "the changing session was ended"
@@ -229,9 +230,10 @@ def test_a_used_reset_link_ends_every_session(world):
     b = _signed_in()
     token = local_store.AuthStore().create_reset_token(USER)
     assert token
-    r = _client().post(f"/auth/reset/{token}",
-                       data={"new_password": NEW_PW, "confirm_password": NEW_PW},
-                       follow_redirects=False)
+    tc = _client()
+    r = tc.post(f"/auth/reset/{token}",
+                data=csrf_form(tc, {"new_password": NEW_PW, "confirm_password": NEW_PW}),
+                follow_redirects=False)
     assert r.status_code == 302, (r.status_code, r.text[:300])
     for tc in (a, b):
         stale = tc.get("/auth/profile")

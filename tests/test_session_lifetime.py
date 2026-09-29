@@ -49,6 +49,7 @@ import app as app_mod
 import brain_client
 import local_store
 from settings import settings
+from tests.conftest import JSON_HEADERS, csrf_form
 
 USER = "life.user@corp.example"
 USER_PW = "Life-user-passw0rd"
@@ -105,7 +106,7 @@ def _sign_in(tc, remember=True, email=USER, password=USER_PW):
     data = {"email": email, "password": password}
     if remember:
         data["remember"] = "on"
-    r = tc.post("/auth/login", data=data, follow_redirects=False)
+    r = tc.post("/auth/login", data=csrf_form(tc, data), follow_redirects=False)
     assert r.status_code == 302, (r.status_code, r.text[:300])
     return r
 
@@ -260,7 +261,7 @@ def test_sign_out_pops_iat(world):
     tc = _client()
     _sign_in(tc)
     assert "iat" in _session_of(tc), "sign-in stamped no iat"
-    r = tc.post("/auth/logout", follow_redirects=False)
+    r = tc.post("/auth/logout", headers=JSON_HEADERS, follow_redirects=False)
     assert r.status_code == 302
     _assert_cleared(r)
 

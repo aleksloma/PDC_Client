@@ -13,6 +13,7 @@ import brain_client
 import local_store
 import roles_store
 from settings import settings
+from tests.conftest import JSON_HEADERS, csrf_form
 
 USER = "plain@x.com"
 POWER = "power@x.com"
@@ -42,7 +43,7 @@ def client(tmp_path, monkeypatch):
 
 
 def _login(client, email):
-    r = client.post("/auth/login", data={"email": email, "password": PW},
+    r = client.post("/auth/login", data=csrf_form(client, {"email": email, "password": PW}),
                     follow_redirects=False)
     assert r.status_code in (302, 303), (r.status_code, r.text)
     return r
@@ -134,7 +135,7 @@ def test_lab_dropdown_db_config_only_for_power_users(client):
     r = client.get("/lab")
     assert r.status_code == 200 and 'id="btnDbConfig"' in r.text
     assert 'data-target="/power/data_sources"' in r.text   # 19g: power keeps /power
-    client.post("/auth/logout")
+    client.post("/auth/logout", headers=JSON_HEADERS)
     _login(client, USER)
     r = client.get("/lab")
     assert r.status_code == 200 and 'id="btnDbConfig"' not in r.text
@@ -146,12 +147,12 @@ def test_profile_carries_is_power_user(client):
     assert prof["is_power_user"] is True
     assert prof["is_admin_user"] is False    # power is not admin (19g flag)
     assert "is_admin" not in prof            # the B2C Publish-menu trap stays shut
-    client.post("/auth/logout")
+    client.post("/auth/logout", headers=JSON_HEADERS)
     _login(client, USER)
     prof = client.get("/auth/profile").json()
     assert prof["is_power_user"] is False
     assert prof["is_admin_user"] is False
-    client.post("/auth/logout")
+    client.post("/auth/logout", headers=JSON_HEADERS)
     _login(client, ADMIN2)
     prof = client.get("/auth/profile").json()
     assert prof["is_admin_user"] is True     # promoted admin (19g)

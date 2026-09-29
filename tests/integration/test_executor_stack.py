@@ -38,6 +38,8 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 
+from tests.conftest import JSON_HEADERS
+
 from .conftest import (EXECUTOR_CONTAINER, WEB_CONTAINER, docker_available,
                        docker_exec, seed_code, session_id)
 
@@ -626,7 +628,7 @@ def test_an_upload_named_like_the_app_source_lands_in_the_session(
     written under the caller's upload session — the application source is
     byte-identical afterwards, and the bytes are where they belong."""
     before = _web_sha256(APP_SOURCE)
-    reset = session.post("/new_session")
+    reset = session.post("/new_session", headers=JSON_HEADERS)
     assert reset.status_code == 200, (reset.status_code, reset.text[:300])
     session_scoped_upload_sids.add(session_id(session))
 

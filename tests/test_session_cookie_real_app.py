@@ -23,6 +23,7 @@ from starlette.testclient import TestClient
 import app as app_mod
 import local_store
 from settings import settings
+from tests.conftest import JSON_HEADERS, csrf_form
 
 EMAIL = "cookie-user@x.com"
 PASSWORD = "S3cure-passw0rd!"
@@ -49,7 +50,7 @@ def client(tmp_path, monkeypatch):
 
 
 def _login(client):
-    return client.post("/auth/login", data={"email": EMAIL, "password": PASSWORD},
+    return client.post("/auth/login", data=csrf_form(client, {"email": EMAIL, "password": PASSWORD}),
                        follow_redirects=False)
 
 
@@ -83,7 +84,7 @@ def test_real_app_login_sets_a_secure_session_cookie(client):
 
 def test_real_app_logout_clear_cookie_is_also_secure(client):
     assert _login(client).status_code == 302
-    r = client.post("/auth/logout", follow_redirects=False)
+    r = client.post("/auth/logout", headers=JSON_HEADERS, follow_redirects=False)
     assert r.status_code == 302
     raw = r.headers["set-cookie"]
     flags = raw.lower()

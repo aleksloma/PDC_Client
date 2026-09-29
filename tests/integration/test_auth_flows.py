@@ -26,6 +26,8 @@ import secrets
 import httpx
 import pytest
 
+from tests.conftest import csrf_form
+
 from .conftest import (REQUEST_TIMEOUT_S, WEB_CONTAINER, _b64, docker_available,
                        docker_exec, precreate_account)
 
@@ -82,7 +84,7 @@ def _client(base_url):
 
 def _login(base_url, email, password):
     with _client(base_url) as c:
-        return c.post("/auth/login", data={"email": email, "password": password})
+        return c.post("/auth/login", data=csrf_form(c, {"email": email, "password": password}))
 
 
 def _normalise(text: str, email: str) -> str:
@@ -105,7 +107,8 @@ def used_token(base_url, reset_account):
     with _client(base_url) as c:
         page = c.get(f"/auth/reset/{token}")
         post = c.post(f"/auth/reset/{token}",
-                      data={"new_password": new_password, "confirm_password": new_password})
+                      data=csrf_form(c, {"new_password": new_password,
+                                         "confirm_password": new_password}))
     return {"token": token, "page": page, "post": post, "new_password": new_password}
 
 
@@ -140,7 +143,8 @@ def test_a_used_link_is_refused(base_url, used_token):
     with _client(base_url) as c:
         again = c.get(f"/auth/reset/{used_token['token']}")
         post = c.post(f"/auth/reset/{used_token['token']}",
-                      data={"new_password": "x-pw-12345", "confirm_password": "x-pw-12345"})
+                      data=csrf_form(c, {"new_password": "x-pw-12345",
+                                         "confirm_password": "x-pw-12345"}))
     assert again.status_code == 404 and INVALID_LINK in again.text
     assert post.status_code == 404
 
@@ -165,8 +169,8 @@ def test_unknown_and_known_reset_requests_answer_alike(base_url, session_scoped_
     unknown = f"integration-unknown-{secrets.token_hex(4)}@example.invalid"
     session_scoped_extra_emails.append(unknown)
     with _client(base_url) as c:
-        a = c.post("/auth/reset_password", data={"email": known})
-        b = c.post("/auth/reset_password", data={"email": unknown})
+        a = c.post("/auth/reset_password", data=csrf_form(c, {"email": known}))
+        b = c.post("/auth/reset_password", data=csrf_form(c, {"email": unknown}))
     assert (a.status_code, b.status_code) == (200, 200)
     assert NEUTRAL_RESET in a.text
     assert _normalise(a.text, known) == _normalise(b.text, unknown)
@@ -179,15 +183,18 @@ def test_a_reset_ends_a_session_that_was_already_open(base_url, session_scoped_e
     _require_docker()
     account = _new_account(session_scoped_extra_emails)
     with _client(base_url) as open_session:
-        signed_in = open_session.post("/auth/login", data={"email": account["email"],
-                                                           "password": account["password"]})
+        signed_in = open_session.post("/auth/login",
+                                      data=csrf_form(open_session,
+                                                     {"email": account["email"],
+                                                      "password": account["password"]}))
         assert signed_in.status_code == 302, (signed_in.status_code, signed_in.text[:300])
         assert open_session.get("/auth/profile").status_code == 200
         token = _mint(account["email"])
         new_password = f"new-{secrets.token_hex(8)}"
         with _client(base_url) as c:
             done = c.post(f"/auth/reset/{token}",
-                          data={"new_password": new_password, "confirm_password": new_password})
+                          data=csrf_form(c, {"new_password": new_password,
+                                             "confirm_password": new_password}))
         assert done.status_code == 302, (done.status_code, done.text[:300])
         after = open_session.get("/auth/profile")
     assert after.status_code == 401, (after.status_code, after.text[:300])
@@ -250,8 +257,8 @@ def test_an_sso_only_account_gets_the_neutral_answer_and_no_link(
     unknown = f"integration-unknown-{secrets.token_hex(4)}@example.invalid"
     session_scoped_extra_emails.append(unknown)
     with _client(base_url) as c:
-        a = c.post("/auth/reset_password", data={"email": email})
-        b = c.post("/auth/reset_password", data={"email": unknown})
+        a = c.post("/auth/reset_password", data=csrf_form(c, {"email": email}))
+        b = c.post("/auth/reset_password", data=csrf_form(c, {"email": unknown}))
     assert (a.status_code, b.status_code) == (200, 200)
     assert NEUTRAL_RESET in a.text
     assert _normalise(a.text, email) == _normalise(b.text, unknown)
@@ -270,11 +277,11 @@ def test_the_forced_change_applies_the_password_rule(base_url, session_scoped_ex
                        _b64(email), _b64(password))
     assert made.returncode == 0, (made.stdout[-300:], made.stderr[-500:])
     with _client(base_url) as c:
-        signed_in = c.post("/auth/login", data={"email": email, "password": password})
+        signed_in = c.post("/auth/login", data=csrf_form(c, {"email": email, "password": password}))
         assert signed_in.status_code == 302, (signed_in.status_code, signed_in.text[:300])
         assert signed_in.headers.get("location") == "/auth/change_password"
         r = c.post("/auth/change_password",
-                   data={"new_password": "Abcde-1", "confirm_password": "Abcde-1"})
+                   data=csrf_form(c, {"new_password": "Abcde-1", "confirm_password": "Abcde-1"}))
     assert r.status_code == 400, (r.status_code, r.text[:300])
     assert RULE_RE.search(r.text), r.text[:600]
 

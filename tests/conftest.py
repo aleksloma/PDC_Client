@@ -105,6 +105,43 @@ def pytest_configure(config):
     )
 
 
+def session_csrf(client) -> str | None:
+    """The form token held in a TestClient's session cookie, or None.
+
+    Starlette's session cookie is `base64(json).timestamp.signature`; only the
+    data part is read (the signature is the server's business)."""
+    import base64
+    import json as _json
+    for cookie in client.cookies.jar:
+        if cookie.name != "session" or not cookie.value:
+            continue
+        try:
+            data = _json.loads(base64.b64decode(cookie.value.split(".", 1)[0]))
+        except Exception:
+            continue
+        token = data.get("csrf") if isinstance(data, dict) else None
+        if isinstance(token, str):
+            return token
+    return None
+
+
+def csrf_form(client, data: dict, page: str = "/?local=1") -> dict:
+    """`data` plus the session's form token, as a browser would post it.
+
+    The four HTML forms (sign-in, reset request, reset link, forced change)
+    refuse a POST without the token their page embeds. A client whose session
+    holds none GETs `page` first (the landing mints it), exactly like a user
+    opening the page before submitting it."""
+    token = session_csrf(client)
+    if not token:
+        client.get(page, follow_redirects=False)
+        token = session_csrf(client)
+    return {**data, "csrf": token or ""}
+
+
+JSON_HEADERS = {"Content-Type": "application/json"}
+
+
 def seed_history(chat_id: str, code: str, *, conv_id: str | None = None) -> str:
     """Persist `code` as an AI answer of chat `chat_id` and return the conv id.
 

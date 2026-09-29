@@ -402,7 +402,7 @@ async function _updatePaymentMethod() {
   _subBody().innerHTML = '<div class="sub-modal-spinner"><p>Loading payment details...</p></div>';
   _subActions().innerHTML = '';
   try {
-    var res = await pdcFetch('/api/paddle/subscription/update-payment', { method: 'POST' });
+    var res = await pdcFetch('/api/paddle/subscription/update-payment', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
     var data = await res.json();
     if (data.ok && data.transaction_id && window.Paddle) {
       _closeSubModal();
@@ -441,7 +441,7 @@ async function _doReactivate() {
   _subBody().innerHTML = '<div class="sub-modal-spinner"><p>Reactivating...</p></div>';
   _subActions().innerHTML = '';
   try {
-    var res = await pdcFetch('/api/paddle/subscription/reactivate', { method: 'POST' });
+    var res = await pdcFetch('/api/paddle/subscription/reactivate', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
     var data = await res.json();
     if (data.ok) {
       _openSubModal('Plan Reactivated',
@@ -1084,7 +1084,7 @@ function setupEventListeners() {
   // Logout button
   document.getElementById('btnLogout').addEventListener('click', async () => {
     profileDropdown.classList.add('hidden');
-    await pdcFetch('/auth/logout', { method: 'POST' });
+    await pdcFetch('/auth/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
     window.location.href = '/';
   });
 
@@ -1379,7 +1379,7 @@ const AutoAnalytics = (function () {
 
   async function start(chatId) {
     try {
-      const res = await pdcFetch(`/api/chat/${chatId}/auto_analysis/start`, { method: 'POST' });
+      const res = await pdcFetch(`/api/chat/${chatId}/auto_analysis/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
       const data = await res.json().catch(() => ({}));
       if (data.status === 'done') {
         setState('done');
@@ -1534,7 +1534,8 @@ async function downloadReport(format) {
 
   try {
     const res = await pdcFetch(`/api/chat/${currentChatId}/conversation/${currentConvId}/${endpoint}`, {
-      method: 'POST'
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
     });
 
     if (!res.ok) {
@@ -3029,7 +3030,7 @@ function stopGeneration() {
   // Fire-and-forget server cancel — do NOT block the UI on it.
   if (chatId && convId) {
     try {
-      pdcFetch(`/api/chat/${chatId}/conversation/${convId}/stop`, { method: 'POST' }).catch(() => {});
+      pdcFetch(`/api/chat/${chatId}/conversation/${convId}/stop`, { method: 'POST', headers: { 'Content-Type': 'application/json' } }).catch(() => {});
     } catch (e) { /* ignore */ }
   }
   // Live-stream path: the active send registered a synchronous handler that
@@ -3626,7 +3627,7 @@ function openCreateWizard() {
   _updateWizardGenerateBtn();
   _loadDbTablesList();
   // Reset session so the wizard always starts fresh
-  pdcFetch('/new_session', { method: 'POST' });
+  pdcFetch('/new_session', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
   document.getElementById('createNewModal').classList.remove('hidden');
 }
 
@@ -3834,7 +3835,7 @@ function openAddDataWizard() {
   _updateWizardGenerateBtn();
   _loadDbTablesList();
   // Fresh temp session for this upload batch (same as Create New)
-  pdcFetch('/new_session', { method: 'POST' });
+  pdcFetch('/new_session', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
   document.getElementById('createNewModal').classList.remove('hidden');
 }
 
@@ -4229,7 +4230,7 @@ async function runFrictionlessFlow(files, opts) {
     if (filesArr.length > 0) {
       // Reset session unless caller already did so (the wizard resets on open)
       if (opts.resetSession !== false) {
-        try { await pdcFetch('/new_session', { method: 'POST' }); } catch (e) { /* non-fatal */ }
+        try { await pdcFetch('/new_session', { method: 'POST', headers: { 'Content-Type': 'application/json' } }); } catch (e) { /* non-fatal */ }
       }
 
       // Direct-to-GCS only when the server enabled it (GCS_UPLOAD_BUCKET, the
@@ -4301,7 +4302,7 @@ async function runFrictionlessFlow(files, opts) {
     // Step 2: AI auto-fill of file + column descriptions in one call per file
     _updateFrictionlessStatus('lab.flow_analyzing');
     try {
-      const afRes = await pdcFetch('/schema_autofill_full', { method: 'POST' });
+      const afRes = await pdcFetch('/schema_autofill_full', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
       if (!afRes.ok) {
         // Continue — chat can still be created with empty descriptions
         console.warn('[FRICTIONLESS] schema_autofill_full HTTP', afRes.status);
@@ -5386,7 +5387,7 @@ async function handlePublish(type, chatId, convId, title) {
     } else {
       endpoint = `/api/chat/${chatId}/publish`;
     }
-    const res = await pdcFetch(endpoint, { method: 'POST' });
+    const res = await pdcFetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
     const data = await res.json();
     if (res.ok) {
       showToast(`${itemType.charAt(0).toUpperCase() + itemType.slice(1)} published successfully`);
@@ -5412,7 +5413,7 @@ async function handleUnpublish(type, chatId, convId, title) {
     } else {
       endpoint = `/api/chat/${chatId}/unpublish`;
     }
-    const res = await pdcFetch(endpoint, { method: 'POST' });
+    const res = await pdcFetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
     const data = await res.json();
     if (res.ok) {
       showToast(`${itemType.charAt(0).toUpperCase() + itemType.slice(1)} unpublished`);

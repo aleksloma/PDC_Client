@@ -248,6 +248,34 @@ def _post_login_target(email: str) -> str:
 
 # --- Auth landing + login ----------------------------------------------------
 
+# --- Form CSRF tokens ----------------------------------------------------------
+# The four HTML forms (sign-in, reset request, reset link, forced change) post
+# form-encoded bodies, which a cross-site page can also send. Each form
+# carries a random token kept in the session; a POST without the matching
+# token is refused before anything is evaluated or counted.
+FORM_EXPIRED_TEXT = "The form has expired. Please try again."
+
+
+def csrf_token(request: Request) -> str:
+    """The session's form token, minted on first use."""
+    token = request.session.get("csrf")
+    if not isinstance(token, str) or len(token) < 32:
+        token = secrets.token_urlsafe(32)
+        request.session["csrf"] = token
+    return token
+
+
+def _csrf_ok(request: Request, form) -> bool:
+    expected = request.session.get("csrf")
+    got = form.get("csrf") if form is not None else None
+    ok = (isinstance(expected, str) and isinstance(got, str) and len(expected) >= 32
+          and secrets.compare_digest(expected, got))
+    if not ok:
+        log_with_sid("csrf", "warning",
+                     f"CSRF_FORM_TOKEN_REFUSED path={log_safe_text(request.url.path, 120)}")
+    return ok
+
+
 def _landing(request: Request, *, error: str = None, password_error: str = None,
              info: str = None, email: str = "", status_code: int = 200,
              show_reset: bool = False, signin_failed: bool = False,
@@ -274,7 +302,8 @@ def _landing(request: Request, *, error: str = None, password_error: str = None,
         {"request": request, "error": error, "password_error": password_error,
          "info": info, "email": email, "show_reset": show_reset,
          "signin_failed": signin_failed, "sso_enabled": sso_enabled,
-         "self_registration": bool(settings.ALLOW_SELF_REGISTRATION)},
+         "self_registration": bool(settings.ALLOW_SELF_REGISTRATION),
+         "csrf": csrf_token(request)},
         status_code=status_code,
         headers=headers,
     )
@@ -319,6 +348,9 @@ def _start_session(request: Request, email: str, *, remember: bool,
     # again at every sign-in).
     request.session["gen"] = generation
     request.session["iat"] = _session_now()
+    # A new form token for the signed-in session (the anonymous one it was
+    # posted with is not carried over).
+    request.session["csrf"] = secrets.token_urlsafe(32)
     # Single funnel for every sign-in branch (password, self-registration,
     # SSO) — the one place to stamp last_login_at. touch_last_login never
     # raises (a removal landing after the check above: it writes nothing and
@@ -351,6 +383,9 @@ async def login(request: Request):
     counts against the limiter until it succeeds.
     """
     form = await request.form()
+    if not _csrf_ok(request, form):
+        # Not a credential guess: the limiter does not count it.
+        return _landing(request, error=FORM_EXPIRED_TEXT, status_code=403)
     email = (form.get("email") or "").strip().lower()
     password = form.get("password") or ""
     remember = bool(form.get("remember"))
@@ -532,6 +567,8 @@ async def reset_password(request: Request):
     hand the address to a background thread, answer 200 with the neutral
     line. Whether a link was minted and mailed never shows."""
     form = await request.form()
+    if not _csrf_ok(request, form):
+        return _landing(request, error=FORM_EXPIRED_TEXT, status_code=403)
     email = (form.get("email") or "").strip().lower()
     if not _EMAIL_RE.fullmatch(email):
         return _landing(request, error="Please enter a valid email",
@@ -570,7 +607,7 @@ def _reset_page(request: Request, token: str, error: str = None, status_code: in
     return _TEMPLATES.TemplateResponse(
         request,
         "reset_password.html",
-        {"request": request, "token": token, "error": error},
+        {"request": request, "token": token, "error": error, "csrf": csrf_token(request)},
         status_code=status_code,
         headers=dict(_RESET_PAGE_HEADERS),
     )
@@ -597,6 +634,10 @@ async def reset_link_submit(request: Request, token: str):
     """Form-encoded {new_password, confirm_password}. Sets the password,
     marks the link used and redirects to the landing page — the user then
     signs in with the new password (no automatic sign-in)."""
+    form = await request.form()
+    if not _csrf_ok(request, form):
+        # Checked before the limiter: a missing token is not a guessed link.
+        return _reset_page(request, token, FORM_EXPIRED_TEXT, 403)
     ip = _peer(request)
     verdict = auth_limiter.begin("token", None, ip)
     if not verdict.allowed:
@@ -615,7 +656,6 @@ async def reset_link_submit(request: Request, token: str):
         # A link minted while SSO was off, used after it was enabled.
         log_with_sid(log_safe_text(link_email, 254), "warning", "SSO_ENFORCED_RESET_REFUSED")
         return _reset_page(request, token, SSO_NO_LOCAL_PASSWORD_TEXT, 403)
-    form = await request.form()
     new_password = form.get("new_password") or ""
     confirm = form.get("confirm_password") or ""
     rule_error = password_rule_error(new_password)
@@ -650,7 +690,7 @@ async def change_password_page(request: Request):
     return _TEMPLATES.TemplateResponse(
         request,
         "change_password.html",
-        {"request": request, "email": email, "error": None},
+        {"request": request, "email": email, "error": None, "csrf": csrf_token(request)},
     )
 
 
@@ -674,9 +714,12 @@ async def change_password_submit(request: Request):
         return _TEMPLATES.TemplateResponse(
             request,
             "change_password.html",
-            {"request": request, "email": email, "error": err},
+            {"request": request, "email": email, "error": err, "csrf": csrf_token(request)},
             status_code=code,
         )
+
+    if not _csrf_ok(request, form):
+        return _page(FORM_EXPIRED_TEXT, 403)
 
     if AuthStore().is_sso_only(email):
         log_with_sid(log_safe_text(email, 254), "warning", "SSO_ACCOUNT_PASSWORD_REFUSED",
@@ -714,6 +757,7 @@ async def logout(request: Request):
     request.session.pop("must_change_password", None)
     request.session.pop("gen", None)
     request.session.pop("iat", None)
+    request.session.pop("csrf", None)   # a fresh form token per identity
     if email:
         log_with_sid(email, "info", "USER_LOGOUT")
     return RedirectResponse(url="/", status_code=302)

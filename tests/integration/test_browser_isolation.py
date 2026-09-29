@@ -54,6 +54,8 @@ from urllib.parse import urlparse
 import httpx
 import pytest
 
+from tests.conftest import JSON_HEADERS, csrf_form
+
 from .conftest import (REQUEST_TIMEOUT_S, SESSION_COOKIE, WEB_CONTAINER,
                        docker_available, precreate_account, seed_history_row)
 
@@ -147,7 +149,7 @@ def test_the_probe_marker_is_in_the_payload_and_matches_a_log_line():
 def _login_cookie(base_url: str, email: str, password: str) -> str:
     with httpx.Client(base_url=base_url, follow_redirects=False,
                       timeout=REQUEST_TIMEOUT_S) as client:
-        r = client.post("/auth/login", data={"email": email, "password": password})
+        r = client.post("/auth/login", data=csrf_form(client, {"email": email, "password": password}))
         assert r.status_code in (302, 303), (r.status_code, r.text[:300])
         cookie = client.cookies.get(SESSION_COOKIE)
     assert cookie, "no session cookie after sign-in"
@@ -878,7 +880,7 @@ def markup_named_chat(session, repo_root, session_scoped_chat_ids,
 
     if local_store.sanitize_upload_filename(MARKUP_FILE_NAME) != MARKUP_FILE_NAME:
         pytest.skip("the upload sanitiser alters the markup file name")
-    assert session.post("/new_session").status_code == 200
+    assert session.post("/new_session", headers=JSON_HEADERS).status_code == 200
     session_scoped_upload_sids.add(session_id(session))
     with open(os.path.join(repo_root, "tools", "fixtures", FIXTURE_CSV), "rb") as fh:
         up = session.post("/upload", files={"files": (MARKUP_FILE_NAME, fh.read(), "text/csv")})

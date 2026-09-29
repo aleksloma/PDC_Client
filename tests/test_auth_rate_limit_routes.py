@@ -30,6 +30,7 @@ from starlette.testclient import TestClient
 import brain_client
 import local_store
 from settings import settings
+from tests.conftest import csrf_form
 
 USER = "limited.user@corp.example"
 USER_PW = "Limited-passw0rd"
@@ -114,6 +115,13 @@ def world(tmp_path, monkeypatch):
     app = FastAPI()
     app.add_middleware(SessionMiddleware, secret_key="test-secret")
     app.include_router(auth_mod.router)
+
+    @app.get("/")
+    async def _landing(request: Request):
+        # The real app's landing mints the form token (tests.conftest.csrf_form).
+        auth_mod.csrf_token(request)
+        return {"ok": True}
+
     yield {"clock": clock, "lim": lim, "sent": sent, "verifications": verifications,
            "client": lambda: TestClient(app, raise_server_exceptions=False),
            "app": app, "auth_mod": auth_mod}
@@ -122,8 +130,9 @@ def world(tmp_path, monkeypatch):
 
 
 def _login(world, email, password):
-    return world["client"]().post("/auth/login", data={"email": email, "password": password},
-                                  follow_redirects=False)
+    tc = world["client"]()
+    return tc.post("/auth/login", data=csrf_form(tc, {"email": email, "password": password}),
+                   follow_redirects=False)
 
 
 def _assert_limited(r, retry_after=None):
@@ -170,7 +179,7 @@ def test_the_schedule_then_the_lockout_refuses_the_correct_password(world):
         assert _login(world, USER, f"wrong-after-{gap}").status_code == 401, gap
     world["clock"].advance(16)
     tc = world["client"]()
-    r = tc.post("/auth/login", data={"email": USER, "password": USER_PW},
+    r = tc.post("/auth/login", data=csrf_form(tc, {"email": USER, "password": USER_PW}),
                 follow_redirects=False)
     wait = _assert_limited(r)
     assert 800 <= wait <= 900, wait
@@ -247,8 +256,9 @@ def test_the_lockout_log_line_carries_no_address(world, monkeypatch):
 # /auth/reset_password
 # ===========================================================================
 def _reset(world, email):
-    return world["client"]().post("/auth/reset_password", data={"email": email},
-                                  follow_redirects=False)
+    tc = world["client"]()
+    return tc.post("/auth/reset_password", data=csrf_form(tc, {"email": email}),
+                   follow_redirects=False)
 
 
 @pytest.mark.parametrize("email", [USER, "nobody@corp.example"], ids=["known", "unknown"])
@@ -296,7 +306,7 @@ def test_a_bad_token_post_counts_too(world, monkeypatch):
     _need(world["lim"])
     _set(monkeypatch, "AUTH_FAIL_THRESHOLD_IP", 3)
     tc = world["client"]()
-    form = {"new_password": "Guess-pw-1", "confirm_password": "Guess-pw-1"}
+    form = csrf_form(tc, {"new_password": "Guess-pw-1", "confirm_password": "Guess-pw-1"})
     for i in range(3):
         r = tc.post(f"/auth/reset/{'D' * 43}", data=form, follow_redirects=False)
         assert r.status_code == 404, i + 1
@@ -310,7 +320,7 @@ def test_a_password_rule_failure_on_a_valid_link_is_not_a_failure(world, monkeyp
     tc = world["client"]()
     for i in range(6):
         r = tc.post(f"/auth/reset/{token}",
-                    data={"new_password": "abcd-1", "confirm_password": "abcd-2"},
+                    data=csrf_form(tc, {"new_password": "abcd-1", "confirm_password": "abcd-2"}),
                     follow_redirects=False)
         assert r.status_code == 400, (i + 1, r.status_code)
 
@@ -368,7 +378,7 @@ def _hammer(world, email, attempts, client=None):
         if evaluated == attempts:
             break
         tc = client or world["client"]()
-        r = tc.post("/auth/login", data={"email": email, "password": f"wrong-{i}"},
+        r = tc.post("/auth/login", data=csrf_form(tc, {"email": email, "password": f"wrong-{i}"}),
                     follow_redirects=False)
         if r.status_code == 429:
             wait = _assert_limited(r)
@@ -397,15 +407,17 @@ def test_the_local_admin_is_spaced_but_never_locked(world, monkeypatch):
     assert evaluated == 14, (evaluated, waits)
     assert not [ln for ln in lines if "AUTH_LOCKOUT" in ln], lines
     # After waiting, the right password signs in.
-    early = world["client"]().post("/auth/login",
-                                   data={"email": LADMIN, "password": LADMIN_PW},
-                                   follow_redirects=False)
+    tc = world["client"]()
+    early = tc.post("/auth/login",
+                    data=csrf_form(tc, {"email": LADMIN, "password": LADMIN_PW}),
+                    follow_redirects=False)
     if early.status_code == 429:
         wait = _assert_limited(early)
         assert wait <= 8, wait
         world["clock"].advance(wait)
-    r = world["client"]().post("/auth/login", data={"email": LADMIN, "password": LADMIN_PW},
-                               follow_redirects=False)
+    tc = world["client"]()
+    r = tc.post("/auth/login", data=csrf_form(tc, {"email": LADMIN, "password": LADMIN_PW}),
+                follow_redirects=False)
     assert r.status_code == 302, (r.status_code, r.headers.get("retry-after"))
     assert r.headers["location"] == "/admin/data_sources"
 
@@ -419,11 +431,13 @@ def test_a_normal_address_from_another_peer_still_locks(world):
     _five_wrong_from(other_peer, USER)
     for gap in (1, 2, 4, 8):
         world["clock"].advance(gap)
-        r = other_peer.post("/auth/login", data={"email": USER, "password": f"w{gap}"},
+        r = other_peer.post("/auth/login",
+                            data=csrf_form(other_peer, {"email": USER, "password": f"w{gap}"}),
                             follow_redirects=False)
         assert r.status_code == 401, (gap, r.status_code)
     world["clock"].advance(16)
-    r = other_peer.post("/auth/login", data={"email": USER, "password": USER_PW},
+    r = other_peer.post("/auth/login",
+                        data=csrf_form(other_peer, {"email": USER, "password": USER_PW}),
                         follow_redirects=False)
     wait = _assert_limited(r)
     assert wait > 8, ("a normal address must still lock", wait)
@@ -431,6 +445,6 @@ def test_a_normal_address_from_another_peer_still_locks(world):
 
 def _five_wrong_from(tc, email):
     for i in range(5):
-        r = tc.post("/auth/login", data={"email": email, "password": f"wrong-{i}"},
+        r = tc.post("/auth/login", data=csrf_form(tc, {"email": email, "password": f"wrong-{i}"}),
                     follow_redirects=False)
         assert r.status_code == 401, (i + 1, r.status_code)

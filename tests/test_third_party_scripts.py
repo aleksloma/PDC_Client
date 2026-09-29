@@ -30,6 +30,7 @@ import app as app_mod
 import brain_client
 import local_store
 from settings import settings
+from tests.conftest import csrf_form
 
 EMAIL = "third-party@x.com"
 PASSWORD = "third-party-pw-123"
@@ -69,7 +70,7 @@ def client(tmp_path, monkeypatch):
     # TemplateResponse site would never render.
     auth.record_conversation(EMAIL, CHAT_ID, CONV_ID, "Third-party check")
     tc = TestClient(app_mod.app, base_url="https://testserver")
-    login = tc.post("/auth/login", data={"email": EMAIL, "password": PASSWORD},
+    login = tc.post("/auth/login", data=csrf_form(tc, {"email": EMAIL, "password": PASSWORD}),
                     follow_redirects=False)
     assert login.status_code == 302, (login.status_code, login.text[:300])
     yield tc

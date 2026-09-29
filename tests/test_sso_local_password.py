@@ -41,6 +41,7 @@ import brain_client
 import local_store
 import roles_store
 from settings import settings
+from tests.conftest import csrf_form
 
 TEXT = "This account signs in with Microsoft and has no local password."
 NEUTRAL_RESET = "If an account exists for this address, a reset link has been sent."
@@ -119,6 +120,12 @@ def world(tmp_path, monkeypatch):
     app.include_router(users_mod.router)
     app.include_router(auth_mod.router)
 
+    @app.get("/")
+    async def _landing(request: Request):
+        # The real app's landing mints the form token (tests.conftest.csrf_form).
+        auth_mod.csrf_token(request)
+        return {"ok": True}
+
     @app.post("/_login/{email}")
     async def _login(request: Request, email: str):
         request.session["email"] = email
@@ -182,15 +189,17 @@ def _record_logs(world, monkeypatch):
     return lines
 
 
-def _request_reset(world, email):
-    return world["client"]().post("/auth/reset_password", data={"email": email},
-                                  follow_redirects=False)
+def _request_reset(world, email, tc=None):
+    tc = tc or world["client"]()
+    return tc.post("/auth/reset_password", data=csrf_form(tc, {"email": email}),
+                   follow_redirects=False)
 
 
 def test_a_reset_request_for_an_sso_account_is_neutral_and_mints_nothing(world, monkeypatch):
     lines = _record_logs(world, monkeypatch)
-    sso = _request_reset(world, SSO)
-    unknown = _request_reset(world, UNKNOWN)
+    tc = world["client"]()                 # one browser: one session, one form token
+    sso = _request_reset(world, SSO, tc)
+    unknown = _request_reset(world, UNKNOWN, tc)
     assert (sso.status_code, unknown.status_code) == (200, 200)
     assert NEUTRAL_RESET in sso.text
     assert TEXT not in sso.text, "the anonymous page must not reveal the account type"
@@ -223,9 +232,10 @@ def test_a_reset_request_for_a_local_account_that_also_uses_microsoft_still_mint
 def test_an_earlier_link_cannot_set_a_password_on_an_sso_account(world):
     token = local_store.AuthStore().create_reset_token(SSO)
     assert token
-    r = world["client"]().post(f"/auth/reset/{token}",
-                               data={"new_password": NEW_PW, "confirm_password": NEW_PW},
-                               follow_redirects=False)
+    tc = world["client"]()
+    r = tc.post(f"/auth/reset/{token}",
+                data=csrf_form(tc, {"new_password": NEW_PW, "confirm_password": NEW_PW}),
+                follow_redirects=False)
     assert r.status_code == 403, (r.status_code, r.headers.get("location"), r.text[:300])
     assert TEXT in r.text, r.text[:600]
     rec = _read_auth(world["tmp"], SSO)
@@ -235,9 +245,10 @@ def test_an_earlier_link_cannot_set_a_password_on_an_sso_account(world):
 
 def test_a_link_for_a_local_account_that_also_uses_microsoft_works(world):
     token = local_store.AuthStore().create_reset_token(MIXED)
-    r = world["client"]().post(f"/auth/reset/{token}",
-                               data={"new_password": NEW_PW, "confirm_password": NEW_PW},
-                               follow_redirects=False)
+    tc = world["client"]()
+    r = tc.post(f"/auth/reset/{token}",
+                data=csrf_form(tc, {"new_password": NEW_PW, "confirm_password": NEW_PW}),
+                follow_redirects=False)
     assert r.status_code == 302, (r.status_code, r.text[:300])
     assert local_store.AuthStore().verify_password(MIXED, NEW_PW) == "ok"
 
@@ -264,7 +275,7 @@ def test_the_profile_change_works_for_a_local_account_that_also_uses_microsoft(w
 def test_the_forced_change_refuses_an_sso_account(world):
     tc = world["client"](SSO, must_change=True)
     r = tc.post("/auth/change_password",
-                data={"new_password": NEW_PW, "confirm_password": NEW_PW},
+                data=csrf_form(tc, {"new_password": NEW_PW, "confirm_password": NEW_PW}),
                 follow_redirects=False)
     assert r.status_code == 403, (r.status_code, r.headers.get("location"), r.text[:300])
     assert TEXT in r.text, r.text[:600]
@@ -332,10 +343,11 @@ def quiet_login(world, monkeypatch):
     return world
 
 
-def _login(world, email, password):
-    return world["client"]().post("/auth/login",
-                                  data={"email": email, "password": password},
-                                  follow_redirects=False)
+def _login(world, email, password, tc=None):
+    tc = tc or world["client"]()
+    return tc.post("/auth/login",
+                   data=csrf_form(tc, {"email": email, "password": password}),
+                   follow_redirects=False)
 
 
 def _record_auth_logs(world, monkeypatch):
@@ -372,13 +384,14 @@ def test_a_dual_account_cannot_sign_in_locally_while_sso_is_enabled(
     _sso_on()
     lines = _record_auth_logs(world, monkeypatch)
     checks = _count_hash_checks(monkeypatch)
-    r = _login(world, MIXED, MIXED_PW)
+    tc = world["client"]()                 # one browser: one session, one form token
+    r = _login(world, MIXED, MIXED_PW, tc)
     assert r.status_code == 401, (r.status_code, r.headers.get("location"), r.text[:300])
     assert 'data-i18n="auth.signin_failed"' in r.text
     assert TEXT not in r.text, "the sign-in page must not reveal the account type"
     assert len(checks) == 1, f"{len(checks)} password verifications on the refused sign-in"
     assert any("SSO_ENFORCED_LOCAL_REFUSED" in ln for ln in lines), lines
-    wrong = _login(world, OWNER, "Wrong-passw0rd")
+    wrong = _login(world, OWNER, "Wrong-passw0rd", tc)
     assert wrong.status_code == 401
     assert _normalise(r.text, MIXED) == _normalise(wrong.text, OWNER)
 
@@ -421,8 +434,9 @@ def test_a_reset_request_for_a_dual_account_mints_nothing_while_sso_is_enabled(
     world = quiet_login
     _sso_on()
     lines = _record_auth_logs(world, monkeypatch)
-    dual = _request_reset(world, MIXED)
-    unknown = _request_reset(world, UNKNOWN)
+    tc = world["client"]()                 # one browser: one session, one form token
+    dual = _request_reset(world, MIXED, tc)
+    unknown = _request_reset(world, UNKNOWN, tc)
     assert (dual.status_code, unknown.status_code) == (200, 200)
     assert NEUTRAL_RESET in dual.text
     assert TEXT not in dual.text
@@ -451,9 +465,10 @@ def test_an_earlier_link_cannot_set_a_dual_accounts_password_while_sso_is_enable
     token = local_store.AuthStore().create_reset_token(MIXED)
     assert token
     _sso_on()
-    r = world["client"]().post(f"/auth/reset/{token}",
-                               data={"new_password": NEW_PW, "confirm_password": NEW_PW},
-                               follow_redirects=False)
+    tc = world["client"]()
+    r = tc.post(f"/auth/reset/{token}",
+                data=csrf_form(tc, {"new_password": NEW_PW, "confirm_password": NEW_PW}),
+                follow_redirects=False)
     assert r.status_code == 403, (r.status_code, r.headers.get("location"), r.text[:300])
     assert TEXT in r.text, r.text[:600]
     store = local_store.AuthStore()
@@ -470,9 +485,10 @@ def test_a_password_only_accounts_reset_is_unaffected_while_sso_is_enabled(quiet
     assert r.status_code == 200
     assert [to for to, _ in world["sent"]] == [LOCAL], world["sent"]
     token = local_store.AuthStore().create_reset_token(LOCAL)
-    r = world["client"]().post(f"/auth/reset/{token}",
-                               data={"new_password": NEW_PW, "confirm_password": NEW_PW},
-                               follow_redirects=False)
+    tc = world["client"]()
+    r = tc.post(f"/auth/reset/{token}",
+                data=csrf_form(tc, {"new_password": NEW_PW, "confirm_password": NEW_PW}),
+                follow_redirects=False)
     assert r.status_code == 302, (r.status_code, r.text[:300])
     assert local_store.AuthStore().verify_password(LOCAL, NEW_PW) == "ok"
 
@@ -483,8 +499,9 @@ def test_an_sso_only_account_keeps_its_refusals_while_sso_is_enabled(quiet_login
     world = quiet_login
     token = local_store.AuthStore().create_reset_token(SSO)
     _sso_on()
-    r = world["client"]().post(f"/auth/reset/{token}",
-                               data={"new_password": NEW_PW, "confirm_password": NEW_PW},
-                               follow_redirects=False)
+    tc = world["client"]()
+    r = tc.post(f"/auth/reset/{token}",
+                data=csrf_form(tc, {"new_password": NEW_PW, "confirm_password": NEW_PW}),
+                follow_redirects=False)
     assert r.status_code == 403
     assert TEXT in r.text

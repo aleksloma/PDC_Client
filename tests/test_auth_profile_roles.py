@@ -9,13 +9,14 @@ ladmin and unreadable/profileless dirs. Offline — brain calls stubbed."""
 import json
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.testclient import TestClient
 
 import brain_client
 import local_store
 from settings import settings
+from tests.conftest import csrf_form
 
 
 @pytest.fixture(autouse=True)
@@ -137,6 +138,13 @@ def client(monkeypatch):
     app = FastAPI()
     app.add_middleware(SessionMiddleware, secret_key="test-secret")
     app.include_router(auth_mod.router)
+
+    @app.get("/")
+    async def _landing(request: Request):
+        # The real app's landing mints the form token (tests.conftest.csrf_form).
+        auth_mod.csrf_token(request)
+        return {"ok": True}
+
     return TestClient(app)
 
 
@@ -150,14 +158,14 @@ def test_login_stamps_last_login_on_both_branches(client, monkeypatch, tmp_path)
     auth = local_store.AuthStore()
     # New-user branch (flag on, no user folder -> entered password becomes theirs).
     r = client.post("/auth/login",
-                    data={"email": "new@x.com", "password": "pw123-long"},
+                    data=csrf_form(client, {"email": "new@x.com", "password": "pw123-long"}),
                     follow_redirects=False)
     assert r.status_code == 302
     first = auth.get_profile("new@x.com")["last_login_at"]
     assert first
     # Returning-user branch (password verify path).
     r2 = client.post("/auth/login",
-                     data={"email": "new@x.com", "password": "pw123-long"},
+                     data=csrf_form(client, {"email": "new@x.com", "password": "pw123-long"}),
                      follow_redirects=False)
     assert r2.status_code == 302
     second = auth.get_profile("new@x.com")["last_login_at"]
@@ -173,7 +181,7 @@ def test_login_does_not_self_register_by_default(client, tmp_path, monkeypatch):
     if "ALLOW_SELF_REGISTRATION" in type(settings).model_fields:
         monkeypatch.setattr(settings, "ALLOW_SELF_REGISTRATION", False)
     r = client.post("/auth/login",
-                    data={"email": "new@x.com", "password": "pw123-long"},
+                    data=csrf_form(client, {"email": "new@x.com", "password": "pw123-long"}),
                     follow_redirects=False)
     assert r.status_code == 401, (r.status_code, r.headers.get("location"))
     assert not (tmp_path / "users" / "new@x.com").exists()

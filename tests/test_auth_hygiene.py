@@ -53,13 +53,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.testclient import TestClient
 
 import brain_client
 import local_store
 from settings import settings
+from tests.conftest import csrf_form
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -423,6 +424,13 @@ def auth_app(tmp_path, monkeypatch):
     app = FastAPI()
     app.add_middleware(SessionMiddleware, secret_key="test-secret")
     app.include_router(auth_mod.router)
+
+    @app.get("/")
+    async def _landing(request: Request):
+        # The real app's landing mints the form token (tests.conftest.csrf_form).
+        auth_mod.csrf_token(request)
+        return {"ok": True}
+
     return {"tmp": tmp_path, "client": lambda: TestClient(app, raise_server_exceptions=False),
             "auth_mod": auth_mod, "store": store}
 
@@ -443,8 +451,8 @@ def test_a_refused_reset_link_request_keeps_the_link_page_headers(auth_app, refu
         r = tc.get(f"/auth/reset/{token}", follow_redirects=False)
     else:
         r = tc.post(f"/auth/reset/{token}",
-                    data={"new_password": "Brand-new-pw-123",
-                          "confirm_password": "Brand-new-pw-123"},
+                    data=csrf_form(tc, {"new_password": "Brand-new-pw-123",
+                                        "confirm_password": "Brand-new-pw-123"}),
                     follow_redirects=False)
     status = r.status_code
     headers = {k.lower(): v for k, v in r.headers.items()}
@@ -455,9 +463,10 @@ def test_a_refused_reset_link_request_keeps_the_link_page_headers(auth_app, refu
 
 
 def test_the_sign_in_429_still_carries_retry_after(auth_app, refuse_everything):
-    r = auth_app["client"]().post("/auth/login",
-                                  data={"email": KNOWN, "password": "whatever-pw-1"},
-                                  follow_redirects=False)
+    tc = auth_app["client"]()
+    r = tc.post("/auth/login",
+                data=csrf_form(tc, {"email": KNOWN, "password": "whatever-pw-1"}),
+                follow_redirects=False)
     assert r.status_code == 429
     assert r.headers.get("retry-after") == "3"
 
@@ -570,10 +579,10 @@ def test_a_legacy_two_hash_account_costs_two_verifications(auth_app, verificatio
     rec["temp_password_hash"] = generate_password_hash("Old-temp-passw0rd")
     rec["must_change_password"] = True
     p.write_text(json.dumps(rec), encoding="utf-8")
+    tc = auth_app["client"]()
+    form = csrf_form(tc, {"email": KNOWN, "password": "Wrong-passw0rd-x"})
     verifications.clear()
-    r = auth_app["client"]().post("/auth/login",
-                                  data={"email": KNOWN, "password": "Wrong-passw0rd-x"},
-                                  follow_redirects=False)
+    r = tc.post("/auth/login", data=form, follow_redirects=False)
     assert r.status_code == 401, r.status_code
     assert NEUTRAL_FAILURE in r.text
     assert len(verifications) == 2, len(verifications)

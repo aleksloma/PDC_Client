@@ -32,13 +32,14 @@ import json
 from pathlib import Path
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.testclient import TestClient
 
 import brain_client
 import local_store
 from settings import settings
+from tests.conftest import csrf_form
 
 USER = "policy.user@corp.example"
 USER_PW = "Policy-passw0rd"
@@ -99,6 +100,12 @@ def world(tmp_path, monkeypatch):
     app.add_middleware(SessionMiddleware, secret_key="test-secret")
     app.include_router(auth_mod.router)
 
+    @app.get("/")
+    async def _landing(request: Request):
+        # The real app's landing mints the form token (tests.conftest.csrf_form).
+        auth_mod.csrf_token(request)
+        return {"ok": True}
+
     def client():
         return TestClient(app, raise_server_exceptions=False)
 
@@ -106,7 +113,7 @@ def world(tmp_path, monkeypatch):
 
 
 def _login(tc, email, password):
-    return tc.post("/auth/login", data={"email": email, "password": password},
+    return tc.post("/auth/login", data=csrf_form(tc, {"email": email, "password": password}),
                    follow_redirects=False)
 
 
@@ -171,7 +178,7 @@ def test_the_reset_form_rejects_seven_characters_and_consumes_nothing(world):
     assert token
     tc = world["client"]()
     r = tc.post(f"/auth/reset/{token}",
-                data={"new_password": SEVEN, "confirm_password": SEVEN},
+                data=csrf_form(tc, {"new_password": SEVEN, "confirm_password": SEVEN}),
                 follow_redirects=False)
     assert r.status_code == 400, (r.status_code, r.text[:300])
     assert _msg(8) in r.text, r.text[:600]
@@ -184,9 +191,10 @@ def test_the_reset_form_rejects_seven_characters_and_consumes_nothing(world):
 
 def test_the_reset_form_accepts_eight_characters(world):
     token = local_store.AuthStore().create_reset_token(USER)
-    r = world["client"]().post(f"/auth/reset/{token}",
-                               data={"new_password": EIGHT, "confirm_password": EIGHT},
-                               follow_redirects=False)
+    tc = world["client"]()
+    r = tc.post(f"/auth/reset/{token}",
+                data=csrf_form(tc, {"new_password": EIGHT, "confirm_password": EIGHT}),
+                follow_redirects=False)
     assert r.status_code == 302, (r.status_code, r.text[:300])
     assert local_store.AuthStore().verify_password(USER, EIGHT) == "ok"
 
@@ -196,7 +204,7 @@ def test_the_reset_form_follows_the_setting(world, monkeypatch):
     token = local_store.AuthStore().create_reset_token(USER)
     tc = world["client"]()
     r = tc.post(f"/auth/reset/{token}",
-                data={"new_password": "Abcdefgh-", "confirm_password": "Abcdefgh-"},
+                data=csrf_form(tc, {"new_password": "Abcdefgh-", "confirm_password": "Abcdefgh-"}),
                 follow_redirects=False)
     assert r.status_code == 400, r.status_code
     assert _msg(10) in r.text, r.text[:600]
@@ -217,7 +225,7 @@ def test_the_forced_change_rejects_seven_characters(world):
     tc = _forced_session(world)
     before = _read_auth(world["tmp"], FORCED).get("password_hash")
     r = tc.post("/auth/change_password",
-                data={"new_password": SEVEN, "confirm_password": SEVEN},
+                data=csrf_form(tc, {"new_password": SEVEN, "confirm_password": SEVEN}),
                 follow_redirects=False)
     assert r.status_code == 400, (r.status_code, r.text[:300])
     assert _msg(8) in r.text, r.text[:600]
@@ -228,7 +236,7 @@ def test_the_forced_change_rejects_seven_characters(world):
 def test_the_forced_change_accepts_eight_characters(world):
     tc = _forced_session(world)
     r = tc.post("/auth/change_password",
-                data={"new_password": EIGHT, "confirm_password": EIGHT},
+                data=csrf_form(tc, {"new_password": EIGHT, "confirm_password": EIGHT}),
                 follow_redirects=False)
     assert r.status_code == 302, (r.status_code, r.text[:300])
     assert local_store.AuthStore().verify_password(FORCED, EIGHT) == "ok"
@@ -270,16 +278,17 @@ def test_the_profile_change_does_not_strip(world):
 def _set_via_reset_link(world):
     token = local_store.AuthStore().create_reset_token(USER)
     assert token
-    r = world["client"]().post(f"/auth/reset/{token}",
-                               data={"new_password": PADDED, "confirm_password": PADDED},
-                               follow_redirects=False)
+    tc = world["client"]()
+    r = tc.post(f"/auth/reset/{token}",
+                data=csrf_form(tc, {"new_password": PADDED, "confirm_password": PADDED}),
+                follow_redirects=False)
     return r, USER
 
 
 def _set_via_forced_change(world):
     tc = _forced_session(world)
     r = tc.post("/auth/change_password",
-                data={"new_password": PADDED, "confirm_password": PADDED},
+                data=csrf_form(tc, {"new_password": PADDED, "confirm_password": PADDED}),
                 follow_redirects=False)
     return r, FORCED
 

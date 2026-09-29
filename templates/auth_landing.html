@@ -56,6 +56,7 @@
 </head>
 <body>
   <form class="card" method="post" action="/auth/login">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
     <img src="/static/logo2.png" alt="PowerDataChat" class="logo" />
     <h1>PowerDataChat</h1>
     <p class="sub">Sign in with your work email</p>

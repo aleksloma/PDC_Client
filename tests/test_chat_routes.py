@@ -41,7 +41,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.testclient import TestClient
 
 import local_store
-from conftest import seed_history
+from conftest import JSON_HEADERS, csrf_form, seed_history
 from settings import settings
 
 OWNER = "owner@acme.com"
@@ -628,7 +628,7 @@ def flagged(tmp_path, monkeypatch):
     auth.record_conversation(FLAGGED, FLAGGED_CHAT, conv, "t")
     seed_history(FLAGGED_CHAT, "RESULT = 1")
     tc = TestClient(app_mod.app, base_url="https://testserver")
-    r = tc.post("/auth/login", data={"email": FLAGGED, "password": FLAGGED_PW},
+    r = tc.post("/auth/login", data=csrf_form(tc, {"email": FLAGGED, "password": FLAGGED_PW}),
                 follow_redirects=False)
     assert r.status_code == 302, r.text[:300]
     assert r.headers["location"] == "/auth/change_password"
@@ -645,7 +645,7 @@ def _blocked_calls(conv):
         ("POST", f"/api/chat/{FLAGGED_CHAT}/refresh_item",
          {"json": {"code": "RESULT = 1", "kind": "table"}}),
         ("POST", "/upload", {"files": {"files": ("t.csv", b"a,b\n1,2\n", "text/csv")}}),
-        ("POST", "/new_session", {}),
+        ("POST", "/new_session", {"headers": JSON_HEADERS}),
         ("GET", "/api/dashboards", {}),
         ("POST", f"/api/chat/{FLAGGED_CHAT}/conversation/{conv}/download_report",
          {"json": {}}),
@@ -683,19 +683,21 @@ def test_pages_keep_redirecting_to_the_change_form(flagged, path):
 
 def test_login_reset_and_logout_allowed_while_password_change_is_pending(flagged):
     tc = flagged["client"]
-    r = tc.post("/auth/login", data={"email": FLAGGED, "password": FLAGGED_PW},
+    r = tc.post("/auth/login", data=csrf_form(tc, {"email": FLAGGED, "password": FLAGGED_PW}),
                 follow_redirects=False)
     assert r.status_code == 302, r.text[:200]
-    r = tc.post("/auth/reset_password", data={"email": FLAGGED}, follow_redirects=False)
+    r = tc.post("/auth/reset_password", data=csrf_form(tc, {"email": FLAGGED}),
+                follow_redirects=False)
     assert r.status_code == 200, r.text[:200]
-    r = tc.post("/auth/logout", follow_redirects=False)
+    r = tc.post("/auth/logout", headers=JSON_HEADERS, follow_redirects=False)
     assert r.status_code == 302
 
 
 def test_apis_answer_normally_after_the_password_is_changed(flagged):
     tc = flagged["client"]
     r = tc.post("/auth/change_password",
-                data={"new_password": "N3w-passw0rd", "confirm_password": "N3w-passw0rd"},
+                data=csrf_form(tc, {"new_password": "N3w-passw0rd",
+                                    "confirm_password": "N3w-passw0rd"}),
                 follow_redirects=False)
     assert r.status_code == 302, r.text[:200]
     assert tc.get("/auth/profile").status_code == 200

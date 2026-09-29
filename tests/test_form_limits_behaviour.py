@@ -37,6 +37,7 @@ import app as app_mod
 import brain_client
 import local_store
 from settings import settings
+from tests.conftest import csrf_form
 
 EMAIL = "limits-user@x.com"
 PASSWORD = "limits-pw-123"
@@ -65,7 +66,7 @@ def client(tmp_path, monkeypatch):
 
 
 def _login(client):
-    r = client.post("/auth/login", data={"email": EMAIL, "password": PASSWORD},
+    r = client.post("/auth/login", data=csrf_form(client, {"email": EMAIL, "password": PASSWORD}),
                     follow_redirects=False)
     assert r.status_code == 302, (r.status_code, r.text)
     return r
@@ -141,7 +142,7 @@ def test_normal_login_form_still_reaches_the_route(client):
     run and produce ITS response. Wrong password is used so the response is
     unmistakably route-produced (401 + the landing template with the
     neutral sign-in failure message) and not the parser's 400."""
-    r = client.post("/auth/login", data={"email": EMAIL, "password": "wrong-pw"},
+    r = client.post("/auth/login", data=csrf_form(client, {"email": EMAIL, "password": "wrong-pw"}),
                     follow_redirects=False)
     status = r.status_code
     text = r.text

@@ -53,6 +53,7 @@ import app as app_mod
 import brain_client
 import local_store
 from settings import settings
+from tests.conftest import csrf_form
 
 CSP = "content-security-policy"
 CSP_RO = "content-security-policy-report-only"
@@ -110,7 +111,7 @@ def env(tmp_path, monkeypatch):
         tc = TestClient(app_mod.app, base_url="https://testserver")
         if who != "anon":
             email = {"user": USER, "other": OTHER, "temp": TEMP}[who]
-            r = tc.post("/auth/login", data={"email": email, "password": PW},
+            r = tc.post("/auth/login", data=csrf_form(tc, {"email": email, "password": PW}),
                         follow_redirects=False)
             assert r.status_code == 302, (who, r.status_code, r.text[:300])
         cache[who] = tc

@@ -3360,7 +3360,7 @@
 
   async function runRoleDelete() {
     if (!roleDeleteCtx) return;
-    const r = await api(`/api/admin/roles/${roleDeleteCtx.id}/delete`, { method: 'POST' });
+    const r = await api(`/api/admin/roles/${roleDeleteCtx.id}/delete`, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
     $('roleDeleteModal').classList.add('hidden');
     roleDeleteCtx = null;
     if (r.ok) {
@@ -3558,7 +3558,7 @@
 
   // ── Account (sidebar footer) ───────────────────────────────────────────
   async function logout() {
-    try { await fetch('/auth/logout', { method: 'POST' }); } catch (e) { /* ignore */ }
+    try { await fetch('/auth/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' } }); } catch (e) { /* ignore */ }
     window.location.href = '/';
   }
 

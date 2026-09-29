@@ -57,6 +57,7 @@ from starlette.testclient import TestClient
 import brain_client
 import local_store
 from settings import settings
+from tests.conftest import csrf_form
 
 KNOWN = "known.user@corp.example"
 KNOWN_PW = "Known-passw0rd"
@@ -153,6 +154,12 @@ def world(tmp_path, monkeypatch):
     app.add_middleware(SessionMiddleware, secret_key="test-secret")
     app.include_router(auth_mod.router)
 
+    @app.get("/")
+    async def _landing(request: Request):
+        # The real app's landing mints the form token (tests.conftest.csrf_form).
+        auth_mod.csrf_token(request)
+        return {"ok": True}
+
     def client():
         # A server-side exception is an answer to assert on, not a crash of
         # the test (today an address with `<` cannot become a folder on some
@@ -163,9 +170,10 @@ def world(tmp_path, monkeypatch):
             "client": client, "app": app, "auth_mod": auth_mod}
 
 
-def _request_reset(world, email):
-    return world["client"]().post("/auth/reset_password", data={"email": email},
-                                  follow_redirects=False)
+def _request_reset(world, email, tc=None):
+    tc = tc or world["client"]()
+    return tc.post("/auth/reset_password", data=csrf_form(tc, {"email": email}),
+                   follow_redirects=False)
 
 
 def _token_from_mail(world, email):
@@ -183,7 +191,7 @@ def _mint(email):
 
 
 def _login(tc, email, password):
-    return tc.post("/auth/login", data={"email": email, "password": password},
+    return tc.post("/auth/login", data=csrf_form(tc, {"email": email, "password": password}),
                    follow_redirects=False)
 
 
@@ -268,8 +276,9 @@ def test_the_brain_client_no_longer_mentions_a_temp_password():
 # POST /auth/reset_password: one answer for every address
 # ===========================================================================
 def test_unknown_and_known_addresses_get_the_same_answer(world):
-    known = _request_reset(world, KNOWN)
-    unknown = _request_reset(world, UNKNOWN)
+    tc = world["client"]()                 # one browser: one session, one form token
+    known = _request_reset(world, KNOWN, tc)
+    unknown = _request_reset(world, UNKNOWN, tc)
     assert (known.status_code, unknown.status_code) == (200, 200)
     assert NEUTRAL_RESET in known.text
     assert _normalise(known.text, KNOWN) == _normalise(unknown.text, UNKNOWN)
@@ -321,8 +330,9 @@ def test_an_email_shaped_bootstrap_admin_gets_the_same_page_and_nothing(world, m
     monkeypatch.setattr(settings, "LOCAL_ADMIN_USERNAME", "admin@corp.example")
     local_store.AuthStore().ensure_user("admin@corp.example")
     local_store.AuthStore().set_password("admin@corp.example", "admin-pw-1")
-    ladmin = _request_reset(world, "admin@corp.example")
-    other = _request_reset(world, KNOWN)
+    tc = world["client"]()                 # one browser: one session, one form token
+    ladmin = _request_reset(world, "admin@corp.example", tc)
+    other = _request_reset(world, KNOWN, tc)
     assert ladmin.status_code == 200
     assert _normalise(ladmin.text, "admin@corp.example") == _normalise(other.text, KNOWN)
     rec = _read_auth(world["tmp"], "admin@corp.example")
@@ -351,8 +361,9 @@ def test_without_a_public_base_url_nothing_is_minted_or_mailed(world, monkeypatc
     error line, and the caller sees the same page as for an unknown address."""
     _set(monkeypatch, "PUBLIC_BASE_URL", "")
     lines = _record_logs(world, monkeypatch)
-    known = _request_reset(world, KNOWN)
-    unknown = _request_reset(world, UNKNOWN)
+    tc = world["client"]()                 # one browser: one session, one form token
+    known = _request_reset(world, KNOWN, tc)
+    unknown = _request_reset(world, UNKNOWN, tc)
     assert (known.status_code, unknown.status_code) == (200, 200)
     assert NEUTRAL_RESET in known.text
     assert _normalise(known.text, KNOWN) == _normalise(unknown.text, UNKNOWN)
@@ -364,9 +375,10 @@ def test_without_a_public_base_url_nothing_is_minted_or_mailed(world, monkeypatc
 
 def test_a_forged_host_header_never_reaches_the_link(world, monkeypatch):
     _set(monkeypatch, "PUBLIC_BASE_URL", "https://pdc.corp.example")
-    r = world["client"]().post("/auth/reset_password", data={"email": KNOWN},
-                               headers={"Host": "attacker.example"},
-                               follow_redirects=False)
+    tc = world["client"]()
+    r = tc.post("/auth/reset_password", data=csrf_form(tc, {"email": KNOWN}),
+                headers={"Host": "attacker.example"},
+                follow_redirects=False)
     assert r.status_code == 200
     url = [u for to, u in world["sent"] if to == KNOWN][-1]
     assert url.startswith("https://pdc.corp.example/auth/reset/"), url
@@ -415,7 +427,7 @@ def test_no_log_line_carries_the_token(world, monkeypatch):
     token = _token_from_mail(world, KNOWN)
     tc = world["client"]()
     tc.get(f"/auth/reset/{token}")
-    tc.post(f"/auth/reset/{token}", data={"new_password": "N3w-pass", "confirm_password": "N3w-pass"},
+    tc.post(f"/auth/reset/{token}", data=csrf_form(tc, {"new_password": "N3w-pass", "confirm_password": "N3w-pass"}),
             follow_redirects=False)
     tc.get(f"/auth/reset/{token}")
     assert lines, "nothing was logged at all"
@@ -437,7 +449,7 @@ def test_the_happy_path(world):
     assert page.headers.get("referrer-policy", "").lower() == "no-referrer", page.headers
     assert f'action="/auth/reset/{token}"' in page.text
     r = tc.post(f"/auth/reset/{token}",
-                data={"new_password": "Brand-new-pw1", "confirm_password": "Brand-new-pw1"},
+                data=csrf_form(tc, {"new_password": "Brand-new-pw1", "confirm_password": "Brand-new-pw1"}),
                 follow_redirects=False)
     assert r.status_code == 302, (r.status_code, r.text[:300])
     assert r.headers["location"] == "/?reset=done"
@@ -455,7 +467,7 @@ def test_a_placeholder_signs_in_after_using_its_link(world):
     token = _token_from_mail(world, PLACEHOLDER)
     tc = world["client"]()
     r = tc.post(f"/auth/reset/{token}",
-                data={"new_password": "Invited-pw1", "confirm_password": "Invited-pw1"},
+                data=csrf_form(tc, {"new_password": "Invited-pw1", "confirm_password": "Invited-pw1"}),
                 follow_redirects=False)
     assert r.status_code == 302 and r.headers["location"] == "/?reset=done"
     login = _login(world["client"](), PLACEHOLDER, "Invited-pw1")
@@ -485,7 +497,7 @@ def test_an_expired_token_is_404_on_get_and_post(world):
     r = tc.get(f"/auth/reset/{token}")
     assert r.status_code == 404 and INVALID_LINK in r.text
     r = tc.post(f"/auth/reset/{token}",
-                data={"new_password": "Late-pw-123", "confirm_password": "Late-pw-123"},
+                data=csrf_form(tc, {"new_password": "Late-pw-123", "confirm_password": "Late-pw-123"}),
                 follow_redirects=False)
     assert r.status_code == 404 and INVALID_LINK in r.text
     assert local_store.AuthStore().verify_password(KNOWN, KNOWN_PW) == "ok"
@@ -495,11 +507,11 @@ def test_a_used_token_is_404_and_changes_nothing(world):
     token = _mint(KNOWN)
     tc = world["client"]()
     first = tc.post(f"/auth/reset/{token}",
-                    data={"new_password": "First-pw-1", "confirm_password": "First-pw-1"},
+                    data=csrf_form(tc, {"new_password": "First-pw-1", "confirm_password": "First-pw-1"}),
                     follow_redirects=False)
     assert first.status_code == 302
     again = tc.post(f"/auth/reset/{token}",
-                    data={"new_password": "Second-pw-2", "confirm_password": "Second-pw-2"},
+                    data=csrf_form(tc, {"new_password": "Second-pw-2", "confirm_password": "Second-pw-2"}),
                     follow_redirects=False)
     assert again.status_code == 404 and INVALID_LINK in again.text
     assert tc.get(f"/auth/reset/{token}").status_code == 404
@@ -519,7 +531,7 @@ def test_a_wrong_or_malformed_token_is_404(world, token):
     assert r.status_code == 404, (token, r.status_code)
     assert INVALID_LINK in r.text
     r = tc.post(f"/auth/reset/{token}",
-                data={"new_password": "Guess-pw-1", "confirm_password": "Guess-pw-1"},
+                data=csrf_form(tc, {"new_password": "Guess-pw-1", "confirm_password": "Guess-pw-1"}),
                 follow_redirects=False)
     assert r.status_code == 404, (token, r.status_code)
     assert local_store.AuthStore().verify_password(KNOWN, KNOWN_PW) == "ok"
@@ -534,7 +546,7 @@ def test_a_wrong_or_malformed_token_is_404(world, token):
 def test_a_password_rule_failure_rerenders_and_consumes_nothing(world, form, error):
     token = _mint(KNOWN)
     tc = world["client"]()
-    r = tc.post(f"/auth/reset/{token}", data=form, follow_redirects=False)
+    r = tc.post(f"/auth/reset/{token}", data=csrf_form(tc, form), follow_redirects=False)
     assert r.status_code == 400, r.status_code
     assert error in r.text
     assert tc.get(f"/auth/reset/{token}").status_code == 200
@@ -614,7 +626,7 @@ def test_setting_a_password_anywhere_drops_an_outstanding_token(world, how):
         assert _login(tc, KNOWN, KNOWN_PW).headers["location"] == "/auth/change_password"
         token = _mint(KNOWN)
         r = tc.post("/auth/change_password",
-                    data={"new_password": "Forced-pw-1", "confirm_password": "Forced-pw-1"},
+                    data=csrf_form(tc, {"new_password": "Forced-pw-1", "confirm_password": "Forced-pw-1"}),
                     follow_redirects=False)
         assert r.status_code == 302
     else:
@@ -724,10 +736,11 @@ def test_every_sign_in_failure_costs_exactly_one_verification(world, verificatio
 
 
 def test_an_unknown_address_cannot_sign_in_and_leaves_no_directory(world):
-    r = _login(world["client"](), UNKNOWN, "any-pw-123")
+    tc = world["client"]()                 # one browser: one session, one form token
+    r = _login(tc, UNKNOWN, "any-pw-123")
     assert r.status_code == 401
     assert not (world["tmp"] / "users" / UNKNOWN).exists()
-    wrong = _login(world["client"](), KNOWN, "wrong-pw-123")
+    wrong = _login(tc, KNOWN, "wrong-pw-123")
     assert _normalise(r.text, UNKNOWN) == _normalise(wrong.text, KNOWN)
 
 
