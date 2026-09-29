@@ -800,3 +800,74 @@ def test_exec_transport_crash_reason_allowlist_matches_the_executor_vocabulary()
     assert node is not None, "exec_transport.py has no module-level CRASH_REASONS allowlist"
     allowed = _string_constants(node)
     assert allowed == EXPECTED_CRASH_REASONS, allowed
+
+
+# ---------------------------------------------------------------------------
+# no unpickling of a job-directory path on the web side
+# ---------------------------------------------------------------------------
+def _unpickle_calls(tree):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            f = node.func
+            name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+            if name in ("read_pickle", "load", "loads") and (
+                    name == "read_pickle"
+                    or (isinstance(f, ast.Attribute) and getattr(f.value, "id", "") == "pickle")):
+                yield node
+
+
+def test_the_web_side_never_unpickles_a_job_directory_path():
+    """The job directory is writable by the sandbox uid, so the web process
+    may unpickle only an in-memory buffer there. Inside exec_transport the one
+    path read is `read_inputs`, which only the sandbox's runner calls;
+    executor_client and app.py never unpickle at all. (local_store's
+    parquet-cache pickle lives under the chat's own files directory, which the
+    sandbox never mounts — outside this pin on purpose.)"""
+    tree = ast.parse(_read(EXEC_TRANSPORT))
+    offenders = []
+    for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
+        for call in _unpickle_calls(fn):
+            if fn.name == "read_inputs":
+                continue
+            arg = call.args[0] if call.args else None
+            is_buffer = (isinstance(arg, ast.Call)
+                         and ast.unparse(arg.func) in ("io.BytesIO", "BytesIO"))
+            if not is_buffer:
+                offenders.append(f"exec_transport.{fn.name}:{call.lineno}")
+    assert offenders == [], offenders
+    for name in ("executor_client.py", "app.py"):
+        calls = list(_unpickle_calls(ast.parse((ROOT / name).read_text(encoding="utf-8"))))
+        assert calls == [], (name, [c.lineno for c in calls])
+    callers = []
+    for path in ROOT.rglob("*.py"):
+        rel = path.relative_to(ROOT).as_posix()
+        if rel.startswith(("tests/", "executor/tests/", ".venv/")) or rel == "exec_transport.py":
+            continue
+        if "read_inputs(" in path.read_text(encoding="utf-8", errors="replace"):
+            callers.append(rel)
+    assert callers == ["executor/runner.py"], callers
+
+
+def _module_constant(path: Path, name: str):
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == name for t in node.targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"{name} not found in {path.name}")
+
+
+def test_orphan_thresholds_are_five_minutes_and_one_minute_on_both_sides():
+    web = ROOT / "executor_client.py"
+    assert _module_constant(EXEC_APP, "_ORPHAN_MAX_AGE_S") == 300
+    assert _module_constant(web, "_ORPHAN_MAX_AGE_S") == 300
+    assert _module_constant(EXEC_APP, "_ORPHAN_SWEEP_INTERVAL_S") == 60
+    assert _module_constant(web, "_SWEEP_INTERVAL_S") == 60
+
+
+def test_both_sweeps_skip_jobs_in_flight_and_the_sandbox_locks_at_startup():
+    app_text = _read(EXEC_APP)
+    web_text = (ROOT / "executor_client.py").read_text(encoding="utf-8")
+    assert "_ACTIVE_JOBS" in app_text and "child.name in _ACTIVE_JOBS" in app_text
+    assert "_ACTIVE_JOBS" in web_text and "child.name in _ACTIVE_JOBS" in web_text
+    assert "os.chmod(child, 0o000)" in app_text
+    lifespan = app_text.index("_lock_preexisting_job_dirs(config.shared_dir)")
+    assert lifespan < app_text.index("_sweep_orphans(config.shared_dir)", lifespan)

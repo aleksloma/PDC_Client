@@ -1657,3 +1657,30 @@ def test_log_safe_text_cap_semantics_unchanged():
     assert exec_transport.log_safe_text("") == ""
     plain = exec_transport.log_safe_text("ordinary text", 500)
     assert plain == "ordinary text", plain
+
+
+def test_pickle_fallback_is_verified_in_memory_and_never_read_back_from_disk(job_dir, monkeypatch):
+    """The job directory is writable by the sandbox uid (mode 2770, shared
+    group, no sticky bit), so the web process must never unpickle anything
+    from it: the fallback pickle is serialised and verified in memory, then
+    written. Any `read_pickle` of a PATH during `write_inputs` fails here."""
+    import io as _io
+    real = pd.read_pickle
+    seen = []
+
+    def guarded(source, *a, **k):
+        seen.append(type(source).__name__)
+        assert isinstance(source, _io.BytesIO), f"read_pickle on {type(source).__name__}"
+        return real(source, *a, **k)
+
+    monkeypatch.setattr(pd, "read_pickle", guarded)
+    mixed = pd.DataFrame({"m": [1, "a", 3], "x": [1, 2, 3]})
+    manifest = exec_transport.write_inputs({"mixed": mixed}, job_dir, sid="test")
+    assert [e.get("format") for e in manifest] == ["pickle"], manifest
+    assert seen == ["BytesIO"], seen
+    monkeypatch.setattr(pd, "read_pickle", real)
+    on_disk = (job_dir / "in" / "0.pkl").read_bytes()
+    buffer = _io.BytesIO()
+    mixed.to_pickle(buffer)
+    assert real(_io.BytesIO(on_disk)).equals(mixed)
+    assert len(on_disk) == len(buffer.getvalue())

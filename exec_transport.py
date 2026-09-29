@@ -23,15 +23,19 @@ Pickle
 ------
 `write_inputs` falls back to `.pkl` for the few dataframes a parquet
 round-trip cannot reproduce byte-identically (a mixed numeric/string object
-column, list-valued cells) — the same precedent as the on-disk parquet cache
-in `local_store._parquet_cache_write`. That is safe HERE and only in this
-direction because (a) the writer and the reader are both this codebase, (b)
-the job directory is not user-writable (mode 2770, owned by the web uid and
-the shared `pdc` group), and (c) at most one job exists per directory while it
-executes. Nothing in the OTHER direction is ever unpickled: the executor is
-the untrusted side, so `deserialize_result` refuses a `.pkl` reference even
-when the file exists, and reads result frames only as UNCOMPRESSED parquet
-inside hard row/column/byte caps.
+column, list-valued cells). The pickle is serialised and verified IN MEMORY
+and only then written out: the web process never reads anything back from the
+job directory. That matters because the directory is NOT private to the web
+side — it is mode 2770 with the shared `pdc` group, so the sandbox uid (a
+member of that group) can write into it and replace any entry in `in/` (there
+is no sticky bit). A read-back from that directory would deserialise bytes
+the sandbox may have chosen, in the container that holds every secret.
+Only the RUNNER unpickles the inputs (`read_inputs`), inside the sandbox,
+where a hostile pickle reaches nothing it could not already reach. Nothing in
+the OTHER direction is ever unpickled: the executor is the untrusted side, so
+`deserialize_result` refuses a `.pkl` reference even when the file exists,
+and reads result frames only as UNCOMPRESSED parquet inside hard
+row/column/byte caps.
 
 Article II: no value in this module is ever forwarded to the brain. The
 `preview` encoder mirrors `run_chat_local._safe_preview` exactly (including
@@ -42,6 +46,7 @@ type NAME (`Opaque`), never as content.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import math
 import os
@@ -495,10 +500,16 @@ def write_inputs(dfs: dict, job_dir, sid: Optional[str] = None) -> list:
         rel = f"in/{index}.pkl"
         target = job_dir / rel
         try:
-            df.to_pickle(target)
-            back = pd.read_pickle(target)
+            # Serialise and verify in memory, then write the bytes: the job
+            # directory is writable by the sandbox uid, so this process must
+            # never read back (let alone unpickle) anything from it.
+            buffer = io.BytesIO()
+            df.to_pickle(buffer)
+            payload = buffer.getvalue()
+            back = pd.read_pickle(io.BytesIO(payload))
             if list(back.columns) != list(df.columns) or not back.equals(df):
                 raise ValueError("pickle round-trip altered the dataframe")
+            target.write_bytes(payload)
         except Exception as e_pkl:
             log_with_sid(log_safe_text(sid, 200) or "exec", "error",
                          f"EXEC_INPUT_WRITE_FAILED key={log_safe_text(str(name), 200)}: "

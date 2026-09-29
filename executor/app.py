@@ -70,7 +70,10 @@ _CODE_MAX_CHARS = 1024 * 1024
 _MAX_INPUT_FRAMES = 64
 _RESPONSE_MAX_BYTES = 64 * 1024 * 1024
 _READER_JOIN_S = 5.0
-_ORPHAN_MAX_AGE_S = 3600
+# An abandoned job directory holds another question's input frames and is
+# readable through the shared group, so it is removed after five minutes (a
+# job still in flight on this side is skipped by name, see _ACTIVE_JOBS).
+_ORPHAN_MAX_AGE_S = 300
 
 # A modification time in the FUTURE is treated as aged (generated code can
 # forward-date an entry it owns so it never looks old), but only beyond this
@@ -78,7 +81,7 @@ _ORPHAN_MAX_AGE_S = 3600
 # ahead of this process's clock, and deleting a live job dir would break
 # the job in flight.
 _FUTURE_MTIME_TOLERANCE_S = 300
-_ORPHAN_SWEEP_INTERVAL_S = 600
+_ORPHAN_SWEEP_INTERVAL_S = 60
 _VERSION_MODULES = ("matplotlib", "numpy", "pandas", "plotly", "pyarrow")
 
 _STATE: dict = {}
@@ -89,6 +92,11 @@ _VERSIONS: dict = {}
 # job's runner.
 _INFLIGHT_LOCK = threading.Lock()
 _INFLIGHT = {"count": 0}
+# Job ids this service has accepted and not yet answered. The orphan sweep
+# skips them by name: its age threshold is shorter than the longest job
+# (EXECUTOR_MAX_TIMEOUT_S), and a running job does not refresh its
+# directory's modification time.
+_ACTIVE_JOBS: set = set()
 # One-shot latch for the EXECUTOR_NOT_READY log line (no lock needed: the
 # route that sets it runs on the event loop).
 _NOT_READY_LOGGED = {"logged": False}
@@ -217,6 +225,10 @@ async def lifespan(app: FastAPI):
     _STATE["pool"] = ThreadPoolExecutor(max_workers=config.max_concurrent + 1,
                                         thread_name_prefix="exec_job")
     _STATE["stop"] = threading.Event()
+    # Lock every job directory already present (the ones this uid may chmod)
+    # before the first job runs, then sweep the aged ones. A FRESH one is left
+    # for the next sweeps: the web service may be about to post that job.
+    _lock_preexisting_job_dirs(config.shared_dir)
     _sweep_orphans(config.shared_dir)
     sweeper = threading.Thread(target=_orphan_loop, args=(config.shared_dir, _STATE["stop"]),
                                daemon=True, name="orphan_sweep")
@@ -253,6 +265,43 @@ def _json(body: dict, status_code: int = 200) -> Response:
 # ---------------------------------------------------------------------------
 # orphan sweep
 # ---------------------------------------------------------------------------
+def _lock_preexisting_job_dirs(shared_dir: Path) -> int:
+    """chmod 000 every job directory present when the service starts.
+
+    The first jobs after a restart must not read what an earlier job left.
+    Only the OWNER may chmod: job directories are created by the web uid, so
+    from this uid the call succeeds only on entries it owns (a directory
+    generated code renamed into a job-id shape) and fails with EPERM on the
+    rest, which stay readable to the shared group until the sweeps remove
+    them (at most _ORPHAN_MAX_AGE_S). Counts only are logged. Never raises.
+    """
+    locked = not_permitted = 0
+    try:
+        entries = list(Path(shared_dir).iterdir())
+    except OSError as e:
+        log_with_sid("executor", "warning",
+                     f"EXEC_ORPHAN_LOCK_FAILED {exec_transport.log_safe_text(type(e).__name__, 80)}")
+        return 0
+    for child in entries:
+        if not exec_transport.valid_job_id(child.name):
+            continue
+        try:
+            info = os.lstat(child)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                continue
+            os.chmod(child, 0o000)
+            locked += 1
+        except PermissionError:
+            not_permitted += 1
+        except OSError as e:
+            log_with_sid("executor", "warning",
+                         f"EXEC_ORPHAN_LOCK_FAILED {exec_transport.log_safe_text(type(e).__name__, 80)}")
+    if locked or not_permitted:
+        log_with_sid("executor", "info",
+                     f"EXEC_ORPHAN_LOCKED count={int(locked)} not_owned={int(not_permitted)}")
+    return locked
+
+
 def _sweep_orphans(shared_dir: Path) -> None:
     """Remove aged job directories, and the strays generated code leaves.
 
@@ -280,6 +329,10 @@ def _sweep_orphans(shared_dir: Path) -> None:
                 # created by `create_job_dir`, which only makes directories —
                 # so it is a stash wearing a job id, not a job.
                 _remove_stray_entry(child, now)
+                continue
+            with _INFLIGHT_LOCK:
+                active = child.name in _ACTIVE_JOBS
+            if active:
                 continue
             # A FUTURE mtime is not fresh: generated code can forward-date
             # what it writes, and a negative age would keep it forever.
@@ -839,6 +892,25 @@ async def execute(request: ExecuteRequest) -> Response:
         return invalid
 
     job_dir = config.shared_dir / request.job_id
+    with _INFLIGHT_LOCK:
+        _ACTIVE_JOBS.add(request.job_id)
+    try:
+        return await _execute_accepted(config, request, job_dir)
+    finally:
+        # Restart the directory's age clock at COMPLETION: the web service
+        # still reads `out/` after this answer, and a job that ran longer than
+        # the sweep threshold would otherwise be eligible for removal while it
+        # does. Group write is enough to set the time to "now".
+        with suppress(OSError):
+            os.utime(job_dir, None)
+        with _INFLIGHT_LOCK:
+            _ACTIVE_JOBS.discard(request.job_id)
+
+
+async def _execute_accepted(config, request, job_dir: Path) -> Response:
+    """The body of /execute once the request is valid; the job id is in
+    `_ACTIVE_JOBS` for the whole call, so the orphan sweep leaves its
+    directory alone however long it queues or runs."""
     try:
         info = os.lstat(job_dir)
     except OSError:

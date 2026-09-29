@@ -441,14 +441,16 @@ def test_while_true_times_out_with_the_byte_identical_text(executor_env, kind):
 def test_queued_job_expires_without_running_when_the_slot_is_busy(executor_env):
     """MAX_CONCURRENT=1: job B (timeout_s=1) queued behind a 4 s job A comes
     back `timeout` before A finishes and never executes its code."""
-    job_a, dir_a, manifest_a = _new_job(executor_env)
-    job_b, dir_b, manifest_b = _new_job(executor_env)
-    marker = dir_b / "in" / "ran.txt"
+    # Jobs are created AFTER the service starts, as in production: a job
+    # directory present at startup is locked (chmod 000) before any job runs.
     code_a = "import time\ntime.sleep(4)\nRESULT = 'A'"
-    code_b = f"open({str(marker)!r}, 'w').write('ran')\nRESULT = 'B'"
     holder = {}
 
     with _client() as client:
+        job_a, dir_a, manifest_a = _new_job(executor_env)
+        job_b, dir_b, manifest_b = _new_job(executor_env)
+        marker = dir_b / "in" / "ran.txt"
+        code_b = f"open({str(marker)!r}, 'w').write('ran')\nRESULT = 'B'"
         # warm the runner imports so A holds the slot for ~4 s of real sleep
         _submit(client, executor_env, "RESULT = 0")
 
@@ -675,6 +677,80 @@ def test_orphan_sweep_removes_old_job_dirs_and_old_strays(executor_env):
         assert not old_uid.exists(), "old job dir with uid-10001 inputs survived the sweep"
 
 
+def test_startup_locks_the_job_dirs_already_present(executor_env):
+    """A job directory present when the service starts is chmod 000 before the
+    first job runs (this uid can do that only to what it owns — here the test
+    creates it, so it does), then left to the age-based sweep."""
+    shared = executor_env
+    present = exec_transport.create_job_dir(shared, exec_transport.new_job_id())
+    (present / "in" / "0.parquet").write_bytes(b"x")
+    try:
+        with _client() as client:
+            assert client.get("/healthz").status_code == 200
+        mode = stat.S_IMODE(os.lstat(present).st_mode)
+        assert mode == 0, oct(mode)
+    finally:
+        with contextlib.suppress(OSError):
+            os.chmod(present, 0o770)
+
+
+def test_the_startup_lock_counts_what_it_may_not_chmod(executor_env, monkeypatch, caplog):
+    """A job directory owned by the web uid cannot be chmodded from this uid:
+    the lock counts it and moves on — never raises."""
+    import logging
+    from executor import app as app_module
+    shared = executor_env
+    exec_transport.create_job_dir(shared, exec_transport.new_job_id())
+
+    def refused(path, mode):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(app_module.os, "chmod", refused)
+    with caplog.at_level(logging.INFO):
+        locked = app_module._lock_preexisting_job_dirs(shared)
+    assert locked == 0
+    assert "EXEC_ORPHAN_LOCKED count=0 not_owned=1" in caplog.text
+
+
+def test_a_finished_job_restarts_its_directory_age(executor_env):
+    """The web service reads `out/` AFTER the answer. A job that ran longer
+    than the sweep threshold must not be swept while it does, so completion
+    sets the directory's mtime to now."""
+    with _client() as client:
+        job_id, job_dir, manifest = _new_job(executor_env)
+        long_ago = time.time() - 3600
+        os.utime(job_dir, (long_ago, long_ago))
+        resp = client.post("/execute", json=_body(job_id, "RESULT = 1", manifest,
+                                                  timeout_s=COLD_JOB_BUDGET_S))
+        assert resp.status_code == 200, resp.text
+    age = time.time() - os.lstat(job_dir).st_mtime
+    assert age < 120, age
+
+
+def test_the_sweep_takes_a_job_dir_after_five_minutes_but_not_one_in_flight(executor_env):
+    from executor import app as app_module
+    shared = executor_env
+    aged = exec_transport.create_job_dir(shared, exec_transport.new_job_id())
+    running_id = exec_transport.new_job_id()
+    running = exec_transport.create_job_dir(shared, running_id)
+    young = exec_transport.create_job_dir(shared, exec_transport.new_job_id())
+    six_minutes_ago = time.time() - 6 * 60
+    for p in (aged, running):
+        os.utime(p, (six_minutes_ago, six_minutes_ago))
+    four_minutes_ago = time.time() - 4 * 60
+    os.utime(young, (four_minutes_ago, four_minutes_ago))
+    with app_module._INFLIGHT_LOCK:
+        app_module._ACTIVE_JOBS.add(running_id)
+    try:
+        app_module._sweep_orphans(shared)
+    finally:
+        with app_module._INFLIGHT_LOCK:
+            app_module._ACTIVE_JOBS.discard(running_id)
+    assert not aged.exists(), "a job dir older than five minutes survived"
+    assert running.is_dir(), "a job in flight was swept"
+    assert young.is_dir(), "a job dir younger than five minutes was swept"
+
+
 # ---------------------------------------------------------------------------
 # hostile requests
 # ---------------------------------------------------------------------------
@@ -710,8 +786,10 @@ def test_missing_or_symlinked_job_dir_is_400(executor_env):
     {"name": "t", "path": "in/sub/0.parquet", "format": "parquet"},
 ])
 def test_hostile_dataframes_path_is_rejected_before_spawning(executor_env, entry):
-    job_id, job_dir, _ = _new_job(executor_env)
+    # Created AFTER the service starts: a job directory present at startup is
+    # locked (chmod 000) before any job runs.
     with _client() as client:
+        job_id, job_dir, _ = _new_job(executor_env)
         resp = client.post("/execute", json=_body(job_id, "RESULT = 1", [entry]))
     assert resp.status_code in (400, 422), (resp.status_code, resp.text)
     assert not (job_dir / "job.json").exists(), "job.json was written for a rejected request"
@@ -1048,12 +1126,14 @@ def test_two_jobs_at_once_both_answer_with_the_stray_sweep_skipped(executor_env,
     monkeypatch.setattr(executor_app, "log_with_sid",
                         lambda sid, level, message, *a, **k: logged.append(message))
 
-    job_a, dir_a, manifest_a = _new_job(executor_env)
-    job_b, dir_b, manifest_b = _new_job(executor_env)
+    # Jobs are created AFTER the service starts: a job directory present at
+    # startup is locked (chmod 000) before any job runs.
     code = "import time\ntime.sleep(3)\nRESULT = 'done'"
     results: dict = {}
 
     with _client() as client:
+        job_a, dir_a, manifest_a = _new_job(executor_env)
+        job_b, dir_b, manifest_b = _new_job(executor_env)
         _submit(client, executor_env, "RESULT = 0")      # warm the runner imports
 
         def _post(tag, job_id, manifest):

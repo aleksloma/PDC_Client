@@ -44,7 +44,10 @@ _READ_TIMEOUT_MARGIN_S = 30
 _WRITE_TIMEOUT_S = 30
 
 _DIR_MODE = 0o2770
-_ORPHAN_MAX_AGE_S = 3600
+# Same threshold as the sandbox's sweep: an abandoned job directory holds
+# another question's input frames, so it goes after five minutes. A job
+# still in flight on this side is skipped by name (_ACTIVE_JOBS).
+_ORPHAN_MAX_AGE_S = 300
 
 # A modification time in the FUTURE is treated as aged (generated code can
 # forward-date an entry it owns so it never looks old), but only beyond this
@@ -52,7 +55,7 @@ _ORPHAN_MAX_AGE_S = 3600
 # ahead of this process's clock, and deleting a live job dir would break
 # the job in flight.
 _FUTURE_MTIME_TOLERANCE_S = 300
-_SWEEP_INTERVAL_S = 600
+_SWEEP_INTERVAL_S = 60
 
 # Compared against the sandbox's own `/healthz` report: the two images are
 # versioned and upgraded independently, and a chart that silently renders
@@ -92,6 +95,12 @@ _PENDING: dict = {"handshake": False}
 # Opportunistic orphan sweep after a dispatch — no thread: an always-on
 # background thread leaks into every pytest session.
 _LAST_SWEEP: dict = {"at": 0.0}
+
+# Job ids this process has created and not yet removed. The sweep skips them
+# by name: its age threshold is shorter than the longest job, and a running
+# job does not refresh its directory's modification time.
+_ACTIVE_JOBS: set = set()
+_ACTIVE_LOCK = threading.Lock()
 
 # Cached reachability, for `/health` to REPORT rather than measure. `ok` is
 # None until something has actually talked to the service — unknown is not the
@@ -390,6 +399,12 @@ def _first_warning_for(path) -> bool:
     return True
 
 
+def _release_job(job_id) -> None:
+    """Forget an in-flight job id (the sweep may take its directory again)."""
+    with _ACTIVE_LOCK:
+        _ACTIVE_JOBS.discard(job_id)
+
+
 def _remove_job_dir(job_dir, log_sid: str) -> None:
     if job_dir is None:
         return
@@ -455,7 +470,7 @@ def _stray_removal_allowed(shared) -> bool:
     mistake would be unrecoverable is refused outright: a jobs directory that
     IS `DATA_ROOT`, or contains it, is a misconfigured install rather than a
     jobs volume. The refusal is logged once — the condition cannot change
-    while the process runs, and a line every 10 minutes forever is a stream.
+    while the process runs, and a line on every sweep forever is a stream.
 
     A jobs directory INSIDE `DATA_ROOT` is refused the same way, with the one
     exception of `<DATA_ROOT>/exec_jobs` — the default the setting falls back
@@ -556,7 +571,7 @@ def _remove_stray_entry(child, now: float, own_uid) -> None:
 
 
 def sweep_orphans() -> None:
-    """Remove job directories older than an hour, and stale strays with them.
+    """Remove job directories older than five minutes, and stale strays with them.
 
     Every dispatch removes its own directory in a `finally`; this catches the
     ones a web worker that died mid-job left behind — and, because the root is
@@ -590,6 +605,10 @@ def sweep_orphans() -> None:
                 # so it is a stash wearing a job id, not a job.
                 if strays:
                     _remove_stray_entry(child, now, own_uid)
+                continue
+            with _ACTIVE_LOCK:
+                active = child.name in _ACTIVE_JOBS
+            if active:
                 continue
             # A FUTURE mtime is not fresh: generated code can forward-date
             # what it writes, and a negative age would keep it forever.
@@ -852,8 +871,11 @@ def _dispatch(kind: str, code: str, dfs: dict, log_sid: str, sid, budget,
         _PENDING["handshake"] = False
 
     job_dir = None
+    job_id = None
     try:
         job_id = exec_transport.new_job_id()
+        with _ACTIVE_LOCK:
+            _ACTIVE_JOBS.add(job_id)
         shared = _shared_dir()
         # `create_job_dir` does not create PARENTS, and not every caller runs
         # through the app lifespan that calls `ensure_shared_dir` — the
@@ -873,6 +895,7 @@ def _dispatch(kind: str, code: str, dfs: dict, log_sid: str, sid, budget,
                      f"EXEC_INPUT_FAILED {_tail(f'{type(e).__name__}: {e}')}",
                      code_hash=code_hash)
         _remove_job_dir(job_dir, log_sid)
+        _release_job(job_id)
         return _error_shape(kind, _PREPARE_TEXT.format(exc=type(e).__name__))
 
     try:
@@ -942,6 +965,7 @@ def _dispatch(kind: str, code: str, dfs: dict, log_sid: str, sid, budget,
         return out
     finally:
         _remove_job_dir(job_dir, log_sid)
+        _release_job(job_id)
         _maybe_sweep()
 
 

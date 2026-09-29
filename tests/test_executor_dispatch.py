@@ -689,6 +689,39 @@ def test_sweep_orphans_removes_stale_job_dirs_and_stale_strays(dispatcher, exec_
     assert not stray.exists(), "an aged entry that is not a job directory survived"
 
 
+def test_the_sweep_takes_a_job_dir_after_five_minutes(dispatcher, exec_env):
+    """The threshold is five minutes: an abandoned directory holds another
+    question's input frames, readable through the shared group."""
+    aged = exec_transport.create_job_dir(exec_env, exec_transport.new_job_id())
+    young = exec_transport.create_job_dir(exec_env, exec_transport.new_job_id())
+    six_minutes_ago = time.time() - 6 * 60
+    four_minutes_ago = time.time() - 4 * 60
+    os.utime(aged, (six_minutes_ago, six_minutes_ago))
+    os.utime(young, (four_minutes_ago, four_minutes_ago))
+    dispatcher.sweep_orphans()
+    assert not aged.exists(), "a job directory older than five minutes survived"
+    assert young.is_dir(), "a job directory younger than five minutes was swept"
+
+
+def test_the_sweep_skips_a_job_still_in_flight(dispatcher, exec_env):
+    """A job can run longer than the threshold and does not refresh its
+    directory's mtime, so a job this process is still running is skipped by
+    name however old its directory looks."""
+    job_id = exec_transport.new_job_id()
+    running = exec_transport.create_job_dir(exec_env, job_id)
+    long_ago = time.time() - 3600
+    os.utime(running, (long_ago, long_ago))
+    with dispatcher._ACTIVE_LOCK:
+        dispatcher._ACTIVE_JOBS.add(job_id)
+    try:
+        dispatcher.sweep_orphans()
+        assert running.is_dir(), "a job in flight was swept"
+    finally:
+        dispatcher._release_job(job_id)
+    dispatcher.sweep_orphans()
+    assert not running.exists(), "a released, aged job directory survived"
+
+
 # ===========================================================================
 # 2. the dispatch gate
 # ===========================================================================
