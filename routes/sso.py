@@ -33,7 +33,7 @@ import sso_store
 from settings import settings
 from local_store import AuthStore
 from exec_transport import log_safe_text
-from logger_utils import log_with_sid
+from logger_utils import log_safe_value, log_with_sid
 from routes.admin_data import _json_body, _require_admin
 from routes.auth import _landing, _start_session
 
@@ -390,7 +390,7 @@ async def test_sso(request: Request):
                 "scope": "https://graph.microsoft.com/.default",
             })
     except Exception as e:
-        log_with_sid(email, "warning", f"SSO_TEST_UNREACHABLE: {type(e).__name__}")
+        log_with_sid(email, "warning", f'SSO_TEST_UNREACHABLE: {log_safe_value(str(type(e).__name__), 300)}')
         return _outcome(False, "Could not reach login.microsoftonline.com: "
                                f"{type(e).__name__}")
 

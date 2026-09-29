@@ -65,10 +65,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pathlib import Path as _P
 
+from starlette.concurrency import run_in_threadpool
+
 import auth_limiter
 import password_utils
 from exec_transport import log_safe_text
-from local_store import (SESSION_GEN_REMOVED, AccountMissing, AuthStore, reset_record_live,
+from local_store import (SESSION_GEN_REMOVED, AccountMissing, AuthStore, UserStore,
+                         reset_record_live,
                          valid_sid)
 from logger_utils import log_with_sid
 from settings import settings
@@ -821,6 +824,7 @@ async def change_password_submit(request: Request):
 @router.post("/auth/logout")
 async def logout(request: Request):
     email = request.session.get("email")
+    sid = request.session.get("sid")
     request.session.pop("email", None)
     request.session.pop("sid", None)
     request.session.pop("remember", None)
@@ -829,7 +833,21 @@ async def logout(request: Request):
     request.session.pop("iat", None)
     request.session.pop("csrf", None)   # a fresh form token per identity
     if email:
-        log_with_sid(email, "info", "USER_LOGOUT")
+        # Signing out ends EVERY session of the account (other browsers, a
+        # copied cookie): the generation every session carries is replaced,
+        # so the session gate empties them on their next request.
+        try:
+            await run_in_threadpool(AuthStore().bump_session_generation, email)
+        except AccountMissing:
+            log_with_sid("auth", "warning", "LOGOUT_ACCOUNT_MISSING")
+        except Exception as e:
+            log_with_sid("auth", "error",
+                         f"LOGOUT_GENERATION_BUMP_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        if sid:
+            # The session's temporary uploads (never promoted to a chat) go
+            # with it; `destroy` refuses another account's folder.
+            await run_in_threadpool(UserStore.destroy, sid, email)
+        log_with_sid(log_safe_text(email, 254), "info", "USER_LOGOUT")
     return RedirectResponse(url="/", status_code=302)
 
 

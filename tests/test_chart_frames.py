@@ -76,6 +76,7 @@ SIMPLE_DOC = ("<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
 
 EXPECTED_DIRECTIVES = {
     "sandbox", "default-src", "script-src", "style-src", "img-src", "frame-ancestors",
+    "form-action",
 }
 
 
@@ -319,6 +320,9 @@ def test_the_document_carries_exactly_one_policy_of_its_own(env):
     assert p["style-src"] == ["'unsafe-inline'"], p
     assert p["img-src"] == ["data:"], p
     assert p["frame-ancestors"] == ["'self'"], p
+    # A chart document cannot submit a form anywhere (a sandboxed frame
+    # still navigates on a form post).
+    assert p["form-action"] == ["'none'"], p
 
 
 def test_the_document_is_not_sniffed_cached_or_referred(env):

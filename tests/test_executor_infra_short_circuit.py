@@ -988,14 +988,15 @@ LOG_SAFE_MODULES = ["run_chat_local.py", "routes/chat.py", "exec_sanitizer.py",
                     "exec_transport.py", "executor_client.py", "app.py",
                     "executor/app.py", "excel_table_detector.py",
                     "routes/dashboards.py", "routes/charts.py",
-                    "routes/auth.py"]
+                    "routes/auth.py", "routes/upload.py", "local_store.py",
+                    "routes/sso.py"]
 
 LOG_CALL_NAME = "log_with_sid"
 
 # The escaping helpers. `_log_safe` is `exec_sanitizer`'s module-local one
 # (that module is a leaf and imports nothing from the transport). `_tail` is
 # `executor_client`'s: it IS `log_safe_text`, bound to that module's cap.
-ESCAPING_HELPERS = {"log_safe_text", "_log_safe", "_tail"}
+ESCAPING_HELPERS = {"log_safe_text", "log_safe_value", "_log_safe", "_tail"}
 
 # Helpers that return a FIXED, value-free string rather than escaping one.
 VALUE_FREE_HELPERS = {"_xlsx_failure_reason"}

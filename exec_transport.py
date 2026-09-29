@@ -62,6 +62,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from exec_sanitizer import sanitize_for_execution
+import logger_utils as _logger_utils
 from logger_utils import log_with_sid
 
 # --- caps ------------------------------------------------------------------
@@ -142,19 +143,9 @@ def loads(payload: Any) -> Any:
 # of whoever reads the log. CR and LF keep their long-standing `\r` / `\n`
 # renderings; the others become their visible Python escape. ONE table, so a
 # character cannot be escaped at one site and forgotten at another.
-_LOG_ESCAPES = str.maketrans({
-    "\r": "\\r",
-    "\n": "\\n",
-    "\x0b": "\\x0b",
-    "\x0c": "\\x0c",
-    "\x1b": "\\x1b",
-    "\x1c": "\\x1c",
-    "\x1d": "\\x1d",
-    "\x1e": "\\x1e",
-    "\x85": "\\x85",
-    "\u2028": "\\u2028",
-    "\u2029": "\\u2029",
-})
+# The escape table and the function live in logger_utils (one helper for
+# the whole client); `log_safe_text` keeps its name here for every caller.
+_LOG_ESCAPES = _logger_utils._LOG_ESCAPES
 
 
 def log_safe_text(value: Any, max_chars: int = LOG_TEXT_MAX_CHARS, *,
@@ -186,16 +177,7 @@ def log_safe_text(value: Any, max_chars: int = LOG_TEXT_MAX_CHARS, *,
     Never raises (Article IV): an unrenderable field is logged as empty rather
     than costing the caller its whole log line.
     """
-    try:
-        if not isinstance(value, str) or not value:
-            return ""
-        limit = (max_chars if isinstance(max_chars, int) and max_chars > 0
-                 else LOG_TEXT_MAX_CHARS)
-        cut = value[-limit:] if tail else value[:limit]
-        cut = cut.translate(_LOG_ESCAPES)
-        return cut[-limit:] if tail else cut[:limit]
-    except Exception:
-        return ""
+    return _logger_utils.log_safe_value(value, max_chars, tail=tail)
 
 
 def normalize_timeout(value):

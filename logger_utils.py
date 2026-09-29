@@ -168,3 +168,44 @@ def log_with_sid(sid_or_id: str, level: str, message: str, **context):
         logger.warning(line)
     else:
         logger.info(line)
+
+
+# ---------------------------------------------------------------------------
+# Log-injection guard. The client log is NEWLINE-DELIMITED: a line break in a
+# value a user or a file controls (a sheet name, a file name, a display name,
+# a library's exception text quoting such a value) would start a forged
+# record. `log_safe_value` renders such a value as ONE bounded line: every
+# line break `str.splitlines` recognises, every other C0 / C1 control
+# character and DEL become visible escapes (CR and LF keep their "\r" / "\n"
+# renderings; a TAB passes). `exec_transport.log_safe_text` is this function
+# (the name every older call site uses).
+# ---------------------------------------------------------------------------
+LOG_TEXT_MAX_CHARS = 2000
+
+_LOG_ESCAPES = {c: "\\x%02x" % c for c in range(0x20) if c != 0x09}
+_LOG_ESCAPES[0x7f] = "\\x7f"
+_LOG_ESCAPES.update({c: "\\x%02x" % c for c in range(0x80, 0xa0)})
+_LOG_ESCAPES.update({0x0d: "\\r", 0x0a: "\\n",
+                     0x2028: "\\u2028", 0x2029: "\\u2029"})
+
+
+def log_safe_value(value, max_chars: int = LOG_TEXT_MAX_CHARS, *,
+                   tail: bool = False) -> str:
+    """ONE line of an untrusted string, length-capped, for a log field.
+
+    `tail=True` keeps the LAST `max_chars` (where an exception's own message
+    sits); the default keeps the first. Escaping happens between the two
+    cuts, so the field stays bounded by the cap although an escape widens a
+    character. A non-string or empty value renders as "" (callers pass
+    `str(x)` for a number they want shown). Never raises (Article IV).
+    """
+    try:
+        if not isinstance(value, str) or not value:
+            return ""
+        limit = (max_chars if isinstance(max_chars, int) and max_chars > 0
+                 else LOG_TEXT_MAX_CHARS)
+        cut = value[-limit:] if tail else value[:limit]
+        cut = cut.translate(_LOG_ESCAPES)
+        return cut[-limit:] if tail else cut[:limit]
+    except Exception:
+        return ""

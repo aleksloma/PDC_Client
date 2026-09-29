@@ -188,6 +188,32 @@ def test_sign_out_pops_the_generation(world):
     _assert_cleared(r)
 
 
+def test_sign_out_ends_every_session_of_the_account(world):
+    """Logging out in one browser ends the account's other sessions too
+    (another browser, a copied cookie): the generation is replaced."""
+    a = _signed_in()
+    b = _signed_in()
+    before = _generation(USER)
+    copied = _client()
+    copied.cookies.update(a.cookies)
+    assert copied.get("/auth/me").status_code == 200
+    r = a.post("/auth/logout", headers=JSON_HEADERS, follow_redirects=False)
+    assert r.status_code == 302
+    assert _generation(USER) != before
+    for other in (b, copied):
+        api = other.get("/auth/profile")
+        assert api.status_code == 401, (api.status_code, api.text[:200])
+    # The account itself still signs in.
+    assert _signed_in().get("/auth/me").status_code == 200
+
+
+def test_sign_out_redirects_even_when_the_account_is_gone(world):
+    tc = _signed_in()
+    assert local_store.AuthStore().remove_user(USER)
+    r = tc.post("/auth/logout", headers=JSON_HEADERS, follow_redirects=False)
+    assert r.status_code == 302 and r.headers["location"] == "/"
+
+
 # ===========================================================================
 # a change ends the OTHER sessions
 # ===========================================================================

@@ -34,7 +34,7 @@ from local_store import (AuthStore, UserStore, ChatDataStore,
                          valid_sid)
 from excel_table_detector import _EXTRACTED_TEXT_ABOVE_TABLE
 from exec_transport import log_safe_text
-from logger_utils import log_with_sid
+from logger_utils import log_safe_value, log_with_sid
 from routes.chat import _EXEC
 from settings import settings, value_denied
 from schema_builder import (
@@ -88,16 +88,20 @@ async def new_session(request: Request):
     email = request.session.get("email")
     if not email:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
-    # Rotate sid → cleanest reset
+    # Rotate sid → cleanest reset. The PREVIOUS session's workspace (its raw
+    # uploads) is deleted, and a clean one is prepared at the new sid — both
+    # off the event loop, INCLUDING the constructor (its _ensure_layout does
+    # mkdirs + a write): these syscalls block every concurrent request on
+    # slow storage (each one is a network RPC on the GCS-fuse-mounted demo
+    # volume).
+    old_sid = request.session.get("sid")
     new_sid = "s_" + secrets.token_hex(8)
     request.session["sid"] = new_sid
-    # Also wipe any stale UserStore folder at the previous sid — off the event
-    # loop, INCLUDING the constructor (its _ensure_layout does mkdirs + a
-    # write): these syscalls block every concurrent request on slow storage
-    # (each one is a network RPC on the GCS-fuse-mounted demo volume).
     loop = asyncio.get_running_loop()
+    if old_sid:
+        await loop.run_in_executor(_EXEC, UserStore.destroy, old_sid, email)
     try:
-        await loop.run_in_executor(_EXEC, lambda: UserStore(new_sid).reset_all())
+        await loop.run_in_executor(_EXEC, lambda: UserStore(new_sid, owner=email).reset_all())
     except local_store.InvalidSessionId:
         # Logged by the store (SESSION_RESET_REFUSED); the folder resolved
         # outside DATA_ROOT/sessions, so nothing was deleted.
@@ -128,7 +132,7 @@ async def upload(request: Request, files: List[UploadFile] = File(...), file_des
         except Exception:
             return JSONResponse({"error": "Invalid file descriptions format."}, status_code=400)
 
-    store = UserStore(sid)
+    store = UserStore(sid, owner=email)
     # Preserve database-table selections across the reset: the wizard may run
     # /session/db_tables before /upload (or the user adds files after picking
     # tables), and reset_all() would silently drop those meta-only entries.
@@ -160,7 +164,7 @@ async def upload(request: Request, files: List[UploadFile] = File(...), file_des
             # activity) must use the name actually STORED on disk.
             out = store.save_upload(f.filename, content)
             saved.append(out.name)
-            log_with_sid(email, "info", "FILE_SAVED", file=out.name, size_kb=int(len(content) / 1024))
+            log_with_sid(email, "info", "FILE_SAVED", file=log_safe_value(str(out.name), 300), size_kb=int(len(content) / 1024))
             try:
                 brain_client.post_activity("file_uploaded", email, {
                     "filename": out.name, "size_bytes": len(content),
@@ -168,7 +172,7 @@ async def upload(request: Request, files: List[UploadFile] = File(...), file_des
             except Exception:
                 pass
     except Exception as e:
-        log_with_sid(email, "error", f"UPLOAD_ERROR: {e}")
+        log_with_sid(email, "error", f'UPLOAD_ERROR: {log_safe_value(str(e), 300)}')
         return JSONResponse({"error": f"Upload failed: {e}"}, status_code=500)
 
     payload, status = await _finish_upload(store, email, sid, saved, descriptions,
@@ -244,14 +248,14 @@ async def _finish_upload(store: UserStore, email: str, sid: str, saved: list[str
             desc = (rsp.get("description") or "").strip()
             if desc:
                 entry["file_description"] = desc[:500]
-                log_with_sid(email, "info", f"UPLOAD_AUTO_DESC file={fn_key} chars={len(desc)}")
+                log_with_sid(email, "info", f'UPLOAD_AUTO_DESC file={log_safe_value(str(fn_key), 300)} chars={len(desc)}')
             else:
                 entry["file_description"] = extracted[:500]
         except (TenantRevokedError, BrainError) as e:
-            log_with_sid(email, "warning", f"UPLOAD_AUTO_DESC_BRAIN_ERROR file={fn_key}: {e}")
+            log_with_sid(email, "warning", f'UPLOAD_AUTO_DESC_BRAIN_ERROR file={log_safe_value(str(fn_key), 300)}: {log_safe_value(str(e), 300)}')
             entry["file_description"] = extracted[:500]
         except Exception as e:
-            log_with_sid(email, "warning", f"UPLOAD_AUTO_DESC_ERROR file={fn_key}: {e}")
+            log_with_sid(email, "warning", f'UPLOAD_AUTO_DESC_ERROR file={log_safe_value(str(fn_key), 300)}: {log_safe_value(str(e), 300)}')
             entry["file_description"] = extracted[:500]
 
     # Re-append the preserved database-table entries (deduping their df keys
@@ -295,8 +299,8 @@ async def _finish_upload(store: UserStore, email: str, sid: str, saved: list[str
                                  "message": "This file type could not be read as a table."})
             failed.append(name)
 
-    log_with_sid(email, "info", "UPLOAD_OK", saved=",".join(saved), dataframes=",".join(df_names),
-                 failed=",".join(failed))
+    log_with_sid(email, "info", "UPLOAD_OK", saved=log_safe_value(str(",".join(saved)), 300), dataframes=log_safe_value(str(",".join(df_names)), 300),
+                 failed=log_safe_value(str(",".join(failed)), 300))
     if failed:
         payload = {
             "ok": False, "saved": saved, "dataframes": df_names, "files": file_results,
@@ -453,7 +457,7 @@ def _column_profile(full_ser, sample, nun, dtype_str: str, *, denied: bool = Fal
     except Exception as e:
         # The exception TYPE only — a pandas message can quote a cell value.
         log_with_sid("autofill", "warning",
-                     f"AUTOFILL_PROFILE_FAILED error={type(e).__name__}")
+                     f'AUTOFILL_PROFILE_FAILED error={log_safe_value(str(type(e).__name__), 300)}')
         out = f"[profile: dtype={dtype_str}]"
     if len(out) > cap:
         out = out[: cap - 1] + "]"
@@ -576,7 +580,7 @@ async def schema_autofill_full(request: Request):
     if not email or not sid:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
-    store = UserStore(sid)
+    store = UserStore(sid, owner=email)
     meta = store.read_meta()
     loop = asyncio.get_running_loop()
     # include_db=False: autofill operates on uploaded files only. Database
@@ -620,7 +624,7 @@ async def schema_autofill_full(request: Request):
                 ctx = _prepare_file_context(fname, df, entry, notes_text)
                 contexts.append(ctx)
             except Exception as e:
-                log_with_sid(email, "warning", f"AUTOFILL_FULL_CTX_FAIL file={fname}: {e}")
+                log_with_sid(email, "warning", f'AUTOFILL_FULL_CTX_FAIL file={log_safe_value(str(fname), 300)}: {log_safe_value(str(e), 300)}')
         return contexts
 
     file_contexts: list[dict] = await loop.run_in_executor(_EXEC, _build_contexts)
@@ -646,7 +650,7 @@ async def schema_autofill_full(request: Request):
             raise
         except (BrainError, Exception) as e:
             log_with_sid(email, "warning",
-                         f"AUTOFILL_FULL_LLM_FAIL file={ctx['fname']}: {e}")
+                         f"AUTOFILL_FULL_LLM_FAIL file={log_safe_value(str(ctx['fname']), 300)}: {log_safe_value(str(e), 300)}")
             return {"file_description": "", "columns": {}}
 
     parsed_results: list[tuple[dict, dict]] = []
@@ -720,7 +724,7 @@ async def schema_autofill_full(request: Request):
                     fields[col]["technical_description"] = _generate_technical_description(df[col], total, name=str(col))
                 except Exception as e:
                     log_with_sid(email, "warning",
-                                 f"AUTOFILL_TECH_DESC_FAIL file={fname} col={col}: {e}")
+                                 f'AUTOFILL_TECH_DESC_FAIL file={log_safe_value(str(fname), 300)} col={log_safe_value(str(col), 300)}: {log_safe_value(str(e), 300)}')
             try:
                 prof = dataset_profile.compute_profile(df)
                 src = store.files_dir / str(fname).split("::")[0]
@@ -731,13 +735,13 @@ async def schema_autofill_full(request: Request):
                      "parser_version": local_store._PARQUET_CACHE_PARSER_VERSION})
             except Exception as e:
                 log_with_sid(email, "warning",
-                             f"PROFILE_COMPUTE_FAILED file={fname}: {e}")
+                             f'PROFILE_COMPUTE_FAILED file={log_safe_value(str(fname), 300)}: {log_safe_value(str(e), 300)}')
 
     await loop.run_in_executor(_EXEC, _fill_technical_descriptions)
 
     store.write_meta(meta)
     log_with_sid(email, "info",
-                 f"SCHEMA_AUTOFILL_FULL filled_total={filled_total} files={len(file_results)}")
+                 f'SCHEMA_AUTOFILL_FULL filled_total={log_safe_value(str(filled_total), 300)} files={len(file_results)}')
     return {"ok": True, "filled": filled_total, "files": file_results, "updated": filled_total}
 
 
@@ -768,7 +772,7 @@ async def generate_chatdata(request: Request):
         pass
     provided_name = (body.get("name") or "").strip()
 
-    user_store = UserStore(sid)
+    user_store = UserStore(sid, owner=email)
     loop = asyncio.get_running_loop()
     # include_db=False: never read a multi-million-row snapshot just to list
     # keys; DB display names join via db_keys below.
@@ -803,9 +807,9 @@ async def generate_chatdata(request: Request):
             welcome_message = (rsp.get("welcome_message") or "").strip()
             suggested_questions = rsp.get("suggested_questions") or []
         except (TenantRevokedError, BrainError) as e:
-            log_with_sid(email, "warning", f"CHAT_METADATA_BRAIN_ERROR: {e}")
+            log_with_sid(email, "warning", f'CHAT_METADATA_BRAIN_ERROR: {log_safe_value(str(e), 300)}')
         except Exception as e:
-            log_with_sid(email, "warning", f"CHAT_METADATA_ERROR: {e}")
+            log_with_sid(email, "warning", f'CHAT_METADATA_ERROR: {log_safe_value(str(e), 300)}')
     else:
         # Name provided by user — only generate welcome + questions
         try:
@@ -821,9 +825,9 @@ async def generate_chatdata(request: Request):
             welcome_message = (rsp.get("welcome_message") or "").strip()
             suggested_questions = rsp.get("suggested_questions") or []
         except (TenantRevokedError, BrainError) as e:
-            log_with_sid(email, "warning", f"CHAT_METADATA_BRAIN_ERROR: {e}")
+            log_with_sid(email, "warning", f'CHAT_METADATA_BRAIN_ERROR: {log_safe_value(str(e), 300)}')
         except Exception as e:
-            log_with_sid(email, "warning", f"CHAT_METADATA_ERROR: {e}")
+            log_with_sid(email, "warning", f'CHAT_METADATA_ERROR: {log_safe_value(str(e), 300)}')
 
     name = provided_name or llm_name or _name_from_files(all_keys)
 
@@ -856,10 +860,14 @@ async def generate_chatdata(request: Request):
     AuthStore().record_active_chat(email, chat_id, title, all_keys)
     log_with_sid(
         email, "info", "CHAT_CREATED",
-        chat_id=chat_id, title=title, files=len(all_keys),
+        chat_id=chat_id, title=log_safe_value(str(title), 300), files=len(all_keys),
         questions=len(suggested_questions),
         welcome_chars=len(welcome_message),
     )
+    # The uploads now live in the chat: the session's temporary copy is
+    # deleted and the session gets a fresh workspace id for its next upload.
+    request.session["sid"] = "s_" + secrets.token_hex(8)
+    await asyncio.get_running_loop().run_in_executor(_EXEC, UserStore.destroy, sid, email)
 
     return {
         "ok": True,
@@ -905,7 +913,7 @@ async def api_db_tables(request: Request):
         loop = asyncio.get_running_loop()
         rows = await loop.run_in_executor(_EXEC, _visible)
     except Exception as e:
-        log_with_sid(email, "warning", f"DB_TABLES_LIST_FAILED: {e}")
+        log_with_sid(email, "warning", f'DB_TABLES_LIST_FAILED: {log_safe_value(str(e), 300)}')
         rows = []
     from db_sources import table_mode
     return {"tables": [{
@@ -1018,13 +1026,13 @@ async def session_db_tables(request: Request):
         names = sorted((tables[t].get("display_name") or tables[t].get("table_name") or t)
                        for t in denied)
         log_with_sid(email, "warning",
-                     f"SESSION_DB_TABLES_ROLE_DENIED sid={sid} tables={names}")
+                     f'SESSION_DB_TABLES_ROLE_DENIED sid={sid} tables={log_safe_value(str(names), 300)}')
         return JSONResponse({"error": "Your role does not include: " + ", ".join(names),
                              "code": "ROLE_DENIED"}, status_code=403)
 
     closure = expand_with_connectors(ids, reg) if ids else []
 
-    user_store = UserStore(sid)
+    user_store = UserStore(sid, owner=email)
     meta = user_store.read_meta()
     meta["files"] = [f for f in (meta.get("files") or [])
                      if not (isinstance(f, dict) and f.get("source") == "database")]
@@ -1168,7 +1176,7 @@ async def add_data_to_chat(request: Request):
     if not sid:
         return JSONResponse({"error": "No upload session. Upload files first."}, status_code=400)
 
-    user_store = UserStore(sid)
+    user_store = UserStore(sid, owner=email)
     loop = asyncio.get_running_loop()
     dfs = await loop.run_in_executor(
         _EXEC, lambda: user_store.load_dataframes(include_db=False))
@@ -1248,7 +1256,7 @@ async def add_data_to_chat(request: Request):
                 overwritten_sources, added, updated, removed)
         except Exception as e:
             log_with_sid(email, "error",
-                         f"ADD_DATA_RESYNC_FAILED (falling back to append-merge): {e}",
+                         f'ADD_DATA_RESYNC_FAILED (falling back to append-merge): {log_safe_value(str(e), 300)}',
                          chat_id=chat_id)
             added, updated, removed = [], [], []
             merged_files = list(chat_meta.get("files", []) or [])
@@ -1268,15 +1276,15 @@ async def add_data_to_chat(request: Request):
         try:
             AuthStore().update_active_chat_files(email, chat_id, all_names)
         except Exception as e:
-            log_with_sid(email, "warning", f"ADD_DATA_FILELIST_UPDATE_FAILED: {e}", chat_id=chat_id)
+            log_with_sid(email, "warning", f'ADD_DATA_FILELIST_UPDATE_FAILED: {log_safe_value(str(e), 300)}', chat_id=chat_id)
 
         log_with_sid(email, "info", "CHAT_DATA_ADDED", chat_id=chat_id,
-                     added=",".join(added), updated=",".join(updated),
-                     removed=",".join(removed))
+                     added=log_safe_value(str(",".join(added)), 300), updated=log_safe_value(str(",".join(updated)), 300),
+                     removed=log_safe_value(str(",".join(removed)), 300))
         return {"ok": True, "chat_id": chat_id, "added": added,
                 "updated": updated, "removed": removed, "files": all_names}
     except Exception as e:
-        log_with_sid(email, "error", f"ADD_DATA_ERROR: {type(e).__name__}: {e}", chat_id=chat_id)
+        log_with_sid(email, "error", f'ADD_DATA_ERROR: {log_safe_value(str(type(e).__name__), 300)}: {log_safe_value(str(e), 300)}', chat_id=chat_id)
         return JSONResponse({"error": "Failed to add data to the chat."}, status_code=500)
 
 
@@ -1365,12 +1373,12 @@ async def _json_body(request: Request, model, email: str):
     try:
         data = await request.json()
     except Exception as e:
-        log_with_sid(email, "warning", f"UPLOAD_BODY_INVALID: {type(e).__name__}", model=model.__name__)
+        log_with_sid(email, "warning", f'UPLOAD_BODY_INVALID: {log_safe_value(str(type(e).__name__), 300)}', model=log_safe_value(str(model.__name__), 300))
         return None
     try:
         return model.model_validate(data)
     except ValidationError as e:
-        log_with_sid(email, "warning", f"UPLOAD_BODY_INVALID: {e.error_count()} field error(s)", model=model.__name__)
+        log_with_sid(email, "warning", f'UPLOAD_BODY_INVALID: {log_safe_value(str(e.error_count()), 300)} field error(s)', model=log_safe_value(str(model.__name__), 300))
         return None
 
 
@@ -1396,20 +1404,20 @@ async def upload_init(request: Request):
         log_with_sid(email, "warning", "UPLOAD_INIT_BAD_FILENAME")
         return JSONResponse({"error": "Invalid filename."}, status_code=400)
     if not _has_direct_upload_ext(safe_name):
-        log_with_sid(email, "warning", "UPLOAD_INIT_BAD_EXTENSION", file=safe_name)
+        log_with_sid(email, "warning", "UPLOAD_INIT_BAD_EXTENSION", file=log_safe_value(str(safe_name), 300))
         return JSONResponse({"error": "Unsupported file type. Use .xlsx, .xls, .csv, or .tsv."},
                             status_code=400)
     if body.size_bytes <= 0 or body.size_bytes > _DIRECT_UPLOAD_MAX_BYTES:
-        log_with_sid(email, "warning", "UPLOAD_INIT_SIZE_REJECTED", file=safe_name, size=body.size_bytes)
+        log_with_sid(email, "warning", "UPLOAD_INIT_SIZE_REJECTED", file=log_safe_value(str(safe_name), 300), size=log_safe_value(str(body.size_bytes), 300))
         return JSONResponse({"error": f"File too large. Maximum allowed is "
                                       f"{_DIRECT_UPLOAD_MAX_BYTES // (1024 * 1024)} MB."},
                             status_code=400)
 
     loop = asyncio.get_running_loop()
     try:
-        existing = await loop.run_in_executor(_EXEC, lambda: _session_upload_bases(UserStore(sid)))
+        existing = await loop.run_in_executor(_EXEC, lambda: _session_upload_bases(UserStore(sid, owner=email)))
     except Exception as e:
-        log_with_sid(email, "warning", f"UPLOAD_INIT_META_READ_FAILED: {type(e).__name__}")
+        log_with_sid(email, "warning", f'UPLOAD_INIT_META_READ_FAILED: {log_safe_value(str(type(e).__name__), 300)}')
         existing = set()
     if len(existing) >= settings.MAX_FILES and safe_name not in existing:
         return JSONResponse({"error": f"You can upload up to {settings.MAX_FILES} files."}, status_code=400)
@@ -1422,12 +1430,12 @@ async def upload_init(request: Request):
     except Exception as e:
         # DefaultCredentialsError / RefreshError / no service-account email all
         # land here. Fixed message: google errors embed request URLs.
-        log_with_sid(email, "error", f"UPLOAD_INIT_SIGN_FAILED: {type(e).__name__}: {str(e)[:200]}",
-                     file=safe_name)
+        log_with_sid(email, "error", f'UPLOAD_INIT_SIGN_FAILED: {log_safe_value(str(type(e).__name__), 300)}: {log_safe_value(str(str(e)[:200]), 300)}',
+                     file=log_safe_value(str(safe_name), 300))
         return JSONResponse({"error": "Direct upload is not configured on this server."}, status_code=500)
 
     expires_at = (datetime.now(timezone.utc) + timedelta(minutes=_DIRECT_UPLOAD_EXPIRY_MIN)).isoformat()
-    log_with_sid(email, "info", "UPLOAD_INIT", file=safe_name, size=body.size_bytes, path=object_path)
+    log_with_sid(email, "info", "UPLOAD_INIT", file=log_safe_value(str(safe_name), 300), size=log_safe_value(str(body.size_bytes), 300), path=log_safe_value(str(object_path), 300))
     return {"signed_url": signed_url, "gcs_path": object_path, "expires_at": expires_at}
 
 
@@ -1451,11 +1459,11 @@ async def upload_finalize(request: Request):
 
     gcs_path = (body.gcs_path or "").strip().lstrip("/")
     if not gcs_path.startswith(f"tmp/{sid}/") or ".." in gcs_path:
-        log_with_sid(email, "warning", "UPLOAD_FINALIZE_REJECTED_PREFIX", path=gcs_path[:120])
+        log_with_sid(email, "warning", "UPLOAD_FINALIZE_REJECTED_PREFIX", path=log_safe_value(str(gcs_path[:120]), 300))
         return JSONResponse({"error": "Invalid upload path."}, status_code=400)
     filename = _safe_upload_filename(gcs_path.rsplit("/", 1)[-1])
     if not filename or not _has_direct_upload_ext(filename):
-        log_with_sid(email, "warning", "UPLOAD_FINALIZE_BAD_FILENAME", path=gcs_path[:120])
+        log_with_sid(email, "warning", "UPLOAD_FINALIZE_BAD_FILENAME", path=log_safe_value(str(gcs_path[:120]), 300))
         return JSONResponse({"error": "Invalid filename in upload path."}, status_code=400)
     descriptions = body.file_descriptions if isinstance(body.file_descriptions, dict) else {}
 
@@ -1468,9 +1476,9 @@ async def upload_finalize(request: Request):
             try:
                 gcs_upload.delete_blob(gcs_path)
             except Exception as e_del:
-                log_with_sid(email, "warning", f"UPLOAD_FINALIZE_TMP_DELETE_FAILED: {type(e_del).__name__}")
+                log_with_sid(email, "warning", f'UPLOAD_FINALIZE_TMP_DELETE_FAILED: {log_safe_value(str(type(e_del).__name__), 300)}')
             return "too_large", size, None
-        store = UserStore(sid)  # constructor mkdirs — keep it off the loop too
+        store = UserStore(sid, owner=email)  # constructor mkdirs — keep it off the loop too
         dest = store.files_dir / filename
         # Defense in depth, the same containment check UserStore.save_upload
         # makes at its write: the destination must resolve INSIDE files_dir even
@@ -1490,7 +1498,7 @@ async def upload_finalize(request: Request):
             try:
                 dest.unlink(missing_ok=True)
             except Exception as e_rm:
-                log_with_sid(email, "warning", f"UPLOAD_FINALIZE_PARTIAL_CLEANUP_FAILED: {type(e_rm).__name__}")
+                log_with_sid(email, "warning", f'UPLOAD_FINALIZE_PARTIAL_CLEANUP_FAILED: {log_safe_value(str(type(e_rm).__name__), 300)}')
             raise
         finally:
             # Best effort on success AND failure; the bucket lifecycle rule
@@ -1498,30 +1506,30 @@ async def upload_finalize(request: Request):
             try:
                 gcs_upload.delete_blob(gcs_path)
             except Exception as e_del:
-                log_with_sid(email, "warning", f"UPLOAD_FINALIZE_TMP_DELETE_FAILED: {type(e_del).__name__}")
+                log_with_sid(email, "warning", f'UPLOAD_FINALIZE_TMP_DELETE_FAILED: {log_safe_value(str(type(e_del).__name__), 300)}')
         return "ok", got, store
 
     loop = asyncio.get_running_loop()
     try:
         state, size, store = await loop.run_in_executor(_EXEC, _pull)
     except Exception as e:
-        log_with_sid(email, "error", f"UPLOAD_FINALIZE_TRANSFER_FAILED: {type(e).__name__}: {str(e)[:200]}",
-                     file=filename)
+        log_with_sid(email, "error", f'UPLOAD_FINALIZE_TRANSFER_FAILED: {log_safe_value(str(type(e).__name__), 300)}: {log_safe_value(str(str(e)[:200]), 300)}',
+                     file=log_safe_value(str(filename), 300))
         return JSONResponse({"error": "Failed to import the uploaded file. Please try again."}, status_code=500)
     if state == "missing":
-        log_with_sid(email, "warning", "UPLOAD_FINALIZE_MISSING", path=gcs_path[:120])
+        log_with_sid(email, "warning", "UPLOAD_FINALIZE_MISSING", path=log_safe_value(str(gcs_path[:120]), 300))
         return JSONResponse({"error": "Uploaded file not found. Please try again."}, status_code=404)
     if state == "unsafe_dest":
         # Nothing was downloaded; the object stays for the bucket lifecycle rule.
-        log_with_sid(email, "warning", "UPLOAD_FINALIZE_UNSAFE_PATH", file=filename[:120])
+        log_with_sid(email, "warning", "UPLOAD_FINALIZE_UNSAFE_PATH", file=log_safe_value(str(filename[:120]), 300))
         return JSONResponse({"error": "Invalid filename in upload path."}, status_code=400)
     if state == "too_large":
-        log_with_sid(email, "warning", "UPLOAD_FINALIZE_SIZE_REJECTED", file=filename, size=size)
+        log_with_sid(email, "warning", "UPLOAD_FINALIZE_SIZE_REJECTED", file=log_safe_value(str(filename), 300), size=log_safe_value(str(size), 300))
         return JSONResponse({"error": f"File too large. Maximum allowed is "
                                       f"{_DIRECT_UPLOAD_MAX_BYTES // (1024 * 1024)} MB."},
                             status_code=400)
 
-    log_with_sid(email, "info", "FILE_SAVED", file=filename, size_kb=int((size or 0) / 1024), via="gcs")
+    log_with_sid(email, "info", "FILE_SAVED", file=log_safe_value(str(filename), 300), size_kb=int((size or 0) / 1024), via="gcs")
     try:
         brain_client.post_activity("file_uploaded", email, {"filename": filename, "size_bytes": size})
     except Exception:

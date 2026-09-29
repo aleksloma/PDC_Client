@@ -33,7 +33,7 @@ from typing import Optional
 import pandas as pd
 
 from settings import settings
-from logger_utils import log_with_sid
+from logger_utils import log_safe_value, log_with_sid
 from excel_table_detector import load_excel_sheets, _EXTRACTED_TEXT_ABOVE_TABLE  # noqa: F401 — re-exported
 from excel_table_detector import ARCHIVE_REJECTED_TEXT, ExcelArchiveRejected
 
@@ -261,12 +261,11 @@ def _read_csv_tolerant(path: Path, sep: str = ",") -> tuple[Optional[pd.DataFram
             bad_rows: list = []
             df = pd.read_csv(path, sep=sep, engine="python",
                              on_bad_lines=lambda fields: bad_rows.append(fields) and None)
-            log_with_sid(path.name, "warning",
-                         f"FILE_LOAD_TOLERANT {path}: skipped={len(bad_rows)} "
-                         f"first_bad_line={first_bad}")
+            log_with_sid(log_safe_value(str(path.name), 254), "warning",
+                         f'FILE_LOAD_TOLERANT {log_safe_value(str(path), 300)}: skipped={len(bad_rows)} first_bad_line={log_safe_value(str(first_bad), 300)}')
             return df, {"skipped_rows": len(bad_rows), "first_bad_line": first_bad}
         except Exception as e:
-            log_with_sid(path.name, "warning", f"FILE_LOAD_ERROR {path}: {e}")
+            log_with_sid(log_safe_value(str(path.name), 254), "warning", f'FILE_LOAD_ERROR {log_safe_value(str(path), 300)}: {log_safe_value(str(e), 300)}')
             return None, {"error": f"{type(strict_err).__name__}: {strict_err}"}
 
 
@@ -322,7 +321,7 @@ def _load_one_file(path: Path, report: Optional[list] = None) -> dict[str, pd.Da
         _report({"file": path.name, "status": "error",
                  "message": ARCHIVE_REJECTED_TEXT})
     except Exception as e:
-        log_with_sid(path.name, "warning", f"FILE_LOAD_ERROR {path}: {e}")
+        log_with_sid(log_safe_value(str(path.name), 254), "warning", f'FILE_LOAD_ERROR {log_safe_value(str(path), 300)}: {log_safe_value(str(e), 300)}')
         _report({"file": path.name, "status": "error",
                  "message": "Could not parse this file."})
     return out
@@ -391,10 +390,10 @@ def _parquet_cache_read(path: Path, src_size: int, src_mtime_ns: int) -> Optiona
                 out[key] = pd.read_pickle(cache_dir / pkl_name)
         if not out:
             return None
-        log_with_sid(path.name, "info", f"PARQUET_CACHE_HIT {path.name} dfs={len(out)}")
+        log_with_sid(log_safe_value(str(path.name), 254), "info", f'PARQUET_CACHE_HIT {log_safe_value(str(path.name), 300)} dfs={len(out)}')
         return out
     except Exception as e:
-        log_with_sid(path.name, "warning", f"PARQUET_CACHE_READ_FAILED {path}: {e}")
+        log_with_sid(log_safe_value(str(path.name), 254), "warning", f'PARQUET_CACHE_READ_FAILED {log_safe_value(str(path), 300)}: {log_safe_value(str(e), 300)}')
         return None
 
 
@@ -441,12 +440,11 @@ def _parquet_cache_write(path: Path, dfs: dict[str, pd.DataFrame],
                         raise ValueError("pickle round-trip altered the dataframe")
                     os.replace(pkl_tmp, cache_dir / pkl_name)
                     entries.append({"key": key, "pickle": pkl_name})
-                    log_with_sid(path.name, "info",
-                                 f"PARQUET_CACHE_PICKLE_FALLBACK file={path.name} key={key}: {e_pq}")
+                    log_with_sid(log_safe_value(str(path.name), 254), "info",
+                                 f'PARQUET_CACHE_PICKLE_FALLBACK file={log_safe_value(str(path.name), 300)} key={log_safe_value(str(key), 300)}: {log_safe_value(str(e_pq), 300)}')
                 except Exception as e_pkl:
-                    log_with_sid(path.name, "warning",
-                                 f"PARQUET_CACHE_SKIP_DF file={path.name} key={key}: "
-                                 f"parquet: {e_pq}; pickle: {e_pkl}")
+                    log_with_sid(log_safe_value(str(path.name), 254), "warning",
+                                 f'PARQUET_CACHE_SKIP_DF file={log_safe_value(str(path.name), 300)} key={log_safe_value(str(key), 300)}: parquet: {log_safe_value(str(e_pq), 300)}; pickle: {log_safe_value(str(e_pkl), 300)}')
                     try:
                         pkl_tmp.unlink(missing_ok=True)
                     except Exception:
@@ -475,9 +473,9 @@ def _parquet_cache_write(path: Path, dfs: dict[str, pd.DataFrame],
                 (cache_dir / fname).unlink(missing_ok=True)
             except Exception:
                 pass
-        log_with_sid(path.name, "info", f"PARQUET_CACHE_REBUILT {path.name} dfs={len(entries)}")
+        log_with_sid(log_safe_value(str(path.name), 254), "info", f'PARQUET_CACHE_REBUILT {log_safe_value(str(path.name), 300)} dfs={len(entries)}')
     except Exception as e:
-        log_with_sid(path.name, "warning", f"PARQUET_CACHE_WRITE_FAILED {path}: {e}")
+        log_with_sid(log_safe_value(str(path.name), 254), "warning", f'PARQUET_CACHE_WRITE_FAILED {log_safe_value(str(path), 300)}: {log_safe_value(str(e), 300)}')
 
 
 def _load_one_file_cached(path: Path, report: Optional[list] = None) -> dict[str, pd.DataFrame]:
@@ -495,7 +493,7 @@ def _load_one_file_cached(path: Path, report: Optional[list] = None) -> dict[str
         st = path.stat()
         src_size, src_mtime_ns = st.st_size, st.st_mtime_ns
     except Exception as e:
-        log_with_sid(path.name, "warning", f"PARQUET_CACHE_STAT_FAILED {path}: {e}")
+        log_with_sid(log_safe_value(str(path.name), 254), "warning", f'PARQUET_CACHE_STAT_FAILED {log_safe_value(str(path), 300)}: {log_safe_value(str(e), 300)}')
         return _load_one_file(path, report)
     cached = _parquet_cache_read(path, src_size, src_mtime_ns)
     if cached is not None:
@@ -619,7 +617,7 @@ def _df_cache_sweeper():
         try:
             _DATAFRAME_CACHE.sweep()
         except Exception as e:
-            log_with_sid("df_cache", "warning", f"DF_CACHE_SWEEP_FAILED: {e}")
+            log_with_sid("df_cache", "warning", f'DF_CACHE_SWEEP_FAILED: {log_safe_value(str(e), 300)}')
 
 
 threading.Thread(target=_df_cache_sweeper, daemon=True, name="df_cache_sweeper").start()
@@ -637,7 +635,7 @@ def _files_signature(files_dir: Path) -> Optional[tuple]:
                 sig.append((fp.name, st.st_mtime_ns, st.st_size))
         return tuple(sig)
     except Exception as e:
-        log_with_sid(str(files_dir), "warning", f"DF_CACHE_SIGNATURE_FAILED: {e}")
+        log_with_sid(log_safe_value(str(str(files_dir)), 254), "warning", f'DF_CACHE_SIGNATURE_FAILED: {log_safe_value(str(e), 300)}')
         return None
 
 
@@ -658,7 +656,7 @@ def _dfs_size_bytes(dfs: dict[str, pd.DataFrame]) -> Optional[int]:
                 total += int(df.memory_usage(deep=True).sum())
         return int(total)
     except Exception as e:
-        log_with_sid("df_cache", "warning", f"DF_CACHE_SIZE_FAILED: {e}")
+        log_with_sid("df_cache", "warning", f'DF_CACHE_SIZE_FAILED: {log_safe_value(str(e), 300)}')
         return None
 
 
@@ -794,8 +792,8 @@ def ensure_chat_profiles(store, dfs: dict) -> dict:
             prof.pop("src", None)
             out[df_key] = _json_safe(prof)
         except Exception as e:
-            log_with_sid(getattr(store, "chat_id", "profiles"), "warning",
-                         f"PROFILE_ENSURE_FAILED key={df_key}: {e}")
+            log_with_sid(log_safe_value(str(getattr(store, "chat_id", "profiles")), 254), "warning",
+                         f'PROFILE_ENSURE_FAILED key={log_safe_value(str(df_key), 300)}: {log_safe_value(str(e), 300)}')
     return out
 
 
@@ -830,7 +828,7 @@ def missing_db_tables(meta) -> list[dict]:
         registered = {t.get("id"): t for t in DataSourceStore().list_tables()}
         registry_ok = True
     except Exception as e:                                   # noqa: BLE001
-        log_with_sid("missing-db", "warning", f"REGISTRY_PROBE_FAILED: {e}")
+        log_with_sid("missing-db", "warning", f'REGISTRY_PROBE_FAILED: {log_safe_value(str(e), 300)}')
     out = []
     for entry in entries:
         db = entry.get("db") or {}
@@ -866,7 +864,7 @@ def empty_dataset_message(meta) -> tuple[str, list]:
     try:
         missing = missing_db_tables(meta)
     except Exception as e:                                   # noqa: BLE001
-        log_with_sid("missing-db", "warning", f"MISSING_DB_PROBE_FAILED: {e}")
+        log_with_sid("missing-db", "warning", f'MISSING_DB_PROBE_FAILED: {log_safe_value(str(e), 300)}')
         missing = []
     if not missing:
         return "Chat dataset is empty.", []
@@ -924,15 +922,15 @@ def _load_db_snapshots(db_entries: list, owner: str) -> dict[str, pd.DataFrame]:
         try:
             path = db_snapshot_path(tid)
         except ValueError:
-            log_with_sid(owner, "warning", f"DB_SNAPSHOT_BAD_ID key={key}")
+            log_with_sid(log_safe_value(str(owner), 254), "warning", f'DB_SNAPSHOT_BAD_ID key={log_safe_value(str(key), 300)}')
             continue
         if not path.exists():
-            log_with_sid(owner, "warning", f"DB_SNAPSHOT_MISSING table={tid} key={key}")
+            log_with_sid(log_safe_value(str(owner), 254), "warning", f'DB_SNAPSHOT_MISSING table={log_safe_value(str(tid), 300)} key={log_safe_value(str(key), 300)}')
             continue
         try:
             out[key] = pd.read_parquet(path)
         except Exception as e:
-            log_with_sid(owner, "warning", f"DB_SNAPSHOT_LOAD_FAILED table={tid}: {e}")
+            log_with_sid(log_safe_value(str(owner), 254), "warning", f'DB_SNAPSHOT_LOAD_FAILED table={log_safe_value(str(tid), 300)}: {log_safe_value(str(e), 300)}')
     return out
 
 
@@ -1037,9 +1035,8 @@ def _partition_db_entries(db_entries: Optional[list], owner: str) -> tuple[list,
         from db_sources import DataSourceStore, table_mode
         rows = {t.get("id"): t for t in DataSourceStore().list_tables()}
     except Exception as e:                                   # noqa: BLE001
-        log_with_sid(owner, "error",
-                     f"LIVE_REGISTRY_PROBE_FAILED error={type(e).__name__} "
-                     f"reason=db_entries_not_loaded")
+        log_with_sid(log_safe_value(str(owner), 254), "error",
+                     f'LIVE_REGISTRY_PROBE_FAILED error={log_safe_value(str(type(e).__name__), 300)} reason=db_entries_not_loaded')
         return [], []
     snapshot, live = [], []
     for entry in entries:
@@ -1076,10 +1073,10 @@ def _load_dataframes_cached(files_dir: Path, owner: str,
         try:
             entry = _DATAFRAME_CACHE.get(key)
             if entry is not None and entry.get("sig") == sig:
-                log_with_sid(owner, "info", f"DF_MEMORY_CACHE_HIT dfs={len(entry['dfs'])}")
+                log_with_sid(log_safe_value(str(owner), 254), "info", f"DF_MEMORY_CACHE_HIT dfs={len(entry['dfs'])}")
                 return {k: df.copy() for k, df in entry["dfs"].items()}
         except Exception as e:
-            log_with_sid(owner, "warning", f"DF_MEMORY_CACHE_GET_FAILED: {e}")
+            log_with_sid(log_safe_value(str(owner), 254), "warning", f'DF_MEMORY_CACHE_GET_FAILED: {log_safe_value(str(e), 300)}')
     dfs: dict[str, pd.DataFrame] = {}
     for fp in sorted(files_dir.iterdir()):
         if fp.is_file() and not fp.name.startswith("."):
@@ -1095,10 +1092,10 @@ def _load_dataframes_cached(files_dir: Path, owner: str,
                     {"sig": sig, "dfs": {k: df.copy() for k, df in dfs.items()}},
                     size_bytes=size)
                 if not cached:
-                    log_with_sid(owner, "info",
-                                 f"DF_MEMORY_CACHE_TOO_LARGE size_mb={size // (1024 * 1024)}")
+                    log_with_sid(log_safe_value(str(owner), 254), "info",
+                                 f'DF_MEMORY_CACHE_TOO_LARGE size_mb={log_safe_value(str(size // (1024 * 1024)), 300)}')
         except Exception as e:
-            log_with_sid(owner, "warning", f"DF_MEMORY_CACHE_SET_FAILED: {e}")
+            log_with_sid(log_safe_value(str(owner), 254), "warning", f'DF_MEMORY_CACHE_SET_FAILED: {log_safe_value(str(e), 300)}')
     return dfs
 
 
@@ -1260,7 +1257,7 @@ class AuthStore:
         try:
             return json.loads(p.read_text(encoding="utf-8"))
         except Exception as e:
-            log_with_sid(email, "error", f"AUTH_READ_FAILED: {e}")
+            log_with_sid(email, "error", f'AUTH_READ_FAILED: {log_safe_value(str(e), 300)}')
             return {}
 
     def _write_auth(self, email: str, auth: dict) -> None:
@@ -1295,7 +1292,7 @@ class AuthStore:
                 self._write_auth(email, auth)
             return True
         except Exception as e:
-            log_with_sid(email, "warning", f"SSO_MARK_LOGIN_FAILED: {e}")
+            log_with_sid(email, "warning", f'SSO_MARK_LOGIN_FAILED: {log_safe_value(str(e), 300)}')
 
     @staticmethod
     def _apply_password_hash(auth: dict, password_hash: str, force_change: bool) -> None:
@@ -1558,7 +1555,7 @@ class AuthStore:
             p = _data_root() / "users" / email / "profile.json"
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps(prof, indent=2, ensure_ascii=False), encoding="utf-8")
-        log_with_sid(email, "info", f"USER_ROLE_SET role={role}")
+        log_with_sid(email, "info", f'USER_ROLE_SET role={log_safe_value(str(role), 300)}')
         return True
 
     def is_admin(self, email: str) -> bool:
@@ -1618,7 +1615,7 @@ class AuthStore:
             p = _data_root() / "users" / email / "profile.json"
             p.parent.mkdir(parents=True, exist_ok=True)
             _write_json_atomic(p, prof)
-        log_with_sid(email, "info", f"USER_DATA_ROLES_SET role_ids={ids}")
+        log_with_sid(email, "info", f'USER_DATA_ROLES_SET role_ids={log_safe_value(str(ids), 300)}')
         return True
 
     # Single-role shims — many call sites/tests predate the multi-role model.
@@ -1645,7 +1642,7 @@ class AuthStore:
                 _write_json_atomic(p, prof)
             return True
         except Exception as e:
-            log_with_sid(email, "warning", f"LAST_LOGIN_STAMP_FAILED: {e}")
+            log_with_sid(email, "warning", f'LAST_LOGIN_STAMP_FAILED: {log_safe_value(str(e), 300)}')
 
     def list_users(self) -> list:
         """Every user with a readable profile.json, sorted by email —
@@ -1684,7 +1681,7 @@ class AuthStore:
                     "last_login_at": prof.get("last_login_at"),
                 })
             except Exception as e:
-                log_with_sid("admin", "warning", f"LIST_USERS_SKIP dir={udir.name}: {e}")
+                log_with_sid("admin", "warning", f'LIST_USERS_SKIP dir={log_safe_value(str(udir.name), 300)}: {log_safe_value(str(e), 300)}')
                 continue
         rows.sort(key=lambda r: r["email"])
         return rows
@@ -1718,9 +1715,9 @@ class AuthStore:
                 # Exempt from the rule (refusing would lock a fresh install
                 # out), so flag it. Never the password, never its length.
                 log_with_sid("startup", "warning",
-                             f"LADMIN_BOOTSTRAP_WEAK min_length={min_len}")
+                             f'LADMIN_BOOTSTRAP_WEAK min_length={log_safe_value(str(min_len), 300)}')
         except Exception as e:
-            log_with_sid("startup", "error", f"LADMIN_BOOTSTRAP_FAILED: {e}")
+            log_with_sid("startup", "error", f'LADMIN_BOOTSTRAP_FAILED: {log_safe_value(str(e), 300)}')
 
     # --- Reset links ----------------------------------------------------------
 
@@ -1748,7 +1745,7 @@ class AuthStore:
             return token
         except Exception as e:
             log_with_sid(email, "error",
-                         f"PASSWORD_RESET_TOKEN_FAILED {type(e).__name__}")
+                         f'PASSWORD_RESET_TOKEN_FAILED {log_safe_value(str(type(e).__name__), 300)}')
             return None
 
     def find_reset_token(self, token: str):
@@ -1779,7 +1776,7 @@ class AuthStore:
                     return udir.name, rec
             return None
         except Exception as e:
-            log_with_sid("auth", "error", f"PASSWORD_RESET_LOOKUP_FAILED {type(e).__name__}")
+            log_with_sid("auth", "error", f'PASSWORD_RESET_LOOKUP_FAILED {log_safe_value(str(type(e).__name__), 300)}')
             return None
 
     def load_reset_token_index(self) -> Optional[int]:
@@ -1806,7 +1803,7 @@ class AuthStore:
             return len(found)
         except Exception as e:
             log_with_sid("startup", "error",
-                         f"RESET_TOKEN_INDEX_FILL_FAILED {type(e).__name__}")
+                         f'RESET_TOKEN_INDEX_FILL_FAILED {log_safe_value(str(type(e).__name__), 300)}')
             return None
 
     def consume_reset_token(self, token: str, new_password: str) -> Optional[str]:
@@ -1853,7 +1850,7 @@ class AuthStore:
                 if old:
                     _RESET_TOKEN_INDEX.pop(old, None)
         except Exception as e:
-            log_with_sid(email, "error", f"PASSWORD_RESET_CLEAR_FAILED {type(e).__name__}")
+            log_with_sid(email, "error", f'PASSWORD_RESET_CLEAR_FAILED {log_safe_value(str(type(e).__name__), 300)}')
 
     def clear_temp_password(self, email: str) -> None:
         with _LOCK:
@@ -2219,13 +2216,14 @@ class UserStore:
     they are cloned into a permanent `ChatDataStore`.
     """
 
-    def __init__(self, sid: str):
+    def __init__(self, sid: str, owner: Optional[str] = None):
         if not valid_sid(sid):
             from exec_transport import log_safe_text
             log_with_sid("session", "warning",
                          f"SID_INVALID sid={log_safe_text(str(sid), 40)}")
             raise InvalidSessionId("invalid session id")
         self.sid = sid
+        self.owner = str(owner or "").strip().lower() or None
         self.root = _data_root() / "sessions" / sid
         self.files_dir = self.root / "files"
         self.meta_path = self.root / "meta.json"
@@ -2235,7 +2233,17 @@ class UserStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.files_dir.mkdir(parents=True, exist_ok=True)
         if not self.meta_path.exists():
-            self.meta_path.write_text(json.dumps({"files": []}, ensure_ascii=False, indent=2), encoding="utf-8")
+            meta = {"files": []}
+            if self.owner:
+                meta["owner"] = self.owner
+            self.meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        elif self.owner:
+            # The owner is recorded once, on a session folder that has none
+            # (a folder written before the field existed).
+            meta = self.read_meta()
+            if not meta.get("owner"):
+                meta["owner"] = self.owner
+                self.write_meta(meta)
 
     def reset_all(self):
         try:
@@ -2246,6 +2254,57 @@ class UserStore:
         if target.exists():
             shutil.rmtree(target, ignore_errors=True)
         self._ensure_layout()
+
+    @staticmethod
+    def destroy(sid, owner: Optional[str] = None) -> bool:
+        """Delete the session's temporary workspace `sessions/<sid>/` (its raw
+        uploads and meta) WITHOUT re-creating it. Called when the uploads
+        have been copied into a chat (/generate_chatdata), when a new
+        session replaces this one (/new_session) and at logout.
+
+        Refused (False, nothing deleted): a sid outside the `s_<16 hex>`
+        shape, a folder that does not resolve strictly inside
+        `DATA_ROOT/sessions`, and a folder whose recorded `owner` is not
+        `owner` (a session is removed only by the account it belongs to; a
+        folder without an owner — written before the field existed — is
+        removed). True when the folder is gone (or never existed). Never
+        raises (Article IV)."""
+        from exec_transport import log_safe_text
+        if not valid_sid(sid):
+            log_with_sid("session", "warning",
+                         f"SESSION_DESTROY_REFUSED reason=sid sid={log_safe_text(str(sid), 40)}")
+            return False
+        root = _data_root() / "sessions" / sid
+        try:
+            if not root.exists():
+                return True
+            target = _assert_inside(root, _data_root() / "sessions")
+            meta_path = target / "meta.json"
+            recorded = ""
+            if meta_path.is_file():
+                try:
+                    recorded = str(json.loads(meta_path.read_text(encoding="utf-8")).get("owner") or "")
+                except Exception:
+                    recorded = ""
+            want = str(owner or "").strip().lower()
+            if recorded and want and recorded.strip().lower() != want:
+                log_with_sid("session", "warning",
+                             f"SESSION_DESTROY_REFUSED reason=owner sid={log_safe_text(sid, 40)}")
+                return False
+            shutil.rmtree(target, ignore_errors=True)
+            _DATAFRAME_CACHE.invalidate(str(target / "files"))   # keyed by files_dir
+            gone = not target.exists()
+            if gone:
+                log_with_sid("session", "info",
+                             f"SESSION_FILES_DELETED sid={log_safe_text(sid, 40)}")
+            else:
+                log_with_sid("session", "warning",
+                             f"SESSION_DESTROY_INCOMPLETE sid={log_safe_text(sid, 40)}")
+            return gone
+        except Exception as e:
+            log_with_sid("session", "error",
+                         f"SESSION_DESTROY_FAILED error={log_safe_text(type(e).__name__, 80)}")
+            return False
 
     def save_upload(self, filename: str, content: bytes) -> Path:
         """Store one uploaded file under `files_dir`, returning its path.
@@ -2297,7 +2356,7 @@ class UserStore:
                 if fp.is_file() and not fp.name.startswith("."):
                     dfs.update(_load_one_file_cached(fp, report))
         except Exception as e:
-            log_with_sid(self.sid, "warning", f"UPLOAD_LOAD_REPORT_FAILED: {e}")
+            log_with_sid(log_safe_value(str(self.sid), 254), "warning", f'UPLOAD_LOAD_REPORT_FAILED: {log_safe_value(str(e), 300)}')
         return dfs, report
 
 
@@ -2355,7 +2414,7 @@ class ChatDataStore:
                 shutil.copytree(src_cache, self.files_dir / _PARQUET_CACHE_DIRNAME,
                                 dirs_exist_ok=True)
         except Exception as e:
-            log_with_sid(self.chat_id, "warning", f"PARQUET_CACHE_CLONE_FAILED: {e}")
+            log_with_sid(log_safe_value(str(self.chat_id), 254), "warning", f'PARQUET_CACHE_CLONE_FAILED: {log_safe_value(str(e), 300)}')
         # Carry the dataset-profile sidecars too: the source files are copy2'd
         # (mtime preserved) above, so the profiles' src stamps stay valid in
         # the new chat store. Best-effort — a missing profile just backfills.
@@ -2365,7 +2424,7 @@ class ChatDataStore:
                 shutil.copytree(src_profiles, self.files_dir / _PROFILE_DIRNAME,
                                 dirs_exist_ok=True)
         except Exception as e:
-            log_with_sid(self.chat_id, "warning", f"PROFILE_CLONE_FAILED: {e}")
+            log_with_sid(log_safe_value(str(self.chat_id), 254), "warning", f'PROFILE_CLONE_FAILED: {log_safe_value(str(e), 300)}')
         # Copy meta wholesale (already contains schema entries)
         try:
             self.meta_path.write_text(user_store.meta_path.read_text(encoding="utf-8"), encoding="utf-8")
@@ -2455,8 +2514,8 @@ class ChatDataStore:
                 reg = DataSourceStore()
                 registry = {t.get("id"): t for t in reg.list_tables()}
             except Exception as e:                           # noqa: BLE001
-                log_with_sid(self.chat_id, "warning",
-                             f"LIVE_REGISTRY_PROBE_FAILED error={type(e).__name__}")
+                log_with_sid(log_safe_value(str(self.chat_id), 254), "warning",
+                             f'LIVE_REGISTRY_PROBE_FAILED error={log_safe_value(str(type(e).__name__), 300)}')
                 registry = None
         for file_entry in files:
             name = file_entry.get("file_name")
@@ -2500,8 +2559,8 @@ class ChatDataStore:
                             "row_cap": cap,
                         }
                     except Exception as e:                   # noqa: BLE001
-                        log_with_sid(self.chat_id, "warning",
-                                     f"LIVE_SCHEMA_DOC_FAILED error={type(e).__name__}")
+                        log_with_sid(log_safe_value(str(self.chat_id), 254), "warning",
+                                     f'LIVE_SCHEMA_DOC_FAILED error={log_safe_value(str(type(e).__name__), 300)}')
         return out
 
     def new_conversation(self, title: str = "New conversation") -> str:
@@ -2558,8 +2617,8 @@ class ChatDataStore:
 
     def append_history(self, conv_id: str, message: dict) -> None:
         if not valid_conv_id(conv_id):
-            log_with_sid(self.chat_id, "warning",
-                         f"CONV_ID_INVALID append_history conv_id={str(conv_id)[:40]}")
+            log_with_sid(log_safe_value(str(self.chat_id), 254), "warning",
+                         f'CONV_ID_INVALID append_history conv_id={log_safe_value(str(str(conv_id)[:40]), 300)}')
             return
         p = self.conversations_dir / f"{conv_id}.jsonl"
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -2571,8 +2630,8 @@ class ChatDataStore:
 
     def get_history(self, conv_id: str) -> list[dict]:
         if not valid_conv_id(conv_id):
-            log_with_sid(self.chat_id, "warning",
-                         f"CONV_ID_INVALID get_history conv_id={str(conv_id)[:40]}")
+            log_with_sid(log_safe_value(str(self.chat_id), 254), "warning",
+                         f'CONV_ID_INVALID get_history conv_id={log_safe_value(str(str(conv_id)[:40]), 300)}')
             return []
         p = self.conversations_dir / f"{conv_id}.jsonl"
         if not p.exists():
@@ -2595,8 +2654,8 @@ class ChatDataStore:
         if not valid_conv_id(conv_id):
             # Logged and returned HERE, before delegating — otherwise the same
             # bad id would emit a second line from get_history.
-            log_with_sid(self.chat_id, "warning",
-                         f"CONV_ID_INVALID truncate_conv_history conv_id={str(conv_id)[:40]}")
+            log_with_sid(log_safe_value(str(self.chat_id), 254), "warning",
+                         f'CONV_ID_INVALID truncate_conv_history conv_id={log_safe_value(str(str(conv_id)[:40]), 300)}')
             return []
         history = self.get_history(conv_id)
         if keep_count >= len(history):
@@ -2656,7 +2715,7 @@ def delete_chats_owned_by(email: str) -> int:
                          f"CHAT_DELETE_FAILED chat={log_safe_text(chat_dir.name, 80)} "
                          f"error={log_safe_text(type(e).__name__, 80)}")
     if deleted:
-        log_with_sid("auth", "info", f"USER_CHATS_DELETED count={deleted}")
+        log_with_sid("auth", "info", f'USER_CHATS_DELETED count={log_safe_value(str(deleted), 300)}')
     return deleted
 
 
@@ -2766,8 +2825,7 @@ def purge_address_grants(email: str) -> dict:
                          f"error={log_safe_text(type(e).__name__, 80)}")
     if out["chats_unshared"] or out["dashboards_unshared"]:
         log_with_sid("auth", "info",
-                     f"USER_SHARES_PURGED chats={out['chats_unshared']} "
-                     f"dashboards={out['dashboards_unshared']}")
+                     f"USER_SHARES_PURGED chats={log_safe_value(str(out['chats_unshared']), 300)} dashboards={log_safe_value(str(out['dashboards_unshared']), 300)}")
     return out
 
 
@@ -2841,7 +2899,7 @@ class DashboardStore:
             rows = json.loads(p.read_text(encoding="utf-8"))
             return rows if isinstance(rows, list) else []
         except Exception as e:
-            log_with_sid(email, "error", f"DASH_INDEX_READ_FAILED: {e}")
+            log_with_sid(email, "error", f'DASH_INDEX_READ_FAILED: {log_safe_value(str(e), 300)}')
             return []
 
     def _write_index(self, email: str, rows: list[dict]) -> None:
@@ -2858,7 +2916,7 @@ class DashboardStore:
             doc = json.loads(p.read_text(encoding="utf-8"))
             return doc if isinstance(doc, dict) else None
         except Exception as e:
-            log_with_sid(owner_email, "error", f"DASH_DOC_READ_FAILED dash={dash_id}: {e}")
+            log_with_sid(log_safe_value(str(owner_email), 254), "error", f'DASH_DOC_READ_FAILED dash={log_safe_value(str(dash_id), 300)}: {log_safe_value(str(e), 300)}')
             return None
 
     def _write_doc(self, owner_email: str, doc: dict) -> None:
@@ -2888,7 +2946,7 @@ class DashboardStore:
                 try:
                     self._write_index(email, keep)
                 except Exception as e:
-                    log_with_sid(email, "warning", f"DASH_INDEX_PRUNE_FAILED: {e}")
+                    log_with_sid(email, "warning", f'DASH_INDEX_PRUNE_FAILED: {log_safe_value(str(e), 300)}')
         keep.sort(key=lambda r: (r.get("last_used_at") or r.get("created_at") or ""),
                   reverse=True)
         return keep
@@ -2909,7 +2967,7 @@ class DashboardStore:
             rows = self._read_index(email)
             rows.append(row)
             self._write_index(email, rows)
-        log_with_sid(email, "info", f"DASHBOARD_CREATED dash={dash_id}")
+        log_with_sid(email, "info", f'DASHBOARD_CREATED dash={log_safe_value(str(dash_id), 300)}')
         return row
 
     def get_dashboard(self, email: str, dash_id: str) -> Optional[dict]:
@@ -2962,7 +3020,7 @@ class DashboardStore:
                     doc["last_used_at"] = now
                     self._write_doc(email, doc)
         except Exception as e:
-            log_with_sid(email, "warning", f"DASH_TOUCH_FAILED dash={dash_id}: {e}")
+            log_with_sid(email, "warning", f'DASH_TOUCH_FAILED dash={log_safe_value(str(dash_id), 300)}: {log_safe_value(str(e), 300)}')
 
     def rename_dashboard(self, owner_email: str, dash_id: str, name: str) -> bool:
         owner_email = _safe_email(owner_email)
@@ -2977,7 +3035,7 @@ class DashboardStore:
                 if row.get("dash_id") == dash_id:
                     row["name"] = name
             self._write_index(owner_email, rows)
-        log_with_sid(owner_email, "info", f"DASHBOARD_RENAMED dash={dash_id}")
+        log_with_sid(log_safe_value(str(owner_email), 254), "info", f'DASHBOARD_RENAMED dash={log_safe_value(str(dash_id), 300)}')
         return True
 
     def delete_dashboard(self, owner_email: str, dash_id: str) -> bool:
@@ -2992,12 +3050,12 @@ class DashboardStore:
             try:
                 p.unlink(missing_ok=True)
             except Exception as e:
-                log_with_sid(owner_email, "error", f"DASH_DELETE_FAILED dash={dash_id}: {e}")
+                log_with_sid(log_safe_value(str(owner_email), 254), "error", f'DASH_DELETE_FAILED dash={log_safe_value(str(dash_id), 300)}: {log_safe_value(str(e), 300)}')
                 return False
             rows = [r for r in self._read_index(owner_email) if r.get("dash_id") != dash_id]
             self._write_index(owner_email, rows)
         if existed:
-            log_with_sid(owner_email, "info", f"DASHBOARD_DELETED dash={dash_id}")
+            log_with_sid(log_safe_value(str(owner_email), 254), "info", f'DASHBOARD_DELETED dash={log_safe_value(str(dash_id), 300)}')
         return True
 
     def remove_from_index(self, email: str, dash_id: str) -> bool:
@@ -3067,8 +3125,8 @@ class DashboardStore:
             doc["tiles"] = tiles
             self._write_doc(owner_email, doc)
             self._sync_tile_count(owner_email, doc)
-        log_with_sid(owner_email, "info",
-                     f"DASH_TILE_ADDED dash={dash_id} tile={tile['tile_id']} kind={tile.get('kind')}")
+        log_with_sid(log_safe_value(str(owner_email), 254), "info",
+                     f"DASH_TILE_ADDED dash={log_safe_value(str(dash_id), 300)} tile={log_safe_value(str(tile['tile_id']), 300)} kind={log_safe_value(str(tile.get('kind')), 300)}")
         return tile
 
     def remove_tile(self, owner_email: str, dash_id: str, tile_id: str) -> bool:
@@ -3084,7 +3142,7 @@ class DashboardStore:
             doc["tiles"] = keep
             self._write_doc(owner_email, doc)
             self._sync_tile_count(owner_email, doc)
-        log_with_sid(owner_email, "info", f"DASH_TILE_REMOVED dash={dash_id} tile={tile_id}")
+        log_with_sid(log_safe_value(str(owner_email), 254), "info", f'DASH_TILE_REMOVED dash={log_safe_value(str(dash_id), 300)} tile={log_safe_value(str(tile_id), 300)}')
         return True
 
     def update_layout(self, owner_email: str, dash_id: str, layouts: list[dict]) -> bool:
@@ -3160,11 +3218,11 @@ class DashboardStore:
                                  "created_at": now, "last_used_at": None})
                     self._write_index(rcpt, rows)
                 except Exception as e:
-                    log_with_sid(owner_email, "error",
-                                 f"DASH_SHARE_POINTER_FAILED dash={dash_id} rcpt={rcpt}: {e}")
+                    log_with_sid(log_safe_value(str(owner_email), 254), "error",
+                                 f'DASH_SHARE_POINTER_FAILED dash={log_safe_value(str(dash_id), 300)} rcpt={log_safe_value(str(rcpt), 300)}: {log_safe_value(str(e), 300)}')
         if new:
-            log_with_sid(owner_email, "info",
-                         f"DASHBOARD_SHARED dash={dash_id} added={len(new)}")
+            log_with_sid(log_safe_value(str(owner_email), 254), "info",
+                         f'DASHBOARD_SHARED dash={log_safe_value(str(dash_id), 300)} added={len(new)}')
         return new
 
     def record_chat_grants(self, owner_email: str, dash_id: str, grants: dict) -> None:
@@ -3196,8 +3254,8 @@ class DashboardStore:
                     doc["sharing"] = sharing
                     self._write_doc(owner_email, doc)
         except Exception as e:
-            log_with_sid(owner_email, "error",
-                         f"DASH_CHAT_GRANTS_RECORD_FAILED dash={dash_id} error={type(e).__name__}")
+            log_with_sid(log_safe_value(str(owner_email), 254), "error",
+                         f'DASH_CHAT_GRANTS_RECORD_FAILED dash={log_safe_value(str(dash_id), 300)} error={log_safe_value(str(type(e).__name__), 300)}')
 
     def forget_chat_grants(self, owner_email: str, chat_id: str, recipients) -> None:
         """A direct share of `chat_id` to `recipients` makes their access
@@ -3234,8 +3292,8 @@ class DashboardStore:
                         doc["sharing"] = sharing
                         self._write_doc(owner_email, doc)
         except Exception as e:
-            log_with_sid(owner_email, "error",
-                         f"DASH_CHAT_GRANTS_FORGET_FAILED error={type(e).__name__}")
+            log_with_sid(log_safe_value(str(owner_email), 254), "error",
+                         f'DASH_CHAT_GRANTS_FORGET_FAILED error={log_safe_value(str(type(e).__name__), 300)}')
 
     def revoke_chat_grants(self, owner_email: str, dash_id: str, recipient: str) -> list[str]:
         """Revoke the source-chat grants THIS dashboard's share created for
@@ -3287,8 +3345,8 @@ class DashboardStore:
                 doc["sharing"] = sharing
                 self._write_doc(owner_email, doc)
         except Exception as e:
-            log_with_sid(owner_email, "error",
-                         f"DASH_CHAT_GRANTS_REVOKE_FAILED dash={dash_id} error={type(e).__name__}")
+            log_with_sid(log_safe_value(str(owner_email), 254), "error",
+                         f'DASH_CHAT_GRANTS_REVOKE_FAILED dash={log_safe_value(str(dash_id), 300)} error={log_safe_value(str(type(e).__name__), 300)}')
             return []
         # Under the same (reentrant) lock as a direct chat share, which
         # forgets the record before it adds the address: a grant the owner
@@ -3302,12 +3360,11 @@ class DashboardStore:
                     AuthStore().deactivate_chat(rcpt, cid)
                     revoked.append(cid)
                 except Exception as e:
-                    log_with_sid(owner_email, "warning",
-                                 f"DASH_UNSHARE_CHAT_REVOKE_FAILED dash={dash_id} "
-                                 f"error={type(e).__name__}")
+                    log_with_sid(log_safe_value(str(owner_email), 254), "warning",
+                                 f'DASH_UNSHARE_CHAT_REVOKE_FAILED dash={log_safe_value(str(dash_id), 300)} error={log_safe_value(str(type(e).__name__), 300)}')
         if revoked:
-            log_with_sid(owner_email, "info",
-                         f"DASHBOARD_CHAT_GRANTS_REVOKED dash={dash_id} count={len(revoked)}")
+            log_with_sid(log_safe_value(str(owner_email), 254), "info",
+                         f'DASHBOARD_CHAT_GRANTS_REVOKED dash={log_safe_value(str(dash_id), 300)} count={len(revoked)}')
         return revoked
 
     def remove_dashboard_share(self, owner_email: str, dash_id: str,
@@ -3349,10 +3406,9 @@ class DashboardStore:
                     if len(kept) != len(rows):
                         self._write_index(rcpt, kept)
                 except Exception as e:
-                    log_with_sid(owner_email, "error",
-                                 f"DASH_UNSHARE_POINTER_FAILED dash={dash_id} "
-                                 f"error={type(e).__name__}")
+                    log_with_sid(log_safe_value(str(owner_email), 254), "error",
+                                 f'DASH_UNSHARE_POINTER_FAILED dash={log_safe_value(str(dash_id), 300)} error={log_safe_value(str(type(e).__name__), 300)}')
         if removed:
-            log_with_sid(owner_email, "info",
-                         f"DASHBOARD_UNSHARED dash={dash_id} remaining={len(remaining)}")
+            log_with_sid(log_safe_value(str(owner_email), 254), "info",
+                         f'DASHBOARD_UNSHARED dash={log_safe_value(str(dash_id), 300)} remaining={len(remaining)}')
         return remaining

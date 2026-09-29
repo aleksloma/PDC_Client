@@ -170,6 +170,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log_with_sid("startup", "error",
                      f"RESET_TOKEN_INDEX_STARTUP_FAILED {log_safe_text(type(e).__name__, 80)}")
+    # Deck QA previews left by an earlier release (nothing serves them).
+    try:
+        from routes.report import sweep_html_previews
+        sweep_html_previews()
+    except Exception as e:
+        log_with_sid("startup", "warning",
+                     f"PPTX_HTML_PREVIEW_SWEEP_FAILED {log_safe_text(type(e).__name__, 80)}")
     if settings.CSP_REPORT_ONLY:
         log_with_sid("startup", "warning",
                      "CSP_REPORT_ONLY_ENABLED the page policy is reported, not enforced "
@@ -648,6 +655,40 @@ class ContentSecurityPolicy:
         await self.app(scope, receive, send_with_policy)
 
 
+_HSTS_VALUE = "max-age=31536000; includeSubDomains"
+
+
+class SecurityHeaders:
+    """Pure ASGI: `X-Content-Type-Options: nosniff` on every response that
+    does not set it itself, and `Strict-Transport-Security` on responses to
+    requests that arrived over HTTPS (`scope["scheme"]`). Behind a TLS
+    reverse proxy the scheme is https only when uvicorn trusts the proxy's
+    `X-Forwarded-Proto` (FORWARDED_ALLOW_IPS naming the proxy); a plain-HTTP
+    request never gets HSTS, so a lab install on http is not pinned to TLS.
+    Registered right outside ContentSecurityPolicy, inside the guard.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        https = scope.get("scheme") == "https"
+
+        async def send_with_headers(message) -> None:
+            if message.get("type") == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                if "x-content-type-options" not in headers:
+                    headers.append("X-Content-Type-Options", "nosniff")
+                if https and "strict-transport-security" not in headers:
+                    headers.append("Strict-Transport-Security", _HSTS_VALUE)
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
 class UploadTooLarge(HTTPException):
     """Raised from UploadByteCap's counting receive. An HTTPException subclass
     because FastAPI re-raises those unchanged out of body parsing (anything
@@ -782,7 +823,11 @@ class JsonContentTypeGate:
 # The absolute session lifetime (seconds): RememberMeSessionMiddleware's cap.
 _REMEMBER_ME_MAX_AGE = settings.REMEMBER_ME_MAX_DAYS * 86400
 
-app = FastAPI(title="PowerDataChat Client (enterprise)", version="1.0", lifespan=lifespan)
+# No interactive API documentation: /docs, /redoc and /openapi.json would
+# publish the whole route map (and a request console) to anyone who can
+# reach the port.
+app = FastAPI(title="PowerDataChat Client (enterprise)", version="1.0", lifespan=lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)
 app.add_exception_handler(UploadTooLarge, upload_too_large_handler)
 # Registered FIRST, so it sits INSIDE the session middleware below and sees
 # the unsigned session.
@@ -802,6 +847,9 @@ app.add_middleware(JsonContentTypeGate)
 # Inside the guard, outside the session: adds the page policy to every HTML
 # response (and so also covers the password gate and the session layer).
 app.add_middleware(ContentSecurityPolicy)
+# Right outside the page policy: nosniff on every response, HSTS on HTTPS
+# requests.
+app.add_middleware(SecurityHeaders)
 # LAST registered = OUTERMOST layer (Starlette inserts each at index 0 and
 # builds the stack from the front), which is what the guard needs: a request
 # from the sandbox's range must be refused before a session is even unsigned.

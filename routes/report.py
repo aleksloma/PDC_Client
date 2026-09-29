@@ -460,8 +460,13 @@ def _render_pptx(qa_pairs: list, report_structure: dict, sid: str) -> bytes:
                      plan_version=(layout_plan or {}).get("version"),
                      n_branding=len((layout_plan or {}).get("branding") or []))
         try:
-            return _render_pptx_native(qa_pairs, report_structure, sid,
-                                       bundle["template_path"], layout_plan)
+            try:
+                return _render_pptx_native(qa_pairs, report_structure, sid,
+                                           bundle["template_path"], layout_plan)
+            finally:
+                # The QA preview is served by nothing and would otherwise
+                # stay on the data volume forever, one per deck.
+                _drop_html_preview(sid)
         except Exception as e:
             log_with_sid(sid, "warning",
                          f"PPTX_TEMPLATED_RENDER_FAIL — falling back to built-in: {e}")
@@ -1310,6 +1315,52 @@ def _html_preview_dir():
         base = _P("/tmp/pptx_previews")
     base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+def _preview_base_path():
+    """`<DATA_ROOT>/pptx_previews` WITHOUT creating it (the readers below must
+    never make the folder appear)."""
+    from pathlib import Path as _P
+    from settings import settings as _s
+    return _P(_s.DATA_ROOT) / "pptx_previews"
+
+
+def _drop_html_preview(sid: str) -> None:
+    """Delete the QA preview `_write_html_preview` wrote for this render.
+    Never raises (Article IV)."""
+    try:
+        path = _preview_base_path() / f"preview_{sid}.html"
+        if path.is_file():
+            path.unlink()
+    except Exception as e:
+        log_with_sid("report", "warning",
+                     f"PPTX_HTML_PREVIEW_REMOVE_FAILED error={log_safe_text(type(e).__name__, 80)}")
+
+
+def sweep_html_previews() -> int:
+    """Remove every leftover `preview_*.html` (decks rendered by an earlier
+    release, or a render that died before its cleanup). Called once from the
+    app lifespan; the folder is not created. Returns the number removed;
+    never raises."""
+    removed = 0
+    try:
+        base = _preview_base_path()
+        if not base.is_dir():
+            return 0
+        for entry in base.glob("preview_*.html"):
+            try:
+                if entry.is_file() and not entry.is_symlink():
+                    entry.unlink()
+                    removed += 1
+            except Exception as e:
+                log_with_sid("report", "warning",
+                             f"PPTX_HTML_PREVIEW_REMOVE_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        if removed:
+            log_with_sid("startup", "info", f"PPTX_HTML_PREVIEWS_SWEPT count={removed}")
+    except Exception as e:
+        log_with_sid("startup", "warning",
+                     f"PPTX_HTML_PREVIEW_SWEEP_FAILED error={log_safe_text(type(e).__name__, 80)}")
+    return removed
 
 
 def _esc(s: str) -> str:

@@ -856,6 +856,36 @@ def execute(kind: str, code: str, dfs: dict, sid: str | None = None,
             gate.release()
 
 
+def _max_response_bytes() -> int:
+    """`settings.EXECUTOR_MAX_RESPONSE_BYTES`, read per call; 64 MiB when the
+    value is unusable."""
+    try:
+        value = int(settings.EXECUTOR_MAX_RESPONSE_BYTES)
+        return value if value > 0 else 64 * 1024 * 1024
+    except Exception:
+        return 64 * 1024 * 1024
+
+
+def _read_capped(response, cap: int):
+    """`(body, too_large)` of a streamed answer: a declared Content-Length
+    above `cap` is refused before any byte is read, and a body without one
+    stops being read as soon as it crosses `cap` (nothing beyond it is kept
+    in memory)."""
+    declared = response.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > cap:
+                return b"", True
+        except ValueError:
+            pass
+    buf = bytearray()
+    for chunk in response.iter_bytes():
+        buf.extend(chunk)
+        if len(buf) > cap:
+            return b"", True
+    return bytes(buf), False
+
+
 def _dispatch(kind: str, code: str, dfs: dict, log_sid: str, sid, budget,
               split_multi_axes: bool, code_hash: str) -> dict:
     """One dispatch, with the slot already held."""
@@ -910,11 +940,14 @@ def _dispatch(kind: str, code: str, dfs: dict, log_sid: str, sid, budget,
             "timeout_s": budget,
             "options": {"split_multi_axes": bool(split_multi_axes)},
         }
+        cap = _max_response_bytes()
         try:
             with _client(read_timeout=budget + _READ_TIMEOUT_MARGIN_S) as client:
-                response = client.post(_service_url("/execute"),
-                                       content=exec_transport.dumps(body),
-                                       headers={"content-type": "application/json"})
+                with client.stream("POST", _service_url("/execute"),
+                                   content=exec_transport.dumps(body),
+                                   headers={"content-type": "application/json"}) as response:
+                    status_code = response.status_code
+                    content, too_large = _read_capped(response, cap)
         except Exception as e:
             # The returned text carries no URL: it is forwarded to the
             # planner's retry prompt. The detail stays in the local log.
@@ -929,14 +962,22 @@ def _dispatch(kind: str, code: str, dfs: dict, log_sid: str, sid, budget,
         # rejection says so just as well as an answer does.
         _note_reachable(True)
 
-        if response.status_code != 200:
+        if too_large:
+            # Nothing past the cap was read into memory; the job fails with
+            # the "could not be read" text like any unusable answer.
+            log_with_sid(log_sid, "error",
+                         f"EXEC_RESPONSE_TOO_LARGE status={int(status_code)} max_bytes={int(cap)}",
+                         job_id=job_id, code_hash=code_hash)
+            return _error_shape(kind, _UNREADABLE_TEXT.format(exc="ResponseTooLarge"))
+
+        if status_code != 200:
             # The body is hostile by contract and this code ends up in the
             # text the planner's retry prompt reads, so only a short
             # SCREAMING_CASE token is accepted; anything else is UNKNOWN
             # rather than an arbitrary string of the sandbox's choosing.
             rejected = "UNKNOWN"
             try:
-                decoded = exec_transport.loads(response.content)
+                decoded = exec_transport.loads(content)
                 if isinstance(decoded, dict):
                     claimed = decoded.get("code")
                     if isinstance(claimed, str) and _CODE_RE.fullmatch(claimed):
@@ -944,14 +985,14 @@ def _dispatch(kind: str, code: str, dfs: dict, log_sid: str, sid, budget,
             except Exception:
                 pass
             log_with_sid(log_sid, "error",
-                         f"EXEC_REJECTED status={int(response.status_code)} code={rejected}",
+                         f"EXEC_REJECTED status={int(status_code)} code={rejected}",
                          job_id=job_id, code_hash=code_hash)
             return _error_shape(kind, _REJECTED_TEXT.format(code=rejected))
 
         try:
             # `exec_transport.loads`, never `response.json()`: the wire dialect
             # carries the NaN/Infinity tokens a strict JSON decoder rejects.
-            decoded = exec_transport.loads(response.content)
+            decoded = exec_transport.loads(content)
             out = exec_transport.deserialize_result(decoded, job_dir, kind, budget,
                                                    sid=log_sid)
         except Exception as e:

@@ -199,6 +199,11 @@ class Settings(BaseModel):
     # ran must not be told its code was too slow, or the planner's retry would
     # try to optimise a queue.
     EXECUTOR_QUEUE_MAX_S: float = Field(default_factory=lambda: _float_env("EXECUTOR_QUEUE_MAX_S", 600.0, 1.0))
+    # The largest HTTP answer body the web process reads from the sandbox
+    # (executor_client); a larger one fails the job cleanly instead of being
+    # buffered in the web container's memory. Result frames travel as files
+    # in the job dir, so a healthy answer is small.
+    EXECUTOR_MAX_RESPONSE_BYTES: int = Field(default_factory=lambda: _int_env("EXECUTOR_MAX_RESPONSE_BYTES", 64 * 1024 * 1024, 1024 * 1024))
     # The sandbox's OWN network, pinned in compose by PDC_BACKEND_SUBNET (the
     # same variable feeds the network's ipam block, so the two can never
     # disagree). A Docker network is bidirectional and the sandbox runs

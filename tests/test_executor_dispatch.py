@@ -28,6 +28,7 @@ forwarded verbatim to the planner's retry prompt.
 import ast
 import base64
 import json
+import logging
 import math
 import os
 import shutil
@@ -2561,3 +2562,55 @@ def test_claiming_the_refresh_slot_does_not_move_checked_at(dispatcher, exec_env
     ok, checked_at = dispatcher.reachable()
     assert ok is False, ok
     assert checked_at > 1.0, checked_at
+
+
+# ===========================================================================
+# the answer-size cap (EXECUTOR_MAX_RESPONSE_BYTES)
+# ===========================================================================
+def _sized_handler(size: int, calls: list, *, declare_length: bool):
+    """Serve `/execute` with a body of `size` bytes, with or without a
+    Content-Length header (a streamed body carries none)."""
+    record = _recorder(calls)
+
+    def handler(request):
+        if request.url.path.endswith("/healthz"):
+            return _healthz_response()
+        record(request)
+        payload = b"x" * size
+        if declare_length:
+            return httpx.Response(200, content=payload, headers=JSON_HEADERS)
+        return httpx.Response(200, stream=httpx.ByteStream(payload),
+                              headers={"content-type": "application/json"})
+
+    return handler
+
+
+@pytest.mark.parametrize("declare_length", [True, False])
+def test_an_answer_over_the_cap_fails_the_job_cleanly(dispatcher, exec_env, monkeypatch,
+                                                      caplog, declare_length):
+    monkeypatch.setattr(settings, "EXECUTOR_MAX_RESPONSE_BYTES", 1024 * 1024)
+    calls = []
+    _install(monkeypatch, _sized_handler(1024 * 1024 + 1, calls, declare_length=declare_length))
+    with caplog.at_level(logging.INFO):
+        out = dispatcher.execute("PYTHON", "RESULT = 1", _dfs(), sid="t", timeout_s=60)
+    _assert_error_shape(out, "PYTHON",
+                        "ExecutorError: the analysis answer could not be read (ResponseTooLarge)")
+    assert any("EXEC_RESPONSE_TOO_LARGE" in r.getMessage() for r in caplog.records)
+    assert _job_dirs(exec_env) == []
+
+
+def test_an_answer_under_the_cap_is_read(dispatcher, exec_env, monkeypatch):
+    monkeypatch.setattr(settings, "EXECUTOR_MAX_RESPONSE_BYTES", 1024 * 1024)
+    calls = []
+    _install(monkeypatch, _replay_handler(_case("python_scalar"), calls))
+    out = dispatcher.execute("PYTHON", "RESULT = 1", _dfs(), sid="t", timeout_s=60)
+    assert "error" not in out or out.get("error") is None, out
+
+
+def test_the_cap_defaults_to_64_mib():
+    import os
+    import settings as settings_mod
+    assert settings_mod._int_env("EXECUTOR_MAX_RESPONSE_BYTES_UNSET_FOR_TEST",
+                                 64 * 1024 * 1024, 1024 * 1024) == 64 * 1024 * 1024
+    if "EXECUTOR_MAX_RESPONSE_BYTES" not in os.environ:
+        assert settings_mod.Settings().EXECUTOR_MAX_RESPONSE_BYTES == 64 * 1024 * 1024

@@ -148,7 +148,8 @@ def _store_get(entry_id: str):
 # to run, so inline is allowed and external scripts are limited to this server.
 _POLICY = ("sandbox allow-scripts; default-src 'none'; "
            "script-src 'self' 'unsafe-eval' 'unsafe-inline'; "
-           "style-src 'unsafe-inline'; img-src data:; frame-ancestors 'self'")
+           "style-src 'unsafe-inline'; img-src data:; frame-ancestors 'self'; "
+           "form-action 'none'")
 
 
 @router.post("/api/charts")
