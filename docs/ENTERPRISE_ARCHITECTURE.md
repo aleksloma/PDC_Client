@@ -687,11 +687,15 @@ and the LLM layer are unchanged** in Phase 1.
 
 **What crosses the boundary — Article II unchanged.** Only names, dtypes,
 ladmin-confirmed descriptions, declared relations (rendered into schema_text
-as a `Database Relations` block), and — during registration's AI draft — the
-same truncated sampled `unique_hints` uploaded files already send to
-`/v1/schema_autofill`. Raw DB values reach only the admin's browser preview
-and the local parquet. DB credentials never cross (Fernet-encrypted at rest,
-masked in APIs, never logged).
+as a `Database Relations` block), and — during registration's AI draft and
+when a refresh drafts descriptions for newly added columns — the same
+`unique_hints` uploaded files send to `/v1/schema_autofill`: the distinct
+values of a categorical column (at most `SCHEMA_AUTOFILL_UNIQUE_THRESHOLD` of
+them) and ONE computed `[profile: …]` string per high-cardinality column
+(dtype, distinct count, null share, a character mask, lengths, rounded
+magnitudes, year-month bounds), never sampled row values. Raw DB values
+reach only the admin's browser preview and the local parquet. DB credentials
+never cross (Fernet-encrypted at rest, masked in APIs, never logged).
 
 **Registration** (admin "Data sources" page): add connection → Test →
 introspect (Inspector + catalog-estimate row count/size; the Inspector step

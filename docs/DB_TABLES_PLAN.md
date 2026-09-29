@@ -141,9 +141,16 @@ action.
 2. Register table: pick schema + table → introspect via SQLAlchemy `inspect()`
    (columns, dtypes, PK/FK, existing indexes, estimated row count, table size) →
    preview first rows → AI-drafted table + field descriptions in English via the
-   existing schema-autofill flow.
+   existing schema-autofill flow. What the draft sends is the autofill's
+   `unique_hints`: a categorical column's distinct values, and for every other
+   column one computed `[profile: …]` string (dtype, cardinality, null share,
+   a character mask, lengths, two-significant-figure magnitudes, year-month
+   bounds) — no sampled row value.
 3. **Mandatory confirm:** ladmin must review/edit descriptions before save — no
-   unconfirmed descriptions are ever persisted.
+   unconfirmed descriptions are persisted at registration. The one exception
+   is a column a later refresh finds ADDED in the source: it gets an
+   AI-drafted description that is stored for review and flagged in the drift
+   banner (see "Schema-drift policy").
 4. Editable fields: display name (`CL_INFO` → "clients information"), table
    description (contents + how it joins to other tables), is_connector, relations
    (related table + join keys), per-column indexed flag (pre-filled from
@@ -304,10 +311,22 @@ Policy — **apply source truth immediately, make every structural change
 visible, never pause-and-hold-stale-data**:
 
 - ADDED column: auto-included in snapshot and metas (unchanged), pandas
-  technical_description computed; the drift record doubles as the "new
+  technical_description computed, and an AI-drafted business description
+  written into the registry (then resynced into the chat metas). The draft
+  goes through the ONE draft mechanism the wizard and Accept use
+  (`routes.admin_data._draft_table_descriptions`), inside the existing
+  refresh worker, bounded by `settings.BRAIN_DRAFT_TIMEOUT`. The surviving
+  columns' stored descriptions are passed as `existing_descriptions`, so the
+  prompt asks only for the added columns; only an added column's
+  `description` is ever written — never a surviving column's (even an empty
+  one), never the table description. A scheduled run drafts as the table's
+  `registered_by`, or as `LOCAL_ADMIN_USERNAME` when the table has none (an
+  admin registration — `scheduler:<reason>` is never sent to the brain); an
+  admin-initiated refresh drafts as its actor. A draft that fails or raises logs
+  `DB_REFRESH_DRAFT_FAILED table=<id> error=…`, leaves the added columns at
+  `""` and never fails the refresh. The drift record doubles as the "new
   column(s) need description review" flag until the admin edits the table
-  or dismisses the banner (descriptions are admin-confirmed by design — no
-  background LLM autofill).
+  or dismisses the banner.
 - REMOVED column: applied — a snapshot honestly mirrors the source; a
   mirror must never retain phantom columns (Fivetran-style soft-delete
   suits warehouses with history, not snapshots).
@@ -321,9 +340,13 @@ visible, never pause-and-hold-stale-data**:
   suits pipelines feeding fixed SQL, not an LLM that replans every
   question.
 - SURFACING: `last_drift` on the table row
-  `{added, removed, retyped, at, dismissed}` (a new drift overwrites and
-  resets dismissal); the Data sources page shows a red banner per drifted
-  table (details incl. `col: from → to`) with an audited Dismiss, plus a
+  `{added, removed, retyped, drafted, at, dismissed}` (`drafted` = the added
+  columns that received an AI-drafted description; absent on records written
+  before it existed; a new drift overwrites and resets dismissal); the
+  refresh response and audit row keep `drift` as `{added, removed, retyped}`.
+  The Data sources page shows a red banner per drifted table (details incl.
+  `col: from → to`, and which new columns carry a draft to review) with an
+  audited Dismiss, plus a
   `schema drift` chip on the row; refresh history (`record_run`) carries
   per-table `skipped`/`drift`. No new notification subsystem.
 - Dashboard tiles on a removed column (verified in code): a tile refresh

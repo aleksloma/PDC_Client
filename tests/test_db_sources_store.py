@@ -195,12 +195,15 @@ def test_drift_record_dismiss_and_reset(store):
     d = store.get_table(tid)["last_drift"]
     assert d["added"] == ["c"] and d["retyped"][0]["to"] == "REAL"
     assert d["dismissed"] is False and d["at"]
+    assert d["drafted"] == []                       # absent in the event -> []
     assert store.dismiss_drift(tid, actor="ladmin") is True
     d2 = store.get_table(tid)["last_drift"]
     assert d2["dismissed"] is True and d2["dismissed_by"] == "ladmin"
     # a NEW drift resets the dismissal
-    store.mark_drift(tid, {"added": [], "removed": ["c"], "retyped": []})
+    store.mark_drift(tid, {"added": ["d"], "removed": ["c"], "retyped": [],
+                           "drafted": ["d"]})
     assert store.get_table(tid)["last_drift"]["dismissed"] is False
+    assert store.get_table(tid)["last_drift"]["drafted"] == ["d"]
     assert store.dismiss_drift("ff00ff00ff00ff00", actor="ladmin") is False
 
 

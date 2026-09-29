@@ -413,6 +413,23 @@
     return bits;
   }
 
+  // A refresh AI-drafts a description for each ADDED column (`drafted` lists
+  // the ones that got one); a column the draft missed stays empty.
+  function _driftDescriptionNote(d) {
+    const added = d.added || [];
+    if (!added.length) return '';
+    const drafted = d.drafted || [];
+    const missing = added.filter((c) => !drafted.includes(c));
+    const bits = [];
+    if (drafted.length) {
+      bits.push(`New columns received AI-drafted descriptions to review (${drafted.join(', ')}) — edit the table to confirm or change them.`);
+    }
+    if (missing.length) {
+      bits.push(`No description could be drafted for ${missing.join(', ')}; they stay empty until you edit the table.`);
+    }
+    return bits.join(' ');
+  }
+
   function renderDriftBanner() {
     const box = $('driftBanner');
     const drifted = TABLES.filter((t) => t.last_drift && !t.last_drift.dismissed);
@@ -423,7 +440,7 @@
           <span class="adm-muted">(${esc(t.last_drift.at || '')})</span><br/>
           ${_driftBits(t.last_drift).map(esc).join(' · ')}<br/>
           <span class="adm-muted">The snapshot and chat schemas already follow the source.
-          New columns keep empty descriptions until you edit the table.</span></div>
+          ${esc(_driftDescriptionNote(t.last_drift))}</span></div>
         <button class="adm-btn ghost" data-act="dismiss-drift">Dismiss</button>
       </div>`).join('');
     box.querySelectorAll('[data-act="dismiss-drift"]').forEach((b) => {

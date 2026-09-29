@@ -280,10 +280,14 @@ async def _finish_upload(store: UserStore, email: str, sid: str, saved: list[str
 #
 # Verbatim port of global `backend/routes/schema.py:schema_autofill_full`,
 # split for the brain/client boundary:
-#   - Client builds per-file context (dtypes, sampled unique values, language
-#     hint, columns needing fill). This is identical to global's
-#     `_prepare_file_context`. Raw row data NEVER leaves the client beyond the
-#     same sampled / truncated values global itself sends to its LLM.
+#   - Client builds per-file context (dtypes, unique-value hints, language
+#     hint, columns needing fill). Derived from global's `_prepare_file_context`
+#     with ONE deliberate departure (Article II): a column with at most
+#     SCHEMA_AUTOFILL_UNIQUE_THRESHOLD distinct values still sends those
+#     values (a categorical vocabulary, the same class of hint `schema_text`
+#     carries); every other column sends ONE computed `[profile: …]` string
+#     built by `_column_profile` — dtype, cardinality, null share, a character
+#     mask, lengths, rounded magnitudes, year-month bounds — and NO real value.
 #   - Brain runs the combined LLM call (`POST /v1/schema_autofill`) that asks
 #     for `{file_description, columns: {col: desc}}` in one round-trip.
 #   - Client persists both into meta.json AND auto-generates
@@ -306,12 +310,120 @@ def _language_name_from_cols(cols: list) -> tuple[str, str]:
     return "en", "English"
 
 
-def _prepare_file_context(fname: str, df, entry: dict, notes_text: str) -> dict:
-    """Verbatim port of global `_prepare_file_context` (CPU-bound, no LLM).
+# A first word is reported as a prefix only when it is STRUCTURAL: shared by
+# at least this share of the non-null values (a names column's first words
+# are real first names, each far below it). At most this many are listed.
+_PROFILE_PREFIX_MIN_SHARE = 0.20
+_PROFILE_PREFIX_MAX = 5
+_PROFILE_LETTER_RE = _re_autofill.compile(r"[^\W\d_]")
+_PROFILE_DIGIT_RE = _re_autofill.compile(r"\d")
 
-    Builds the same payload global feeds its own LLM in-process. This runs on
-    the client so raw row data never leaves; the brain only sees the sampled
-    / truncated `unique_hints`.
+
+def _value_mask(text: str) -> str:
+    """Character mask of one value: letters -> A, digits -> 9, anything else
+    kept (TR-2024-00817 -> AA-9999-99999)."""
+    return _PROFILE_DIGIT_RE.sub("9", _PROFILE_LETTER_RE.sub("A", text))
+
+
+def _yes_no(flag) -> str:
+    return "yes" if bool(flag) else "no"
+
+
+def _two_sig(x) -> str:
+    """A magnitude, not a value: two significant figures (1234.56 -> 1200)."""
+    return f"{float(f'{float(x):.2g}'):g}"
+
+
+def _column_profile(full_ser, sample, nun, dtype_str: str) -> str:
+    """ONE value-free description of a high-cardinality column for the
+    schema-autofill prompt (Article II: no real row value leaves the client).
+
+    `full_ser` is the whole column (for the null share); `sample` its non-null
+    values in ROW order (the caller's bounded sample, index-sorted); `nun` the
+    distinct count already computed. Aggregates only: counts, shares, a
+    character mask, lengths, two-significant-figure magnitudes, year-month
+    bounds. Never raises (Article IV) — any failure answers the dtype alone.
+    """
+    import numpy as np
+    import pandas as pd
+    from pandas.api import types as ptypes
+
+    trunc = settings.SCHEMA_AUTOFILL_VALUE_TRUNC
+    cap = trunc * 4
+    try:
+        parts = [f"dtype={dtype_str}", f"distinct={int(nun or 0)}"]
+        total = len(full_ser)
+        null_pct = (float(full_ser.isna().sum()) * 100.0 / total) if total else 0.0
+        parts.append(f"nulls={null_pct:.1f}%")
+        dt = full_ser.dtype
+        n = len(sample)
+        if n == 0:
+            pass
+        elif ptypes.is_bool_dtype(dt):
+            parts.append(f"true_share={float(sample.astype(bool).mean()) * 100.0:.1f}%")
+        elif ptypes.is_datetime64_any_dtype(dt):
+            ts = pd.to_datetime(sample)
+            parts.append(f"min={ts.min().strftime('%Y-%m')}")
+            parts.append(f"max={ts.max().strftime('%Y-%m')}")
+            has_time = ((ts.dt.hour != 0) | (ts.dt.minute != 0) | (ts.dt.second != 0)
+                        | (ts.dt.microsecond != 0) | (ts.dt.nanosecond != 0)).any()
+            if has_time:
+                gran = "time"
+            elif (ts.dt.day != 1).any():
+                gran = "day"
+            elif (ts.dt.month != 1).any():
+                gran = "month"
+            else:
+                gran = "year"
+            parts.append(f"granularity={gran}")
+        elif ptypes.is_numeric_dtype(dt) and not ptypes.is_timedelta64_dtype(dt):
+            vals = sample.astype("float64")
+            finite = vals[np.isfinite(vals)]
+            if len(finite):
+                parts.append(f"min={_two_sig(finite.min())}")
+                parts.append(f"max={_two_sig(finite.max())}")
+                parts.append(f"mean={_two_sig(finite.mean())}")
+                parts.append(f"integers={_yes_no((finite % 1 == 0).all())}")
+            parts.append(f"non_negative={_yes_no((vals >= 0).all())}")
+            parts.append(
+                f"increasing={_yes_no(vals.is_monotonic_increasing and vals.is_unique)}")
+        else:
+            s = sample.astype(str)
+            masks = s.str.slice(0, trunc).map(_value_mask)
+            mask = str(masks.value_counts().index[0])
+            # A mask with no letter or digit IS the value (e.g. "***") — omit.
+            if "A" in mask or "9" in mask:
+                parts.append(f"mask={mask}")
+            lens = s.str.len()
+            parts.append(f"len={int(lens.min())}/{float(lens.mean()):.1f}/{int(lens.max())}")
+            parts.append(f"unique={_yes_no(int(nun or 0) == n)}")
+            first = s.str.split().str[0]
+            # Per value: a first word that is the WHOLE value is that value,
+            # never a prefix — only words that start a longer value count.
+            counts = first[first != s].value_counts()
+            keep = counts[counts / n >= _PROFILE_PREFIX_MIN_SHARE].head(_PROFILE_PREFIX_MAX)
+            if len(keep):
+                parts.append("prefixes=" + ", ".join(
+                    f"'{str(w)[:trunc]}'({int(c)})" for w, c in keep.items()))
+            parts.append(f"avg_commas={float(s.str.count(',').mean()):.1f}")
+        out = "[profile: " + ", ".join(parts) + "]"
+    except Exception as e:
+        # The exception TYPE only — a pandas message can quote a cell value.
+        log_with_sid("autofill", "warning",
+                     f"AUTOFILL_PROFILE_FAILED error={type(e).__name__}")
+        out = f"[profile: dtype={dtype_str}]"
+    if len(out) > cap:
+        out = out[: cap - 1] + "]"
+    return out
+
+
+def _prepare_file_context(fname: str, df, entry: dict, notes_text: str) -> dict:
+    """Derived from global `_prepare_file_context` (CPU-bound, no LLM).
+
+    Runs on the client so raw row data never leaves. The brain sees, per
+    column, either its distinct values (at most SCHEMA_AUTOFILL_UNIQUE_THRESHOLD
+    of them — a categorical vocabulary) or ONE `[profile: …]` string from
+    `_column_profile` that carries no real value.
     """
     import pandas as pd
 
@@ -348,30 +460,13 @@ def _prepare_file_context(fname: str, df, entry: dict, notes_text: str) -> dict:
                     str(v)[: settings.SCHEMA_AUTOFILL_VALUE_TRUNC] for v in uniq
                 ][: settings.SCHEMA_AUTOFILL_UNIQUE_THRESHOLD]
             else:
-                k = min(settings.SCHEMA_AUTOFILL_SAMPLE_VALUES, len(ser))
-                if k > 0:
-                    smp = ser.sample(n=k, replace=False).astype(str).tolist()
-                    truncated = [s[: settings.SCHEMA_AUTOFILL_VALUE_TRUNC] for s in smp]
-                    dtype = str(df[col].dtype)
-                    if nun > 20 and dtype in ("object", "str", "string"):
-                        try:
-                            first_words = (
-                                ser.dropna().astype(str).str.split().str[0].value_counts().head(5)
-                            )
-                            prefix_summary = ", ".join(
-                                [f"'{w}'({c})" for w, c in first_words.items()]
-                            )
-                            avg_commas = ser.dropna().astype(str).str.count(",").mean()
-                            pattern_note = (
-                                f"[Patterns: prefixes={prefix_summary}, avg_commas={avg_commas:.1f}]"
-                            )
-                            unique_hints[col] = truncated + [pattern_note]
-                        except Exception:
-                            unique_hints[col] = truncated
-                    else:
-                        unique_hints[col] = truncated
-                else:
-                    unique_hints[col] = []
+                # Article II: no sampled row values for a high-cardinality
+                # column — one computed profile instead. Row order is kept
+                # (index-sorted) for the "increasing" check.
+                prof_src = sample.sort_index() if len(ser) > SAMPLE_SIZE else ser
+                unique_hints[col] = [
+                    _column_profile(df[col], prof_src, nun, str(df[col].dtype))
+                ]
         except Exception:
             unique_hints[col] = []
 

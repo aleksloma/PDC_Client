@@ -610,6 +610,9 @@ class DataSourceStore:
                             "added": list(drift.get("added") or []),
                             "removed": list(drift.get("removed") or []),
                             "retyped": [dict(r) for r in (drift.get("retyped") or [])],
+                            # added columns that received an AI-drafted
+                            # description (db_scheduler) — for the banner
+                            "drafted": list(drift.get("drafted") or []),
                             "at": _now(),
                             "dismissed": False,
                         }

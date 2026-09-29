@@ -82,6 +82,61 @@ def _log_live_skip(table_id) -> None:
                  f"LIVE_SKIP table={log_safe_text(str(table_id))}")
 
 
+def _draft_added_descriptions(conn: dict, password: str, row: dict,
+                              added: list, new_columns: list, actor: str,
+                              table_id: str) -> list:
+    """AI-draft business descriptions for the columns a refresh found ADDED
+    in the source, through the ONE draft mechanism the wizard and Accept use
+    (`routes.admin_data._draft_table_descriptions` — its brain call is bounded
+    by settings.BRAIN_DRAFT_TIMEOUT and runs on this refresh's own worker).
+    Only the added columns are drafted and written: the surviving columns'
+    stored descriptions are passed as `existing_descriptions`, so the prompt's
+    `cols_to_fill` holds only undescribed columns, and nothing but an added
+    column's `description` is ever changed here — never a surviving column's
+    (even an empty one) and never the table description. Returns the names
+    that received a draft. Never raises (Article IV): a failed or unavailable
+    draft logs DB_REFRESH_DRAFT_FAILED and leaves the added columns at ""."""
+    from exec_transport import log_safe_text
+    added_set = {str(a) for a in added}
+    drafted: list = []
+    # A scheduled run has no session: the registrant stands in for the
+    # admin whose email the draft call carries. A table without one was
+    # registered by the administrator — never send "scheduler:<reason>",
+    # which the brain would count as a tenant user.
+    email = actor
+    if str(actor).startswith("scheduler"):
+        email = row.get("registered_by") or settings.LOCAL_ADMIN_USERNAME
+    existing = {str(c.get("name")): c.get("description") or ""
+                for c in new_columns
+                if c.get("name") and str(c.get("name")) not in added_set}
+    try:
+        from routes.admin_data import _draft_table_descriptions
+        draft = _draft_table_descriptions(
+            conn, password, row.get("schema") or None, row.get("table_name"),
+            email, intro=None, existing_descriptions=existing)
+        if not isinstance(draft, dict) or not draft.get("ok"):
+            err = (draft or {}).get("error") if isinstance(draft, dict) else None
+            log_with_sid("db_refresh", "warning",
+                         f"DB_REFRESH_DRAFT_FAILED table={log_safe_text(str(table_id))} "
+                         f"error={log_safe_text(str(err or 'draft unavailable'), 200)}")
+            return []
+        cols = ((draft.get("draft") or {}).get("columns")) or {}
+        for col in new_columns:
+            name = str(col.get("name"))
+            if name not in added_set:
+                continue
+            text = cols.get(name)
+            if isinstance(text, str) and text.strip():
+                col["description"] = text.strip()
+                drafted.append(name)
+    except Exception as e:
+        log_with_sid("db_refresh", "warning",
+                     f"DB_REFRESH_DRAFT_FAILED table={log_safe_text(str(table_id))} "
+                     f"error={log_safe_text(type(e).__name__, 80)}")
+        return []
+    return drafted
+
+
 def refresh_one_table(table_id: str, *, actor: str = "scheduler",
                       force: bool = True, actor_kind: str | None = None) -> dict:
     """Re-snapshot one registered table and re-sync drifted chat metas.
@@ -238,6 +293,13 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler",
         elif str(name) in live_quote:
             col.pop("quote", None)
         new_columns.append(col)
+    # Columns the source ADDED get an AI-drafted business description (only
+    # those — surviving columns and the table description are never touched).
+    # A draft failure leaves them at "" and never fails the refresh.
+    drafted: list = []
+    if added:
+        drafted = _draft_added_descriptions(conn, password or "", row, added,
+                                            new_columns, actor, table_id)
     # Technical descriptions + dataset profile from the fresh snapshot (one
     # parquet read, pandas stats, no LLM). Best-effort; tech descs flow into
     # chat metas via the resync below, the profile is a sidecar next to the
@@ -265,10 +327,16 @@ def refresh_one_table(table_id: str, *, actor: str = "scheduler",
 
     drift = {"added": added, "removed": removed, "retyped": retyped}
     if added or removed or retyped:
+        from exec_transport import log_safe_text
         log_with_sid("db_refresh", "warning",
-                     f"DB_SCHEMA_DRIFT table={label} added={added} "
-                     f"removed={removed} retyped={[r['col'] for r in retyped]}")
-        store.mark_drift(table_id, drift)
+                     f"DB_SCHEMA_DRIFT table={log_safe_text(label)} "
+                     f"added={log_safe_text(str(added), 400)} "
+                     f"removed={log_safe_text(str(removed), 400)} "
+                     f"retyped={log_safe_text(str([r['col'] for r in retyped]), 400)} "
+                     f"drafted={log_safe_text(str(drafted), 400)}")
+        # `drafted` rides on the stored drift record only (the admin banner);
+        # the returned/audited `drift` keeps its three keys.
+        store.mark_drift(table_id, {**drift, "drafted": drafted})
         # Retype-only drift ALSO resyncs — technical descriptions changed.
         resync_chats_for_table(table_id)
     else:

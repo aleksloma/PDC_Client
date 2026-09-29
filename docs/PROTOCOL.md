@@ -729,11 +729,18 @@ Combined autofill — file description + per-column descriptions in one LLM call
 `_parse_combined_response` (`backend/routes/schema.py` L813-881). One call per
 file; the client runs them in parallel and merges the results into `meta.json`.
 
-The client builds the per-file context locally (same logic as global's
-`_prepare_file_context`) so the brain receives **only** the same inputs global
-itself feeds to the LLM: filename, dtypes, sampled / truncated unique values,
-language hint, user notes. No raw row data ever crosses the boundary beyond
-what global itself samples for this prompt.
+The client builds the per-file context locally (derived from global's
+`_prepare_file_context`): filename, dtypes, unique-value hints, language hint,
+user notes. `unique_hints` carries, per column, EITHER its distinct values
+(only when there are at most `SCHEMA_AUTOFILL_UNIQUE_THRESHOLD` of them — a
+categorical vocabulary) OR exactly one computed string starting with
+`[profile: ` that holds no real value: dtype, distinct count, null share, and
+per type a character mask of a typical value (letters → `A`, digits → `9`)
+with min/avg/max length, uniqueness and structural prefixes (text), two-
+significant-figure min/max/mean with integer/non-negative/increasing flags
+(numeric), year-month bounds and granularity (datetime), or the true share
+(boolean). No sampled row value of a high-cardinality column crosses the
+boundary.
 
 ### Request
 
@@ -745,7 +752,7 @@ what global itself samples for this prompt.
   "cols_to_fill": ["name", "department", "salary"],
   "unique_hints": {
     "department": ["Engineering", "Sales", "Support"],
-    "salary": ["145000", "82000", "158000"]
+    "salary": ["[profile: dtype=int64, distinct=412, nulls=0.0%, min=41000, max=210000, mean=97000, integers=yes, non_negative=yes, increasing=no]"]
   },
   "dtypes": {"name": "object", "department": "object", "salary": "int64"},
   "file_desc": "",                       // existing description, if any

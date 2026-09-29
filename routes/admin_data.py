@@ -1773,13 +1773,19 @@ def _count_and_profile_live(tid: str, actor: str, actor_kind=None) -> dict:
 
 
 def _draft_table_descriptions(cfg: dict, password: str, schema, table: str,
-                              email: str, intro: Optional[dict] = None) -> dict:
+                              email: str, intro: Optional[dict] = None,
+                              existing_descriptions: Optional[dict] = None) -> dict:
     """The ONE AI-draft mechanism (the existing schema-autofill brain call) —
-    used by the draft_descriptions route and the recommendation Accept, so
-    the two can never fork. Sync (run via _run). Pass a fresh `intro` to skip
-    the internal introspection (Accept already has one — no second live
-    catalog round-trip against the customer DB). Returns {"ok": True,
-    "draft": {...}, "confirmed": False} or {"ok": False, "error": ...}."""
+    used by the draft_descriptions route, the recommendation Accept and the
+    refresh's added-column draft (db_scheduler), so they can never fork.
+    Sync (run via _run). Pass a fresh `intro` to skip the internal
+    introspection (Accept already has one — no second live catalog
+    round-trip against the customer DB). `existing_descriptions`
+    ({column: text}) pre-fills the fields so `cols_to_fill` holds only the
+    columns without one — the refresh passes its surviving columns' stored
+    descriptions to draft only the added columns; the wizard and Accept pass
+    nothing. Returns {"ok": True, "draft": {...}, "confirmed": False} or
+    {"ok": False, "error": ...}."""
     import pandas as pd
     from routes.upload import _prepare_file_context
     if intro is None:
@@ -1808,6 +1814,11 @@ def _draft_table_descriptions(cfg: dict, password: str, schema, table: str,
     entry = {"file_name": f"{schema}.{table}" if schema else table,
              "file_description": intro.get("table_comment") or "",
              "schema": {"file_name": table, "fields": {}}}
+    if existing_descriptions:
+        entry["schema"]["fields"] = {
+            str(name): {"description": text}
+            for name, text in existing_descriptions.items()
+            if isinstance(text, str)}
     ctx = _prepare_file_context(entry["file_name"], df, entry, "")
     try:
         rsp = brain_client.schema_autofill(

@@ -26,6 +26,14 @@ def _isolate(tmp_path, monkeypatch):
     # stop() leaves the module _STOP flag set by design; a test that called it
     # must not make a later run_all_due() exit before its first table.
     db_scheduler._STOP.clear()
+    # A refresh that finds an ADDED column drafts its description through the
+    # brain. Offline by default: the draft fails fast (the refresh carries on
+    # with an empty description); tests that exercise the draft override it.
+    import brain_client
+
+    def _offline_autofill(**kw):
+        raise brain_client.BrainError("offline test suite")
+    monkeypatch.setattr(brain_client, "schema_autofill", _offline_autofill)
     yield
     db_scheduler._STOP.clear()
     local_store._DATAFRAME_CACHE.invalidate()
@@ -578,3 +586,166 @@ def test_run_all_due_leaves_live_tables_out(tmp_path, caplog):
     assert not store.get_table(live_tid).get("refreshed_at")
     assert any("LIVE_SKIP" in r.getMessage() and live_tid in r.getMessage()
                for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Added columns get an AI-drafted description (the ONE draft mechanism);
+# surviving columns and the table description are never touched, and a
+# draft failure never fails the refresh.
+# ---------------------------------------------------------------------------
+
+def _add_column_c(db):
+    from sqlalchemy import create_engine, text
+    eng = create_engine(f"sqlite+pysqlite:///{db}")
+    with eng.begin() as conn:
+        conn.execute(text("ALTER TABLE t ADD COLUMN c INTEGER"))
+    eng.dispose()
+
+
+def _fake_drafter(monkeypatch, result=None, raises=None):
+    import routes.admin_data as admin_mod
+    calls = []
+
+    def fake(cfg, password, schema, table, email, intro=None,
+             existing_descriptions=None):
+        calls.append({"schema": schema, "table": table, "email": email,
+                      "intro": intro,
+                      "existing_descriptions": existing_descriptions})
+        if raises is not None:
+            raise raises
+        return result
+    monkeypatch.setattr(admin_mod, "_draft_table_descriptions", fake)
+    return calls
+
+
+_DRAFT_OK = {"ok": True, "confirmed": False,
+             "draft": {"table_description": "NEW TABLE DESC",
+                       "columns": {"a": "DRAFT A", "b": "DRAFT B",
+                                   "c": "DRAFT C"}}}
+
+
+def test_added_column_gets_the_drafted_description(tmp_path, monkeypatch):
+    db, store, tid = _sqlite_setup(tmp_path)
+    assert db_scheduler.refresh_one_table(tid, actor="test")["ok"] is True
+    chat = local_store.ChatDataStore("c_draft")
+    meta = chat.read_meta()
+    meta["files"] = [{
+        "file_name": "test table", "source": "database",
+        "db": {"table_id": tid, "display_name": "test table",
+               "auto_included": False, "relations": []},
+        "schema": {"file_name": "test table",
+                   "fields": {"a": {"description": "col a", "values": None},
+                              "b": {"description": "col b", "values": None}}}}]
+    chat.write_meta(meta)
+    _add_column_c(db)
+    calls = _fake_drafter(monkeypatch, result=_DRAFT_OK)
+
+    res = db_scheduler.refresh_one_table(tid, actor="test")
+    assert res["ok"] is True
+    # The returned drift keeps its three keys.
+    assert res["drift"] == {"added": ["c"], "removed": [], "retyped": []}
+    row = store.get_table(tid)
+    by_name = {c["name"]: c for c in row["columns"]}
+    assert by_name["c"]["description"] == "DRAFT C"
+    assert by_name["a"]["description"] == "col a"      # surviving: untouched
+    assert by_name["b"]["description"] == "col b"
+    assert row["description"] == "d"                    # table desc untouched
+    assert row["last_drift"]["added"] == ["c"]
+    assert row["last_drift"]["drafted"] == ["c"]
+    # Draft only the added columns: every surviving column arrives
+    # pre-described, so the prompt's cols_to_fill can only be ["c"].
+    assert len(calls) == 1
+    assert calls[0]["intro"] is None
+    assert calls[0]["email"] == "test"
+    assert calls[0]["table"] == "t"
+    assert calls[0]["existing_descriptions"] == {"a": "col a", "b": "col b"}
+    # The resync carries the drafted text into the referencing chat.
+    fields = local_store.ChatDataStore("c_draft").read_meta()["files"][0][
+        "schema"]["fields"]
+    assert fields["c"]["description"] == "DRAFT C"
+    assert fields["a"]["description"] == "col a"
+
+
+def test_the_real_drafter_asks_only_for_the_added_column(tmp_path, monkeypatch):
+    """End to end through routes.admin_data._draft_table_descriptions against
+    the sqlite source: the brain call's cols_to_fill is exactly the added
+    column, and its unique_hints carry no real value of it."""
+    import routes.admin_data as admin_mod
+    db, store, tid = _sqlite_setup(tmp_path)
+    assert db_scheduler.refresh_one_table(tid, actor="test")["ok"] is True
+    _add_column_c(db)
+    seen = {}
+
+    def fake_autofill(**kw):
+        seen.update(kw)
+        return {"file_description": "ignored", "columns": {"c": "DRAFT C"}}
+    monkeypatch.setattr(admin_mod.brain_client, "schema_autofill", fake_autofill)
+    monkeypatch.setattr(settings, "BRAIN_DRAFT_TIMEOUT", 7.0)
+
+    res = db_scheduler.refresh_one_table(tid, actor="test")
+    assert res["ok"] is True
+    assert seen["cols_to_fill"] == ["c"]
+    assert seen["timeout"] == 7.0
+    # The added column is all NULL here: one value-free profile, no values.
+    hint_c = seen["unique_hints"]["c"]
+    assert len(hint_c) == 1 and hint_c[0].startswith("[profile: ")
+    assert "nulls=100.0%" in hint_c[0]
+    by_name = {c["name"]: c for c in store.get_table(tid)["columns"]}
+    assert by_name["c"]["description"] == "DRAFT C"
+    assert by_name["a"]["description"] == "col a"
+
+
+def test_scheduled_run_drafts_as_the_registrant(tmp_path, monkeypatch):
+    db, store, tid = _sqlite_setup(tmp_path)
+    doc = store.get_table(tid)
+    doc["registered_by"] = "owner@x.com"
+    store.upsert_table(doc, actor="ladmin")
+    assert db_scheduler.refresh_one_table(tid, actor="test")["ok"] is True
+    _add_column_c(db)
+    calls = _fake_drafter(monkeypatch, result=_DRAFT_OK)
+    assert db_scheduler.refresh_one_table(tid, actor="scheduler:test")["ok"] is True
+    assert calls[0]["email"] == "owner@x.com"
+
+
+def test_scheduled_run_without_registrant_drafts_as_the_admin(tmp_path, monkeypatch):
+    """An admin-registered table carries no registered_by: the draft goes out
+    as the local admin, never as "scheduler:<reason>"."""
+    db, store, tid = _sqlite_setup(tmp_path)
+    assert db_scheduler.refresh_one_table(tid, actor="test")["ok"] is True
+    _add_column_c(db)
+    monkeypatch.setattr(settings, "LOCAL_ADMIN_USERNAME", "ladmin")
+    calls = _fake_drafter(monkeypatch, result=_DRAFT_OK)
+    assert db_scheduler.refresh_one_table(tid, actor="scheduler:nightly")["ok"] is True
+    assert calls[0]["email"] == "ladmin"
+
+
+@pytest.mark.parametrize("mode", ["not_ok", "raises"])
+def test_draft_failure_never_fails_the_refresh(tmp_path, monkeypatch, caplog, mode):
+    import logging
+    db, store, tid = _sqlite_setup(tmp_path)
+    assert db_scheduler.refresh_one_table(tid, actor="test")["ok"] is True
+    _add_column_c(db)
+    if mode == "not_ok":
+        _fake_drafter(monkeypatch, result={"ok": False, "error": "boom"})
+    else:
+        _fake_drafter(monkeypatch, raises=RuntimeError("brain down"))
+    with caplog.at_level(logging.WARNING):
+        res = db_scheduler.refresh_one_table(tid, actor="test")
+    assert res["ok"] is True and res["drift"]["added"] == ["c"]
+    row = store.get_table(tid)
+    by_name = {c["name"]: c for c in row["columns"]}
+    assert by_name["c"]["description"] == ""
+    assert by_name["a"]["description"] == "col a"
+    assert row["last_drift"]["drafted"] == []
+    assert local_store.db_snapshot_path(tid).exists()
+    assert any("DB_REFRESH_DRAFT_FAILED" in r.getMessage() and tid in r.getMessage()
+               for r in caplog.records)
+
+
+def test_no_added_column_means_no_draft_call(tmp_path, monkeypatch):
+    _, store, tid = _sqlite_setup(tmp_path)
+    calls = _fake_drafter(monkeypatch, result=_DRAFT_OK)
+    assert db_scheduler.refresh_one_table(tid, actor="test")["ok"] is True
+    assert calls == []
+    by_name = {c["name"]: c for c in store.get_table(tid)["columns"]}
+    assert by_name["a"]["description"] == "col a"
