@@ -53,7 +53,12 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "8091:8000"
+      # Published on the loopback interface only: the reverse proxy that
+      # terminates TLS runs on this host and forwards to it. Set
+      # PDC_WEB_BIND_HOST (next to this file, like PDC_BACKEND_SUBNET) only
+      # if the proxy runs on another machine — then the app is reachable
+      # without TLS by anyone who can reach that address.
+      - "${PDC_WEB_BIND_HOST:-127.0.0.1}:8091:8000"
     # `default` carries the browser and the calls out to the brain; `backend`
     # is the only way to reach the sandbox.
     networks: [default, backend]
@@ -109,7 +114,15 @@ services:
     security_opt: ["no-new-privileges:true"]
     mem_limit: 4g
     pids_limit: 512
-    # cpus: "2.0"   # uncomment to cap CPU
+    # CPU cap: one runaway render or query cannot starve the host (or the
+    # other container). Raise it on a bigger host; see CUSTOMER_INSTALL.md.
+    cpus: "2.0"
+    # Docker's json-file log is rotated: at most 5 files of 20 MB each.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     restart: unless-stopped
 
   # The analysis sandbox. Generated Python runs here and nowhere else, so this
@@ -141,7 +154,15 @@ services:
     # as an ordinary analysis error instead of pressuring the host.
     mem_limit: 3g
     pids_limit: 256
-    # cpus: "2.0"   # uncomment to cap CPU
+    # CPU cap: one runaway render or query cannot starve the host (or the
+    # other container). Raise it on a bigger host; see CUSTOMER_INSTALL.md.
+    cpus: "2.0"
+    # Docker's json-file log is rotated: at most 5 files of 20 MB each.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     restart: unless-stopped
     environment:
       EXECUTOR_SHARED_DIR: /jobs

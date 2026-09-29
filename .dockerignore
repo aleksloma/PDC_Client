@@ -7,10 +7,10 @@ logs/
 *.env
 !*.env.example
 .claude/
-# The image is built with `COPY . .` from the repository root, so whatever
-# sits in the working tree ends up inside /app and is handed to a customer.
-# Git-ignoring a file keeps it out of the REPOSITORY, which is not the same
-# thing as keeping it out of the ARTIFACT — this list is what does that.
+# Both images copy named files only, so the working tree does not reach /app
+# through their COPY lines; this list still bounds the BUILD CONTEXT (and any
+# directory a COPY names, e.g. static/). Git-ignoring a file keeps it out of
+# the REPOSITORY, which is not the same thing as keeping it out of the build.
 # Anything describing the product's own security posture belongs here.
 docs/security/
 # Note on the pattern below: Docker's `*` does not cross `/`, so this excludes

@@ -9,6 +9,9 @@ ENV PYTHONUNBUFFERED=1 \
     BRAIN_URL=http://brain:8080
 
 # Native libs for matplotlib / kaleido / pandas + unixodbc for pyodbc (MSSQL).
+# No system libxml2: nothing in the image links it (checked with ldd on the
+# SQL Server ODBC driver, libodbc and pyodbc; msodbcsql18 / unixodbc do not
+# depend on it), and the .xlsx path uses lxml, which bundles its own libxml2.
 # `apt-get upgrade` patches the base image's own OS packages in the same layer:
 # the base tag is rebuilt less often than its security fixes ship, so without it
 # a fresh build inherits OS vulnerabilities that already have a fix. The release
@@ -17,7 +20,7 @@ RUN apt-get update \
     && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
         curl ca-certificates gnupg \
-        libxml2 libgomp1 fontconfig \
+        libgomp1 fontconfig \
         unixodbc \
     && rm -rf /var/lib/apt/lists/*
 
@@ -48,7 +51,25 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip==26.2.1
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Named files only, the way the sandbox image is built: the working tree
+# (tests, docs, env templates, build files, whatever else sits in a checkout)
+# never reaches the customer's image, whatever .dockerignore says.
+# tests/test_container_hardening_config.py pins that every root module is
+# listed and that no development material is copied.
+COPY app.py auth_limiter.py auto_analytics.py brain_client.py code_exec.py \
+     dataset_profile.py db_connector.py db_scheduler.py db_sources.py \
+     excel_table_detector.py exec_sanitizer.py exec_transport.py \
+     executor_client.py gcs_upload.py html_sanitize.py local_store.py \
+     logger_utils.py models.py outlier_utils.py password_utils.py \
+     plot_utils.py pptx_template_cache.py relation_discovery.py \
+     result_backstop.py roles_store.py run_chat_local.py sandbox_guard.py \
+     schedule_utils.py schema_builder.py settings.py sso_store.py ./
+COPY routes/ routes/
+COPY templates/ templates/
+COPY static/ static/
+# The post-release pipeline canary (docs/BUILD_AND_RUN.md) and its one fixture.
+COPY tools/canary_check.py tools/canary_expected.json tools/
+COPY tools/fixtures/sample_sales.csv tools/fixtures/
 
 # Offline plotly.js: bake the pip package's own plotly.min.js into static/vendor/
 # so chart iframes never load from cdn.plot.ly (customer LANs may be air-gapped).

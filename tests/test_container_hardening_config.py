@@ -372,16 +372,24 @@ def test_compose_sets_memory_and_pid_limits(path, service):
 
 
 @pytest.mark.parametrize("path,service", SERVICE_CASES)
-def test_compose_cpu_cap_stays_commented_out(path, service):
-    """No `cpus` on either service, in either file.
-
-    The sandbox runner already pins every numeric library to one thread and the
-    web process no longer executes analysis, so a CPU cap here would only
-    throttle the customer's own analysis on their own hardware. The commented
-    `# cpus:` line stays as the documented opt-in.
-    """
+def test_compose_caps_cpu(path, service):
+    """Both services carry a CPU cap, in both files: one runaway render,
+    query or job cannot starve the host or the other container. The value is
+    the one CUSTOMER_INSTALL.md states."""
     svc = _service(path, service)
-    assert "cpus" not in svc, sorted(svc.keys())
+    assert str(svc.get("cpus")) == "2.0", sorted(svc.keys())
+
+
+@pytest.mark.parametrize("path,service", SERVICE_CASES)
+def test_compose_rotates_the_container_log(path, service):
+    """Docker's json-file log is rotated (at most 5 files of 20 MB), so a
+    chatty or attacked container cannot fill the host disk."""
+    svc = _service(path, service)
+    logging_cfg = svc.get("logging") or {}
+    assert logging_cfg.get("driver") == "json-file", logging_cfg
+    options = logging_cfg.get("options") or {}
+    assert str(options.get("max-size")) == "20m", options
+    assert str(options.get("max-file")) == "5", options
 
 
 @pytest.mark.parametrize("path", COMPOSE_FILES)
@@ -399,6 +407,7 @@ def test_compose_limit_values_match_what_the_docs_promise(path):
     assert mem_limit == "4g", mem_limit
     pids_limit = svc.get("pids_limit")
     assert pids_limit == 512, pids_limit
+    assert str(svc.get("cpus")) == "2.0", svc.get("cpus")
     tmp = [str(e) for e in _tmpfs_entries(svc) if str(e).split(":")[0] == "/tmp"]
     assert len(tmp) == 1, _tmpfs_entries(svc)
     options = tmp[0].split(":", 1)[1] if ":" in tmp[0] else ""
@@ -431,9 +440,12 @@ def test_local_compose_keeps_external_data_volume_and_drops_logs_volume():
     assert "pdc_client_logs" not in set(_walk_strings(doc)), doc.get("volumes")
 
 
-def test_local_compose_port_unchanged():
+BIND_DEFAULT = "${PDC_WEB_BIND_HOST:-127.0.0.1}"
+
+
+def test_local_compose_port_binds_to_loopback_by_default():
     ports = _ports(_client_service(COMPOSE_LOCAL))
-    assert "8091:8000" in ports, ports
+    assert ports == [f"{BIND_DEFAULT}:8091:8000"], ports
 
 
 # ---------------------------------------------------------------------------
@@ -444,10 +456,10 @@ def test_customer_compose_never_mentions_session_https_only():
     assert "SESSION_HTTPS_ONLY" not in text
 
 
-def test_customer_compose_port_restart_and_env_file_unchanged():
+def test_customer_compose_port_on_loopback_restart_and_env_file_unchanged():
     svc = _client_service(COMPOSE_CUSTOMER)
     ports = _ports(svc)
-    assert "8000:8000" in ports, ports
+    assert ports == [f"{BIND_DEFAULT}:8000:8000"], ports
     restart = svc.get("restart")
     assert restart == "unless-stopped", restart
     env_file = svc.get("env_file")
@@ -729,14 +741,14 @@ def test_customer_compose_executor_is_image_only():
 # ---------------------------------------------------------------------------
 # What the build context hands to a customer
 #
-# The web image is built with a WHOLE-TREE `COPY . .`, so every file sitting
-# in the working tree at build time lands in `/app` and is shipped. Some of
-# this repository's working material is local-only and must not ship;
-# git-ignoring it keeps it out of the REPOSITORY, which is a different thing
-# from keeping it out of the ARTIFACT, and only `.dockerignore` does the
-# second. The two facts — a whole-tree copy and the exclusion list — are only
-# safe TOGETHER, which is why both are pinned here: a reader who changes one
-# has to see the other.
+# Both images copy NAMED files only (the web image since the C2 hardening:
+# every root module, routes/, templates/, static/ and the canary), so the
+# working tree cannot reach /app through the COPY lines. `.dockerignore`
+# still bounds the BUILD CONTEXT sent to the daemon (and would bound any
+# directory a future COPY names), so local-only material stays excluded
+# there too, and the exclusion list is still pinned below. Git-ignoring a
+# file keeps it out of the REPOSITORY, which is a different thing from
+# keeping it out of the build context.
 # ---------------------------------------------------------------------------
 DOCKERIGNORE = ROOT / ".dockerignore"
 
@@ -838,19 +850,57 @@ def test_every_such_file_in_the_tree_is_excluded(glob):
     assert offenders == [], offenders
 
 
-def test_the_web_image_still_copies_the_whole_tree():
-    """This is WHY the exclusion list is load-bearing.
+def _web_copy_sources() -> list:
+    """Every source path of every COPY in the web Dockerfile (continuation
+    lines joined, destination dropped)."""
+    text = _dockerfile_text(DOCKERFILE).replace("\\\n", " ")
+    sources = []
+    for line in text.splitlines():
+        parts = line.strip().split()
+        if parts and parts[0].upper() == "COPY":
+            args = [a for a in parts[1:] if not a.startswith("--")]
+            sources.extend(args[:-1])
+    return sources
 
-    If this ever becomes a list of named files (the shape the sandbox image
-    uses), the ignore file stops being the only thing between the working
-    tree and the customer — and the reasoning above has to be revisited in
-    the same change rather than left as a stale comment.
-    """
-    text = _dockerfile_text(DOCKERFILE)
-    copies = [line.strip() for line in text.splitlines()
-              if line.strip().upper().startswith("COPY ")]
-    whole_tree = [line for line in copies if line.split()[1:] == [".", "."]]
-    assert whole_tree, copies
+
+def test_the_web_image_copies_named_files_only():
+    """The web image copies named files, like the sandbox image: the working
+    tree (tests, docs, env templates, build files) cannot reach the customer's
+    image whatever .dockerignore says. .dockerignore still trims the build
+    context."""
+    sources = _web_copy_sources()
+    assert sources, _dockerfile_text(DOCKERFILE)[:300]
+    assert "." not in sources, sources
+
+
+def test_every_root_module_is_in_the_web_image():
+    """A new root module that is not listed would be missing at run time."""
+    sources = set(_web_copy_sources())
+    modules = sorted(p.name for p in ROOT.glob("*.py"))
+    missing = [m for m in modules if m not in sources]
+    assert missing == [], missing
+
+
+@pytest.mark.parametrize("source_prefix", [
+    "tests/", "docs/", "executor/", "CLAUDE.md", "README.md", "CUSTOMER_INSTALL.md",
+    "RELEASES.md", "cloudbuild.yaml", "docker-compose", ".env", "client.env",
+    "client.local.env", "flow.jpg", "structure.jpg", "claude/", "dr/", "logs/",
+    ".claude/", "tools/capture_executor_fixtures.py", "tools/design.md",
+])
+def test_no_development_material_is_copied(source_prefix):
+    sources = _web_copy_sources()
+    hit = [s for s in sources if s.startswith(source_prefix)
+           or s.rstrip("/") == source_prefix.rstrip("/")]
+    assert hit == [], hit
+
+
+def test_the_web_image_installs_no_system_libxml2():
+    """Nothing in the image links the Debian libxml2 (the SQL Server ODBC
+    driver, libodbc and pyodbc were checked with ldd), and the .xlsx path uses
+    lxml's own bundled copy, so the package is not installed."""
+    installs = [args for args in _run_args(DOCKERFILE) if "apt-get install" in args]
+    assert installs, _run_args(DOCKERFILE)
+    assert not any("libxml2" in args for args in installs), installs
 
 
 def test_the_sandbox_image_copies_named_files_only():
