@@ -778,6 +778,94 @@ def test_a_tampered_font_template_file_is_not_copied(healthy, executor_env, monk
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_a_swept_child_is_reaped_not_left_a_zombie(healthy):
+    """An escapee the sweep killed becomes a zombie of whoever it was
+    reparented to — this service, when it is pid 1 — and a zombie keeps a pid
+    slot counted against the uid's limits. The sweep reaps what it killed."""
+    pid = os.fork()
+    if pid == 0:
+        time.sleep(60)
+        os._exit(0)
+    healthy._kill_pid(pid)
+    deadline = time.monotonic() + 5
+    while healthy._REAP_PENDING and time.monotonic() < deadline:
+        healthy._reap_swept()
+        time.sleep(0.05)
+    assert pid not in healthy._REAP_PENDING
+    assert not os.path.exists(f"/proc/{pid}"), "the killed child is still a zombie"
+
+
+_NL = chr(10)
+_FORKERS = {
+    # detached (setsid) escapees, alive when the sweep runs: killed + reaped
+    "setsid": _NL.join([
+        "import os, time",
+        "for i in range(40):",
+        "    if os.fork() == 0:",
+        "        os.setsid()",
+        "        for j in range(3):",
+        "            if os.fork() == 0:",
+        "                time.sleep(120); os._exit(0)",
+        "        time.sleep(120); os._exit(0)",
+        "RESULT = 'forked'",
+    ]),
+    # children in the runner's own process group: they die with the killpg
+    # and are ALREADY zombies of the service when the sweep looks
+    "process_group": _NL.join([
+        "import os, time",
+        "for i in range(120):",
+        "    if os.fork() == 0:",
+        "        time.sleep(120); os._exit(0)",
+        "RESULT = 'forked'",
+    ]),
+    # children that exit on their own right after the job
+    "self_exit": _NL.join([
+        "import os, time",
+        "for i in range(120):",
+        "    if os.fork() == 0:",
+        "        os.setsid(); time.sleep(0.2); os._exit(0)",
+        "RESULT = 'forked'",
+    ]),
+}
+
+
+@pytest.mark.skipif(os.getpid() != 1, reason="orphans reparent to this process only as pid 1")
+@pytest.mark.parametrize("shape", sorted(_FORKERS))
+def test_a_job_that_leaves_many_escapees_does_not_starve_the_next_job(executor_env, shape):
+    """Live shape of the audit's probe: job A leaves ~120 children behind
+    (detached, in its process group, or exiting on their own); after the
+    sweep, job B must still be able to start threads and see no process of
+    the job uid but itself — and no pile of zombies."""
+    NL = _NL
+    forker = _FORKERS[shape]
+    probe = NL.join([
+        "import os, threading",
+        "t = threading.Thread(target=lambda: None); t.start(); t.join()",
+        "me = os.getpid(); others = []",
+        "for e in os.listdir('/proc'):",
+        "    if not e.isdigit() or int(e) in (me, os.getppid()): continue",
+        "    try:",
+        "        st = open(f'/proc/{e}/status').read()",
+        "    except OSError:",
+        "        continue",
+        "    uid = [l.split()[1] for l in st.splitlines() if l.startswith('Uid:')][0]",
+        "    state = [l.split()[1] for l in st.splitlines() if l.startswith('State:')][0]",
+        "    if uid == str(os.getuid()): others.append((int(e), state))",
+        "RESULT = others",
+    ])
+    with _client() as client:
+        _submit(client, executor_env, forker)
+        if shape == "self_exit":
+            time.sleep(1.0)
+        job_dir, response, _ = _submit(client, executor_env, probe)
+    assert response.get("status") == "ok", response
+    others = _decode(response, job_dir)["result"]
+    live = [p for p in others if p[1] not in ("Z", "X")]
+    assert live == [], live
+    assert len(others) < 5, f"zombies were left behind: {others}"
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
 def test_a_zombie_is_not_counted_as_a_live_process(healthy):
     """A killed escapee stays a zombie until reaped; it runs nothing, so it
     must not keep the sweep looping into an unhealthy verdict."""

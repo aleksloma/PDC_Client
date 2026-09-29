@@ -121,6 +121,10 @@ _UNHEALTHY: dict = {"reason": None}
 # SIGKILL the service did not send (the OOM killer), which tells the planner
 # to use less memory. Only reachable with EXECUTOR_MAX_CONCURRENT > 1.
 _SWEPT_PIDS: set = set()
+# Killed pids whose zombie this service may have to reap (see _reap_swept).
+_REAP_PENDING: set = set()
+# Pids of live job runners (their exit status belongs to their Popen).
+_RUNNER_PIDS: set = set()
 # The font-cache template's files as warmed: {name: (size, sha256)}. Only a
 # file that still matches is copied into a job's scratch.
 _MPL_TEMPLATE_FILES: dict = {}
@@ -554,14 +558,27 @@ def _same_uid_pids() -> set:
             continue
         uid = None
         state = ""
+        ppid = None
         for line in status.splitlines():
             if line.startswith("State:"):
                 state = line.split(":", 1)[1].strip()[:1]
+            elif line.startswith("PPid:"):
+                with suppress(IndexError, ValueError):
+                    ppid = int(line.split()[1])
             elif line.startswith("Uid:"):
                 with suppress(IndexError, ValueError):
                     uid = int(line.split()[1])
-        if uid == me and state not in ("Z", "X"):
+        if uid != me:
+            continue
+        if state not in ("Z", "X"):
             found.add(pid)
+        elif ppid == os.getpid():
+            # A zombie reparented to this service (a job's child that exited
+            # on its own): queue it for reaping, unless it is a job runner,
+            # whose own Popen collects its status.
+            with _INFLIGHT_LOCK:
+                if pid not in _RUNNER_PIDS:
+                    _REAP_PENDING.add(pid)
     return found
 
 
@@ -574,7 +591,37 @@ def _kill_pid(pid: int) -> None:
         if len(_SWEPT_PIDS) > 4096:
             _SWEPT_PIDS.clear()
         _SWEPT_PIDS.add(int(pid))
+        if int(pid) not in _RUNNER_PIDS:
+            _REAP_PENDING.add(int(pid))
     log_with_sid("executor", "warning", f"EXEC_STRAY_KILLED pid={int(pid)}")
+
+
+def _reap_swept() -> None:
+    """Collect the exit status of killed escapees that were reparented to
+    this process. When the service is pid 1 (the container's init) it is
+    their parent, and an unreaped zombie keeps a pid slot counted against the
+    uid's process limits — enough of them and the NEXT user's job cannot
+    start a thread. Only pids the sweep killed are reaped (never a job
+    runner, whose status its own Popen collects), plus zombies
+    `_same_uid_pids` found parented to this process. When the service is not
+    pid 1 (a supervisor, `--reload`) orphans go to that parent instead and
+    are dropped here as not ours (dev only). Never raises."""
+    with _INFLIGHT_LOCK:
+        pending = list(_REAP_PENDING)
+    for pid in pending:
+        with _INFLIGHT_LOCK:
+            if pid in _RUNNER_PIDS:           # a runner: its Popen collects it
+                _REAP_PENDING.discard(pid)
+                continue
+        try:
+            done, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            done = pid                     # not our child: someone else reaps it
+        except OSError:
+            continue
+        if done:
+            with _INFLIGHT_LOCK:
+                _REAP_PENDING.discard(pid)
 
 
 def _sweep_same_uid_processes() -> bool:
@@ -596,12 +643,17 @@ def _sweep_same_uid_processes() -> bool:
         with _INFLIGHT_LOCK:
             _SWEPT_PIDS.clear()
     for _ in range(_SWEEP_MAX_PASSES):
+        _reap_swept()
         pids = _same_uid_pids()
         if not pids:
+            # This pass may have queued zombies (children that died with the
+            # runner's process group): reap them before the next job runs.
+            _reap_swept()
             return True
         for pid in sorted(pids):
             _kill_pid(pid)
         time.sleep(_SWEEP_PAUSE_S)
+    _reap_swept()
     if not _same_uid_pids():
         return True
     if _UNHEALTHY["reason"] is None:
@@ -863,16 +915,22 @@ def _execute_job(config: Config, request: ExecuteRequest, job_dir: Path,
     read_fd, write_fd = os.pipe()
     try:
         try:
-            process = subprocess.Popen(
-                [sys.executable, "-I", "-u", str(_RUNNER), str(job_json)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                pass_fds=(write_fd,),
-                env=_runner_env(config, write_fd, scratch),
-                cwd=str(_APP_ROOT),
-                start_new_session=True,
-            )
+            # Spawned under the lock and registered before it is released:
+            # a concurrent sweep can only see this pid after the fork, and it
+            # then always finds it in _RUNNER_PIDS (never queued for reaping —
+            # its exit status belongs to this Popen).
+            with _INFLIGHT_LOCK:
+                process = subprocess.Popen(
+                    [sys.executable, "-I", "-u", str(_RUNNER), str(job_json)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    pass_fds=(write_fd,),
+                    env=_runner_env(config, write_fd, scratch),
+                    cwd=str(_APP_ROOT),
+                    start_new_session=True,
+                )
+                _RUNNER_PIDS.add(process.pid)
         finally:
             os.close(write_fd)
     except Exception as e:
@@ -928,6 +986,8 @@ def _execute_job(config: Config, request: ExecuteRequest, job_dir: Path,
     for reader in readers:
         reader.join(timeout=_READER_JOIN_S)
 
+    with _INFLIGHT_LOCK:
+        _RUNNER_PIDS.discard(process.pid)
     elapsed_ms = int((time.monotonic() - started) * 1000)
     exit_code = process.returncode
     signal_no = -exit_code if isinstance(exit_code, int) and exit_code < 0 else None
