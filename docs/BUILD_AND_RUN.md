@@ -95,6 +95,19 @@ To run the client you need a **tenant token from the brain**. Create one
 through the brain's admin panel — when the token is created it is shown
 ONCE and never again. Save it.
 
+Two settings stop the web container at startup, before it serves a request:
+
+- **`SECRET_KEY`** signs the session cookie and is **required**. Empty, the
+  old placeholder `replace-me-in-prod`, or shorter than 32 characters ⇒ the
+  log shows `SECRET_KEY_UNSET` and the process exits non-zero. Generate it
+  once with `python -c "import secrets; print(secrets.token_hex(32))"` and
+  keep it stable; a new key signs everyone out once.
+- **`EXECUTOR_NETWORK_CIDR`** is required while `EXECUTOR_URL` is set (the
+  default is `http://pdc-executor:8090`). Empty or not a valid network ⇒
+  `EXECUTOR_CIDR_UNSET` and exit. Both compose files set it from
+  `PDC_BACKEND_SUBNET`. Only a run with `EXECUTOR_URL=""` (no sandbox at
+  all) may leave it empty.
+
 Run the two images with compose, never by hand: the sandbox is only isolated
 because compose gives it an internal network with no gateway, and the two
 containers must mount the same jobs directory. `docker-compose.local.yml` is
@@ -180,7 +193,8 @@ Configuration comes from gitignored env files at runtime — secrets are never
 baked into images: the brain reads `.env` (`GOOGLE_API_KEY`, `SECRET_KEY`,
 `GMAIL_SENDER` / `GMAIL_APP_PASSWORD`), the client reads `client.local.env`
 (`BRAIN_URL=http://host.docker.internal:8090`, `BRAIN_TENANT_TOKEN` of a
-tenant existing in the local brain volume, a STABLE `SECRET_KEY`).
+tenant existing in the local brain volume, a STABLE `SECRET_KEY` of at least
+32 characters — the client refuses to start without one, §2).
 
 ### Data preservation (hard rules)
 

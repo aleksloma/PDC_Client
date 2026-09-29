@@ -50,6 +50,11 @@ job files through an in-memory volume.
 | Executor settings | `EXECUTOR_URL=http://127.0.0.1:8090`, `EXECUTOR_SHARED_DIR=/jobs`, `EXECUTOR_MAX_CONCURRENT=1` | `EXECUTOR_SHARED_DIR=/jobs`, `EXECUTOR_MEM_LIMIT_MB=2048`, `EXECUTOR_MAX_CONCURRENT=1` |
 | Guard settings | `EXECUTOR_NETWORK_CIDR=127.0.0.0/8`, `FORWARDED_ALLOW_IPS=""` | — |
 
+The web container refuses to start unless `SECRET_KEY` is at least 32
+characters (`SECRET_KEY_UNSET`) and, because `EXECUTOR_URL` is set, unless
+`EXECUTOR_NETWORK_CIDR` is a valid network (`EXECUTOR_CIDR_UNSET`); the demo's
+`127.0.0.0/8` satisfies the second check.
+
 **What the demo keeps of the customer topology's isolation (Constitution
 Art. XIV):**
 
@@ -173,7 +178,8 @@ gcloud iam service-accounts add-iam-policy-binding \
   --role="roles/iam.serviceAccountTokenCreator" --project=pdc-enterprise
 
 # Secret values: tenant token copied one-time from the brain admin panel;
-# SECRET_KEY random (e.g. python -c "import secrets;print(secrets.token_urlsafe(48))").
+# SECRET_KEY random, at least 32 characters or the web container will not start
+# (e.g. python -c "import secrets;print(secrets.token_urlsafe(48))").
 # NEVER commit either value.
 gcloud secrets create CLIENT_DEMO_TENANT_TOKEN --data-file=<file> --project=pdc-enterprise
 gcloud secrets create CLIENT_DEMO_SECRET_KEY   --data-file=<file> --project=pdc-enterprise

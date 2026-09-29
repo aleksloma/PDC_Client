@@ -494,11 +494,14 @@ signatures, so nothing upstream changed.
 | `EXECUTOR_PLOT_TIMEOUT_S` | `120` s | the budget for a chart; analysis blocks use `code_exec.CODE_EXEC_TIMEOUT_SECONDS` (60 s) |
 | `EXECUTOR_MAX_CONCURRENT` | `1` | jobs dispatched at once — must never exceed the sandbox's own limit (§7) |
 | `EXECUTOR_QUEUE_MAX_S` | `600` s | how long a job may wait for a slot before it is answered "busy" |
-| `EXECUTOR_NETWORK_CIDR` | *(empty)* | the sandbox network's own subnet. Requests whose peer address falls inside it are answered 403: a Docker network is bidirectional, so this is what stops generated code calling the web service's unauthenticated endpoints. Compose sets it from the same variable that pins the network, so the two cannot drift. Empty disables the refusal (a single-container dev run) |
+| `EXECUTOR_NETWORK_CIDR` | *(empty)* | the sandbox network's own subnet. Requests whose peer address falls inside it are answered 403: a Docker network is bidirectional, so this is what stops generated code calling the web service's unauthenticated endpoints. Compose sets it from the same variable that pins the network, so the two cannot drift. **Mandatory while `EXECUTOR_URL` is set:** the web service refuses to start (`EXECUTOR_CIDR_UNSET`, exit non-zero) when it is empty or not a valid network. Only a run with `EXECUTOR_URL=""` (no sandbox at all) may leave it empty |
 
 Every one is read at call time, and a malformed value falls back to its
 default rather than raising during import — a settings module that throws
-crash-loops the container before any log exists.
+crash-loops the container before any log exists. `EXECUTOR_NETWORK_CIDR` is
+the one exception to "falls back": the lifespan checks it before the app
+serves a request, and a missing or malformed value stops the start instead of
+running the guard silently disabled.
 
 **The dispatch gate.** A job acquires a semaphore sized from
 `EXECUTOR_MAX_CONCURRENT` *before* anything is created, and its `timeout_s`
@@ -572,6 +575,12 @@ opportunistically after a dispatch, and the sandbox does the same on its own
 schedule (§7). Beyond 32-hex job directories, the only entries either side
 touches are the aged strays of the jobs root described in §7 — on this side
 never one it owns, and never at all when the jobs directory is refused.
+
+**Startup refusal.** Before anything else, the web service's lifespan checks
+that `EXECUTOR_NETWORK_CIDR` is a valid network whenever `EXECUTOR_URL` is
+set. If it is not, it logs `EXECUTOR_CIDR_UNSET` (preceded by
+`EXECUTOR_CIDR_INVALID <Type>` for a malformed value) and exits non-zero. The
+value is never logged.
 
 **Version handshake.** At startup the web service calls `/healthz` and logs
 one warning per library whose version differs from its own, plus

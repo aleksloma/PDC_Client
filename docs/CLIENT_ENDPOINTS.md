@@ -26,9 +26,25 @@ file documents the enterprise client's implementation of each one.
   peer lies inside the sandbox's subnet (`EXECUTOR_NETWORK_CIDR`) is refused
   on EVERY path, `/health` included, with a bare `403 {"error": "forbidden"}`
   (no path, range or caller named) and one `BACKEND_REQUEST_REFUSED` log line
-  per peer address. Source: `BackendNetworkGuard` in `app.py`.
+  per peer address. The app refuses to start while `EXECUTOR_URL` is set and
+  this range is empty or malformed (`EXECUTOR_CIDR_UNSET`), so the refusal is
+  never silently off. Source: `BackendNetworkGuard` in `app.py`.
 - **Chat ids.** A chat id outside `[A-Za-z0-9_-]{1,64}` answers
   `404 {"error": "Chat not found"}`, like an unknown chat.
+- **Session ids.** The session's `sid` must be `s_` + 16 lowercase hex. A
+  session carrying any other `sid` is a forged or corrupt cookie: the upload
+  and schema routes (`/upload`, `/upload/init`, `/upload/finalize`,
+  `/schema_autofill_full`, `/generate_chatdata`, `/session/db_tables`,
+  `/add_data_to_chat`, `/schema_details`, `/schema_common_fields`, `/schema`)
+  clear the session, so the response clears the cookie, and answer
+  `401 {"error": "Not authenticated"}` (log `SESSION_SID_INVALID`).
+  `/new_session` rotates to a fresh sid, so a malformed one is simply
+  replaced. Every sign-in re-mints a malformed sid instead of keeping it. A
+  session folder that resolves outside `<DATA_ROOT>/sessions/` is never
+  deleted: `/new_session` and `/upload` answer
+  `401 {"error": "Session invalid"}` and clear the session. Source:
+  `local_store.valid_sid`, `_require_session` in `routes/upload.py` and
+  `routes/schema.py`.
 - **CSRF.** The session cookie is `SameSite=lax`, and every state-changing
   endpoint is a `POST` — a cross-site form or link cannot carry the session
   into a write.

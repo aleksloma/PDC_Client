@@ -136,11 +136,13 @@ To run the stack you need:
 |---|---|
 | `BRAIN_URL` | Where the brain is reachable from inside the client's network. |
 | `BRAIN_TENANT_TOKEN` | Per-tenant bearer token issued by PowerDataChat (shown ONCE in the operator's admin panel). |
-| `SECRET_KEY` | Local session-cookie signing secret (`openssl rand -hex 32`). |
+| `SECRET_KEY` | **Required.** Local session-cookie signing secret, at least 32 characters. Generate once with `python -c "import secrets; print(secrets.token_hex(32))"`. The app refuses to start (`SECRET_KEY_UNSET`) without it. |
 | `DATA_ROOT` | Local-disk root for raw data + chats. Mount a volume. |
 
 The `EXECUTOR_*` topology values are set by the compose file, not by the env
-file. See [`client.env.example`](client.env.example) for the full list and
+file. `EXECUTOR_NETWORK_CIDR` is mandatory while `EXECUTOR_URL` is set: the
+app refuses to start (`EXECUTOR_CIDR_UNSET`) without a valid network, and the
+compose files feed it from `PDC_BACKEND_SUBNET`. See [`client.env.example`](client.env.example) for the full list and
 [`docs/BUILD_AND_RUN.md`](docs/BUILD_AND_RUN.md) for build + run.
 
 ```bash

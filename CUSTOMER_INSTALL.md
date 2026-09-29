@@ -12,6 +12,16 @@ both are started together by Docker Compose, and neither is useful alone.
 This is the short, operational quickstart. For build internals and the full
 endpoint contract see [`docs/BUILD_AND_RUN.md`](docs/BUILD_AND_RUN.md).
 
+## Upgrade notes
+
+Read these before you upgrade an existing install to this release.
+
+- SECRET_KEY is now mandatory: the app refuses to start without a random
+  value of at least 32 characters; setting a new key signs everyone out once.
+- EXECUTOR_NETWORK_CIDR is now mandatory while the analysis sandbox is
+  enabled; the shipped compose files set it from PDC_BACKEND_SUBNET, but an
+  older or hand-edited compose file without that line will not start.
+
 ## 1. Get the images
 
 Two images make up one release and must always be installed together, at the
@@ -55,8 +65,12 @@ Edit `client.env` and fill in:
 
 - **`BRAIN_TENANT_TOKEN`** — the token from the PowerDataChat admin panel (shown
   once at tenant creation).
-- **`SECRET_KEY`** — generate once with `openssl rand -hex 32`; keep it stable so
-  logins persist.
+- **`SECRET_KEY`** — **required.** It signs the session cookie. Generate it once
+  with `python -c "import secrets; print(secrets.token_hex(32))"` and keep it
+  stable so logins persist; a new key signs everyone out once. The web
+  container refuses to start while it is empty, the old placeholder
+  `replace-me-in-prod`, or shorter than 32 characters: `docker logs pdc-client`
+  then shows `SECRET_KEY_UNSET` and the container exits.
 - **`CLIENT_ENCRYPTION_KEY`** — **set this at install time.** It encrypts every
   credential the admin panel stores at rest: database passwords ("Data
   sources") AND the Microsoft SSO client secret — without it those Save/Test
@@ -101,6 +115,13 @@ two containers together (`EXECUTOR_URL`, `EXECUTOR_SHARED_DIR`,
 `docker-compose.yml`, where compose `environment` overrides `env_file`. A
 well-meant edit to the env file therefore cannot break the topology. Timeouts
 and sizes stay tunable; `client.env.example` marks which is which.
+
+`EXECUTOR_NETWORK_CIDR` is **mandatory** while the sandbox is enabled (that
+is, while `EXECUTOR_URL` is set, which it is by default). The shipped
+`docker-compose.yml` sets it from `PDC_BACKEND_SUBNET`, so an unmodified
+install complies. A compose file without that line, or with a value that is
+not a valid network, makes the web container refuse to start:
+`docker logs pdc-client` shows `EXECUTOR_CIDR_UNSET` and the container exits.
 
 ### Connecting your own databases (optional)
 
