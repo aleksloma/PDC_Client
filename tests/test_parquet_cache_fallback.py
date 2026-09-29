@@ -125,7 +125,7 @@ def test_pickle_failure_keeps_abort_semantics(tmp_path, monkeypatch):
 
 def test_clone_carries_parquet_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(local_store.settings, "DATA_ROOT", str(tmp_path))
-    us = local_store.UserStore("s_clonecache")
+    us = local_store.UserStore("s_0000000000000c02")
     (us.files_dir / "d.csv").write_text("a,b\n1,2\n", encoding="utf-8")
     us.load_dataframes()  # populates .parquet_cache
     assert (us.files_dir / ".parquet_cache").is_dir()

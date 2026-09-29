@@ -45,7 +45,7 @@ def client(tmp_path, monkeypatch):
     @app.post("/_login/{email}")
     async def _login(request: Request, email: str):
         request.session["email"] = email
-        request.session["sid"] = "s_rolegate"
+        request.session["sid"] = "s_0000000000000b01"
         request.session.pop("must_change_password", None)
         return {"ok": True}
 

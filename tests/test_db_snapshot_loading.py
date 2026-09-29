@@ -234,7 +234,7 @@ def test_schema_docs_db_extras_and_file_shape_unchanged():
 
 def test_clone_carries_db_entries():
     _write_snapshot(TID, pd.DataFrame({"a": [1]}))
-    user = local_store.UserStore("s_dbclone")
+    user = local_store.UserStore("s_0000000000000d02")
     meta = user.read_meta()
     meta["files"] = [_db_entry("t", TID)]
     user.write_meta(meta)

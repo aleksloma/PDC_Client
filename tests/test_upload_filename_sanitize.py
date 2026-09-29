@@ -28,7 +28,7 @@ from settings import settings
 
 _ROOT = Path(__file__).resolve().parent.parent
 OWNER = "user@x.com"
-SID = "s_sanitize"
+SID = "s_0000000000000a02"
 CHAT = "chatsanitize1"
 CSV = b"a,b\n1,2\n"
 GEORGIAN = "გაყიდვები 2026.xlsx"

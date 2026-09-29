@@ -50,7 +50,7 @@ def client(tmp_path, monkeypatch):
     @app.post("/_login/{email}")
     async def _login(request: Request, email: str):
         request.session["email"] = email
-        request.session["sid"] = "s_dbflow"
+        request.session["sid"] = "s_0000000000000d01"
         return {"ok": True}
 
     tc = TestClient(app)
@@ -108,7 +108,7 @@ def test_session_db_tables_freezes_connector_closure(client, registry):
     assert set(keys) == {"clients information", "cities dictionary"}
     assert keys["cities dictionary"]["auto_included"] is True
     # Frozen into session meta.
-    meta = local_store.UserStore("s_dbflow").read_meta()
+    meta = local_store.UserStore("s_0000000000000d01").read_meta()
     entries = local_store.db_entries_from_meta(meta)
     assert {e["file_name"] for e in entries} == {"clients information",
                                                 "cities dictionary"}
@@ -140,7 +140,7 @@ def test_upload_preserves_db_entries_across_reset(client, registry):
     r = client.post("/upload",
                     files=[("files", ("data.csv", io.BytesIO(b"a,b\n1,2\n"), "text/csv"))])
     assert r.status_code == 200
-    meta = local_store.UserStore("s_dbflow").read_meta()
+    meta = local_store.UserStore("s_0000000000000d01").read_meta()
     keys = [e.get("file_name") for e in meta["files"]]
     assert "data.csv" in keys and "transactions" in keys
     assert meta["db_table_ids"] == [registry["tr_data"]]
@@ -170,7 +170,7 @@ def test_autofill_skips_db_entries(client, registry):
     r = client.post("/schema_autofill_full")
     assert r.status_code == 200          # DB-only session: ok, nothing to fill
     assert client._autofill_calls == []  # brain never called for DB tables
-    meta = local_store.UserStore("s_dbflow").read_meta()
+    meta = local_store.UserStore("s_0000000000000d01").read_meta()
     entry = [e for e in local_store.db_entries_from_meta(meta)
              if e["file_name"] == "clients information"][0]
     assert entry["file_description"] == "clients information desc"  # untouched
@@ -257,7 +257,7 @@ def test_session_db_tables_accepts_a_live_table(client, registry):
                     json={"table_ids": [registry["tr_data"]]})
     assert r.status_code == 200, r.json()
     assert {row["df_key"] for row in r.json()["tables"]} == {"transactions"}
-    meta = local_store.UserStore("s_dbflow").read_meta()
+    meta = local_store.UserStore("s_0000000000000d01").read_meta()
     entries = local_store.db_entries_from_meta(meta)
     assert [e["db"]["table_id"] for e in entries] == [registry["tr_data"]]
     assert entries[0]["file_name"] == "transactions"

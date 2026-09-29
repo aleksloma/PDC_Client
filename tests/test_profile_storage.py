@@ -49,7 +49,7 @@ def client(monkeypatch):
     @app.post("/_login/{email}")
     async def _login(request: Request, email: str):
         request.session["email"] = email
-        request.session["sid"] = "s_prof"
+        request.session["sid"] = "s_0000000000000a01"
         return {"ok": True}
 
     tc = TestClient(app)
@@ -61,7 +61,7 @@ def test_autofill_writes_profile_sidecar(client):
     client.post("/upload", files=[("files", ("link.csv", io.BytesIO(CSV), "text/csv"))])
     r = client.post("/schema_autofill_full")
     assert r.status_code == 200
-    store = local_store.UserStore("s_prof")
+    store = local_store.UserStore("s_0000000000000a01")
     ppath = local_store.profile_path_for_file(store.files_dir, "link.csv")
     assert ppath.is_file()
     prof = json.loads(ppath.read_text(encoding="utf-8"))
@@ -73,7 +73,7 @@ def test_autofill_writes_profile_sidecar(client):
 def test_clone_carries_profiles(client):
     client.post("/upload", files=[("files", ("link.csv", io.BytesIO(CSV), "text/csv"))])
     client.post("/schema_autofill_full")
-    user_store = local_store.UserStore("s_prof")
+    user_store = local_store.UserStore("s_0000000000000a01")
     chat_store = local_store.ChatDataStore("c_profclone")
     chat_store.clone_from_user_store(user_store)
     assert local_store.profile_path_for_file(chat_store.files_dir, "link.csv").is_file()

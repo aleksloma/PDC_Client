@@ -89,7 +89,7 @@ def test_inplace_df_mutation_cannot_poison_cache(store):
 def test_userstore_and_chatstore_have_distinct_keys(tmp_path, monkeypatch, load_counter):
     monkeypatch.setattr(local_store.settings, "DATA_ROOT", str(tmp_path))
     local_store._DATAFRAME_CACHE.invalidate()
-    us = local_store.UserStore("s_cachetest")
+    us = local_store.UserStore("s_0000000000000c01")
     cs = local_store.ChatDataStore("c_cachetest2")
     _write_csv(us)
     _write_csv(cs, rows=("x,y", "5,6"))

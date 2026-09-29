@@ -83,8 +83,61 @@ def _build_stamp() -> str:
     return f"started {_STARTED_AT:%Y-%m-%d %H:%M} UTC"
 
 
+def _refuse_on_weak_secret_key() -> None:
+    """Refuse to start without a real session-signing key.
+
+    SECRET_KEY signs the session cookie, and the session's `sid` names a
+    folder under DATA_ROOT: whoever knows the key can sign any session. An
+    empty value, the historical placeholder or anything shorter than
+    `SECRET_KEY_MIN_CHARS` is refused before the app serves a request. The
+    value itself is never logged.
+    """
+    import settings as settings_module
+    raw = str(getattr(settings, "SECRET_KEY", "") or "")
+    if (not raw.strip()
+            or raw == settings_module.SECRET_KEY_PLACEHOLDER
+            or len(raw) < settings_module.SECRET_KEY_MIN_CHARS):
+        log_with_sid("startup", "error",
+                     "SECRET_KEY_UNSET refusing to start: set SECRET_KEY to a random "
+                     "value of at least 32 characters "
+                     "(python -c \"import secrets; print(secrets.token_hex(32))\")")
+        raise SystemExit(1)
+
+
+def _refuse_on_missing_executor_cidr() -> None:
+    """Refuse to start when the sandbox is configured but its subnet is not.
+
+    `BackendNetworkGuard` refuses requests arriving from the sandbox's subnet,
+    and it can only do that when it knows the subnet. With EXECUTOR_URL set and
+    EXECUTOR_NETWORK_CIDR empty or malformed the guard would stand down
+    silently, so the app does not start at all. The value is never logged.
+    """
+    if not str(getattr(settings, "EXECUTOR_URL", "") or "").strip():
+        return
+    raw = str(getattr(settings, "EXECUTOR_NETWORK_CIDR", "") or "").strip()
+    network = None
+    if raw:
+        try:
+            network = ipaddress.ip_network(raw, strict=False)
+        except Exception as e:
+            log_with_sid("startup", "error",
+                         f"EXECUTOR_CIDR_INVALID {log_safe_text(type(e).__name__, 80)}")
+            network = None
+    if network is None:
+        log_with_sid("startup", "error",
+                     "EXECUTOR_CIDR_UNSET refusing to start: EXECUTOR_URL is set but "
+                     "EXECUTOR_NETWORK_CIDR is empty or not a valid network (compose "
+                     "feeds it from PDC_BACKEND_SUBNET; set EXECUTOR_URL empty only "
+                     "when no analysis sandbox runs)")
+        raise SystemExit(1)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Configuration checks come FIRST: a misconfigured install must not serve a
+    # single request (the executor's secret self-check is the same pattern).
+    _refuse_on_weak_secret_key()
+    _refuse_on_missing_executor_cidr()
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:

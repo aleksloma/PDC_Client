@@ -187,10 +187,15 @@ def test_a_trusted_proxy_can_present_any_address_known_limitation(monkeypatch):
     assert direct.status_code == 403, (direct.status_code, direct.text[:300])
 
 
-def test_the_setting_exists_and_defaults_to_empty():
-    """Default OFF so a single-container install behaves exactly as today."""
+def test_the_setting_exists_and_defaults_to_empty(monkeypatch):
+    """The FIELD default is empty (the guard's request-time parse treats that
+    as inert). Boot no longer accepts it while EXECUTOR_URL is set — the app's
+    lifespan refuses to start (tests/test_executor_cidr_refusal.py) — so empty
+    is only reachable with EXECUTOR_URL="" (no sandbox at all). The suite's
+    conftest sets a test value; this test reads the unset default."""
     from settings import Settings
 
+    monkeypatch.delenv("EXECUTOR_NETWORK_CIDR", raising=False)
     value = getattr(Settings(), "EXECUTOR_NETWORK_CIDR", None)   # local: no Settings repr
     assert value == ""
 

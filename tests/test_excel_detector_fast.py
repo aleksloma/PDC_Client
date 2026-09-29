@@ -185,7 +185,7 @@ def test_upload_meta_with_hidden_sheets_and_odd_keys(tmp_path, monkeypatch):
         "HiddenData": {"rows": _SIMPLE_ROWS, "state": "hidden"},
     })
     dfs = det.load_excel_sheets(path, "mix2.xlsx")
-    store = local_store.UserStore("s_hiddenmeta")
+    store = local_store.UserStore("s_0000000000000e01")
     meta = {"files": [
         {"file_name": k,
          "schema": {"fields": {c: {"description": ""} for c in df.columns}}}

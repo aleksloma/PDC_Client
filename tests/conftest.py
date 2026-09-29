@@ -41,6 +41,14 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+# The app refuses to start (its lifespan raises SystemExit) without a real
+# SECRET_KEY and, while EXECUTOR_URL is set, without a valid
+# EXECUTOR_NETWORK_CIDR. Set test values BEFORE anything imports `settings`
+# (the imports below do). `setdefault` keeps a value the environment already
+# carries, and `load_dotenv` never overrides one that is set.
+os.environ.setdefault("SECRET_KEY", "0123456789abcdef" * 4)
+os.environ.setdefault("EXECUTOR_NETWORK_CIDR", "192.168.255.240/28")
+
 import pytest  # noqa: E402
 
 # Imported HERE, at conftest MODULE scope, BEFORE any patching can happen.

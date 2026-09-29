@@ -125,6 +125,22 @@ def _data_root() -> Path:
     return root
 
 
+def _assert_inside(path: Path, root: Path) -> Path:
+    """Return `path` resolved, or raise ValueError unless it lies STRICTLY
+    inside `root` (resolved; the root itself is refused too).
+
+    Every recursive delete in this module names the directory it is allowed to
+    delete under, and asserts it here first: a path built from a value the
+    request or the disk supplied (a session id, an address, a chat folder) can
+    then never reach `rmtree` pointing anywhere else, symlinks included.
+    """
+    resolved = Path(path).resolve()
+    base = Path(root).resolve()
+    if resolved == base or not resolved.is_relative_to(base):
+        raise ValueError("path is outside the directory it may be deleted from")
+    return resolved
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1336,7 +1352,7 @@ class AuthStore:
             token_hash = rec.get("reset_token_hash")
             try:
                 if udir.exists():
-                    shutil.rmtree(udir)
+                    shutil.rmtree(_assert_inside(udir, _data_root() / "users"))
             except Exception as e:
                 ok = False
                 from exec_transport import log_safe_text
@@ -2067,6 +2083,25 @@ def sanitize_upload_filename(name: str) -> str:
 # ---------------------------------------------------------------------------
 # UserStore — per-session temp area (mirror of B2C UserStore)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Session ids
+# ---------------------------------------------------------------------------
+# Every sid is minted as "s_" + secrets.token_hex(8) (routes/auth.py
+# _start_session, routes/upload.py). It comes back from the signed session
+# cookie and names a folder under DATA_ROOT/sessions, so it gets the same
+# shape guard as a conversation id: anything else never becomes a path.
+_SID_RE = re.compile(r"^s_[0-9a-f]{16}$")
+
+
+class InvalidSessionId(ValueError):
+    """A session id that is not the canonical `s_<16 lowercase hex>` shape."""
+
+
+def valid_sid(value) -> bool:
+    """True only for a canonical `s_<16 lowercase hex>` session id."""
+    return bool(isinstance(value, str) and _SID_RE.fullmatch(value))
+
+
 class UserStore:
     """Per-session temporary workspace.
 
@@ -2076,6 +2111,11 @@ class UserStore:
     """
 
     def __init__(self, sid: str):
+        if not valid_sid(sid):
+            from exec_transport import log_safe_text
+            log_with_sid("session", "warning",
+                         f"SID_INVALID sid={log_safe_text(str(sid), 40)}")
+            raise InvalidSessionId("invalid session id")
         self.sid = sid
         self.root = _data_root() / "sessions" / sid
         self.files_dir = self.root / "files"
@@ -2089,8 +2129,13 @@ class UserStore:
             self.meta_path.write_text(json.dumps({"files": []}, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def reset_all(self):
-        if self.root.exists():
-            shutil.rmtree(self.root, ignore_errors=True)
+        try:
+            target = _assert_inside(self.root, _data_root() / "sessions")
+        except ValueError:
+            log_with_sid("session", "error", "SESSION_RESET_REFUSED reason=outside_sessions")
+            raise InvalidSessionId("session folder is outside DATA_ROOT/sessions")
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
         self._ensure_layout()
 
     def save_upload(self, filename: str, content: bytes) -> Path:
@@ -2479,7 +2524,7 @@ def delete_chats_owned_by(email: str) -> int:
             owner = get_chat_meta_owner(chat_dir.name)
             if str(owner or "").strip().lower() != target:
                 continue
-            shutil.rmtree(chat_dir)
+            shutil.rmtree(_assert_inside(chat_dir, root))
             deleted += 1
         except Exception as e:
             log_with_sid("auth", "warning",

@@ -56,10 +56,18 @@ def _float_env(name: str, default: float, minimum: float) -> float:
     return max(value, minimum)
 
 
+# The session-signing key has NO usable default. The placeholder below is what
+# an unset variable reads as, so `import settings` never fails; the app's
+# lifespan refuses to start while SECRET_KEY is empty, equals the placeholder
+# or is shorter than SECRET_KEY_MIN_CHARS (app._refuse_on_weak_secret_key).
+SECRET_KEY_PLACEHOLDER = "replace-me-in-prod"
+SECRET_KEY_MIN_CHARS = 32
+
+
 class Settings(BaseModel):
     DATA_ROOT: str = Field(default_factory=lambda: os.getenv("DATA_ROOT", "./client_data"))
     MAX_FILES: int = Field(default_factory=lambda: int(os.getenv("MAX_FILES", "5")))
-    SECRET_KEY: str = Field(default_factory=lambda: os.getenv("SECRET_KEY", "replace-me-in-prod"))
+    SECRET_KEY: str = Field(default_factory=lambda: os.getenv("SECRET_KEY", SECRET_KEY_PLACEHOLDER))
 
     # Build identity — baked in as Docker build args (see the Dockerfile).
     # Empty on an unstamped build; the app then reports its start time.
@@ -177,8 +185,10 @@ class Settings(BaseModel):
     # same variable feeds the network's ipam block, so the two can never
     # disagree). A Docker network is bidirectional and the sandbox runs
     # untrusted code, so any request whose peer address falls inside this range
-    # is refused — the sandbox never needs to call this app. EMPTY (the
-    # default) means no refusal: a single-container dev run has no such network.
+    # is refused — the sandbox never needs to call this app. The app REFUSES TO
+    # START while EXECUTOR_URL is set and this is empty or malformed
+    # (app._refuse_on_missing_executor_cidr); only a run with EXECUTOR_URL=""
+    # (no sandbox at all) may leave it empty.
     EXECUTOR_NETWORK_CIDR: str = Field(default_factory=lambda: os.getenv("EXECUTOR_NETWORK_CIDR", ""))
 
     # Third-party browser scripts on the /lab page (Google Analytics, the

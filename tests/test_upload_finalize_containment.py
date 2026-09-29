@@ -28,7 +28,7 @@ import local_store
 from settings import settings
 
 OWNER = "user@x.com"
-SID = "s_finalizecontain"
+SID = "s_0000000000000a03"
 CSV = b"a,b\n1,2\n3,4\n"
 
 

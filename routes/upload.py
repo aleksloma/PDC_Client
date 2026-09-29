@@ -30,8 +30,10 @@ import gcs_upload
 import local_store
 from brain_client import BrainError, TenantRevokedError
 from local_store import (AuthStore, UserStore, ChatDataStore,
-                         db_entries_from_meta, merge_schema_entry, unique_df_key)
+                         db_entries_from_meta, merge_schema_entry, unique_df_key,
+                         valid_sid)
 from excel_table_detector import _EXTRACTED_TEXT_ABOVE_TABLE
+from exec_transport import log_safe_text
 from logger_utils import log_with_sid
 from routes.chat import _EXEC
 from settings import settings
@@ -45,8 +47,21 @@ router = APIRouter(tags=["upload"])
 
 
 def _require_session(request: Request) -> tuple[Optional[str], Optional[str]]:
-    """Return (email, sid). Either may be None on auth failure."""
-    return request.session.get("email"), request.session.get("sid")
+    """Return (email, sid). Either may be None on auth failure.
+
+    A sid that is present but not the canonical `s_<16 hex>` shape is a
+    forged or corrupted cookie: the session is cleared (the middleware then
+    sends the clearing cookie) and (None, None) is returned, so every caller
+    answers its ordinary 401. A missing sid stays None — the upload routes
+    issue one.
+    """
+    email, sid = request.session.get("email"), request.session.get("sid")
+    if sid is not None and not valid_sid(sid):
+        log_with_sid("session", "warning",
+                     f"SESSION_SID_INVALID sid={log_safe_text(str(sid), 40)}")
+        request.session.clear()
+        return None, None
+    return email, sid
 
 
 def _session_or_issue(request: Request) -> tuple[Optional[str], Optional[str]]:
@@ -81,7 +96,13 @@ async def new_session(request: Request):
     # write): these syscalls block every concurrent request on slow storage
     # (each one is a network RPC on the GCS-fuse-mounted demo volume).
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(_EXEC, lambda: UserStore(new_sid).reset_all())
+    try:
+        await loop.run_in_executor(_EXEC, lambda: UserStore(new_sid).reset_all())
+    except local_store.InvalidSessionId:
+        # Logged by the store (SESSION_RESET_REFUSED); the folder resolved
+        # outside DATA_ROOT/sessions, so nothing was deleted.
+        request.session.clear()
+        return JSONResponse({"error": "Session invalid"}, status_code=401)
     log_with_sid(email, "info", "NEW_SESSION_RESET", sid=new_sid)
     return {"ok": True}
 
@@ -114,7 +135,12 @@ async def upload(request: Request, files: List[UploadFile] = File(...), file_des
     prior_meta = store.read_meta()
     preserved_db = db_entries_from_meta(prior_meta)
     preserved_db_ids = prior_meta.get("db_table_ids") or []
-    store.reset_all()  # Fresh temp area for this upload batch (matches B2C)
+    try:
+        store.reset_all()  # Fresh temp area for this upload batch (matches B2C)
+    except local_store.InvalidSessionId:
+        # Logged by the store (SESSION_RESET_REFUSED); nothing was deleted.
+        request.session.clear()
+        return JSONResponse({"error": "Session invalid"}, status_code=401)
 
     saved = []
     try:
@@ -1115,7 +1141,9 @@ async def add_data_to_chat(request: Request):
     email, err = _require_chat_owner(request, chat_id)
     if err:
         return err
-    sid = request.session.get("sid")
+    _, sid = _require_session(request)
+    if sid is None and request.session.get("email") is None:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
     if not sid:
         return JSONResponse({"error": "No upload session. Upload files first."}, status_code=400)
 

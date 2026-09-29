@@ -43,7 +43,7 @@ def client(tmp_path, monkeypatch):
     @app.post("/_login/{email}")
     async def _login(request: Request, email: str):
         request.session["email"] = email
-        request.session["sid"] = "s_badcsv"
+        request.session["sid"] = "s_0000000000000a04"
         return {"ok": True}
 
     tc = TestClient(app)
@@ -104,7 +104,7 @@ def test_clean_files_keep_ok_true_with_per_file_ok(client):
 
 def test_post_upload_load_matches_upload_row_count(client, tmp_path):
     _upload(client, [("hr.csv", RAGGED_CSV)])
-    dfs = local_store.UserStore("s_badcsv").load_dataframes(include_db=False)
+    dfs = local_store.UserStore("s_0000000000000a04").load_dataframes(include_db=False)
     # 3 data lines, 1 skipped → 2 rows, consistently on every later load
     assert len(dfs["hr.csv"]) == 2
 

@@ -31,7 +31,7 @@ from settings import settings
 
 _ROOT = Path(__file__).resolve().parent.parent
 OWNER = "user@x.com"
-SID = "s_directgcs"
+SID = "s_0000000000000a05"
 CSV = b"a,b\n1,2\n3,4\n"
 STUB_BODIES = {
     "/upload/init": "Direct-to-GCS upload is not available in the on-prem build. "

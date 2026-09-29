@@ -67,7 +67,8 @@ from pathlib import Path as _P
 import auth_limiter
 import password_utils
 from exec_transport import log_safe_text
-from local_store import SESSION_GEN_REMOVED, AccountMissing, AuthStore, reset_record_live
+from local_store import (SESSION_GEN_REMOVED, AccountMissing, AuthStore, reset_record_live,
+                         valid_sid)
 from logger_utils import log_with_sid
 from settings import settings
 import brain_client
@@ -309,7 +310,9 @@ def _start_session(request: Request, email: str, *, remember: bool,
     else:
         request.session.pop("must_change_password", None)
     # Issue a per-session SID for the temp UserStore (the upload flow keys off it)
-    if not request.session.get("sid"):
+    # A sid that is not the canonical shape is re-minted here rather than
+    # refused later by the upload routes (which would force a second sign-in).
+    if not valid_sid(request.session.get("sid")):
         request.session["sid"] = "s_" + secrets.token_hex(8)
     # The account's current generation (a later password change or reset
     # ends this session) and the sign-in time (the absolute lifetime starts

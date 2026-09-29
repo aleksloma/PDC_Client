@@ -22,7 +22,8 @@ from typing import Optional
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from local_store import UserStore
+from exec_transport import log_safe_text
+from local_store import UserStore, valid_sid
 from logger_utils import log_with_sid
 from routes.chat import _EXEC
 from settings import settings
@@ -31,8 +32,15 @@ router = APIRouter(tags=["schema"])
 
 
 def _require_session(request: Request):
+    """(email, sid), or (None, None) → the caller answers 401. A sid that is
+    not the canonical shape clears the session first (forged/corrupt cookie)."""
     email = request.session.get("email")
     sid = request.session.get("sid")
+    if sid is not None and not valid_sid(sid):
+        log_with_sid("session", "warning",
+                     f"SESSION_SID_INVALID sid={log_safe_text(str(sid), 40)}")
+        request.session.clear()
+        return None, None
     if not email or not sid:
         return None, None
     return email, sid
