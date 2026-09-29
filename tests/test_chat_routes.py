@@ -767,6 +767,49 @@ def test_stream_registers_a_partial_code_before_the_turn_is_persisted(client, mo
     assert CHAT not in chat_mod._INFLIGHT_CODES, chat_mod._INFLIGHT_CODES.get(CHAT)
 
 
+def test_each_live_chart_carries_a_reference_and_one_failure_disables_only_that_chart(
+        client, monkeypatch):
+    """The PNG export takes a reference, never markup. Every streamed chart is
+    registered as it is sent; if one registration fails, that chart alone has
+    no reference (its Download button is disabled) and the turn completes."""
+    import json as _json
+    import plotly.graph_objects as go
+    import routes.chat as chat_mod
+    import routes.report as report_mod
+
+    def gen(**kw):
+        for n in (1, 2, 3):
+            yield {"partial": True, "image_base64": f"<div>plotly chart {n}</div>",
+                   "answer": f"a{n}", "code": INFLIGHT_CODE, "chart_n": n,
+                   "chart_total": 3, "usage": {}}
+        yield {"done": True, "combined_answer": "a", "combined_codes": [INFLIGHT_CODE],
+               "total_usage": {}}
+
+    original = report_mod._is_plotly_html
+    calls = {"n": 0}
+
+    def flaky(html):
+        if "chart 2" in str(html):
+            calls["n"] += 1
+            raise RuntimeError("registry unavailable")
+        return original(html)
+
+    monkeypatch.setattr(report_mod, "_is_plotly_html", flaky)
+    monkeypatch.setattr(chat_mod.run_chat_local, "run_chat_multi_plot", lambda **kw: gen(**kw))
+    r = client.post(f"/api/chat/{CHAT}/chat/stream", json={"question": "charts"})
+    assert r.status_code == 200, r.text[:300]
+    events = [_json.loads(line[6:]) for line in r.text.splitlines() if line.startswith("data: ")]
+    partials = [e for e in events if e.get("partial")]
+    assert [bool(e.get("chart_ref")) for e in partials] == [True, False, True], partials
+    assert any(e.get("done") for e in events)
+    assert calls["n"] >= 1
+    monkeypatch.setattr(go.Figure, "to_image", lambda self, **k: b"\x89PNG")
+    monkeypatch.setattr(report_mod, "_plotly_html_to_png", lambda html, sid: b"\x89PNG" + html.encode())
+    ok = client.post(f"/api/chat/{CHAT}/export_plotly_png",
+                     json={"chart_ref": partials[2]["chart_ref"]})
+    assert ok.status_code == 200 and b"chart 3" in ok.content, ok.text[:200]
+
+
 def test_edit_regenerate_registers_its_codes_until_the_record_is_written(
         client, world, monkeypatch):
     """Edit-regenerate consumes the whole run first, then persists; its codes

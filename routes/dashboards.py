@@ -18,10 +18,11 @@ render.
 """
 from __future__ import annotations
 
+import asyncio
 import secrets
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 import html_sanitize
 import local_store
@@ -29,11 +30,12 @@ import brain_client
 from brain_client import TenantRevokedError, BrainError
 from exec_transport import log_safe_text
 from logger_utils import log_with_sid
-from routes.chat import (_FULL_KEY_RE, _code_not_stored, _json_safe,
-                         _load_full_table_record, _persist_full_table,
+from routes.chat import (_EXEC as _CHAT_EXEC, _FULL_KEY_RE, _code_not_stored,
+                         _json_safe, _load_full_table_record, _persist_full_table,
                          _persistable_chart_data, _reexecute_full_df,
-                         _refresh_role_gate, _require_chat,
-                         code_is_stored_async, run_item_refresh)
+                         _refresh_role_gate, _require_chat, _safe_filename,
+                         code_is_stored_async, run_item_refresh,
+                         stored_chart_for_code)
 
 router = APIRouter(prefix="/api/dashboards", tags=["client-dashboards"])
 
@@ -484,6 +486,59 @@ async def update_layout(request: Request, dash_id: str):
     return {"ok": bool(ok)}
 
 
+@router.post("/{dash_id}/tiles/{tile_id}/export_png")
+async def export_tile_png(request: Request, dash_id: str, tile_id: str):
+    """PNG of a chart tile, for the owner and shared recipients.
+
+    The renderer (kaleido's Chromium in the web container) only ever sees
+    chart markup the server produced: a snapshot written by the tile refresh
+    (`server_rendered`), else the source chat's stored chart for the tile's
+    code. A snapshot the browser posted at pin time is never rendered.
+    Body: {filename?}."""
+    email, err = _require_email(request)
+    if err:
+        return err
+    doc, _is_owner = _dash_store.resolve_dashboard(email, dash_id)
+    if doc is None:
+        return JSONResponse({"error": "Dashboard not found"}, status_code=404)
+    tile = next((t for t in (doc.get("tiles") or []) if t.get("tile_id") == tile_id), None)
+    if tile is None or (tile.get("kind") or "chart").lower() != "chart":
+        return JSONResponse({"error": "Tile not found"}, status_code=404)
+    chat_id = str(tile.get("chat_id") or "")
+    if not chat_id or not local_store.chat_exists(chat_id):
+        return JSONResponse({"error": "The source chat of this tile no longer exists."},
+                            status_code=404)
+    _, chat_err = _require_chat(request, chat_id)
+    if chat_err:
+        return chat_err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    filename = _safe_filename(body.get("filename") or "chart", "chart")
+    snap = tile.get("snapshot") if isinstance(tile.get("snapshot"), dict) else {}
+    html = None
+    if snap.get("server_rendered") and snap.get("is_plotly"):
+        html = snap.get("image_base64")
+    if not html:
+        html = await asyncio.get_running_loop().run_in_executor(
+            _CHAT_EXEC, stored_chart_for_code, chat_id, tile.get("code"))
+    if not html:
+        return JSONResponse(
+            {"error": "This chart is not stored in its source chat; refresh the tile first."},
+            status_code=404)
+    from routes.report import _plotly_html_to_png
+    # kaleido takes seconds: off the event loop.
+    png = await asyncio.get_running_loop().run_in_executor(
+        _CHAT_EXEC, _plotly_html_to_png, html, email)
+    if not png:
+        return JSONResponse({"error": "Could not render chart image."}, status_code=502)
+    return Response(content=png, media_type="image/png",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}.png"'})
+
+
 @router.post("/{dash_id}/tiles/{tile_id}/refresh")
 async def refresh_tile(request: Request, dash_id: str, tile_id: str):
     """Re-run one tile's stored code against the source chat's current data and
@@ -586,9 +641,12 @@ async def refresh_tile(request: Request, dash_id: str, tile_id: str):
         if result.get("full_table_key"):
             patch["full_table_key"] = result["full_table_key"]
     else:
+        # `server_rendered`: this markup came from the sandbox via this route,
+        # not from a browser pin, so the PNG export may render it directly.
         patch["snapshot"] = {"image_base64": result.get("image_base64"),
                              "is_plotly": bool(result.get("is_plotly")),
-                             "rendered_at": now}
+                             "rendered_at": now,
+                             "server_rendered": True}
         cd_key = result.get("chart_data_key")
         if isinstance(cd_key, str) and _FULL_KEY_RE.fullmatch(cd_key):
             rec = _load_full_table_record(local_store.ChatDataStore(chat_id), cd_key)

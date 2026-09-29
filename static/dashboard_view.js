@@ -446,9 +446,10 @@
       } catch (_) { /* keep default */ }
       const content = (tile.snapshot || {}).image_base64 || '';
       if (isPlotlySnapshot(tile)) {
-        const res = await pdcFetch(`/api/chat/${tile.chat_id}/export_plotly_png`, {
+        // The server renders the tile's own stored chart; no markup is sent.
+        const res = await pdcFetch(`/api/dashboards/${DASH_ID}/tiles/${tile.tile_id}/export_png`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ html: content, filename, scale: 3 }),
+          body: JSON.stringify({ filename }),
         });
         if (!res.ok) throw new Error('png export failed');
         const blob = await res.blob();

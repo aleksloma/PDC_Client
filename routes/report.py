@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse, Response
 import brain_client
 import local_store
 from brain_client import TenantRevokedError, BrainError
+from exec_transport import log_safe_text
 from logger_utils import log_with_sid
 
 # Module-level `qn` (OOXML qualified-name helper). Several helpers
@@ -50,8 +51,94 @@ def _is_plotly_html(image_b64) -> bool:
     return s.startswith("<!") or s.startswith("<div")
 
 
+# Keys whose STRING value Plotly (and the Chromium kaleido drives) would fetch:
+# layout.images[].source, an image trace's source, a map layer's source, a
+# choropleth's geojson given as a URL. A `data:` URI is kept; anything else is
+# blanked before rendering, so the renderer inside the web container (which
+# holds the secrets and has LAN egress) fetches nothing a chart named.
+_REMOTE_REF_KEYS = frozenset({"source", "src", "url", "href", "sourceurl", "geojson"})
+# Map subplots (`mapbox`, `map`, `mapbox2`, ...) load tiles from their style:
+# the style becomes the tile-less "white-bg" and the access token is dropped.
+_TILE_SUBPLOT_RE = re.compile(r"^(?:mapbox|map)\d*$")
+
+
+# Plotly's pseudo-HTML (titles, annotations, tick and legend text) copies a
+# tag's quoted `style` attribute onto the SVG text element, and Chromium
+# resolves a CSS `url(...)` there. Every style attribute inside a tag goes.
+# The prefix mirrors plotly.js's own matcher `(^|[\s"'])style\s*=`: an
+# attribute directly after a closing quote counts too.
+_PSEUDO_HTML_STYLE_RE = re.compile(r"""(<[^>]*?[\s"'])style\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)""",
+                                   re.IGNORECASE)
+
+
+def _strip_text_styles(value: str) -> str:
+    if "<" not in value:
+        return value
+    previous = None
+    while previous != value:
+        previous = value
+        value = _PSEUDO_HTML_STYLE_RE.sub(r"\1", value)
+    return value
+
+
+def _strip_remote_refs(obj, in_tiles: bool = False) -> int:
+    """Blank every URL-bearing value in a figure's data/layout, in place.
+    Walks nested dicts and lists (templates included). Returns the count.
+
+    - a string under a URL-bearing key (`_REMOTE_REF_KEYS`) that is not a
+      `data:` URI is blanked; a LIST under such a key (a map layer's list of
+      tile URLs) is emptied;
+    - inside a map subplot the style — a name, a URL or a whole style object
+      with its own sprite/glyph/tile URLs — becomes "white-bg" and the access
+      token is dropped;
+    - every pseudo-HTML `style` attribute in any text is removed."""
+    count = 0
+    if isinstance(obj, dict):
+        for key in list(obj.keys()):
+            value = obj[key]
+            name = str(key).lower()
+            if in_tiles and name == "style":
+                if value != "white-bg":
+                    obj[key] = "white-bg"
+                    count += 1
+            elif name in _REMOTE_REF_KEYS and isinstance(value, str):
+                if not value.strip().lower().startswith("data:"):
+                    obj[key] = ""
+                    count += 1
+            elif name in _REMOTE_REF_KEYS and isinstance(value, list):
+                if value:
+                    obj[key] = []
+                    count += 1
+            elif in_tiles and name == "accesstoken" and isinstance(value, str):
+                if value:
+                    obj[key] = ""
+                    count += 1
+            elif isinstance(value, str):
+                cleaned = _strip_text_styles(value)
+                if cleaned != value:
+                    obj[key] = cleaned
+                    count += 1
+            else:
+                count += _strip_remote_refs(
+                    value, in_tiles or bool(_TILE_SUBPLOT_RE.match(name)))
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            if isinstance(item, str):
+                cleaned = _strip_text_styles(item)
+                if cleaned != item:
+                    obj[i] = cleaned
+                    count += 1
+            else:
+                count += _strip_remote_refs(item, in_tiles)
+    return count
+
+
 def _plotly_html_to_png(html_str: str, sid: str) -> bytes | None:
-    """Mirror chat.py.plotly_html_to_png — local, uses kaleido. No network."""
+    """Render stored chart markup to a PNG with kaleido, locally.
+
+    Every URL-bearing value is blanked first (`_strip_remote_refs`): kaleido
+    drives a Chromium inside the web container, and a chart must not make it
+    fetch a URL or a local file."""
     try:
         import plotly.graph_objects as _go
 
@@ -106,10 +193,16 @@ def _plotly_html_to_png(html_str: str, sid: str) -> bytes | None:
             return None
         layout_end = _find_balanced_end(html_str, i)
         layout_json = json.loads(html_str[i:layout_end])
+        stripped = _strip_remote_refs(data_json) + _strip_remote_refs(layout_json)
+        if stripped:
+            log_with_sid(log_safe_text(str(sid), 254), "warning",
+                         f"PLOTLY_REMOTE_REF_STRIPPED count={int(stripped)}")
         fig = _go.Figure(data=data_json, layout=layout_json)
         return fig.to_image(format="png", width=1200, height=800, scale=2)
     except Exception as e:
-        log_with_sid(sid, "warning", f"PLOTLY_TO_PNG_FAILED: {e}")
+        # The type only: a plotly/json message can quote the chart's data.
+        log_with_sid(log_safe_text(str(sid), 254), "warning",
+                     f"PLOTLY_TO_PNG_FAILED: {log_safe_text(type(e).__name__, 80)}")
         return None
 
 

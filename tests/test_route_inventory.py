@@ -144,6 +144,7 @@ EXPECTED_ROUTES = [
     ('POST', '/api/dashboards/{dash_id}/rename'),
     ('POST', '/api/dashboards/{dash_id}/share'),
     ('POST', '/api/dashboards/{dash_id}/tiles'),
+    ('POST', '/api/dashboards/{dash_id}/tiles/{tile_id}/export_png'),
     ('POST', '/api/dashboards/{dash_id}/tiles/{tile_id}/refresh'),
     ('POST', '/api/dashboards/{dash_id}/tiles/{tile_id}/remove'),
     ('POST', '/api/dashboards/{dash_id}/tiles/{tile_id}/update'),

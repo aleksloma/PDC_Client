@@ -1873,7 +1873,7 @@ async function openConversation(chatId, convId) {
     chatMessages.innerHTML = '';
 
     let welcomeRendered = false;
-    history.forEach(msg => {
+    history.forEach((msg, rowIdx) => {
       const isAi = msg.role !== 'human';
       // Re-render the seeded welcome (first AI entry whose content matches the
       // welcome text) with its starter questions, once — matching openChat().
@@ -1897,7 +1897,8 @@ async function openConversation(chatId, convId) {
         msg.images.forEach((img, idx) => {
           const code = img.code || legacySegs[idx] || null;
           appendMessage('assistant', img.answer || '', img.image_base64, null, null,
-            { code: code, chartData: img.chart_data || null });
+            { code: code, chartData: img.chart_data || null,
+              chartRef: { conv_id: convId, ai_index: rowIdx, image_index: idx } });
         });
         // Mixed dashboard record: the tables ride after the charts.
         if (msg.tables && msg.tables.length) {
@@ -1910,7 +1911,8 @@ async function openConversation(chatId, convId) {
         // Multi-table records carry msg.tables (+ per-table full keys).
         appendMessage(msg.role === 'human' ? 'user' : 'assistant', msg.content, msg.image_base64, msg.table, msg.full_table_key,
           msg.role === 'human' ? null : { code: msg.code, chartData: msg.chart_data || null,
-            tables: msg.tables || null, fullTableKeys: msg.full_table_keys || null });
+            tables: msg.tables || null, fullTableKeys: msg.full_table_keys || null,
+            chartRef: { conv_id: convId, ai_index: rowIdx, image_index: 0 } });
       }
     });
 
@@ -2246,7 +2248,7 @@ async function _refreshChart(container, bar, code, extras) {
   const isHtml = newContent.trim().startsWith('<');
   const img = container.querySelector('img');
   if (isHtml && typeof container._setChartHtml === 'function') {
-    container._setChartHtml(newContent);
+    container._setChartHtml(newContent, data.chart_ref ? { chart_ref: data.chart_ref } : null);
   } else if (!isHtml && img) {
     img.src = 'data:image/png;base64,' + newContent;
   } else {
@@ -2348,7 +2350,10 @@ function appendMessage(role, content, imageBase64, table, fullTableKey, extras) 
   if (imageBase64) {
     // Check if it's interactive HTML (Plotly) or base64 image
     if (imageBase64.trim().startsWith('<') && imageBase64.includes('plotly')) {
-      chartContainer = createPlotlyContainer(imageBase64, currentChatId, content || '');
+      // extras.chartRef: {chart_ref} from a live response, or the stored
+      // row's {conv_id, ai_index, image_index} after a reload.
+      chartContainer = createPlotlyContainer(imageBase64, currentChatId, content || '',
+        (extras && extras.chartRef) || null);
     } else {
       // It's a base64 image (matplotlib/seaborn)
       chartContainer = createImageWithFullscreen(imageBase64, content || '');
@@ -2525,12 +2530,26 @@ function createImageWithFullscreen(base64Data, messageContext = '') {
   return container;
 }
 
+// A chart reference for the PNG export, or null: {chart_ref} (a chart the
+// server just sent) or {conv_id, ai_index, image_index} (a stored row).
+function _validChartRef(ref) {
+  if (!ref || typeof ref !== 'object') return null;
+  if (typeof ref.chart_ref === 'string' && ref.chart_ref) return { chart_ref: ref.chart_ref };
+  if (typeof ref.conv_id === 'string' && ref.conv_id && Number.isInteger(ref.ai_index)) {
+    return { conv_id: ref.conv_id, ai_index: ref.ai_index,
+             image_index: Number.isInteger(ref.image_index) ? ref.image_index : 0 };
+  }
+  return null;
+}
+
 // Renders a Plotly interactive chart inside an iframe and adds
-// [View Larger] + [Download] buttons. The Download button posts the raw
-// Plotly HTML to /export_plotly_png and saves the returned high-res PNG.
-// NOTE: chat.js has a parallel copy of this function with the same signature.
-// Keep them in sync.
-function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
+// [View Larger] + [Download] buttons. The Download button sends a REFERENCE
+// to the chart (never its markup) to /export_plotly_png: `chartRef` is either
+// {chart_ref} (a chart the server just sent) or {conv_id, ai_index,
+// image_index} (a chart stored in the conversation). Without one the button
+// is disabled — only for this chart.
+// NOTE: chat.js has an older parallel copy that no template loads.
+function createPlotlyContainer(htmlString, chatIdRef, messageContext = '', chartRef = null) {
   // Mutable holder so the per-chart Refresh button can swap the chart in place;
   // View Larger and Download always use the CURRENT html. Persisted chart HTML
   // may reference cdn.plot.ly (pre-offline-fix records) — rewrite it to the
@@ -2550,10 +2569,16 @@ function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
   PDCViewers.setChartFrame(iframe, currentHtml);
   plotlyContainer.appendChild(iframe);
 
-  // Used by the per-chart Refresh button to update the chart in place.
-  plotlyContainer._setChartHtml = (h) => {
+  // The server-side reference the PNG export uses (see above).
+  let currentRef = _validChartRef(chartRef);
+
+  // Used by the per-chart Refresh button to update the chart in place; the
+  // refreshed chart comes with its own reference (none ⇒ Download disabled).
+  plotlyContainer._setChartHtml = (h, newRef) => {
     currentHtml = PDCViewers.fixPlotlyOffline(h);
     PDCViewers.setChartFrame(iframe, currentHtml);
+    currentRef = _validChartRef(newRef);
+    _syncDownloadState();
   };
   // The chart's own HTML (what a pin stores) — never the frame's wrapped
   // document.
@@ -2599,9 +2624,17 @@ function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
   const downloadBtn = document.createElement('button');
   downloadBtn.className = 'ghost';
   downloadBtn.innerHTML = '📥 Download';
-  downloadBtn.title = 'Download high-resolution PNG';
   downloadBtn.style.cssText = 'padding: 6px 12px; font-size: 13px;';
+  // Disabled (only this chart) when the server gave no reference for it.
+  function _syncDownloadState() {
+    downloadBtn.disabled = !currentRef;
+    downloadBtn.title = currentRef
+      ? 'Download high-resolution PNG'
+      : 'Download is unavailable for this chart. Reload the conversation to enable it.';
+  }
+  _syncDownloadState();
   downloadBtn.addEventListener('click', async () => {
+    if (!currentRef) return;
     const originalLabel = downloadBtn.innerHTML;
     try {
       downloadBtn.disabled = true;
@@ -2621,7 +2654,7 @@ function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
       const res = await pdcFetch(`/api/chat/${chatIdRef}/export_plotly_png`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ html: currentHtml, filename, scale: 3 })
+        body: JSON.stringify(Object.assign({ filename }, currentRef))
       });
       if (!res.ok) {
         let serverMsg = `HTTP ${res.status}`;
@@ -2647,8 +2680,8 @@ function createPlotlyContainer(htmlString, chatIdRef, messageContext = '') {
       console.error('Plotly download failed:', e);
       alert('Download failed: ' + (e && e.message ? e.message : 'unknown error'));
     } finally {
-      downloadBtn.disabled = false;
       downloadBtn.innerHTML = originalLabel;
+      _syncDownloadState();
     }
   });
 
@@ -3042,11 +3075,13 @@ async function _tryRecoverResponse(chatId, convId, loadingDiv) {
         last.images.forEach((img, idx) => {
           const code = img.code || recSegs[idx] || null;
           appendMessage('assistant', img.answer || '', img.image_base64, null, null,
-            { code: code, chartData: img.chart_data || null });
+            { code: code, chartData: img.chart_data || null,
+              chartRef: { conv_id: convId, ai_index: history.length - 1, image_index: idx } });
         });
       } else {
         appendMessage('assistant', last.content || '', last.image_base64, last.table, last.full_table_key,
-          { code: last.code });
+          { code: last.code,
+            chartRef: { conv_id: convId, ai_index: history.length - 1, image_index: 0 } });
       }
       chatMessages.scrollTop = chatMessages.scrollHeight;
       console.log(`Response recovered from saved history (attempt ${attempt + 1})`);
@@ -3212,7 +3247,8 @@ async function sendMessage() {
             // Append chart as a new assistant message
             chartCount++;
             appendMessage('assistant', data.answer || '', data.image_base64, null, null,
-              { code: data.code, chartDataKey: data.chart_data_key });
+              { code: data.code, chartDataKey: data.chart_data_key,
+                chartRef: data.chart_ref ? { chart_ref: data.chart_ref } : null });
             chatMessages.scrollTop = chatMessages.scrollHeight;
 
             // Show "Rendering chart N of M..." if more charts expected
@@ -3246,7 +3282,8 @@ async function sendMessage() {
               } else {
                 appendMessage('assistant', answer, data.image_base64, data.table, data.full_table_key,
           { code: data.code, chartDataKey: data.chart_data_key,
-            tables: data.tables || null, fullTableKeys: data.full_table_keys || null });
+            tables: data.tables || null, fullTableKeys: data.full_table_keys || null,
+            chartRef: data.chart_ref ? { chart_ref: data.chart_ref } : null });
               }
               chatMessages.scrollTop = chatMessages.scrollHeight;
             } else if (data.tables && data.tables.length) {
@@ -3317,7 +3354,8 @@ async function sendMessage() {
       } else {
         appendMessage('assistant', answer, data.image_base64, data.table, data.full_table_key,
           { code: data.code, chartDataKey: data.chart_data_key,
-            tables: data.tables || null, fullTableKeys: data.full_table_keys || null });
+            tables: data.tables || null, fullTableKeys: data.full_table_keys || null,
+            chartRef: data.chart_ref ? { chart_ref: data.chart_ref } : null });
       }
       chatMessages.scrollTop = chatMessages.scrollHeight;
 
@@ -3538,7 +3576,8 @@ async function editAndRegenerate(messageDiv, editedQuestion) {
     } else {
       appendMessage('assistant', answer, data.image_base64, data.table, data.full_table_key,
         { code: data.code, chartDataKey: data.chart_data_key,
-          tables: data.tables || null, fullTableKeys: data.full_table_keys || null });
+          tables: data.tables || null, fullTableKeys: data.full_table_keys || null,
+          chartRef: data.chart_ref ? { chart_ref: data.chart_ref } : null });
     }
     chatMessages.scrollTop = chatMessages.scrollHeight;
 

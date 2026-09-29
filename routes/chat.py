@@ -22,6 +22,7 @@ import re
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, File, Request, UploadFile
@@ -53,6 +54,125 @@ def _cache_full_table(table: dict) -> str:
         old = _FULL_TABLE_ORDER.pop(0)
         _FULL_TABLE_CACHE.pop(old, None)
     return key
+
+
+# Chart references for the PNG export. The export renders chart markup with
+# kaleido/Chromium inside the web container, so it never takes markup from the
+# request: only a chart THIS SERVER produced. Every chart the server sends to
+# the browser (stream partials, the single-shot answer, edit-regenerate, a
+# refresh) is registered here under a random `chart_ref`, bound to the user and
+# the chat; after a reload the browser names the stored history row instead
+# (`_stored_chart_html`). In memory, per process (correct under --workers 1),
+# bounded by age, count and total size. A registration failure only leaves
+# that one chart without a reference (its Download button is disabled).
+_CHART_REFS: "OrderedDict[str, tuple]" = OrderedDict()
+_CHART_REF_LOCK = threading.Lock()
+_CHART_REF_TTL_S = 1800
+_CHART_REF_MAX = 256
+_CHART_REF_MAX_BYTES = 200_000_000
+_CHART_REF_TOTAL = {"bytes": 0}
+_CHART_REF_RE = re.compile(r"[0-9a-f]{32}")
+# One warning per process when a browser still posts chart markup.
+_EXPORT_LEGACY_LOGGED = {"logged": False}
+
+
+def _chart_ref_for(email, chat_id, html) -> str | None:
+    """Register a server-produced Plotly chart; its reference, or None."""
+    try:
+        from routes.report import _is_plotly_html
+        if not isinstance(html, str) or not _is_plotly_html(html):
+            return None
+        ref = secrets.token_hex(16)
+        size = len(html)
+        now = time.monotonic()
+        with _CHART_REF_LOCK:
+            _CHART_REFS[ref] = (str(email or "").strip().lower(), str(chat_id), html, now, size)
+            _CHART_REF_TOTAL["bytes"] += size
+            while _CHART_REFS:
+                oldest_ref, oldest = next(iter(_CHART_REFS.items()))
+                if (oldest_ref != ref
+                        and (now - oldest[3] > _CHART_REF_TTL_S
+                             or len(_CHART_REFS) > _CHART_REF_MAX
+                             or _CHART_REF_TOTAL["bytes"] > _CHART_REF_MAX_BYTES)):
+                    _CHART_REFS.popitem(last=False)
+                    _CHART_REF_TOTAL["bytes"] -= oldest[4]
+                    continue
+                break
+        return ref
+    except Exception as e:
+        log_with_sid(log_safe_text(str(email or "chat"), 254), "warning",
+                     f"CHART_REF_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return None
+
+
+def _chart_by_ref(email, chat_id, ref) -> str | None:
+    """The chart registered under `ref` for this user and chat, or None."""
+    if not isinstance(ref, str) or not _CHART_REF_RE.fullmatch(ref):
+        return None
+    with _CHART_REF_LOCK:
+        entry = _CHART_REFS.get(ref)
+    if not entry:
+        return None
+    owner, ref_chat, html, created, _size = entry
+    if (owner != str(email or "").strip().lower() or ref_chat != str(chat_id)
+            or time.monotonic() - created > _CHART_REF_TTL_S):
+        return None
+    return html
+
+
+def _with_chart_refs(out: dict, email, chat_id) -> dict:
+    """A copy of a response dict whose charts carry a `chart_ref`: the
+    top-level `image_base64`, and every entry of an `images` list (copied —
+    those dicts may be the persisted history row's)."""
+    if not isinstance(out, dict):
+        return out
+    out = dict(out)
+    if out.get("image_base64"):
+        out["chart_ref"] = _chart_ref_for(email, chat_id, out.get("image_base64"))
+    imgs = out.get("images")
+    if isinstance(imgs, list):
+        stamped = []
+        for img in imgs:
+            if isinstance(img, dict) and img.get("image_base64"):
+                img = dict(img)
+                img["chart_ref"] = _chart_ref_for(email, chat_id, img.get("image_base64"))
+            stamped.append(img)
+        out["images"] = stamped
+    return out
+
+
+def _stored_chart_html(chat_id: str, conv_id, ai_index, image_index) -> str | None:
+    """The Plotly chart stored in a conversation row, or None. `ai_index` is
+    the row's position in the history the conversation route serves (that
+    route never drops or reorders rows); `image_index` picks one chart of a
+    multi-chart row (0 for a single-chart row)."""
+    try:
+        if not local_store.valid_conv_id(conv_id):
+            return None
+        if (isinstance(ai_index, bool) or not isinstance(ai_index, int)
+                or isinstance(image_index, bool) or not isinstance(image_index, int)):
+            return None
+        rows = local_store.ChatDataStore(chat_id).get_history(conv_id)
+        if not (0 <= ai_index < len(rows)):
+            return None
+        row = rows[ai_index]
+        if not isinstance(row, dict) or row.get("role") != "ai":
+            return None
+        imgs = row.get("images")
+        if isinstance(imgs, list) and imgs:
+            if not (0 <= image_index < len(imgs)) or not isinstance(imgs[image_index], dict):
+                return None
+            html = imgs[image_index].get("image_base64")
+        elif image_index == 0:
+            html = row.get("image_base64")
+        else:
+            return None
+        from routes.report import _is_plotly_html
+        return html if isinstance(html, str) and _is_plotly_html(html) else None
+    except Exception as e:
+        log_with_sid(chat_id, "warning",
+                     f"STORED_CHART_LOOKUP_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return None
 
 
 # Durable full-table persistence (port of the B2C `download_full_excel`
@@ -805,6 +925,60 @@ async def code_is_stored_async(chat_id: str, code) -> bool:
     """`code_is_stored` on the worker pool, like the frame load."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_EXEC, code_is_stored, chat_id, code)
+
+
+def stored_chart_for_code(chat_id: str, code) -> str | None:
+    """The Plotly chart a stored AI row of this chat rendered from `code`, or
+    None. A multi-chart row matches per chart (its own `code`, else the
+    matching segment of the legacy joined code). Used by the dashboard tile
+    export for a snapshot the browser posted at pin time: the PNG renderer
+    only ever sees chart markup the server itself produced. Blocking file I/O;
+    never raises."""
+    try:
+        from routes.report import _is_plotly_html
+        wanted = _normalize_code(code)
+        if not wanted:
+            return None
+        conv_dir = local_store._data_root() / "chatdata" / chat_id / "conversations"
+        if not conv_dir.is_dir():
+            return None
+        for path in sorted(conv_dir.glob("*.jsonl")):
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except Exception as e:
+                log_with_sid(chat_id, "warning",
+                             f"CHART_LOOKUP_READ_FAILED {log_safe_text(type(e).__name__, 80)}")
+                continue
+            for line in lines:
+                if '"image_base64"' not in line or '"code"' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(row, dict) or row.get("role") != "ai":
+                    continue
+                imgs = row.get("images")
+                if isinstance(imgs, list) and imgs:
+                    legacy = [s for s in str(row.get("code") or "").split("###NEXT_PLOT###")]
+                    for idx, img in enumerate(imgs):
+                        if not isinstance(img, dict):
+                            continue
+                        own = img.get("code") or (legacy[idx] if idx < len(legacy) else None)
+                        html = img.get("image_base64")
+                        if (_normalize_code(own) == wanted and isinstance(html, str)
+                                and _is_plotly_html(html)):
+                            return html
+                else:
+                    html = row.get("image_base64")
+                    if (wanted in _code_segments(row.get("code")) and isinstance(html, str)
+                            and _is_plotly_html(html)):
+                        return html
+        return None
+    except Exception as e:
+        log_with_sid(chat_id, "error",
+                     f"CHART_LOOKUP_FAILED {log_safe_text(type(e).__name__, 80)}")
+        return None
 
 
 def _code_not_stored(status_code: int) -> JSONResponse:
@@ -1685,6 +1859,9 @@ async def chat_stream(request: Request, chat_id: str):
                         "code": ev.get("code"),
                         "chart_data_key": chart_data_key,
                         "tokens": ev.get("usage") or {},
+                        # The PNG export's reference to THIS chart (the
+                        # export never takes chart markup from the browser).
+                        "chart_ref": _chart_ref_for(email, chat_id, img),
                     }
                     yield f"data: {json.dumps(_json_safe(partial_payload), ensure_ascii=False)}\n\n"
                     if img:
@@ -1748,6 +1925,7 @@ async def chat_stream(request: Request, chat_id: str):
                     "chart_data_key": chart_data_key,
                     "code": result.get("code"),
                     "tokens": result.get("usage") or {},
+                    "chart_ref": _chart_ref_for(email, chat_id, result.get("image_base64")),
                 }
                 yield f"data: {json.dumps(_json_safe(out), ensure_ascii=False)}\n\n"
 
@@ -1962,7 +2140,7 @@ async def edit_regenerate(request: Request, chat_id: str):
                 if tbls:
                     out["tables"] = tbls
                     out["full_table_keys"] = history_obj.get("full_table_keys")
-                return JSONResponse(_json_safe(out))
+                return JSONResponse(_json_safe(_with_chart_refs(out, email, chat_id)))
 
             # Single-shot path
             if ev.get("single_response"):
@@ -2021,7 +2199,7 @@ async def edit_regenerate(request: Request, chat_id: str):
                     "code": single_result.get("code"),
                     "tokens": single_result.get("usage") or {},
                 }
-                return JSONResponse(_json_safe(out))
+                return JSONResponse(_json_safe(_with_chart_refs(out, email, chat_id)))
     finally:
         _inflight_discard(chat_id, inflight)
 
@@ -2685,8 +2863,16 @@ async def refresh_item(request: Request, chat_id: str):
                      chat_id=chat_id, tables=blocked)
         return {"ok": False, "code": "ROLE_DENIED", "blocked_tables": blocked,
                 "error": _ROLE_DENIED_REFRESH_TEXT}
-    return await run_item_refresh(chat_id, code, kind, secrets.token_hex(8),
-                                  drop_df_keys=drop)
+    result = await run_item_refresh(chat_id, code, kind, secrets.token_hex(8),
+                                    drop_df_keys=drop)
+    # A refreshed chart is not persisted; its PNG export needs a reference to
+    # the chart the server just produced.
+    if isinstance(result, dict) and result.get("ok") and result.get("image_base64"):
+        ref = _chart_ref_for(email, chat_id, result.get("image_base64"))
+        if ref:
+            result = dict(result)
+            result["chart_ref"] = ref
+    return result
 
 
 # --- Downloads (chart PNG + table Excel) -------------------------------------
@@ -2754,8 +2940,13 @@ def _xlsx_failure_reason(exc: BaseException) -> str:
 
 @router.post("/{chat_id}/export_plotly_png")
 async def export_plotly_png(request: Request, chat_id: str):
-    """Render a Plotly chart (raw HTML from the iframe) to a high-res PNG via
-    kaleido and stream it back. Body: {html, filename?, scale?}."""
+    """Render one of THIS chat's charts to a high-res PNG via kaleido.
+
+    The renderer is a Chromium inside the web container, so the chart markup
+    never comes from the request: the body names a chart the server produced.
+    Body: {chart_ref, filename?} for a chart the server just sent (a live turn
+    or a refresh), or {conv_id, ai_index, image_index?, filename?} for a chart
+    stored in the conversation. Any `html` field is ignored."""
     email, err = _require_chat(request, chat_id)
     if err:
         return err
@@ -2763,18 +2954,37 @@ async def export_plotly_png(request: Request, chat_id: str):
         body = await request.json()
     except Exception:
         body = {}
-    html = (body or {}).get("html") or ""
-    filename = _safe_filename((body or {}).get("filename") or "chart", "chart")
+    if not isinstance(body, dict):
+        body = {}
+    if "html" in body and not _EXPORT_LEGACY_LOGGED["logged"]:
+        _EXPORT_LEGACY_LOGGED["logged"] = True
+        log_with_sid(email, "warning", "EXPORT_PNG_LEGACY_BODY html field ignored",
+                     chat_id=chat_id)
+    filename = _safe_filename(body.get("filename") or "chart", "chart")
+    ref = body.get("chart_ref")
+    conv_id = body.get("conv_id")
+    if ref:
+        html = _chart_by_ref(email, chat_id, ref)
+    elif conv_id is not None and "ai_index" in body:
+        if not _may_use_conversation(email, chat_id, conv_id):
+            return _access_denied()
+        image_index = body.get("image_index", 0)
+        html = await asyncio.get_running_loop().run_in_executor(
+            _EXEC, lambda: _stored_chart_html(chat_id, conv_id, body.get("ai_index"), image_index))
+    else:
+        return JSONResponse({"error": "A chart reference is required."}, status_code=400)
     if not html:
-        return JSONResponse({"error": "No chart HTML provided."}, status_code=400)
+        return JSONResponse(
+            {"error": "Chart not found. Reload the conversation and try again."},
+            status_code=404)
     try:
         from routes.report import _plotly_html_to_png
-        png = _plotly_html_to_png(html, email)
+        png = await asyncio.get_running_loop().run_in_executor(
+            _EXEC, _plotly_html_to_png, html, email)
     except Exception as e:
-        # `html` is the chart document the sandbox produced and the browser
-        # posted back, so kaleido/plotly failures quote parts of it.
+        # The type only: a plotly/kaleido message can quote the chart's data.
         log_with_sid(email, "error",
-                     f"EXPORT_PLOTLY_PNG_FAILED: {log_safe_text(str(e), 200)}",
+                     f"EXPORT_PLOTLY_PNG_FAILED: {log_safe_text(type(e).__name__, 80)}",
                      chat_id=chat_id)
         png = None
     if not png:
