@@ -757,3 +757,55 @@ carrying a silently failing gate. And because the base image is referenced by
 tag rather than by digest, a rebuild moves the operating system underneath you
 on purpose: that is how OS patches arrive, and it is why the scan belongs to
 the release rather than to the commit.
+
+---
+
+## 9. Continuous integration and branch protection
+
+### What CI runs
+
+`.github/workflows/ci.yml` runs on every push and every pull request, as
+three jobs. Their names are the required status checks below.
+
+| Check | What it does |
+|---|---|
+| `tests` | Installs `requirements.txt` plus `pytest` and PyYAML on Python 3.12 (the images' version) and runs the whole `tests/` suite, nothing skipped by selection, as the runner's own non-root user (the job fails if it finds itself running as root). |
+| `executor-tests` | Builds the sandbox image's `test` target and runs `executor/tests` twice: as root and as the sandbox user (`--user 10002:10001`). |
+| `images` | Builds both images, runs pip-audit against each image's installed set with both advisory services (PyPI and OSV), and runs Trivy 0.74.0 on both images. Trivy fails the job on a HIGH or CRITICAL finding that has a published fix; findings without a fix are recorded by the release scan (§8), not blocking. `.trivyignore` lists the accepted findings, each also recorded in `RELEASES.md`. |
+
+`.github/CODEOWNERS` names the code owner of the isolation boundary, the data
+store, the SQL guard, the rendering sanitisers, the log helper and the build
+and deploy files.
+
+### Branch protection for `main`
+
+Branch protection is a GitHub setting, not a file in the repository, so it has
+to be set by a repository administrator: **Settings → Branches → Add branch
+ruleset** (or a classic branch protection rule) for `main`, with:
+
+| Setting | Value |
+|---|---|
+| Require a pull request before merging | On |
+| Required approvals | 1 |
+| Require review from Code Owners | On |
+| Dismiss stale pull request approvals when new commits are pushed | On |
+| Require status checks to pass before merging | On |
+| Required status checks | `tests`, `executor-tests`, `images` |
+| Require branches to be up to date before merging | On |
+| Require conversation resolution before merging | On |
+| Block force pushes | On |
+| Restrict deletions | On |
+| Do not allow bypassing the above settings (include administrators) | On |
+
+A repository with a single maintainer cannot satisfy "Require review from
+Code Owners" on its own pull requests: GitHub does not let an author approve
+their own pull request. Either add a second maintainer account as a code
+owner, or grant the maintainer a documented bypass for emergencies and record
+each use.
+
+Check the result with:
+
+```bash
+gh api repos/aleksloma/PDC_Client/rulesets
+gh api repos/aleksloma/PDC_Client/branches/main/protection
+```
