@@ -84,6 +84,7 @@ def test_an_out_of_domain_recipient_is_refused_and_no_account_is_created(world):
     r = _share(client, ["mallory@gmail.com"])
     assert r.status_code == 400, r.text
     assert r.json()["code"] == "RECIPIENT_DOMAIN_NOT_ALLOWED"
+    assert "allowed sharing domains" in r.json()["error"]
     assert not local_store.AuthStore().user_exists("mallory@gmail.com")
     assert local_store.ChatDataStore(CHAT).read_meta().get("sharing", {}).get("shared_with", []) == []
     assert sent == []

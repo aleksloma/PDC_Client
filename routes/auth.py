@@ -108,7 +108,7 @@ def _local_admin_username() -> str:
 
 
 SHARE_DOMAIN_REFUSED_TEXT = ("Sharing is limited to your organisation's addresses; "
-                             "the administrator must invite this user first.")
+                             "this address's domain is not among the allowed sharing domains.")
 SHARE_DOMAINS_UNSET_TEXT = ("Sharing is not configured: the administrator must set "
                             "SHARE_ALLOWED_DOMAINS (or promote an administrator account).")
 
