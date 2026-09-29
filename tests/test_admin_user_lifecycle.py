@@ -1238,8 +1238,13 @@ def test_a_microsoft_sign_in_racing_a_removal_leaves_no_session(world, monkeypat
 
     class _Fake:
         async def authorize_access_token(self, request):
-            return {"userinfo": {"preferred_username": addr}}
+            return {"userinfo": {"preferred_username": addr,
+                                 "tid": "11111111-2222-3333-4444-555555555555",
+                                 "oid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}
     monkeypatch.setattr(sso_mod, "_oauth_client", lambda: _Fake())
+    # "new": an address with no account reaches the stamp only when the
+    # callback may provision it.
+    monkeypatch.setattr(settings, "SSO_AUTO_PROVISION", True)
 
     calls = []
     restore = _race(monkeypatch, "mark_sso_login", calls=calls)

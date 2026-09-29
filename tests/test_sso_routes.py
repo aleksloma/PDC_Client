@@ -24,6 +24,9 @@ USER = "user@x.com"
 
 TENANT = "11111111-2222-3333-4444-555555555555"
 TOKEN_ENDPOINT = f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token"
+# The Entra identity every faked sign-in carries unless a test says otherwise.
+OID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+IDS = {"tid": TENANT, "oid": OID}
 
 
 @pytest.fixture
@@ -137,7 +140,7 @@ def test_callback_success(client, monkeypatch):
     _save()
     _enable()
     _install_fake(monkeypatch, _FakeOAuthClient(
-        token={"userinfo": {"preferred_username": "User@X.com"}}))
+        token={"userinfo": {**IDS, "preferred_username": "User@X.com"}}))
     r = client.get("/auth/microsoft/callback", follow_redirects=False)
     assert r.status_code == 302
     assert r.headers["location"] == "/lab"
@@ -168,7 +171,7 @@ def test_callback_session_carries_the_generation_and_issue_time(client, monkeypa
     _save()
     _enable()
     _install_fake(monkeypatch, _FakeOAuthClient(
-        token={"userinfo": {"preferred_username": "User@X.com"}}))
+        token={"userinfo": {**IDS, "preferred_username": "User@X.com"}}))
     r = client.get("/auth/microsoft/callback", follow_redirects=False)
     assert r.status_code == 302, (r.status_code, r.text[:300])
     stamps = client.get("/_session_stamps").json()
@@ -181,10 +184,11 @@ def test_callback_session_carries_the_generation_and_issue_time(client, monkeypa
 
 
 def test_callback_email_claim_fallback(client, monkeypatch):
+    monkeypatch.setattr(settings, "SSO_AUTO_PROVISION", True)
     _save()
     _enable()
     _install_fake(monkeypatch, _FakeOAuthClient(
-        token={"userinfo": {"email": "Fallback@X.com"}}))
+        token={"userinfo": {**IDS, "email": "Fallback@X.com"}}))
     r = client.get("/auth/microsoft/callback", follow_redirects=False)
     assert r.status_code == 302
     assert client.get("/_whoami").json()["email"] == "fallback@x.com"
@@ -197,7 +201,7 @@ def test_callback_refuses_bootstrap_admin_identity(client, monkeypatch):
     _save()
     _enable()
     _install_fake(monkeypatch, _FakeOAuthClient(
-        token={"userinfo": {"preferred_username": "Admin@X.com"}}))
+        token={"userinfo": {**IDS, "preferred_username": "Admin@X.com"}}))
     r = client.get("/auth/microsoft/callback", follow_redirects=False)
     assert r.status_code == 403
     assert "Microsoft sign-in failed" in r.text
@@ -224,7 +228,7 @@ def test_no_module_scope_secret_after_flow(client, monkeypatch):
 def test_callback_missing_email_claim(client, monkeypatch):
     _save()
     _enable()
-    _install_fake(monkeypatch, _FakeOAuthClient(token={"userinfo": {"sub": "abc"}}))
+    _install_fake(monkeypatch, _FakeOAuthClient(token={"userinfo": {**IDS, "sub": "abc"}}))
     r = client.get("/auth/microsoft/callback", follow_redirects=False)
     assert r.status_code == 400
     assert "Microsoft sign-in failed" in r.text

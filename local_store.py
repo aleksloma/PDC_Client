@@ -46,6 +46,10 @@ _LOCK = threading.RLock()
 # source of truth. A miss still scans the records, so a token written by
 # another process (an operator script, the integration suite) is found.
 _RESET_TOKEN_INDEX: dict = {}
+# Microsoft SSO identity binding: ("<DATA_ROOT>", tid, oid) -> the account
+# folder name (safe email). A cache only — `find_sso_account` re-checks the
+# auth record on a hit and scans the records on a miss, like the reset index.
+_SSO_INDEX: dict = {}
 # auth.json paths already reported unreadable by a scan (one line per path).
 _UNREADABLE_AUTH_LOGGED: set = set()
 RESET_TOKEN_TTL_S = 1800
@@ -1378,6 +1382,8 @@ class AuthStore:
                 _RESET_TOKEN_INDEX.pop(token_hash, None)
             for h in [h for h, who in _RESET_TOKEN_INDEX.items() if who == safe]:
                 _RESET_TOKEN_INDEX.pop(h, None)
+            for k in [k for k, who in _SSO_INDEX.items() if who == safe]:
+                _SSO_INDEX.pop(k, None)
         if ok:
             log_with_sid(email, "info", "USER_REMOVED")
         return ok and not udir.exists()
@@ -1423,6 +1429,94 @@ class AuthStore:
             value = value if isinstance(value, str) else ""
             _SESSION_GEN_CACHE[key] = value
             return value
+
+    # ── Microsoft SSO identity binding ────────────────────────────────
+    # auth.json keys `sso_tid` / `sso_oid` (additive): the Entra tenant id and
+    # object id this account signed in with first. Once bound, the account is
+    # found by that pair, whatever username Entra reports later, and a
+    # different identity presenting the same address is refused.
+
+    @staticmethod
+    def _sso_key(tid: str, oid: str) -> tuple:
+        return (str(settings.DATA_ROOT), str(tid or "").strip().lower(),
+                str(oid or "").strip().lower())
+
+    def sso_identity(self, email: str) -> tuple:
+        """`(tid, oid)` bound to this account, lowercased; ("", "") when none."""
+        auth = self.get_auth(email)
+        return (str(auth.get("sso_tid") or "").strip().lower(),
+                str(auth.get("sso_oid") or "").strip().lower())
+
+    def find_sso_account(self, tid: str, oid: str) -> Optional[str]:
+        """The account (folder name) bound to this Entra identity, else None.
+        The cache entry is verified against the auth record; a miss scans
+        `users/*/auth.json`. Never raises."""
+        try:
+            key = self._sso_key(tid, oid)
+            if not key[1] or not key[2]:
+                return None
+            cached = _SSO_INDEX.get(key)
+            if cached and self.sso_identity(cached) == key[1:]:
+                return cached
+            _SSO_INDEX.pop(key, None)
+            users = _data_root() / "users"
+            if not users.is_dir():
+                return None
+            for udir in users.iterdir():
+                rec = _read_auth_for_scan(udir)
+                if rec is None:
+                    continue
+                if (str(rec.get("sso_tid") or "").strip().lower() == key[1]
+                        and str(rec.get("sso_oid") or "").strip().lower() == key[2]):
+                    _SSO_INDEX[key] = udir.name
+                    return udir.name
+            return None
+        except Exception as e:
+            from exec_transport import log_safe_text
+            log_with_sid("sso", "error",
+                         f"SSO_LOOKUP_FAILED error={log_safe_text(type(e).__name__, 80)}")
+            return None
+
+    def bind_sso_identity(self, email: str, tid: str, oid: str) -> str:
+        """Bind an Entra identity to an existing account, once. Answers
+        "bound" (written now), "already" (this identity was bound before),
+        "conflict" (the account is bound to a DIFFERENT identity — nothing
+        written, `SSO_BIND_CONFLICT`), "missing" (no such account) or
+        "failed" (I/O error, logged). Never raises."""
+        from exec_transport import log_safe_text
+        key = self._sso_key(tid, oid)
+        if not key[1] or not key[2]:
+            return "failed"
+        try:
+            with _LOCK:
+                if not self._account_present(email, "bind_sso_identity"):
+                    return "missing"
+                if self._auth_path(email).exists() and                         _read_auth_for_scan(self._auth_path(email).parent) is None:
+                    # Unreadable record: rewriting it would drop a stored
+                    # binding (and any password hash) — refuse instead.
+                    log_with_sid(log_safe_text(_safe_email(email), 254), "error",
+                                 "SSO_BIND_REFUSED_UNREADABLE")
+                    return "failed"
+                auth = self.get_auth(email)
+                have = (str(auth.get("sso_tid") or "").strip().lower(),
+                        str(auth.get("sso_oid") or "").strip().lower())
+                if have == key[1:]:
+                    _SSO_INDEX[key] = _safe_email(email)
+                    return "already"
+                if have[1]:
+                    log_with_sid(log_safe_text(_safe_email(email), 254), "warning",
+                                 "SSO_BIND_CONFLICT")
+                    return "conflict"
+                auth["sso_tid"] = key[1]
+                auth["sso_oid"] = key[2]
+                self._write_auth(email, auth)
+                _SSO_INDEX[key] = _safe_email(email)
+            log_with_sid(log_safe_text(_safe_email(email), 254), "info", "SSO_IDENTITY_BOUND")
+            return "bound"
+        except Exception as e:
+            log_with_sid("sso", "error",
+                         f"SSO_BIND_FAILED error={log_safe_text(type(e).__name__, 80)}")
+            return "failed"
 
     def is_sso_only(self, email: str) -> bool:
         """True for an account that signs in with Microsoft and has no local

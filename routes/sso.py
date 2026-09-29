@@ -30,7 +30,9 @@ import httpx
 import brain_client
 import db_sources
 import sso_store
+from settings import settings
 from local_store import AuthStore
+from exec_transport import log_safe_text
 from logger_utils import log_with_sid
 from routes.admin_data import _json_body, _require_admin
 from routes.auth import _landing, _start_session
@@ -110,7 +112,18 @@ def _remember_metadata(client) -> None:
             _METADATA_CACHE["key"] = client._pdc_cache_key
             _METADATA_CACHE["metadata"] = md
     except Exception as e:
-        log_with_sid("sso", "warning", f"SSO_METADATA_CACHE_FAILED: {e}")
+        log_with_sid("sso", "warning",
+                     f"SSO_METADATA_CACHE_FAILED error={log_safe_text(type(e).__name__, 80)}")
+
+
+def _is_guest(claims: dict) -> bool:
+    """A B2B guest of the tenant: Entra writes `#EXT#` into the guest's
+    user principal name (`upn`, and `preferred_username` for some account
+    types)."""
+    for claim in ("upn", "preferred_username"):
+        if "#ext#" in str(claims.get(claim) or "").lower():
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +145,9 @@ async def microsoft_login(request: Request):
         # tenant / unreachable Microsoft must degrade, not 500 (Article IV).
         resp = await client.authorize_redirect(request, sso_store.redirect_uri(request))
     except Exception as e:
-        log_with_sid("sso", "warning", f"SSO_START_FAILED: {type(e).__name__}: {e}")
+        log_with_sid("sso", "warning",
+                     f"SSO_START_FAILED: {log_safe_text(type(e).__name__, 80)}: "
+                     f"{log_safe_text(str(e), 300)}")
         return _landing(request, error=_SIGNIN_FAILED, status_code=503)
     _remember_metadata(client)
     return resp
@@ -153,16 +168,24 @@ async def microsoft_callback(request: Request):
     except OAuthError as e:
         # str(e) carries only Microsoft's error/error_description — never
         # token material. The token dict itself is NEVER logged.
-        log_with_sid("sso", "warning", f"SSO_CALLBACK_FAILED: OAuthError: {e}")
+        log_with_sid("sso", "warning",
+                     f"SSO_CALLBACK_FAILED: OAuthError: {log_safe_text(str(e), 300)}")
         return _landing(request, error=_SIGNIN_FAILED, status_code=401)
     except Exception as e:
         log_with_sid("sso", "warning",
-                     f"SSO_CALLBACK_FAILED: {type(e).__name__}: {e}")
+                     f"SSO_CALLBACK_FAILED: {log_safe_text(type(e).__name__, 80)}: "
+                     f"{log_safe_text(str(e), 300)}")
         return _landing(request, error=_SIGNIN_FAILED, status_code=401)
 
     _remember_metadata(client)
     claims = token.get("userinfo") or {}
-    email = str(claims.get("preferred_username") or claims.get("email") or "")
+    # A guest's `email` claim is the mail attribute of another directory,
+    # which this tenant does not verify: a guest is identified by
+    # preferred_username only.
+    if _is_guest(claims):
+        email = str(claims.get("preferred_username") or "")
+    else:
+        email = str(claims.get("preferred_username") or claims.get("email") or "")
     email = email.strip().lower()
     if not email or "@" not in email:
         log_with_sid("sso", "warning", "SSO_CALLBACK_NO_EMAIL")
@@ -171,11 +194,44 @@ async def microsoft_callback(request: Request):
         # The appliance account signs in with its password only — even on an
         # install whose LOCAL_ADMIN_USERNAME was set to a real Entra email,
         # SSO must never open the bootstrap-admin session.
-        log_with_sid(email, "warning", "SSO_BOOTSTRAP_ADMIN_REFUSED")
+        log_with_sid(log_safe_text(email, 254), "warning", "SSO_BOOTSTRAP_ADMIN_REFUSED")
+        return _landing(request, error=_SIGNIN_FAILED, status_code=403)
+
+    # Identity binding: the account is the Entra tenant id + object id, not
+    # the username (which an Entra admin can change or re-issue).
+    tid = str(claims.get("tid") or "").strip()
+    oid = str(claims.get("oid") or "").strip()
+    if not (_GUID_RE.match(tid) and _GUID_RE.match(oid)):
+        log_with_sid("sso", "warning", "SSO_CLAIMS_MISSING")
+        return _landing(request, error=_SIGNIN_FAILED, status_code=401)
+    if _is_guest(claims) and not settings.SSO_ALLOW_GUESTS:
+        log_with_sid("sso", "warning", "SSO_GUEST_REFUSED")
         return _landing(request, error=_SIGNIN_FAILED, status_code=403)
 
     store = AuthStore()
-    store.ensure_user(email)
+    bound = store.find_sso_account(tid, oid)
+    if bound:
+        if bound != email:
+            # Same person, new username: sign in to the bound account.
+            log_with_sid(log_safe_text(bound, 254), "info", "SSO_USERNAME_CHANGED")
+        email = bound
+    elif store.user_exists(email):
+        # An account created before binding existed (invited, shared, or an
+        # earlier SSO sign-in): bound on this first sign-in, once.
+        outcome = store.bind_sso_identity(email, tid, oid)
+        if outcome not in ("bound", "already"):
+            return _landing(request, error=_SIGNIN_FAILED, status_code=403)
+    elif settings.SSO_AUTO_PROVISION:
+        store.ensure_user(email)
+        if store.bind_sso_identity(email, tid, oid) not in ("bound", "already"):
+            return _landing(request, error=_SIGNIN_FAILED, status_code=403)
+        log_with_sid(log_safe_text(email, 254), "info", "SSO_ACCOUNT_PROVISIONED")
+    else:
+        log_with_sid("sso", "warning", "SSO_UNKNOWN_ACCOUNT")
+        return _landing(request, error=_SIGNIN_FAILED, status_code=401)
+    if store.is_bootstrap_admin(email):
+        log_with_sid("sso", "warning", "SSO_BOOTSTRAP_ADMIN_REFUSED")
+        return _landing(request, error=_SIGNIN_FAILED, status_code=403)
     store.mark_sso_login(email, "microsoft")
     # Browser-session cookie on purpose (remember=False): Entra re-auth is
     # silent on joined devices, so a 30-day persistent cookie would add risk
@@ -183,7 +239,7 @@ async def microsoft_callback(request: Request):
     if not _start_session(request, email, remember=False):
         # Removed by an administrator while this sign-in was under way.
         return _landing(request, error=_SIGNIN_FAILED, status_code=401)
-    log_with_sid(email, "info", "USER_LOGIN_SSO", sid=request.session.get("sid"))
+    log_with_sid(log_safe_text(email, 254), "info", "USER_LOGIN_SSO", sid=request.session.get("sid"))
     try:
         brain_client.post_activity("login", email)
     except Exception:

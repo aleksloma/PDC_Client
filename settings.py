@@ -237,6 +237,11 @@ class Settings(BaseModel):
     # is a setting and not a deletion is the hosted demo (a startup warning
     # when on). Never set it on a customer install.
     ALLOW_SELF_REGISTRATION: bool = Field(default_factory=lambda: os.getenv("ALLOW_SELF_REGISTRATION", "").strip().lower() in ("1", "true", "yes", "on"))
+    # Microsoft SSO provisioning (routes/sso.py). A guest of the Entra tenant
+    # (#EXT# in upn / preferred_username) is refused unless SSO_ALLOW_GUESTS;
+    # an identity matching no account is refused unless SSO_AUTO_PROVISION.
+    SSO_ALLOW_GUESTS: bool = Field(default_factory=lambda: os.getenv("SSO_ALLOW_GUESTS", "").strip().lower() in ("1", "true", "yes", "on"))
+    SSO_AUTO_PROVISION: bool = Field(default_factory=lambda: os.getenv("SSO_AUTO_PROVISION", "").strip().lower() in ("1", "true", "yes", "on"))
 
     # Sign-in / reset attempt limiting (auth_limiter.py, in memory — correct
     # only under the one-worker rule). Beyond AUTH_FAIL_THRESHOLD failures per
