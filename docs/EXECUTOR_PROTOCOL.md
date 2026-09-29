@@ -280,6 +280,18 @@ reaches the Brain's retry prompt.
 
 ## 6. What the web service refuses to read
 
+The HTTP answer itself is bounded before anything else is read. The web
+service streams the `/execute` body and reads at most
+`EXECUTOR_MAX_RESPONSE_BYTES` (64 MiB by default, minimum 1 MiB): a declared
+`Content-Length` above the cap is refused before any byte is read, and a body
+without one stops being read as soon as it crosses the cap, so nothing beyond
+it is held in the web container's memory. Either way the job fails with
+`ExecutorError: the analysis answer could not be read (ResponseTooLarge)`
+(§10) and the log shows `EXEC_RESPONSE_TOO_LARGE status= max_bytes=`. The
+check runs before the status code is looked at, so an oversized rejection
+body is refused the same way. A healthy answer is small: result frames travel
+as files in the job directory, not in the body.
+
 Every reference is opened through a directory-handle chain that refuses to
 follow symlinks at any component and requires a regular file, so a symlinked
 `out/` cannot redirect a read into the customer-data mount and a planted FIFO
@@ -605,6 +617,7 @@ signatures, so nothing upstream changed.
 | `EXECUTOR_PLOT_TIMEOUT_S` | `120` s | the budget for a chart; analysis blocks use `code_exec.CODE_EXEC_TIMEOUT_SECONDS` (60 s) |
 | `EXECUTOR_MAX_CONCURRENT` | `1` | jobs dispatched at once — must never exceed the sandbox's own limit (§7) |
 | `EXECUTOR_QUEUE_MAX_S` | `600` s | how long a job may wait for a slot before it is answered "busy" |
+| `EXECUTOR_MAX_RESPONSE_BYTES` | `67108864` (64 MiB; minimum 1 MiB) | the largest `/execute` answer body the web service reads (§6); a larger one fails the job as `could not be read (ResponseTooLarge)` |
 | `EXECUTOR_NETWORK_CIDR` | *(empty)* | the sandbox network's own subnet. Requests whose peer address falls inside it are answered 403: a Docker network is bidirectional, so this is what stops generated code calling the web service's unauthenticated endpoints. Compose sets it from the same variable that pins the network, so the two cannot drift. **Mandatory while `EXECUTOR_URL` is set:** the web service refuses to start (`EXECUTOR_CIDR_UNSET`, exit non-zero) when it is empty or not a valid network. Only a run with `EXECUTOR_URL=""` (no sandbox at all) may leave it empty |
 
 Every one is read at call time, and a malformed value falls back to its
@@ -635,7 +648,7 @@ error as an answer it can handle:
 | `ExecutorBusy: the analysis service is busy, try again` | no slot within `EXECUTOR_QUEUE_MAX_S` |
 | `ExecutorError: the analysis service rejected the job (<CODE>)` | any non-200; `<CODE>` is the sandbox's own code (§4), validated as a short token because the body is untrusted and this text reaches the planner's retry prompt |
 | `ExecutorError: cannot prepare the job (<Type>)` | the job directory or the input write failed before dispatch |
-| `ExecutorError: the analysis answer could not be read (<Type>)` | reconstruction itself raised. It is written never to raise, so this is the belt on top of the braces — and the caller still gets an answer it can handle |
+| `ExecutorError: the analysis answer could not be read (<Type>)` | reconstruction itself raised. It is written never to raise, so this is the belt on top of the braces — and the caller still gets an answer it can handle. Also the answer body was larger than `EXECUTOR_MAX_RESPONSE_BYTES` (§6): `<Type>` is then `ResponseTooLarge` |
 
 None of them carries a URL, a path or any data: the detail goes to the local
 log, the text goes upstream.

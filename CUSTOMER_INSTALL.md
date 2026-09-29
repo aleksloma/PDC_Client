@@ -91,6 +91,13 @@ Read these before you upgrade an existing install to this release.
   Entra identity at its next Microsoft sign-in. If you use single sign-on,
   make sure "Assignment required?" is Yes on the Entra enterprise application
   (see "Single sign-on with Microsoft Entra ID" in §2).
+- Signing out now ends every session of that account, on every browser, not
+  only the one where the user clicked Logout.
+- Files uploaded but never turned into a chat are now deleted when the user
+  signs out or starts a new upload, and the upload copy is deleted once the
+  chat is created (the chat keeps its own copy).
+- The interactive API documentation (`/docs`, `/redoc`, `/openapi.json`) is
+  no longer served; those addresses answer 404.
 
 ## 1. Get the images
 
@@ -218,7 +225,12 @@ two containers together (`EXECUTOR_URL`, `EXECUTOR_SHARED_DIR`,
 `EXECUTOR_MAX_CONCURRENT`, `EXECUTOR_NETWORK_CIDR`) are set in
 `docker-compose.yml`, where compose `environment` overrides `env_file`. A
 well-meant edit to the env file therefore cannot break the topology. Timeouts
-and sizes stay tunable; `client.env.example` marks which is which.
+and sizes stay tunable; `client.env.example` marks which is which. One of the
+sizes is `EXECUTOR_MAX_RESPONSE_BYTES` (64 MiB by default, at least 1 MiB): the
+largest answer the web container reads back from the sandbox for one job. A
+larger answer fails that job, and the log shows `EXEC_RESPONSE_TOO_LARGE`.
+Result tables travel as files, not in the answer, so the default rarely needs
+changing.
 
 `EXECUTOR_NETWORK_CIDR` is **mandatory** while the sandbox is enabled (that
 is, while `EXECUTOR_URL` is set, which it is by default). The shipped
@@ -797,6 +809,12 @@ The session cookie is marked `Secure`, so browsers return it only over HTTPS
 terminator — a reverse proxy or load balancer with your certificate — and
 publish that HTTPS address to your users.
 
+The application sends `Strict-Transport-Security` (browsers then refuse
+plain HTTP for the site for a year) only on requests that reached it as HTTPS.
+Behind the proxy that is the case only when `FORWARDED_ALLOW_IPS` names the
+proxy's address and the proxy sets `X-Forwarded-Proto` (see "Forward your
+users' addresses" below); otherwise the header is simply not sent.
+
 If you must run plain HTTP on the LAN, set `SESSION_HTTPS_ONLY=false` in
 `client.env`. Sessions then travel unencrypted and can be captured on your
 network; only do this on an isolated segment or for a short evaluation.
@@ -971,7 +989,9 @@ decks, and your branded templates.
   have been revoked — contact PowerDataChat.
 - **Your data stays yours.** Raw uploads, chats, and rendered decks live only in
   the `/data/client` volume on your server and are never transmitted. See
-  "What leaves your network" for exactly what does reach the brain.
+  "What leaves your network" for exactly what does reach the brain. Files a
+  user uploads but never turns into a chat are deleted when that user signs
+  out or starts a new upload.
 - **Sharing rules your users will meet.**
   - Sharing works only with addresses in the allowed domains (see "Sharing"
     in §2); one address outside them refuses the whole share.

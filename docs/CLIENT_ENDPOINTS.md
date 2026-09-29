@@ -84,6 +84,18 @@ file documents the enterprise client's implementation of each one.
   allows `'unsafe-eval'`, and it is not added to a response that already
   carries its own policy (the chart documents below). Source:
   `ContentSecurityPolicy` in `app.py`.
+- **Other security headers.** Every response carries
+  `X-Content-Type-Options: nosniff` (unless the route set it itself).
+  `Strict-Transport-Security: max-age=31536000; includeSubDomains` is added
+  only to responses to requests that arrived over HTTPS (`scope["scheme"]`);
+  behind a TLS reverse proxy that is the case only when uvicorn trusts the
+  proxy's `X-Forwarded-Proto` (`FORWARDED_ALLOW_IPS` naming the proxy, never
+  `*`). A plain-HTTP request never gets HSTS. Source: `SecurityHeaders` in
+  `app.py`, which sits right outside `ContentSecurityPolicy`, inside
+  `BackendNetworkGuard`.
+- **No API documentation routes.** `/docs`, `/redoc` and `/openapi.json` do
+  not exist (`404`): the FastAPI app is built with `docs_url`, `redoc_url`
+  and `openapi_url` set to `None`.
 - **Rendered chart and table markup.** Chart HTML (`image_base64` holding a
   Plotly document, from a stream, history, a refresh or a dashboard tile) is
   rendered only inside an iframe with `sandbox="allow-scripts"` — an opaque
@@ -113,7 +125,7 @@ file documents the enterprise client's implementation of each one.
 | Method | Path | Behavior |
 |---|---|---|
 | `POST` | `/api/charts` | `{html}` (a chart document, ≤ 5,000,000 characters) → `{url: "/charts/<token>"}`. Signed-in only (`401` otherwise); `400` for a missing, non-string, empty or oversize `html`. The HTML goes into a bounded in-memory store (30-minute lifetime; sizes counted in UTF-8 bytes, 200 MB in total and 40 MB per user; when full, the registering user's own oldest entries go first, then the oldest overall; one web worker). Called by `PDCViewers.setChartFrame` for every chart it renders — live, from history, refreshed, or from a dashboard tile. |
-| `GET` | `/charts/{token}` | the registered document. The token is signed with `SECRET_KEY`, valid 30 minutes and carries only the store entry's id (no address); the entry is bound to the user who registered it; a bad, expired, evicted or other user's token, or no session, → `404`. Headers: `Content-Security-Policy: sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'self'` (no nonce: the document is served exactly as registered, its inline scripts run inside the sandbox, and external scripts can come only from this server), `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, `Referrer-Policy: no-referrer`. The only response in the application whose policy allows `'unsafe-eval'` (Plotly's WebGL traces need it); the document runs with an opaque origin. |
+| `GET` | `/charts/{token}` | the registered document. The token is signed with `SECRET_KEY`, valid 30 minutes and carries only the store entry's id (no address); the entry is bound to the user who registered it; a bad, expired, evicted or other user's token, or no session, → `404`. Headers: `Content-Security-Policy: sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'self'; form-action 'none'` (no nonce: the document is served exactly as registered, its inline scripts run inside the sandbox, and external scripts can come only from this server), `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, `Referrer-Policy: no-referrer`. The only response in the application whose policy allows `'unsafe-eval'` (Plotly's WebGL traces need it); the document runs with an opaque origin. |
 
 ---
 
@@ -260,7 +272,7 @@ enforcement to such an account in advance.
 | `GET` | `/auth/reset/{token}` | the set-new-password form (`reset_password.html`, no script) with `Cache-Control: no-store` and `Referrer-Policy: no-referrer`; no side effect. A malformed, unknown, expired or used token → the sign-in page with "This reset link is invalid or has expired. Request a new one." (404). Invalid tokens count per peer address. |
 | `POST` | `/auth/reset/{token}` | form-encoded `new_password=`, `confirm_password=`, `csrf=` (missing or wrong token → `403` reset page with "The form has expired. Please try again.", checked before the limiter, so it does not count as an invalid link) (the password rule above, matching; a rule failure re-renders the form, 400; a Microsoft-only account — and, while SSO is enabled, any account that has signed in with Microsoft — → 403, checked before the password rule). Validates and consumes the token in one locked step, sets the password (which also clears any temporary password and pending forced change), `302` → `/?reset=done` ("Your password has been updated. Sign in with it."). No automatic sign-in; every open session of the account ends. A second use → 404; a 429 here carries the same no-store / no-referrer headers. |
 | `POST` | `/auth/change_password` | form-encoded `new_password=`, `confirm_password=`, `csrf=` — the forced-change submit (session required; a missing or wrong token → `403` "The form has expired. Please try again."; the password rule above, 400; a Microsoft-only account → 403). Ends the account's other sessions; this one stays signed in. An account removed while the request was under way: nothing written, the session cleared, `302` → `/`. |
-| `POST` | `/auth/logout` | clears session (form token included), redirects to `/`. Like every other non-form `POST`, it must send `Content-Type: application/json` (else `415`). |
+| `POST` | `/auth/logout` | clears session (form token included), redirects to `/`. For a signed-in session it also replaces the account's session generation (`AuthStore.bump_session_generation`), so EVERY session of the account ends on its next request — other browsers and a copied cookie included; a failure is logged (`LOGOUT_GENERATION_BUMP_FAILED`, or `LOGOUT_ACCOUNT_MISSING` for a removed account) and never blocks the redirect. It then deletes the session's upload workspace `<DATA_ROOT>/sessions/<sid>/` (`UserStore.destroy`, see "Upload flow"). Like every other non-form `POST`, it must send `Content-Type: application/json` (else `415`). |
 | `GET`  | `/auth/me` | `{authenticated, email}` |
 | `GET`  | `/auth/profile` | `{username: email, email, full_name: "", subscription_plan: "Enterprise", is_local_admin, is_power_user, is_admin_user}` — shape that dashboard.js expects. `is_local_admin` and `is_admin_user` (deliberately NEVER `is_admin` — that key feeds the B2C Publish menu, 400 by design on-prem); `is_power_user` = the user's per-account PERMISSION is "power" (AuthStore profile `role`, 19e — roles_store.is_power_user delegates to it; admin is NOT power; fail-closed false on any error); `is_admin_user` (19g) = a PROMOTED admin — permission "admin" AND not the bootstrap account (fail-closed false). Both feed the profile-dropdown "DB config" item: power → `/power/data_sources`, promoted admin → `/admin/data_sources` (the partial bakes the target into `data-target`) |
 | `POST` | `/auth/profile/update` | email is the identity; attempts to change it are silently ignored |
@@ -305,7 +317,19 @@ branch is present but GATED on the server flag `window.__DIRECT_UPLOAD__`
 customer install the flag is false and step 2 handles every size:
 
 1. **`POST /new_session`** — resets the per-session temp `UserStore`.
-   Returns `{ok: true}`. Issues a fresh SID into the session cookie.
+   Returns `{ok: true}`. Issues a fresh SID into the session cookie and
+   deletes the PREVIOUS sid's workspace (`UserStore.destroy`).
+
+   **Session workspaces.** `<DATA_ROOT>/sessions/<sid>/` holds a session's
+   raw uploads until they become a chat. Its `meta.json` records the owner's
+   address (`UserStore(sid, owner=)`, written once on a folder that has
+   none). `UserStore.destroy(sid, owner)` deletes the folder without
+   re-creating it: after `/generate_chatdata`, for the previous sid in
+   `/new_session`, and at `/auth/logout`. It refuses (nothing deleted,
+   `SESSION_DESTROY_REFUSED`) a sid outside the `s_<16 hex>` shape, a folder
+   that does not resolve strictly inside `<DATA_ROOT>/sessions/`, and a
+   folder whose recorded owner is another address; a folder written before
+   the owner field existed is deleted. Success logs `SESSION_FILES_DELETED`.
 
 2. **`POST /upload`** (multipart, field `files`; EVERY file goes this way
    whenever direct upload is off) — saves uploads to the
@@ -404,7 +428,10 @@ customer install the flag is false and step 2 handles every size:
    of global `_generate_all_parallel` (3 parallel sub-calls: chat name,
    welcome message, suggested questions) — same prompts, same sanitizers
    — so the output is identical to the B2C app. Returns
-   `{ok, chat_id, name, welcome_message, suggested_questions}`.
+   `{ok, chat_id, name, welcome_message, suggested_questions}`. Once the
+   chat exists, the session gets a fresh sid and the temp workspace the
+   uploads came from is deleted (`UserStore.destroy`); the next upload
+   starts in a new workspace.
 
 ### Direct-to-GCS large files (OPTIONAL — `GCS_UPLOAD_BUCKET`)
 

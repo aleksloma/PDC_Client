@@ -4,8 +4,8 @@
 > enterprise (on-prem) edition. Adapted from the original B2C constitution
 > for the brain/client split.
 
-**Version:** 1.6 (enterprise)
-**Last Updated:** 2026-09-26
+**Version:** 1.7 (enterprise)
+**Last Updated:** 2026-09-29
 
 ---
 
@@ -180,8 +180,12 @@ multiplier  = settings.LLM_BACKOFF_MULTIPLIER # 2.0
 - Context: `tenant=`, `chat_id=`, `endpoint=`. Never log raw payloads.
 - **The log file is newline-delimited, so any text you did not write must be
   escaped before it reaches a line.** Pass it through
-  `exec_transport.log_safe_text`, which escapes every line break and ESC
-  (see Article XIV for the exact set) and caps the length.
+  `logger_utils.log_safe_value`, which escapes every line break and every
+  other control character (see Article XIV for the exact set) and caps the
+  length. `exec_transport.log_safe_text` is the older name of the same
+  helper and delegates to it; both are correct. (Amended in 1.7: the helper
+  moved to `logger_utils` so every module can import it, and its set grew
+  from line breaks plus ESC to all control characters.)
   This applies to the message AND to every context value AND to the `sid`
   field itself, and it applies to text from any origin you do not control:
   the request body (a question, a conversation id from a path segment), a
@@ -633,10 +637,12 @@ rule bounds who writes the bytes, not what they contain.
   rule: **every site that writes it to a log must escape it first**, because
   the log is newline-delimited and a message the sandbox chose could
   otherwise forge a whole record in the file an operator reads to
-  reconstruct what happened. "Escape" means `exec_transport.log_safe_text`:
+  reconstruct what happened. "Escape" means `logger_utils.log_safe_value`
+  (`exec_transport.log_safe_text` is its older name and delegates to it):
   it replaces CR, LF and every other character Python treats as a line break
-  (VT, FF, FS, GS, RS, NEL, U+2028, U+2029) plus ESC with a visible
-  backslash escape, and caps the length. That is an obligation on every writer, not a
+  (VT, FF, FS, GS, RS, NEL, U+2028, U+2029), every other C0 control
+  character except TAB, DEL and the C1 controls with a visible backslash
+  escape, and caps the length. That is an obligation on every writer, not a
   property of the text — it was found open at eight sites in two rounds, in
   three different modules, each time by looking again rather than by a test
   failing. The same obligation covers any string DERIVED from the response
@@ -741,7 +747,7 @@ To modify this constitution:
 | LLM calls    | REST API only, no LangChain. Tier via `_eff()`.                            |
 | Storage      | Local filesystem. JSONL for history, JSON for metadata. No GCSPath. Direct-to-GCS upload hop only with `GCS_UPLOAD_BUCKET` (demo). |
 | Errors       | Catch → log with sid → return fallback. Never crash silently.             |
-| Logging      | Escape any text you did not write (`log_safe_text`) — message, context values and the sid. Never log a data value at all. |
+| Logging      | Escape any text you did not write (`log_safe_value`, alias `log_safe_text`) — message, context values and the sid. Never log a data value at all. |
 | Resources    | `atexit` for executors; close HTTP clients on lifespan shutdown.          |
 | Security     | Secrets in env only. Never commit `.env`. Brain holds the Gemini key.     |
 | SQL          | Free SELECT only through `assert_read_only_query` (bound to the one registered table by its allowlist), capped by `wrap_with_row_limit`, run by `run_live_select` in the main app (never the sandbox), role-gated before the plan and before the fetch, SQL logged as a hash only; a failure crosses as a class, never as the driver text. The SELECT-only DB grant is the real guarantee. |
