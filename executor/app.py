@@ -587,6 +587,9 @@ def _runner_env(config: Config, response_fd: int) -> dict:
         "ARROW_DEFAULT_MEMORY_POOL": "system",
         "EXECUTOR_MEM_LIMIT_MB": str(config.mem_limit_mb),
         "EXECUTOR_RESPONSE_FD": str(response_fd),
+        # The runner logs through the same logger_utils: it must never open a
+        # log FILE that a later job (same uid) could read.
+        "PDC_EXECUTOR": "1",
     }
     for optional in ("LANG", "LC_ALL"):
         value = os.environ.get(optional)
@@ -790,16 +793,17 @@ def _execute_job(config: Config, request: ExecuteRequest, job_dir: Path,
                         "traceback": stderr_text, "exit_code": exit_code,
                         "signal": signal_no, "reason": reason}
 
+    # Lengths only, never the text: stderr and stdout are written by the job,
+    # and this log is not the place another user's values should land. The
+    # full streams travel in the response; the web service logs its own tail.
     level = "info" if response["status"] in ("ok", "error") else "warning"
     log_with_sid(job_id, level,
                  f"EXEC_JOB_END status={response['status']} code_hash={code_hash} "
                  f"elapsed_ms={int(elapsed_ms)} "
                  f"exit_code={exit_code} "
-                 f"reason={exec_transport.log_safe_text(str(response.get('reason')), 80)}")
-    if response["status"] in ("killed", "crashed"):
-        log_with_sid(job_id, "warning",
-                     f"EXEC_JOB_STDERR "
-                     f"{exec_transport.log_safe_text(stderr_text, 2000, tail=True)}")
+                 f"reason={exec_transport.log_safe_text(str(response.get('reason')), 80)} "
+                 f"stderr_len={len(stderr_text)} "
+                 f"stdout_len={len(response.get('stdout') or '')}")
     return response
 
 

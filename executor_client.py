@@ -133,10 +133,10 @@ _REMOVE_WARNED_MAX = 1000
 # process runs and one line is the whole signal.
 _STRAY_REFUSED: dict = {"logged": False}
 
-# Tails of the sandbox's own stderr/traceback on the error log lines. In
-# process, a failing block's traceback landed in THIS container's log; now it
-# exists only in the sandbox's log, which sits on a tmpfs and is gone on
-# restart. Capped because the strings are untrusted and unbounded.
+# Tails of the sandbox's own stderr/traceback on the error log lines. The
+# sandbox keeps no log file and logs no job text (a later job runs as the same
+# uid), so these tails are the only durable copy of a failing block's
+# traceback. Capped because the strings are untrusted and unbounded.
 _LOG_TAIL_MAX_CHARS = 2000
 # The generated-code snippet on the two error lines: its lines are joined with
 # a VISIBLE `\n`, and the field is escaped and capped like any other text this
@@ -999,10 +999,9 @@ def _log_outcome(kind: str, out: dict, response, log_sid: str, job_id: str,
                          elapsed_ms=elapsed_ms, peak_rss_mb=peak_rss_mb)
             return
         keys = list(dfs.keys()) if isinstance(dfs, dict) else []
-        # `traceback=` / `stderr=` — LOG ONLY. When `exec()` ran in this
-        # process, a failing block's traceback landed in this container's
-        # log. It now exists only in the sandbox's log, which lives on a tmpfs
-        # and is wiped on restart, so the durable copy is this tail. It never
+        # `traceback=` / `stderr=` — LOG ONLY. The sandbox keeps no log file
+        # and logs no job text, so this tail is the only durable copy of a
+        # failing block's traceback. It never
         # reaches the returned dict: the callers' error channel is the text
         # the planner and the user see, and it is unchanged.
         reply = response if isinstance(response, dict) else {}

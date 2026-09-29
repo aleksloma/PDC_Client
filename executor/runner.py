@@ -221,7 +221,9 @@ def main(argv) -> None:
         status = "error"
         trace = traceback.format_exc()[:exec_transport.ERROR_MAX_CHARS]
         payload = _error_shape(kind, f"{type(e).__name__}: {e}")
-        log_with_sid(job_id, "error", f"EXEC_RUNNER_FAILED {type(e).__name__}: {e}")
+        # Type only: the message can quote a value from the job's frames.
+        log_with_sid(job_id, "error",
+                     f"EXEC_RUNNER_FAILED {exec_transport.log_safe_text(type(e).__name__, 80)}")
 
     log_with_sid(job_id, "info", f"EXEC_RUNNER_END status={status}")
     _write_response({

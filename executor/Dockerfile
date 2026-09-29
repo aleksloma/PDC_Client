@@ -8,13 +8,14 @@ FROM python:3.12-slim AS app
 
 WORKDIR /app
 
-# DATA_ROOT is a tmpfs throwaway: the executor keeps NO state. It exists only
-# so logger_utils has a writable log directory (5 MiB x 2, so a chatty job
-# cannot compete with the 1 GiB /tmp). The thread pins and the system Arrow
-# allocator keep a job inside its RLIMIT_AS (jemalloc reserves large virtual
-# ranges that the limit counts).
+# DATA_ROOT is a tmpfs throwaway: the executor keeps NO state. PDC_EXECUTOR=1
+# makes logger_utils log to stdout ONLY: every job runs as this image's uid,
+# so a log FILE here would be readable by the next user's job. The thread
+# pins and the system Arrow allocator keep a job inside its RLIMIT_AS
+# (jemalloc reserves large virtual ranges that the limit counts).
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PDC_EXECUTOR=1 \
     DATA_ROOT=/tmp/executor \
     MPLBACKEND=Agg \
     MPLCONFIGDIR=/tmp/mpl \

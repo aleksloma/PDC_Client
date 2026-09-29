@@ -110,6 +110,8 @@ EXPECTED_RUNTIME_ENV = {
     "LOG_BACKUP_COUNT": "1",
     "PYTHONUNBUFFERED": "1",
     "PYTHONDONTWRITEBYTECODE": "1",
+    # stdout-only logging inside the sandbox (no log file a later job reads)
+    "PDC_EXECUTOR": "1",
 }
 EXPECTED_CMD = 'CMD ["uvicorn", "executor.app:app", "--host", "0.0.0.0", "--port", "8090", "--workers", "1"]'
 EXPECTED_BASE_IMAGE = "python:3.12-slim"
@@ -871,3 +873,77 @@ def test_both_sweeps_skip_jobs_in_flight_and_the_sandbox_locks_at_startup():
     assert "os.chmod(child, 0o000)" in app_text
     lifespan = app_text.index("_lock_preexisting_job_dirs(config.shared_dir)")
     assert lifespan < app_text.index("_sweep_orphans(config.shared_dir)", lifespan)
+
+
+# ---------------------------------------------------------------------------
+# the sandbox keeps no log FILE and logs no job-derived text
+# ---------------------------------------------------------------------------
+def _log_calls(path: Path):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "log_with_sid":
+            yield node
+
+
+def _without_lengths(call) -> str:
+    """The call's source with every `len(...)` removed: a length is what these
+    lines are allowed to carry."""
+    src = ast.unparse(call)
+    for node in ast.walk(call):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "len":
+            src = src.replace(ast.unparse(node), "<len>")
+    return src
+
+
+def test_sandbox_side_log_lines_carry_no_error_text_code_or_stderr():
+    """Every job runs as the uid that owns the sandbox's log stream: exception
+    text (a library quotes the value it choked on), code snippets, frame
+    names and stderr contents stay out of it. Lengths, hashes, types and
+    statuses only; the full text travels in the response."""
+    offenders = []
+    code_exec = ROOT / "code_exec.py"
+    for call in _log_calls(code_exec):
+        src = _without_lengths(call)
+        if "EXEC_ERROR" not in src and "EXEC_TIMEOUT" not in src:
+            continue
+        for bad in ("exec_result.get('error')", "{e}", "snippet", "code=", "dfs="):
+            if bad in src:
+                offenders.append(f"code_exec.py:{call.lineno} {bad}")
+    app_text = _read(EXEC_APP)
+    assert "EXEC_JOB_STDERR" not in app_text
+    for call in _log_calls(EXEC_APP):
+        src = _without_lengths(call)
+        if "stderr_text" in src:
+            offenders.append(f"executor/app.py:{call.lineno} stderr text")
+    for call in _log_calls(ROOT / "executor" / "runner.py"):
+        src = ast.unparse(call)
+        if "EXEC_RUNNER_FAILED" in src and "{e}" in src:
+            offenders.append(f"runner.py:{call.lineno} exception text")
+    # plot_utils._render_in_process is the runner's PLOT entry: its root-logger
+    # lines must not carry the exception text or a traceback either.
+    # Exempt: two setup functions no job reaches — the font registration at
+    # import, and the web-lifespan copy of the Plotly bundle. Their exceptions
+    # are about files of the image, not about a job's data.
+    tree = ast.parse((ROOT / "plot_utils.py").read_text(encoding="utf-8"))
+    setup = {"_setup_unicode_font", "ensure_plotly_js_asset"}
+    exempt = set()
+    for fn in ast.walk(tree):
+        if isinstance(fn, ast.FunctionDef) and fn.name in setup:
+            exempt.update(id(n) for n in ast.walk(fn))
+    for node in ast.walk(tree):
+        if id(node) in exempt:
+            continue
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and getattr(node.func.value, "id", "") == "logging"
+                and node.func.attr in ("error", "warning", "exception")):
+            src = _without_lengths(node)
+            for bad in ("{e}", "{tb}", "format_exc"):
+                if bad in src:
+                    offenders.append(f"plot_utils.py:{node.lineno} {bad}")
+    assert offenders == [], offenders
+
+
+def test_the_runner_env_marks_the_sandbox_for_the_logger():
+    text = _read(EXEC_APP)
+    fn = text[text.index("def _runner_env"):text.index("def _enter_job")]
+    assert '"PDC_EXECUTOR": "1"' in fn

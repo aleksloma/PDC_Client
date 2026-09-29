@@ -446,7 +446,10 @@ def _encode_current_figure() -> str:
         # tight_layout() can fail due to invalid format strings in tick labels
         # (e.g. FormatStrFormatter('%,d') — '%,' is not a valid format specifier).
         # bbox_inches="tight" in savefig handles layout as a fallback.
-        logging.warning(f"tight_layout() failed (non-fatal, using bbox_inches fallback): {e}")
+        # Type only: this runs in the sandbox, and a formatter error quotes the
+        # tick label it choked on.
+        logging.warning(f"tight_layout() failed (non-fatal, using bbox_inches fallback): "
+                        f"{type(e).__name__}")
     fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode("ascii")
@@ -1882,5 +1885,8 @@ def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: b
             
     except Exception as e:
         tb = traceback.format_exc(limit=3)
-        logging.error(f"Plot rendering error: {e}\n{tb}")
+        # Type only: this runs in the sandbox, and the message and traceback
+        # can quote a value from the job's frames. The full error and trace
+        # travel in the returned dict; the web service logs its own copy.
+        logging.error(f"Plot rendering error: {type(e).__name__} error_len={len(str(e))}")
         return {"ok": False, "error": f"{type(e).__name__}: {e}", "trace": tb}

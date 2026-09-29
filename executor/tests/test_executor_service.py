@@ -577,6 +577,29 @@ def test_generated_code_sees_a_clean_allowlisted_environment(executor_env, monke
     assert env.get("MPLBACKEND") == "Agg", env
     assert "EXECUTOR_RESPONSE_FD" in env, sorted(env)
     assert "PYTHONPATH" not in env, sorted(env)
+    assert env.get("PDC_EXECUTOR") == "1", env
+
+
+def test_a_failing_job_leaves_no_error_text_in_the_sandbox_log(executor_env, caplog):
+    """The job's exception text (which can quote a customer value) travels in
+    the response only; the service's own log lines carry lengths and hashes,
+    and no log FILE exists for a later job to read. (The runner's own lines
+    are pinned structurally in tests/test_executor_structure.py.)"""
+    import logging
+    needle = "needle-4f1c-value"
+    with caplog.at_level(logging.INFO, logger="datachat"):
+        with _client() as client:
+            job_dir, response, _ = _submit(client, executor_env,
+                                           f"raise ValueError({needle!r})")
+    assert response.get("status") == "error", response
+    decoded = _decode(response, job_dir)
+    assert needle in str(decoded.get("error")), decoded
+    text = caplog.text
+    assert "EXEC_JOB_END" in text, text[-2000:]
+    assert "stderr_len=" in text
+    assert needle not in text, "the job's error text reached the sandbox log"
+    data_root = Path(os.environ.get("DATA_ROOT", "/tmp/executor"))
+    assert not (data_root / "logs" / "datachat.log").exists()
 
 
 @pytest.mark.parametrize("name", ["BRAIN_TENANT_TOKEN", "BRAIN_URL", "SECRET_KEY",

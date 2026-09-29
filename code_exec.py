@@ -289,21 +289,24 @@ def _execute_in_process(code: str, dfs: dict, sid: str | None = None, timeout: f
             return {"error": f"TimeoutError: Code execution exceeded {timeout} seconds limit"}
 
         if not exec_result.get("success"):
-            # Execution error
+            # Execution error. This body runs INSIDE the sandbox, so the line
+            # carries no exception text, no code and no frame names — a
+            # library's error quotes the value it choked on. The full error
+            # travels in the response; the web service logs its own copy.
             try:
                 h = hashlib.sha256(code.encode("utf-8", errors="ignore")).hexdigest()[:10]
-                snippet = code.strip().splitlines()[:settings.EXEC_ERROR_SNIPPET_LINES]
-                log_with_sid(sid or "exec", "error", f"EXEC_ERROR {exec_result.get('error')}", code_hash=h, code=" \\n".join(snippet), dfs=list(dfs.keys()))
+                log_with_sid(sid or "exec", "error", "EXEC_ERROR", code_hash=h, status="error",
+                             error_len=len(str(exec_result.get("error") or "")))
             except Exception:
                 pass
             return {"error": exec_result.get("error")}
 
     except Exception as e:
-        # Unexpected error in executor setup
+        # Unexpected error in executor setup — type only, same reason.
         try:
             h = hashlib.sha256(code.encode("utf-8", errors="ignore")).hexdigest()[:10]
-            snippet = code.strip().splitlines()[:settings.EXEC_ERROR_SNIPPET_LINES]
-            log_with_sid(sid or "exec", "error", f"EXEC_ERROR {type(e).__name__}: {e}", code_hash=h, code=" \\n".join(snippet), dfs=list(dfs.keys()))
+            log_with_sid(sid or "exec", "error", "EXEC_ERROR", code_hash=h, status="error",
+                         error_type=type(e).__name__, error_len=len(str(e)))
         except Exception:
             pass
         return {"error": f"{type(e).__name__}: {e}"}

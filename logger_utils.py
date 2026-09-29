@@ -85,9 +85,28 @@ def _log_dir() -> Path:
     return fallback
 
 
+def _in_executor() -> bool:
+    """True inside the analysis-sandbox image (`PDC_EXECUTOR=1`, set by
+    executor/Dockerfile and passed to every runner). Read at call time."""
+    return (os.environ.get("PDC_EXECUTOR") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def get_logger():
-    """Return a configured logger writing to <DATA_ROOT>/logs/datachat.log and stdout."""
+    """Return a configured logger writing to <DATA_ROOT>/logs/datachat.log and stdout.
+
+    Inside the sandbox image the FILE handler is never added: every job runs
+    as the uid that would own that file, so a later job — another user's —
+    could open() it and read what earlier jobs logged. The sandbox logs to
+    stdout only (Docker collects it); the web service keeps the durable copy
+    of each job's outcome.
+    """
     logger = logging.getLogger("datachat")
+    if not logger.handlers and _in_executor():
+        fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
+        logger.setLevel(logging.INFO)
     if not logger.handlers:
         try:
             log_dir = _log_dir()
