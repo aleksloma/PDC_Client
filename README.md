@@ -158,7 +158,7 @@ To run the stack you need:
 | `SECRET_KEY` | **Required.** Local session-cookie signing secret, at least 32 characters. Generate once with `python -c "import secrets; print(secrets.token_hex(32))"`. The app refuses to start (`SECRET_KEY_UNSET`) without it. |
 | `DATA_ROOT` | Local-disk root for raw data + chats. Mount a volume. |
 | `SCHEMA_VALUE_DENY_COLUMNS` | Optional. Comma-separated column names (case-insensitive) whose values never reach the brain: those columns send name, dtype and counts only. Empty by default. |
-| `SHARE_ALLOWED_DOMAINS` | Optional. Comma-separated recipient domains a chat, conversation or dashboard may be shared with. Empty by default: the domains of the administrator accounts are used. |
+| `SHARE_ALLOWED_DOMAINS` | Optional. Comma-separated recipient domains a chat, conversation or dashboard may be shared with. Empty by default: the domains of the administrator accounts are used, or, when none has an email address, the domains of all accounts with one; with no such account every share is refused. |
 | `SSO_ALLOW_GUESTS` | Optional, default `false`. `true` lets guests (`#EXT#`) of your Entra tenant sign in with Microsoft. See [`docs/SSO_MICROSOFT.md`](docs/SSO_MICROSOFT.md). |
 | `SSO_AUTO_PROVISION` | Optional, default `false`. `true` creates an account at the Microsoft sign-in of an identity that has none; otherwise such a sign-in is refused. Requires "Assignment required? = Yes" on the Entra enterprise application. |
 
@@ -206,7 +206,8 @@ users get a 500 when they try to sign in.
 
 **Sharing.** A chat, a conversation or a dashboard can be shared only with
 addresses in the allowed domains (`SHARE_ALLOWED_DOMAINS`, else the domains of
-the administrator accounts). One address outside them refuses the whole share
+the administrator accounts, else the domains of all accounts with an email
+address). One address outside them refuses the whole share
 (`400 RECIPIENT_DOMAIN_NOT_ALLOWED`): nothing is shared and no account is
 created. An allowed address without an account gets a password-less account
 (Microsoft-only while single sign-on is enabled). A chat's owner can remove a

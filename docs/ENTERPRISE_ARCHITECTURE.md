@@ -1367,7 +1367,8 @@ alone (no brain-side list is consulted). The share routes
 `POST /api/dashboards/{id}/share`) check every recipient against the allowed
 domains before anything is written (`routes.auth.share_recipient_refusal`):
 the client setting `SHARE_ALLOWED_DOMAINS` when set, otherwise the domains of
-the existing administrator accounts, derived at call time. One recipient
+the existing administrator accounts, or, when no administrator has an email
+address, the domains of every account with one, derived at call time. One recipient
 outside them refuses the whole request (`400`, code
 `RECIPIENT_DOMAIN_NOT_ALLOWED`): nothing is shared, no account is created, no
 mail is sent; with no allowed domain at all every share is refused. Beyond

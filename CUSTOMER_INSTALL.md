@@ -74,10 +74,11 @@ Read these before you upgrade an existing install to this release.
   stored by an earlier release are filtered the same way; nothing needs to
   be re-uploaded.
 - Sharing is limited to allowed domains: set SHARE_ALLOWED_DOMAINS, or the
-  domains of your administrator accounts are used; an out-of-domain share is
-  refused and creates no account. With neither (only the `ladmin` account and
-  no promoted administrator), every share is refused until you set it or
-  promote one (see "Sharing" in §2).
+  domains of your administrator accounts are used; when no administrator has
+  an email address (only the `ladmin` account), the domains of all existing
+  accounts with an email address are used. An out-of-domain share is refused
+  and creates no account. With no account that has an email address, every
+  share is refused until you set SHARE_ALLOWED_DOMAINS (see "Sharing" in §2).
 - A share recipient whose data role does not cover a chat's database tables
   no longer gets those tables (snapshot or live) when asking a new question or
   editing one in the shared chat; uploaded files are unaffected.
@@ -523,12 +524,15 @@ with addresses in the allowed domains. `SHARE_ALLOWED_DOMAINS` in
 `SHARE_ALLOWED_DOMAINS=bank.example,partner.example` (case-insensitive; a
 leading `@` is accepted). Left empty, the allowed domains are those of your
 administrator accounts: every user whose permission is **Local admin**, plus
-`ladmin` when its username is an address. The derived list is read at each
-share, so a promotion counts at once; a change to the setting needs a restart
-of the web container. With no setting and no administrator address (the default
-`ladmin` username is not one), every share is refused with "Sharing is not
-configured: the administrator must set SHARE_ALLOWED_DOMAINS (or promote an
-administrator account)."
+`ladmin` when its username is an address. When none of them has an address
+(the default `ladmin` username is not one), the allowed domains are those of
+every existing account with an email address — not while
+`ALLOW_SELF_REGISTRATION` is on, since anyone could then add a domain by
+signing up. The derived list is read at
+each share, so a new account or a promotion counts at once; a change to the
+setting needs a restart of the web container. With no setting and no account
+that has an email address, every share is refused with "Sharing is not configured: no account with an email address exists yet, so the administrator must set SHARE_ALLOWED_DOMAINS."
+(logged once as `SHARE_DOMAINS_UNCONFIGURED`).
 
 If any recipient of a share is outside the allowed domains, the whole share
 is refused (`400`, code `RECIPIENT_DOMAIN_NOT_ALLOWED`): nothing is shared,
