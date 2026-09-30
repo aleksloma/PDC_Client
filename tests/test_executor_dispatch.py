@@ -671,7 +671,7 @@ def test_a_failed_startup_greeting_is_retried_exactly_once_not_per_dispatch(
     assert left == [], left
 
 
-def test_sweep_orphans_removes_stale_job_dirs_and_stale_strays(dispatcher, exec_env):
+def test_sweep_orphans_removes_stale_job_dirs_and_stale_strays(dispatcher, exec_env, written_by_the_sandbox):
     """INVERTED on purpose: an aged non-job entry is now REMOVED.
 
     The previous version of this test asserted that `keep_me` SURVIVED, and
@@ -2088,6 +2088,19 @@ STRAY_REFUSED = "EXEC_STRAY_SWEEP_REFUSED"
 TWO_HOURS_S = 2 * 3600
 
 
+@pytest.fixture
+def written_by_the_sandbox(dispatcher, monkeypatch):
+    """The web-side sweep leaves alone every entry ITS OWN uid owns (that is
+    what protects a misconfigured EXECUTOR_SHARED_DIR pointed at customer
+    state). In production a stray in the jobs root is written by the
+    SANDBOX's uid; the entries these tests create belong to the test's own
+    uid, which on Linux is also the sweep's. Make the sweep see a different
+    identity, as production does. (On Windows there is no euid and the rule
+    does not apply.)"""
+    if hasattr(os, "geteuid"):
+        monkeypatch.setattr(dispatcher, "_own_euid", lambda: os.geteuid() + 1)
+
+
 def _age(path, seconds: float = TWO_HOURS_S) -> None:
     """Back-date an entry past the sweep's age threshold.
 
@@ -2114,7 +2127,7 @@ def _reset_stray_latch(dispatcher):
         dispatcher._STRAY_REFUSED.update(saved)
 
 
-def test_an_aged_stray_file_is_removed(dispatcher, exec_env, monkeypatch):
+def test_an_aged_stray_file_is_removed(dispatcher, exec_env, written_by_the_sandbox, monkeypatch):
     """The commonest shape: generated code writing `open("/jobs/x", "w")`."""
     stray = exec_env / "stash.txt"
     stray.write_text("exfiltrated", encoding="utf-8")
@@ -2129,7 +2142,7 @@ def test_an_aged_stray_file_is_removed(dispatcher, exec_env, monkeypatch):
     assert "kind=file" in hits[0]["message"], hits[0]["message"]
 
 
-def test_an_aged_stray_directory_is_removed_with_its_contents(dispatcher, exec_env,
+def test_an_aged_stray_directory_is_removed_with_its_contents(dispatcher, exec_env, written_by_the_sandbox,
                                                               monkeypatch):
     stray = exec_env / "stash_dir"
     stray.mkdir()
@@ -2145,7 +2158,7 @@ def test_an_aged_stray_directory_is_removed_with_its_contents(dispatcher, exec_e
     assert "kind=dir" in hits[0]["message"], hits[0]["message"]
 
 
-def test_a_job_id_shaped_stray_file_is_removed(dispatcher, exec_env):
+def test_a_job_id_shaped_stray_file_is_removed(dispatcher, exec_env, written_by_the_sandbox):
     """The case the widening would otherwise have missed.
 
     `create_job_dir` only ever makes DIRECTORIES, so a 32-hex name that is a
@@ -2174,7 +2187,7 @@ def test_a_fresh_stray_is_kept(dispatcher, exec_env):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
-def test_an_aged_stray_symlink_is_unlinked_and_never_followed(dispatcher, exec_env,
+def test_an_aged_stray_symlink_is_unlinked_and_never_followed(dispatcher, exec_env, written_by_the_sandbox,
                                                               tmp_path):
     """Generated code chooses where a symlink points, and this sweep runs in
     the container where `DATA_ROOT` IS mounted — so the link is UNLINKED and
@@ -2280,7 +2293,7 @@ def test_an_unresolvable_jobs_dir_fails_closed(dispatcher, exec_env, monkeypatch
     assert "unresolved" in hits[0]["message"], hits[0]["message"]
 
 
-def test_a_stray_name_carrying_a_newline_is_logged_on_one_line(dispatcher, exec_env,
+def test_a_stray_name_carrying_a_newline_is_logged_on_one_line(dispatcher, exec_env, written_by_the_sandbox,
                                                                monkeypatch):
     """The name of anything that is not a job directory was chosen by
     generated code, so it is untrusted text on a newline-delimited line —
