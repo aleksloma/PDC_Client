@@ -161,7 +161,7 @@ PDC_Client/
 | [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | Brain `/v1/*` request/response shapes (what this client calls) |
 | [`docs/CLIENT_ENDPOINTS.md`](docs/CLIENT_ENDPOINTS.md) | This client's HTTP surface (dashboard contract) |
 | [`docs/BUILD_AND_RUN.md`](docs/BUILD_AND_RUN.md) | Build, run, configure, logs |
-| [`docs/DATA_PROCESSING.md`](docs/DATA_PROCESSING.md) | For customer reviewers: brain hosting, the language model, retention, sub-processors, administrator access; contract facts left as [FILL] |
+| [`docs/DATA_PROCESSING.md`](docs/DATA_PROCESSING.md) | For customer reviewers: brain hosting, the language model, retention, sub-processors, administrator access; facts neither repo records are marked "to be confirmed by PowerDataChat" |
 | [`docs/LIVE_TABLES_PLAN.md`](docs/LIVE_TABLES_PLAN.md) | Live mode for large database tables: the registry half that has shipped (mode field, cell thresholds, mode endpoint, sampled profile, admin UI) and the design of the query path that follows |
 | [`docs/EXECUTOR_PROTOCOL.md`](docs/EXECUTOR_PROTOCOL.md) | The `pdc-client` ↔ `pdc-executor` contract: trust model, job-dir ownership, request/response, serialization matrix, status→error mapping, what the main app refuses to read |
 | [`RELEASES.md`](RELEASES.md) | One entry per tagged release: commit, both image digests, scope, release-gate results and any accepted scan findings with their reasons |
