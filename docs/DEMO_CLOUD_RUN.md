@@ -387,6 +387,47 @@ Remove the check's throwaway account and dashboard afterwards.
 
 ## Deploy history
 
+**2026-09-30 — `main` at `e396e49`.** The September follow-ups: sharing
+domains derived from every account when no administrator has an address, the
+share note read from `comment`, and the filled-in data-processing facts (not a
+tagged release). Built by Cloud Build `1bdfa931-7f64-44fa-817e-8188bee6b4bb`
+(both images stamped `e396e49`, `BUILD_TIME=2026-09-30T09:57:05Z`):
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:e396e49` | `sha256:44b4bc57367c0f1be9dff430f38960b630c109619030b9b66fa9d84bb425edf9` |
+| `pdcexecutor-demo:e396e49` | `sha256:75642f81ff2e73db6e67d4b2b9129907e5bf4ed15a15e4a63015d97bd77ef6e4` |
+
+Revision `pdcclient-demo-e396e49`, serving 100 % since 2026-09-30 ~10:09 UTC.
+It replaced `pdcclient-demo-b7527a6`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise \
+  --region=europe-west1 --to-revisions=pdcclient-demo-b7527a6=100
+```
+
+Backup taken before the deploy:
+`gs://pdc-enterprise-client-demo-data-backups/20260930-095747/`, which matched
+the data bucket in size (365,715,955 bytes) and in its 485 object names.
+
+The spec change was image-only (two `image:` lines and the template name),
+checked by a diff against the export before the Admin API `PUT`. Candidate
+checks (`candidate---…` URL) all passed:
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`, and `/version` reported `e396e49`.
+- `/lab` carried `window.__DIRECT_UPLOAD__ = true`.
+- A self-registered throwaway account signed in (the landing's form token
+  posted with the password), uploaded `sample_sales.csv`, got a chart from a
+  question (sandbox job `EXEC_JOB_END status=ok`), then created a dashboard,
+  pinned the chart, read it back and deleted it.
+- Revision log: `EXECUTOR_HANDSHAKE_OK version=e396e49`; no
+  `EXECUTOR_SHARED_DIR_*`, no `BACKEND_REQUEST_REFUSED`, no errors, no 5xx.
+- After the shift, `client.powerdatachat.com` reported the same `/version` and
+  `/health`, and `pdcbrain` gained no revision (`pdcbrain-00016-95f` still serving).
+
+The throwaway account (and its chat) was removed afterwards through
+`/api/admin/users/remove`.
+
 **2026-09-29 — `main` at `b7527a6`.** Profile autofill hints and AI drafts
 for added columns (not a tagged release). Built by Cloud Build
 `6410995c-14da-4f13-a285-43b6f1899a20` (both images stamped `b7527a6`,
