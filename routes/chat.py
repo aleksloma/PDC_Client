@@ -2328,7 +2328,8 @@ async def share_delete(request: Request, chat_id: str, recipient: str):
 
 @router.post("/{chat_id}/share")
 async def share_post(request: Request, chat_id: str):
-    """Body: {emails: ["a@x.com", ...], message?: "..."}.
+    """Body: {emails: ["a@x.com", ...], comment?: "..."}; the share dialog
+    sends the note as `comment`, and `message` is still read as a fallback.
 
     Adds the recipients to this chat's sharing list and asks the brain to
     SMTP-relay an invite email to each. The brain's SMTP relay uses this
@@ -2356,7 +2357,7 @@ async def share_post(request: Request, chat_id: str):
     refusal = share_recipient_refusal(recipients)
     if refusal:
         return JSONResponse(refusal, status_code=400)
-    message_text = (body.get("message") or "").strip()
+    message_text = (body.get("comment") or body.get("message") or "").strip()
 
     store = local_store.ChatDataStore(chat_id)
     # A direct share makes the access deliberate: a dashboard share that

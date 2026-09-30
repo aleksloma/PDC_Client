@@ -6,6 +6,8 @@
   an address. An out-of-domain recipient is refused (400
   RECIPIENT_DOMAIN_NOT_ALLOWED) and NO account is created. With no address
   at all every share is refused and SHARE_DOMAINS_UNCONFIGURED is logged once.
+- The share dialog's note (`comment`; `message` as a fallback) reaches the
+  mail relay.
 - A same-domain recipient without an account gets the password-less
   placeholder as before, and after activating it (a reset link) sees the chat.
   With Microsoft SSO on, the placeholder is SSO-only: the reset page refuses
@@ -20,6 +22,7 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
 
+import brain_client
 import local_store
 import routes.auth as auth_mod
 import routes.chat as chat_mod
@@ -30,6 +33,8 @@ from tests.conftest import csrf_form
 OWNER = "owner@acme.com"
 CHAT = "c_sharepolicy1"
 PW = "a-good-password-1"
+# The real relay call, captured before any fixture replaces it.
+_REAL_SEND_SHARE_EMAIL = brain_client.send_share_email
 
 
 @pytest.fixture
@@ -184,6 +189,30 @@ def test_the_other_share_routes_apply_the_same_rule(world, route):
                         json={"allowed_emails": ["m@gmail.com"]})
     assert r.status_code == 400, (route, r.status_code, r.text[:200])
     assert not local_store.AuthStore().user_exists("m@gmail.com")
+
+
+# ---------------------------------------------------------------- the note
+@pytest.mark.parametrize("body, note", [
+    ({"comment": "See the Q3 figures"}, "See the Q3 figures"),       # what the page sends
+    ({"message": "legacy note"}, "legacy note"),                     # the older key
+    ({"comment": "new", "message": "old"}, "new"),
+])
+def test_the_share_note_reaches_the_mail_relay(world, monkeypatch, body, note):
+    client, _ = world
+    # Capture at the relay call itself, so the real send_share_email builds
+    # the payload the brain turns into the mail body.
+    posted = []
+    monkeypatch.setattr(brain_client, "send_share_email", _REAL_SEND_SHARE_EMAIL)
+    monkeypatch.setattr(brain_client, "_post",
+                        lambda path, payload, **kw: posted.append((path, payload))
+                        or {"smtp_configured": True, "sent": payload["to"], "failed": []})
+    friend = "friend@acme.com"
+    local_store.AuthStore().create_account(friend)
+    r = client.post(f"/api/chat/{CHAT}/share", json={"emails": [friend], **body})
+    assert r.status_code == 200, r.text
+    assert [p for p, _ in posted] == ["/v1/send_share_email"]
+    assert posted[0][1]["message"] == note
+    assert posted[0][1]["to"] == [friend]
 
 
 # ---------------------------------------------------------------- placeholders
