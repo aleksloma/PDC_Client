@@ -780,28 +780,55 @@ and deploy files.
 ### Branch protection for `main`
 
 Branch protection is a GitHub setting, not a file in the repository, so it has
-to be set by a repository administrator: **Settings → Branches → Add branch
-ruleset** (or a classic branch protection rule) for `main`, with:
+to be set by a repository administrator: **Settings → Branches** (a classic
+branch protection rule) for `main`, or the API call below. The rule applied
+to `main` since 2026-09-30:
 
-| Setting | Value |
-|---|---|
-| Require a pull request before merging | On |
-| Required approvals | 1 |
-| Require review from Code Owners | On |
-| Dismiss stale pull request approvals when new commits are pushed | On |
-| Require status checks to pass before merging | On |
-| Required status checks | `tests`, `executor-tests`, `images` |
-| Require branches to be up to date before merging | On |
-| Require conversation resolution before merging | On |
-| Block force pushes | On |
-| Restrict deletions | On |
-| Do not allow bypassing the above settings (include administrators) | On |
+| Setting | Target | Applied today |
+|---|---|---|
+| Require a pull request before merging | On | On |
+| Required approvals | 1 | **0** — single maintainer, see below |
+| Require review from Code Owners | On | **Off** — single maintainer, see below |
+| Dismiss stale pull request approvals when new commits are pushed | On | On |
+| Require status checks to pass before merging | On | On |
+| Required status checks | `tests`, `executor-tests`, `images` | `tests`, `executor-tests`, `images` |
+| Require branches to be up to date before merging | On | On |
+| Require conversation resolution before merging | On | On |
+| Block force pushes | On | On |
+| Restrict deletions | On | On |
+| Do not allow bypassing the above settings (include administrators) | On | On |
 
-A repository with a single maintainer cannot satisfy "Require review from
-Code Owners" on its own pull requests: GitHub does not let an author approve
-their own pull request. Either add a second maintainer account as a code
-owner, or grant the maintainer a documented bypass for emergencies and record
-each use.
+The repository has a single maintainer, who cannot satisfy "Require review
+from Code Owners" or a required approval on their own pull requests: GitHub
+does not let an author approve their own pull request, so either setting
+would block every merge. Both stay off until a second maintainer account is
+added as a code owner; then set the approvals to 1 and code-owner review on.
+Because administrators are included, the maintainer's own changes reach
+`main` only through a pull request whose three checks pass on a branch that
+is up to date with `main`; a direct push to `main` is refused.
+
+The applied rule, as one call (`protection.json` holds the JSON below):
+
+```bash
+gh api -X PUT repos/aleksloma/PDC_Client/branches/main/protection --input protection.json
+```
+
+```json
+{
+  "required_status_checks": {"strict": true, "contexts": ["tests", "executor-tests", "images"]},
+  "enforce_admins": true,
+  "required_pull_request_reviews": {
+    "required_approving_review_count": 0,
+    "require_code_owner_reviews": false,
+    "dismiss_stale_reviews": true
+  },
+  "restrictions": null,
+  "required_conversation_resolution": true,
+  "allow_force_pushes": false,
+  "allow_deletions": false,
+  "required_linear_history": false
+}
+```
 
 Check the result with:
 
