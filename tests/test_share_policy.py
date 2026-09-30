@@ -1,9 +1,11 @@
 """Sharing: allowed domains, placeholders, revocation.
 
 - A recipient's domain must be in SHARE_ALLOWED_DOMAINS or, when that is
-  empty, among the domains of the existing administrator accounts. An
-  out-of-domain recipient is refused (400 RECIPIENT_DOMAIN_NOT_ALLOWED) and
-  NO account is created.
+  empty, among the domains of the existing administrator accounts, or, when
+  no administrator has an address, among the domains of every account with
+  an address. An out-of-domain recipient is refused (400
+  RECIPIENT_DOMAIN_NOT_ALLOWED) and NO account is created. With no address
+  at all every share is refused and SHARE_DOMAINS_UNCONFIGURED is logged once.
 - A same-domain recipient without an account gets the password-less
   placeholder as before, and after activating it (a reset link) sees the chat.
   With Microsoft SSO on, the placeholder is SSO-only: the reset page refuses
@@ -37,6 +39,7 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "PUBLIC_BASE_URL", "https://pdc.acme.com")
     import auth_limiter
     auth_limiter.reset()
+    monkeypatch.setitem(auth_mod._SHARE_UNCONFIGURED_LOGGED, "logged", False)
     store = local_store.AuthStore()
     store.create_account(OWNER)
     store.set_password(OWNER, PW)
@@ -104,11 +107,66 @@ def test_the_configured_domains_replace_the_derived_ones(world, monkeypatch):
     assert _share(client, ["y@bank.ge"]).status_code == 200
 
 
-def test_no_admin_domain_and_no_setting_refuses_every_share(world):
+def test_password_users_at_one_domain_share_within_it_without_an_admin_address(world):
+    # A ladmin-only install (the bootstrap username is not an address, no
+    # promoted administrator) with two password users at one domain.
     client, _ = world
-    local_store.AuthStore().set_role(OWNER, "user")
-    r = _share(client, ["colleague@acme.com"])
+    store = local_store.AuthStore()
+    store.set_role(OWNER, "user")
+    store.create_account("colleague@acme.com")
+    store.set_password("colleague@acme.com", PW)
+    r = _share(client, ["third@acme.com"])
+    assert r.status_code == 200, r.text
+    assert store.user_exists("third@acme.com") and not store.has_password("third@acme.com")
+    assert "third@acme.com" in client.get(f"/api/chat/{CHAT}/share").json()["shared_with"]
+    refused = _share(client, ["someone@gmail.com"])
+    assert refused.status_code == 400
+    assert refused.json()["code"] == "RECIPIENT_DOMAIN_NOT_ALLOWED"
+
+
+def test_the_all_accounts_fallback_never_widens_an_admin_derived_set(world):
+    client, _ = world
+    store = local_store.AuthStore()
+    store.create_account("partner@other.com")
+    store.set_password("partner@other.com", PW)
+    assert _share(client, ["x@other.com"]).status_code == 400
+    assert not store.user_exists("x@other.com")
+
+
+def test_self_registration_turns_the_all_accounts_fallback_off(world, monkeypatch):
+    # With open sign-up anyone can create an account at any domain; that
+    # must not make the domain a share target.
+    client, _ = world
+    monkeypatch.setattr(settings, "ALLOW_SELF_REGISTRATION", True)
+    store = local_store.AuthStore()
+    store.set_role(OWNER, "user")
+    store.create_account("visitor@gmail.com")
+    store.set_password("visitor@gmail.com", PW)
+    r = _share(client, ["someone@gmail.com"])
     assert r.status_code == 400 and "SHARE_ALLOWED_DOMAINS" in r.json()["error"]
+    assert not store.user_exists("someone@gmail.com")
+
+
+def test_no_email_account_refuses_the_share_and_logs_once(world, monkeypatch):
+    client, sent = world
+    store = local_store.AuthStore()
+    assert store.remove_user(OWNER)
+    chat = local_store.ChatDataStore(CHAT)
+    meta = chat.read_meta()
+    meta["owner"] = "ladmin"
+    chat.write_meta(meta)
+    lines = []
+    monkeypatch.setattr(auth_mod, "log_with_sid",
+                        lambda sid, level, message, **kw: lines.append(message))
+    client.post("/_login/ladmin")
+    for _ in range(2):
+        r = _share(client, ["colleague@acme.com"])
+        assert r.status_code == 400, r.text
+        assert r.json()["code"] == "RECIPIENT_DOMAIN_NOT_ALLOWED"
+        assert "SHARE_ALLOWED_DOMAINS" in r.json()["error"]
+    assert not store.user_exists("colleague@acme.com")
+    assert sent == []
+    assert len([m for m in lines if "SHARE_DOMAINS_UNCONFIGURED" in m]) == 1
 
 
 @pytest.mark.parametrize("route", ["dashboard", "conversation"])

@@ -112,8 +112,11 @@ def _local_admin_username() -> str:
 
 SHARE_DOMAIN_REFUSED_TEXT = ("Sharing is limited to your organisation's addresses; "
                              "this address's domain is not among the allowed sharing domains.")
-SHARE_DOMAINS_UNSET_TEXT = ("Sharing is not configured: the administrator must set "
-                            "SHARE_ALLOWED_DOMAINS (or promote an administrator account).")
+SHARE_DOMAINS_UNSET_TEXT = ("Sharing is not configured: no account with an email address "
+                            "exists yet, so the administrator must set SHARE_ALLOWED_DOMAINS.")
+
+# SHARE_DOMAINS_UNCONFIGURED is logged once per process.
+_SHARE_UNCONFIGURED_LOGGED = {"logged": False}
 
 
 def _address_domain(address) -> str:
@@ -126,16 +129,23 @@ def share_allowed_domains() -> frozenset:
 
     SHARE_ALLOWED_DOMAINS (comma-separated) when set; otherwise the domains of
     the existing administrator accounts (permission "admin", plus the
-    bootstrap admin when its username is an address), so an install shares
-    within its own organisation without configuration. Never raises; a
-    failure answers the empty set (every share refused)."""
+    bootstrap admin when its username is an address); when none of those has
+    an address (the default `ladmin` username is not one), the domains of
+    every existing account with an email address — except while
+    ALLOW_SELF_REGISTRATION is on, because anyone can then create an account
+    at any domain and so widen the set. So an install shares
+    within its own organisation without configuration. With no address at
+    all the set is empty and every share is refused (SHARE_DOMAINS_UNCONFIGURED,
+    logged once per process). Never raises; a failure answers the empty set
+    (every share refused)."""
     try:
         raw = str(settings.SHARE_ALLOWED_DOMAINS or "")
         configured = {p.strip().lower().lstrip("@") for p in raw.split(",") if p.strip()}
         if configured:
             return frozenset(configured)
+        rows = AuthStore().list_users()
         derived = set()
-        for row in AuthStore().list_users():
+        for row in rows:
             if str(row.get("role") or "") == "admin":
                 domain = _address_domain(row.get("email"))
                 if domain:
@@ -143,6 +153,16 @@ def share_allowed_domains() -> frozenset:
         admin_domain = _address_domain(_local_admin_username())
         if admin_domain:
             derived.add(admin_domain)
+        if not derived and not settings.ALLOW_SELF_REGISTRATION:
+            for row in rows:
+                address = str(row.get("email") or "").strip().lower()
+                if _EMAIL_RE.fullmatch(address):
+                    derived.add(_address_domain(address))
+        if not derived and not _SHARE_UNCONFIGURED_LOGGED["logged"]:
+            _SHARE_UNCONFIGURED_LOGGED["logged"] = True
+            log_with_sid("share", "warning",
+                         "SHARE_DOMAINS_UNCONFIGURED no account has an email address; "
+                         "every share is refused until SHARE_ALLOWED_DOMAINS is set")
         return frozenset(derived)
     except Exception as e:
         log_with_sid("share", "error",

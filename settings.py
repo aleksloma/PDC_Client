@@ -133,8 +133,9 @@ class Settings(BaseModel):
     SCHEMA_VALUE_DENY_COLUMNS: str = Field(default_factory=lambda: os.getenv("SCHEMA_VALUE_DENY_COLUMNS", ""))
     # Sharing: the recipient domains a chat / dashboard / conversation share
     # may reach (comma-separated, e.g. "bank.ge,partner.ge"). Empty = the
-    # domains of the existing administrator accounts, derived at call time
-    # (routes.auth.share_allowed_domains).
+    # domains of the existing administrator accounts, or, when none has an
+    # address, of every account with an email address, derived at call time
+    # (routes.auth.share_allowed_domains); no address at all = every share refused.
     SHARE_ALLOWED_DOMAINS: str = Field(default_factory=lambda: os.getenv("SHARE_ALLOWED_DOMAINS", ""))
 
     # Schema autofill — same defaults as global (backend/routes/schema.py).
