@@ -120,7 +120,14 @@ Debian `libxml2` package in the image. The application does parse XML: every
 statically links its own libxml2 2.14.6, so the Debian package is not on the
 .xlsx path.
 
-Current state of the working tree on 2026-09-29, before the next release:
-web suite 3938 passed, 74 skipped, 0 failed (`tests/test_export_plotly_png.py`
-run separately in a Linux container: 8 passed); executor suite as uid 10002
-79 passed, 5 skipped, and as root 83 passed, 1 skipped.
+Verification of `main` after the September 2026 fixes (commit `a2ec7e6`,
+CI run 36680671756, all three checks green), before the next release:
+
+| Gate | Result |
+|---|---|
+| Web suite, Linux, non-root (CI `tests`) | 4091 passed, 63 skipped, 0 failed — the whole `tests/` directory, `tests/test_export_plotly_png.py` included |
+| Executor suite as uid 10002 / as root (CI `executor-tests`) | 79 passed, 5 skipped / 83 passed, 1 skipped |
+| pip-audit, PyPI and OSV, each image's installed set | no known vulnerabilities (web 103 packages, sandbox 53) |
+| Trivy 0.74.0 HIGH/CRITICAL, web image | 0 CRITICAL (the libxml2 finding is gone with the package), 63 HIGH without a published fix, 2 HIGH with a fix: the accepted pip-vendored msgpack and setuptools above |
+| Trivy 0.74.0 HIGH/CRITICAL, sandbox image | 0 CRITICAL, 48 HIGH without a published fix, the same 2 accepted |
+| Re-assessment probes | forged session id (`tests/test_probe_sid_forge.py`) and chart-export SSRF (`tests/test_probe_ssrf_plotly_png.py`, rendering half with real Chromium on Linux) both refused; the original probe scripts were not in the repository and are re-created as these tests |
