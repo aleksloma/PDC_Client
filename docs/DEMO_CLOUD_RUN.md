@@ -387,6 +387,66 @@ Remove the check's throwaway account and dashboard afterwards.
 
 ## Deploy history
 
+**2026-10-02 — `main` at `6b4dce5`.** The "Select from DB" picker grouped by
+connection and schema, the single "Download Analytics" dropdown with the Auto
+Analytics item, decision-tree plots no longer rejected as empty charts, and
+both images built without pip with `urllib3` pinned (not a tagged release).
+Built by Cloud Build `c9234501-67b0-46a9-b624-91bbb20df5fa` (both images
+stamped `6b4dce5`, `BUILD_TIME=2026-10-02T12:28:05Z`):
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:6b4dce5` | `sha256:afdd1ba7a7f783e53da72c6bff4313b5b8bdba7a16958bd075a570d85eb0c264` |
+| `pdcexecutor-demo:6b4dce5` | `sha256:324dd31a369211ff1334a3cc4e32f179d306df283993b794635ef55a11d92bf4` |
+
+Revision `pdcclient-demo-6b4dce5`, serving 100 % since 2026-10-02 ~13:09 UTC;
+it resolved exactly the two digests above. It replaced
+`pdcclient-demo-e396e49`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise \
+  --region=europe-west1 --to-revisions=pdcclient-demo-e396e49=100
+```
+
+Backup taken before the deploy:
+`gs://pdc-enterprise-client-demo-data-backups/20261002-122847/`, which matched
+the data bucket in size (438,787,392 bytes) and in its 515 object names.
+
+The spec change was image-only (two `image:` lines and the template name),
+checked by a diff against the export before the Admin API `PUT`. Candidate
+checks (`candidate---…` URL):
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`, and `/version` reported `6b4dce5`.
+- A self-registered throwaway account signed in, uploaded
+  `sample_sales.csv`, got a chart from a question, then created a dashboard,
+  pinned the chart and read it back.
+- The top bar showed one "Download Analytics" dropdown whose first item read
+  "Run Auto Analytics" with the sparkle icon, and no separate button; the
+  "Select from DB" list was grouped (connection `Moda_Line_Demo`, schema
+  `moda`, 7 tables); a decision-tree question on the sample file rendered a
+  tree image (sandbox job `EXEC_JOB_END status=ok`, `MULTI_PLOT_DONE
+  rendered=1`, no `EmptyChartError`).
+- Revision log: `EXECUTOR_HANDSHAKE_OK version=6b4dce5`; no
+  `EXECUTOR_SHARED_DIR_*`, no `BACKEND_REQUEST_REFUSED`, no
+  `ModuleNotFoundError`, no errors, no 5xx.
+- Direct upload: `/lab` carried `window.__DIRECT_UPLOAD__ = true`, but the
+  browser's `PUT` of a 35 MiB CSV was refused on the candidate URL — the
+  uploads bucket's CORS lists only the two site origins, so that step cannot
+  pass on a `candidate---…` address for any revision. `/upload/init` and
+  `/upload/finalize` answered 200 around a relayed `PUT`. Traffic was shifted
+  on that basis and the full browser sequence (`/upload/init` 200 → `PUT
+  storage.googleapis.com/…` 200 → `/upload/finalize` 200, no multipart
+  `/upload`) then passed on `client.powerdatachat.com`; the uploads bucket
+  was empty afterwards.
+- After the shift, `client.powerdatachat.com` reported the same `/version` and
+  `/health`, the revision log stayed free of errors and 5xx, and `pdcbrain`
+  gained no revision (`pdcbrain-00016-95f` still serving).
+
+The throwaway account (and its three chats and dashboard) was removed
+afterwards through `/api/admin/users/remove`. Two of its empty session
+workspaces stay in the data bucket (`sessions/s_856f14e033208cf2/`,
+`sessions/s_aed10daebc9ad2f1/`, 63 bytes each).
+
 **2026-09-30 — `main` at `e396e49`.** The September follow-ups: sharing
 domains derived from every account when no administrator has an address, the
 share note read from `comment`, and the filled-in data-processing facts (not a
