@@ -502,7 +502,7 @@ Runbook:
    admin action, secrets scrubbed), newest first.
 
 Users then pick registered tables in the Create-New / Add-Data wizard via
-the compact **🗄️ Select from DB** dropdown (names only, searchable,
+the compact **🗄️ Select from DB** dropdown (table names grouped by connection and schema, searchable,
 scrolls past ~8 tables; connector tables never listed).
 
 ---
