@@ -404,7 +404,8 @@ it resolved exactly the two digests above. It replaced
 `pdcclient-demo-e396e49`, which stays available for rollback:
 
 ```bash
-gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-demo-e396e49=100
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise \
+  --region=europe-west1 --to-revisions=pdcclient-demo-e396e49=100
 ```
 
 Backup taken before the deploy:
