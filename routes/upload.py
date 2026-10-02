@@ -903,18 +903,30 @@ async def api_db_tables(request: Request):
         def _visible():
             # Live tables are listed too (queried at question time); the
             # row's `mode` tells the picker which kind it is.
-            rows = DataSourceStore().list_tables(include_connector=False,
-                                                 include_live=True)
+            store = DataSourceStore()
+            rows = store.list_tables(include_connector=False,
+                                     include_live=True)
             # Role gate: only tables the user's role covers right now (a
             # helper failure resolves to Base → empty list, fail-closed).
             allowed = roles_store.allowed_table_ids_for(email)
-            return [r for r in rows if r.get("id") in allowed]
+            # Connection NAMES for the picker's grouping — id and name only,
+            # never host/user/port/database or the masked connection shape.
+            # A failure here costs the group headers, not the list.
+            try:
+                names = {str(c.get("id")): str(c.get("name") or "")
+                         for c in store.read_doc()["connections"]
+                         if isinstance(c, dict) and c.get("id")}
+            except Exception as e:
+                log_with_sid(email, "warning",
+                             f"DB_TABLES_CONN_NAMES_FAILED error={log_safe_value(str(type(e).__name__), 300)}")
+                names = {}
+            return [r for r in rows if r.get("id") in allowed], names
 
         loop = asyncio.get_running_loop()
-        rows = await loop.run_in_executor(_EXEC, _visible)
+        rows, conn_names = await loop.run_in_executor(_EXEC, _visible)
     except Exception as e:
         log_with_sid(email, "warning", f'DB_TABLES_LIST_FAILED: {log_safe_value(str(e), 300)}')
-        rows = []
+        rows, conn_names = [], {}
     from db_sources import table_mode
     return {"tables": [{
         "table_id": r.get("id"),
@@ -923,6 +935,9 @@ async def api_db_tables(request: Request):
         "row_count": r.get("row_count"),
         "refreshed_at": r.get("refreshed_at"),
         "mode": table_mode(r),
+        "connection_id": r.get("connection_id"),
+        "connection_name": conn_names.get(str(r.get("connection_id") or "")) or "",
+        "schema": r.get("schema") or "",
     } for r in rows if r.get("id")]}
 
 

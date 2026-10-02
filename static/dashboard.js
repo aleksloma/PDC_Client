@@ -1251,7 +1251,9 @@ function setupEventListeners() {
   // Auto Analytics button (idle / processing / done state machine)
   AutoAnalytics.init();
 
-  // Download Analytics dropdown: main button toggles menu; menu items dispatch by format.
+  // Download Analytics dropdown: main button toggles menu; the two
+  // [data-format] items dispatch by format. The Auto Analytics item keeps its
+  // own handler (AutoAnalytics.init above) — here it only closes the menu.
   const dlBtn = document.getElementById('btnDownloadReport');
   const dlMenu = document.getElementById('downloadReportMenu');
   if (dlBtn && dlMenu) {
@@ -1259,7 +1261,10 @@ function setupEventListeners() {
       e.stopPropagation();
       dlMenu.classList.toggle('hidden');
     });
-    dlMenu.querySelectorAll('.dropdown-item').forEach(item => {
+    document.getElementById('btnAutoAnalytics')?.addEventListener('click', () => {
+      dlMenu.classList.add('hidden');
+    });
+    dlMenu.querySelectorAll('.dropdown-item[data-format]').forEach(item => {
       item.addEventListener('click', (e) => {
         e.stopPropagation();
         const format = item.dataset.format || 'pdf';
@@ -1301,9 +1306,10 @@ function setupEventListeners() {
 let currentWelcomeMessage = '';
 
 // ===================== Auto Analytics =====================
-// Per-chat background auto-analysis -> branded PPTX. The #btnAutoAnalytics
-// button has three states: idle ("Run Auto Analytics"), processing
-// ("Processing…", disabled) and done ("Download Presentation", green).
+// Per-chat background auto-analysis -> branded PPTX. #btnAutoAnalytics — the
+// first item of the Download Analytics menu — has three states: idle ("Auto
+// Analytics"), processing ("Processing…", disabled) and done ("Download
+// Presentation"; the main #btnDownloadReport turns green).
 const AutoAnalytics = (function () {
   let pollTimer = null;
   let pollChatId = null;
@@ -1334,10 +1340,13 @@ const AutoAnalytics = (function () {
       b.classList.add('auto-analytics-done');
     } else { // idle
       if (icon) icon.textContent = '✨';
-      if (label) label.textContent = _t('lab.run_auto_analytics', 'Run Auto Analytics');
+      if (label) label.textContent = _t('lab.auto_analytics_option', 'Auto Analytics');
       b.disabled = false;
       b.classList.remove('auto-analytics-done');
     }
+    // The main dropdown button's "ready" cue is decided in ONE place, because
+    // the item's visibility can change after this call (owner-only hiding).
+    _syncAnalyticsDropdown();
   }
 
   function stopPolling() {
@@ -1474,6 +1483,35 @@ function _applyOwnerOnlyActions() {
   document.getElementById('btnSchema')?.classList.add('hidden');
   document.getElementById('btnAddData')?.classList.add('hidden');
   document.getElementById('btnAutoAnalytics')?.classList.add('hidden');
+  _syncAnalyticsDropdown();
+}
+
+// The Download Analytics dropdown holds items with DIFFERENT visibility rules
+// (Auto Analytics: open chat + owner; the two "Current Analytics" exports:
+// 2+ charts/tables). Each site toggles `.hidden` on its own items and calls
+// this: the container shows iff at least one item is available.
+function _syncAnalyticsDropdown() {
+  // A finished Auto Analytics run shows green on the main button without
+  // opening the menu — only while its item is actually offered (a share
+  // recipient's item is hidden, so no "ready" cue with nothing behind it).
+  const auto = document.getElementById('btnAutoAnalytics');
+  document.getElementById('btnDownloadReport')?.classList.toggle(
+    'auto-analytics-done',
+    !!auto && !auto.classList.contains('hidden') && auto.dataset.aaState === 'done');
+  const dropdown = document.getElementById('downloadReportDropdown');
+  const menu = document.getElementById('downloadReportMenu');
+  if (!dropdown || !menu) return;
+  const any = !!menu.querySelector('.dropdown-item:not(.hidden)');
+  dropdown.classList.toggle('hidden', !any);
+  if (!any) menu.classList.add('hidden');
+}
+
+// Show/hide the two "Current Analytics" (PDF / PowerPoint) menu items.
+function _setCurrentAnalyticsVisible(show) {
+  document.querySelectorAll('#downloadReportMenu [data-format]').forEach(item => {
+    item.classList.toggle('hidden', !show);
+  });
+  _syncAnalyticsDropdown();
 }
 
 // Show/hide top bar action buttons
@@ -1486,22 +1524,21 @@ function showTopBarActions(show) {
     btnAddData?.classList.remove('hidden');
     btnAuto?.classList.remove('hidden');
     _applyOwnerOnlyActions();
+    _syncAnalyticsDropdown();
   } else {
     btnSchema?.classList.add('hidden');
     btnAddData?.classList.add('hidden');
     btnAuto?.classList.add('hidden');
     document.getElementById('dataAsOfBadge')?.classList.add('hidden');
     AutoAnalytics.stopPolling();
-    // Also hide report dropdown when top bar actions are hidden
-    document.getElementById('downloadReportDropdown')?.classList.add('hidden');
+    // Also hide the report items (and with them the whole dropdown)
+    _setCurrentAnalyticsVisible(false);
     document.getElementById('downloadReportMenu')?.classList.add('hidden');
   }
 }
 
 // Check if conversation has enough reportable content (plots/tables) for analytics export
 function updateReportButtonVisibility(history) {
-  const dropdown = document.getElementById('downloadReportDropdown');
-  if (!dropdown) return;
   let reportableCount = 0;
   (history || []).forEach(m => {
     if (m.role !== 'ai') return;
@@ -1512,12 +1549,7 @@ function updateReportButtonVisibility(history) {
       reportableCount += 1;
     }
   });
-  if (reportableCount >= 2) {
-    dropdown.classList.remove('hidden');
-  } else {
-    dropdown.classList.add('hidden');
-    document.getElementById('downloadReportMenu')?.classList.add('hidden');
-  }
+  _setCurrentAnalyticsVisible(reportableCount >= 2);
 }
 
 // Download analytics report (format: 'pdf' or 'pptx').
@@ -1596,8 +1628,8 @@ async function openChat(chatId) {
     welcomeState.classList.add('hidden');
     chatState.classList.remove('hidden');
     showTopBarActions(true);
-    // Hide report dropdown for new chats (no conversation history yet)
-    document.getElementById('downloadReportDropdown')?.classList.add('hidden');
+    // Hide the report items for new chats (no conversation history yet)
+    _setCurrentAnalyticsVisible(false);
     document.getElementById('downloadReportMenu')?.classList.add('hidden');
 
     // Show welcome message with questions (questions are pre-generated during chat creation)
@@ -3302,7 +3334,7 @@ async function sendMessage() {
               if (el.querySelector('img, iframe, table')) reportable++;
             });
             if (reportable >= 2) {
-              document.getElementById('downloadReportDropdown')?.classList.remove('hidden');
+              _setCurrentAnalyticsVisible(true);
             }
           }
         }
@@ -3367,7 +3399,7 @@ async function sendMessage() {
           if (el.querySelector('img, iframe, table')) reportable++;
         });
         if (reportable >= 2) {
-          document.getElementById('downloadReportDropdown')?.classList.remove('hidden');
+          _setCurrentAnalyticsVisible(true);
         }
       }
     }
@@ -3758,31 +3790,63 @@ function _renderDbTableList() {
   const q = (document.getElementById('dbTableSearch')?.value || '').trim().toLowerCase();
   const selected = new Set(selectedFiles.filter(f => f._isDbTable).map(f => f._tableId));
   list.innerHTML = '';
+  // Group the matching rows by connection, then schema. A row without the
+  // grouping keys (an older cached response) lands in the fallback group.
+  const groups = new Map();
   (_dbTablesCache || []).forEach(t => {
-    const name = t.display_name || '';
-    if (q && !name.toLowerCase().includes(q)) return;
-    // ADD mode: tables the target chat already contains render checked +
-    // DISABLED (display-only — they never join selectedFiles, so the count
-    // badge keeps counting NEW selections only).
-    const already = wizardMode === 'add' && addDataExistingDbTableIds
-      && addDataExistingDbTableIds.has(t.table_id);
-    const row = document.createElement('label');
-    row.className = 'db-table-row' + (already ? ' db-table-row-existing' : '');
-    row.title = t.description || '';
-    row.innerHTML = `
-      <input type="checkbox" class="db-table-check"
-        ${already || selected.has(t.table_id) ? 'checked' : ''} ${already ? 'disabled' : ''} />
-      <span class="db-table-name">${escapeHtml(name)}</span>
-      ${already ? `<span class="db-table-note">${escapeHtml(_t('wizard.db_already_in_chat', 'Already in this chat'))}</span>` : ''}
-    `;
-    if (!already) {
-      row.querySelector('.db-table-check').addEventListener('change', (e) => {
-        _toggleDbTable(t, e.target.checked);
-      });
-    }
-    list.appendChild(row);
+    if (q && !(t.display_name || '').toLowerCase().includes(q)) return;
+    const connId = String(t.connection_id || '');
+    const conn = String(t.connection_name || '');
+    const schema = String(t.schema || '');
+    const gk = JSON.stringify([connId, conn, schema]);
+    if (!groups.has(gk)) groups.set(gk, { connId, conn, schema, rows: [] });
+    groups.get(gk).rows.push(t);
   });
-  if (!list.children.length) {
+  const _ci = (a, b) => a.toLowerCase().localeCompare(b.toLowerCase());
+  // connId as the tie-break keeps two same-named connections apart.
+  const ordered = Array.from(groups.values()).sort((a, b) =>
+    _ci(a.conn, b.conn) || a.connId.localeCompare(b.connId) || _ci(a.schema, b.schema));
+  let rowCount = 0;
+  let lastConnKey = null;
+  ordered.forEach(g => {
+    const connKey = JSON.stringify([g.connId, g.conn]);
+    if (connKey !== lastConnKey) {
+      lastConnKey = connKey;
+      const connHeader = document.createElement('div');
+      connHeader.className = 'db-group-conn';
+      connHeader.textContent = g.conn || _t('wizard.db_unknown_connection', 'Unknown connection');
+      list.appendChild(connHeader);
+    }
+    const schemaHeader = document.createElement('div');
+    schemaHeader.className = 'db-group-schema';
+    schemaHeader.textContent = g.schema || _t('wizard.db_default_schema', '(default schema)');
+    list.appendChild(schemaHeader);
+    g.rows.forEach(t => {
+      const name = t.display_name || '';
+      // ADD mode: tables the target chat already contains render checked +
+      // DISABLED (display-only — they never join selectedFiles, so the count
+      // badge keeps counting NEW selections only).
+      const already = wizardMode === 'add' && addDataExistingDbTableIds
+        && addDataExistingDbTableIds.has(t.table_id);
+      const row = document.createElement('label');
+      row.className = 'db-table-row' + (already ? ' db-table-row-existing' : '');
+      row.title = t.description || '';
+      row.innerHTML = `
+        <input type="checkbox" class="db-table-check"
+          ${already || selected.has(t.table_id) ? 'checked' : ''} ${already ? 'disabled' : ''} />
+        <span class="db-table-name">${escapeHtml(name)}</span>
+        ${already ? `<span class="db-table-note">${escapeHtml(_t('wizard.db_already_in_chat', 'Already in this chat'))}</span>` : ''}
+      `;
+      if (!already) {
+        row.querySelector('.db-table-check').addEventListener('change', (e) => {
+          _toggleDbTable(t, e.target.checked);
+        });
+      }
+      list.appendChild(row);
+      rowCount += 1;
+    });
+  });
+  if (!rowCount) {
     const key = (_dbTablesCache || []).length ? 'wizard.db_no_match' : 'wizard.db_empty';
     const fallback = (_dbTablesCache || []).length ? 'No matching tables'
       : 'No database tables yet — an administrator can register them under Data sources.';
