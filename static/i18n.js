@@ -146,8 +146,9 @@ window.I18N_TRANSLATIONS = {
     'lab.current_analytics_pptx': '📊 Current Analytics – PowerPoint',
     'lab.processing': 'Processing…',
     'lab.download_presentation': 'Download Presentation',
+    'lab.download_auto_analytics': 'Download Auto Analytics',
     'lab.auto_analytics_popup_title': 'Auto Analysis Started',
-    'lab.auto_analytics_popup_body': 'Auto analysis is running in the background. It can take several minutes — you\'ll be notified when it finishes. You can safely close this window.',
+    'lab.auto_analytics_popup_body': 'Auto analysis is running in the background. It can take several minutes. The presentation will be downloaded automatically when it is ready.',
 
     // Wizard (create new chat — single step)
     'wizard.title': 'Create New Chat',
@@ -557,8 +558,9 @@ window.I18N_TRANSLATIONS = {
     'lab.current_analytics_pptx': '📊 მიმდინარე ანალიტიკა – PowerPoint',
     'lab.processing': 'მუშავდება…',
     'lab.download_presentation': 'პრეზენტაციის ჩამოტვირთვა',
+    'lab.download_auto_analytics': 'ავტო ანალიტიკის ჩამოტვირთვა',
     'lab.auto_analytics_popup_title': 'ავტომატური ანალიზი დაიწყო',
-    'lab.auto_analytics_popup_body': 'ავტომატური ანალიზი მუშაობს ფონურ რეჟიმში. ამას შესაძლოა რამდენიმე წუთი დასჭირდეს — დასრულებისას შეგატყობინებთ. ამ ფანჯრის უსაფრთხოდ დახურვა შეგიძლიათ.',
+    'lab.auto_analytics_popup_body': 'ავტომატური ანალიზი მუშაობს ფონურ რეჟიმში. ამას შესაძლოა რამდენიმე წუთი დასჭირდეს. პრეზენტაცია ავტომატურად ჩამოიტვირთება, როგორც კი მზად იქნება.',
 
     // Wizard (single step)
     'wizard.title': 'ახალი ჩატის შექმნა',
@@ -968,8 +970,9 @@ window.I18N_TRANSLATIONS = {
     'lab.current_analytics_pptx': '📊 Текущая аналитика – PowerPoint',
     'lab.processing': 'Обработка…',
     'lab.download_presentation': 'Скачать презентацию',
+    'lab.download_auto_analytics': 'Скачать авто-аналитику',
     'lab.auto_analytics_popup_title': 'Авто-анализ запущен',
-    'lab.auto_analytics_popup_body': 'Авто-анализ выполняется в фоновом режиме. Это может занять несколько минут — мы сообщим, когда он завершится. Это окно можно безопасно закрыть.',
+    'lab.auto_analytics_popup_body': 'Авто-анализ выполняется в фоновом режиме. Это может занять несколько минут. Презентация будет скачана автоматически, когда будет готова.',
 
     // Wizard (single step)
     'wizard.title': 'Создать новый чат',

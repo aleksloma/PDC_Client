@@ -1307,9 +1307,11 @@ let currentWelcomeMessage = '';
 
 // ===================== Auto Analytics =====================
 // Per-chat background auto-analysis -> branded PPTX. #btnAutoAnalytics — the
-// first item of the Download Analytics menu — has three states: idle ("Auto
-// Analytics"), processing ("Processing…", disabled) and done ("Download
-// Presentation"; the main #btnDownloadReport turns green).
+// first item of the Download Analytics menu — has three states: idle ("Run
+// Auto Analytics", ✨), processing ("Processing…", disabled) and done
+// ("Download Auto Analytics", ✨; the main #btnDownloadReport turns green). A
+// run that finishes while this page polls it downloads the presentation once,
+// automatically; a click in the done state downloads the existing file again.
 const AutoAnalytics = (function () {
   let pollTimer = null;
   let pollChatId = null;
@@ -1334,13 +1336,13 @@ const AutoAnalytics = (function () {
       b.disabled = true;
       b.classList.remove('auto-analytics-done');
     } else if (state === 'done') {
-      if (icon) icon.textContent = '📥';
-      if (label) label.textContent = _t('lab.download_presentation', 'Download Presentation');
+      if (icon) icon.textContent = '✨';
+      if (label) label.textContent = _t('lab.download_auto_analytics', 'Download Auto Analytics');
       b.disabled = false;
       b.classList.add('auto-analytics-done');
     } else { // idle
       if (icon) icon.textContent = '✨';
-      if (label) label.textContent = _t('lab.auto_analytics_option', 'Auto Analytics');
+      if (label) label.textContent = _t('lab.run_auto_analytics', 'Run Auto Analytics');
       b.disabled = false;
       b.classList.remove('auto-analytics-done');
     }
@@ -1369,6 +1371,14 @@ const AutoAnalytics = (function () {
         if (data.status === 'done') {
           setState('done');
           stopPolling();
+          // The run finished while this page was polling it: download the
+          // presentation once (polling has stopped, so this fires once per
+          // run). Only when the item is actually offered — a share
+          // recipient's poll reads done too, but their item is hidden.
+          // refresh() and a start() answered done deliberately do not: the
+          // run had already finished when the chat was opened.
+          const b = btn();
+          if (b && !b.classList.contains('hidden')) download(chatId);
         } else if (data.status === 'idle') {
           // Run crashed / reset server-side — allow the user to retry.
           setState('idle');
