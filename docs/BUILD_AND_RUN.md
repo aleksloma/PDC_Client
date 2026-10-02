@@ -701,7 +701,7 @@ time against the built sandbox image and its own pin file.
 
 Every runtime dependency in `requirements.txt` is pinned to an exact version,
 and the security-relevant transitives (`starlette` for fastapi, `joserfc` for
-Authlib, `pillow` for matplotlib) are pinned explicitly even though a parent
+Authlib, `pillow` for matplotlib, `urllib3` for requests) are pinned explicitly even though a parent
 pulls them — their parents' bounds are open-ended, so an unpinned rebuild of
 the same commit could ship a different, never-audited version.
 
@@ -712,9 +712,11 @@ until it is either fixed or written down as accepted:
 # 1. a THROWAWAY venv — never the project venv, never inside the image
 python -m venv /tmp/audit && /tmp/audit/bin/pip install -q pip-audit
 
-# 2. the input is the BUILT IMAGE's installed set, not requirements.txt
-docker run --rm powerdatachat-client:enterprise-<tag> \
-  pip list --format=freeze > /tmp/audit/image.txt
+# 2. the input is the BUILT IMAGE's installed set, not requirements.txt.
+#    Neither image contains pip (it is removed after the install), so the set
+#    is read with importlib.metadata: one name==version line per distribution
+docker run --rm powerdatachat-client:enterprise-<tag> python -c 'import importlib.metadata as m; [print(d.metadata["Name"] + "==" + d.version) for d in m.distributions()]' > /tmp/audit/image.txt
+test -s /tmp/audit/image.txt   # an empty list would audit nothing
 
 # 3. BOTH advisory services — they do not carry the same records
 /tmp/audit/bin/pip-audit --no-deps --disable-pip -r /tmp/audit/image.txt
@@ -723,9 +725,17 @@ docker run --rm powerdatachat-client:enterprise-<tag> \
 
 Why each detail matters:
 
-- **The image, not `requirements.txt`.** The freeze lists transitives that the
-  pin file never names, and `pip` itself. Auditing only the pin file misses
-  exactly the packages nobody chose deliberately.
+- **The image, not `requirements.txt`.** The list carries the transitives that
+  the pin file never names. Auditing only the pin file misses exactly the
+  packages nobody chose deliberately.
+- **No pip in either image.** Both Dockerfiles uninstall pip right after the
+  dependency install and fail the build if `import pip` still works or a
+  `/usr/local/bin/pip*` launcher is left: pip is a build tool, and the copies
+  it vendors (`pip/_vendor`: urllib3, msgpack, setuptools) are reported by an
+  image scan as if the application shipped them. So `pip list` inside an image
+  does not work; `importlib.metadata` gives the same `name==version` lines.
+  The Python base image's bundled ensurepip wheel stays (the sandbox `test`
+  build stage restores pip from it for itself); the shipped images do not.
 - **Both services.** The default (PyPI) and OSV databases overlap but neither
   is a superset; a package can be clean in one and flagged in the other.
 - **`--no-deps --disable-pip`** keeps the scan a pure lookup over the versions
@@ -771,7 +781,7 @@ three jobs. Their names are the required status checks below.
 |---|---|
 | `tests` | Installs `requirements.txt` plus `pytest` and PyYAML on Python 3.12 (the images' version) and runs the whole `tests/` suite, nothing skipped by selection, as the runner's own non-root user (the job fails if it finds itself running as root). |
 | `executor-tests` | Builds the sandbox image's `test` target and runs `executor/tests` twice: as root and as the sandbox user (`--user 10002:10001`). |
-| `images` | Builds both images, runs pip-audit against each image's installed set with both advisory services (PyPI and OSV), and runs Trivy 0.74.0 on both images. Trivy fails the job on a HIGH or CRITICAL finding that has a published fix; findings without a fix are recorded by the release scan (§8), not blocking. `.trivyignore` lists the accepted findings, each also recorded in `RELEASES.md`. |
+| `images` | Builds both images, lists each image's installed set with `importlib.metadata` (the images contain no pip; an empty list fails the job), checks that neither image contains pip (step "Neither image contains pip": no importable `pip` module, no `/usr/local/bin/pip*` launcher), runs pip-audit against each installed set with both advisory services (PyPI and OSV), and runs Trivy 0.74.0 on both images. Trivy fails the job on a HIGH or CRITICAL finding that has a published fix; findings without a fix are recorded by the release scan (§8), not blocking. `.trivyignore` is where an accepted finding is listed, each also recorded in `RELEASES.md`; it currently lists no accepted finding. |
 
 `.github/CODEOWNERS` names the code owner of the isolation boundary, the data
 store, the SQL guard, the rendering sanitisers, the log helper and the build
