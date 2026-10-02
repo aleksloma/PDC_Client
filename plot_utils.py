@@ -1001,6 +1001,25 @@ def _mpl_axis_has_plot(ax):
         return False
 
 
+def _axes_has_annotations(ax):
+    """True if a matplotlib axis holds at least one visible Annotation with
+    non-blank text AND a bbox patch. sklearn's plot_tree draws ONLY such
+    artists (every node is a boxed Annotation in ax.texts), which
+    ax.has_data() ignores — without this a tree reads as an empty chart. The
+    bbox requirement keeps a stray plain `ax.annotate("n=0", ...)` on an
+    otherwise empty chart from passing as one."""
+    try:
+        from matplotlib.text import Annotation
+        for t in getattr(ax, "texts", None) or []:
+            if (isinstance(t, Annotation) and t.get_visible()
+                    and str(t.get_text() or "").strip()
+                    and t.get_bbox_patch() is not None):
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def _bars_are_horizontal(bars):
     """True if a set of bar patches are HORIZONTAL (categories on the Y axis,
     value on X). Horizontal bars share a constant height (thickness) and vary in
@@ -1692,7 +1711,9 @@ def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: b
             # Empty-data guard: check if any axes have actual data before encoding
             fig = plt.gcf()
             axes = fig.get_axes()
-            if axes and not any(ax.has_data() for ax in axes):
+            # An annotation-only axis (sklearn plot_tree) counts as drawn:
+            # has_data() does not see Annotation artists.
+            if axes and not any(ax.has_data() or _axes_has_annotations(ax) for ax in axes):
                 plt.close(fig)
                 return {"ok": False, "error": "EmptyChartError: Chart rendered with no data. The filtered dataset may be empty or the column values may not match the expected filter criteria.", "trace": ""}
             # Near-zero value guard for bar charts: detect meaningless near-zero data
@@ -1795,6 +1816,10 @@ def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: b
                         if hasattr(coll, 'get_paths') and len(coll.get_paths()) > 2:
                             _is_nonstandard_viz = True
                             break
+                # Decision trees (sklearn plot_tree): annotations only — no
+                # bars, lines or points for the sparse guard to count.
+                if not ax.has_data() and _axes_has_annotations(ax):
+                    _is_nonstandard_viz = True
                 if _is_nonstandard_viz:
                     break
 

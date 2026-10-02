@@ -624,7 +624,7 @@ two). An edit of an existing table keeps its stored mode. The design is in
 
 | Method | Path | Behavior |
 |---|---|---|
-| `GET` | `/api/db_tables` | Registered NON-connector tables for the Create-New / Add Data picker, **filtered to the requester's role** (`roles_store.allowed_table_ids_for` — explicit grants ∪ schema/connection scope grants, computed per request): `{tables: [{table_id, display_name, description, row_count, refreshed_at, mode}]}`. LIVE tables are listed too (`mode: "live"`, `refreshed_at` null — they are queried at question time). Connector (helper/join) tables are never listed — they are auto-included through the relations graph and exempt from role checks. A Base-role user with no grants gets an empty list. |
+| `GET` | `/api/db_tables` | Registered NON-connector tables for the Create-New / Add Data picker, **filtered to the requester's role** (`roles_store.allowed_table_ids_for` — explicit grants ∪ schema/connection scope grants, computed per request): `{tables: [{table_id, display_name, description, row_count, refreshed_at, mode, connection_id, connection_name, schema}]}`. `connection_name` is the registered connection's name (`""` when the connection is missing or unnamed) and `schema` is `""` when the table has none — the picker groups its rows by connection, then schema. Only the connection's id and name are read for this; no host, user, port, database or credential is returned. If that name lookup fails (`DB_TABLES_CONN_NAMES_FAILED error=<Type>` in the log) the rows are still listed, with `connection_name: ""`. LIVE tables are listed too (`mode: "live"`, `refreshed_at` null — they are queried at question time). Connector (helper/join) tables are never listed — they are auto-included through the relations graph and exempt from role checks. A Base-role user with no grants gets an empty list. |
 | `POST` | `/session/db_tables` | Body `{table_ids: [...]}`. Sets the temp session's DB-table selection: validates ids, **rejects a directly-selected connector (400)**, accepts a LIVE seed exactly like a snapshot one (the chat loads it as a placeholder and queries it at question time), **rejects seeds outside the requester's role (403 `{error, code:"ROLE_DENIED"}` naming the denied display names)** — the connector CLOSURE below stays exempt (gating connectors would silently break allowed joins) — expands through the connector relations graph (transitive, undirected, capped; a live connector is never added nor walked through — frozen into the session meta so later admin edits never silently change an existing chat), REPLACES any previous selection, and writes meta-only entries built from the registry (no brain call, no snapshot read). The wizard calls it between `/upload` and `/schema_autofill_full`; `/upload` defensively preserves DB entries across its session reset. |
 
 `/schema_autofill_full`, `/generate_chatdata` and `/add_data_to_chat` accept a
@@ -674,7 +674,29 @@ owner-only mutations — `POST /api/chat/{id}/schema` (descriptions),
 `POST /api/chat/{id}/auto_analysis/start` — answer a share recipient
 `403 {"error": "Access denied"}`; when `is_owner` is `false` the `/lab` page
 hides View / Edit Descriptions, Add Data and Auto Analytics instead of letting
-them fail.
+them fail. Auto Analytics is not a top-bar button of its own: it is the first
+item of the **Download Analytics** dropdown, next to "Current Analytics – PDF"
+and "Current Analytics – PowerPoint" (`/download_report`, `/download_pptx`).
+Each item has its own rule — the Auto Analytics item is offered on an open
+chat to its owner, the two Current Analytics items once the conversation holds
+at least two AI charts/tables — and the dropdown is shown only when at least
+one item is. So a share recipient sees no dropdown until the conversation has
+two charts/tables, and then only the two exports. The dropdown button turns
+green when a finished Auto Analytics deck is ready, and only while the Auto
+Analytics item is offered.
+
+The Auto Analytics item reads **Run Auto Analytics** while no deck exists (a
+click calls `POST /api/chat/{id}/auto_analysis/start`), "Processing…"
+(disabled) while a run is in progress, and **Download Auto Analytics** once the
+deck is ready — a click in that state only downloads the existing deck
+(`GET /api/chat/{id}/auto_analysis/download`) and never starts a new run.
+Starting a run shows a popup for 5 seconds: "Auto analysis is running in the
+background. It can take several minutes. The presentation will be downloaded
+automatically when it is ready." While the chat stays open the page polls
+`GET /api/chat/{id}/auto_analysis/status`, and a run that finishes during that
+polling downloads the deck once, automatically. Opening a chat whose deck is
+already finished sets the **Download Auto Analytics** state without
+downloading anything.
 
 ### Admin routes — `/api/admin/*` (ladmin + scoped POWER USERS)
 

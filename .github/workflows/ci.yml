@@ -76,11 +76,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Neither image contains pip (it is removed after the install), so the
+      # installed set is read with importlib.metadata: one `name==version` line
+      # per installed distribution, the format pip-audit reads with -r.
+      # `test -s` fails the job on an empty list instead of auditing nothing.
       - name: Installed package sets of both images
         run: |
-          docker run --rm --entrypoint sh powerdatachat-client:ci -c "pip list --format=freeze" > web-freeze.txt
-          docker run --rm --entrypoint sh powerdatachat-executor:ci -c "pip list --format=freeze" > executor-freeze.txt
+          LIST='import importlib.metadata as m; [print(line) for line in sorted({d.metadata["Name"] + "==" + d.version for d in m.distributions()}, key=str.lower)]'
+          docker run --rm --entrypoint python powerdatachat-client:ci -c "$LIST" > web-freeze.txt
+          docker run --rm --entrypoint python powerdatachat-executor:ci -c "$LIST" > executor-freeze.txt
+          test -s web-freeze.txt && test -s executor-freeze.txt
           wc -l web-freeze.txt executor-freeze.txt
+      - name: Neither image contains pip
+        run: |
+          for i in powerdatachat-client:ci powerdatachat-executor:ci; do
+            docker run --rm --entrypoint sh "$i" -c '! python -c "import pip" 2>/dev/null && ! ls /usr/local/bin/pip* 2>/dev/null'
+          done
       - name: pip-audit (PyPI and OSV advisories)
         run: |
           python -m pip install pip-audit==2.10.1
@@ -93,7 +104,8 @@ jobs:
       # Trivy fails the job on a HIGH or CRITICAL finding that HAS a fix.
       # Findings without a published fix (--ignore-unfixed) are recorded by the
       # release scan, not blocking here (docs/BUILD_AND_RUN.md section 8).
-      # .trivyignore lists the accepted findings, each with its reason.
+      # .trivyignore is where an accepted finding is listed with its reason;
+      # it holds none at present.
       - name: Trivy — web image
         run: >
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock

@@ -118,15 +118,18 @@
           <!-- "Data as of" — shown only for chats that use database tables
                (min refreshed_at across the chat's snapshots). -->
           <span id="dataAsOfBadge" class="data-as-of-badge hidden" title=""></span>
-          <button id="btnAutoAnalytics" class="ghost small top-action-btn report-download-btn hidden" type="button">
-            <span class="aa-btn-icon" aria-hidden="true">✨</span>
-            <span class="aa-btn-label">Run Auto Analytics</span>
-          </button>
+          <!-- ONE analytics dropdown: Auto Analytics (owner only) + the two
+               exports of the current conversation (2+ charts/tables). Each
+               item is shown by its own rule; the container shows when any is. -->
           <div id="downloadReportDropdown" class="dropdown-container hidden">
             <button id="btnDownloadReport" class="ghost small top-action-btn report-download-btn" data-i18n="lab.download_report">📊 Download Analytics</button>
             <div id="downloadReportMenu" class="dropdown-menu hidden">
-              <button class="dropdown-item" data-format="pdf" type="button">📄 PDF</button>
-              <button class="dropdown-item" data-format="pptx" type="button">📊 PowerPoint</button>
+              <button id="btnAutoAnalytics" class="dropdown-item hidden" type="button">
+                <span class="aa-btn-icon" aria-hidden="true">✨</span>
+                <span class="aa-btn-label">Run Auto Analytics</span>
+              </button>
+              <button class="dropdown-item hidden" data-format="pdf" type="button" data-i18n="lab.current_analytics_pdf">📄 Current Analytics – PDF</button>
+              <button class="dropdown-item hidden" data-format="pptx" type="button" data-i18n="lab.current_analytics_pptx">📊 Current Analytics – PowerPoint</button>
             </div>
           </div>
           <button id="btnAddData" class="ghost small top-action-btn hidden" data-i18n="lab.add_data">➕ Add Data</button>
@@ -171,7 +174,7 @@
     <div class="modal-content small-modal auto-analytics-popup">
       <div class="auto-analytics-popup-icon" aria-hidden="true">✨</div>
       <h3 class="auto-analytics-popup-title" data-i18n="lab.auto_analytics_popup_title">Auto Analysis Started</h3>
-      <p class="auto-analytics-popup-text" data-i18n="lab.auto_analytics_popup_body">Auto analysis is running in the background. It can take several minutes — you'll be notified when it finishes. You can safely close this window.</p>
+      <p class="auto-analytics-popup-text" data-i18n="lab.auto_analytics_popup_body">Auto analysis is running in the background. It can take several minutes. The presentation will be downloaded automatically when it is ready.</p>
     </div>
   </div>
 

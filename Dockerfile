@@ -44,12 +44,25 @@ RUN if [ "$INSTALL_MSSQL_ODBC" = "1" ] \
        fi
 
 COPY requirements.txt .
-# The image's bundled pip is a build-time tool, but it still shows up in any
-# dependency scan of the image, so it is kept current HERE rather than in
+# pip is a build-time tool, so its version is fixed HERE rather than in
 # requirements.txt — that file is the application's runtime set. The upgrade
 # runs before the install, so the dependencies are installed by the fixed pip.
 RUN pip install --no-cache-dir --upgrade pip==26.2.1
 RUN pip install --no-cache-dir -r requirements.txt
+# pip leaves the image once the install is done: the running application never
+# calls it, and it carries its own vendored copies of other libraries
+# (pip/_vendor: urllib3, msgpack, setuptools) that an image scan reports as
+# if the application shipped them. The two checks fail the build if a pip
+# module or a pip launcher is left behind. What the removal delivers is exactly
+# that: no installed pip distribution, no launcher, no pip/_vendor tree. The
+# base image's own pip wheel (ensurepip/_bundled) stays, and pip can still be
+# run from it; the scan this repository runs (Trivy) does not report it.
+# NOTHING below this line may call pip. To read the installed set of the built
+# image use importlib.metadata (see .github/workflows/ci.yml).
+RUN python -m pip uninstall -y pip \
+    && rm -f /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.12 \
+    && ! python -c "import pip" 2>/dev/null \
+    && ! ls /usr/local/bin/pip* 2>/dev/null
 
 # Named files only, the way the sandbox image is built: the working tree
 # (tests, docs, env templates, build files, whatever else sits in a checkout)

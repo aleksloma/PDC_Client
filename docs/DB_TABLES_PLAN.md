@@ -203,6 +203,15 @@ DB badge, multi-select.
 checkbox dropdown — names only, search on top, scrolls past ~8 tables; the
 description now shows as a hover tooltip. Selection semantics unchanged.)*
 
+The dropdown groups its rows by connection, then schema: a connection header
+(the registered connection's name, "Unknown connection" when it has none), a
+schema header under it ("(default schema)" when the table has none), and the
+table rows indented beneath. Groups are sorted case-insensitively. The search
+matches the table's display name only, and a group with no matching row is not
+shown. `GET /api/db_tables` supplies `connection_id`, `connection_name` and
+`schema` per row for this — the connection's name only, never its host, user,
+port or credentials. The same list serves Create New and Add Data.
+
 ## Refresh
 
 Background scheduler (same pattern as auto_analytics): re-snapshot registered
