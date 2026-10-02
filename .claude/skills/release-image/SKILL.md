@@ -45,13 +45,15 @@ shared jobs volume holds in-flight jobs only and needs no migration.
   the images have no test runner, so the suite's installed-equals-pinned check
   only ever covers the developer's venv. Run it twice, once per pair of image
   and pin file (`requirements.txt`, then `executor/requirements.txt`):
+  (Neither image contains pip — it is removed after the install — so the
+  installed set is read with `importlib.metadata`.)
   ```
-  docker run --rm powerdatachat-client:enterprise-<tag> pip list --format=freeze > /tmp/image.txt
+  docker run --rm powerdatachat-client:enterprise-<tag> python -c 'import importlib.metadata as m; [print(d.metadata["Name"] + "==" + d.version) for d in m.distributions()]' > /tmp/image.txt
   grep -E '^[A-Za-z0-9].*==' requirements.txt | sed 's/\[.*\]//' | while read -r pin; do
     grep -qix "$pin" /tmp/image.txt || echo "MISMATCH: $pin"
   done
 
-  docker run --rm powerdatachat-executor:enterprise-<tag> pip list --format=freeze > /tmp/exec.txt
+  docker run --rm powerdatachat-executor:enterprise-<tag> python -c 'import importlib.metadata as m; [print(d.metadata["Name"] + "==" + d.version) for d in m.distributions()]' > /tmp/exec.txt
   grep -E '^[A-Za-z0-9].*==' executor/requirements.txt | sed 's/\[.*\]//' | while read -r pin; do
     grep -qix "$pin" /tmp/exec.txt || echo "MISMATCH: $pin"
   done

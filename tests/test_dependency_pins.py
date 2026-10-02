@@ -2,12 +2,14 @@
 
 The client image ships a fully pinned `requirements.txt`, and several of those
 pins carried published advisories (cryptography, starlette via fastapi,
-python-multipart, jinja2, pyarrow, python-dotenv) while three security-relevant
-transitives (starlette, joserfc, pillow) were not pinned at all and floated at
-build time. This pin set bumps every audited pin to at least its highest fix
-version, pins the three transitives explicitly, replaces the Authlib comment
-that justified the old `cryptography<45` constraint, upgrades pip inside the
-Dockerfile before the requirements install (pip itself had advisories), and
+python-multipart, jinja2, pyarrow, python-dotenv) while security-relevant
+transitives (starlette, joserfc, pillow, urllib3) were not pinned at all
+and floated at build time. This pin set bumps every audited pin to at least
+its highest fix version, pins those transitives explicitly, replaces the
+Authlib comment that justified the old `cryptography<45` constraint, upgrades
+pip inside the Dockerfile before the requirements install (the install runs
+with a fixed pip) and REMOVES pip from the image afterwards (a build tool the
+running app never calls, whose vendored urllib3 a scan flagged), and
 moves the nine `TemplateResponse(name, context)` calls to the Starlette-1
 `TemplateResponse(request, name, context)` signature that the bump requires.
 These tests parse `requirements.txt`, the `Dockerfile`, `app.py` and
@@ -75,11 +77,13 @@ FIX_VERSIONS = {
     "jinja2": "3.1.6",
     "pyarrow": "23.0.1",
     "python-dotenv": "1.2.2",
+    "urllib3": "2.8.0",
 }
 
-# Security-relevant transitives that fastapi / Authlib / matplotlib would
-# otherwise leave to the resolver at build time.
-PRIORITY_TRANSITIVES = ["starlette", "joserfc", "pillow"]
+# Security-relevant transitives that fastapi / Authlib / matplotlib / the HTTP
+# libraries (urllib3) would otherwise leave to the resolver at build time.
+PRIORITY_TRANSITIVES = ["starlette", "joserfc", "pillow", "urllib3"]
+URLLIB3_PIN = "2.8.0"
 
 # Packages whose installed version must equal the pin (the priority set).
 INSTALLED_MUST_MATCH = [
@@ -215,8 +219,8 @@ def test_every_requirement_line_is_pinned_exactly():
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("package", PRIORITY_TRANSITIVES)
 def test_priority_transitives_are_pinned_explicitly(package):
-    """starlette (fastapi's), joserfc (Authlib's) and pillow (matplotlib's)
-    are compiled or security-relevant transitives. Without an explicit `==`
+    """starlette (fastapi's), joserfc (Authlib's), pillow (matplotlib's) and
+    urllib3 (the HTTP libraries') are compiled or security-relevant transitives. Without an explicit `==`
     pin the resolver picks whatever satisfies the parent's open-ended bound
     at build time, so two builds of the same commit can ship different
     versions — and the audited version is not the shipped one."""
@@ -225,6 +229,18 @@ def test_priority_transitives_are_pinned_explicitly(package):
         f"{package} is not pinned in requirements.txt — it would float at "
         f"build time; add an explicit `{package}==<version>` line"
     )
+
+
+def test_urllib3_is_pinned_exactly_once_at_the_fixed_version():
+    """The scan flagged urllib3 2.7.0. The application's own copy is pinned
+    `urllib3==2.8.0` — ONE line (a second line would let the later one win
+    silently in `_pins()` and confuse the resolver)."""
+    lines = [raw.split("#", 1)[0].strip() for raw in _requirements_text().splitlines()]
+    hits = [ln for ln in lines if re.match(r"(?i)^urllib3\b", ln)]
+    n_hits = len(hits)
+    assert n_hits == 1, f"expected exactly one urllib3 requirement line, got {hits}"
+    compact = re.sub(r"\s+", "", hits[0])
+    assert compact == f"urllib3=={URLLIB3_PIN}", hits[0]
 
 
 # ---------------------------------------------------------------------------
@@ -259,11 +275,13 @@ def test_authlib_comment_no_longer_claims_the_old_constraint():
 # (4) the Dockerfile upgrades pip BEFORE installing requirements
 # ---------------------------------------------------------------------------
 def test_dockerfile_upgrades_pip_before_requirements():
-    """pip is an image tool, not an application dependency, so its advisories
-    are closed in the Dockerfile: a `RUN pip install ... --upgrade ... pip==X`
+    """pip is a build tool, not an application dependency, so its version is
+    fixed in the Dockerfile: a `RUN pip install ... --upgrade ... pip==X`
     (X >= 26.2.1) must come BEFORE `RUN pip install --no-cache-dir -r
     requirements.txt` — the install itself runs with the fixed pip — and
-    before `USER pdc` (root is still needed to write site-packages)."""
+    before `USER pdc` (root is still needed to write site-packages). pip does
+    not stay in the image: see
+    `test_dockerfile_removes_pip_after_the_requirements_install`."""
     lines = _logical_lines()
     pip_re = re.compile(r"pip install .*--upgrade .*pip==(\d+\.\d+(\.\d+)?)")
 
@@ -294,6 +312,49 @@ def test_dockerfile_upgrades_pip_before_requirements():
     assert upgrade_idx < user_idx, (
         f"pip upgrade (line {upgrade_idx + 1}) must precede `USER pdc` (line {user_idx + 1})"
     )
+
+
+# ---------------------------------------------------------------------------
+# (4b) pip is removed once the dependencies are installed
+# ---------------------------------------------------------------------------
+_PIP_REMOVAL_RE = re.compile(r"\bpip\s+uninstall\s+(?:-\S+\s+)*pip\b")
+_PIP_WORD_RE = re.compile(r"(?<![\w./-])pip3?(?:\.\d+)?(?![\w-])")
+
+
+def test_dockerfile_removes_pip_after_the_requirements_install():
+    """The running application never calls pip, and pip carries vendored
+    copies of other libraries (the flagged urllib3 2.7.0 among them) that an
+    image scan reports. So a RUN step uninstalls pip AFTER `pip install -r
+    requirements.txt` and BEFORE `USER pdc` (root owns site-packages), and no
+    instruction after that step names pip at all."""
+    lines = _logical_lines()
+    removal_hits = [(idx, text) for idx, text in lines
+                    if text.startswith("RUN") and _PIP_REMOVAL_RE.search(text)]
+    n_removals = len(removal_hits)
+    assert n_removals == 1, (
+        "expected exactly one RUN that uninstalls pip; "
+        f"RUN lines: {[t for _, t in lines if t.startswith('RUN')]}"
+    )
+    removal_idx, removal_text = removal_hits[0]
+
+    req_hits = [idx for idx, text in lines
+                if text.startswith("RUN") and re.search(r"pip\s+install\s+.*-r\s+requirements\.txt", text)]
+    assert req_hits, [t for _, t in lines if t.startswith("RUN")]
+    req_idx = req_hits[-1]
+    assert req_idx < removal_idx, (
+        f"pip removal (line {removal_idx + 1}) must follow the requirements install (line {req_idx + 1})"
+    )
+
+    user_hits = [idx for idx, text in lines if re.fullmatch(r"USER\s+pdc", text.strip())]
+    assert user_hits, [t for _, t in lines if t.startswith("USER")]
+    user_idx = user_hits[-1]
+    assert removal_idx < user_idx, (
+        f"pip removal (line {removal_idx + 1}) must precede `USER pdc` (line {user_idx + 1})"
+    )
+
+    later = [(idx + 1, text) for idx, text in lines
+             if idx > removal_idx and _PIP_WORD_RE.search(text)]
+    assert later == [], f"pip is named after its removal step: {later}"
 
 
 # ---------------------------------------------------------------------------

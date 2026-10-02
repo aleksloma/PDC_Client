@@ -43,11 +43,23 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY executor/requirements.txt executor/requirements.txt
-# Same rule as the main image: pip is a build-time tool kept current here
-# rather than in a requirements file, and the upgrade runs BEFORE the install
-# so the dependencies are installed by the fixed pip.
+# Same rule as the main image: pip is a build-time tool whose version is fixed
+# here rather than in a requirements file, and the upgrade runs BEFORE the
+# install so the dependencies are installed by the fixed pip.
 RUN pip install --no-cache-dir --upgrade pip==26.2.1
 RUN pip install --no-cache-dir -r executor/requirements.txt
+# Same rule as the main image again: pip leaves once the install is done. The
+# sandbox never calls it, and pip's vendored libraries (pip/_vendor) would
+# otherwise be reported by an image scan as if the sandbox shipped them. The
+# two checks fail the build if a pip module or launcher is left, so the image
+# holds no installed pip distribution, no launcher and no pip/_vendor tree. The
+# base image's ensurepip wheel stays (pip can still be run from it).
+# NOTHING below this line in this stage may call pip; the `test` stage
+# puts its own pip back from the base image's ensurepip wheel.
+RUN python -m pip uninstall -y pip \
+    && rm -f /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.12 \
+    && ! python -c "import pip" 2>/dev/null \
+    && ! ls /usr/local/bin/pip* 2>/dev/null
 
 # Only the modules the runner imports — never `COPY . .`. No local_store, no
 # db_*, no brain_client, no routes, no templates: the sandbox container cannot
@@ -99,7 +111,13 @@ FROM app AS test
 
 USER root
 
-RUN pip install --no-cache-dir pytest==8.3.3 httpx==0.27.2
+# `app` has no pip (removed after its install), so this stage restores it from
+# the base image's own ensurepip wheel, moves it to the same fixed version as
+# the build, and only then installs the test tools. The runtime stage below
+# does not inherit this stage, so the shipped image stays without pip.
+RUN python -m ensurepip \
+    && python -m pip install --no-cache-dir --upgrade pip==26.2.1 \
+    && python -m pip install --no-cache-dir pytest==8.3.3 httpx==0.27.2
 
 COPY executor/tests/ executor/tests/
 COPY tools/fixtures/sample_sales.csv tools/fixtures/

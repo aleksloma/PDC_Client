@@ -3,9 +3,11 @@
 
 `executor/requirements.txt` must be an identical-version SUBSET of the
 audited root `requirements.txt`: exactly the required list, none of the
-forbidden packages (DB drivers, cryptography, Authlib, httpx, kaleido,
-google-*, ...). `executor/Dockerfile` must build the unprivileged sandbox
-image: the same base image and pip line as the root Dockerfile, uid 10002 in
+forbidden packages (DB drivers, cryptography, Authlib, httpx, urllib3,
+kaleido, google-*, ...). `executor/Dockerfile` must build the unprivileged
+sandbox image: the same base image and pip line as the root Dockerfile, pip
+REMOVED again after the requirements install (only the `test` stage restores
+it, through ensurepip), uid 10002 in
 gid 10001, `USER pdcexec` before `CMD`, a HEALTHCHECK on `/healthz`, the
 thread/allocator ENV set the runner needs, the plotly bake line, and a COPY
 set limited to the modules the runner imports (never `COPY . .`, never
@@ -77,6 +79,9 @@ FORBIDDEN_EXECUTOR_PACKAGES = [
     "cachetools", "pyasn1", "pyasn1_modules", "rsa", "croniter",
     # the styled-table HTML sanitiser: main app only, never in the sandbox
     "nh3",
+    # an HTTP client library: the sandbox holds no HTTP client by decision
+    # (the root file pins it only because the web image's libraries pull it)
+    "urllib3",
 ]
 
 # Dockerfile COPY sources: the modules the runner imports plus the transport.
@@ -562,6 +567,79 @@ def test_dockerfile_default_target_runs_as_pdcexec_and_has_no_test_runner():
     flat = "\n".join(f"{kw} {args}" for kw, args in instructions)
     assert not re.search(r"pip install[^\n]*\bpytest\b", flat), flat
     assert "pytest" not in flat, flat
+
+
+# ---------------------------------------------------------------------------
+# (3b) pip leaves the hardened image; only the test stage puts it back
+# ---------------------------------------------------------------------------
+_PIP_REMOVAL_RE = re.compile(r"\bpip\s+uninstall\s+(?:-\S+\s+)*pip\b")
+_REQ_INSTALL_RE = re.compile(r"pip\s+install\s+.*-r\s+\S*requirements\.txt")
+_PIP_WORD_RE = re.compile(r"(?<![\w./-])pip3?(?:\.\d+)?(?![\w-])")
+
+
+def test_executor_requirements_never_name_urllib3():
+    """urllib3 is pinned in the ROOT file (a transitive of the web image's
+    HTTP libraries). The sandbox installs no HTTP client, so the name must not
+    appear in its requirements at all — not as a pin, not in any other form."""
+    lines = [raw.split("#", 1)[0].strip() for raw in _read(EXEC_REQUIREMENTS).splitlines()]
+    hits = [ln for ln in lines if ln and re.match(r"(?i)^urllib3\b", ln)]
+    assert hits == [], hits
+    assert "urllib3" not in _pins(_read(EXEC_REQUIREMENTS)), sorted(_pins(_read(EXEC_REQUIREMENTS)))
+    root_pin = _pins(_read(ROOT_REQUIREMENTS)).get("urllib3")
+    assert root_pin is not None, "urllib3 is not pinned in the root requirements.txt"
+
+
+def test_dockerfile_default_target_removes_pip_after_its_requirements_install():
+    """pip is a build tool the sandbox never calls, and its vendored libraries
+    (pip/_vendor) are what an image scan reports as if the sandbox shipped
+    them. The removal leaves no installed pip distribution, no launcher and no
+    pip/_vendor tree (the base image's ensurepip wheel stays). The removal step must sit in the chain the DEFAULT
+    target is built from, after the requirements install, before `USER
+    pdcexec`, and nothing after it in that chain may call pip."""
+    runtime = _runtime_instructions(_read(EXEC_DOCKERFILE))
+    runs = [(i, args) for i, (kw, args) in enumerate(runtime) if kw == "RUN"]
+    install = [i for i, r in runs if _REQ_INSTALL_RE.search(r)]
+    assert install, [r for _, r in runs]
+    removal = [i for i, r in runs if _PIP_REMOVAL_RE.search(r)]
+    assert len(removal) == 1, f"expected one pip removal RUN in the default target: {[r for _, r in runs]}"
+    removal_idx = removal[0]
+    assert install[-1] < removal_idx, (install, removal_idx)
+    user_idx = max(i for i, (kw, _) in enumerate(runtime) if kw == "USER")
+    assert removal_idx < user_idx, (removal_idx, user_idx)
+    later = [f"{kw} {args}" for kw, args in runtime[removal_idx + 1:] if _PIP_WORD_RE.search(args)]
+    assert later == [], f"pip named after its removal in the default target: {later}"
+    flat = "\n".join(f"{kw} {args}" for kw, args in runtime)
+    assert "ensurepip" not in flat, "the default target must not restore pip"
+
+
+def test_dockerfile_removal_is_in_the_stage_the_default_target_inherits():
+    """The removal lives in `app` (the stage `runtime` inherits whole), never
+    only in the trailing stage: `runtime` stays instruction-free, and `test`
+    builds on an `app` that already has no pip."""
+    stages = {name: instr for name, _, instr in _stages(_read(EXEC_DOCKERFILE))}
+    app_runs = [args for kw, args in stages["app"] if kw == "RUN"]
+    assert any(_PIP_REMOVAL_RE.search(r) for r in app_runs), app_runs
+    assert stages["runtime"] == [], stages["runtime"]
+
+
+def test_dockerfile_test_stage_restores_pip_before_installing_pytest():
+    """`app` has no pip, so the test stage re-creates it (ensurepip) BEFORE
+    the pytest install, and never removes it again — and the last stage is
+    still the hardened one, so the restored pip cannot ship by default."""
+    text = _read(EXEC_DOCKERFILE)
+    _, base, test_stage = _test_stage(text)
+    assert base == "app", base
+    flat = "\n".join(f"{kw} {args}" for kw, args in test_stage)
+    ensure = re.search(r"python\s+-m\s+ensurepip\b", flat)
+    assert ensure, flat
+    pytest_install = re.search(r"pip\s+install\b[^\n]*?\bpytest\b", flat)
+    assert pytest_install, flat
+    first_pip_install = re.search(r"pip\s+install\b", flat)
+    assert ensure.start() < first_pip_install.start(), flat
+    assert ensure.start() < pytest_install.start(), flat
+    last_name = _stages(text)[-1][0]
+    assert last_name == "runtime" and last_name != "test", last_name
+    assert "test" not in [s[0] for s in _default_chain(text)]
 
 
 # ---------------------------------------------------------------------------
