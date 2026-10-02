@@ -685,6 +685,19 @@ two charts/tables, and then only the two exports. The dropdown button turns
 green when a finished Auto Analytics deck is ready, and only while the Auto
 Analytics item is offered.
 
+The Auto Analytics item reads **Run Auto Analytics** while no deck exists (a
+click calls `POST /api/chat/{id}/auto_analysis/start`), "Processing…"
+(disabled) while a run is in progress, and **Download Auto Analytics** once the
+deck is ready — a click in that state only downloads the existing deck
+(`GET /api/chat/{id}/auto_analysis/download`) and never starts a new run.
+Starting a run shows a popup for 5 seconds: "Auto analysis is running in the
+background. It can take several minutes. The presentation will be downloaded
+automatically when it is ready." While the chat stays open the page polls
+`GET /api/chat/{id}/auto_analysis/status`, and a run that finishes during that
+polling downloads the deck once, automatically. Opening a chat whose deck is
+already finished sets the **Download Auto Analytics** state without
+downloading anything.
+
 ### Admin routes — `/api/admin/*` (ladmin + scoped POWER USERS)
 
 Two guards (prompt 19):
