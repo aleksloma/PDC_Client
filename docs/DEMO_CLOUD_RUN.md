@@ -8,6 +8,8 @@
 > dedicated demo tenant, holding only PowerDataChat's own demo data — so the
 > customer data-boundary model (Constitution Art. II) is unaffected.
 
+A second hosted instance, `pdcclient-brb` at `brb.powerdatachat.com` (BRB demo on Cloud SQL, same images), is documented in `BRB_CLOUD_RUN.md`.
+
 ## Topology
 
 | Piece | Value |
