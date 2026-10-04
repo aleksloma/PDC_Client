@@ -102,7 +102,14 @@ file documents the enterprise client's implementation of each one.
   origin with no cookies, storage or access to the page — built by
   `PDCViewers.setChartFrame` (`static/vendor/viewers.js`), which registers the
   HTML with `POST /api/charts` and loads the returned `/charts/{token}` (see
-  "Chart documents"). `styled_html` (a pandas Styler's table) is sanitised
+  "Chart documents"). Before registering, `setChartFrame` adds one inline
+  `<script data-pdc-title-fit>` to the document (`PDCViewers.fitChartTitle`,
+  render time only — the stored HTML, a pin snapshot and the PNG/PDF exports
+  never carry it): inside the frame it keeps the chart hidden until it has
+  moved the title below the Plotly toolbar and word-wrapped it to the frame
+  width with one `Plotly.relayout` (again on resize only when the wrap
+  changes), so a long title never runs under the toolbar buttons; untitled
+  charts are shown at once (see "Chart HTML is offline-safe"). `styled_html` (a pandas Styler's table) is sanitised
   on the server to an allowlist of table elements, `T_`-prefixed ids, the
   class names pandas Styler generates (`T_<hex>`, `col<n>`, `row<n>`,
   `level<n>`, `data`, `index_name`, `blank`, `col_heading`, `row_heading`),
@@ -427,7 +434,13 @@ customer install the flag is false and step 2 handles every size:
    brain's `/v1/chat_metadata` endpoint. That endpoint is a verbatim port
    of global `_generate_all_parallel` (3 parallel sub-calls: chat name,
    welcome message, suggested questions) — same prompts, same sanitizers
-   — so the output is identical to the B2C app. Returns
+   — so the output is identical to the B2C app. When no name was typed,
+   that call also carries `existing_names`: the user's own chat titles, the
+   50 most recent by creation (pins ignored, shared chats included), each
+   cut to 60 characters — titles only, no data values — so the brain names
+   the chat unlike the ones the user already has (field: see
+   `docs/PROTOCOL.md`). The `_2`, `_3` suffix for a name that still
+   collides is unchanged. Returns
    `{ok, chat_id, name, welcome_message, suggested_questions}`. Once the
    chat exists, the session gets a fresh sid and the temp workspace the
    uploads came from is deleted (`UserStore.destroy`); the next upload
@@ -1003,6 +1016,33 @@ failing harder. If the asset is missing server-side, `_plotly_js_include()`
 logs `PLOTLY_JS_ASSET_MISSING` once and falls back to the CDN src for new
 charts.
 
+**Chart title fit (render time).** Every chart document a page puts into a
+frame (chat, View larger, dashboard tiles) gets one inline
+`<script data-pdc-title-fit>` from `PDCViewers.fitChartTitle`, applied by
+`setChartFrame` before `POST /api/charts`; idempotent by that marker; the
+stored HTML is never changed. Inside the frame the chart stays hidden until
+the title is fitted (fallback reveal after 1.5 s): the original title is
+word-wrapped to the frame width and placed at the top of the frame below the
+toolbar (`title.yref:'container'`, `y:1`, `yanchor:'top'`, `pad.t` = toolbar
+bottom + 8 px, the top margin reserved to fit it), x/xanchor kept, in ONE
+`Plotly.relayout`; a chart whose toolbar has no buttons (pie, sunburst,
+treemap) is fitted the same way with no toolbar offset; untitled charts are
+never relayouted. The frame exposes `window.__pdcTitleFit = {relayouts, done}`.
+
+**Hierarchy repair.** A sunburst/treemap/icicle whose nodes name a parent id
+that is not among the ids (what `px.sunburst(path=[…, pd.cut(…)])` produces
+for unobserved categories) draws nothing in plotly.js. `_plotly_to_html`
+first drops every zero/NaN node of such a trace, filtering every per-node
+array together; a non-zero node left without its parent, or a per-node array
+that cannot be aligned, leaves the trace as built. Valid charts are never
+changed, and "Show data" lists the same nodes as the chart.
+
+**Hierarchical value labels.** On treemap/sunburst/icicle, a `textinfo` that
+shows the value becomes an equivalent `texttemplate` whose value part follows
+the label rule (thousands-grouped; 0 decimals for integer values, at most 2
+otherwise); label, percent, path and text parts and the hover text are
+unchanged. A preset template's bare `%{value}` is regrouped the same way.
+
 On kill-switch (tenant revoked / suspended), the stream emits a single
 `{error: "Service unavailable. Please contact your administrator.", done: true}`
 event and the chat UI surfaces it to the user.
@@ -1361,7 +1401,11 @@ all own dashboards shown immediately, live filter, Enter picks the first
 match, "＋ Add new" pinned at the bottom, explicit loading/empty/error rows. Every chart and table block in a response carries a 📌 pin button in
 its `.pdc-action-bar` (live stream, history reload, multi-chart, multi-table)
 that opens the anchored combobox popover; the payload is read at CLICK time so a
-prior in-chat refresh pins the refreshed render. The dashboard page uses
+prior in-chat refresh pins the refreshed render. A successful pin shows the
+"Added to …" toast (`showToast` in `static/dashboard.js`) just below the top
+bar — measured when it appears, since the bar wraps onto more rows on a narrow
+screen; 64 px from the top when no top bar is visible — never over the chat
+input, and click-through (`pointer-events: none`) for its 3 seconds. The dashboard page uses
 vendored GridStack 10.3.1 (`static/vendor/gridstack/`, MIT, offline) — drag by
 the tile grab strip (a `⠿` grip glyph; the old grey title snippet is gone —
 QA 3.1 — the title lives in the strip tooltip and the info popover). The grip
