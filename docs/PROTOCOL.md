@@ -21,6 +21,19 @@ Transport: **HTTPS**. Every `/v1/*` call requires
 `Authorization: Bearer <tenant_token>`. The brain validates the token by
 lookup; revoked / suspended tenants get **HTTP 403** (the kill-switch).
 
+**Answer language** (`/v1/plan`, `/v1/describe`, `/v1/summarize`): the
+answer text is written in the language the question is written in. No
+request field carries it: the brain puts one answer-language instruction at
+the top of each prompt, and the model recognizes the question's language
+itself — by language, not alphabet (an Uzbek question in Latin or Cyrillic
+letters is answered in Uzbek). The tenant's `main_language` /
+`secondary_languages` (brain-side tenant config, admin panel) are given as
+the organization's likely languages; a question clearly written in another
+language is still answered in that language, and when the language cannot
+be recognized the answer is in `main_language`, else English. No extra model
+call. `/v1/chat_metadata` (`welcome_language`) and `/v1/title` (`lang`) are
+unchanged.
+
 ---
 
 ## Field-shape mapping back to the B2C code
@@ -425,12 +438,35 @@ resolved language governs BOTH the welcome message and the suggested questions
     "Which department has the highest average salary?",
     "How does the total salary spend compare across different departments?",
     "Who are the highest paid employees in the company?"
-  ]
+  ],
+  "welcome_source": "model"
 }
 ```
 
 The welcome message and questions are the same prompts and sanitizers
 global uses — output is byte-compatible.
+
+`welcome_message` is never empty. The welcome, questions and chat-name calls
+(and `/v1/title`) make at most 2 attempts each: a model that rejects
+`thinkingConfig.thinkingBudget = 0` with 400 is retried without it (and is
+then remembered in-process, so later calls skip it), a MAX_TOKENS cut is
+retried with a larger budget, a 429 / 5xx after a 1 s backoff, and an empty
+or unparseable answer is retried once. When the welcome is still empty, the brain returns a fixed welcome in
+the resolved language (English, Georgian, Russian or Uzbek; any other
+language gets English) — greeting, "your data analyst for this dataset",
+analysis / visualizations / reports, and the localized final line "For
+example you can ask:" — and `suggested_questions` may be `[]`.
+
+`welcome_source` (optional, added 2026-10-04): `"model"` when the model wrote
+the welcome, `"fallback"` when it is the fixed one. Clients that ignore it
+are unaffected.
+
+Time bound: each attempt is capped at 20 s wall clock, the three sub-calls
+run in parallel, and the whole request is cut at 45 s (fallback welcome, no
+questions, `CHAT_METADATA_TIMEOUT` logged). Every request logs one `BRAIN_CHAT_METADATA_RESULT` line
+(`name_ok`, `welcome_ok`, `questions_ok`, `welcome_source`, `elapsed`); each
+failed or empty attempt logs `CHAT_METADATA_{WELCOME|QUESTIONS|NAME}_{FAILED|EMPTY}`
+with the model, HTTP status, finishReason and token counts.
 
 ---
 
@@ -654,8 +690,8 @@ client-side and login proceeds regardless.
 
 Same relay + same rate limit / error shape as the welcome mail. Sends the
 user a link that sets a new password. The link is generated ON THE CLIENT: it
-carries a single-use token valid for 30 minutes, of which the client stores
-only a SHA-256 hash. Its address is the client's configured
+carries a single-use token — valid for 30 minutes for a reset, 30 days for an
+invitation — of which the client stores only a SHA-256 hash. Its address is the client's configured
 `PUBLIC_BASE_URL`, never taken from an incoming request; a client without
 that setting sends no reset mail. The link is a credential until it is used
 or expires, so it appears solely in the outgoing mail body — the brain never
@@ -682,8 +718,10 @@ per-tenant allowed-hosts list: the host is whatever the client's
 | `reset` (default) | "PowerDataChat password reset" | a reset was requested; set a new password at the link; if you did not request it, ignore the mail — the current password stays valid |
 | `invite` | "You have been invited to PowerDataChat" | you have been given access; set your password at the link; if it has expired, use "Reset password" on the sign-in page |
 
-Both mails state that the link is valid for 30 minutes and can be used only
-once. Neither contains a password.
+The reset mail states "This link is valid for 30 minutes and can be used only
+once."; the invitation mail states "This link is valid for 30 days and can be
+used only once." (matching the client's link lifetimes). Neither contains a
+password.
 
 **Deprecated shape — `temp_password`.** Clients not yet upgraded (the hosted
 demo) still send `{sid, email, temp_password}`. The brain keeps accepting
