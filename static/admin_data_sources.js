@@ -2874,16 +2874,26 @@
     let text;
     let ok = false;
     if (r.ok && r.data.ok) {
+      const resent = r.data.resent === true;
       if (r.data.mail_sent) {
         ok = true;
-        text = `Invitation sent to ${r.data.email}. The link is valid for 30 minutes.`;
+        text = resent
+          ? `A new invitation was sent to ${r.data.email}. The previous link no longer works; the new one is valid for 30 days.`
+          : `Invitation sent to ${r.data.email}. The link is valid for 30 days.`;
       } else {
-        text = `${r.data.email} was invited. `
+        text = (resent ? `The invitation to ${r.data.email} was not re-sent. `
+                       : `${r.data.email} was invited. `)
           + (r.data.mail_error || 'The invitation mail could not be sent.')
-          + ' They can use “Reset password” on the sign-in page.';
+          + (resent ? ' The link sent earlier, if it has not expired, still works.'
+                    : ' They can use “Reset password” on the sign-in page.');
       }
       input.value = '';
       loadUsers();
+    } else if (r.status === 401) {
+      // Signing out (in any tab) ends every session of the account, this
+      // page's included: nothing was refused, the page is no longer signed in.
+      text = 'Your session has ended (you signed out, possibly in another tab). '
+        + 'Sign in again, then send the invitation again.';
     } else {
       text = r.data.error || 'Could not invite this user.';
     }

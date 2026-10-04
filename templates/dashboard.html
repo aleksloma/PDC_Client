@@ -199,12 +199,6 @@
             </label>
             <input type="file" id="fileInput" multiple accept=".csv,.tsv,.xlsx,.xls" style="display: none;" />
 
-            <span class="upload-divider" data-i18n="wizard.or">or</span>
-
-            <button type="button" id="shareGoogleSheetBtn" class="google-btn" data-i18n="wizard.share_google_sheet">
-              📎 Share Google Sheet
-            </button>
-
             <!-- Database tables (admin-registered; non-connector only). Hidden
                  unless the server has registered tables. A compact checkbox
                  dropdown (Excel-filter style): names only, scrolls past ~8
@@ -224,17 +218,6 @@
             </div>
 
             <span class="upload-divider" data-i18n="wizard.or_drop">or drop here</span>
-          </div>
-
-          <!-- Google Sheet URL input -->
-          <div id="googleSheetInputBox" class="google-input-box hidden">
-            <p class="google-warning" data-i18n="wizard.google_warning">⚠️ Make sure the file is shared with "Anyone with the link can view"</p>
-            <div class="google-input-row">
-              <input type="text" id="googleUrlInput" placeholder="Paste Google Sheets or Drive link here..." data-i18n-placeholder="wizard.google_placeholder" />
-              <button type="button" id="importFromUrlBtn" class="import-btn" data-i18n="wizard.share_btn">Share</button>
-              <button type="button" id="cancelGoogleSheetBtn" class="cancel-btn" data-i18n="wizard.cancel_btn">Cancel</button>
-            </div>
-            <span id="urlImportStatus" class="import-status"></span>
           </div>
 
           <!-- Selected files list (filename + remove icon, no description input) -->
