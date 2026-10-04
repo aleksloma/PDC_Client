@@ -218,6 +218,54 @@ the demo export is kept in `BRB_Database_template/docs/BRB_SERVICE_DIFF.md`.
 
 ## Deploy history
 
+**2026-10-04 — `main` at `9b48b58` (PR #7).** The first redeploy. Same
+images as `pdcclient-demo` (Cloud Build
+`db066d39-724c-4818-9c2c-cf697082cb21`, `BUILD_TIME=2026-10-04T09:03:37Z`),
+deployed right after the demo was verified on them; the revision resolved
+exactly these digests:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:9b48b58` | `sha256:b11dbc3c4f60ca2e7998ef0526d055e92955d8ae9f491ab6ba307970fc999c01` |
+| `pdcexecutor-demo:9b48b58` | `sha256:dd99cb928f0e7617e3551a559d9295428555de2f118cce8e7f1a8b931671f6cc` |
+
+Revision `pdcclient-brb-9b48b58`, serving 100 % since 2026-10-04 ~09:17 UTC.
+It replaced `pdcclient-brb-6b4dce5`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-brb --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-brb-6b4dce5=100
+```
+
+Backup taken before the deploy (the first one of this bucket):
+`gs://pdc-enterprise-client-brb-data-backups/20261004-091424/`, which matched
+the data bucket in size (238,746,432 bytes) and in its 102 object names.
+
+The spec change was image-only (two `image:` lines and the template name;
+the `cloudsql-instances` annotation, secrets, buckets and resources carried
+over), checked by a diff against the export before the Admin API `PUT`.
+Candidate checks (`candidate---…` URL):
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `9b48b58`.
+- Revision log: `LADMIN_PRESENT`, `RESET_TOKEN_INDEX_FILLED count=3` (the
+  data bucket is mounted and read), `EXECUTOR_HANDSHAKE_OK version=9b48b58`,
+  `DB_SCHEDULER_STARTED`; no errors, no 5xx. Cloud SQL `brb-demo-pg`
+  RUNNABLE.
+- The served `dashboard.js` and `i18n.js` carry no Google Sheet control or
+  string; an anonymous `/lab` redirects to sign-in.
+- **Not run here: the signed-in checks.** `ladmin`'s password was changed
+  on 2026-10-03 06:00 UTC through the profile's Change Password, so the
+  password in `CLIENT_BRB_LADMIN_PASSWORD` no longer signs in (two attempts
+  answered 401). The invitation (sent twice), the wizard and the chat checks
+  passed on the `pdcclient-demo` candidate running the same two digests. Run
+  them here with the current `ladmin` password, and either store that
+  password as a new version of `CLIENT_BRB_LADMIN_PASSWORD` or keep it
+  elsewhere so the next deploy can sign in.
+- The welcome message stays empty until the brain-side fix
+  (`docs/WELCOME_INVESTIGATION.md`).
+- After the shift, `brb.powerdatachat.com` reported the same `/version` and
+  `/health`; `pdcbrain` gained no revision (`pdcbrain-00023-vow`) and
+  `pdcclient-demo` stayed on `pdcclient-demo-9b48b58`.
+
 **2026-10-03 — first deploy, `main` at `6b4dce5`.** The service was created
 from the `pdcclient-demo` export (revision `pdcclient-demo-6b4dce5`) with
 the changes listed in `BRB_Database_template/docs/BRB_SERVICE_DIFF.md`,

@@ -395,6 +395,58 @@ Remove the check's throwaway account and dashboard afterwards.
 
 ## Deploy history
 
+**2026-10-04 — `main` at `9b48b58` (PR #7).** Invitation links valid 30 days
+and re-sendable until a password is set (reset links stay 30 minutes); the
+"Share Google Sheet" wizard control removed; the welcome-message
+investigation (`docs/WELCOME_INVESTIGATION.md`, brain-side). Built ONCE by
+Cloud Build `db066d39-724c-4818-9c2c-cf697082cb21` (both images stamped
+`9b48b58`, `BUILD_TIME=2026-10-04T09:03:37Z`) and deployed here first, then to
+`pdcclient-brb`:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:9b48b58` | `sha256:b11dbc3c4f60ca2e7998ef0526d055e92955d8ae9f491ab6ba307970fc999c01` |
+| `pdcexecutor-demo:9b48b58` | `sha256:dd99cb928f0e7617e3551a559d9295428555de2f118cce8e7f1a8b931671f6cc` |
+
+Revision `pdcclient-demo-9b48b58`, serving 100 % since 2026-10-04 ~09:14 UTC;
+it resolved exactly the two digests above. It replaced
+`pdcclient-demo-6b4dce5`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-demo-6b4dce5=100
+```
+
+Backup taken before the deploy:
+`gs://pdc-enterprise-client-demo-data-backups/20261004-090446/`, which matched
+the data bucket in size (439,256,357 bytes) and in its 523 object names.
+
+The spec change was image-only (two `image:` lines and the template name),
+checked by a diff against the export before the Admin API `PUT`. Candidate
+checks (`candidate---…` URL):
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `9b48b58`.
+- `ladmin` signed in (302 → `/admin/data_sources`). An invitation to a
+  throwaway `deploycheck-9b48b58-…@example.com` was sent twice: the first
+  answered `created: true`, the second `created: false, resent: true`, both
+  `mail_sent: true`; the account was then removed.
+- `/lab` (self-registered throwaway account) shows "Choose Files" and
+  "Select from DB" and no Google Sheet control; `dashboard.js` carries no
+  Google Sheet handler.
+- A chat from two registered tables (`Sale_transactions`, `Client_info`,
+  chat `c_7f2713745543cec9` "Moda Analytics", owned by `ladmin`, left in
+  place) and a CSV chat both got an EMPTY welcome: the brain log shows
+  `[WELCOME] Failed` / `[QUESTIONS] Failed` with 400 from
+  `gemini-3.5-flash-lite` — the brain-side cause in
+  `docs/WELCOME_INVESTIGATION.md`, not this revision. Recorded, not blocking.
+- The throwaway account uploaded `sample_sales.csv`, got a chart from a
+  question (15.7 s), created a dashboard and pinned the chart (1 tile read
+  back); the account was then removed (1 chat deleted).
+- Revision log: `EXECUTOR_HANDSHAKE_OK version=9b48b58`; no errors, no 5xx,
+  no `BACKEND_REQUEST_REFUSED`.
+- After the shift, `client.powerdatachat.com` reported the same `/version`
+  and `/health`, and `pdcbrain` gained no revision (`pdcbrain-00023-vow`
+  still serving).
+
 **2026-10-02 — `main` at `6b4dce5`.** The "Select from DB" picker grouped by
 connection and schema, the single "Download Analytics" dropdown with the Auto
 Analytics item, decision-tree plots no longer rejected as empty charts, and
