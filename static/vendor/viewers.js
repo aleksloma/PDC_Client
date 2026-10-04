@@ -9,6 +9,7 @@
  *
  * Public API (window.PDCViewers):
  *   fixPlotlyOffline(html)    — rewrite a chart doc's cdn.plot.ly script tag to the local plotly.js asset.
+ *   fitChartTitle(html)       — add the script that keeps a chart's title clear of the Plotly toolbar.
  *   setChartFrame(iframe, html) — THE one way a chart document is put into a frame (sandbox, registered with /api/charts, loaded from /charts/{token}).
  *   openCode(code)            — open a tab and render highlighted Python.
  *   openData(table)           — open a tab and render a {columns, rows} table.
@@ -277,6 +278,212 @@
     }
   }
 
+  // ---- Chart title fit (render time) ----------------------------------------
+  // Plotly draws the chart title in the top margin, where the always-visible
+  // toolbar (modebar) also sits, so a long title runs under the buttons.
+  // `fitChartTitle(doc)` puts ONE inline script into the chart document;
+  // once the chart is drawn, and again on resize, it moves the title below
+  // the toolbar and word-wraps it to the frame width. The stored HTML and the
+  // PNG/PDF exports never see it. `chartTitleFitScript` is NEVER run on this
+  // page: its source is serialized into the chart document, where the
+  // /charts/ route's policy allows inline script inside the sandboxed frame.
+  // The document exposes `window.__pdcTitleFit = {relayouts, done}`.
+  function chartTitleFitScript() {
+    "use strict";
+    var GAP = 8;               // px between the toolbar and the title, and below the title
+    var SIDE = 12;             // px kept free at each end of a wrapped line
+    var LINE_SPACING = 1.3;    // plotly.js line step, in font sizes
+    var CAP_SHIFT = 0.7;       // plotly.js top-anchor shift, in font sizes
+    // Deadlines in REAL elapsed time from start() (the chart's own scripts
+    // have run): the forced fit lands well before the fallback reveal, so a
+    // title is never shown unfitted and then moved. Timer ticks are not
+    // counted — a busy page delays them.
+    var FORCE_AFTER_MS = 1000;  // fit whatever is drawn by then
+    var REVEAL_AFTER_MS = 1500; // nothing stays hidden longer than this
+    var SAFETY_REVEAL_MS = 5000; // from the script's own start, should start() never run
+    var POLL_MS = 50;
+    var state = { relayouts: 0, done: false };
+    window.__pdcTitleFit = state;
+    // Hidden until the first fit, so the title (and the plot area it pushes
+    // down) never visibly jumps.
+    var hide = document.createElement("style");
+    hide.textContent = ".plotly-graph-div{visibility:hidden}";
+    (document.head || document.documentElement).appendChild(hide);
+    var gd = null, original = null, baseMarginT = null, singleH = null, busy = false,
+      last = null, canvas = null, timer = 0;
+
+    function reveal() { if (hide.parentNode) hide.parentNode.removeChild(hide); }
+    function finish() { state.done = true; reveal(); }
+    function now() { return (window.performance && performance.now) ? performance.now() : Date.now(); }
+    setTimeout(reveal, SAFETY_REVEAL_MS);
+
+    function titleOf(layout) {
+      var t = layout && layout.title;
+      if (typeof t === "string") return { text: t };
+      return t || {};
+    }
+    function fontOf(full) {
+      var f = (full && full.font) || {};
+      var style = f.style === "italic" ? "italic " : "";
+      var weight = f.weight ? String(f.weight) + " " : "";
+      return style + weight + (f.size || 17) + "px " + (f.family || "sans-serif");
+    }
+    function textWidth(s, font) {
+      canvas = canvas || document.createElement("canvas");
+      var ctx = canvas.getContext("2d");
+      ctx.font = font;
+      return ctx.measureText(s).width;
+    }
+    function wrap(text, avail, font) {
+      var out = [];
+      text.split(/<br\s*\/?>/i).forEach(function (line) {
+        var cur = "";
+        line.split(/\s+/).forEach(function (w) {
+          if (!w) return;
+          var next = cur ? cur + " " + w : w;
+          if (cur && textWidth(next, font) > avail) { out.push(cur); cur = w; }
+          else { cur = next; }
+        });
+        out.push(cur);
+      });
+      return out.join("<br>");
+    }
+    function availWidth(full) {
+      var w = gd.clientWidth || gd.getBoundingClientRect().width;
+      var x = typeof full.x === "number" ? full.x : 0.5;
+      var xa = full.xanchor || "auto";
+      if (xa === "auto") xa = x < 1 / 3 ? "left" : (x > 2 / 3 ? "right" : "center");
+      var a = xa === "center" ? 2 * Math.min(x, 1 - x) * w : (xa === "left" ? (1 - x) * w : x * w);
+      return Math.max(40, a - 2 * SIDE);
+    }
+    // The visible toolbar, or null. A chart whose every button is trimmed
+    // (pie, sunburst, treemap) still has a `.modebar`, of zero height and
+    // without a `.modebar-btn`: that is NO toolbar.
+    function toolbar() {
+      var mb = gd.querySelector(".modebar");
+      if (!mb || !mb.querySelector(".modebar-btn")) return null;
+      return mb.getBoundingClientRect().height > 0 ? mb : null;
+    }
+    function toolbarBottom() {
+      var mb = toolbar();
+      if (!mb) return 0;
+      return Math.max(0, mb.getBoundingClientRect().bottom - gd.getBoundingClientRect().top);
+    }
+    function lineCount(s) { return String(s || "").split(/<br\s*\/?>/i).length; }
+    // Height the title will take with `lines` lines: one line's box (measured
+    // ONCE on the title as first drawn, so a re-measure cannot move the
+    // margin by a pixel and trigger another relayout) + one line step per
+    // extra line.
+    function titleHeight(t, lines, size) {
+      if (singleH === null) {
+        var el = gd.querySelector(".g-gtitle");
+        var h0 = el && el.getBBox ? el.getBBox().height : 0;
+        singleH = h0 > 0 ? h0 - (lineCount(t.text) - 1) * LINE_SPACING * size : 0;
+        if (!(singleH > 0)) singleH = 1.25 * size;
+      }
+      return singleH + (lines - 1) * LINE_SPACING * size;
+    }
+    // `force`: fit even before the title and the toolbar are both drawn (the
+    // reveal deadline); otherwise a fit waits for them, so the toolbar is
+    // never measured before it exists.
+    function fit(force) {
+      if (busy || !gd || !window.Plotly || !gd._fullLayout) return;
+      if (force !== true && !drawn()) return;
+      try {
+        var t = titleOf(gd.layout);
+        if (original === null) original = typeof t.text === "string" ? t.text : "";
+        if (!original) { finish(); return; }
+        var full = gd._fullLayout.title || {};
+        if (baseMarginT === null) {
+          var m = gd.layout.margin || {};
+          baseMarginT = typeof m.t === "number" ? m.t : ((gd._fullLayout.margin || {}).t || 0);
+        }
+        // Markup other than <br> is kept as written: the title is only moved.
+        var text = /<(?!br\s*\/?>)[^>]*>/i.test(original)
+          ? original : wrap(original, availWidth(full), fontOf(full));
+        var size = (full.font && full.font.size) || 17;
+        var lines = lineCount(text);
+        // plotly.js 2.35 anchors a multi-line title's FIRST BASELINE at the
+        // top position (its lines carry their own y, which drops the 0.7em
+        // cap shift a one-line title gets), so it needs that shift as pad.
+        var padT = Math.ceil(toolbarBottom() + GAP + (lines > 1 ? CAP_SHIFT * size : 0));
+        // The top margin is reserved here, so title.automargin never has to
+        // push it: when it pushes, plotly.js 2.35 also moves a multi-line
+        // title UP by its extra lines — back under the toolbar.
+        var marginT = Math.max(baseMarginT,
+          Math.ceil(padT + titleHeight(t, lines, size) + GAP));
+        var pad = t.pad || {};
+        var current = t.text === text && pad.t === padT && t.yref === "container" &&
+          t.y === 1 && t.yanchor === "top" && t.automargin === true &&
+          (gd.layout.margin || {}).t === marginT;
+        // `last` also stops a loop should Plotly normalize what it stores.
+        if (current || (last && last.text === text && last.padT === padT &&
+            last.marginT === marginT)) { finish(); return; }
+        busy = true;
+        last = { text: text, padT: padT, marginT: marginT };
+        state.relayouts += 1;
+        var settle = function () { busy = false; finish(); };
+        Promise.resolve(window.Plotly.relayout(gd, {
+          "title.text": text, "title.yref": "container", "title.y": 1,
+          "title.yanchor": "top", "title.pad.t": padT, "title.automargin": true,
+          "margin.t": marginT
+        })).then(settle, settle);
+      } catch (e) { busy = false; finish(); }
+    }
+    function start() {
+      try {
+        gd = document.getElementById("plotly-chart") || document.querySelector(".plotly-graph-div");
+        if (!gd || !window.Plotly || !titleOf(gd.layout).text) { finish(); return; }
+        if (typeof gd.on === "function") gd.on("plotly_afterplot", function () { fit(); });
+        window.addEventListener("resize", function () {
+          clearTimeout(timer);
+          timer = setTimeout(function () { fit(); }, 120);
+        });
+        // The first draw may already be complete (afterplot fired before
+        // this listener existed): poll until the chart is drawn; at the force
+        // deadline fit whatever is there.
+        var t0 = now();
+        var forced = function () { fit(true); if (!busy) finish(); };
+        (function poll() {
+          if (state.done || busy || last) return;   // a fit ran or is running
+          if (drawn() || now() - t0 >= FORCE_AFTER_MS) { forced(); return; }
+          setTimeout(poll, POLL_MS);
+        })();
+        // Fallback reveal: a fit still pending is forced first, so even a
+        // delayed timer never shows the title before it is fitted.
+        setTimeout(function () {
+          if (!state.done && !busy && !last) forced();
+          if (!busy) reveal();
+        }, REVEAL_AFTER_MS);
+      } catch (e) { finish(); }
+    }
+    // Drawn: the title exists and the toolbar step has run (its container
+    // exists, buttons or not), or the chart has no toolbar at all.
+    function drawn() {
+      if (!gd._fullLayout || !gd.querySelector(".gtitle")) return false;
+      if (gd._context && gd._context.displayModeBar === false) return true;
+      return !!gd.querySelector(".modebar-container");
+    }
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
+    else start();
+  }
+
+  // Insert the title-fit script into a chart document (right after <head>,
+  // else at the very start). Idempotent (the `data-pdc-title-fit` marker);
+  // a non-plotly document, or any error, returns the document unchanged.
+  function fitChartTitle(doc) {
+    try {
+      if (!doc || typeof doc !== "string" || doc.indexOf("data-pdc-title-fit") !== -1) return doc;
+      if (!/plotly/i.test(doc)) return doc;
+      var tag = "<script data-pdc-title-fit>(" + String(chartTitleFitScript) + ")();<\/script>";
+      var m = /<head(\s[^>]*)?>/i.exec(doc);
+      if (m) return doc.slice(0, m.index + m[0].length) + tag + doc.slice(m.index + m[0].length);
+      return tag + doc;
+    } catch (e) {
+      return doc;
+    }
+  }
+
   // Put a chart document (plotly HTML: a full document with inline scripts)
   // into `iframe`. The frame is sandboxed with scripts ONLY, so the document
   // gets an opaque origin of its own: no cookies, no storage, no access to
@@ -291,6 +498,7 @@
   function setChartFrame(iframe, html) {
     if (!iframe) return Promise.resolve();
     var doc = fixPlotlyOffline(typeof html === "string" ? html : String(html == null ? "" : html));
+    doc = fitChartTitle(doc);   // keep the title clear of the toolbar (render time only)
     iframe.setAttribute('sandbox', 'allow-scripts');
     // Per-frame generation: two quick refreshes race, and the first
     // registration may answer last. Only the newest one may set the src.
@@ -316,6 +524,7 @@
 
   window.PDCViewers = {
     fixPlotlyOffline: fixPlotlyOffline,
+    fitChartTitle: fitChartTitle,
     setChartFrame: setChartFrame,
     openCode: function (code) {
       var win = window.open("", "_blank");

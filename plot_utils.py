@@ -542,9 +542,294 @@ def _widen_discrete_colors(fig) -> None:
         pass
 
 
+# Hierarchical trace types whose nodes are linked by ids/parents.
+_HIERARCHY_TYPES = ("sunburst", "treemap", "icicle")
+# Keys whose arrays are never per node (a colour scale, a domain pair, a
+# colour bar's ticks, free-form meta), skipped when a hierarchy is repaired.
+# Every OTHER array of a hierarchical trace is indexed per node by plotly.js.
+_HIERARCHY_NON_NODE_KEYS = frozenset({"colorscale", "domain", "colorbar",
+                                      "meta", "transforms"})
+# Arrays of node INDICES: they would need renumbering, not filtering.
+_HIERARCHY_INDEX_KEYS = frozenset({"selectedpoints"})
+
+
+class _UnalignedHierarchyArray(Exception):
+    """A per-node array that cannot be filtered safely (another length, or
+    node indices) — the repair leaves the whole trace untouched."""
+
+
+def _hierarchy_key(v) -> str:
+    """A node id / parent id as plotly.js reads it: None and "" are the empty
+    (root) parent, anything else is compared by its string form."""
+    if v is None:
+        return ""
+    return str(v)
+
+
+def _hierarchy_zero(v) -> bool:
+    """True for a node value of 0, NaN or None. A value that is not a number
+    counts as NON-zero, so an unreadable value is never dropped."""
+    if v is None:
+        return True
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return False
+    return f != f or f == 0.0
+
+
+def _filter_node_array(arr, keep):
+    """`arr` with only the positions where `keep` is True (numpy stays numpy,
+    so a 2-D customdata keeps its rows)."""
+    if isinstance(arr, np.ndarray):
+        return arr[np.asarray(keep, dtype=bool)]
+    return [v for v, k in zip(list(arr), keep) if k]
+
+
+def _hierarchy_node_patch(obj: dict, n: int, keep) -> dict:
+    """Nested dict holding every array of `obj` (a trace's plotly JSON, or a
+    sub-object of it) filtered by `keep`: ids, labels, parents, values,
+    customdata (by row), text, hovertext, hover/text templates, marker
+    colours, line colours and widths, fonts, patterns — whatever the code
+    set. Raises `_UnalignedHierarchyArray` for an array of any other non-zero
+    length (plotly.js would still index it per node, and it cannot be
+    realigned) or for node indices."""
+    patch = {}
+    for key, val in obj.items():
+        if key in _HIERARCHY_NON_NODE_KEYS:
+            continue
+        if isinstance(val, dict):
+            sub = _hierarchy_node_patch(val, n, keep)
+            if sub:
+                patch[key] = sub
+            continue
+        if not isinstance(val, (list, tuple, np.ndarray)):
+            continue
+        if isinstance(val, np.ndarray) and val.ndim == 0:
+            continue
+        if len(val) == 0:
+            continue
+        if key in _HIERARCHY_INDEX_KEYS or len(val) != n:
+            raise _UnalignedHierarchyArray()
+        patch[key] = _filter_node_array(val, keep)
+    return patch
+
+
+def _hierarchy_patch_originals(obj: dict, patch: dict) -> dict:
+    """The values of `obj` at the paths `patch` sets (the undo of a patch)."""
+    out = {}
+    for key, val in patch.items():
+        if isinstance(val, dict):
+            out[key] = _hierarchy_patch_originals(obj.get(key) or {}, val)
+        else:
+            out[key] = obj.get(key)
+    return out
+
+
+def _repair_hierarchy_trace(tr, ttype) -> None:
+    """Repair ONE sunburst/treemap/icicle trace in place (see
+    `_repair_plotly_hierarchy`). Raises only on unexpected errors; the caller
+    logs and moves on."""
+    import logging
+    ids_src = getattr(tr, "ids", None)
+    if ids_src is None:
+        ids_src = getattr(tr, "labels", None)
+    parents = getattr(tr, "parents", None)
+    values = getattr(tr, "values", None)
+    if ids_src is None or parents is None:
+        return
+    node_keys = [_hierarchy_key(v) for v in ids_src]
+    parent_keys = [_hierarchy_key(v) for v in parents]
+    n = len(node_keys)
+    if n == 0 or len(parent_keys) != n:
+        return
+    present = set(node_keys)
+    if not any(p != "" and p not in present for p in parent_keys):
+        return  # a valid hierarchy (zero nodes included) is never touched
+    if values is None or len(values) != n:
+        logging.warning(f"PLOTLY_HIERARCHY_ORPHAN_KEPT type={ttype} "
+                        f"orphans={sum(1 for p in parent_keys if p != '' and p not in present)}")
+        return
+    vals = list(values)
+
+    # Drop every zero / NaN node. This is also the fixpoint of the cascade
+    # "drop a zero node whose parent is gone": that rule only ever removes
+    # zero nodes, and every one of them is already removed here.
+    keep = [not _hierarchy_zero(v) for v in vals]
+    kept_ids = {node_keys[i] for i in range(n) if keep[i]}
+    orphans = sum(1 for i in range(n)
+                  if keep[i] and parent_keys[i] != "" and parent_keys[i] not in kept_ids)
+    if orphans:
+        # A non-zero node would have to go — that changes the totals, so the
+        # whole trace stays exactly as the code built it.
+        logging.warning(f"PLOTLY_HIERARCHY_ORPHAN_KEPT type={ttype} orphans={orphans}")
+        return
+    removed = keep.count(False)
+    if removed == 0:
+        return
+
+    # Every per-node array of the trace, at any depth, is filtered by the same
+    # mask — a list left at n entries would shift by the dropped nodes. Built
+    # completely first; anything that cannot be aligned leaves the trace as is.
+    current = tr.to_plotly_json()
+    try:
+        patch = _hierarchy_node_patch(current, n, keep)
+    except _UnalignedHierarchyArray:
+        logging.warning(f"PLOTLY_HIERARCHY_ARRAY_KEPT type={ttype} reason=unaligned_array")
+        return
+    restore = _hierarchy_patch_originals(current, patch)
+    try:
+        tr.update(patch)
+    except Exception:
+        tr.update(restore)   # put back every array the failed update touched
+        raise
+    logging.info(f"PLOTLY_HIERARCHY_REPAIRED type={ttype} removed={removed} "
+                 f"kept={n - removed}")
+
+
+def _repair_plotly_hierarchy(fig) -> None:
+    """Make a broken sunburst/treemap/icicle drawable again.
+
+    `px.sunburst(path=[..., pd.cut(...)])` groups by a categorical with its
+    UNOBSERVED categories, which emits zero-value nodes whose parent ids are
+    not among the ids — plotly.js then cannot build the hierarchy and draws
+    nothing. Only a trace with at least one such dangling parent is touched:
+    its zero/NaN nodes are dropped (every per-node array of the trace, at any
+    depth, filtered together; surviving values untouched). In such a trace
+    EVERY zero/NaN node goes, an observed zero under a parent that is present
+    included — accepted on purpose: a zero node draws no area and adds nothing
+    to any total, so the drawn chart and its totals are the same either way.
+    When a NON-zero node would still be left without its parent, or a
+    per-node array cannot be aligned (`_hierarchy_node_patch`), the trace is
+    left exactly as it was. A valid trace is never modified, so its HTML is
+    byte-identical. Never raises (Article IV); logs counts only, never a
+    label or a value.
+    """
+    import logging
+    try:
+        for tr in list(getattr(fig, "data", None) or []):
+            ttype = getattr(tr, "type", None)
+            if ttype not in _HIERARCHY_TYPES:
+                continue
+            try:
+                _repair_hierarchy_trace(tr, ttype)
+            except Exception as e:
+                logging.warning(f"PLOTLY_HIERARCHY_REPAIR_FAILED type={ttype} "
+                                f"error={type(e).__name__}")
+    except Exception as e:
+        logging.warning(f"PLOTLY_HIERARCHY_REPAIR_FAILED error={type(e).__name__}")
+
+
+# textinfo percent flags → the texttemplate variable plotly.js fills with the
+# SAME formatted percent, and the " of <x>" suffix it adds when more than one
+# percent flag is on.
+_HIERARCHY_PERCENT_PARTS = (("percent parent", "%{percentParentLabel}", "parent"),
+                            ("percent entry", "%{percentEntryLabel}", "entry"),
+                            ("percent root", "%{percentRootLabel}", "root"))
+
+
+def _js_truthy_label(v) -> bool:
+    """plotly.js keeps a slice label when `v || typeof v == "number"`."""
+    import numbers
+    if isinstance(v, numbers.Number) and not isinstance(v, bool):
+        return True
+    return bool(v)
+
+
+def _js_valid_text(v) -> bool:
+    """plotly.js `isValidTextValue`: `v || v === 0` (NaN and "" are not)."""
+    import numbers
+    if v is None or isinstance(v, bool):
+        return bool(v)
+    if isinstance(v, numbers.Number):
+        return v == v  # 0 is valid, NaN is not
+    return bool(v)
+
+
+def _hierarchy_texttemplate(tr, fmt):
+    """A texttemplate that renders exactly what the trace's `textinfo` shows,
+    except that the value part is `%{value:<fmt>}`. None when textinfo does
+    not show the value (nothing to do). Returns one string, or a per-node
+    list when the parts differ between nodes.
+
+    Mirrors plotly.js 2.35.2 `formatSliceLabel` (sunburst, shared by treemap
+    and icicle): parts in the order label, value, then — not on the hierarchy
+    root — current path, percent parent, percent entry, percent root (each
+    with " of parent|entry|root" when more than one percent flag is on), then
+    text; joined with "<br>". The label part only when the node's label is
+    non-empty, the text part only when the node's text is valid, because a
+    template variable plotly.js cannot fill is rendered literally. The
+    percent parts use the `...Label` variables: `%{percentEntry}` is the raw
+    fraction, `%{percentEntryLabel}` the same formatPercent text as textinfo.
+    The hierarchy root is the node whose parent is empty when it is the ONLY
+    such node. With several, plotly.js adds a root of its own above them,
+    which is no trace node and has no label or value. Sunburst and treemap do
+    not draw it; icicle does, and a single template string would apply to it
+    and show its unfillable variables literally — so an icicle with several
+    roots always gets a per-node list (that root, no index into the list,
+    gets no template, as with textinfo). With NO empty parent plotly.js adds
+    an implied root that shows its label under textinfo but no value — no
+    template can reproduce that, so such a trace is left to its textinfo
+    (None).
+    """
+    info = getattr(tr, "textinfo", None)
+    if not isinstance(info, str):
+        return None
+    flags = info.split("+")
+    if "value" not in flags:
+        return None
+    ids_src = getattr(tr, "ids", None)
+    labels = getattr(tr, "labels", None)
+    nodes = ids_src if ids_src is not None else labels
+    if nodes is None:
+        return None
+    n = len(nodes)
+    parents = getattr(tr, "parents", None)
+    parent_keys = ([_hierarchy_key(p) for p in parents] if parents is not None
+                   else [""] * n)
+    n_roots = parent_keys.count("")
+    if n_roots == 0:
+        return None
+    single_root = n_roots == 1
+    text = getattr(tr, "text", None)
+    text_is_array = text is not None and not isinstance(text, str) and hasattr(text, "__len__")
+    percents = [p for p in _HIERARCHY_PERCENT_PARTS if p[0] in flags]
+
+    templates = []
+    for i in range(n):
+        parts = []
+        lab = labels[i] if labels is not None and i < len(labels) else None
+        if "label" in flags and _js_truthy_label(lab):
+            parts.append("%{label}")
+        parts.append("%{value:" + fmt + "}")
+        is_root = single_root and i < len(parent_keys) and parent_keys[i] == ""
+        if not is_root:
+            if "current path" in flags:
+                parts.append("%{currentPath}")
+            for _flag, var, suffix in percents:
+                parts.append(var + (" of " + suffix if len(percents) > 1 else ""))
+        if "text" in flags:
+            t = (text[i] if i < len(text) else None) if text_is_array else text
+            if _js_valid_text(t):
+                parts.append("%{text}")
+        templates.append("<br>".join(parts))
+    if not templates:
+        return None
+    drawn_extra_root = not single_root and getattr(tr, "type", None) == "icicle"
+    if not drawn_extra_root and all(t == templates[0] for t in templates):
+        return templates[0]
+    return templates
+
+
 def _plotly_to_html(fig) -> str:
     """Convert Plotly figure to interactive HTML string with full-height styling."""
     try:
+        # Drop the zero nodes that leave a sunburst/treemap/icicle without a
+        # drawable hierarchy. FIRST, so the formatting below and the "Show
+        # data" extraction that runs on the same fig afterwards see the same
+        # nodes. No-op for every valid figure.
+        _repair_plotly_hierarchy(fig)
+
         # Update figure layout to use autosize and fill container.
         # title.automargin: True lets Plotly grow the top margin to fit the title text
         # so the final character is never clipped on narrow viewports.
@@ -1321,7 +1606,7 @@ def _format_plotly_numeric(fig):
 
         def _value_var(tr):
             ttype = getattr(tr, "type", None)
-            if ttype in ("pie", "funnelarea"):
+            if ttype in ("pie", "funnelarea") or ttype in _HIERARCHY_TYPES:
                 return "value"
             if ttype == "bar" and getattr(tr, "orientation", None) == "h":
                 return "x"
@@ -1366,9 +1651,26 @@ def _format_plotly_numeric(fig):
         for tr in traces:
             try:
                 var = _value_var(tr)
+                # (C) sunburst/treemap/icicle without a texttemplate: a
+                # `textinfo` that shows the value gets an equivalent template
+                # whose value part is formatted (see _hierarchy_texttemplate);
+                # label, percent, path and text parts stay as the code asked.
+                # With a preset template, (B) below regroups a bare %{value}.
+                # (A) never applies to them: their `text` is a separate label
+                # part, not the node value.
+                is_hier = getattr(tr, "type", None) in _HIERARCHY_TYPES
+                if is_hier:
+                    tt = getattr(tr, "texttemplate", None)
+                    if tt is None or (isinstance(tt, str) and tt == ""):
+                        nums = _bound_numeric(tr, var)
+                        if nums and not _is_year_series(nums):
+                            built = _hierarchy_texttemplate(tr, _grouped_fmt(nums))
+                            if built is not None:
+                                tr.texttemplate = built
+                        continue
                 # (A) explicit numeric trace.text
                 txt = getattr(tr, "text", None)
-                if txt is not None and not isinstance(txt, str):
+                if not is_hier and txt is not None and not isinstance(txt, str):
                     seq = list(txt) if hasattr(txt, "__iter__") else []
                     if seq:
                         parsed = [_as_num(v) for v in seq]   # raises on a real string → except
