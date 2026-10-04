@@ -4,8 +4,8 @@
 > enterprise (on-prem) edition. Adapted from the original B2C constitution
 > for the brain/client split.
 
-**Version:** 1.7 (enterprise)
-**Last Updated:** 2026-09-29
+**Version:** 1.8 (enterprise)
+**Last Updated:** 2026-10-04
 
 ---
 
@@ -64,6 +64,10 @@ The split is the whole product. Violating it defeats the on-prem promise.
 - The first 300 characters of an answer, for `/v1/title`.
 - Operational events for `/v1/activity` — `event`, `user_email`, lightweight
   metadata.
+- The titles of the user's own chats: `existing_names` on `/v1/chat_metadata`
+  — at most 50 titles, each at most 60 characters, so the generated chat name
+  differs from them. Metadata of the same class as the question text; the
+  brain logs only their count, never the titles.
 
 ### What MUST NOT cross
 - DataFrame rows, cell values, or computed result tables.

@@ -191,8 +191,26 @@ function showToast(text, isError = false) {
   const t = document.createElement('div');
   t.textContent = text;
   const bg = isError === 'warn' ? '#f59e0b' : (isError ? '#ef4444' : '#10b981');
-  t.style.cssText = `position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;color:#fff;font-size:14px;z-index:9999;box-shadow:0 4px 12px rgba(0,0,0,0.15);transition:opacity 0.3s;background:${bg};`;
+  // Shown just below the top bar, measured now (it wraps onto more rows on a
+  // narrow screen), 64 px when no top bar is visible — lower down it covered
+  // the chat input. Click-through, so it never swallows a click.
+  const visibleRect = (sel) => {
+    for (const el of document.querySelectorAll(sel)) {
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) return r;
+    }
+    return null;
+  };
+  const bar = visibleRect('.top-bar');
+  const top = bar ? Math.round(Math.max(bar.bottom, 0)) + 12 : 64;
+  t.style.cssText = `position:fixed;top:${top}px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;color:#fff;font-size:14px;z-index:9999;box-shadow:0 4px 12px rgba(0,0,0,0.15);transition:opacity 0.3s;pointer-events:none;background:${bg};`;
   document.body.appendChild(t);
+  // Never over the chat input: on a very short screen, sit just above it.
+  const input = visibleRect('.chat-input-container');
+  const own = t.getBoundingClientRect();
+  if (input && own.bottom > input.top - 4) {
+    t.style.top = Math.max(0, Math.round(input.top - own.height - 12)) + 'px';
+  }
   setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 3000);
 }
 

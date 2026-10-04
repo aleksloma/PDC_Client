@@ -802,6 +802,7 @@ async def generate_chatdata(request: Request):
                 lang_instruction=lang_instruction,
                 columns_to_human=cth,
                 user_email=email,
+                existing_names=_existing_chat_names(email),
             )
             llm_name = (rsp.get("name") or "").strip() if rsp.get("name") else ""
             welcome_message = (rsp.get("welcome_message") or "").strip()
@@ -1312,6 +1313,40 @@ def _name_from_files(filenames: list[str]) -> str:
         if sep in first:
             first = first.split(sep)[0]
     return first[:60] or "Data Analysis"
+
+
+_EXISTING_NAMES_MAX = 50        # titles sent to /v1/chat_metadata
+_EXISTING_NAME_MAX_CHARS = 60   # each title cut to this
+
+
+def _existing_chat_names(email: str) -> list[str]:
+    """The user's own chat titles, newest first, for `/v1/chat_metadata` so the
+    brain names a new chat unlike the ones the user already has.
+
+    Pure recency (`created_at` descending — pins ignored, a row without
+    `created_at` counts as oldest), shared chats included, empty titles
+    skipped, each cut to `_EXISTING_NAME_MAX_CHARS`, at most
+    `_EXISTING_NAMES_MAX`. Titles only — never a data value (Article II).
+    Any failure → [] (the call then goes out without suggestions to avoid);
+    the log carries the exception TYPE only, never a title.
+    """
+    try:
+        rows = AuthStore().list_active_chats(email)
+        # Stable sort: equal stamps keep the store's order.
+        rows = sorted(rows, key=lambda r: r.get("created_at") or "", reverse=True)
+        out = []
+        for row in rows:
+            title = row.get("title")
+            if not isinstance(title, str) or not title.strip():
+                continue
+            out.append(title[:_EXISTING_NAME_MAX_CHARS])
+            if len(out) >= _EXISTING_NAMES_MAX:
+                break
+        return out
+    except Exception as e:
+        log_with_sid(email, "warning",
+                     f"CHAT_EXISTING_NAMES_FAILED error={log_safe_value(type(e).__name__, 100)}")
+        return []
 
 
 # ---------------------------------------------------------------------------

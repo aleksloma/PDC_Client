@@ -110,6 +110,8 @@ def _debug_log_request(path: str, payload: dict[str, Any], sid: str) -> None:
         df_names=_trunc(payload.get("df_names"), n) if payload.get("df_names") is not None else None,
         schema_text=_trunc(payload.get("schema_text"), n) if payload.get("schema_text") is not None else None,
         history_n=len(payload.get("history_rows") or []) if payload.get("history_rows") is not None else None,
+        # A count only — chat titles never reach a log line.
+        existing_names=len(payload.get("existing_names") or []) if payload.get("existing_names") is not None else None,
         error_msg=_trunc(payload.get("error_msg"), n) if payload.get("error_msg") is not None else None,
         failed_code=_trunc(payload.get("failed_code"), n) if payload.get("failed_code") is not None else None,
     )
@@ -476,9 +478,15 @@ def report(sid: str, qa_pairs: list, user_email: str | None = None,
 def chat_metadata(sid: str, files_info: list, file_descriptions: dict,
                   context: str, lang_instruction: str,
                   columns_to_human: dict | None = None,
-                  user_email: str | None = None) -> dict:
-    """Calls /v1/chat_metadata. Returns {name, welcome_message, suggested_questions}."""
-    return _post("/v1/chat_metadata", {
+                  user_email: str | None = None,
+                  existing_names: list | None = None) -> dict:
+    """Calls /v1/chat_metadata. Returns {name, welcome_message, suggested_questions}.
+
+    `existing_names` — the user's own chat titles, newest first (titles
+    only, no data values), so the brain can name the new chat differently.
+    The key is sent ONLY when given: a call without it posts the same
+    payload as before."""
+    payload = {
         "sid": sid,
         "files_info": files_info,
         "file_descriptions": file_descriptions,
@@ -486,7 +494,10 @@ def chat_metadata(sid: str, files_info: list, file_descriptions: dict,
         "lang_instruction": lang_instruction,
         "columns_to_human": columns_to_human or {},
         "user_email": user_email,
-    }, sid)
+    }
+    if existing_names is not None:
+        payload["existing_names"] = existing_names
+    return _post("/v1/chat_metadata", payload, sid)
 
 
 def file_description(sid: str, extracted_text: str, user_email: str | None = None) -> dict:

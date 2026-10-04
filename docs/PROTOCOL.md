@@ -410,9 +410,25 @@ per-tier model overrides apply automatically.
   "context": "File: sales.csv\nDescription: ...\nColumns:\n  - name ...",
   "lang_instruction": "English",
   "columns_to_human": {"loan_int_rate": "loan int rate"},
+  "existing_names": ["Ledger Pulse", "Card Insights"],   // optional
   "user_email": "..."
 }
 ```
+
+`existing_names` (optional, added 2026-10-04): the titles of the user's
+active chats — a list of at most 50 strings, each at most 60 characters.
+A value that is not a list counts as absent; entries that are not strings,
+are empty after trimming or are longer than 60 characters are dropped, and
+only the first 50 valid entries are used. When the list is non-empty, the
+returned `name` differs from every entry (compared trimmed and
+case-insensitive): the name prompt lists the names in use, and if the model
+still returns a taken name, the name sub-call is retried once naming the
+taken name. If the second name is taken too, it is returned as is — the
+client's `_2`, `_3` suffix stays the last resort. Field absent or empty: the
+name prompt and the response are byte-identical to before. The titles are
+logged as a count only (`existing_names_n`), never as text. Naming style
+(exactly 2 words, English, proper case), the welcome and questions
+sub-calls, the response shape and the time bounds are unchanged.
 
 `lang_instruction` is now only a **fallback hint** (the language the client
 detected from the file). The brain decides the welcome/questions language by
