@@ -376,9 +376,16 @@ Accounts come to exist in two ways, plus a third you can switch on:
 
 - **Invitation.** On the admin panel's **Users** page, `ladmin` enters an
   address and clicks **Invite user**. The account is created without a
-  password and a link that sets one is mailed to the address. If the mail
-  cannot be sent, the page says so; the colleague can still click **Reset
-  password** on the sign-in page.
+  password and a link that sets one is mailed to the address. The link is
+  valid for 30 days and works once (the mail's own text may still say 30
+  minutes; that wording comes from the hosted service and is being
+  corrected). Until the colleague has set a password,
+  **Invite user** can be used again for the same address: a new link is
+  mailed and the previous one stops working. Once a password is set, the
+  page answers that the user already has an account and should use **Reset
+  password** on the sign-in page. If the mail cannot be sent, the page says
+  so; the colleague can still click **Reset password** on the sign-in
+  page.
 - **Sharing.** Sharing a chat, a conversation or a dashboard with a new
   address in an allowed domain creates the same password-less account. The
   colleague sets a password through **Reset password** (or, while single
@@ -431,11 +438,11 @@ the incoming request, because a caller controls that address and could
 otherwise have a genuine reset mail point at a server of their choosing.
 
 **Password reset.** "Reset password" mails a link valid for 30 minutes that
-works once. The sign-in page gives the same answer whether or not the address
+works once (an invitation link is valid for 30 days). The sign-in page gives the same answer whether or not the address
 has an account. The link's token appears in the browser history and in your
 proxy's access log, like any URL (the
 application's own access log shows it as `/auth/reset/<redacted>`); single use
-and the 30-minute lifetime are the protection.
+and the 30-minute lifetime (30 days for an invitation) are the protection.
 
 **Sessions.** Setting a new password — through a reset link, the forced
 change or **Change Password** — signs the account out everywhere else; the
@@ -1045,7 +1052,7 @@ worth stating plainly:
 | Table column names | Report generation | Column NAMES only, first 10 — never rows |
 | User email | Every call | Tenant routing and per-user activity |
 | Activity events | Login, upload, chat, report | Event name, user email, lightweight counters |
-| Password-reset payload | Password reset and invitation | The e-mail address, whether it is a reset or an invitation, and a single-use reset link (valid 30 minutes), relayed through the brain's mail service; the brain never logs or stores the link. Until it is used or expires the link sets the account's password, so the operator of the brain and of its mail relay is trusted with it, as with any mailed reset link |
+| Password-reset payload | Password reset and invitation | The e-mail address, whether it is a reset or an invitation, and a single-use link (valid 30 minutes for a reset, 30 days for an invitation), relayed through the brain's mail service; the brain never logs or stores the link. Until it is used or expires the link sets the account's password, so the operator of the brain and of its mail relay is trusted with it, as with any mailed reset link |
 | Third-party browser scripts | Never, by default | The `/lab` page loads no analytics or billing script; the browser contacts only your own server |
 
 Never sent: uploaded files, DataFrames, query result sets, rendered charts or

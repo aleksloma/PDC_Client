@@ -10,6 +10,12 @@
 
 A second hosted instance, `pdcclient-brb` at `brb.powerdatachat.com` (BRB demo on Cloud SQL, same images), is documented in `BRB_CLOUD_RUN.md`.
 
+**Build once, deploy both.** Every release builds the two images ONCE from a
+merged `main` commit ("Build" below) and deploys them to both services, one
+after the other: `pdcclient-demo` first, then `pdcclient-brb` with the same
+tag the demo has just been verified on. Each service keeps its own spec,
+data bucket, backups and secrets; only the two `image:` lines change.
+
 ## Topology
 
 | Piece | Value |
