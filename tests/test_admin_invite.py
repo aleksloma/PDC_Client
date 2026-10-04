@@ -319,7 +319,7 @@ def test_without_a_public_base_url_the_account_exists_but_nothing_is_mailed(worl
     r = _invite(world, INVITEE)
     assert r.status_code == 200, (r.status_code, r.text[:300])
     assert r.json() == {
-        "ok": True, "email": INVITEE, "created": True, "mail_sent": False,
+        "ok": True, "email": INVITEE, "created": True, "resent": False, "mail_sent": False,
         "mail_error": "PUBLIC_BASE_URL is not set, so no invitation link can be mailed.",
     }, r.json()
     profile = _profile(world["tmp"], INVITEE)
@@ -329,3 +329,137 @@ def test_without_a_public_base_url_the_account_exists_but_nothing_is_mailed(worl
     rows = _audit_rows("user.invite")
     assert len(rows) == 1, rows
     assert (rows[0].get("detail") or {}).get("mail_sent") is False, rows[0]
+
+
+# ===========================================================================
+# link validity and re-sending (CLIENT_FIX 1)
+# ===========================================================================
+DAY = 24 * 3600
+
+
+def test_an_invitation_link_is_valid_for_30_days(world):
+    import time
+    before = time.time()
+    assert _invite(world, INVITEE).status_code == 200
+    expires = _auth(world["tmp"], INVITEE).get("reset_expires_at")
+    assert local_store.INVITE_TOKEN_TTL_S == 30 * DAY
+    assert before + 30 * DAY - 5 <= expires <= time.time() + 30 * DAY + 5, expires
+
+
+def test_a_reset_link_keeps_its_30_minutes(world):
+    import time
+    assert local_store.RESET_TOKEN_TTL_S == 1800
+    assert _invite(world, INVITEE).status_code == 200
+    before = time.time()
+    tc = world["client"]()
+    r = tc.post("/auth/reset_password", data=csrf_form(tc, {"email": INVITEE}),
+                follow_redirects=False)
+    assert r.status_code == 200
+    expires = _auth(world["tmp"], INVITEE).get("reset_expires_at")
+    assert before + 1800 - 5 <= expires <= time.time() + 1800 + 5, expires
+
+
+def test_a_reinvite_replaces_the_previous_link(world):
+    first = _invite(world, INVITEE)
+    assert first.status_code == 200 and first.json().get("resent") is False, first.json()
+    second = _invite(world, INVITEE)
+    assert second.status_code == 200, second.text[:300]
+    body = second.json()
+    assert body.get("created") is False and body.get("resent") is True, body
+    assert body.get("mail_sent") is True, body
+    assert [to for to, _ in world["sent"]] == [INVITEE, INVITEE]
+    old_token = world["sent"][0][1].rsplit("/", 1)[1]
+    new_token = world["sent"][1][1].rsplit("/", 1)[1]
+    assert old_token != new_token
+    tc = world["client"]()
+    assert tc.get(f"/auth/reset/{old_token}").status_code == 404
+    assert tc.get(f"/auth/reset/{new_token}").status_code == 200
+    expires = _auth(world["tmp"], INVITEE).get("reset_expires_at")
+    import time
+    assert expires >= time.time() + 30 * DAY - 60, "a re-sent link must also last 30 days"
+
+
+def test_the_invite_is_refused_only_once_a_password_is_set(world):
+    assert _invite(world, INVITEE).status_code == 200
+    token = world["sent"][-1][1].rsplit("/", 1)[1]
+    assert _invite(world, INVITEE).status_code == 200, "a not-yet-activated account"
+    token = world["sent"][-1][1].rsplit("/", 1)[1]
+    tc = world["client"]()
+    r = tc.post(f"/auth/reset/{token}",
+                data=csrf_form(tc, {"new_password": "Invitee-pw1",
+                                    "confirm_password": "Invitee-pw1"}),
+                follow_redirects=False)
+    assert r.status_code == 302
+    refused = _invite(world, INVITEE)
+    assert refused.status_code == 409, refused.text[:300]
+    assert refused.json().get("code") == "USER_EXISTS"
+    assert "Reset password" in refused.json().get("error", ""), refused.json()
+    # The used link stays used: setting the password invalidated it.
+    assert world["client"]().get(f"/auth/reset/{token}").status_code == 404
+
+
+def test_a_failed_resend_keeps_the_earlier_link_working(world):
+    assert _invite(world, INVITEE).status_code == 200
+    token = world["sent"][-1][1].rsplit("/", 1)[1]
+    world["fail"]["on"] = True
+    r = _invite(world, INVITEE)
+    assert r.status_code == 200, r.text[:300]
+    body = r.json()
+    assert body.get("resent") is True and body.get("mail_sent") is False, body
+    assert world["client"]().get(f"/auth/reset/{token}").status_code == 200
+
+
+def test_a_failed_first_invite_leaves_no_link(world):
+    world["fail"]["on"] = True
+    assert _invite(world, INVITEE).status_code == 200
+    assert not _auth(world["tmp"], INVITEE).get("reset_token_hash")
+
+
+def test_the_brain_mail_cap_is_named(world, monkeypatch):
+    def capped(email, reset_url, **kwargs):
+        raise brain_client.BrainError("Brain rejected request 429: rate limited")
+    monkeypatch.setattr(brain_client, "send_password_reset_email", capped)
+    body = _invite(world, INVITEE).json()
+    assert body.get("mail_sent") is False
+    assert "Too many mails" in body.get("mail_error", ""), body
+    assert "rate limited" not in body.get("mail_error", ""), "the brain's text is never passed on"
+
+
+def test_a_failed_resend_never_revives_a_link_once_a_password_is_set(world, monkeypatch):
+    """The password is set (here: through the sign-in page's reset path)
+    while the re-send's mail is failing: the rollback must not put the old
+    invitation link back on an account that now has a password."""
+    assert _invite(world, INVITEE).status_code == 200
+    old_token = world["sent"][-1][1].rsplit("/", 1)[1]
+
+    def set_password_then_fail(email, reset_url, **kwargs):
+        local_store.AuthStore().set_password(email, "Invitee-pw1")
+        raise brain_client.BrainError("brain answered 503")
+
+    monkeypatch.setattr(brain_client, "send_password_reset_email", set_password_then_fail)
+    r = _invite(world, INVITEE)
+    assert r.status_code == 200 and r.json().get("mail_sent") is False, r.text[:300]
+    assert not _auth(world["tmp"], INVITEE).get("reset_token_hash")
+    assert world["client"]().get(f"/auth/reset/{old_token}").status_code == 404
+
+
+def test_a_failed_resend_never_revives_a_link_once_the_new_one_was_used(world, monkeypatch):
+    """The relay times out although the mail went out, and the invitee uses
+    the NEW link before the route rolls back: the used link keeps its hash
+    (marked used), so the rollback must also check `reset_used` and the
+    password — the old link stays dead and the password stays."""
+    assert _invite(world, INVITEE).status_code == 200
+    old_token = world["sent"][-1][1].rsplit("/", 1)[1]
+
+    def used_then_timeout(email, reset_url, **kwargs):
+        new_token = reset_url.rsplit("/", 1)[1]
+        assert local_store.AuthStore().consume_reset_token(new_token, "Invitee-pw1") == email
+        raise brain_client.BrainTimeoutError("timed out")
+
+    monkeypatch.setattr(brain_client, "send_password_reset_email", used_then_timeout)
+    r = _invite(world, INVITEE)
+    assert r.status_code == 200 and r.json().get("mail_sent") is False, r.text[:300]
+    rec = _auth(world["tmp"], INVITEE)
+    assert rec.get("password_hash"), "the password set through the new link must stay"
+    assert rec.get("reset_used") is True, rec
+    assert world["client"]().get(f"/auth/reset/{old_token}").status_code == 404

@@ -53,6 +53,10 @@ _SSO_INDEX: dict = {}
 # auth.json paths already reported unreadable by a scan (one line per path).
 _UNREADABLE_AUTH_LOGGED: set = set()
 RESET_TOKEN_TTL_S = 1800
+# An invitation link (the admin's "Invite user") lives longer than a reset
+# link: an invitee may not open the mail for days. Applied only where the
+# invite route mints; a reset link keeps RESET_TOKEN_TTL_S.
+INVITE_TOKEN_TTL_S = 30 * 24 * 3600
 _RESET_KEYS = ("reset_token_hash", "reset_expires_at", "reset_used")
 # Exactly what secrets.token_urlsafe(32) produces.
 _RESET_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
@@ -1721,12 +1725,15 @@ class AuthStore:
 
     # --- Reset links ----------------------------------------------------------
 
-    def create_reset_token(self, email: str) -> Optional[str]:
+    def create_reset_token(self, email: str, *, ttl_s: Optional[int] = None) -> Optional[str]:
         """Mint a reset link token for an EXISTING account (profile or auth
         record) and return it — the only place the raw token exists outside
-        the mail. Replaces any earlier token. None, with nothing written, for
-        an unknown address or on failure (Article IV)."""
+        the mail. Replaces any earlier token. `ttl_s` is the link's lifetime
+        (None = RESET_TOKEN_TTL_S; the admin invite passes
+        INVITE_TOKEN_TTL_S). None, with nothing written, for an unknown
+        address or on failure (Article IV)."""
         try:
+            ttl = RESET_TOKEN_TTL_S if ttl_s is None else int(ttl_s)
             token = secrets.token_urlsafe(32)
             token_hash = _reset_token_hash(token)
             with _LOCK:
@@ -1735,7 +1742,7 @@ class AuthStore:
                 auth = self.get_auth(email)
                 old = auth.get("reset_token_hash")
                 auth["reset_token_hash"] = token_hash
-                auth["reset_expires_at"] = int(_time.time()) + RESET_TOKEN_TTL_S
+                auth["reset_expires_at"] = int(_time.time()) + ttl
                 auth["reset_used"] = False
                 self._write_auth(email, auth)
                 if old:
@@ -1851,6 +1858,45 @@ class AuthStore:
                     _RESET_TOKEN_INDEX.pop(old, None)
         except Exception as e:
             log_with_sid(email, "error", f'PASSWORD_RESET_CLEAR_FAILED {log_safe_value(str(type(e).__name__), 300)}')
+
+    def restore_reset_token(self, email: str, previous: dict, minted: str) -> None:
+        """The failed-send rollback of a re-sent invitation: put back the
+        reset-link keys `previous` (the auth record read before the mint)
+        held, so the link the invitee already has keeps working — without a
+        token in `previous`, drop the minted one. Only while the record still
+        holds exactly `minted` (the raw token this mint returned), UNUSED, on
+        an account without a password: a link used, a password set or another
+        link minted in between wins and nothing is written (a mail that timed
+        out may still have arrived and been used). Never raises."""
+        try:
+            kept = {key: previous[key] for key in _RESET_KEYS
+                    if isinstance(previous, dict) and key in previous}
+            with _LOCK:
+                if not self._account_present(email, "restore_reset_token"):
+                    return
+                auth = self.get_auth(email)
+                current = auth.get("reset_token_hash")
+                if (not current
+                        or not hmac.compare_digest(str(current), _reset_token_hash(minted))
+                        or auth.get("reset_used") is not False
+                        or auth.get("password_hash") or auth.get("temp_password_hash")):
+                    log_with_sid(email, "info", "PASSWORD_RESET_RESTORE_SKIPPED")
+                    return
+                if not kept.get("reset_token_hash"):
+                    for key in _RESET_KEYS:
+                        auth.pop(key, None)
+                    self._write_auth(email, auth)
+                    _RESET_TOKEN_INDEX.pop(current, None)
+                    return
+                for key in _RESET_KEYS:
+                    auth.pop(key, None)
+                auth.update(kept)
+                self._write_auth(email, auth)
+                if current:
+                    _RESET_TOKEN_INDEX.pop(current, None)
+                _RESET_TOKEN_INDEX[kept["reset_token_hash"]] = _safe_email(email)
+        except Exception as e:
+            log_with_sid(email, "error", f'PASSWORD_RESET_RESTORE_FAILED {log_safe_value(str(type(e).__name__), 300)}')
 
     def clear_temp_password(self, email: str) -> None:
         with _LOCK:

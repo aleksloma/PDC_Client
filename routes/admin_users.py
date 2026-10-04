@@ -44,8 +44,8 @@ import brain_client
 import db_sources
 import roles_store
 from exec_transport import log_safe_text
-from local_store import (AccountMissing, AuthStore, delete_chats_owned_by,
-                         purge_address_grants)
+from local_store import (INVITE_TOKEN_TTL_S, AccountMissing, AuthStore,
+                         delete_chats_owned_by, purge_address_grants)
 from logger_utils import log_with_sid
 from routes.admin_data import _require_admin, _json_body
 from settings import settings
@@ -452,6 +452,19 @@ async def remove_user(request: Request):
 
 
 NO_BASE_URL_MAIL_ERROR = "PUBLIC_BASE_URL is not set, so no invitation link can be mailed."
+USER_EXISTS_TEXT = ("This user already has an account. They can use "
+                    "\u201cReset password\u201d on the sign-in page.")
+MAIL_RATE_LIMITED_ERROR = ("Too many mails were sent to this address in the last hour, "
+                           "so the invitation mail was not sent. Try again later.")
+
+
+def _invite_mail_error(exc: Exception) -> str:
+    """The fixed sentence the admin reads when the relay failed — never the
+    brain's own text. A 429 is the brain's per-recipient hourly mail cap,
+    which repeated invitations to one address are the likeliest to hit."""
+    if str(exc).startswith("Brain rejected request 429"):
+        return MAIL_RATE_LIMITED_ERROR
+    return f"The invitation mail could not be sent ({type(exc).__name__})."
 
 
 @router.post("/users/invite")
@@ -459,12 +472,16 @@ async def invite_user(request: Request):
     """Invite an address (sign-in is invitation-only, D9-1): body {email}.
     Creates a password-less placeholder (`invited_by` = this admin) when the
     address has no account — a legacy or placeholder account without a
-    password is used as it is — mints a reset link and mails it through the
-    brain, waiting for the answer (the admin may learn whether it went out).
-    Answers {ok, email, created, mail_sent[, mail_error]}; a failed mail is
-    still 200 — the account exists and "Reset password" works for the
-    invitee. With PUBLIC_BASE_URL unset (or not http(s)) nothing is minted or
-    mailed: 200 with mail_sent false and that reason (D9-26). 400 for an invalid address or the bootstrap account, 409
+    password is used as it is, so an invitation can be RE-SENT until the
+    invitee sets a password (`resent: true`; the new link replaces the
+    previous one) — mints a link valid INVITE_TOKEN_TTL_S (30 days) and mails
+    it through the brain, waiting for the answer (the admin may learn whether
+    it went out). Answers {ok, email, created, resent, mail_sent[,
+    mail_error]}; a failed mail is still 200 — the account exists; a failed
+    first mail leaves no link behind, a failed re-send puts the previous link
+    back. With PUBLIC_BASE_URL unset (or not http(s)) nothing is minted or
+    mailed: 200 with mail_sent false and that reason (D9-26). 400 for an
+    invalid address or the bootstrap account, 409
     USER_EXISTS for an account that already has a password, 409 SSO_ACCOUNT
     for an account that signs in with Microsoft and has none. The mail is of
     kind "invite" (invitation wording). Audited `user.invite` (never the
@@ -482,17 +499,19 @@ async def invite_user(request: Request):
         return JSONResponse(
             {"error": "The local admin account cannot be invited."}, status_code=400)
     if auth.has_password(target):
-        return JSONResponse(
-            {"error": "This user already has an account.", "code": "USER_EXISTS"},
-            status_code=409)
+        log_with_sid(email, "info", f"ADMIN_USER_INVITE_REFUSED user={target} code=USER_EXISTS")
+        return JSONResponse({"error": USER_EXISTS_TEXT, "code": "USER_EXISTS"},
+                            status_code=409)
     if auth.is_sso_only(target):
         # Signs in with Microsoft: an invitation link would give it a local
         # password that bypasses the identity provider's MFA.
+        log_with_sid(email, "info", f"ADMIN_USER_INVITE_REFUSED user={target} code=SSO_ACCOUNT")
         return JSONResponse({"error": SSO_NO_LOCAL_PASSWORD_TEXT, "code": "SSO_ACCOUNT"},
                             status_code=409)
     created = False
     if not auth.user_exists(target):
         created = auth.ensure_invited_user(target, email)
+    resent = not created
     base = _public_base()
     mail_error = None
     if not base:
@@ -503,7 +522,11 @@ async def invite_user(request: Request):
             return JSONResponse({"error": "Could not create the invitation."}, status_code=500)
         mail_error = NO_BASE_URL_MAIL_ERROR
     else:
-        token = auth.create_reset_token(target) if auth.user_exists(target) else None
+        # The record before the mint: a re-send whose mail fails puts its
+        # link back, so the one the invitee already holds keeps working.
+        previous = auth.get_auth(target) if resent else {}
+        token = (auth.create_reset_token(target, ttl_s=INVITE_TOKEN_TTL_S)
+                 if auth.user_exists(target) else None)
         if not token:
             log_with_sid(email, "error", f"ADMIN_USER_INVITE_FAILED user={target}")
             return JSONResponse({"error": "Could not create the invitation."}, status_code=500)
@@ -514,17 +537,19 @@ async def invite_user(request: Request):
                                         timeout=settings.BRAIN_DRAFT_TIMEOUT,
                                         kind="invite"))
         except Exception as e:
-            # No link nobody received stays behind; the invitee asks for a
-            # fresh one from the sign-in page.
-            auth.clear_reset_token(target)
-            mail_error = f"The invitation mail could not be sent ({type(e).__name__})."
+            # No link nobody received stays behind.
+            auth.restore_reset_token(target, previous, token)
+            mail_error = _invite_mail_error(e)
+            log_with_sid(email, "warning",
+                         f"ADMIN_USER_INVITE_MAIL_FAILED user={target} error={type(e).__name__}")
     mail_sent = mail_error is None
     db_sources.audit(email, "user.invite", target=target,
                      detail={"created": created, "mail_sent": mail_sent},
                      ip=(request.client.host if request.client else None))
     log_with_sid(email, "info",
                  f"ADMIN_USER_INVITED user={target} created={created} mail_sent={mail_sent}")
-    out = {"ok": True, "email": target, "created": created, "mail_sent": mail_sent}
+    out = {"ok": True, "email": target, "created": created, "resent": resent,
+           "mail_sent": mail_sent}
     if mail_error:
         out["mail_error"] = mail_error
     return out

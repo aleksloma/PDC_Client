@@ -1204,7 +1204,7 @@ function setupEventListeners() {
       if (files.length === 0) return;
       // Modal drops ACCUMULATE — same path the file-picker uses. The user must click
       // "Generate Chat" to actually start the upload+autofill+generate flow. This lets
-      // them drop multiple files and/or share a Google Sheet in the same session before
+      // them drop multiple files and/or pick database tables in the same session before
       // committing. Plan-limit and extension validation live in addFilesToSelection.
       addFilesToSelection(files);
     });
@@ -1214,16 +1214,6 @@ function setupEventListeners() {
       wizardModalContent.classList.remove('drag-active');
     });
   }
-
-  // Google Sheet import
-  document.getElementById('shareGoogleSheetBtn').addEventListener('click', () => {
-    document.getElementById('googleSheetInputBox').classList.remove('hidden');
-  });
-  document.getElementById('cancelGoogleSheetBtn').addEventListener('click', () => {
-    document.getElementById('googleSheetInputBox').classList.add('hidden');
-    document.getElementById('googleUrlInput').value = '';
-  });
-  document.getElementById('importFromUrlBtn').addEventListener('click', importFromGoogleUrl);
 
   // Chat input
   chatInput.addEventListener('keydown', (e) => {
@@ -3677,7 +3667,7 @@ function openCreateWizard() {
 // Registered NON-connector tables (GET /api/db_tables) render inside a compact
 // "Select from DB" checkbox dropdown (Excel-column-filter style: names only,
 // search on top, scrolls past ~8 rows). A checked table joins `selectedFiles`
-// as {name, _isDbTable: true, _tableId} (the Google-Sheet no-File precedent),
+// as {name, _isDbTable: true, _tableId} (an entry with no File behind it),
 // so the shared render/validation/removal paths need almost no changes and DB
 // tables + uploaded files mix freely in one chat.
 // CACHE-FIRST: the list is prefetched once at page load; every wizard open
@@ -3934,7 +3924,7 @@ async function _fetchAddDataDbTableIds(chatId) {
   }
 }
 
-// Enable Generate Chat only when there's at least one selected file (or shared Google Sheet).
+// Enable Generate Chat only when there's at least one selected file or database table.
 // Uses the standard `disabled` attribute on the existing .primary button — no new visual.
 function _updateWizardGenerateBtn() {
   const btn = document.getElementById('btnWizardNext');
@@ -3960,7 +3950,7 @@ async function wizardNextStep() {
   // Close the modal first so the progress overlay is the only thing visible
   closeCreateWizard();
 
-  const regularFiles = selectedFiles.filter(f => !f._isGoogleSheet && !f._isDbTable);
+  const regularFiles = selectedFiles.filter(f => !f._isDbTable);
   const dbTableIds = selectedFiles.filter(f => f._isDbTable).map(f => f._tableId);
   if (mode === 'add' && targetChatId) {
     if (regularFiles.length === 0 && dbTableIds.length === 0) {
@@ -3972,13 +3962,10 @@ async function wizardNextStep() {
     });
     return;
   }
-  // Google Sheets are already uploaded by /upload_from_url; if any are selected,
-  // we MUST NOT call /new_session again (that would wipe them). The wizard already
-  // reset the session in openCreateWizard(). DB tables need no upload at all —
-  // /session/db_tables records the selection server-side.
-  await runFrictionlessFlow(regularFiles, {
-    skipUploadIfEmpty: true, resetSession: false, dbTableIds,
-  });
+  // The wizard already reset the session in openCreateWizard(), so no second
+  // /new_session. DB tables need no upload at all — /session/db_tables records
+  // the selection server-side.
+  await runFrictionlessFlow(regularFiles, { resetSession: false, dbTableIds });
 }
 
 // File handling — used by wizard <input>, page drop, welcome pick-button drop
@@ -4149,7 +4136,7 @@ async function addFilesToSelection(newFiles) {
 
   // Reject unsupported types up-front (unchanged behavior)
   for (const f of incoming) {
-    if (!f._isGoogleSheet && !_hasValidUploadExtension(f.name)) {
+    if (!_hasValidUploadExtension(f.name)) {
       showToast(_t('lab.invalid_file_type', 'Unsupported file type. Use .xlsx, .xls, .csv, or .tsv.'), true);
       return;
     }
@@ -4165,17 +4152,12 @@ async function addFilesToSelection(newFiles) {
     Object.prototype.hasOwnProperty.call(chatFps, name);
 
   for (const f of incoming) {
-    if (f._isGoogleSheet) {
-      // No local bytes to hash — keep the legacy name-level dedup.
-      if (!isTaken(f.name)) accepted.push(f);
-      continue;
-    }
     delete f._pdcUploadName;   // a re-added File object starts clean
 
     // Duplicate within the selection?
     const dupe = selectedFiles.concat(accepted).find(o => _uploadNameOf(o) === f.name);
     if (dupe) {
-      const identical = (!dupe._isGoogleSheet && dupe.size === f.size)
+      const identical = (!dupe._isDbTable && dupe.size === f.size)
         ? await _sameLocalContent(dupe, f) : false;
       if (identical) {
         showToast(`${_t('lab.duplicate_file_ignored', 'Duplicate file ignored')}: ${f.name}`);
@@ -4243,14 +4225,12 @@ function renderSelectedFilesList() {
   }
   container.innerHTML = '';
   selectedFiles.forEach((file, index) => {
-    const isGoogle = !!file._isGoogleSheet;
     const isDb = !!file._isDbTable;
     const row = document.createElement('div');
-    row.className = 'selected-file-row' + (isGoogle ? ' google-sheet' : '') + (isDb ? ' db-table' : '');
+    row.className = 'selected-file-row' + (isDb ? ' db-table' : '');
     row.innerHTML = `
       <span class="selected-file-name">
         ${index + 1}. ${escapeHtml(_uploadNameOf(file))}
-        ${isGoogle ? '<span class="selected-file-badge">📎 Google Sheet</span>' : ''}
         ${isDb ? '<span class="selected-file-badge db">🗄️ DB table</span>' : ''}
       </span>
       <button type="button" class="file-remove-btn" data-index="${index}">×</button>
@@ -4264,9 +4244,9 @@ function renderSelectedFilesList() {
  * Steps: Upload → /schema_autofill_full → /generate_chatdata → openChat
  * Used by both page-level drop and the single-step Create New modal.
  *
- * @param {File[]} files local files to upload (may be empty when only Google Sheets are present;
- *   in that case `opts.skipUploadIfEmpty` should be true so we still continue to autofill+generate).
- * @param {{skipUploadIfEmpty?: boolean, resetSession?: boolean, addToChatId?: string}} opts
+ * @param {File[]} files local files to upload (may be empty when only database tables
+ *   are selected — `opts.dbTableIds`).
+ * @param {{resetSession?: boolean, addToChatId?: string, dbTableIds?: string[]}} opts
  *   `addToChatId` (Add Data mode): after the same upload+autofill steps, the
  *   files are merged into that EXISTING chat via /add_data_to_chat instead of
  *   creating a new chat.
@@ -4291,7 +4271,7 @@ async function runFrictionlessFlow(files, opts) {
   }
 
   const dbTableIds = opts.dbTableIds || [];
-  if (filesArr.length === 0 && dbTableIds.length === 0 && !opts.skipUploadIfEmpty) {
+  if (filesArr.length === 0 && dbTableIds.length === 0) {
     showToast('Please select at least one file', true);
     return;
   }
@@ -4300,7 +4280,7 @@ async function runFrictionlessFlow(files, opts) {
   _showFrictionlessOverlay('lab.flow_uploading');
 
   try {
-    // Step 1: Upload (only if we have local files; Google Sheets are already on the server)
+    // Step 1: Upload (only if we have local files; DB tables need no upload)
     if (filesArr.length > 0) {
       // Reset session unless caller already did so (the wizard resets on open)
       if (opts.resetSession !== false) {
@@ -4463,50 +4443,6 @@ async function runFrictionlessFlow(files, opts) {
     isFrictionlessFlowRunning = false;
     _hideFrictionlessOverlay();
   }
-}
-
-// Import from Google URL
-async function importFromGoogleUrl() {
-  const url = document.getElementById('googleUrlInput').value.trim();
-  const status = document.getElementById('urlImportStatus');
-  
-  if (!url) {
-    status.textContent = 'Please enter a URL';
-    status.style.color = '#ef4444';
-    return;
-  }
-  
-  showLoading('Importing from Google...');
-  
-  try {
-    const res = await pdcFetch('/upload_from_url', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, description: 'Shared Google Sheet' })
-    });
-    
-    const data = await res.json();
-    
-    if (data.error) {
-      status.textContent = data.error;
-      status.style.color = '#ef4444';
-    } else {
-      // Add as a file
-      const fakeFile = { name: data.filename, _isGoogleSheet: true };
-      selectedFiles.push(fakeFile);
-      renderSelectedFilesList();
-      _updateWizardGenerateBtn();
-
-      document.getElementById('googleSheetInputBox').classList.add('hidden');
-      document.getElementById('googleUrlInput').value = '';
-      status.textContent = '';
-    }
-  } catch (e) {
-    status.textContent = 'Failed to import';
-    status.style.color = '#ef4444';
-  }
-  
-  hideLoading();
 }
 
 // (Schema editing in the new flow lives in the post-creation modal — see openSchemaViewer.)

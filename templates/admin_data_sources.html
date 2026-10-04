@@ -263,7 +263,8 @@
           </div>
         </header>
         {# Sign-in is invitation-only: an invite creates the account and mails
-           the address a link to set its password (valid 30 minutes). #}
+           the address a link to set its password (valid 30 days; inviting again
+           sends a new link and the previous one stops working). #}
         <div class="adm-users-invite">
           <input type="email" id="inviteEmail" class="adm-search" autocomplete="off"
                  name="pdc-invite-email" placeholder="name@company.com" />
