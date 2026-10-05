@@ -218,6 +218,54 @@ the demo export is kept in `BRB_Database_template/docs/BRB_SERVICE_DIFF.md`.
 
 ## Deploy history
 
+**2026-10-04 — `main` at `684e88a` (PR #10).** The five findings from
+testing this instance (blank `pd.cut` sunburst/treemap, raw-precision
+hierarchical labels, title under the Plotly toolbar, the pin toast over the
+chat input, `existing_names` on `/v1/chat_metadata`). Same images as
+`pdcclient-demo` (Cloud Build `148db1e0-d115-44d3-b697-02da2dd24217`,
+`BUILD_TIME=2026-10-04T19:39:29Z`), deployed right after the demo was
+verified on them; the revision resolved exactly these digests:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:684e88a` | `sha256:64745590530e50430a533e8591eaf5c220f64f8507d690fd86302a8da664179e` |
+| `pdcexecutor-demo:684e88a` | `sha256:521041550e4fe20d3cef3238b5ac2f421abf56587527f7a2f06f0c43819f895d` |
+
+Revision `pdcclient-brb-684e88a`, serving 100 % since 2026-10-04 ~20:20 UTC.
+It replaced `pdcclient-brb-9b48b58`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-brb --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-brb-9b48b58=100
+```
+
+Backup taken before the deploy:
+`gs://pdc-enterprise-client-brb-data-backups/20261004-201704/`, which matched
+the data bucket in size (245,470,719 bytes) and in its 157 object names.
+
+The spec change was image-only (two `image:` lines and the template name;
+the `cloudsql-instances` annotation, secrets, buckets and resources carried
+over), checked by a diff against the export before the Admin API `PUT`.
+Candidate checks (`candidate---…` URL), none of them signed in:
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `684e88a`; the landing
+  page answered 200 and an anonymous `/lab` redirected to sign-in.
+- The served `vendor/viewers.js` carries the title fit
+  (`data-pdc-title-fit`) and `dashboard.js` the new toast placement.
+- Revision log: `LADMIN_PRESENT`, `RESET_TOKEN_INDEX_FILLED count=3`,
+  `EXECUTOR_HANDSHAKE_OK version=684e88a`, `DB_SCHEDULER_STARTED`; no error
+  lines, no 5xx.
+- **Pending, to be done by hand in the browser:** the signed-in checks — in
+  the chat "Ledger Pulse_2", Refresh on the blank sunburst answer draws it; a
+  treemap question with values shows rounded labels; pinning a chart, the
+  toast does not cover the input; a long title is not under the toolbar; a new
+  chat from the card tables gets a name unlike the existing ones (needs a
+  `pdcbrain` revision that knows `existing_names`; `pdcbrain-00025-yab`,
+  serving at this deploy, predates it). The same digests passed the signed-in
+  checks on the `pdcclient-demo` candidate.
+- After the shift, `brb.powerdatachat.com` reported the same `/version` and
+  `/health`; `pdcbrain` gained no revision (`pdcbrain-00025-yab`) and
+  `pdcclient-demo` stayed on `pdcclient-demo-684e88a`.
+
 **2026-10-04 — `main` at `9b48b58` (PR #7).** The first redeploy. Same
 images as `pdcclient-demo` (Cloud Build
 `db066d39-724c-4818-9c2c-cf697082cb21`, `BUILD_TIME=2026-10-04T09:03:37Z`),
