@@ -218,6 +218,55 @@ the demo export is kept in `BRB_Database_template/docs/BRB_SERVICE_DIFF.md`.
 
 ## Deploy history
 
+**2026-10-05 — `main` at `44cc1b3` (PR #12).** Shared chat names: a share
+recipient's chat-list row and the share mail carry the owner's current name
+of the chat (numbered `_2`, `_3` on a name the recipient already uses), and
+shared chats show the green style (`is_shared` on `/auth/active_chats`). Same
+images as `pdcclient-demo` (Cloud Build
+`c2e94cf9-a25b-4eb6-b24b-7c7b38b92f8f`, `BUILD_TIME=2026-10-05T18:15:08Z`),
+deployed right after the demo; the revision resolved exactly these digests:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:44cc1b3` | `sha256:513a01cb306e354b5978f4978279d70551a4f40219840365397abb0bd53cdd56` |
+| `pdcexecutor-demo:44cc1b3` | `sha256:f46b2807b710d83865b17f74c531c162a804261452c361c15e7940502542f5fe` |
+
+Revision `pdcclient-brb-44cc1b3`, serving 100 % since 2026-10-05 ~18:34 UTC.
+It replaced `pdcclient-brb-684e88a`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-brb --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-brb-684e88a=100
+```
+
+Backup taken before the deploy:
+`gs://pdc-enterprise-client-brb-data-backups/20261005-182506/`, which matched
+the data bucket in size (252,516,429 bytes) and in its 226 object names.
+
+The spec change was image-only (two `image:` lines and the template name;
+the `cloudsql-instances` annotation, secrets, buckets and resources carried
+over), checked by a diff against the export before the Admin API `PUT`.
+Candidate checks (`candidate---…` URL), none of them signed in:
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `44cc1b3`; the landing
+  page answered 200, an anonymous `/lab` redirected to sign-in and an
+  anonymous `/auth/active_chats` answered 401.
+- The served `dashboard.js` carries the new Rename gate.
+- Revision log: `LADMIN_PRESENT`, `RESET_TOKEN_INDEX_FILLED count=9`,
+  `EXECUTOR_HANDSHAKE_OK version=44cc1b3`, `DB_SCHEDULER_STARTED`; no error
+  lines, no 5xx.
+- **Pending, to be done by hand in the browser:** the signed-in checks — an
+  owner renames a chat and shares it (and one conversation of another renamed
+  chat) with a second account; the recipient sees the owner's current names,
+  the rows green, can open them and ask a question, and the recipient's menu
+  shows Pin, Rename, Delete and no Share; a recipient already holding the name
+  gets `_2`; a recipient row written earlier under the old name takes the
+  owner's current name once the owner shares again. These were NOT run on the
+  `pdcclient-demo` candidate either (sharing is not configured there — see
+  its entry); they passed on the local stack with two accounts.
+- After the shift, `brb.powerdatachat.com` reported the same `/version` and
+  `/health`; `pdcbrain` gained no revision (`pdcbrain-00027-haq`) and
+  `pdcclient-demo` stayed on `pdcclient-demo-44cc1b3`.
+
 **2026-10-04 — `main` at `684e88a` (PR #10).** The five findings from
 testing this instance (blank `pd.cut` sunburst/treemap, raw-precision
 hierarchical labels, title under the Plotly toolbar, the pin toast over the

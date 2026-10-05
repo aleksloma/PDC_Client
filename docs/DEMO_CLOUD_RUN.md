@@ -395,6 +395,57 @@ Remove the check's throwaway account and dashboard afterwards.
 
 ## Deploy history
 
+**2026-10-05 — `main` at `44cc1b3` (PR #12).** Shared chat names: a share
+recipient's chat-list row and the share mail carry the owner's current name
+of the chat (numbered `_2`, `_3` on a name the recipient already uses, with a
+repair of rows written under the stale creation name), and
+`/auth/active_chats` rows carry `is_shared`, so shared chats show the green
+style. Built ONCE by Cloud Build `c2e94cf9-a25b-4eb6-b24b-7c7b38b92f8f` (both
+images stamped `44cc1b3`, `BUILD_TIME=2026-10-05T18:15:08Z`) and deployed here
+first, then to `pdcclient-brb`:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:44cc1b3` | `sha256:513a01cb306e354b5978f4978279d70551a4f40219840365397abb0bd53cdd56` |
+| `pdcexecutor-demo:44cc1b3` | `sha256:f46b2807b710d83865b17f74c531c162a804261452c361c15e7940502542f5fe` |
+
+Revision `pdcclient-demo-44cc1b3`, serving 100 % since 2026-10-05 ~18:31 UTC;
+it resolved exactly the two digests above. It replaced
+`pdcclient-demo-684e88a`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-demo-684e88a=100
+```
+
+Backup taken before the deploy:
+`gs://pdc-enterprise-client-demo-data-backups/20261005-181604/`, which matched
+the data bucket in size (439,307,798 bytes) and in its 528 object names.
+
+The spec change was image-only (two `image:` lines and the template name),
+checked by a diff against the export before the Admin API `PUT`. Candidate
+checks (`candidate---…` URL), with two self-registered throwaway accounts:
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `44cc1b3`. Revision
+  log: `EXECUTOR_HANDSHAKE_OK version=44cc1b3`, no error lines, no 5xx.
+- Account A created a `sample_sales.csv` chat ("Sales Analytics"), got a bar
+  chart, and renamed the chat through the sidebar menu; its own row was not
+  green, `/auth/active_chats` answered `is_shared: false` for it and its menu
+  offered Pin, Rename, Share, Delete.
+- **NOT DONE — the share itself.** This instance refuses every share:
+  `400 RECIPIENT_DOMAIN_NOT_ALLOWED`, "Sharing is not configured: no account
+  with an email address exists yet, so the administrator must set
+  SHARE_ALLOWED_DOMAINS." No `SHARE_ALLOWED_DOMAINS` is set, no administrator
+  account has an email address, and with `ALLOW_SELF_REGISTRATION` on the
+  fallback to every account's domain is skipped. This predates the release.
+  So the recipient's view (owner's current name, green row, no Share in the
+  menu) was verified on the local stack with two accounts, not here; nothing
+  was changed on the instance to make sharing possible.
+- Both throwaway accounts were removed through `POST /api/admin/users/remove`
+  (1 chat deleted).
+- After the shift, `client.powerdatachat.com` reported the same `/version`
+  and `/health`, and `pdcbrain` gained no revision (`pdcbrain-00027-haq`
+  serving before and after).
+
 **2026-10-04 — `main` at `684e88a` (PR #10).** The five brb findings:
 sunburst/treemap/icicle charts built from a `pd.cut` column in `path` no
 longer render blank (hierarchy repair), hierarchical value labels follow the
