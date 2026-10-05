@@ -2740,20 +2740,193 @@ class ChatDataStore:
         return new
 
     def remove_share_recipient(self, email: str) -> list[str]:
-        """Take one address (case-insensitive) off `sharing.shared_with`.
+        """Take one address (case-insensitive) off `sharing.shared_with` and
+        out of the conversation-share records (`conv_shares`, `conv_granted`).
         Returns the remaining list; idempotent (an absent address changes
-        nothing)."""
+        nothing, and a meta without the record keys gets none)."""
         target = str(email or "").strip().lower()
         with _LOCK:
             meta = self.read_meta()
             sharing = meta.get("sharing") or {"shared_with": []}
             current = list(sharing.get("shared_with") or [])
             remaining = [s for s in current if str(s or "").strip().lower() != target]
-            if len(remaining) != len(current):
+            changed = len(remaining) != len(current)
+            if changed:
                 sharing["shared_with"] = remaining
+            if _drop_conv_share_address(sharing, target):
+                changed = True
+            if changed:
                 meta["sharing"] = sharing
                 self.write_meta(meta)
         return remaining
+
+    # -- per-conversation share records -------------------------------------
+    # `sharing.conv_shares` = {source conv id: {address: [copy conv id, ...]}}
+    # and `sharing.conv_granted` = the addresses whose place on `shared_with`
+    # a conversation share CREATED. Both additive: written only when
+    # non-empty, read tolerantly, so a meta without them is an empty record.
+
+    def record_conv_shares(self, conv_id: str, copies: dict, granted) -> None:
+        """Remember what a conversation share delivered: `copies` is
+        {address: copy_conv_id} (a list of ids is accepted too), `granted`
+        the addresses the share newly put on `shared_with`. Merged into the
+        record; nothing to record → nothing written."""
+        new_copies: dict[str, list[str]] = {}
+        for addr, ids in (copies or {}).items():
+            key = str(addr or "").strip().lower()
+            if isinstance(ids, str):
+                ids = [ids]
+            ids = [i for i in (ids or []) if isinstance(i, str) and i]
+            if key and ids:
+                new_copies.setdefault(key, []).extend(ids)
+        new_granted = {str(a or "").strip().lower() for a in (granted or [])}
+        new_granted.discard("")
+        if not conv_id or not (new_copies or new_granted):
+            return
+        with _LOCK:
+            meta = self.read_meta()
+            sharing = meta.get("sharing")
+            if not isinstance(sharing, dict):
+                sharing = {"shared_with": []}
+            shares = _conv_shares_of(sharing)
+            if new_copies:
+                per = shares.setdefault(conv_id, {})
+                for key, ids in new_copies.items():
+                    have = per.setdefault(key, [])
+                    have.extend(i for i in dict.fromkeys(ids) if i not in have)
+            all_granted = set(_conv_granted_of(sharing)) | new_granted
+            _set_conv_records(sharing, shares, all_granted)
+            meta["sharing"] = sharing
+            self.write_meta(meta)
+
+    def conv_share_recipients(self, conv_id: str) -> list[str]:
+        """The addresses one conversation is recorded as shared with, sorted.
+        [] for a conversation (or a meta) without a record; never raises."""
+        try:
+            sharing = self.read_meta().get("sharing")
+            return sorted(_conv_shares_of(sharing).get(conv_id) or {})
+        except Exception as e:
+            log_with_sid(log_safe_value(str(self.chat_id), 254), "warning",
+                         f'CONV_SHARE_LIST_FAILED error={log_safe_value(str(type(e).__name__), 300)}')
+            return []
+
+    def remove_conv_share(self, conv_id: str, recipient: str, owner: str) -> dict:
+        """Take one address off ONE conversation's share record and delete
+        the copies that share delivered (the recipient's index rows and the
+        files). Chat access goes with it only when a conversation share
+        created it (`conv_granted`) and nothing else needs it: another shared
+        conversation of this chat keeps it, and one of `owner`'s dashboards
+        still shared with the address and holding a tile of this chat takes
+        the grant over (its own unshare revokes it later). An address that
+        is not recorded for the conversation changes nothing.
+        Returns {"shared_with": <remaining addresses of this conversation>,
+        "chat_access_removed": bool}."""
+        target = str(recipient or "").strip().lower()
+        chat_access_removed = False
+        # One (reentrant) lock section, like the dashboard revocation: a
+        # chat share made on purpose cannot land between the steps.
+        with _LOCK:
+            meta = self.read_meta()
+            sharing = meta.get("sharing")
+            shares = _conv_shares_of(sharing)
+            per = shares.get(conv_id) or {}
+            if not target or target not in per:
+                return {"shared_with": sorted(per), "chat_access_removed": False}
+            copy_ids = per.pop(target)
+            if per:
+                shares[conv_id] = per
+            else:
+                shares.pop(conv_id, None)
+            granted = _conv_granted_of(sharing)
+            _set_conv_records(sharing, shares, granted)
+            meta["sharing"] = sharing
+            self.write_meta(meta)
+            remaining = sorted(per)
+
+            # The copies: ids come from the record only, shape-checked, and
+            # the files are looked up inside this chat's own folder.
+            auth = AuthStore()
+            # A damaged record must not delete what the share did not
+            # create: both indexes are read ONCE, and an id that is the
+            # recipient's conversation of ANOTHER chat, or one of the
+            # owner's own conversations, is skipped — nothing deleted.
+            indexes_read = True
+            recipient_chats: dict = {}
+            owner_conv_ids: set = set()
+            try:
+                for row in auth.list_conversations(target):
+                    if isinstance(row, dict):
+                        recipient_chats.setdefault(
+                            row.get("conv_id"), []).append(row.get("chat_id"))
+                owner_conv_ids = {
+                    row.get("conv_id") for row in auth.list_conversations(owner)
+                    if isinstance(row, dict)}
+            except Exception as e:
+                # Neither check can be made: no copy is deleted.
+                indexes_read = False
+                log_with_sid(log_safe_value(str(self.chat_id), 254), "warning",
+                             f'CONV_SHARE_COPY_INDEX_FAILED error={log_safe_value(str(type(e).__name__), 300)}')
+            for copy_id in copy_ids:
+                if not indexes_read:
+                    break
+                if not valid_conv_id(copy_id) or copy_id == conv_id:
+                    continue
+                row_chats = recipient_chats.get(copy_id) or []
+                skip_reason = None
+                if any(c != self.chat_id for c in row_chats):
+                    skip_reason = "other_chat"
+                elif copy_id in owner_conv_ids:
+                    skip_reason = "owner_conversation"
+                if skip_reason:
+                    log_with_sid(log_safe_value(str(self.chat_id), 254), "warning",
+                                 f'CONV_SHARE_COPY_SKIPPED reason={log_safe_value(str(skip_reason), 80)} '
+                                 f'chat_id={log_safe_value(str(self.chat_id), 80)} '
+                                 f'conv_id={log_safe_value(str(conv_id), 80)} '
+                                 f'copy_id={log_safe_value(str(copy_id), 80)}')
+                    continue
+                try:
+                    if row_chats:
+                        auth.delete_conversation(target, copy_id)
+                    # A recipient who had already lost the row left the file.
+                    leftover = self.conversations_dir / f"{copy_id}.jsonl"
+                    if leftover.exists():
+                        leftover.unlink()
+                except Exception as e:
+                    log_with_sid(log_safe_value(str(self.chat_id), 254), "warning",
+                                 f'CONV_SHARE_COPY_DELETE_FAILED error={log_safe_value(str(type(e).__name__), 300)}')
+
+            elsewhere = any(target in other for other in shares.values())
+            if not elsewhere and target in granted:
+                dash_id = DashboardStore().dashboard_needing_chat(
+                    owner, self.chat_id, target)
+                if dash_id:
+                    # Hand the grant over to that dashboard and stop
+                    # counting it as a conversation grant.
+                    DashboardStore().record_chat_grants(
+                        owner, dash_id, {target: [self.chat_id]})
+                    meta = self.read_meta()
+                    sharing = meta.get("sharing")
+                    if isinstance(sharing, dict):
+                        _set_conv_records(
+                            sharing, _conv_shares_of(sharing),
+                            set(_conv_granted_of(sharing)) - {target})
+                        meta["sharing"] = sharing
+                        self.write_meta(meta)
+                else:
+                    # Exactly what the Share Chat Remove does.
+                    self.remove_share_recipient(target)
+                    chat_access_removed = True
+                    try:
+                        auth.deactivate_chat(target, self.chat_id)
+                    except Exception as e:
+                        log_with_sid(log_safe_value(str(self.chat_id), 254), "warning",
+                                     f'CONV_SHARE_SIDEBAR_FAILED error={log_safe_value(str(type(e).__name__), 300)}')
+        log_with_sid(log_safe_value(str(self.chat_id), 254), "info",
+                     f'CONV_SHARE_REMOVED chat_id={log_safe_value(str(self.chat_id), 80)} '
+                     f'conv_id={log_safe_value(str(conv_id), 80)} '
+                     f'copies={log_safe_value(str(len(copy_ids)), 80)} '
+                     f'chat_access_removed={log_safe_value(str(chat_access_removed), 80)}')
+        return {"shared_with": remaining, "chat_access_removed": chat_access_removed}
 
     def append_history(self, conv_id: str, message: dict) -> None:
         if not valid_conv_id(conv_id):
@@ -2871,9 +3044,82 @@ def _lists_address(doc, target: str) -> bool:
     return any(str(s or "").strip().lower() == target for s in shared)
 
 
+def _conv_shares_of(sharing) -> dict:
+    """Tolerant read of `sharing.conv_shares` as a fresh
+    {conv_id: {address: [copy conv id, ...]}} — addresses lower-cased, ids
+    distinct; anything of another shape (and an address without a copy, a
+    conversation without an address) reads as absent."""
+    raw = sharing.get("conv_shares") if isinstance(sharing, dict) else None
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    for conv_id, per in raw.items():
+        if not isinstance(conv_id, str) or not isinstance(per, dict):
+            continue
+        clean: dict = {}
+        for addr, ids in per.items():
+            key = str(addr or "").strip().lower()
+            if not key or not isinstance(ids, list):
+                continue
+            have = clean.setdefault(key, [])
+            have.extend(i for i in dict.fromkeys(
+                x for x in ids if isinstance(x, str) and x) if i not in have)
+        clean = {k: v for k, v in clean.items() if v}
+        if clean:
+            out[conv_id] = clean
+    return out
+
+
+def _conv_granted_of(sharing) -> list:
+    """Tolerant read of `sharing.conv_granted`: sorted lower-case addresses,
+    [] for a missing or malformed value."""
+    raw = sharing.get("conv_granted") if isinstance(sharing, dict) else None
+    if not isinstance(raw, list):
+        return []
+    return sorted({str(a).strip().lower() for a in raw
+                   if isinstance(a, str) and a.strip()})
+
+
+def _set_conv_records(sharing: dict, shares: dict, granted) -> None:
+    """Write the two record keys into `sharing` — each only when non-empty,
+    popped otherwise."""
+    shares = {c: {a: list(i) for a, i in per.items() if i}
+              for c, per in (shares or {}).items()}
+    shares = {c: per for c, per in shares.items() if per}
+    if shares:
+        sharing["conv_shares"] = shares
+    else:
+        sharing.pop("conv_shares", None)
+    granted = sorted(set(granted or []))
+    if granted:
+        sharing["conv_granted"] = granted
+    else:
+        sharing.pop("conv_granted", None)
+
+
+def _drop_conv_share_address(sharing, address: str) -> bool:
+    """Drop `address` (compared `strip().lower()`) from every `conv_shares`
+    entry and from `conv_granted` of one `sharing` object, in place. True
+    when something was dropped; a `sharing` that does not hold the address
+    is left exactly as it is (no key added, none rewritten)."""
+    target = str(address or "").strip().lower()
+    if not target or not isinstance(sharing, dict):
+        return False
+    shares = _conv_shares_of(sharing)
+    granted = _conv_granted_of(sharing)
+    in_shares = any(target in per for per in shares.values())
+    if not in_shares and target not in granted:
+        return False
+    for per in shares.values():
+        per.pop(target, None)
+    _set_conv_records(sharing, shares, [a for a in granted if a != target])
+    return True
+
+
 def purge_address_grants(email: str) -> dict:
     """Take `email` off every OTHER owner's share list — each chat's
-    `sharing.shared_with` in `chatdata/*/meta.json` and each dashboard doc
+    `sharing.shared_with` (and its conversation-share records, `conv_shares`
+    / `conv_granted`) in `chatdata/*/meta.json` and each dashboard doc
     under `users/*/dashboards/` — so an address that is created again
     inherits none of them. Called by the admin's Remove after the account
     and the chats it owns are gone.
@@ -2924,6 +3170,7 @@ def purge_address_grants(email: str) -> dict:
                 shared = meta["sharing"]["shared_with"]
                 meta["sharing"]["shared_with"] = [
                     s for s in shared if str(s or "").strip().lower() != target]
+                _drop_conv_share_address(meta["sharing"], target)
                 _write_json_atomic(meta_path, meta)
             out["chats_unshared"] += 1
         except Exception as e:
@@ -3434,6 +3681,38 @@ class DashboardStore:
         except Exception as e:
             log_with_sid(log_safe_value(str(owner_email), 254), "error",
                          f'DASH_CHAT_GRANTS_FORGET_FAILED error={log_safe_value(str(type(e).__name__), 300)}')
+
+    def dashboard_needing_chat(self, owner_email: str, chat_id: str,
+                               recipient: str) -> Optional[str]:
+        """One of `owner_email`'s OWN dashboards that is still shared with
+        `recipient` and holds a tile of `chat_id` — the dashboard a
+        conversation unshare hands the chat grant over to. The dash_id, or
+        None when there is none; never raises (a failure is logged and
+        answers None)."""
+        owner_email = _safe_email(owner_email)
+        rcpt = str(recipient or "").strip().lower()
+        if not chat_id or not rcpt:
+            return None
+        try:
+            with _LOCK:
+                for row in self._read_index(owner_email):
+                    dash_id = row.get("dash_id")
+                    if row.get("shared_by") or not dash_id:
+                        continue
+                    doc = self._read_doc(owner_email, dash_id)
+                    if not doc:
+                        continue
+                    shared = [str(s or "").strip().lower()
+                              for s in (doc.get("sharing") or {}).get("shared_with") or []]
+                    if rcpt not in shared:
+                        continue
+                    if any(isinstance(t, dict) and t.get("chat_id") == chat_id
+                           for t in doc.get("tiles") or []):
+                        return dash_id
+        except Exception as e:
+            log_with_sid(log_safe_value(str(owner_email), 254), "error",
+                         f'DASH_CHAT_NEEDED_SCAN_FAILED error={log_safe_value(str(type(e).__name__), 300)}')
+        return None
 
     def revoke_chat_grants(self, owner_email: str, dash_id: str, recipient: str) -> list[str]:
         """Revoke the source-chat grants THIS dashboard's share created for

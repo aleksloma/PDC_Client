@@ -5333,6 +5333,16 @@ async function handleShare(type, chatId, convId, title) {
 
   // The chat owner sees who the chat is shared with and can remove an
   // address (DELETE /api/chat/{id}/share/{email}). Text only (textContent).
+  // A conversation has its own list and its own Remove
+  // (/api/chat/{id}/conversation/{conv}/share): only the addresses THAT
+  // conversation was shared with, never the whole chat's.
+  const isConvShare = type === 'conversation' && !!convId;
+  const shareListUrl = isConvShare
+    ? `/api/chat/${chatId}/conversation/${convId}/share`
+    : `/api/chat/${chatId}/share`;
+  const shareRemoveUrl = (addr) => isConvShare
+    ? `/api/chat/${chatId}/conversation/${convId}/share/${encodeURIComponent(addr)}`
+    : `/api/chat/${chatId}/share/${encodeURIComponent(addr)}`;
   const currentWrap = document.getElementById('shareCurrentWrap');
   const currentList = document.getElementById('shareCurrentList');
   const renderShared = (list) => {
@@ -5351,7 +5361,7 @@ async function handleShare(type, chatId, convId, title) {
       btn.addEventListener('click', async () => {
         btn.disabled = true;
         try {
-          const res = await pdcFetch(`/api/chat/${chatId}/share/${encodeURIComponent(addr)}`, {
+          const res = await pdcFetch(shareRemoveUrl(addr), {
             method: 'DELETE',
             headers: { 'Content-Type': 'application/json' }
           });
@@ -5372,17 +5382,23 @@ async function handleShare(type, chatId, convId, title) {
   };
   renderShared([]);
   if (chatId) {
-    // A late answer for a chat the modal no longer shows is dropped.
+    // A late answer for a chat (or conversation) the modal no longer shows
+    // is dropped.
+    const shownConvId = isConvShare ? convId : '';
     modal.dataset.shareChatId = chatId;
-    pdcFetch(`/api/chat/${chatId}/share`).then(r => r.ok ? r.json() : null).then(data => {
+    modal.dataset.shareConvId = shownConvId;
+    pdcFetch(shareListUrl).then(r => r.ok ? r.json() : null).then(data => {
       if (modal.dataset.shareChatId !== chatId) return;
-      if (data && data.is_owner) renderShared(data.shared_with || []);
+      if (modal.dataset.shareConvId !== shownConvId) return;
+      // The conversation route answers its owner only (anyone else: not ok).
+      if (data && (isConvShare || data.is_owner)) renderShared(data.shared_with || []);
     }).catch(() => {});
   }
 
   const closeModal = () => {
     modal.classList.add('hidden');
     delete modal.dataset.shareChatId;
+    delete modal.dataset.shareConvId;
     renderShared([]);
     // Clean up event handlers
     btnSave.onclick = null;

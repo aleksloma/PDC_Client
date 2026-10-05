@@ -2535,3 +2535,9 @@ button.danger:hover {
 .share-current.hidden {
   display: none;
 }
+
+/* Share modal: the body scrolls inside the dialog, so the title bar and
+   Cancel / Share stay visible however long the "Shared with" list is. */
+#shareModal .modal-header,
+#shareModal .modal-actions { flex: 0 0 auto; }
+#shareModal .modal-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; }

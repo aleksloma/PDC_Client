@@ -1165,21 +1165,48 @@ async def share_conversation(request: Request, conv_id: str):
     files = [f.get("file_name") for f in meta.get("files", []) if f.get("file_name")]
     conv_title = (conv.get("title") or "").strip() or f"Shared by {email}"
 
-    # Add recipients to chat's sharing list (so /_require_chat lets them in)
-    added = store.add_share_recipients(recipients)
-    # An address that has never signed in gets a password-less placeholder,
-    # so whoever types it first at the sign-in page cannot claim the share.
-    for rec in recipients:
-        ensure_share_recipient(rec, email)
+    # Who is on the chat's list ALREADY, compared without letter case: the
+    # store compares exactly, so an address stored as "B@x.com" by an older
+    # release is reported as newly added — it must not count as a grant this
+    # conversation share created.
+    _sharing_now = meta.get("sharing") if isinstance(meta.get("sharing"), dict) else {}
+    _listed_now = _sharing_now.get("shared_with")
+    already_listed = {str(s or "").strip().lower()
+                      for s in (_listed_now if isinstance(_listed_now, list) else [])}
 
     snapshot_conv_ids: dict[str, str] = {}
-    for rec in recipients:
-        new_conv_id = store.copy_conv_to_new(conv_id)
-        snapshot_conv_ids[rec] = new_conv_id
-        recipient_title = f"(Shared) {conv_title}" if not conv_title.startswith("(Shared)") else conv_title
-        AuthStore().record_conversation(rec, chat_id, new_conv_id, recipient_title, shared_by=email)
-        AuthStore().record_shared_chat(rec, chat_id, chat_title, files, shared_by=email,
-                                       original_title=meta_title)
+    # address -> the copies that reached the recipient's index (an address
+    # typed twice gets two), for the per-conversation share record.
+    delivered: dict[str, list[str]] = {}
+    # ONE critical section from the grant to its record (the module RLock,
+    # which the stores take re-entrantly): a Share Chat Remove cannot land
+    # between the two. The mail below stays outside it.
+    with _ls._LOCK:
+        # Add recipients to chat's sharing list (so /_require_chat lets them in)
+        added = store.add_share_recipients(recipients)
+        # An address that has never signed in gets a password-less placeholder,
+        # so whoever types it first at the sign-in page cannot claim the share.
+        for rec in recipients:
+            ensure_share_recipient(rec, email)
+
+        for rec in recipients:
+            new_conv_id = store.copy_conv_to_new(conv_id)
+            snapshot_conv_ids[rec] = new_conv_id
+            recipient_title = f"(Shared) {conv_title}" if not conv_title.startswith("(Shared)") else conv_title
+            if AuthStore().record_conversation(rec, chat_id, new_conv_id, recipient_title,
+                                               shared_by=email):
+                delivered.setdefault(rec, []).append(new_conv_id)
+            AuthStore().record_shared_chat(rec, chat_id, chat_title, files, shared_by=email,
+                                           original_title=meta_title)
+        # Which conversation went to whom, and whose chat access this share
+        # created — what the Share Conversation dialog lists and its Remove undoes.
+        try:
+            store.record_conv_shares(
+                conv_id, delivered,
+                granted=[a for a in added if a not in already_listed])
+        except Exception as e:
+            log_with_sid(email, "error",
+                         f"CONV_SHARE_RECORD_FAILED error={log_safe_text(type(e).__name__, 80)}")
 
     smtp_result = {"smtp_configured": False, "sent": [], "failed": []}
     if recipients:
