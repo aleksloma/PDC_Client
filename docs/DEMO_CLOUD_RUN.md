@@ -395,6 +395,64 @@ Remove the check's throwaway account and dashboard afterwards.
 
 ## Deploy history
 
+**2026-10-04 — `main` at `684e88a` (PR #10).** The five brb findings:
+sunburst/treemap/icicle charts built from a `pd.cut` column in `path` no
+longer render blank (hierarchy repair), hierarchical value labels follow the
+label rule, the chart title sits below the Plotly toolbar (render-time title
+fit), the "Added to …" toast no longer covers the chat input, and
+`/v1/chat_metadata` receives `existing_names`. Built ONCE by Cloud Build
+`148db1e0-d115-44d3-b697-02da2dd24217` (both images stamped `684e88a`,
+`BUILD_TIME=2026-10-04T19:39:29Z`) and deployed here first, then to
+`pdcclient-brb`:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:684e88a` | `sha256:64745590530e50430a533e8591eaf5c220f64f8507d690fd86302a8da664179e` |
+| `pdcexecutor-demo:684e88a` | `sha256:521041550e4fe20d3cef3238b5ac2f421abf56587527f7a2f06f0c43819f895d` |
+
+Revision `pdcclient-demo-684e88a`, serving 100 % since 2026-10-04 ~20:12 UTC;
+it resolved exactly the two digests above. It replaced
+`pdcclient-demo-9b48b58`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-demo-9b48b58=100
+```
+
+Backup taken before the deploy:
+`gs://pdc-enterprise-client-demo-data-backups/20261004-194032/`, which matched
+the data bucket in size (439,277,484 bytes) and in its 527 object names.
+
+The spec change was image-only (two `image:` lines and the template name),
+checked by a diff against the export before the Admin API `PUT`. Candidate
+checks (`candidate---…` URL), with a self-registered throwaway account:
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `684e88a`. Revision
+  log: `EXECUTOR_HANDSHAKE_OK version=684e88a`, no error lines.
+- `sample_sales.csv` chat ("Sales Analytics"): bar chart drawn; pinned to a
+  new dashboard — the "Added to …" toast sat below the top bar, clear of the
+  chat input, and typing into the input while it showed worked; the dashboard
+  tile drew.
+- Cards CSV chat ("Card Analytics", no `_N` suffix): a sunburst and a treemap
+  binned with `pd.cut` drew (42 nodes, no missing parent, no zero node, Show
+  data = 42 rows), both still drawn after Refresh; treemap labels grouped,
+  0 decimals.
+- Title vs toolbar at 380 / 730 / 1400 px: title and toolbar boxes disjoint,
+  title inside the frame, one relayout per chart.
+- The throwaway account (and a second one used to compare sign-ins) was then
+  removed through `POST /api/admin/users/remove` (2 chats deleted).
+- KNOWN, pre-existing, not fixed: a sign-in submitted while the landing page
+  is still loading can land back on the sign-in page. The landing page's own
+  `GET /static/logo.png`, still in flight, answers right after the
+  `POST /auth/login` 302 with a `Set-Cookie: session` holding the anonymous
+  pre-login session, which replaces the signed-in cookie; `/lab` then answers
+  302 to `/`. Measured with the same script on both revisions before the
+  shift (submit at DOMContentLoaded): 13 of 20 sign-ins bounced on
+  `pdcclient-demo-9b48b58`, 14 of 20 on `pdcclient-demo-684e88a`; 0 of 15 on
+  each when the page had finished loading. Signing in again works.
+- After the shift, `client.powerdatachat.com` reported the same `/version`
+  and `/health`, and `pdcbrain` gained no revision (`pdcbrain-00025-yab`
+  still serving).
+
 **2026-10-04 — `main` at `9b48b58` (PR #7).** Invitation links valid 30 days
 and re-sendable until a password is set (reset links stay 30 minutes); the
 "Share Google Sheet" wizard control removed; the welcome-message
