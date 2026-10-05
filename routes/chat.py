@@ -2326,6 +2326,55 @@ async def share_delete(request: Request, chat_id: str, recipient: str):
     return {"ok": True, "shared_with": remaining}
 
 
+@router.get("/{chat_id}/conversation/{conv_id}/share")
+async def conv_share_get(request: Request, chat_id: str, conv_id: str):
+    """Owner-only: the addresses ONE conversation of the chat was shared
+    with (the per-conversation record; a conversation shared before the
+    record existed lists nobody)."""
+    email, err = _require_chat_owner(request, chat_id)
+    if err:
+        return err
+    if not _conv_in_index(email, chat_id, conv_id):
+        return JSONResponse({"error": "Conversation not found"}, status_code=404)
+    loop = asyncio.get_running_loop()
+    shared = await loop.run_in_executor(
+        _EXEC, lambda: local_store.ChatDataStore(chat_id).conv_share_recipients(conv_id))
+    return {"shared_with": shared}
+
+
+@router.delete("/{chat_id}/conversation/{conv_id}/share/{recipient}")
+async def conv_share_delete(request: Request, chat_id: str, conv_id: str, recipient: str):
+    """Owner-only: take one address off ONE conversation's share — the
+    copies it delivered go, and chat access with them only when that share
+    created it and nothing else needs it (`remove_conv_share`). Idempotent."""
+    email, err = _require_chat_owner(request, chat_id)
+    if err:
+        return err
+    if not _conv_in_index(email, chat_id, conv_id):
+        return JSONResponse({"error": "Conversation not found"}, status_code=404)
+    from routes.auth import _EMAIL_RE   # the one address pattern
+    rec = str(recipient or "").strip().lower()
+    if not _EMAIL_RE.fullmatch(rec):
+        return JSONResponse({"error": "Provide a valid email address."}, status_code=400)
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            _EXEC, lambda: local_store.ChatDataStore(chat_id).remove_conv_share(
+                conv_id, rec, email))
+    except Exception as e:
+        log_with_sid(email, "error",
+                     f"CONV_UNSHARE_FAILED error={log_safe_text(type(e).__name__, 80)}",
+                     chat_id=chat_id)
+        return JSONResponse({"error": "Could not remove access."}, status_code=500)
+    removed = bool(result.get("chat_access_removed"))
+    log_with_sid(email, "info", "CONV_UNSHARED", chat_id=chat_id,
+                 conv_id=log_safe_text(conv_id, 80),
+                 recipient=log_safe_text(rec, 120),
+                 chat_access_removed=log_safe_text(str(removed), 80))
+    return {"ok": True, "shared_with": result.get("shared_with") or [],
+            "chat_access_removed": removed}
+
+
 @router.post("/{chat_id}/share")
 async def share_post(request: Request, chat_id: str):
     """Body: {emails: ["a@x.com", ...], comment?: "..."}; the share dialog
@@ -2372,6 +2421,16 @@ async def share_post(request: Request, chat_id: str):
         new_recipients = [r for r in recipients if r not in existing]
         existing.update(new_recipients)
         sharing["shared_with"] = sorted(existing)
+        # The same for access a conversation share created: it is no longer
+        # that share's to take away at its Remove.
+        granted = sharing.get("conv_granted")
+        if isinstance(granted, list):
+            kept = [g for g in granted
+                    if str(g or "").strip().lower() not in recipients]
+            if kept:
+                sharing["conv_granted"] = kept
+            else:
+                sharing.pop("conv_granted", None)
         meta["sharing"] = sharing
         store.write_meta(meta)
     # An address that has never signed in gets a password-less placeholder,

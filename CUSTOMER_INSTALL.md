@@ -86,6 +86,11 @@ Read these before you upgrade an existing install to this release.
   the recipient had before the dashboard share, or got from a direct share of
   the chat, is kept. Dashboards shared before the upgrade carry no such record
   and their unshare revokes no chat access.
+- The Share dialog of a conversation now lists only the people that
+  conversation was shared with, and its Remove deletes their copy of it.
+  Conversations shared before the upgrade carry no such record: they are not
+  listed there, and their recipients are removed in the chat's Share dialog as
+  before.
 - Microsoft sign-in no longer creates accounts or admits guests: an identity
   without an account, and a guest of your tenant, is refused unless
   SSO_AUTO_PROVISION / SSO_ALLOW_GUESTS is set; each account is bound to its
@@ -560,7 +565,24 @@ path.
 **Removing a recipient.** In a chat's **Share** dialog the owner sees the
 current recipients and can **Remove** each one. The address leaves the
 chat's list and the chat leaves that person's chat list; their next request
-for the chat is refused. Only the owner can do this.
+for the chat is refused. Only the owner can do this. Copies of conversations
+that were shared with that person are not deleted: they can no longer be
+opened, and become reachable again if the chat is shared with the person
+again. The same holds when a dashboard unshare ends the chat access and when
+an administrator removes a user.
+
+**Removing a recipient from one conversation.** The **Share** dialog of a
+conversation lists only the people that conversation was shared with, each
+once, however often it was shared with them. **Remove** deletes that person's
+copies of the conversation. Their access to the chat ends as well, unless
+something else gives it: another conversation of the chat shared with them, a
+share of the chat itself, an entry on the chat's list from before this
+release, or a shared dashboard with a tile from the chat — in that last case
+unsharing the dashboard ends the access later. Conversations shared before
+this release are not listed in this dialog; remove those recipients in the
+chat's Share dialog. A deleted conversation keeps its record until the
+recipient is removed from the chat, and a recipient who deletes their own
+copy stays listed until the owner removes them.
 
 **Unsharing a dashboard.** Sharing a dashboard also gives its recipients
 access to the chats behind its tiles (those the dashboard's owner owns).
@@ -1088,6 +1110,11 @@ decks, and your branded templates.
     as their own data role covers them.
   - A chat's owner can remove a recipient from the chat's Share dialog;
     unsharing a dashboard also ends the chat access that share gave.
+  - A conversation's Share dialog lists only the people that conversation
+    was shared with. Removing someone there deletes their copy of the
+    conversation; they keep the chat only if something else was shared with
+    them (another conversation of it, the chat itself, or a dashboard built
+    on it).
   - Charts and styled tables that anyone shares are shown in an isolated
     frame or reduced to plain table formatting, so what one user shares
     cannot act in another user's browser session.

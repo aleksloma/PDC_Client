@@ -1387,6 +1387,13 @@ revokes the source-chat grants that dashboard's share created (recorded on
 the dashboard as `sharing.chat_grants`), keeping any grant that predates it,
 that another of the owner's dashboards still shared with the recipient
 needs, or that the owner has since made by sharing the chat directly. A
+conversation share is revoked per conversation and recipient with
+`DELETE /api/chat/{id}/conversation/{conv_id}/share/{recipient}`: the
+recipient's snapshot copies of that conversation are deleted, and their chat
+access ends only when a conversation share created it and nothing else — a
+chat share, another shared conversation of the chat, a dashboard share —
+still needs it (recorded in the chat's `meta.json` as `sharing.conv_shares` /
+`sharing.conv_granted`; client-side only). A
 recipient's own data role gates the chat's database tables on every new
 question (see the role-gate list above).
 
