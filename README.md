@@ -211,7 +211,8 @@ address). One address outside them refuses the whole share
 (`400 RECIPIENT_DOMAIN_NOT_ALLOWED`): nothing is shared and no account is
 created. An allowed address without an account gets a password-less account
 (Microsoft-only while single sign-on is enabled). A chat's owner can remove a
-recipient from the share dialog, and unsharing a dashboard also ends the chat
+recipient from the share dialog (a conversation's share dialog removes that
+person's copy of the conversation), and unsharing a dashboard also ends the chat
 access that share gave. A recipient whose data role does not cover a chat's
 database tables gets no answers from those tables. See
 [`CUSTOMER_INSTALL.md`](CUSTOMER_INSTALL.md), "Sharing".
