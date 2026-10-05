@@ -1039,6 +1039,9 @@ async def active_chats(request: Request):
     for r in rows:
         if isinstance(r, dict) and "name" not in r:
             r["name"] = r.get("title", "")
+        # Additive: the row was written by a share (someone else owns the chat).
+        if isinstance(r, dict):
+            r["is_shared"] = bool(r.get("shared_by"))
     return {"active_chats": rows}
 
 
@@ -1153,7 +1156,12 @@ async def share_conversation(request: Request, conv_id: str):
 
     store = _ls.ChatDataStore(chat_id)
     meta = store.read_meta()
-    chat_title = meta.get("title") or "Chat"
+    # The OWNER's current name (a rename rewrites only the owner's sidebar
+    # row, never the meta title); the meta title rides along as
+    # `original_title` so a row an earlier share wrote under it is repaired.
+    meta_title = meta.get("title") if isinstance(meta.get("title"), str) else None
+    chat_title = (AuthStore().active_chat_title(email, chat_id)
+                  or meta.get("title") or "Chat")
     files = [f.get("file_name") for f in meta.get("files", []) if f.get("file_name")]
     conv_title = (conv.get("title") or "").strip() or f"Shared by {email}"
 
@@ -1170,7 +1178,8 @@ async def share_conversation(request: Request, conv_id: str):
         snapshot_conv_ids[rec] = new_conv_id
         recipient_title = f"(Shared) {conv_title}" if not conv_title.startswith("(Shared)") else conv_title
         AuthStore().record_conversation(rec, chat_id, new_conv_id, recipient_title, shared_by=email)
-        AuthStore().record_shared_chat(rec, chat_id, chat_title, files, shared_by=email)
+        AuthStore().record_shared_chat(rec, chat_id, chat_title, files, shared_by=email,
+                                       original_title=meta_title)
 
     smtp_result = {"smtp_configured": False, "sent": [], "failed": []}
     if recipients:

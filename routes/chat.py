@@ -2381,19 +2381,26 @@ async def share_post(request: Request, chat_id: str):
         ensure_share_recipient(rec, email)
     # List the chat in each recipient's sidebar, as the conversation-level
     # share does (the store skips a chat the recipient already lists).
-    sidebar_title = meta.get("title") or "Chat"
+    # The name is the OWNER's current one: a rename rewrites only the owner's
+    # sidebar row, so the meta title may be stale. The meta title rides along
+    # as `original_title` so a row an earlier share wrote under it is repaired.
+    current_title = auth.active_chat_title(email, chat_id)
+    meta_title = meta.get("title") if isinstance(meta.get("title"), str) else None
+    sidebar_title = current_title or meta.get("title") or "Chat"
     sidebar_files = [f.get("file_name") for f in meta.get("files", []) if f.get("file_name")]
     for rec in recipients:
         try:
             auth.record_shared_chat(rec, chat_id, sidebar_title, sidebar_files,
-                                    shared_by=email)
+                                    shared_by=email, original_title=meta_title)
         except Exception as e:
             log_with_sid(email, "warning",
                          f"SHARE_SIDEBAR_RECORD_FAILED "
                          f"error={log_safe_text(type(e).__name__, 80)}",
                          chat_id=chat_id, recipient=log_safe_text(rec, 120))
 
-    chat_title = meta.get("title", "")
+    # The mail names the chat as its owner does — never a recipient's
+    # numbered sidebar title.
+    chat_title = current_title or meta.get("title", "")
     smtp_result = {"smtp_configured": False, "sent": [], "failed": []}
     if new_recipients:
         try:
