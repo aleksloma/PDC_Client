@@ -2033,25 +2033,119 @@ class AuthStore:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         return True
 
+    def active_chat_title(self, email: str, chat_id: str) -> Optional[str]:
+        """The name this user's own sidebar row gives the chat (a rename
+        rewrites only that row, never the chat meta). None when the user does
+        not list the chat, the title is empty or not a str, or on any failure
+        (logged, never raises)."""
+        try:
+            for row in self.list_active_chats(email):
+                if isinstance(row, dict) and row.get("chat_id") == chat_id:
+                    title = row.get("title")
+                    return title if isinstance(title, str) and title else None
+        except Exception as e:
+            log_with_sid(log_safe_value(_safe_email(email), 254), "warning",
+                         f"ACTIVE_CHAT_TITLE_FAILED "
+                         f"chat_id={log_safe_value(chat_id, 80)} "
+                         f"error={log_safe_value(type(e).__name__, 80)}")
+        return None
+
+    @staticmethod
+    def _unique_chat_title(title: str, existing: set) -> str:
+        """`title`, or `title_2`, `title_3`, … — the first not in `existing`.
+        The creation flow's rule (routes/upload.py `generate_chatdata`):
+        exact, case-sensitive membership."""
+        t = title
+        n = 1
+        while t in existing:
+            n += 1
+            t = f"{title}_{n}"
+        return t
+
     def record_shared_chat(self, email: str, chat_id: str, title: str,
-                            files: list[str], shared_by: str) -> bool:
-        """Record a chat in the recipient's active_chats so they can open it."""
+                            files: list[str], shared_by: str, *,
+                            original_title: Optional[str] = None) -> bool:
+        """Record a chat in the recipient's active_chats so they can open it.
+
+        A chat the recipient does not list yet is appended under `title`,
+        numbered like a new chat's name when the recipient already has a row
+        (own or shared) with that title. A chat already listed is left as it
+        is, with one repair: a SHARED row still carrying `original_title`
+        (the chat meta's title, which an owner's rename never updates) takes
+        `title`, the owner's current name. An own row, or a row the recipient
+        renamed, is never touched."""
         with _LOCK:
             email = _safe_email(email)
             if not self._account_present(email, "record_shared_chat"):
                 return False
-            existing_ids = {row.get("chat_id") for row in self.list_active_chats(email)}
-            if chat_id in existing_ids:
+            rows = [r for r in self.list_active_chats(email) if isinstance(r, dict)]
+            if any(r.get("chat_id") == chat_id for r in rows):
+                if (isinstance(original_title, str) and original_title
+                        and title != original_title
+                        and any(r.get("chat_id") == chat_id and r.get("shared_by")
+                                and r.get("title") == original_title for r in rows)):
+                    self._repair_shared_chat_title(email, chat_id, title,
+                                                   original_title, rows)
                 return True
+            existing = {r.get("title") for r in rows if isinstance(r.get("title"), str)}
+            row_title = (self._unique_chat_title(title, existing)
+                         if isinstance(title, str) else title)
             p = _data_root() / "users" / email / "active_chats.jsonl"
             p.parent.mkdir(parents=True, exist_ok=True)
             with p.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({
-                    "chat_id": chat_id, "title": title, "files": files,
+                    "chat_id": chat_id, "title": row_title, "files": files,
                     "created_at": _now(),
                     "shared_by": shared_by,
                 }, ensure_ascii=False) + "\n")
         return True
+
+    def _repair_shared_chat_title(self, email: str, chat_id: str, title: str,
+                                  original_title: str, rows: list) -> None:
+        """Give the recipient's shared row(s) of `chat_id` that still carry
+        `original_title` the owner's current name, unique against the
+        recipient's OTHER rows. Called inside `record_shared_chat`'s `_LOCK`
+        section with the already-safe email; the `rename_active_chat` rewrite
+        idiom. Never raises — a failure leaves the row as it was."""
+        try:
+            others = {r.get("title") for r in rows
+                      if r.get("chat_id") != chat_id and isinstance(r.get("title"), str)}
+            new_title = self._unique_chat_title(title, others)
+            p = _data_root() / "users" / email / "active_chats.jsonl"
+            out_lines = []
+            repaired = False
+            kept_unparsed = 0
+            for line in p.read_text(encoding="utf-8").splitlines():
+                try:
+                    rec = json.loads(line)
+                    if (isinstance(rec, dict) and rec.get("chat_id") == chat_id
+                            and rec.get("shared_by")
+                            and rec.get("title") == original_title):
+                        rec["title"] = new_title
+                        repaired = True
+                    out_lines.append(json.dumps(rec, ensure_ascii=False))
+                except Exception:
+                    # Kept verbatim (the rename idiom); only counted.
+                    kept_unparsed += 1
+                    out_lines.append(line)
+            if not repaired:
+                return
+            p.write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
+            # The chat id (and a count) only — a title never reaches a log line.
+            if kept_unparsed:
+                log_with_sid(log_safe_value(email, 254), "info",
+                             f"SHARED_CHAT_TITLE_REPAIRED "
+                             f"chat_id={log_safe_value(chat_id, 80)} "
+                             f"kept_unparsed={log_safe_value(kept_unparsed, 20)}")
+            else:
+                log_with_sid(log_safe_value(email, 254), "info",
+                             f"SHARED_CHAT_TITLE_REPAIRED "
+                             f"chat_id={log_safe_value(chat_id, 80)}")
+        except Exception as e:
+            log_with_sid(log_safe_value(email, 254), "warning",
+                         f"SHARED_CHAT_TITLE_REPAIR_FAILED "
+                         f"chat_id={log_safe_value(chat_id, 80)} "
+                         f"error={log_safe_value(type(e).__name__, 80)}")
 
     def rename_active_chat(self, email: str, chat_id: str, new_title: str) -> bool:
         with _LOCK:

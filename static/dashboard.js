@@ -5133,8 +5133,9 @@ function showItemMenu(btn) {
     </button>`;
   }
 
-  // Rename option (not for shared or published-only items)
-  if (!isShared && !isPublished) {
+  // Rename option (not for published-only items). A rename rewrites only the
+  // user's own sidebar row, so a chat shared with them keeps it.
+  if (!isPublished) {
     menuItems += `<button class="context-menu-item" data-action="rename">
       <span>✏️</span> Rename
     </button>`;
