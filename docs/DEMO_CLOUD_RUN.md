@@ -395,6 +395,58 @@ Remove the check's throwaway account and dashboard afterwards.
 
 ## Deploy history
 
+**2026-10-05 — `main` at `0ff6638` (PR #14).** Share dialog: its body scrolls
+inside the dialog, so Cancel / Share stay visible on a small window; and each
+conversation share is recorded in the chat meta (`sharing.conv_shares`,
+`sharing.conv_granted`), so the Share Conversation dialog lists only that
+conversation's addresses and its Remove takes that conversation away from the
+person (two new owner-only routes under
+`/api/chat/{chat_id}/conversation/{conv_id}/share`). Built ONCE by Cloud Build
+`8f0aa31e-5e7f-436f-8822-38c9db6f0792` (both images stamped `0ff6638`,
+`BUILD_TIME=2026-10-05T21:38:02Z`) and deployed here first, then to
+`pdcclient-brb`:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:0ff6638` | `sha256:ace9bcec10982a940b10d0e3ba78564d86a902904eeaf77926a9f1df1de64c97` |
+| `pdcexecutor-demo:0ff6638` | `sha256:fa1e5f0122268095b2cf582217bfe9acbf26ea9feefe0f53adb44b3c9e2ead2c` |
+
+Revision `pdcclient-demo-0ff6638`, serving 100 % since 2026-10-05 ~21:49 UTC;
+it resolved exactly the two digests above. It replaced
+`pdcclient-demo-44cc1b3`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-demo-44cc1b3=100
+```
+
+Backup taken before the deploy:
+`gs://pdc-enterprise-client-demo-data-backups/20261005-213838/`, which matched
+the data bucket in size (439,315,450 bytes) and in its 528 object names.
+
+The spec change was image-only (two `image:` lines and the template name),
+checked by a diff against the export before the Admin API `PUT`. Candidate
+checks (`candidate---…` URL), with one self-registered throwaway account:
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `0ff6638`. Revision
+  log: `EXECUTOR_HANDSHAKE_OK version=0ff6638`, no error lines, no 5xx.
+- The account created a `sample_sales.csv` chat and got a bar chart. The
+  Share Conversation dialog at 1366x768 and 1280x600, and the Share Chat
+  dialog at 1280x600: the dialog, its title, the close button, Cancel and
+  Share were fully inside the window and topmost; Cancel closed it. The
+  conversation's list request answered `200 {"shared_with": []}`.
+- With 12 rows put into the list in the browser only (nothing sent to the
+  server) at 1280x600, the body scrolled inside the dialog (1149 px of content
+  in 346 px) and the buttons stayed inside the window.
+- **NOT DONE — a real list.** This instance still refuses every share
+  (`400 RECIPIENT_DOMAIN_NOT_ALLOWED`, see the `44cc1b3` entry), so the
+  per-conversation list and its Remove were verified on the local stack with
+  three accounts, not here.
+- The throwaway account was removed through `POST /api/admin/users/remove`
+  (1 chat deleted).
+- After the shift, `client.powerdatachat.com` reported the same `/version`
+  and `/health`, and `pdcbrain` gained no revision (`pdcbrain-00027-haq`
+  serving before and after).
+
 **2026-10-05 — `main` at `44cc1b3` (PR #12).** Shared chat names: a share
 recipient's chat-list row and the share mail carry the owner's current name
 of the chat (numbered `_2`, `_3` on a name the recipient already uses, with a

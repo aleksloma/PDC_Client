@@ -218,6 +218,55 @@ the demo export is kept in `BRB_Database_template/docs/BRB_SERVICE_DIFF.md`.
 
 ## Deploy history
 
+**2026-10-05 — `main` at `0ff6638` (PR #14).** Share dialog: its body scrolls
+inside the dialog, so Cancel / Share stay visible on a small window; and each
+conversation share is recorded, so the Share Conversation dialog lists only
+that conversation's addresses and its Remove takes that conversation away
+from the person. Same images as `pdcclient-demo` (Cloud Build
+`8f0aa31e-5e7f-436f-8822-38c9db6f0792`, `BUILD_TIME=2026-10-05T21:38:02Z`),
+deployed right after the demo; the revision resolved exactly these digests:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:0ff6638` | `sha256:ace9bcec10982a940b10d0e3ba78564d86a902904eeaf77926a9f1df1de64c97` |
+| `pdcexecutor-demo:0ff6638` | `sha256:fa1e5f0122268095b2cf582217bfe9acbf26ea9feefe0f53adb44b3c9e2ead2c` |
+
+Revision `pdcclient-brb-0ff6638`, serving 100 % since 2026-10-05 ~21:52 UTC.
+It replaced `pdcclient-brb-44cc1b3`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-brb --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-brb-44cc1b3=100
+```
+
+Backup taken before the deploy:
+`gs://pdc-enterprise-client-brb-data-backups/20261005-214022/`, which matched
+the data bucket in size (254,786,195 bytes) and in its 243 object names.
+
+The spec change was image-only (two `image:` lines and the template name;
+the `cloudsql-instances` annotation, secrets, buckets and resources carried
+over), checked by a diff against the export before the Admin API `PUT`.
+Candidate checks (`candidate---…` URL), none of them signed in:
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `0ff6638`; the landing
+  page answered 200, an anonymous `/lab` redirected to sign-in, an anonymous
+  `/auth/active_chats` and an anonymous request to the new conversation-share
+  route answered 401.
+- The served `dashboard.css` carries the `#shareModal` rules and the served
+  `dashboard.js` the conversation-share routes.
+- Revision log: `LADMIN_PRESENT`, `RESET_TOKEN_INDEX_FILLED count=9`,
+  `EXECUTOR_HANDSHAKE_OK version=0ff6638`, `DB_SCHEDULER_STARTED`; no error
+  lines, no 5xx.
+- **Pending, to be done by hand in the browser:** the signed-in checks — the
+  Share dialog of a conversation with several addresses on a laptop-size
+  window keeps Cancel and Share visible and the list scrolls; a conversation
+  shared with two people lists exactly those two, another conversation of the
+  same chat lists nobody, and the Share Chat dialog lists everyone; Remove in
+  the Share Conversation dialog takes the copy from that person, who loses
+  the chat only when nothing else was shared with them. These were NOT run on
+  the instance; the same cases passed on the local stack.
+- After the shift, `brb.powerdatachat.com` reported the same `/version` and
+  `/health`; `pdcbrain` gained no revision (`pdcbrain-00027-haq`).
+
 **2026-10-05 — `main` at `44cc1b3` (PR #12).** Shared chat names: a share
 recipient's chat-list row and the share mail carry the owner's current name
 of the chat (numbered `_2`, `_3` on a name the recipient already uses), and
