@@ -417,6 +417,8 @@ body.admin-ds-page {
 .adm-btn.danger:disabled { background: #fca5a5; cursor: not-allowed; }
 .adm-users-toolbar { margin-bottom: 12px; }
 .adm-users-invite { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+/* approved sign-in domains list: same spacing as the invite row below it */
+.adm-signin-domains { margin-bottom: 10px; }
 .adm-alert.ok { background: #ecfdf5; border-color: #a7f3d0; color: #065f46; }
 .adm-search {
   width: 320px; max-width: 100%; box-sizing: border-box;

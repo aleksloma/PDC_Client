@@ -112,6 +112,8 @@
 
   let USERS = [];               // admin Users window rows
   let ROLES = [];               // roles registry (Base first, server-sorted)
+  let SIGNIN_DOMAINS = [];      // approved sign-in domains — ONLY from a successful GET/POST answer
+  let signinDomainsBusy = false; // one Add/Remove POST at a time (the endpoint replaces the list)
   let editingRoleId = null;     // null = creating
   let roleDraft = null;         // role-modal working state (Sets, re-rendered per toggle)
   let roleDeleteCtx = null;     // {id, name, member_count} for the delete confirm
@@ -2868,12 +2870,89 @@
     out.classList.remove('hidden');
   }
 
+  // The list shows only what the server confirmed (SIGNIN_DOMAINS is set
+  // from a successful GET/POST answer, never from what was typed).
+  function renderSigninDomains() {
+    const box = $('signinDomainsList');
+    if (!box) return;
+    if (!SIGNIN_DOMAINS.length) {
+      box.innerHTML = `<div class="adm-card"><div class="adm-empty">No approved domains. Sign-in is by invitation only.</div></div>`;
+      return;
+    }
+    box.innerHTML = `<div class="adm-card adm-table-scroll"><table class="adm-table">
+      <tbody>${SIGNIN_DOMAINS.map((d) => `
+        <tr data-domain="${esc(d)}">
+          <td>${esc(d)}</td>
+          <td class="adm-actions-cell"><button type="button" class="adm-btn danger small adm-signin-domain-remove">Remove</button></td>
+        </tr>`).join('')}
+      </tbody></table></div>`;
+    box.querySelectorAll('tr[data-domain]').forEach((tr) => {
+      tr.querySelector('.adm-signin-domain-remove')
+        .addEventListener('click', () => removeSigninDomain(tr.dataset.domain));
+    });
+  }
+
   async function loadSigninDomains() {
+    if (!$('signinDomainsList')) return;   // power mode has no Users section
+    const r = await api('/api/admin/signin_domains');
+    if (r.ok && r.data) SIGNIN_DOMAINS = r.data.domains || [];
+    else _showSigninDomainsResult((r.data && r.data.error) || 'Could not load the approved domains.', false);
+    renderSigninDomains();
+  }
+
+  // POSTs the FULL list (the endpoint replaces it). On success the server's
+  // answer becomes the list; on failure the last confirmed list is
+  // re-rendered (re-enabling its buttons), so nothing unconfirmed shows.
+  async function _postSigninDomains(domains, okText) {
+    if (signinDomainsBusy) return false;   // Enter must not race a request in flight
+    signinDomainsBusy = true;
+    const btn = $('btnAddSigninDomain');
+    if (btn) btn.disabled = true;
+    document.querySelectorAll('.adm-signin-domain-remove').forEach((b) => { b.disabled = true; });
+    let r;
+    try {
+      r = await api('/api/admin/signin_domains', {
+        method: 'POST', body: JSON.stringify({ domains }),
+      });
+    } finally {
+      signinDomainsBusy = false;
+      if (btn) btn.disabled = false;
+    }
+    if (r.ok && r.data && r.data.ok) {
+      SIGNIN_DOMAINS = r.data.domains || [];
+      renderSigninDomains();
+      _showSigninDomainsResult(okText(SIGNIN_DOMAINS), true);
+      return true;
+    }
+    if (r.status === 401) {
+      _showSigninDomainsResult('Your session has ended (you signed out, possibly in another tab). '
+        + 'Sign in again, then try again.', false);
+    } else {
+      _showSigninDomainsResult((r.data && r.data.error) || 'Could not save the approved domains.', false);
+    }
+    renderSigninDomains();
+    return false;
+  }
+
+  async function addSigninDomain() {
     const input = $('signinDomains');
     if (!input) return;
-    const r = await api('/api/admin/signin_domains');
-    if (r.ok) input.value = ((r.data && r.data.domains) || []).join(', ');
-    else _showSigninDomainsResult((r.data && r.data.error) || 'Could not load the approved domains.', false);
+    const value = (input.value || '').trim().toLowerCase();
+    if (!value) { input.focus(); return; }
+    if (signinDomainsBusy) return;
+    if (SIGNIN_DOMAINS.includes(value)) {   // already confirmed by the server: nothing to post
+      input.value = '';
+      _showSigninDomainsResult(`${value} is already approved.`, true);
+      return;
+    }
+    const ok = await _postSigninDomains([...SIGNIN_DOMAINS, value], () => `Added ${value}.`);
+    if (ok) input.value = '';   // a failed add keeps the typed text to fix
+  }
+
+  async function removeSigninDomain(d) {
+    await _postSigninDomains(SIGNIN_DOMAINS.filter((x) => x !== d), (saved) => (saved.length
+      ? `Removed ${d}.`
+      : `Removed ${d}. No approved domains — sign-in is by invitation only.`));
   }
 
   // Invite (sign-in is invitation-only): creates the account and mails the
@@ -2920,30 +2999,6 @@
     out.classList.toggle('ok', ok);
     out.classList.toggle('warn', !ok);
     out.classList.remove('hidden');
-  }
-
-  async function saveSigninDomains() {
-    const input = $('signinDomains');
-    const btn = $('btnSaveSigninDomains');
-    if (!input || !btn) return;
-    const domains = (input.value || '').split(',').map((d) => d.trim()).filter((d) => d);
-    btn.disabled = true;
-    const r = await api('/api/admin/signin_domains', {
-      method: 'POST', body: JSON.stringify({ domains }),
-    });
-    btn.disabled = false;
-    if (r.ok && r.data && r.data.ok) {
-      const saved = r.data.domains || [];
-      input.value = saved.join(', ');
-      _showSigninDomainsResult(saved.length
-        ? `Saved. ${saved.length} approved domain(s): ${saved.join(', ')}.`
-        : 'Saved. No approved domains — accounts are created by invitation only.', true);
-    } else if (r.status === 401) {
-      _showSigninDomainsResult('Your session has ended (you signed out, possibly in another tab). '
-        + 'Sign in again, then save again.', false);
-    } else {
-      _showSigninDomainsResult((r.data && r.data.error) || 'Could not save the approved domains.', false);
-    }
   }
 
   // 19c multi-role model: the role cell is a button + checkbox panel. A user
@@ -3703,9 +3758,9 @@
     $('inviteEmail')?.addEventListener('keydown', (ev) => {
       if (ev.key === 'Enter') { ev.preventDefault(); inviteUser(); }
     });
-    $('btnSaveSigninDomains')?.addEventListener('click', saveSigninDomains);
+    $('btnAddSigninDomain')?.addEventListener('click', addSigninDomain);
     $('signinDomains')?.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter') { ev.preventDefault(); saveSigninDomains(); }
+      if (ev.key === 'Enter') { ev.preventDefault(); addSigninDomain(); }
     });
     $('btnAddRole')?.addEventListener('click', () => openRoleModal(null));
     $('closeRoleModal').addEventListener('click', () => $('roleModal').classList.add('hidden'));
