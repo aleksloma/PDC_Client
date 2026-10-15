@@ -135,7 +135,7 @@
       cyInstance = null;
     }
     if (name === 'relations' && relView === 'graph') refreshRelGraph();
-    if (name === 'users') loadUsers();     // lazy refetch, like the audit tail
+    if (name === 'users') { loadUsers(); loadSigninDomains(); }   // lazy refetch, like the audit tail
     if (name === 'audit') loadAudit();
     if (name === 'sso') loadSso();
     if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
@@ -2857,6 +2857,25 @@
     renderUsers();
   }
 
+  // Approved sign-in domains: an address in one of them creates its own
+  // account at its first sign-in. Text only (textContent).
+  function _showSigninDomainsResult(text, ok) {
+    const out = $('signinDomainsResult');
+    if (!out) return;
+    out.textContent = text;
+    out.classList.toggle('ok', ok);
+    out.classList.toggle('warn', !ok);
+    out.classList.remove('hidden');
+  }
+
+  async function loadSigninDomains() {
+    const input = $('signinDomains');
+    if (!input) return;
+    const r = await api('/api/admin/signin_domains');
+    if (r.ok) input.value = ((r.data && r.data.domains) || []).join(', ');
+    else _showSigninDomainsResult((r.data && r.data.error) || 'Could not load the approved domains.', false);
+  }
+
   // Invite (sign-in is invitation-only): creates the account and mails the
   // address a set-your-password link; the outcome line says whether the mail
   // went out. Text only (textContent) — the address is user input.
@@ -2901,6 +2920,30 @@
     out.classList.toggle('ok', ok);
     out.classList.toggle('warn', !ok);
     out.classList.remove('hidden');
+  }
+
+  async function saveSigninDomains() {
+    const input = $('signinDomains');
+    const btn = $('btnSaveSigninDomains');
+    if (!input || !btn) return;
+    const domains = (input.value || '').split(',').map((d) => d.trim()).filter((d) => d);
+    btn.disabled = true;
+    const r = await api('/api/admin/signin_domains', {
+      method: 'POST', body: JSON.stringify({ domains }),
+    });
+    btn.disabled = false;
+    if (r.ok && r.data && r.data.ok) {
+      const saved = r.data.domains || [];
+      input.value = saved.join(', ');
+      _showSigninDomainsResult(saved.length
+        ? `Saved. ${saved.length} approved domain(s): ${saved.join(', ')}.`
+        : 'Saved. No approved domains — accounts are created by invitation only.', true);
+    } else if (r.status === 401) {
+      _showSigninDomainsResult('Your session has ended (you signed out, possibly in another tab). '
+        + 'Sign in again, then save again.', false);
+    } else {
+      _showSigninDomainsResult((r.data && r.data.error) || 'Could not save the approved domains.', false);
+    }
   }
 
   // 19c multi-role model: the role cell is a button + checkbox panel. A user
@@ -3659,6 +3702,10 @@
     $('btnInviteUser')?.addEventListener('click', inviteUser);
     $('inviteEmail')?.addEventListener('keydown', (ev) => {
       if (ev.key === 'Enter') { ev.preventDefault(); inviteUser(); }
+    });
+    $('btnSaveSigninDomains')?.addEventListener('click', saveSigninDomains);
+    $('signinDomains')?.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); saveSigninDomains(); }
     });
     $('btnAddRole')?.addEventListener('click', () => openRoleModal(null));
     $('closeRoleModal').addEventListener('click', () => $('roleModal').classList.add('hidden'));

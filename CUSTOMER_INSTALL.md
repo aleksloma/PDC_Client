@@ -376,8 +376,9 @@ snapshot and live query) is made read-only where the database allows it:
 
 ### Users and sign-in
 
-Nobody can create an account by typing an address at the sign-in page.
-Accounts come to exist in two ways, plus a third you can switch on:
+Unless you approve sign-in domains (below), nobody can create an account by
+typing an address at the sign-in page. Accounts come to exist in two ways,
+plus two you can switch on:
 
 - **Invitation.** On the admin panel's **Users** page, `ladmin` enters an
   address and clicks **Invite user**. The account is created without a
@@ -397,8 +398,32 @@ Accounts come to exist in two ways, plus a third you can switch on:
   sign-on is enabled, signs in with Microsoft — see "Sharing" below).
 - **Single sign-on.** A Microsoft sign-in does NOT create an account: an
   identity with no account here is refused. Only with
-  `SSO_AUTO_PROVISION=true` in `client.env` does the first Microsoft sign-in
-  create one (see "Single sign-on with Microsoft Entra ID" below).
+  `SSO_AUTO_PROVISION=true` in `client.env`, or for an address in an
+  approved sign-in domain, does the first Microsoft sign-in create one (see
+  "Single sign-on with Microsoft Entra ID" below).
+- **Approved sign-in domains.** Under **Approved sign-in domains** on the
+  **Users** page, `ladmin` can list company domains, comma separated (e.g.
+  `bank.example, subsidiary.example`), and click **Save**; an empty list
+  (the default, also for an install upgraded from an earlier release) keeps
+  sign-in invitation-only. A person whose address is in a listed domain and
+  who has no account yet creates one by signing in with their email and a
+  new password (the password rules below apply, and a welcome mail is
+  sent), or by signing in with Microsoft. The domain must match exactly: a
+  subdomain such as `hr.bank.example` must be listed itself. The new account
+  has the **Standard** permission and no data roles, like an invited one;
+  change them on the **Users** page as usual. Invitations keep working for
+  every address, listed domains included. An address that already has an
+  account — an invited or shared-with colleague who has not set a password
+  yet, a Microsoft account — is not affected: an invited colleague still
+  uses the mailed link. The list is separate from `SHARE_ALLOWED_DOMAINS`
+  (who can receive a share, see "Sharing" below). **Security note:** this
+  path does not check that the person owns the mailbox — whoever first
+  signs in with a not-yet-used address in a listed domain sets its
+  password. The real owner then gets the normal "Sign-in failed" answer and
+  takes the account back with **Reset password**: the link goes to their
+  mailbox, and setting the password signs the other person out. Approve
+  only domains whose addresses you trust on your network; an invitation
+  remains the verified way to create an account.
 
 **Ending sessions and removing users.** Each row of the **Users** page has
 two more actions, both confirmed in a dialog first. **End sessions** signs
@@ -414,7 +439,8 @@ registered stay registered and keep working for everyone who has access, but
 from then on count as registered by an administrator: only an administrator
 can delete them. Who confirmed the descriptions and the audit log keep the
 removed address. If the address is later used again — invited, shared with,
-or signing in with Microsoft under `SSO_AUTO_PROVISION` — it becomes a new account that inherits none of
+signing in with Microsoft under `SSO_AUTO_PROVISION`, or signing in for the
+first time in an approved sign-in domain — it becomes a new account that inherits none of
 this (the removal answer lists what was deleted and unshared; if a count is
 lower than you expected, check the log before reusing the address), and no
 session of the removed account works for it. A sign-in or password change
@@ -424,13 +450,16 @@ can leave that dashboard's folder behind, which an account created later at
 the same address would find — remove such a folder by hand before reusing
 the address if it matters.) With `SSO_AUTO_PROVISION=true`, a
 Microsoft user who is still assigned in Entra gets such an account simply by
-signing in again, so unassign them in Entra as well. Neither action can
+signing in again, so unassign them in Entra as well. The same holds when the
+address is in an approved sign-in domain, where the person can also create
+a new account with a password at the sign-in page. Neither action can
 target the `ladmin` account, and you cannot remove your own.
 
 **Passwords** must be at least 8 characters (`PASSWORD_MIN_LENGTH` in
 `client.env`; it cannot be set below 4). The rule applies whenever a password
 is set: through a reset or invitation link, the forced change after a
-temporary password, and **Change Password** in the profile menu. A password
+temporary password, **Change Password** in the profile menu and the first
+sign-in in an approved sign-in domain. A password
 set before this release keeps working until its owner changes it.
 
 **Set `PUBLIC_BASE_URL`** in `client.env` on every install, to the address
@@ -613,7 +642,8 @@ or groups who may use PowerDataChat. Without it, any member of your tenant
 whose address matches an account here that has not yet signed in with
 Microsoft (an invited colleague, a share recipient, a password account) can
 sign in to it — and with `SSO_AUTO_PROVISION=true`, any member at all gets an
-account.
+account (with approved sign-in domains, any member whose address is in one
+of them).
 
 **Who gets in.** Each account is bound to its Entra identity (tenant id +
 object id) at its first Microsoft sign-in; afterwards the same person reaches
@@ -627,6 +657,18 @@ them):
 - `SSO_AUTO_PROVISION=true` creates an account for a Microsoft identity that
   has none, which is refused otherwise. Set it only together with
   "Assignment required? = Yes".
+
+The **Approved sign-in domains** list on the **Users** page (see "Users and
+sign-in" above; no restart) also creates the account for a Microsoft
+identity whose address is in a listed domain. **Security note:** the list
+is not limited to Microsoft. While single sign-on is enabled, a new address
+in a listed domain can still create an account with a LOCAL password at the
+sign-in page (`/?local=1` is always reachable), and that sign-in does not
+go through Entra's multi-factor authentication or conditional access — the
+"Microsoft accounts have no local password" rule covers only accounts that
+have already signed in with Microsoft. If you want Microsoft-only sign-in,
+leave the list empty and use `SSO_AUTO_PROVISION=true` instead, or accept
+this.
 
 If a user is deleted and re-created in Entra, or the wrong person was bound
 to an account, that user's Microsoft sign-in is refused until you re-bind

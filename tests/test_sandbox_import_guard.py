@@ -32,6 +32,7 @@ EXECUTOR_SETTING_NAMES = ("EXECUTOR_URL", "EXECUTOR_SHARED_DIR",
     "brain_client", "password_utils", "relation_discovery", "sqlglot",
     "roles_store", "clickhouse_driver", "clickhouse_sqlalchemy",
     "clickhouse_connect", "sso_store", "gcs_upload", "google",
+    "signin_domains",
 ])
 def test_denied_import_raises_in_safe_execute(mod):
     out = code_exec._execute_in_process(f"import {mod}\nRESULT = 1", {}, sid="t")

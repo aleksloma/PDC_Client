@@ -97,6 +97,7 @@ FORBIDDEN_COPY_FRAGMENTS = [
     "local_store", "db_connector", "db_sources", "db_scheduler", "brain_client",
     "roles_store", "sso_store", "gcs_upload", "password_utils", "routes",
     "templates", ".env", "client.env", "run_chat_local", "auto_analytics",
+    "signin_domains",
 ]
 
 EXPECTED_RUNTIME_ENV = {
@@ -125,6 +126,7 @@ EXPECTED_BASE_IMAGE = "python:3.12-slim"
 DENIED_IMPORTS = {
     "local_store", "db_connector", "db_sources", "db_scheduler", "brain_client",
     "roles_store", "sso_store", "gcs_upload", "password_utils", "sqlalchemy", "kaleido",
+    "signin_domains",
 }
 
 # Env names executor/app.py may read: its own config, the build stamp, the

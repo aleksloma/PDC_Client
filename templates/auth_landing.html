@@ -110,7 +110,7 @@
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
     {% if info %}<div class="info">{{ info }}</div>{% endif %}
     <div class="footer">Enterprise · on-premise deployment<br>
-      {% if self_registration %}First time here? The password you enter becomes your password.{% else %}Accounts are created by invitation.{% endif %}</div>
+      {% if self_registration %}First time here? The password you enter becomes your password.{% elif signin_domains %}Users with an email in an approved company domain can create their account by signing in with their email and a new password. Other users need an invitation.{% else %}Accounts are created by invitation.{% endif %}</div>
   </form>
   <script src="/static/i18n.js"></script>
   <script nonce="{{ request.state.csp_nonce }}">

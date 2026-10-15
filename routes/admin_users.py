@@ -43,6 +43,7 @@ from fastapi.responses import JSONResponse
 import brain_client
 import db_sources
 import roles_store
+import signin_domains
 from exec_transport import log_safe_text
 from local_store import (INVITE_TOKEN_TTL_S, AccountMissing, AuthStore,
                          delete_chats_owned_by, purge_address_grants)
@@ -553,6 +554,44 @@ async def invite_user(request: Request):
     if mail_error:
         out["mail_error"] = mail_error
     return out
+
+
+# ---------------------------------------------------------------------------
+# Approved sign-in domains
+# ---------------------------------------------------------------------------
+
+@router.get("/signin_domains")
+async def get_signin_domains(request: Request):
+    """The approved sign-in domains (signin_domains.json; absent ⇒ [])."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    return {"domains": signin_domains.load()}
+
+
+@router.post("/signin_domains")
+async def set_signin_domains(request: Request):
+    """Replace the approved sign-in domains: body {domains: [str]} (an empty
+    list clears it). 400 for a non-list or an invalid entry, nothing written.
+    Audited `signin_domains.set` with the stored list."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    body = await _json_body(request)
+    try:
+        saved = signin_domains.save(body.get("domains"), email)
+    except ValueError as e:
+        log_with_sid(email, "info", "SIGNIN_DOMAINS_REFUSED reason=invalid")
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        log_with_sid(email, "error",
+                     f"SIGNIN_DOMAINS_SAVE_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return JSONResponse({"error": "Could not save the domains."}, status_code=500)
+    db_sources.audit(email, "signin_domains.set", target="signin_domains",
+                     detail={"domains": saved},
+                     ip=(request.client.host if request.client else None))
+    log_with_sid(email, "info", f"SIGNIN_DOMAINS_SET count={len(saved)}")
+    return {"ok": True, "domains": saved}
 
 
 # ---------------------------------------------------------------------------

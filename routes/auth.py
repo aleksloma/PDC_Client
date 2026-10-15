@@ -4,8 +4,10 @@ Password model (all local — the brain never sees a password):
   - Sign-in is INVITATION-ONLY: accounts come to exist through an admin
     invite (`POST /api/admin/users/invite`), a share (password-less
     placeholder) or Microsoft SSO. `/auth/login` never creates one unless
-    `ALLOW_SELF_REGISTRATION` is on (the hosted demo only): then an address
-    with NO user folder gets the typed password + the welcome mail.
+    `ALLOW_SELF_REGISTRATION` is on (the hosted demo only) or the address's
+    domain is an approved sign-in domain (`signin_domains`, set by the
+    admin): then an address with NO user folder gets the typed password +
+    the welcome mail.
   - Every sign-in failure — unknown address, account without a password,
     wrong password — answers 401 with ONE neutral line and the Reset action,
     after exactly one PBKDF2 verification (a dummy hash where there is none),
@@ -69,6 +71,7 @@ from starlette.concurrency import run_in_threadpool
 
 import auth_limiter
 import password_utils
+import signin_domains
 from exec_transport import log_safe_text
 from local_store import (SESSION_GEN_REMOVED, AccountMissing, AuthStore, UserStore,
                          reset_record_live,
@@ -396,6 +399,7 @@ def _landing(request: Request, *, error: str = None, password_error: str = None,
          "info": info, "email": email, "show_reset": show_reset,
          "signin_failed": signin_failed, "sso_enabled": sso_enabled,
          "self_registration": bool(settings.ALLOW_SELF_REGISTRATION),
+         "signin_domains": signin_domains.is_configured(),
          "csrf": csrf_token(request)},
         status_code=status_code,
         headers=headers,
@@ -514,11 +518,14 @@ async def login(request: Request):
                 password_error=("The administrator account has no password yet. "
                                 "Set LOCAL_ADMIN_PASSWORD in the server "
                                 "environment and restart the container."))
-        if not store.user_exists(email) and settings.ALLOW_SELF_REGISTRATION:
-            # Demo-only open registration: a genuinely NEW address (no user
-            # folder) sets its own password here, under the same rule as
-            # every other place a password is set, checked before anything
-            # is written.
+        new_address = not store.user_exists(email)
+        domain_ok = (new_address and not settings.ALLOW_SELF_REGISTRATION
+                     and signin_domains.allows_email(email))
+        if new_address and (settings.ALLOW_SELF_REGISTRATION or domain_ok):
+            # Demo-only open registration, or an address in an approved
+            # sign-in domain: a genuinely NEW address (no user folder) sets
+            # its own password here, under the same rule as every other
+            # place a password is set, checked before anything is written.
             rule_error = password_rule_error(password)
             if rule_error:
                 return _landing(request, password_error=rule_error,
@@ -536,6 +543,9 @@ async def login(request: Request):
             auth_limiter.success("login", email, ip)
             log_with_sid(email, "info", "USER_LOGIN_FIRST_PASSWORD_SET",
                          sid=log_safe_text(request.session.get("sid"), 40))
+            if domain_ok:
+                log_with_sid(email, "info", "USER_LOGIN_DOMAIN_ACCOUNT_CREATED",
+                             sid=log_safe_text(request.session.get("sid"), 40))
             _send_welcome_email_async(email)
             try:
                 brain_client.post_activity("login", email)

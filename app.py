@@ -35,6 +35,7 @@ from logger_utils import log_with_sid
 from exec_transport import log_safe_text
 from local_store import SESSION_GEN_REMOVED, AuthStore
 import sso_store
+import signin_domains
 import gcs_upload
 
 from routes.auth import router as auth_router
@@ -899,6 +900,7 @@ async def landing(request: Request):
         {"request": request, "error": None, "password_error": None,
          "info": info, "email": "", "sso_enabled": sso_enabled,
          "self_registration": bool(settings.ALLOW_SELF_REGISTRATION),
+         "signin_domains": signin_domains.is_configured(),
          "csrf": csrf_token(request)},
     )
 

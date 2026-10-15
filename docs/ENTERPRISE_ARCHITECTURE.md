@@ -1221,9 +1221,33 @@ and the audit rows keep their attribution; these steps are best-effort —
 each logs its own per-item failures and reports what it achieved in the
 response and the `user.removed` audit row, so a partial failure shows as a
 lower count, not an error).
+
+**Approved sign-in domains.** Accounts normally come from an invitation, a
+share placeholder or Microsoft SSO. The Users section also holds an
+"Approved sign-in domains" list (`signin_domains.py`,
+`DATA_ROOT/signin_domains.json`, `GET`/`POST /api/admin/signin_domains`,
+audited `signin_domains.set`): a genuinely NEW address (no user folder)
+whose domain — the text after the last `@`, matched exactly, subdomains not
+included — is on it creates its own account at its first sign-in, through
+the password form (the typed password becomes its password, welcome mail)
+or a Microsoft sign-in (§10c). Such an account starts with the Standard
+permission and no data roles (Base), like an invited one; the administrator
+changes them as usual. An existing account at an approved address — an
+invited or share placeholder, an SSO-only account — is never affected, and
+an absent file is an empty list, so an install from before the feature
+stays invitation-only with nothing migrated. The store is denied in the
+analysis sandbox. Trade-off: the password-form path does not verify the
+mailbox — whoever first signs in with a not-yet-existing address in an
+approved domain sets its password. The address's owner then gets the
+neutral sign-in failure and takes the account back with "Reset password"
+(the link goes to the mailbox, and setting the password ends every other
+session). Only domains whose addresses are trusted on the network should be
+approved; an invitation remains the verified path.
+
 Every account is created with a fresh session generation
 (`AuthStore.create_account`, behind invitation, share placeholder, first
-Microsoft sign-in, demo self-registration and the bootstrap admin), so no
+Microsoft sign-in, first sign-in in an approved domain, demo
+self-registration and the bootstrap admin), so no
 session of a removed account matches an account created again at the same
 address, and that account normally starts empty (a step that failed —
 e.g. an owned chat that could not be deleted — is visible in the counts);
@@ -1317,15 +1341,16 @@ its first Microsoft sign-in (`auth.json` `sso_tid`/`sso_oid`,
 account whatever username it presents (`find_sso_account`), and a different
 identity presenting a bound address is refused (403). Invited users, share
 placeholders and accounts from before binding are bound at their next
-Microsoft sign-in. A Microsoft sign-in does NOT create an account: an
-identity matching none is refused (401) unless `SSO_AUTO_PROVISION` is set,
-and a guest is refused (403) unless `SSO_ALLOW_GUESTS` is set (both env
-settings, default false). SSO is therefore a way an account comes to exist
-only under `SSO_AUTO_PROVISION`; otherwise accounts come from an
-administrator's invitation or a share, since a password sign-in never
-creates one either. Who may complete a Microsoft sign-in at all is decided
-in Entra — "Assignment required? = Yes" on the enterprise application is a
-mandatory install step; the client holds no allow-list. Nothing about SSO
+Microsoft sign-in. A Microsoft sign-in creates an account only when
+`SSO_AUTO_PROVISION` is set (any address) or the address's domain is an
+approved sign-in domain (§10b; logged `SSO_DOMAIN_ACCOUNT_PROVISIONED`);
+otherwise an identity matching no account is refused (401). A guest is
+refused (403) unless `SSO_ALLOW_GUESTS` is set (both env settings, default
+false). Without either, accounts come from an administrator's invitation or
+a share. Who may complete a Microsoft sign-in at all is decided in Entra —
+"Assignment required? = Yes" on the enterprise application is a mandatory
+install step; the client's approved domains decide only whether a missing
+account is created, never who may sign in. Nothing about SSO
 crosses to the brain except the normal `login` activity event that password
 logins already post.
 
@@ -1354,7 +1379,12 @@ those passwords — nothing is deleted. The enforcement starts at an
 account's FIRST Microsoft sign-in: a password account that has never
 signed in with Microsoft keeps signing in with its local password while
 SSO is enabled, and is not subject to Entra's MFA or conditional access
-until it signs in with Microsoft once.
+until it signs in with Microsoft once. Approved sign-in domains widen that
+gap: with SSO enabled, a NEW address in an approved domain can still create
+a LOCAL-password account through the sign-in form (`/?local=1`), which does
+not go through Entra's MFA — the enforcement applies only to accounts that
+carry `sso_provider`. An install that wants Microsoft-only sign-in leaves
+the domain list empty and uses `SSO_AUTO_PROVISION`, or accepts this.
 Customer guide: `docs/SSO_MICROSOFT.md`.
 
 ---
@@ -1376,7 +1406,9 @@ that: only the owner of a chat can share it or one of its conversations, a
 dashboard share grants only the chats the dashboard's owner owns, and an
 allowed address that has never signed in gets a password-less placeholder
 account, so the share cannot be claimed by whoever types that address at the
-sign-in page first. Password sign-in never creates an account at all; the
+sign-in page first. Password sign-in creates an account only for an address
+that has none (an approved sign-in domain, §10b, or the demo's
+self-registration) — never for a placeholder, which already exists; the
 placeholder's owner sets a password through a mailed single-use link — or,
 for a placeholder created while Microsoft SSO is enabled, signs in with
 Microsoft (the placeholder is SSO-only and the reset page refuses it).

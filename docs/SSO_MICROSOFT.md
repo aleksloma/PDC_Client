@@ -11,7 +11,9 @@ The connection is configured from the local-admin web UI — no code
 changes, no container restart. Two optional settings in `client.env`
 (`SSO_ALLOW_GUESTS`, `SSO_AUTO_PROVISION`, see "Who can sign in with
 Microsoft" below) widen who is admitted; they are read at start, so changing
-them needs a restart of the web container.
+them needs a restart of the web container. The **Approved sign-in domains**
+list on the admin panel's **Users** page (no restart) also lets a new
+address in those domains get an account at its first Microsoft sign-in.
 
 What stays local: PowerDataChat never sees a password. From the ID token it
 reads the user's address (`preferred_username`, falling back to the `email`
@@ -158,8 +160,12 @@ A refusal shows the same "Microsoft sign-in failed" page; the log line
   (`SSO_UNKNOWN_ACCOUNT`, 401): add the person with **Invite user** on the
   admin panel's **Users** page, or share with them. With
   `SSO_AUTO_PROVISION=true` the account is created and bound instead
-  (`SSO_ACCOUNT_PROVISIONED`). Before this release every successful
-  Microsoft sign-in created an account.
+  (`SSO_ACCOUNT_PROVISIONED`); so it is when the address's domain is on the
+  **Approved sign-in domains** list of the **Users** page
+  (`SSO_DOMAIN_ACCOUNT_PROVISIONED`; exact domain, a subdomain must be
+  listed itself). A created account has the Standard permission and no data
+  roles until the administrator changes them. Before this release every
+  successful Microsoft sign-in created an account.
 - The `ladmin` account never signs in with Microsoft
   (`SSO_BOOTSTRAP_ADMIN_REFUSED`, 403).
 
@@ -167,6 +173,16 @@ A refusal shows the same "Microsoft sign-in failed" page; the log line
 |---|---|---|
 | `SSO_ALLOW_GUESTS` | `false` | `true` lets guests of your tenant sign in (subject to the other checks). |
 | `SSO_AUTO_PROVISION` | `false` | `true` creates an account for any identity Entra lets through that has none. Use it only with **Assignment required? = Yes** (Step 1.6). |
+
+**Approved sign-in domains and local passwords.** The approved-domain list is
+not specific to Microsoft: a new address in an approved domain can also
+create an account with a LOCAL password at the sign-in form (`/?local=1`,
+always reachable), and that sign-in does not go through Entra's multi-factor
+authentication or conditional access. The SSO enforcement below covers only
+accounts that have signed in with Microsoft (`sso_provider` in their
+record). If you want Microsoft-only sign-in, leave the approved-domain list
+empty and set `SSO_AUTO_PROVISION=true` instead (with **Assignment
+required? = Yes**), or accept this.
 
 **Removing a user** (admin panel → **Users** → **Remove**) also removes the
 account's binding. Invited again, the address is bound afresh at its next
@@ -191,8 +207,8 @@ deletes the user's chats and dashboards.
   Microsoft front-channel logout. On a shared machine, users should also
   sign out of Microsoft 365 or use a private window.
 - **A Microsoft sign-in does not create an account** unless
-  `SSO_AUTO_PROVISION=true` (above); accounts come from an invitation or a
-  share. An existing password account with the same email becomes a
+  `SSO_AUTO_PROVISION=true` or the address is in an approved sign-in domain
+  (above); otherwise accounts come from an invitation or a share. An existing password account with the same email becomes a
   Microsoft account at its first Microsoft sign-in (below).
 - **No local password for Microsoft accounts.** An account that has signed in
   with Microsoft and holds no local password cannot obtain one: "Reset
@@ -222,7 +238,9 @@ deletes the user's chats and dashboards.
   and Entra's multi-factor authentication and conditional access do not
   apply to it until the user signs in with Microsoft once. If every user
   must go through Entra, have each of them sign in with Microsoft once after
-  SSO is enabled.
+  SSO is enabled — and keep the approved sign-in domain list empty, since it
+  lets new local-password accounts appear (see "Approved sign-in domains and
+  local passwords" above).
 - **Disabling a user in Entra does not end an open session here.** There is
   no back-channel logout: an open PowerDataChat session lasts until the
   browser drops the cookie or its 30-day lifetime (`REMEMBER_ME_MAX_DAYS`)
@@ -230,7 +248,8 @@ deletes the user's chats and dashboards.
   admin panel's **Users** page; **Remove** deletes the account and everything it
   owns and takes the address off everything shared with it and off the
   tables it registered. The removed user's next Microsoft sign-in is refused
-  as an unknown account — unless `SSO_AUTO_PROVISION=true`, in which case a
+  as an unknown account — unless `SSO_AUTO_PROVISION=true` or the address is
+  in an approved sign-in domain, in which case a
   user still assigned in Entra gets a new, empty account (none of the old
   chats, shares, roles or registrations, and no old session works for it);
   unassign them in Entra as well.
