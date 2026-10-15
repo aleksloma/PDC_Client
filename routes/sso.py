@@ -29,6 +29,7 @@ import httpx
 
 import brain_client
 import db_sources
+import signin_domains
 import sso_store
 from settings import settings
 from local_store import AuthStore
@@ -221,11 +222,15 @@ async def microsoft_callback(request: Request):
         outcome = store.bind_sso_identity(email, tid, oid)
         if outcome not in ("bound", "already"):
             return _landing(request, error=_SIGNIN_FAILED, status_code=403)
-    elif settings.SSO_AUTO_PROVISION:
+    elif settings.SSO_AUTO_PROVISION or signin_domains.allows_email(email):
+        # SSO_AUTO_PROVISION (any domain) or an approved sign-in domain.
         store.ensure_user(email)
         if store.bind_sso_identity(email, tid, oid) not in ("bound", "already"):
             return _landing(request, error=_SIGNIN_FAILED, status_code=403)
-        log_with_sid(log_safe_text(email, 254), "info", "SSO_ACCOUNT_PROVISIONED")
+        if settings.SSO_AUTO_PROVISION:
+            log_with_sid(log_safe_text(email, 254), "info", "SSO_ACCOUNT_PROVISIONED")
+        else:
+            log_with_sid(log_safe_text(email, 254), "info", "SSO_DOMAIN_ACCOUNT_PROVISIONED")
     else:
         log_with_sid("sso", "warning", "SSO_UNKNOWN_ACCOUNT")
         return _landing(request, error=_SIGNIN_FAILED, status_code=401)

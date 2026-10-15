@@ -271,6 +271,20 @@
           <button id="btnInviteUser" type="button" class="adm-btn primary">Invite user</button>
         </div>
         <div id="inviteResult" class="adm-alert hidden" role="status"></div>
+        {# Approved sign-in domains: an address in one of them creates its own
+           account at its first sign-in (password form or Microsoft). #}
+        <div class="adm-subhead">
+          <h4><label for="signinDomains">Approved sign-in domains</label></h4>
+        </div>
+        <p class="adm-page-sub" style="margin-bottom: 8px">Anyone with an email in these domains can create their own account by
+           signing in with their email and a new password. They get the Standard permission and the
+           Base data role. Invitations still work for everyone.</p>
+        <div class="adm-users-invite">
+          <input type="text" id="signinDomains" class="adm-search" autocomplete="off"
+                 name="pdc-signin-domains" placeholder="company.com, subsidiary.com" />
+          <button id="btnSaveSigninDomains" type="button" class="adm-btn primary">Save</button>
+        </div>
+        <div id="signinDomainsResult" class="adm-alert hidden" role="status"></div>
         <div class="adm-users-toolbar">
           {# autocomplete=off + non-credential name: Chrome used to autofill the
              saved login email here and silently filter the list to one user. #}

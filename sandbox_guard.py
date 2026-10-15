@@ -46,6 +46,9 @@ DENIED_MODULES = frozenset({
     # role grants: sandboxed code must not rewrite roles.json (privilege
     # escalation for the DB-table role gate)
     "roles_store",
+    # approved sign-in domains: rewriting signin_domains.json would let
+    # generated code open self-service sign-up for any domain
+    "signin_domains",
     # relation discovery: one hop from the registry, and the sandbox has no
     # business growing a SQL parser for free
     "relation_discovery", "sqlglot",
