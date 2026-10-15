@@ -402,8 +402,12 @@ plus two you can switch on:
   approved sign-in domain, does the first Microsoft sign-in create one (see
   "Single sign-on with Microsoft Entra ID" below).
 - **Approved sign-in domains.** Under **Approved sign-in domains** on the
-  **Users** page, `ladmin` can list company domains, comma separated (e.g.
-  `bank.example, subsidiary.example`), and click **Save**; an empty list
+  **Users** page, `ladmin` sees the approved company domains as a list, one
+  row per domain with a **Remove** button. Type a domain (e.g.
+  `bank.example`) into the box below the list and click **Add** (or press
+  Enter); the list shows what the server saved, and an invalid entry shows
+  the server's error and changes nothing. When the list is empty the page
+  says "No approved domains. Sign-in is by invitation only."; an empty list
   (the default, also for an install upgraded from an earlier release) keeps
   sign-in invitation-only. A person whose address is in a listed domain and
   who has no account yet creates one by signing in with their email and a
