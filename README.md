@@ -100,6 +100,7 @@ PDC_Client/
 ├── brain_client.py          # HTTP client to brain (bearer token)
 ├── run_chat_local.py        # local execution + _safe_preview guard
 ├── local_store.py           # users + chats + conversations on local disk
+├── signin_domains.py        # approved sign-in domains (DATA_ROOT/signin_domains.json)
 ├── schema_builder.py        # _schema_text builder
 ├── excel_table_detector.py  # 6-stage Excel table detection
 ├── auto_analytics.py        # background job (brain planner → local exec → PPTX)
@@ -116,7 +117,9 @@ PDC_Client/
 ├── docker-compose.yml       # customer stack: both services, two networks
 ├── docker-compose.local.yml # local stack: both services, built from this repo
 ├── routes/
-│   ├── auth.py              # /auth/* — email+password sign-in (by invitation), reset link, change
+│   ├── auth.py              # /auth/* — email+password sign-in (by invitation, or self-created in an approved sign-in domain), reset link, change
+│   ├── admin_users.py       # /api/admin/users*, /roles*, /signin_domains — user management
+│   ├── sso.py               # /auth/microsoft* — optional Microsoft Entra ID sign-in
 │   ├── upload.py            # /upload, /schema_autofill_full, /generate_chatdata
 │   ├── schema.py            # /schema_details, /schema_common_fields, /schema
 │   ├── chat.py              # /api/chat/* — SSE stream, edit-regenerate, sharing
@@ -160,7 +163,7 @@ To run the stack you need:
 | `SCHEMA_VALUE_DENY_COLUMNS` | Optional. Comma-separated column names (case-insensitive) whose values never reach the brain: those columns send name, dtype and counts only. Empty by default. |
 | `SHARE_ALLOWED_DOMAINS` | Optional. Comma-separated recipient domains a chat, conversation or dashboard may be shared with. Empty by default: the domains of the administrator accounts are used, or, when none has an email address, the domains of all accounts with one; with no such account every share is refused. |
 | `SSO_ALLOW_GUESTS` | Optional, default `false`. `true` lets guests (`#EXT#`) of your Entra tenant sign in with Microsoft. See [`docs/SSO_MICROSOFT.md`](docs/SSO_MICROSOFT.md). |
-| `SSO_AUTO_PROVISION` | Optional, default `false`. `true` creates an account at the Microsoft sign-in of an identity that has none; otherwise such a sign-in is refused. Requires "Assignment required? = Yes" on the Entra enterprise application. |
+| `SSO_AUTO_PROVISION` | Optional, default `false`. `true` creates an account at the Microsoft sign-in of an identity that has none; otherwise such a sign-in is refused, except for an address in an approved sign-in domain (set by `ladmin` on the admin panel's **Users** page, not in `client.env`). Requires "Assignment required? = Yes" on the Entra enterprise application. |
 
 The `EXECUTOR_*` topology values are set by the compose file, not by the env
 file. `EXECUTOR_NETWORK_CIDR` is mandatory while `EXECUTOR_URL` is set: the
@@ -189,7 +192,10 @@ speaks plain HTTP. See [`CUSTOMER_INSTALL.md`](CUSTOMER_INSTALL.md) §3,
 On the Docker host itself, open `http://localhost:8000` and sign in as
 `ladmin` with `LOCAL_ADMIN_PASSWORD`, then invite users from the admin panel's
 **Users** page; each sets a password through the mailed link and lands in
-`/lab`. `curl http://127.0.0.1:8000/health`, run on the host, must report
+`/lab`. (Optionally list approved sign-in domains on the same page: an
+address in one of them can then create its own account at the sign-in page —
+see [`CUSTOMER_INSTALL.md`](CUSTOMER_INSTALL.md), "Users and sign-in", for the
+security note.) `curl http://127.0.0.1:8000/health`, run on the host, must report
 `executor_reachable: true`; it stays 200 either way, so read the body.
 
 The compose files carry the hardening both containers need (read-only rootfs,
