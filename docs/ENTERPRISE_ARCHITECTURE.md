@@ -1389,6 +1389,59 @@ Customer guide: `docs/SSO_MICROSOFT.md`.
 
 ---
 
+## 10d. Narrative templates and diagnostics
+
+The answer text of a computed result is a TEMPLATE that the brain writes
+and the client fills. The planner never sees a result value, so it writes
+slots (`{{total_loans:count}}`) and the generated code stores each value
+in `VALUES`. The client runs the code, fills the slots locally and shows
+the filled text. Values never reach the brain. The design rests on four
+constraints:
+
+- **C1.** From an executed result only booleans, input column names and
+  fixed codes (`FINDINGS`) may go back to the brain.
+- **C2.** Every number reaches the user through a brain template that the
+  client fills after execution.
+- **C3.** A templated answer needs no describe or summarize. A summarize
+  fallback sends `preview: null`, and the brain writes a reading guide
+  without a value.
+- **C4.** At most two code passes per question; the second is planned from
+  FINDINGS only. Never a third.
+
+**Capabilities.** Every change is opt-in per request through
+`capabilities` on `/v1/plan` and `/v1/retry` (`narrative_v1`,
+`diagnostics_v1`, `two_phase_v1`). A client that sends none gets
+byte-identical prompts and responses (pinned by golden tests), so an old
+client keeps working against the new brain. A few changes apply to every
+client, for example: the brain strips a ```` ```narrative ```` /
+```` ```caption:<n> ```` fence from any plan or retry reply, and a null
+summarize preview gets the reading guide. See `PROTOCOL.md` (`/v1/plan`,
+"Capabilities") for the full list.
+
+**Diagnostics playbook.** With `diagnostics_v1` the classifier can return
+the task type `diagnostic` (why, what drives, what problems) or `advisory`
+(what to do). Such a plan gets `skills/core/diagnostics.yaml`: a coverage
+check, confirm the anomaly, then decompose the change or attribute the
+level, using the client's deterministic `pdc_diag` helpers. The
+conclusion is written as template conditionals over FINDINGS codes. Until
+`two_phase_v1` ships, the playbook runs in a single pass.
+
+**Two-phase (deferred to session 3).** With `two_phase_v1` the brain marks
+a phase-1 diagnostic plan `diagnostic: true`, and the client may ask once
+more with the phase-1 FINDINGS. The brain side exists; no client sends the
+capability yet.
+
+**Deploy order.** Brain first, then client. A new client against an old
+brain gets no `narrative` and falls back to describe and summarize, but
+its null summarize preview gets no reading guide there. Client
+kill-switch: `BRAIN_CAPABILITIES=""` makes the client send no
+capabilities, which restores the earlier prompts and responses.
+
+Wire shapes: `PROTOCOL.md`. Design: `docs/DIAGNOSTICS_SPEC.md` in the
+client repository.
+
+---
+
 ## 11. Sharing restriction
 
 Sharing is restricted to the company's own domains, enforced by the client
