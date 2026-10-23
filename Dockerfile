@@ -73,7 +73,7 @@ COPY app.py auth_limiter.py auto_analytics.py brain_client.py code_exec.py \
      dataset_profile.py db_connector.py db_scheduler.py db_sources.py \
      excel_table_detector.py exec_sanitizer.py exec_transport.py \
      executor_client.py gcs_upload.py html_sanitize.py local_store.py \
-     logger_utils.py models.py outlier_utils.py \
+     logger_utils.py models.py narrative.py outlier_utils.py \
      password_utils.py pdc_diag.py plot_utils.py pptx_template_cache.py \
      relation_discovery.py \
      result_backstop.py roles_store.py run_chat_local.py sandbox_guard.py \
