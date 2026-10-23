@@ -1,6 +1,6 @@
 # Narrative-Template Answers & Diagnostic Analytics — Design Spec
 
-**Status:** Design — not yet implemented (2026-10-23). Decisions of 2026-10-23 applied (section F). Sessions 1 and 2 are approved for implementation. Session 3 (two-phase) is decided after sessions 1+2 have been tested on the BRB questions; its design stays in this spec, gated behind the capability `two_phase_v1`.
+**Status:** Design — not yet implemented (2026-10-23). Decisions of 2026-10-23 applied (section F). Sessions 1 and 2 are approved for implementation. Session 2 shipped in PDC_Brain PRs #2–#4; B10.2, B10.3 and B10.5 are synced to the merged brain texts (PITFALLS block, pdc_diag key map, block-isolation routing, pitfall 5 on `latest_is_past_period`). Session 3 (two-phase) is decided after sessions 1+2 have been tested on the BRB questions; its design stays in this spec, gated behind the capability `two_phase_v1`.
 **Location:** `PDC_Client/docs/DIAGNOSTICS_SPEC.md` (client repo; referenced from the DRAFT section of `PROTOCOL.md` in both repos)
 **Audience:** the three implementation sessions (client, brain, two-phase integration), reviewers of the data boundary (Article II), the lead.
 
@@ -1106,7 +1106,7 @@ task_type "advisory": the user asks WHAT TO DO, what to recommend or how to impr
 loaded data (not general advice). Examples:
 - Uzbek: "Kredit portfelini yaxshilash uchun nima qilishimiz kerak?" / "Qaysi hududlarga e'tibor qaratishni tavsiya qilasiz?"
 - Russian: "Что нам сделать, чтобы снизить просрочку?" / "Какие сводки нам стоит регулярно делать по этой базе?"
-- Georgian: "რა უნდა გავაკეთოთ ვადაგადაცილების შესამცირებლად?" / "რომელ რეგიონებზე გვირჩევთ ფოკუსირებას?"
+- Georgian: "რა უნდა გავაკეთოთ ვადაგადაცილების შესამცირებლად?" / "რომელ რეგიონებზე გვირჩევთ ყურადღების გამახვილებას?"
 - English: "What should we do to reduce churn?" / "Which segments do you recommend we focus on?"
 Precedence: a why / what-drives / what-problems question is "diagnostic" even when it also asks for a
 dashboard, an overview or several charts (diagnostic wins over complex_analysis); a what-to-do question is
@@ -1163,6 +1163,14 @@ SANITY HOOKS (every data answer)
 - A stock (balance, outstanding, active, portfolio) is never summed across periods: report the latest period or each period.
 - "This month", "current period", "now": compute the latest period in the data; coverage_check sets latest_is_past_period when the data ends before the current month; then the template says, inside {{#latest_is_past_period}}…{{/latest_is_past_period}}, that the latest period in the data is {{latest_period:period}}.
 
+PITFALLS (every data answer)
+- A stock (active, outstanding, portfolio) summed over months double counts — use the latest period.
+- A 'granted' column equal to an 'active' column in most rows is a stock, not new grants — check_metric_overlap.
+- Amounts across different currency or unit labels are never added without conversion — mixed_units.
+- A thin period (few rows) is a coverage problem, not a business drop — period_status partial_period.
+- 'This month' is the calendar month; the data's latest period may be older — latest_is_past_period.
+- A dimension dominated by an unknown/placeholder member cannot explain anything — unknown_dominated.
+
 CONVERSATION HISTORY
 - Earlier answers appear as templates: {{name}} slots stand for values the user saw and you never see, and a first line "[Findings: key=value; …]" lists that answer's checks. Never guess, restate or compute from a slot's value; refer to it in words ("the total shown above").
 ````
@@ -1193,6 +1201,8 @@ purpose: >
 routing:
   - "Diagnostic and advisory plans ALWAYS use the ###NEXT_PLOT### multi-block form, at most 4 blocks in a pass."
   - "Every block produces a figure (fig) or a RESULT table, and sets VALUES/FINDINGS with pdc_diag results."
+  - "Each ###NEXT_PLOT### block runs with its own empty VALUES and FINDINGS and cannot read another block's variables or results, so its code never reads a VALUES or FINDINGS key that another block sets (never branch in code on one). The narrative template may use every block's VALUES and FINDINGS."
+  - 'A block that needs the anomaly period obtains it itself: pdc_diag.decompose_change(..., to_period="primary_anomaly") — leave from_period unset and use the same agg as the anomaly check (or run detect_anomalies again inside the block).'
 playbook:
   step_1_coverage: >
     First block: pdc_diag.coverage_check(df, <period col>, dims=<categorical dims>, metrics=<metrics>,
@@ -1212,6 +1222,30 @@ playbook:
     {{#concentrated_in_one_dim}} (name the dimension with the {{change_dim_label:text}} slot),
     {{#dominant_feature}} / {{#weak_signal}}. First sentence = the direct answer with its slot;
     last sentence = how to read the visual.
+  keys:
+    coverage_check: >
+      VALUES n_periods, first_period, latest_period, latest_rows, median_rows, thin_period_label,
+      coverage_jaccard, unknown_share_max, as_of_period, coverage_dim_label, unknown_dim_label;
+      FINDINGS coverage, coverage_dim, thin_period, period_status, unknown_dominated, unknown_dim, units,
+      metric_gap, period_order_unknown, latest_is_current_period, latest_is_past_period
+    detect_anomalies: >
+      VALUES anomaly_period, anomaly_value, baseline_value, anomaly_ratio_median, anomaly_prev_period,
+      anomaly_prev_value, anomaly_ratio_prev, n_periods, n_anomalies;
+      FINDINGS anomaly, anomaly_up, anomaly_is_latest, multiple_anomalies, too_few_periods
+    decompose_change: >
+      VALUES change_from_period, change_to_period, change_from_value, change_to_value, change_abs,
+      change_ratio, change_pct, change_top_member, change_top_member_share, change_top_member_delta,
+      change_dim_label; FINDINGS change_shape, change_dim, change_up, change_large, too_few_periods,
+      anomaly (no_anomaly when to_period="primary_anomaly" finds none)
+    attribute_level: >
+      VALUES top_feature_label, second_feature_label, top_feature_share, second_feature_share, n_rows_used,
+      top_member, top_member_target, overall_target; FINDINGS attribution, top_feature, second_feature,
+      method_fallback
+    check_metric_overlap: >
+      VALUES overlap_equal_share, overlap_sum_ratio, overlap_rows; FINDINGS metric_relation, metrics_identical
+    slot_rule: >
+      A narrative slot must be one of these VALUES keys (with the prefix= you passed) or a key the code sets
+      itself with VALUES["..."] = …; never an invented name.
 single_pass_rule: >
   Do all four steps in THIS pass (at most 4 blocks): coverage, anomaly, then decompose_change with
   to_period="primary_anomaly" (or attribute_level), then the conditional conclusion. Never set FINDINGS["needs_phase2"].
@@ -1233,7 +1267,7 @@ pitfalls:
   - "A 'granted' column equal to an 'active' column in most rows is a stock, not new grants — check_metric_overlap."
   - "Amounts across different currency or unit labels are never added without conversion — mixed_units."
   - "A thin period (few rows) is a coverage problem, not a business drop — period_status partial_period."
-  - "'This month' is the calendar month; the data's latest period may be older — latest_is_current_period."
+  - "'This month' is the calendar month; the data's latest period may be older — latest_is_past_period."
   - "A dimension dominated by an unknown/placeholder member cannot explain anything — unknown_dominated."
 forbidden:
   - "No numbers, names or category values in the template; no FINDINGS key built from data; no third pass."

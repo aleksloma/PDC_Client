@@ -60,20 +60,25 @@ are unchanged.
 
 | Brain field          | Same field in B2C | Built by |
 |---------------------|-------------------|----------|
-| `schema_text`       | return value of `_schema_text(schema_docs, dfs, common_fields)`. VALUE POLICY (enterprise, stricter than B2C): a text column with at most 20 distinct values lists them, each cut to 40 characters; any other text column carries its distinct COUNT only (`object (N unique)`); a numeric or date column carries its dtype only, never a value. The stored per-column `technical_description` is filtered to the same rule as a string when the text is built (a `sample:` list written by an earlier release is dropped, a categorical list of more than 20 values becomes its count). A column named in the client setting `SCHEMA_VALUE_DENY_COLUMNS` (comma-separated, case-insensitive) carries its dtype only, a technical line of dtype + fill count, and no `Value Descriptions` entry | client (`schema_builder.schema_text`, `_safe_technical_description`) |
+| `schema_text`       | return value of `_schema_text(schema_docs, dfs, common_fields)`. VALUE POLICY (enterprise, stricter than B2C): a text column with at most 20 distinct values lists them, each cut to 40 characters; any other text column carries its distinct COUNT only (`object (N unique)`); a numeric or date column carries its dtype only, never a value. The stored per-column `technical_description` is filtered to the same rule as a string when the text is built (a `sample:` list written by an earlier release is dropped, a categorical list of more than 20 values becomes its count). A column named in the client setting `SCHEMA_VALUE_DENY_COLUMNS` (comma-separated, case-insensitive) carries its dtype only, a technical line of dtype + fill count, and no `Value Descriptions` entry. Unchanged by the narrative release: the category lists of text columns with ≤ 20 distinct values stay | client (`schema_builder.schema_text`, `_safe_technical_description`) |
 | `df_names`          | `list(dfs.keys())` | client |
 | `df_columns`        | `{name: list(df.columns)}` (only sent on retry, for column self-correction) | client |
-| `history_rows`      | the `history_rows` arg to `generate_pandas_code` / `summarize_answer`. Each row carries **only** `role`, `content`, and (when present) `code` — the client's `brain_client._sanitize_history_rows` strips every other persisted field (`image_base64`, `chart_data`, `table`, `usage`, `full_table_key`, `ts`, …) before the POST, so raw data values in locally persisted records never cross the boundary (Article II) | client (`local_store.get_history`, sanitized in `brain_client.plan/retry/summarize`) |
+| `history_rows`      | the `history_rows` arg to `generate_pandas_code` / `summarize_answer`. Each row carries **only** `role`, `content`, and (when present) `code` — the client's `brain_client._sanitize_history_rows` strips every other persisted field (`image_base64`, `chart_data`, `table`, `usage`, `full_table_key`, `ts`, …) before the POST, so raw data values in locally persisted records never cross the boundary (Article II). From its narrative release the client writes the `content` of a templated AI turn as a `[Findings: …]` marker line plus the unfilled template (see `/v1/plan` "History") | client (`local_store.get_history`, sanitized in `brain_client.plan/retry/summarize`) |
 | `common_fields`     | the `common_fields` arg to `generate_pandas_code` | client |
-| `error_msg`         | `exec_out["error"]` from `safe_execute` | client |
+| `error_msg`         | `exec_out["error"]` from `safe_execute`. From its narrative release the client replaces every quoted literal that is not an input column name or a df name with `'<value>'`, and the `NearZeroChartError` text carries no number | client |
 | `failed_code`       | the failed code block | client |
-| `preview` (summarize) | the `_safe_preview` value: a `str`/`int`/`float`/`bool`, a flat object whose keys and values are all such scalars (or null values), or `null` — lists, tables and objects holding anything else become `null`. Capped in transport: a string at 500 characters + `…[truncated]`; an object at its first 20 keys, each string key/value cut the same way, plus `"_truncated_keys": <number dropped>` when more existed | client (`run_chat_local._safe_preview`, capped by `brain_client._compact_preview_for_transport`) |
+| `preview` (summarize) | the `_safe_preview` value: a `str`/`int`/`float`/`bool`, a flat object whose keys and values are all such scalars (or null values), or `null` — lists, tables and objects holding anything else become `null`. Capped in transport: a string at 500 characters + `…[truncated]`; an object at its first 20 keys, each string key/value cut the same way, plus `"_truncated_keys": <number dropped>` when more existed. From its narrative release the client always sends `null` (see `/v1/summarize`) | client (`run_chat_local._safe_preview`, capped by `brain_client._compact_preview_for_transport`) |
 | `qa_pairs` (report) | the `findings_for_llm` list the B2C `_generate_report_structure` already builds | client |
-| `dataset_profile` (plan/retry, **optional**) | enterprise-only (no B2C equivalent): `{df_key: profile}` of computed FACTS per loaded table — rows, duplicate count, per-column dtype/nunique/null rates/min-max/constant/all-unique flags, truncated top-value hints, detected grain, deterministic warnings. Aggregate metadata only, never row data (Article II — same class as the cardinality hints in `technical_description`). `top_values` (≤ 5 pairs, each value cut to 40 characters) only for a column with `nunique` ≤ 20; a column on `SCHEMA_VALUE_DENY_COLUMNS` carries only `dtype`, `nunique`, `null_count`, `null_pct`, `constant`, `all_unique`, and its constant-column warning reads `<col> is constant` without the value. The transport compaction applies both rules to profiles stored by an earlier release too. Absent field ⇒ pre-profile behavior everywhere | client (`dataset_profile.compute_profile`, stored as sidecar JSON, compacted by `brain_client._compact_profiles_for_transport`) |
-| `data_caveat` (describe, **optional**) | enterprise-only: the client's DETERMINISTIC post-execution finding about the result it just rendered — `{kind: constant_metric\|identical_series\|constant_table\|matrix_readability, facts[], grain[], catalog}`. Aggregate findings + column names + truncated constant-value hints only (Article II, same class as `dataset_profile`). Makes the flat-result explanation mandatory instead of prompt-dependent; absent field ⇒ byte-identical describe prompt | client (`result_backstop.inspect_outputs`, compacted by `brain_client._compact_caveat_for_transport`) |
+| `dataset_profile` (plan/retry, **optional**) | enterprise-only (no B2C equivalent): `{df_key: profile}` of computed FACTS per loaded table — rows, duplicate count, per-column dtype/nunique/null rates/min-max/constant/all-unique flags, truncated top-value hints, detected grain, deterministic warnings. Aggregate metadata only, never row data (Article II — same class as the cardinality hints in `technical_description`). `top_values` (≤ 5 pairs, each value cut to 40 characters) only for a column with `nunique` ≤ 20; a column on `SCHEMA_VALUE_DENY_COLUMNS` carries only `dtype`, `nunique`, `null_count`, `null_pct`, `constant`, `all_unique`, and its constant-column warning reads `<col> is constant` without the value. The transport compaction applies both rules to profiles stored by an earlier release too. Absent field ⇒ pre-profile behavior everywhere. From its narrative release the client stops sending `min`, `max` and `top_values` for every column and writes every constant-column warning as `<col> is constant` (transport only; stored profiles are not rewritten); the brain renders a profile without them | client (`dataset_profile.compute_profile`, stored as sidecar JSON, compacted by `brain_client._compact_profiles_for_transport`) |
+| `data_caveat` (describe, **optional**) | enterprise-only: the client's DETERMINISTIC post-execution finding about the result it just rendered — `{kind: constant_metric\|identical_series\|constant_table\|matrix_readability, facts[], grain[], catalog}`. Aggregate findings + column names + truncated constant-value hints only (Article II, same class as `dataset_profile`). Makes the flat-result explanation mandatory instead of prompt-dependent; absent field ⇒ byte-identical describe prompt. From its narrative release the client stops sending the constant-value hint in `facts`; the brain renders the caveat without it | client (`result_backstop.inspect_outputs`, compacted by `brain_client._compact_caveat_for_transport`) |
 | `live_tables` (plan/retry, **optional**) | enterprise-only (no B2C equivalent): `[{name, dialect, row_cap, filtered}]` — one row per LIVE database table the chat holds (`name` = the df key, `dialect` = the connector registry key such as `postgresql` / `mysql` / `mariadb` / `mssql` / `oracle` / `clickhouse`, `row_cap` = the effective row cap, `filtered` = true when an administrator row filter applies, in which case the client fetches the rows itself and expects no SQL). Metadata only; sent only when the chat holds a live table | client (`run_chat_local._live_tables_for_brain` from `ChatDataStore.schema_docs`) |
 | `sql` (plan/retry response, **optional**; echoed on a retry request) | enterprise-only: `{<df key>: "<one read-only SELECT>"}` written by the brain for the live tables the code references. The client validates it (read-only guard + a per-table allowlist), runs it in the web application, and places the result under the df key; a missing entry ⇒ the client's default capped fetch. On a retry request (every retry, the regeneration ones included) the client sends what RAN this turn: the brain's own text for a SELECT that reached the database (also when it failed there), `null` for a default read, for a SELECT ignored on a `filtered` table and for a SELECT the client's guard refused; keys never fetched are absent — never a result | brain (planner); echoed by client (`brain_client.retry(sql=)`) |
 | `sql_error` (retry, **optional**) | enterprise-only: `{table, dialect, class, guard, message}` describing a failed live SELECT, or (once, on the next retry) a SELECT ignored on a `filtered` table — `class` ∈ `syntax` / `unknown_column` / `unknown_table` / `timeout` / `permission` / `guard` / `other`; `guard` true when the client's own SQL gate refused the text, and then `message` is the gate's sentence (naming at most an identifier), otherwise `message` is null. Never the driver message, a literal or a cell value (Article II) | client (`brain_client.live_sql_error`) |
+| `capabilities` (plan/retry, **optional**) | enterprise-only (no B2C equivalent): the feature names the client supports — `narrative_v1` (answer text as a template), `diagnostics_v1` (the diagnostic playbook; honoured only with `narrative_v1`) and `two_phase_v1` (one second code pass; honoured only with `diagnostics_v1`, sent by no client until the two-phase flow ships). Unknown names, non-string items and a value that is not a list are ignored. A constant list, no data. Absent (or no known name) ⇒ the earlier prompts and response | client (`brain_client.plan/retry`, from the `BRAIN_CAPABILITIES` setting) |
+| `findings` (plan, **optional**) | enterprise-only: `{key: value}` — the deterministic checks the phase-1 code computed, sent only on the second pass of a two-phase diagnostic. At most 24 keys matching `^[a-z][a-z0-9_]{0,39}$`; each value a boolean or a string of 1–64 characters without control characters. On the client a string is an exact input column name (never a column the code created) or one fixed code (`coverage_change`, `coverage_stable`, `partial_period`, `metric_definition_overlap`, `mixed_units`, `concentrated_in_one_dim`, `spread_evenly`, `weak_signal`, `dominant_feature`, `anomaly_confirmed`, `no_anomaly`, `data_gap`, `outlier_driven`, `seasonal_pattern`), and the key `needs_phase2` is reserved for a boolean. The brain checks the shape only (the 400 rules are under `/v1/plan`) | client (`narrative.validate_findings`) |
+| `data_caveat.findings` (describe, **optional**) | enterprise-only: the same FINDINGS shape as `findings`, sent with or without `kind` when describe runs for a turn whose code set FINDINGS. Cleaned like `findings`; a bad entry is dropped, never a 400 | client (`narrative.validate_findings`, carried by `brain_client._compact_caveat_for_transport`) |
+| `narrative` / `captions` (plan/retry response, **optional**) | enterprise-only: the answer template (≤ 4000 characters) and the per-visual caption templates `{"<n>": template}` (≤ 600 characters each) the planner wrote in ```` ```narrative ```` / ```` ```caption:<n> ```` fences. Returned only with `narrative_v1`, next to `PYTHON` / `PLOT_CODE` | brain (planner); filled by the client (`narrative.render`) |
+| `diagnostic` (plan response, **optional**) | enterprise-only: `true` on a phase-1 diagnostic or advisory code plan when `two_phase_v1` is on; never `false` | brain (classifier task_type) |
 
 ---
 
@@ -114,7 +119,13 @@ the convenience `kind` + `code` from `_extract_code_kind`.
       "dialect": "postgresql",             // connector registry key: postgresql | mysql | mariadb | mssql | oracle | clickhouse
       "row_cap": 200000,                   // the effective row cap of the SELECT's result
       "filtered": false }                  // true ⇒ an administrator row filter applies: the client
-  ]                                        //   pre-fetches the rows itself and expects NO SQL for it
+  ],                                       //   pre-fetches the rows itself and expects NO SQL for it
+  "capabilities": ["narrative_v1", "diagnostics_v1"],  // OPTIONAL — absent ⇒ the earlier prompts and response
+  "findings": {                            // OPTIONAL — phase 2 only (the second and last pass)
+    "anomaly": "anomaly_confirmed",        //   a fixed code
+    "coverage_dim": "CURRENCY",            //   an input column name
+    "needs_phase2": true                   //   a boolean
+  }
 }
 ```
 
@@ -122,7 +133,9 @@ The brain injects the profile LAZILY into the planner prompt: a one-line
 micro-summary per table (`PROFILE <name>: rows=N; warnings: ...`) ALWAYS,
 and the full block (capped ~15 lines/table) only when the query analyzer
 classifies the question as a data task (aggregation / visualization /
-statistical or complex analysis; classifier failure counts as a data task).
+statistical or complex analysis, and diagnostic / advisory, which the
+classifier offers only with `diagnostics_v1`; classifier failure counts as
+a data task).
 Logs carry only `profile_tables=N`, never the profile body.
 
 **Live tables.** `live_tables` lists the chat's live database tables (their
@@ -171,6 +184,72 @@ MERGE, DROP, CREATE, ALTER, TRUNCATE, GRANT, REVOKE, EXEC, EXECUTE, CALL,
 INTO, ATTACH, PRAGMA, VACUUM, COPY. On ClickHouse it refuses a `SETTINGS`
 clause.
 
+**Capabilities.** `capabilities` is an optional list of the features the
+client supports (field table above). The brain keeps the known names,
+drops `diagnostics_v1` without `narrative_v1` and `two_phase_v1` without
+`diagnostics_v1`, and ignores everything else. A request with no known
+name gets exactly the earlier planner prompt, classifier prompt and
+response, except for four changes that apply to every client:
+
+- the fence stripping under "Narrative and captions" below (a reply
+  without such a fence comes back untouched);
+- a non-empty `findings` adds the PHASE 2 block ("Findings (phase 2)"
+  below);
+- the skill name `diagnostics` is always removed from the skill list
+  ("Diagnostic questions" below);
+- a null `/v1/summarize` preview gets the reading guide ("Null preview"
+  under `/v1/summarize`).
+
+Design: `docs/DIAGNOSTICS_SPEC.md` in the client repository.
+
+**Diagnostic questions.** Only with `diagnostics_v1`, the classifier
+prompt offers two more task types and one more skill name:
+`diagnostic` (why something changed, what drives a metric, what problems
+the data shows) and `advisory` (what to do, grounded in the loaded data),
+and the skill `diagnostics`. Both task types count as data tasks for the
+dataset-profile gate. When the classifier picks one of them, or lists
+`diagnostics` in `skills_needed`, the planner's system instruction gains
+the diagnostics playbook (`skills/core/diagnostics.yaml`, after the other
+skills): a coverage check, confirm the anomaly, then decompose the change
+or attribute the level, as `###NEXT_PLOT###` blocks. Without
+`two_phase_v1` the playbook does every step in one pass and never asks
+for a second one. The name `diagnostics` (any case, any padding) is
+always removed from `skills_needed` before the generic skill loader runs,
+capability or not; a classifier reply that listed only `diagnostics` then
+gets the keyword skill selection.
+
+**Findings (phase 2).** `findings` carries the checks the phase-1 code
+computed (field table above). The brain checks its shape before the
+planner runs:
+
+- not an object (`null` counts as absent) → HTTP 400
+  `{"detail": "Invalid 'findings': findings must be an object"}`;
+- an object with a value that is not a boolean or a string → HTTP 400
+  `{"detail": "Invalid 'findings': findings values must be booleans or strings"}`.
+
+Both messages are fixed and never name a key or a value. The rejection is
+logged as `BRAIN_PLAN_REJECTED reason=findings_shape` with the tenant id
+and no content. Every other violation (a bad key, an empty or longer
+string, a control character, keys past the 24th) silently drops that
+entry. Non-empty cleaned findings alone, with or without capabilities,
+add a PHASE 2 block to the planner prompt: the findings as sorted
+`- key: true|false|value` lines, and the instruction to write only step 3
+of the playbook with its own narrative and never a third pass. The block
+sits after the dataset profile and BEFORE the Common Fields section. It
+is never part of the `CODE_PROMPT` log snippet; the brain logs
+`PHASE2_PLAN findings_n=<count>`.
+
+**History.** A client from its narrative release sends an AI history row
+for a templated turn whose `content` is a marker line
+`[Findings: key=value; …]` (only when the turn set FINDINGS; keys sorted,
+at most 400 characters) followed by the unfilled template. Slots are
+never filled in history. With `narrative_v1` the planner prompt tells the
+model that a slot stands for a value the user saw and the model never
+sees. The brain parses neither line; it trims history rows as before (800
+characters per row, 150 in the classifier prompt), which is why the
+marker comes first. Turns without a template keep their describe or
+summarize text.
+
 ### Response
 
 ```jsonc
@@ -183,7 +262,12 @@ clause.
   "model_used": "gemini-2.5-pro",
   "sql": {                                // OPTIONAL — one read-only SELECT per live df key the
     "transactions": "SELECT region, SUM(amount) AS total FROM public.transactions GROUP BY region"
-  }                                       //   code references; unknown fields are ignored
+  },                                      //   code references; unknown fields are ignored
+  "narrative": "{{total_loans:count}} loans were granted in {{latest_period:period}}. The bars show the count per month.",
+                                          // OPTIONAL — narrative_v1 only, next to PYTHON / PLOT_CODE
+  "captions": { "1": "Count per month; {{anomaly_period:period}} is highlighted." },
+                                          // OPTIONAL — keys are strings "1".."12"
+  "diagnostic": true                      // OPTIONAL — phase-1 plan with two_phase_v1 only; never false
 }
 ```
 
@@ -211,6 +295,81 @@ from domain context. The client returns `CLARIFICATION`, `ANSWER`, and
 `MISSING_DATA` text to the user directly without executing anything; a flow
 that requires code treats `ANSWER` and `MISSING_DATA` exactly like `NO_CODE`
 (retry loops count them as failed prose attempts).
+
+**Narrative and captions.** With `narrative_v1` the brain asks for the
+answer text as a template. The system instruction gains the narrative
+rules (`planner_narrative_system`, right after `planner_system`), and the
+user prompt gains a format line (`planner_narrative_suffix`, after
+`planner_human_suffix` and before the live block). Every code reply then
+ends with one ```` ```narrative ```` fence after its last code block,
+optionally followed by ```` ```caption:<n> ```` fences, one per visual. `n`
+is the 1-based position of the code block in the reply as split by
+`###NEXT_PLOT###`; every `python` / `plot_code` block counts, and
+`1 ≤ n ≤ 12`. The code sets the dict `VALUES` for every slot and `FINDINGS`
+for its checks; the client fills the template after execution, so no
+result value reaches the brain.
+
+How the brain takes the fences out of the reply:
+
+- **Every client.** The fences are cut out of every plan and retry reply,
+  with or without capabilities, before the SQL, language-tag and code
+  parsers run, so a template is normally never read as code or shown
+  raw, and is never logged outside the opt-in `LLM_DEBUG_LOG`.
+  Without `narrative_v1` nothing is returned, and the brain logs
+  `NARRATIVE_FENCE_STRIPPED_NO_CAP n=<count>`. A reply without such a
+  fence comes back unchanged.
+- **First wins.** The first `narrative` fence and the first `caption:<n>`
+  per index win; later ones are removed and dropped.
+- **Caps.** A narrative over 4000 characters or a caption over 600 is
+  dropped, not truncated. An empty one is dropped too.
+- **Malformed.** A fence whose info string starts with `narrative` or
+  `caption` (any case) but is not exactly `narrative` or `caption:<1–12>`
+  (for example `caption:0`, `caption:13`, `captions:1`, `narrative text`)
+  is removed and never returned.
+- **Cut-off reply.** An UNTERMINATED fence after the last complete fence,
+  on its own line (only spaces or tabs before it), whose info string starts
+  with `narrative` or `caption` is cut from there to the end of the reply,
+  as malformed. A prose mention of ```` ```narrative ```` inside a line is
+  left alone.
+- **When returned.** `narrative` / `captions` come back only with
+  `narrative_v1`, and only next to `PYTHON` / `PLOT_CODE`; next to `ANSWER` /
+  `CLARIFICATION` / `MISSING_DATA` / `NO_CODE` both are dropped. Caption
+  keys are strings (`"1"`), and `n` must not exceed the number of code
+  blocks in the reply (a single code block counts as one); a caption past
+  that is dropped. A field with nothing in it is absent.
+
+**Template language** (rendered by the client). The template is written
+in the answer language:
+
+- a slot is `{{name}}` or `{{name:kind}}`: `name` = letters, digits and
+  underscores, at most 40 characters; `kind` is `count`, `float`, `pct`
+  (the value is a fraction: 0.125 is shown as 12.5%), `ratio`, `amount`,
+  `text` or `period`. A slot no block sets is shown as `n/a`;
+- `{{#flag}}…{{/flag}}` is shown when FINDINGS has `flag` true, holds a
+  column name or code under `flag`, or `flag` is a code some FINDINGS value
+  equals; `{{^flag}}…{{/flag}}` is shown otherwise. One level only;
+- plain markdown only (bold, `- ` bullets, blank lines), never three
+  backticks. The model never writes a value itself: every number, name and
+  date is a slot.
+
+**`diagnostic: true`.** Set only when all of these hold:
+`two_phase_v1` and `diagnostics_v1` both survive cleaning, the classifier's
+`analysis.task_type` is `diagnostic` or `advisory`, the kind is `PYTHON` /
+`PLOT_CODE`, and the request carried no `findings` (none left after
+cleaning). It is never sent as `false`, and never on `/v1/retry`. No
+client sends `two_phase_v1` yet, so no plan carries the flag today. With
+it, the client may run exactly one more `/v1/plan`: the same question, the
+same history plus one `ai` row with the phase-1 code (code only, no
+values), and `findings`. That second plan never carries `diagnostic`, and
+there is no third.
+
+**Logs.** `BRAIN_PLAN` adds `caps` (the cleaned names, comma-joined;
+absent when none) and `findings_n` (the cleaned count). `BRAIN_PLAN_DONE`
+adds `narrative` (a boolean, only with `narrative_v1`), `captions_n` and
+`diagnostic`. `NARRATIVE_EXTRACT` and `NARRATIVE` carry lengths and counts
+(duplicates, too long, empty, malformed, out of range, dropped kind).
+Outside the opt-in `LLM_DEBUG_LOG`, no log line carries template text or a
+findings value.
 
 ---
 
@@ -251,7 +410,8 @@ code" prompt and calls the simple (or complex, on later attempts) model.
                                           //   | permission | guard | other
     "guard": false,                       //   true ⇒ the client's SQL gate refused the text
     "message": null                       //   the gate's own sentence when guard is true
-  }                                       //   (an identifier at most), otherwise null
+  },                                      //   (an identifier at most), otherwise null
+  "capabilities": ["narrative_v1"]        // OPTIONAL — same list and cleaning as /v1/plan
 }
 ```
 
@@ -294,6 +454,20 @@ For a `guard` refusal that sentence still reaches the log inside
 `error_msg`, which the brain has always logged truncated; it names at most
 an identifier.
 
+**Narrative.** With `narrative_v1`, the retry system instruction gains
+`retry_narrative_system`, after the live retry block: keep every `VALUES`
+and `FINDINGS` key the failed code sets, with the same meaning; end the
+reply with a new ```` ```narrative ```` block only when the corrected code
+changes what those values mean, optionally with ```` ```caption:<n> ````
+blocks numbered within this reply. The fences are cut out exactly as on
+`/v1/plan`, for every client, before the SQL map, the code parsers and the
+`RETRY_CODE_RAW` log line. The response may carry `narrative` / `captions`
+under the same rules, never `diagnostic`. On the client, a single-block
+answer's retry `narrative` replaces the plan's (absent ⇒ the plan's is
+kept); in a multi-block answer a per-block retry's `narrative` is ignored
+and its `caption:1` replaces that block's caption. `BRAIN_RETRY` logs
+`caps`; `BRAIN_RETRY_DONE` logs `narrative` and `captions_n`.
+
 ### Response
 
 ```jsonc
@@ -303,8 +477,10 @@ an identifier.
   "code": "df.groupby('department')['salary'].mean()",
   "usage": { ... },
   "model_used": "gemini-2.5-pro",
-  "sql": { ... }                          // OPTIONAL — a new SELECT per live df key, same
+  "sql": { ... },                         // OPTIONAL — a new SELECT per live df key, same
                                           //   rules as /v1/plan; a key it names is re-fetched
+  "narrative": "...",                     // OPTIONAL — narrative_v1 only; same rules as /v1/plan
+  "captions": { "1": "..." }              // OPTIONAL — never "diagnostic" on a retry
 }
 ```
 
@@ -341,7 +517,11 @@ from **the code only**, never the result. No data values ever sent.
     "kind": "constant_metric",
     "facts": ["Quantity is the same for every group in the chart (= 1)"],
     "grain": ["cl prod link: one row per (client_id, product_id)"],
-    "catalog": true                      // catalog/link grain, not measured quantities
+    "catalog": true,                     // catalog/link grain, not measured quantities
+    "findings": {                        // OPTIONAL — accepted with or without `kind`
+      "units": "mixed_units",
+      "coverage_dim": "CURRENCY"
+    }
   }
 }
 ```
@@ -355,6 +535,20 @@ the literal marker `[[DATA_NOTE]]`. The client strips that marker before
 display and, if it is absent (or the call failed), prepends its own localized
 sentence — so the explanation reaches the user even when the model omits it.
 Unknown/malformed caveats are ignored, never fatal.
+
+**Findings.** `data_caveat.findings` carries the FINDINGS the executed
+code set, in the `/v1/plan` `findings` shape, cleaned the same way (a bad
+entry is dropped; describe never answers 400 for it). It is accepted with
+or without `kind`: the MANDATORY DATA NOTE block still needs a known
+`kind`, the findings do not. Non-empty cleaned findings add a separate
+block after the data note, `DIAGNOSTIC FINDINGS (names and codes only — no
+values):`, with sorted `- key: value` lines. It lets the model say in one
+short clause what a code means for reading the chart, and forbids any
+number, name or category value. It is not subject to `[[DATA_NOTE]]`.
+Absent, empty or fully dropped findings ⇒ a byte-identical describe
+prompt. The brain logs `DESCRIBE_FINDINGS_APPLIED n=<count>`. The client
+sends findings only when describe runs: an answer without a template, or
+a visual whose caption is missing.
 
 ### Response
 
@@ -400,7 +594,7 @@ characters (+ `…[truncated]`), an object at its first 20 keys plus
   "question": "what is the highest salary?",
   "schema_text": "...",
   "history_rows": [ ... ],
-  "preview": 162000,                      // scalar or flat object of scalars; capped (500 chars / 20 keys)
+  "preview": 162000,                      // scalar or flat object of scalars; capped (500 chars / 20 keys); or null
   "context_decision": { "complexity": "simple", ... },
   "user_email": "..."
 }
@@ -411,6 +605,19 @@ characters (+ `…[truncated]`), an object at its first 20 keys plus
 ```jsonc
 { "text": "The highest salary in the dataset is **$162,000**.", "usage": { ... } }
 ```
+
+**Null preview.** When `preview` is `null` or absent (or cannot be
+serialized), the prompt has no preview section; instead a READING GUIDE
+block follows the question. It says that no result value is available,
+forbids stating, estimating or guessing any number, total, percentage,
+name or category, and asks for 1–2 sentences on what the result shows and
+how to read it; the client displays the value. The brain logs
+`SUMMARIZE_READING_GUIDE`. A non-null preview gets a byte-identical
+prompt. **Behaviour change (2026-10-23):** this applies to every client,
+so an older client's null preview (for example a value its guard turned
+into `null`) now gets the reading guide too. A client from its narrative
+release never calls summarize for a templated answer, and always sends
+`"preview": null` when it falls back to summarize.
 
 ---
 
@@ -666,7 +873,9 @@ human message in a conversation (matches global's UX). Uses the Light model.
 ```
 
 `answer` carries at most the first 300 characters of the answer text (cut by
-`brain_client.title`).
+`brain_client.title`). For a templated answer, a client from its narrative
+release sends a slot-free view of the template (each slot replaced by
+`[slot name]`), never the text it rendered.
 
 Returns `{ "title": "Compensation Overview" }` (2-3 words, language-aware).
 
@@ -894,7 +1103,10 @@ Mirror of `chat.py._generate_report_structure`. The client first runs the
 same `_build_qa_pairs` logic locally (the B2C `_build_report_data`
 helper), then sends only the no-values findings payload. The brain
 returns the narrative JSON; the client renders the PPTX into its own
-template locally.
+template locally. For a templated answer, a client from its narrative
+release sends a slot-free view of the narrative or caption template as
+`answer_text` (each slot replaced by `[slot name]`), never the text it
+rendered.
 
 ### Request
 
@@ -947,125 +1159,3 @@ template locally.
 
 The client implements all of these in `brain_client.py` as
 `BrainError` / `TenantRevokedError`.
-
----
-
-## DRAFT — narrative templates & diagnostics (not yet implemented)
-
-> **NOT YET IMPLEMENTED.** This section describes planned wire changes only. Nothing below is served or sent today.
-> - Design: `docs/DIAGNOSTICS_SPEC.md` in the PDC_Client repository.
-> - When implemented, these fields move into the normal endpoint sections and this banner is removed.
-
-What changes:
-- **Templates.** The brain writes answer text as a template with value slots. The client fills the slots locally after execution, so no result value ever reaches the brain.
-- **Second pass.** A diagnostic question may get one second code pass, planned from value-free FINDINGS only.
-- **Opt-in.** Both behaviours are opt-in per request through `capabilities`. A request without it gets byte-identical prompts and responses.
-
-### Field-shape mapping (additions)
-
-| Brain field | Same field in B2C | Built by |
-|---|---|---|
-| `capabilities` (plan/retry, **optional**) | none (enterprise-only) | client (`brain_client.plan/retry`, from the `BRAIN_CAPABILITIES` setting); known values `narrative_v1`, `diagnostics_v1` (honoured only together with `narrative_v1`), `two_phase_v1` (honoured only together with `diagnostics_v1`; sent only once the two-phase flow ships); unknown values are ignored |
-| `narrative` / `captions` (plan/retry response, **optional**) | none | brain (the planner's `` ```narrative `` / `` ```caption:<n> `` fences) |
-| `diagnostic` (plan response, **optional**) | none | brain (classifier task_type `diagnostic` / `advisory`) |
-| `findings` (plan request, **optional**; also `data_caveat.findings` on describe) | none | client (`narrative.validate_findings`): ≤ 24 keys matching `^[a-z][a-z0-9_]{0,39}$`, each written literally in the executed code or a fixed key of the client's diagnostic library. Each value is a boolean, an exact column name of the input data (a registered column, never a column the code created), or one fixed code (`coverage_change`, `coverage_stable`, `partial_period`, `metric_definition_overlap`, `mixed_units`, `concentrated_in_one_dim`, `spread_evenly`, `weak_signal`, `dominant_feature`, `anomaly_confirmed`, `no_anomaly`, `data_gap`, `outlier_driven`, `seasonal_pattern`); the key `needs_phase2` is reserved for a boolean |
-
-### `POST /v1/plan` — additions
-
-```jsonc
-// request
-{
-  "sid": "8af3d2e1",
-  "question": "why did granted loans jump in the last month?",
-  "...": "existing fields unchanged",
-  "capabilities": ["narrative_v1", "diagnostics_v1"],   // OPTIONAL — absent ⇒ today's prompt and response
-  "findings": {                                          // OPTIONAL — phase 2 only (the second and last pass)
-    "anomaly": "anomaly_confirmed",
-    "coverage_dim": "CURRENCY",
-    "needs_phase2": true
-  }
-}
-// response
-{
-  "raw_text": "```plot_code\n# answer_language: English\n...\n```",   // narrative/caption fences REMOVED
-  "kind": "PLOT_CODE",
-  "code": "...",
-  "usage": { },
-  "context_decision": { "analysis": { "task_type": "diagnostic" }, "...": "..." },
-  "model_used": "...",
-  "narrative": "{{total_loans:count}} loans were granted in {{latest_period:period}}. The bars show the count per month.",
-  "captions": { "1": "Count per month; {{anomaly_period:period}} is highlighted." },   // keys are strings "1".."12"
-  "diagnostic": true                                     // OPTIONAL — only on a phase-1 plan (no `findings`)
-}
-```
-
-**Fences.**
-- **Placement.** With `narrative_v1`, the planner ends every code reply with one `` ```narrative `` fence and optional `` ```caption:<n> `` fences, after the last code block. `n` is the 1-based position of the code block in the reply as split by `###NEXT_PLOT###` (every `python` / `plot_code` block counts), `1 ≤ n ≤ 12`.
-- **Stripping.** The brain removes these fences from **every** plan and retry reply, capability or not, before the SQL, language-tag and code parsers run. Any fence whose info string starts with `narrative` or `caption` is also removed.
-- **Duplicates and caps.** The first fence of each name wins. A template over 4000 characters or a caption over 600 is dropped, not truncated.
-- **When returned.** `narrative` / `captions` come back only with `narrative_v1`, and only next to `PYTHON` / `PLOT_CODE`. A caption index beyond the reply's block count is dropped, and next to `ANSWER` / `CLARIFICATION` / `MISSING_DATA` / `NO_CODE` both fields are dropped.
-- **Logging.** The brain logs counts and lengths only, never the template text.
-
-**Template language** (rendered by the client):
-- slots `{{name}}` / `{{name:kind}}` with `kind ∈ count | float | pct (value is a fraction) | ratio | amount | text | period`;
-- sections `{{#flag}}…{{/flag}}` / `{{^flag}}…{{/flag}}` over FINDINGS, one level only;
-- markdown only.
-
-**`diagnostic: true`.**
-- **Condition.** Returned when all of these hold: `two_phase_v1` and `diagnostics_v1` are present, the classifier's task_type is `diagnostic` or `advisory`, the kind is `PYTHON` / `PLOT_CODE`, and the request carried no `findings`.
-- **Second pass.** The client may then run exactly one more `/v1/plan` with the same question, the same history plus one `ai` row carrying the phase-1 code (code only, no values), and `findings`. Without `two_phase_v1` a diagnostic answer is planned in one pass. The brain never sets `diagnostic` on that request, and the client never makes a third.
-
-**Classifier.** Only with `diagnostics_v1`: task_type gains `diagnostic` and `advisory`, and the skill `diagnostics` loads `skills/core/diagnostics.yaml`.
-
-**History.** A client that uses templates sends AI history rows whose `content` is `[Findings: key=value; …]` (the first line, when FINDINGS exist) followed by the template. Slots are never filled in history. Turns without a template keep today's describe/summarize text.
-
-### `POST /v1/retry` — additions
-
-```jsonc
-// request: existing fields + "capabilities": ["narrative_v1"]          // OPTIONAL
-// response: existing fields + OPTIONAL "narrative", "captions" (same rules as /v1/plan; never "diagnostic")
-```
-
-- **Prompt.** With `narrative_v1`, the retry prompt asks the model to keep every `VALUES` / `FINDINGS` key of `failed_code`.
-- **Single-block answer.** A retry reply's `narrative` replaces the plan's.
-- **Multi-block answer.** A per-block retry's `caption:1` replaces that block's caption, and its `narrative` is ignored.
-
-### `POST /v1/describe` — `data_caveat.findings`
-
-```jsonc
-{
-  "sid": "...", "question": "...", "code": "...",
-  "data_caveat": {                       // OPTIONAL; `kind` is still required for the DATA NOTE block; a caveat may now carry `findings` alone
-    "findings": { "units": "mixed_units", "coverage_dim": "CURRENCY" }
-  }
-}
-```
-
-- **When sent.** Only when describe runs: an answer without a template, or a visual whose caption is missing, and only if the executed code set FINDINGS.
-- **Rendering.** The brain renders a separate "DIAGNOSTIC FINDINGS (names and codes only — no values)" block. It is not subject to `[[DATA_NOTE]]`.
-- **Absent field.** A request without `data_caveat.findings` gets a byte-identical prompt.
-
-### `POST /v1/summarize` — null preview
-
-- **Client.** A client that uses templates never calls summarize for a templated answer. When it falls back to summarize, it always sends `"preview": null`.
-- **Brain.** Whenever no preview section is included (`preview` null, from any client), the brain adds a READING GUIDE block. It forbids stating or guessing any number, total, percentage, name or category, and asks for a description of what the result shows and how to read it. The client displays the value.
-- **Unchanged case.** A non-null preview gets a byte-identical prompt.
-- **Behaviour change:** older clients' null previews now get the reading guide too.
-
-### Value scrubs in existing fields (planned with this change)
-
-- **`dataset_profile`.** Every column loses `min`, `max` and `top_values`, not only `SCHEMA_VALUE_DENY_COLUMNS` columns, and constant-column warnings read `<col> is constant` without the value. The client's transport compaction applies this; stored profiles are not rewritten.
-- **`data_caveat.facts`.** Facts no longer carry the truncated constant-value hint.
-- **`/v1/retry` `error_msg`.** Every quoted literal that is not an input column name or a df name is replaced with `'<value>'`. The client's `NearZeroChartError` text no longer contains numbers.
-- **`schema_text`.** Unchanged: category lists for text columns with ≤ 20 distinct values stay.
-
-### Data boundary (Article II)
-
-- **New crossings:**
-  - `capabilities` (a constant list);
-  - `findings` (booleans, input column names and fixed codes, at most 24 keys per pass);
-  - templates in history;
-  - a slot-free view of the templates on `/v1/title` / `/v1/report` (each slot replaced by `[slot name]`).
-- **Stays in the client:** result values (`VALUES`) and every text the client renders from a template.
-- **Summarize:** `preview` on `/v1/summarize` carries no value any more.
-- **Brain logs:** counts and lengths of templates and findings, never their text.

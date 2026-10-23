@@ -4,8 +4,8 @@
 > enterprise (on-prem) edition. Adapted from the original B2C constitution
 > for the brain/client split.
 
-**Version:** 1.8 (enterprise)
-**Last Updated:** 2026-10-04
+**Version:** 1.9 (enterprise)
+**Last Updated:** 2026-10-23
 
 ---
 
@@ -68,6 +68,23 @@ The split is the whole product. Violating it defeats the on-prem promise.
   — at most 50 titles, each at most 60 characters, so the generated chat name
   differs from them. Metadata of the same class as the question text; the
   brain logs only their count, never the titles.
+- `capabilities` on `/v1/plan` / `/v1/retry` — a constant list of the
+  feature names the client supports (`narrative_v1`, `diagnostics_v1`,
+  `two_phase_v1`). No data.
+- FINDINGS: `findings` on `/v1/plan` (the second pass of a two-phase
+  diagnostic) and `data_caveat.findings` on `/v1/describe`, at most 24
+  keys. FINDINGS are check outcomes derived from the data — booleans, fixed
+  codes and which input column — never a number, cell value, category value
+  or date. The brain checks only the shape (key pattern, key count, a
+  boolean or a short string per value); the guarantee that a string is an
+  input column name or a fixed code from the `PROTOCOL.md` list rests on
+  the client validator (`narrative.validate_findings`). The brain logs only
+  the count.
+- AI history rows of a templated turn, whose `content` is a
+  `[Findings: …]` marker line plus the unfilled template: the brain's own
+  text with slots, never a filled-in value.
+- `preview: null` on `/v1/summarize` — a client that uses templates sends
+  no preview value at all.
 
 ### What MUST NOT cross
 - DataFrame rows, cell values, or computed result tables.
@@ -78,6 +95,13 @@ The split is the whole product. Violating it defeats the on-prem promise.
   `run_live_select`): it can quote a literal from the statement or a cell
   value the database choked on. It stays local — never logged, never sent;
   only the class sentence reaches the user, the retry request and the log.
+- Result VALUES: the `VALUES` the generated code sets for template slots.
+  They stay in the sandbox, the client's renderer, the local record and
+  the browser.
+- Any text rendered from a template (a filled narrative or caption).
+  `/v1/title` and `/v1/report` get a slot-free view of the template
+  instead; its choice of sections reflects FINDINGS, the same information
+  as the marker.
 
 ### The guard
 The summarizer's `_safe_preview` helper (in
@@ -114,7 +138,11 @@ includes truncated unique-value hints for low-cardinality columns — generated
 code, error text); no raw rows or result tables ever reach the brain, so the
 debug log can expose at most what the protocol already sends the LLM. It is a
 diagnostic switch for validating LLM behavior, OFF by default, and must be
-turned back OFF once validation is done. Independently of the flag, the HTTP
+turned back OFF once validation is done. Its output may contain narrative
+and caption templates (brain-written text with slots, never values) and
+FINDINGS (the phase-2 block of the plan prompt, the describe findings
+block and the history marker lines); normal logs carry template lengths
+and findings counts only. Independently of the flag, the HTTP
 error body on any non-200 / exception is logged UNCONDITIONALLY (truncated to
 `LLM_ERROR_BODY_LOG_CHARS`, default 2000) — an API rejection must never be
 silently swallowed (Article IV).
