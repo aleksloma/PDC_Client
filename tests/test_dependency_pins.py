@@ -78,6 +78,7 @@ FIX_VERSIONS = {
     "pyarrow": "23.0.1",
     "python-dotenv": "1.2.2",
     "urllib3": "2.8.0",
+    "pillow": "13.0.0",
 }
 
 # Security-relevant transitives that fastapi / Authlib / matplotlib / the HTTP

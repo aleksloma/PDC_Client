@@ -52,7 +52,7 @@ pyarrow==25.0.1
 matplotlib==3.9.2
 # Compiled transitive of matplotlib / wordcloud / reportlab / python-pptx /
 # missingno; pinned explicitly so an image rebuild cannot float it.
-pillow==12.3.0
+pillow==13.0.0
 seaborn==0.13.2
 plotly==5.24.1
 kaleido==0.2.1
