@@ -64,7 +64,7 @@ RUN python -m pip uninstall -y pip \
 # Only the modules the runner imports — never `COPY . .`. No local_store, no
 # db_*, no brain_client, no routes, no templates: the sandbox container cannot
 # reach state or credentials it does not contain.
-COPY code_exec.py plot_utils.py exec_sanitizer.py sandbox_guard.py outlier_utils.py logger_utils.py settings.py exec_transport.py ./
+COPY code_exec.py plot_utils.py exec_sanitizer.py sandbox_guard.py outlier_utils.py logger_utils.py settings.py exec_transport.py pdc_diag.py ./
 COPY static/fonts/DejaVuSans.ttf static/fonts/
 COPY executor/__init__.py executor/app.py executor/runner.py executor/
 

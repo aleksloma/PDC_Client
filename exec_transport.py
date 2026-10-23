@@ -911,11 +911,150 @@ def _serialize_multi_charts(charts: Any, writer: _OutWriter, top_is_plotly: bool
 
 
 # ---------------------------------------------------------------------------
+# VALUES / FINDINGS — the two dicts generated code fills (DIAGNOSTICS_SPEC A3)
+# ---------------------------------------------------------------------------
+# One rule set for both directions: the sandbox ENCODES what the job left in
+# its namespace, the main app DECODES the response with the same rules because
+# the response is hostile. A rejected entry is DROPPED and COUNTED — never
+# logged, never raised on (its content may be a customer value).
+VALUE_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}\Z")
+FINDING_KEY_RE = re.compile(r"[a-z][a-z0-9_]{0,39}\Z")
+VALUES_MAX_KEYS = 40
+VALUES_STR_MAX = 200
+FINDINGS_PREFILTER_MAX_KEYS = 32
+FINDINGS_STR_MAX = 64
+# The widest drop count a response may report; anything else reads as 0.
+_DROPPED_MAX = 100_000
+_OUTPUT_KEYS = ("values", "values_dropped", "findings", "findings_dropped")
+_PLAIN_TYPES = (bool, int, float, str, type(None))
+
+
+def _plain_scalar(value: Any):
+    """`(ok, value)`: an EXACT builtin scalar as it is, a numpy scalar
+    replaced by its Python value, anything else refused. Never raises.
+
+    The sandbox capture runs AFTER the timed exec, so no method generated
+    code could have written may run here — an override can loop forever.
+    Only exact types are inspected (`type(...) is`, never `isinstance` on a
+    subclass whose `__len__` / `__str__` could be overridden), and a numpy
+    scalar is read through numpy's own `np.generic.item`, called once, so a
+    subclass overriding `item()` never has its override run. A plain object
+    with an `.item()` of its own is dropped without being called."""
+    try:
+        kind = type(value)
+        if kind in _PLAIN_TYPES:
+            return True, value
+        if isinstance(value, np.generic):
+            value = np.generic.item(value)
+            if type(value) in _PLAIN_TYPES:
+                return True, value
+        return False, None
+    except Exception:
+        return False, None
+
+
+def _accept_value(value: Any):
+    ok, value = _plain_scalar(value)
+    if not ok:
+        return False, None
+    if type(value) is str and len(value) > VALUES_STR_MAX:
+        return False, None
+    return True, value
+
+
+def _accept_finding(value: Any):
+    ok, value = _plain_scalar(value)
+    if not ok:
+        return False, None
+    if type(value) is bool:
+        return True, value
+    if (type(value) is str and 1 <= len(value) <= FINDINGS_STR_MAX
+            and not any(ord(ch) < 0x20 for ch in value)):
+        return True, value
+    return False, None
+
+
+def _filter_outputs(raw: Any, key_re, accept, max_keys: int) -> tuple:
+    """`(kept, dropped)` under one rule set. Never raises.
+
+    Only an EXACT `dict` is read, and through `dict.items` (the base-class
+    method): a subclass — whose `items()` / `__iter__` generated code may
+    have made endless — counts as one drop without any of its methods
+    running. Keys must be exact `str` for the same reason."""
+    if raw is None:
+        return {}, 0
+    if type(raw) is not dict:
+        return {}, 1
+    kept: dict = {}
+    dropped = 0
+    seen = 0
+    try:
+        for key, value in dict.items(raw):
+            seen += 1
+            if type(key) is not str or not key_re.match(key):
+                dropped += 1
+                continue
+            ok, plain = accept(value)
+            if not ok or len(kept) >= max_keys:
+                dropped += 1
+                continue
+            kept[key] = plain
+        return kept, dropped
+    except Exception:
+        return {}, seen
+
+
+def encode_values(raw: Any) -> tuple:
+    """The sandbox side of VALUES: `(kept, dropped)`. Never raises."""
+    return _filter_outputs(raw, VALUE_KEY_RE, _accept_value, VALUES_MAX_KEYS)
+
+
+def decode_values(raw: Any) -> tuple:
+    """The main-app side of VALUES (hostile input), the same rules."""
+    return _filter_outputs(raw, VALUE_KEY_RE, _accept_value, VALUES_MAX_KEYS)
+
+
+def encode_findings(raw: Any) -> tuple:
+    """The sandbox side of FINDINGS: `(kept, dropped)`. Shape only — the
+    semantic check is `narrative.validate_findings` in the main app."""
+    return _filter_outputs(raw, FINDING_KEY_RE, _accept_finding, FINDINGS_PREFILTER_MAX_KEYS)
+
+
+def decode_findings(raw: Any) -> tuple:
+    """The main-app side of FINDINGS (hostile input), the same rules."""
+    return _filter_outputs(raw, FINDING_KEY_RE, _accept_finding, FINDINGS_PREFILTER_MAX_KEYS)
+
+
+def capture_outputs(env: Any) -> dict:
+    """The four capture keys of one job's namespace. Never raises."""
+    try:
+        if not isinstance(env, dict):
+            env = {}
+        values, values_dropped = encode_values(dict.get(env, "VALUES"))
+        findings, findings_dropped = encode_findings(dict.get(env, "FINDINGS"))
+        return {"values": values, "values_dropped": values_dropped,
+                "findings": findings, "findings_dropped": findings_dropped}
+    except Exception:
+        return {"values": {}, "values_dropped": 0, "findings": {}, "findings_dropped": 0}
+
+
+def _known_dropped(value: Any) -> int:
+    """A drop count from the response: a non-negative int up to the cap,
+    else 0. A count cannot be negative, so a negative one reads as 0."""
+    number = known_number(value, _DROPPED_MAX)
+    if not isinstance(number, int) or number < 0:
+        return 0
+    return number
+
+
+# ---------------------------------------------------------------------------
 # deserialization — the input here is hostile
 # ---------------------------------------------------------------------------
-_PYTHON_KEYS = ("error", "result", "preview", "image_base64")
+_PYTHON_KEYS = ("error", "result", "preview", "image_base64",
+                "values", "values_dropped", "findings", "findings_dropped")
 _PLOT_KEYS = ("ok", "error", "trace", "multi_axes", "is_plotly", "image",
-              "plotly_html", "multi_charts", "chart_data", "result")
+              "plotly_html", "multi_charts", "chart_data", "result",
+              "values", "values_dropped", "findings", "findings_dropped")
 _CHART_KEYS = ("image", "is_plotly", "title", "chart_data")
 _MULTI_CHARTS_MAX = 32
 
@@ -994,7 +1133,7 @@ def _reconstruct(payload: dict, job_dir: Path, kind: str) -> dict:
     known = _PLOT_KEYS if kind == "PLOT" else _PYTHON_KEYS
     out: dict = {}
     for key, value in payload.items():
-        if key not in known:
+        if key not in known or key in _OUTPUT_KEYS:
             continue
         if key in ("error", "trace"):
             out[key] = _as_error_text(value, key)
@@ -1014,6 +1153,17 @@ def _reconstruct(payload: dict, job_dir: Path, kind: str) -> dict:
             out[key] = _decode_chart_data(value)
         elif key == "multi_charts":
             out[key] = _decode_multi_charts(value, job_dir)
+    # VALUES / FINDINGS never cause a violation: a hostile entry degrades to
+    # an empty dict and a drop count. An older sandbox image sends none of
+    # the four keys, and then none is added.
+    if "values" in payload or "values_dropped" in payload:
+        values, dropped = decode_values(payload.get("values"))
+        out["values"] = values
+        out["values_dropped"] = _known_dropped(payload.get("values_dropped")) + dropped
+    if "findings" in payload or "findings_dropped" in payload:
+        findings, dropped = decode_findings(payload.get("findings"))
+        out["findings"] = findings
+        out["findings_dropped"] = _known_dropped(payload.get("findings_dropped")) + dropped
     return out
 
 

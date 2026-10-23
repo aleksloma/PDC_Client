@@ -19,6 +19,9 @@ import matplotlib.patches as mpatches
 # Deterministic outlier helpers for the plot exec namespace (leaf module —
 # pandas-only, no import cycle)
 from outlier_utils import outlier_mask, drop_extreme_outliers
+# The sandbox diagnostics library (DIAGNOSTICS_SPEC B8) — a leaf module too
+# (stdlib + numpy + pandas at import time).
+import pdc_diag
 
 # Import visualization libraries
 try:
@@ -386,6 +389,10 @@ GLOBAL_PLOT_SCOPE = {
     # sites (`code_exec._execute_in_process` registers the same pair)
     "outlier_mask": outlier_mask,
     "drop_extreme_outliers": drop_extreme_outliers,
+    # Diagnostics library (DIAGNOSTICS_SPEC B8). VALUES / FINDINGS are NOT
+    # here: this dict is shared, `_render_in_process` gives every job its
+    # own fresh pair.
+    "pdc_diag": pdc_diag,
     # Machine Learning
     "train_test_split": train_test_split,
     "LogisticRegression": LogisticRegression,
@@ -1891,6 +1898,23 @@ def render_plot_safe(code: str, dfs: dict, sid_or_id: str, split_multi_axes: boo
                    split_multi_axes=split_multi_axes)
 
 
+def _with_outputs(out: dict, env: dict) -> dict:
+    """A success return of `_render_in_process` plus the job's VALUES /
+    FINDINGS (DIAGNOSTICS_SPEC A3.1). Never raises: a capture failure keeps
+    the chart and reports empty, zero-dropped outputs."""
+    try:
+        import exec_transport
+        outputs = exec_transport.capture_outputs(env)
+        merged = dict(out)
+        for key in ("values", "values_dropped", "findings", "findings_dropped"):
+            merged[key] = outputs[key]
+        return merged
+    except Exception:
+        fallback = dict(out)
+        fallback.update({"values": {}, "values_dropped": 0, "findings": {}, "findings_dropped": 0})
+        return fallback
+
+
 def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: bool = False):
     """Execute plotting code in a limited scope and return {ok, image|error}.
 
@@ -1914,6 +1938,9 @@ def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: b
     import re as _re
     logging.info(f"[PLOT_RENDER] Starting plot execution, go={go is not None}, px={px is not None}")
     env = dict(GLOBAL_PLOT_SCOPE)
+    # The two dicts generated code fills (DIAGNOSTICS_SPEC A3.1): fresh per job.
+    env["VALUES"] = {}
+    env["FINDINGS"] = {}
     # Article XIII gate: chart code must only ever see standard dtypes (same
     # per-exec-site install pattern as SANDBOX_BUILTINS below).
     from exec_sanitizer import sanitize_for_execution
@@ -1998,7 +2025,8 @@ def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: b
                 charts = [c for c in _split_plotly_grid(plotly_fig) if c.get("image")]
                 if charts:
                     logging.info(f"[PLOT_RENDER] PLOTLY_GRID_SPLIT charts={len(charts)} sid={sid_or_id}")
-                    return {"ok": True, "is_plotly": True, "multi_charts": charts}
+                    out = {"ok": True, "is_plotly": True, "multi_charts": charts}
+                    return _with_outputs(out, env)
                 # Could not split — fall through and render the grid as-is (better
                 # one combined chart than nothing).
             # Handle Plotly figure - return interactive HTML for 3D rotation support
@@ -2008,7 +2036,8 @@ def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: b
             # Capture the plotted data for the client-side "Show data" button.
             # Display-only; failures degrade to None and never block the chart.
             chart_data = _extract_plotly_chart_data(plotly_fig)
-            return {"ok": True, "plotly_html": html, "is_plotly": True, "chart_data": chart_data}
+            out = {"ok": True, "plotly_html": html, "is_plotly": True, "chart_data": chart_data}
+            return _with_outputs(out, env)
         else:
             # Empty-data guard: check if any axes have actual data before encoding
             fig = plt.gcf()
@@ -2037,7 +2066,10 @@ def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: b
                         return {
                             "ok": False,
                             "error": (
-                                f"NearZeroChartError: All bar values are near zero (max={max_abs:.4f}, range={data_range:.4f}). "
+                                # A fixed sentence (DIAGNOSTICS_SPEC B7.7): no
+                                # magnitude of the data reaches the retry prompt
+                                # or a log line through this text.
+                                "NearZeroChartError: All bar values are near zero. "
                                 "This likely indicates a data type error — numeric operations were applied to non-numeric or boolean data. "
                                 "Check column dtypes and recompute the metric correctly."
                             ),
@@ -2198,7 +2230,8 @@ def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: b
                         })
                     plt.close(fig)
                     logging.info(f"[PLOT_RENDER] MULTI_AXES_SPLIT charts={len(charts)} sid={sid_or_id}")
-                    return {"ok": True, "is_plotly": False, "multi_charts": charts}
+                    out = {"ok": True, "is_plotly": False, "multi_charts": charts}
+                    return _with_outputs(out, env)
 
             # Handle Matplotlib/Seaborn figure
             logging.info(f"[PLOT_RENDER] No Plotly figure found, trying matplotlib axes={len(axes)}, nonstandard_viz={_is_nonstandard_viz}")
@@ -2208,7 +2241,8 @@ def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: b
             chart_data = _extract_matplotlib_chart_data(fig, env, dfs)
             img = _encode_current_figure()
             logging.info(f"[PLOT_RENDER] Generated matplotlib image: {len(img)} chars")
-            return {"ok": True, "image": img, "is_plotly": False, "chart_data": chart_data}
+            out = {"ok": True, "image": img, "is_plotly": False, "chart_data": chart_data}
+            return _with_outputs(out, env)
             
     except Exception as e:
         tb = traceback.format_exc(limit=3)
