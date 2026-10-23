@@ -27,7 +27,7 @@ pandas==2.2.3
 numpy==1.26.4
 pyarrow==25.0.1
 matplotlib==3.9.2
-pillow==12.3.0
+pillow==13.0.0
 # Present ONLY because pandas implements `DataFrame.style` with jinja2: a
 # Styler RESULT is rendered to `styled_html` HERE, so without it
 # any generated `df.style...` is an ImportError instead of a formatted table.

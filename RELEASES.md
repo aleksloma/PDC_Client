@@ -8,6 +8,32 @@ against the existing data volume.
 
 ---
 
+## Unreleased (on `main`, not yet tagged)
+
+### pillow 12.3.0 → 13.0.0 — 2026-10-23
+
+**Why.** pip-audit (PyPI and OSV) reported 35 known vulnerabilities against
+`pillow==12.3.0` (34 CVE-2026 entries and `GHSA-78g4-xqwv-q3g8`), all fixed in
+13.0.0. They made the CI `images` check fail for every pull request. pillow is
+the matplotlib / reportlab / python-pptx imaging dependency in both images.
+
+**Change.**
+- `pillow==13.0.0` in `requirements.txt` and `executor/requirements.txt`.
+- The regression floor `FIX_VERSIONS["pillow"] = "13.0.0"` in
+  `tests/test_dependency_pins.py`.
+- Nothing else changed.
+
+**Gates (local, before the pull request).**
+
+| Gate | Result |
+|---|---|
+| Web suite, Python 3.11, Windows (`tests/test_export_plotly_png.py` excluded locally — kaleido does not start natively on this machine; CI runs it) | 4410 passed, 87 skipped, 0 failed |
+| Both images build | yes, each with `pillow==13.0.0` installed and no pip |
+| pip-audit 2.10.1, PyPI and OSV, each built image's installed set | no known vulnerabilities (web 102 packages, sandbox 52) |
+| Localhost smoke on the rebuilt stack (`docker-compose.local.yml`) | A matplotlib PNG was rendered in the sandbox and decoded by pillow in the web container. A Plotly chart was converted to PNG by kaleido. A PDF (both charts embedded) and a PPTX (two PNG media) were built by `routes/report.py`. Both containers report uid 10001 / 10002, and their logs show no tracebacks |
+
+---
+
 ## v1.0-security-r1 — 2026-09-28
 
 **Commit:** `2089883072548edd5c9ba069e46362ea4e3bbd8a` (annotated tag `v1.0-security-r1`)
