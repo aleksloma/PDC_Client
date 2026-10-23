@@ -22,17 +22,37 @@ Transport: **HTTPS**. Every `/v1/*` call requires
 lookup; revoked / suspended tenants get **HTTP 403** (the kill-switch).
 
 **Answer language** (`/v1/plan`, `/v1/describe`, `/v1/summarize`): the
-answer text is written in the language the question is written in. No
-request field carries it: the brain puts one answer-language instruction at
-the top of each prompt, and the model recognizes the question's language
-itself — by language, not alphabet (an Uzbek question in Latin or Cyrillic
-letters is answered in Uzbek). The tenant's `main_language` /
-`secondary_languages` (brain-side tenant config, admin panel) are given as
-the organization's likely languages; a question clearly written in another
-language is still answered in that language, and when the language cannot
-be recognized the answer is in `main_language`, else English. No extra model
-call. `/v1/chat_metadata` (`welcome_language`) and `/v1/title` (`lang`) are
-unchanged.
+answer text is written in the language the question is written in, whatever
+the tenant's languages and whatever language the welcome or earlier turns
+are in. The language is recognized ONCE per question, by the query
+classifier call `/v1/plan` already makes (no extra model call) — by
+language, not alphabet (an Uzbek question in Latin or Cyrillic letters is
+Uzbek). The tenant's `main_language` / `secondary_languages` (brain-side
+tenant config, admin panel) are given to that classifier only, as the
+organization's likely languages for a very short or ambiguous question;
+they never appear in a prompt that writes the answer. The recognized
+language travels to the later calls with no new request field (changed
+2026-10-04):
+
+- `/v1/plan` returns it as `context_decision.answer_language` (an English
+  language name such as `"English"`, `"Uzbek"`; `null` when it could not be
+  recognized) and writes `# answer_language: <Name>` as the first line of
+  every Python / plot code block it returns — exactly one such line per
+  block; a line copied from earlier code in the history is replaced by the
+  current question's language. Text replies (ANSWER / CLARIFICATION /
+  MISSING_DATA) carry no such line; the plan prompt itself names the
+  language.
+- `/v1/describe` reads the language from that comment line in `code`.
+- `/v1/summarize` reads it from `context_decision.answer_language` (the
+  client passes the plan's `context_decision` back verbatim).
+- `/v1/retry` keeps the language of `failed_code` on the corrected code.
+
+When no language is carried (older client flow, classifier failure, a
+question with no words) the prompt asks the model to answer in the
+question's language, and when that cannot be determined in `main_language`,
+else English. Chart text (titles, axis labels, legends) stays English, as
+before. `/v1/chat_metadata` (`welcome_language`) and `/v1/title` (`lang`)
+are unchanged.
 
 ---
 
@@ -159,7 +179,7 @@ clause.
   "kind": "PYTHON",                       // PYTHON | PLOT_CODE | NO_CODE | CLARIFICATION | ANSWER | MISSING_DATA
   "code": "result = df.groupby('department')['salary'].mean()",
   "usage": { "input_tokens": 1234, "output_tokens": 56, "total_tokens": 1290 },
-  "context_decision": { "complexity": "simple", "complexity_score": 5, "skills_needed": ["analytics_libraries"], "is_greeting": false, ... },
+  "context_decision": { "complexity": "simple", "complexity_score": 5, "skills_needed": ["analytics_libraries"], "is_greeting": false, "answer_language": "English", ... },
   "model_used": "gemini-2.5-pro",
   "sql": {                                // OPTIONAL — one read-only SELECT per live df key the
     "transactions": "SELECT region, SUM(amount) AS total FROM public.transactions GROUP BY region"
@@ -927,3 +947,125 @@ template locally.
 
 The client implements all of these in `brain_client.py` as
 `BrainError` / `TenantRevokedError`.
+
+---
+
+## DRAFT — narrative templates & diagnostics (not yet implemented)
+
+> **NOT YET IMPLEMENTED.** This section describes planned wire changes only. Nothing below is served or sent today.
+> - Design: `docs/DIAGNOSTICS_SPEC.md` in the PDC_Client repository.
+> - When implemented, these fields move into the normal endpoint sections and this banner is removed.
+
+What changes:
+- **Templates.** The brain writes answer text as a template with value slots. The client fills the slots locally after execution, so no result value ever reaches the brain.
+- **Second pass.** A diagnostic question may get one second code pass, planned from value-free FINDINGS only.
+- **Opt-in.** Both behaviours are opt-in per request through `capabilities`. A request without it gets byte-identical prompts and responses.
+
+### Field-shape mapping (additions)
+
+| Brain field | Same field in B2C | Built by |
+|---|---|---|
+| `capabilities` (plan/retry, **optional**) | none (enterprise-only) | client (`brain_client.plan/retry`, from the `BRAIN_CAPABILITIES` setting); known values `narrative_v1`, `diagnostics_v1` (honoured only together with `narrative_v1`), `two_phase_v1` (honoured only together with `diagnostics_v1`; sent only once the two-phase flow ships); unknown values are ignored |
+| `narrative` / `captions` (plan/retry response, **optional**) | none | brain (the planner's `` ```narrative `` / `` ```caption:<n> `` fences) |
+| `diagnostic` (plan response, **optional**) | none | brain (classifier task_type `diagnostic` / `advisory`) |
+| `findings` (plan request, **optional**; also `data_caveat.findings` on describe) | none | client (`narrative.validate_findings`): ≤ 24 keys matching `^[a-z][a-z0-9_]{0,39}$`, each written literally in the executed code or a fixed key of the client's diagnostic library. Each value is a boolean, an exact column name of the input data (a registered column, never a column the code created), or one fixed code (`coverage_change`, `coverage_stable`, `partial_period`, `metric_definition_overlap`, `mixed_units`, `concentrated_in_one_dim`, `spread_evenly`, `weak_signal`, `dominant_feature`, `anomaly_confirmed`, `no_anomaly`, `data_gap`, `outlier_driven`, `seasonal_pattern`); the key `needs_phase2` is reserved for a boolean |
+
+### `POST /v1/plan` — additions
+
+```jsonc
+// request
+{
+  "sid": "8af3d2e1",
+  "question": "why did granted loans jump in the last month?",
+  "...": "existing fields unchanged",
+  "capabilities": ["narrative_v1", "diagnostics_v1"],   // OPTIONAL — absent ⇒ today's prompt and response
+  "findings": {                                          // OPTIONAL — phase 2 only (the second and last pass)
+    "anomaly": "anomaly_confirmed",
+    "coverage_dim": "CURRENCY",
+    "needs_phase2": true
+  }
+}
+// response
+{
+  "raw_text": "```plot_code\n# answer_language: English\n...\n```",   // narrative/caption fences REMOVED
+  "kind": "PLOT_CODE",
+  "code": "...",
+  "usage": { },
+  "context_decision": { "analysis": { "task_type": "diagnostic" }, "...": "..." },
+  "model_used": "...",
+  "narrative": "{{total_loans:count}} loans were granted in {{latest_period:period}}. The bars show the count per month.",
+  "captions": { "1": "Count per month; {{anomaly_period:period}} is highlighted." },   // keys are strings "1".."12"
+  "diagnostic": true                                     // OPTIONAL — only on a phase-1 plan (no `findings`)
+}
+```
+
+**Fences.**
+- **Placement.** With `narrative_v1`, the planner ends every code reply with one `` ```narrative `` fence and optional `` ```caption:<n> `` fences, after the last code block. `n` is the 1-based position of the code block in the reply as split by `###NEXT_PLOT###` (every `python` / `plot_code` block counts), `1 ≤ n ≤ 12`.
+- **Stripping.** The brain removes these fences from **every** plan and retry reply, capability or not, before the SQL, language-tag and code parsers run. Any fence whose info string starts with `narrative` or `caption` is also removed.
+- **Duplicates and caps.** The first fence of each name wins. A template over 4000 characters or a caption over 600 is dropped, not truncated.
+- **When returned.** `narrative` / `captions` come back only with `narrative_v1`, and only next to `PYTHON` / `PLOT_CODE`. A caption index beyond the reply's block count is dropped, and next to `ANSWER` / `CLARIFICATION` / `MISSING_DATA` / `NO_CODE` both fields are dropped.
+- **Logging.** The brain logs counts and lengths only, never the template text.
+
+**Template language** (rendered by the client):
+- slots `{{name}}` / `{{name:kind}}` with `kind ∈ count | float | pct (value is a fraction) | ratio | amount | text | period`;
+- sections `{{#flag}}…{{/flag}}` / `{{^flag}}…{{/flag}}` over FINDINGS, one level only;
+- markdown only.
+
+**`diagnostic: true`.**
+- **Condition.** Returned when all of these hold: `two_phase_v1` and `diagnostics_v1` are present, the classifier's task_type is `diagnostic` or `advisory`, the kind is `PYTHON` / `PLOT_CODE`, and the request carried no `findings`.
+- **Second pass.** The client may then run exactly one more `/v1/plan` with the same question, the same history plus one `ai` row carrying the phase-1 code (code only, no values), and `findings`. Without `two_phase_v1` a diagnostic answer is planned in one pass. The brain never sets `diagnostic` on that request, and the client never makes a third.
+
+**Classifier.** Only with `diagnostics_v1`: task_type gains `diagnostic` and `advisory`, and the skill `diagnostics` loads `skills/core/diagnostics.yaml`.
+
+**History.** A client that uses templates sends AI history rows whose `content` is `[Findings: key=value; …]` (the first line, when FINDINGS exist) followed by the template. Slots are never filled in history. Turns without a template keep today's describe/summarize text.
+
+### `POST /v1/retry` — additions
+
+```jsonc
+// request: existing fields + "capabilities": ["narrative_v1"]          // OPTIONAL
+// response: existing fields + OPTIONAL "narrative", "captions" (same rules as /v1/plan; never "diagnostic")
+```
+
+- **Prompt.** With `narrative_v1`, the retry prompt asks the model to keep every `VALUES` / `FINDINGS` key of `failed_code`.
+- **Single-block answer.** A retry reply's `narrative` replaces the plan's.
+- **Multi-block answer.** A per-block retry's `caption:1` replaces that block's caption, and its `narrative` is ignored.
+
+### `POST /v1/describe` — `data_caveat.findings`
+
+```jsonc
+{
+  "sid": "...", "question": "...", "code": "...",
+  "data_caveat": {                       // OPTIONAL; `kind` is still required for the DATA NOTE block; a caveat may now carry `findings` alone
+    "findings": { "units": "mixed_units", "coverage_dim": "CURRENCY" }
+  }
+}
+```
+
+- **When sent.** Only when describe runs: an answer without a template, or a visual whose caption is missing, and only if the executed code set FINDINGS.
+- **Rendering.** The brain renders a separate "DIAGNOSTIC FINDINGS (names and codes only — no values)" block. It is not subject to `[[DATA_NOTE]]`.
+- **Absent field.** A request without `data_caveat.findings` gets a byte-identical prompt.
+
+### `POST /v1/summarize` — null preview
+
+- **Client.** A client that uses templates never calls summarize for a templated answer. When it falls back to summarize, it always sends `"preview": null`.
+- **Brain.** Whenever no preview section is included (`preview` null, from any client), the brain adds a READING GUIDE block. It forbids stating or guessing any number, total, percentage, name or category, and asks for a description of what the result shows and how to read it. The client displays the value.
+- **Unchanged case.** A non-null preview gets a byte-identical prompt.
+- **Behaviour change:** older clients' null previews now get the reading guide too.
+
+### Value scrubs in existing fields (planned with this change)
+
+- **`dataset_profile`.** Every column loses `min`, `max` and `top_values`, not only `SCHEMA_VALUE_DENY_COLUMNS` columns, and constant-column warnings read `<col> is constant` without the value. The client's transport compaction applies this; stored profiles are not rewritten.
+- **`data_caveat.facts`.** Facts no longer carry the truncated constant-value hint.
+- **`/v1/retry` `error_msg`.** Every quoted literal that is not an input column name or a df name is replaced with `'<value>'`. The client's `NearZeroChartError` text no longer contains numbers.
+- **`schema_text`.** Unchanged: category lists for text columns with ≤ 20 distinct values stay.
+
+### Data boundary (Article II)
+
+- **New crossings:**
+  - `capabilities` (a constant list);
+  - `findings` (booleans, input column names and fixed codes, at most 24 keys per pass);
+  - templates in history;
+  - a slot-free view of the templates on `/v1/title` / `/v1/report` (each slot replaced by `[slot name]`).
+- **Stays in the client:** result values (`VALUES`) and every text the client renders from a template.
+- **Summarize:** `preview` on `/v1/summarize` carries no value any more.
+- **Brain logs:** counts and lengths of templates and findings, never their text.
