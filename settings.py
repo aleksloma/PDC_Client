@@ -131,6 +131,12 @@ class Settings(BaseModel):
     # case-insensitive): schema text, technical descriptions, dataset
     # profiles and schema autofill send the column's name and dtype only.
     SCHEMA_VALUE_DENY_COLUMNS: str = Field(default_factory=lambda: os.getenv("SCHEMA_VALUE_DENY_COLUMNS", ""))
+    # The narrative/diagnostics capabilities `run_chat_multi_plot` announces
+    # on /v1/plan and /v1/retry (comma-separated). Parsed at call time by
+    # `brain_capabilities()`: only "narrative_v1" and "diagnostics_v1" are
+    # recognised ("two_phase_v1" is dropped in this release); an empty value
+    # is the kill switch (no capabilities key on the payload at all).
+    BRAIN_CAPABILITIES: str = Field(default_factory=lambda: os.getenv("BRAIN_CAPABILITIES", "narrative_v1,diagnostics_v1"))
     # Sharing: the recipient domains a chat / dashboard / conversation share
     # may reach (comma-separated, e.g. "bank.ge,partner.ge"). Empty = the
     # domains of the existing administrator accounts, or, when none has an
@@ -344,6 +350,32 @@ def schema_value_deny_columns() -> frozenset:
         return frozenset(p.strip().lower() for p in raw.split(",") if p.strip())
     except Exception:
         return frozenset()
+
+
+# The capabilities this client release can honour, in announcement order.
+# "two_phase_v1" is deliberately absent: it is dropped even when configured.
+_KNOWN_CAPABILITIES = ("narrative_v1", "diagnostics_v1")
+
+
+def brain_capabilities() -> list[str]:
+    """BRAIN_CAPABILITIES as the list `run_chat_multi_plot` sends, read at call
+    time: split on ",", stripped, de-duplicated in order, only the known names
+    kept; "diagnostics_v1" only together with "narrative_v1" (the diagnostics
+    playbook writes into the narrative). None / "" / junk -> []. Never raises."""
+    try:
+        raw = settings.BRAIN_CAPABILITIES
+        if not raw:
+            return []
+        seen: list[str] = []
+        for part in str(raw).split(","):
+            name = part.strip()
+            if name in _KNOWN_CAPABILITIES and name not in seen:
+                seen.append(name)
+        if "narrative_v1" not in seen:
+            return []
+        return seen
+    except Exception:
+        return []
 
 
 def value_denied(column) -> bool:

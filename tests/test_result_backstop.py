@@ -34,7 +34,10 @@ def test_constant_single_series_fires():
                  {"city": "Kutaisi", "Quantity": 1}])
     det = inspect_chart(cd)
     assert det["kind"] == "constant_metric"
-    assert "Quantity" in det["facts"][0] and "= 1" in det["facts"][0]
+    # B7.6 (decision F1): a fact names the column and the finding, never the
+    # value — the facts travel to /v1/describe as `data_caveat`.
+    assert "Quantity" in det["facts"][0]
+    assert "= 1" not in det["facts"][0] and "(=" not in det["facts"][0]
 
 
 def test_varying_series_does_not_fire():

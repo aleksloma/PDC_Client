@@ -145,3 +145,83 @@ def test_without_total_rows_nothing_changes():
     prof = dp.compute_profile(df)
     assert prof["rows"] == 5
     assert prof["sampled"] is False
+
+
+# ---------------------------------------------------------------------------
+# Narrative session 1 (DIAGNOSTICS_SPEC / plan C3, prompt item 7): the
+# "stock, not a flow" warning — two numeric columns equal in more than 90% of
+# the rows. Names and an integer percent only; never a value.
+# ---------------------------------------------------------------------------
+
+def _stock_flow_frame(n_equal: int, n: int = 100) -> pd.DataFrame:
+    base = np.arange(1, n + 1, dtype=np.int64) * 3
+    other = base.copy()
+    other[n_equal:] = other[n_equal:] + 1000          # the rows that differ
+    return pd.DataFrame({"GRANTED_LOAN_COUNT": base, "LOAN_COUNT": other,
+                         "label": [f"l{i}" for i in range(n)]})
+
+
+def test_stock_not_flow_warning():
+    prof = dp.compute_profile(_stock_flow_frame(94))
+    expected = "GRANTED_LOAN_COUNT equals LOAN_COUNT in 94% of rows: likely a stock, not a flow"
+    assert expected in prof["warnings"]
+    equal_warnings = [w for w in prof["warnings"] if "equals" in w]
+    assert equal_warnings == [expected]
+    # names + the integer percent only: no cell value of either column leaks
+    blob = json.dumps(equal_warnings)
+    for v in (3, 300, 1300):
+        assert f" {v} " not in blob and f"= {v}" not in blob
+
+
+def test_stock_not_flow_requires_more_than_90_percent():
+    assert not any("equals" in w for w in dp.compute_profile(_stock_flow_frame(90))["warnings"])
+    assert any("equals" in w for w in dp.compute_profile(_stock_flow_frame(91))["warnings"])
+
+
+def test_stock_not_flow_skips_constant_and_non_numeric_columns():
+    df = pd.DataFrame({"a": [7] * 20, "b": [7] * 20,                 # constant pair: skipped
+                       "s": [str(i) for i in range(20)],
+                       "t": [str(i) for i in range(20)]})            # text pair: never compared
+    assert not any("equals" in w for w in dp.compute_profile(df)["warnings"])
+
+
+def test_profile_without_equal_columns_byte_identical():
+    """A frame with no near-equal numeric pair yields the SAME profile as
+    before the pair scan existed (the expectation below was captured from the
+    pre-change `compute_profile`; `computed_at` is the only volatile key)."""
+    df = pd.DataFrame({"a": [1, 2, 3, 4], "b": [10, 20, 30, 40],
+                       "name": ["x", "y", "z", "w"]})
+    prof = local_store._json_safe(dp.compute_profile(df))
+    assert isinstance(prof.pop("computed_at"), str)
+    expected = json.loads(
+        '{"columns": {"a": {"all_unique": true, "constant": false, "dtype": "int64", '
+        '"max": 4, "min": 1, "null_count": 0, "null_pct": 0.0, "nunique": 4, '
+        '"top_values": [["1", 1], ["2", 1], ["3", 1], ["4", 1]]}, '
+        '"b": {"all_unique": true, "constant": false, "dtype": "int64", "max": 40, '
+        '"min": 10, "null_count": 0, "null_pct": 0.0, "nunique": 4, '
+        '"top_values": [["10", 1], ["20", 1], ["30", 1], ["40", 1]]}, '
+        '"name": {"all_unique": true, "constant": false, "dtype": "object", '
+        '"null_count": 0, "null_pct": 0.0, "nunique": 4, '
+        '"top_values": [["x", 1], ["y", 1], ["z", 1], ["w", 1]]}}, '
+        '"duplicate_row_count": 0, '
+        '"grain": {"columns": ["a"], "kind": "single", "text": "one row per (a)"}, '
+        '"profile_version": 1, "rows": 4, "sampled": false, "warnings": []}')
+    assert json.dumps(prof, sort_keys=True) == json.dumps(expected, sort_keys=True)
+
+
+def test_stock_not_flow_one_warning_per_equality_group():
+    # Review finding: k equal columns gave k(k-1)/2 warnings; one per group.
+    base = np.arange(1, 101, dtype=np.int64) % 17
+    df = pd.DataFrame({"A": base, "B": base.copy(), "C": base.copy(),
+                       "D": (base * 7 + 3) % 11})
+    eq = [w for w in dp.compute_profile(df)["warnings"] if "equals" in w]
+    assert eq == ["A equals B in 100% of rows: likely a stock, not a flow"]
+
+
+def test_stock_not_flow_skips_identical_unique_id_columns():
+    # Review finding: two row-number / id columns (every value unique, equal
+    # in every row) are not a stock-vs-flow pair.
+    n = 50
+    df = pd.DataFrame({"ROW_NO": np.arange(1, n + 1), "ID": np.arange(1, n + 1),
+                       "amount": np.arange(n) % 7})
+    assert not any("equals" in w for w in dp.compute_profile(df)["warnings"])

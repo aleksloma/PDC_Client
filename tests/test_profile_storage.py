@@ -187,6 +187,18 @@ def test_retry_payload_carries_profile(monkeypatch):
 
 
 def test_size_guard_drops_top_values_then_columns(monkeypatch):
+    # B7.6 (decision F1): top_values never reach the transport, so the size
+    # guard's "drop top_values first" step is a no-op; the columns-drop step
+    # is what the guard still does. Under an unlimited cap the top_values are
+    # already absent.
+    monkeypatch.setattr(brain_client, "_PROFILE_TRANSPORT_MAX_CHARS", 10_000_000)
+    big_cols0 = {f"c{i}": {"dtype": "object", "nunique": 3,
+                           "top_values": [["v" * 30, 5]]} for i in range(10)}
+    out0 = brain_client._compact_profiles_for_transport(
+        {"t": {"profile_version": 1, "rows": 9, "warnings": ["w"], "columns": big_cols0}})
+    assert "columns" in out0["t"]
+    assert all("top_values" not in c for c in out0["t"]["columns"].values())
+
     monkeypatch.setattr(brain_client, "_PROFILE_TRANSPORT_MAX_CHARS", 200)
     big_cols = {f"c{i}": {"dtype": "object", "nunique": 3,
                           "top_values": [["v" * 30, 5]]} for i in range(10)}

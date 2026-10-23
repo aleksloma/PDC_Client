@@ -164,10 +164,14 @@ def test_a_stored_profile_is_filtered_in_transport(monkeypatch):
     out = brain_client._compact_profiles_for_transport(stored)["t"]
     blob = json.dumps(out)
     assert "Nino Beridze" not in blob and "GE00XX" not in blob
-    assert out["columns"]["region"]["top_values"] == [["East", 25], ["West", 25]]
+    # B7.6 (decision F1): the transport drops top_values/min/max from EVERY
+    # column, not only from a denied one (the stored sidecar keeps them).
+    assert "top_values" not in out["columns"]["region"]
+    assert "East" not in blob and "West" not in blob
     assert out["columns"]["iban"] == {"dtype": "object", "nunique": 1, "constant": True}
     assert "iban is constant" in out["warnings"]
-    assert "status is constant: every value = open" in out["warnings"]
+    assert "status is constant" in out["warnings"]
+    assert "open" not in blob
 
 
 # ---------------------------------------------------------------- schema autofill

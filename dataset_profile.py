@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 
 PROFILE_VERSION = 1
@@ -33,6 +34,8 @@ TOP_VALUES_N = 5
 TOP_VALUE_MAXLEN = 40
 LOW_CARDINALITY_MAX = 20       # top_values emitted when nunique <= this
 NULL_PCT_WARN = 30.0
+EQUAL_PAIR_MIN_SHARE = 0.90    # "stock, not a flow": equal in MORE than this share
+EQUAL_PAIR_MAX_NUMERIC_COLS = 30   # the pair scan is skipped above this many
 
 
 def _generate_technical_description(series, total: int, *, name=None) -> str:
@@ -216,7 +219,72 @@ def _build_warnings(work: pd.DataFrame, col_profiles: dict,
                     f"no varying numeric measure")
         except Exception:
             pass
+    warnings.extend(_equal_pair_warnings(work, col_profiles))
     return warnings[:MAX_WARNINGS]
+
+
+def _equal_pair_warnings(work: pd.DataFrame, col_profiles: dict) -> list:
+    """The warning "<a> equals <b> in <pct>% of rows: likely a stock, not a
+    flow" for every unordered pair of numeric (non-bool) columns, in frame order, that hold the
+    same value in MORE than EQUAL_PAIR_MIN_SHARE of the rows where both are
+    non-null (np.isclose, rtol=1e-9, atol=0). Constant and all-null columns are
+    skipped; so is the whole scan above EQUAL_PAIR_MAX_NUMERIC_COLS numeric
+    columns. Two all-unique columns equal in EVERY row (row numbers, ids) are
+    not a stock-vs-flow pair. k mutually equal columns give ONE warning: the
+    first pair (frame order) of each equality group warns, a later equal pair
+    joins its group silently, and a pair whose columns are both already in a
+    warned group is not compared. Names and an integer (floored) percent only
+    — never a value. Never raises: a failing pair is skipped."""
+    out: list = []
+    try:
+        numeric = []
+        for col in work.columns:
+            series = work[col]
+            if isinstance(series, pd.DataFrame) or not _is_numeric_kind(series):
+                continue
+            prof = col_profiles.get(str(col)) or {}
+            if prof.get("constant"):
+                continue
+            arr = pd.to_numeric(series, errors="coerce").to_numpy(dtype="float64", na_value=np.nan)
+            mask = ~np.isnan(arr)
+            if not mask.any():
+                continue
+            numeric.append((col, arr, mask))
+        if len(numeric) < 2 or len(numeric) > EQUAL_PAIR_MAX_NUMERIC_COLS:
+            return out
+        group_of: dict = {}            # column position -> warned group id
+        for i in range(len(numeric)):
+            a, arr_a, mask_a = numeric[i]
+            for j in range(i + 1, len(numeric)):
+                b, arr_b, mask_b = numeric[j]
+                if i in group_of and j in group_of:
+                    continue
+                try:
+                    both = mask_a & mask_b
+                    n_both = int(both.sum())
+                    if n_both == 0:
+                        continue
+                    equal = int(np.isclose(arr_a[both], arr_b[both], rtol=1e-9, atol=0).sum())
+                    if equal / n_both <= EQUAL_PAIR_MIN_SHARE:
+                        continue
+                    if (equal == n_both
+                            and (col_profiles.get(str(a)) or {}).get("all_unique")
+                            and (col_profiles.get(str(b)) or {}).get("all_unique")):
+                        continue
+                    if i in group_of or j in group_of:
+                        group = group_of.get(i, group_of.get(j))
+                        group_of[i] = group
+                        group_of[j] = group
+                        continue
+                    group_of[i] = group_of[j] = i
+                    pct = (equal * 100) // n_both
+                    out.append(f"{a} equals {b} in {pct}% of rows: "
+                               f"likely a stock, not a flow")
+                except Exception:
+                    continue
+    except Exception:
+        return out
+    return out
 
 
 def compute_profile(df: pd.DataFrame, *, total_rows: int | None = None) -> dict:

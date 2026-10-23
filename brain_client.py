@@ -263,20 +263,29 @@ _CONSTANT_WARNING_RE = re.compile(r"^(?P<col>.*?) is constant: every value = .*$
 
 
 def _safe_profile_warning(text: str) -> str:
-    """A stored profile warning with the constant value removed for a
-    deny-listed column."""
+    """A stored profile warning with the constant value removed. B7.6
+    (decision F1): EVERY constant-column warning crosses in the value-free
+    form `<col> is constant`, not only a deny-listed column's; the stored
+    sidecar keeps the full wording (`_CONSTANT_WARNING_RE` parses it)."""
     m = _CONSTANT_WARNING_RE.match(text)
-    if m and value_denied(m.group("col")):
+    if m:
         return f"{m.group('col')} is constant"
     return text
 
 
+# B7.6: keys that carry a cell value of the column; never on the transport.
+_PROFILE_VALUE_KEYS = ("min", "max", "top_values")
+
+
 def _compact_profiles_for_transport(profiles: dict | None) -> dict | None:
     """Boundary guard for the dataset_profile payload field (Article II class:
-    aggregate metadata only — counts, rates, flags, truncated top-value hints;
-    never row data). Strips the storage-only "src" stamp, enforces the caps,
-    and degrades deterministically when oversized: drop top_values first, then
-    drop the per-column block entirely (table-level + grain + warnings stay)."""
+    aggregate metadata only — counts, rates, flags; never a cell value).
+    Strips the storage-only "src" stamp, drops `min` / `max` / `top_values`
+    from EVERY column and rewrites every constant-column warning to
+    `<col> is constant` (B7.6, decision F1 — the stored sidecar keeps them),
+    enforces the caps, and degrades deterministically when oversized: the
+    per-column block is dropped entirely (table-level + grain + warnings
+    stay). The input is never mutated."""
     if not profiles:
         return None
     try:
@@ -298,28 +307,18 @@ def _compact_profiles_for_transport(profiles: dict | None) -> dict | None:
                     if value_denied(cname):
                         # SCHEMA_VALUE_DENY_COLUMNS: counts and flags only.
                         c = {k: v for k, v in c.items() if k in _PROFILE_VALUE_FREE_KEYS}
-                    tv = c.get("top_values")
-                    nunique = c.get("nunique")
-                    if isinstance(tv, list) and isinstance(nunique, int) and nunique <= 20:
-                        c["top_values"] = [[str(v)[:40], n] for v, n in tv[:5]]
-                    else:
-                        # A profile stored by an earlier release may carry the
-                        # top values of a high-cardinality column (row data).
-                        c.pop("top_values", None)
+                    for value_key in _PROFILE_VALUE_KEYS:
+                        c.pop(value_key, None)
                     slim_cols[str(cname)] = c
                 p["columns"] = slim_cols
             out[str(key)] = p
         if len(json.dumps(out, ensure_ascii=False, default=str)) > _PROFILE_TRANSPORT_MAX_CHARS:
             for p in out.values():
-                for c in (p.get("columns") or {}).values():
-                    if isinstance(c, dict):
-                        c.pop("top_values", None)
-        if len(json.dumps(out, ensure_ascii=False, default=str)) > _PROFILE_TRANSPORT_MAX_CHARS:
-            for p in out.values():
                 p.pop("columns", None)
         return out or None
     except Exception as e:
-        log_with_sid("profile-transport", "warning", f"PROFILE_COMPACT_FAILED: {e}")
+        log_with_sid("profile-transport", "warning",
+                     f"PROFILE_COMPACT_FAILED {log_safe_text(type(e).__name__, 80)}")
         return None
 
 
@@ -329,30 +328,142 @@ _CAVEAT_KINDS = ("constant_metric", "identical_series", "constant_table",
                  "matrix_readability")
 
 
-def _compact_caveat_for_transport(caveat: dict | None) -> dict | None:
-    """Boundary guard for the describe `data_caveat` field. Same Article II
-    class as the profiles: aggregate findings, column NAMES, and truncated
-    constant-value hints — never rows. Unknown keys and unknown kinds are
-    dropped; anything malformed degrades to None (describe runs unchanged)."""
-    if not caveat:
+# B7.6 belt and braces: a fact ending in a constant-value hint "(= …)".
+_VALUE_HINT_RE = re.compile(r"\(\s*=\s*[^)]*\)\s*$")
+
+# FINDINGS on the wire (B7.1 shape rules; the semantic check is
+# narrative.validate_findings): a lowercase key, a bool or a short string
+# that cannot break the history marker grammar.
+_FINDING_KEY_RE = re.compile(r"[a-z][a-z0-9_]{0,39}\Z")
+_FINDING_STR_BAD_RE = re.compile("[\x00-\x1f\x7f;\\]\u2028\u2029]")
+_FINDINGS_MAX_KEYS = 24
+_FINDING_STR_MAX = 64
+
+
+def _compact_findings_for_transport(findings) -> dict | None:
+    """Shape guard for FINDINGS sent on /v1/plan and inside `data_caveat`:
+    key `^[a-z][a-z0-9_]{0,39}$`, value a bool or a 1–64 char str without C0
+    controls, ";" or "]". At most 24 keys survive, chosen with the B7.2 merge
+    priority (`needs_phase2`, then `pdc_diag` registry keys, then the rest,
+    each in the given order). Anything else is dropped; nothing left (or not
+    a dict) -> None. Never raises."""
+    if not isinstance(findings, dict) or not findings:
         return None
     try:
-        kind = caveat.get("kind")
-        if kind not in _CAVEAT_KINDS:
-            return None
-        out: dict = {"kind": kind}
-        for key in ("facts", "grain"):
-            items = caveat.get(key)
-            if isinstance(items, list):
-                vals = [str(x)[:200] for x in items[:6] if str(x).strip()]
-                if vals:
-                    out[key] = vals
-        if caveat.get("catalog"):
-            out["catalog"] = True
-        return out if (out.get("facts") or out.get("grain")) else None
+        shaped: dict = {}
+        for key, value in findings.items():
+            if not isinstance(key, str) or not _FINDING_KEY_RE.match(key):
+                continue
+            if isinstance(value, bool):
+                shaped[key] = value
+            elif (isinstance(value, str) and 1 <= len(value) <= _FINDING_STR_MAX
+                  and not _FINDING_STR_BAD_RE.search(value)):
+                shaped[key] = value
+        if len(shaped) <= _FINDINGS_MAX_KEYS:
+            return shaped or None
+        try:
+            # Lazy: the registry lives in the sandbox leaf module; a failed
+            # import only loses the priority, never the guard.
+            from pdc_diag import PDC_DIAG_FINDING_KEYS as registry
+        except Exception:
+            registry = frozenset()
+        order = ([k for k in shaped if k == "needs_phase2"]
+                 + [k for k in shaped if k != "needs_phase2" and k in registry]
+                 + [k for k in shaped if k != "needs_phase2" and k not in registry])
+        keep = set(order[:_FINDINGS_MAX_KEYS])
+        return {k: v for k, v in shaped.items() if k in keep}
     except Exception as e:
-        log_with_sid("caveat-transport", "warning", f"CAVEAT_COMPACT_FAILED: {e}")
+        log_with_sid("findings-transport", "warning",
+                     f"FINDINGS_COMPACT_FAILED {log_safe_text(type(e).__name__, 80)}")
         return None
+
+
+def _compact_caveat_for_transport(caveat: dict | None) -> dict | None:
+    """Boundary guard for the describe `data_caveat` field. Same Article II
+    class as the profiles: aggregate findings and column NAMES — never rows,
+    never a cell value (B7.6: a fact ending in a "(= …)" value hint is
+    dropped). `kind`, `facts`, `grain` and `catalog` are copied only for a
+    known kind; an unknown or absent kind drops only those keys, never
+    `findings` (B7.4), which are re-validated for shape. Returns the caveat
+    when it holds a kind with facts or grain, or findings; otherwise None
+    (describe runs unchanged)."""
+    if not caveat or not isinstance(caveat, dict):
+        return None
+    try:
+        out: dict = {}
+        kind = caveat.get("kind")
+        if kind in _CAVEAT_KINDS:
+            body: dict = {}
+            for key in ("facts", "grain"):
+                items = caveat.get(key)
+                if isinstance(items, list):
+                    vals = [str(x)[:200] for x in items[:6] if str(x).strip()]
+                    if key == "facts":
+                        vals = [v for v in vals if not _VALUE_HINT_RE.search(v)]
+                    if vals:
+                        body[key] = vals
+            if body:
+                out["kind"] = kind
+                out.update(body)
+                if caveat.get("catalog"):
+                    out["catalog"] = True
+        findings = _compact_findings_for_transport(caveat.get("findings"))
+        if findings:
+            out["findings"] = findings
+        return out or None
+    except Exception as e:
+        log_with_sid("caveat-transport", "warning",
+                     f"CAVEAT_COMPACT_FAILED {log_safe_text(type(e).__name__, 80)}")
+        return None
+
+
+# B7.7: a quoted literal in an exception text. The opening quote must not
+# follow a letter or digit (so the apostrophe of "can't" never opens one) and
+# the closing single quote must not precede one (so "O'Brien" stays one
+# literal); a literal never spans lines.
+# A Python string prefix (b'…', u'…', rb'…' — a repr of bytes, say) right
+# before a quote: dropped first, or the letter would hide the literal from the
+# opening-quote rule above and its content would leak.
+_STRING_PREFIX_RE = re.compile(r"(?<![A-Za-z0-9_])[bBuUrRfF]{1,2}(?=['\"])")
+_SINGLE_QUOTED_RE = re.compile(r"(?<![A-Za-z0-9])'([^\n]*?)'(?![A-Za-z0-9])")
+_DOUBLE_QUOTED_RE = re.compile(r'(?<![A-Za-z0-9])"([^"\n]*)"')
+_SCRUBBED_LITERAL = "'<value>'"
+
+
+def _scrub_error_msg(text, keep) -> str:
+    """The retry `error_msg` with every quoted literal replaced by '<value>'
+    unless its content is a name in `keep` (the input column names and the df
+    names, so `KeyError: 'Department'` stays useful for self-correction).
+    Exception texts quote the value they choked on — a cell value of the
+    customer's data (Article II, B7.7). Single-quoted literals are scrubbed
+    first; a double-quoted literal that held one (pandas' `KeyError: "['x']
+    not in index"`) keeps its already-scrubbed content, any other is replaced
+    whole. A literal is replaced whatever its length. Never raises: None reads
+    as "", any other non-str as its type name, an internal failure answers
+    the exception type only."""
+    try:
+        if text is None:
+            return ""
+        if not isinstance(text, str):
+            return type(text).__name__
+        names = frozenset(str(k) for k in (keep or ()))
+
+        def _single(m):
+            return m.group(0) if m.group(1) in names else _SCRUBBED_LITERAL
+
+        def _double(m):
+            inner = m.group(1)
+            if inner in names:
+                return m.group(0)
+            if _SINGLE_QUOTED_RE.search(inner):
+                return m.group(0)        # its single-quoted literals are already scrubbed
+            return _SCRUBBED_LITERAL
+
+        out = _STRING_PREFIX_RE.sub("", text)
+        out = _SINGLE_QUOTED_RE.sub(_single, out)
+        return _DOUBLE_QUOTED_RE.sub(_double, out)
+    except Exception as e:
+        return type(e).__name__
 
 
 # A copy of the canonical `db_connector.ERROR_CLASSES` (kept here so this
@@ -380,7 +491,9 @@ def plan(sid: str, question: str, schema_text: str, df_names: list[str],
          history_rows: list, common_fields: list | None = None,
          user_email: str | None = None,
          dataset_profile: dict | None = None,
-         live_tables: list | None = None) -> dict:
+         live_tables: list | None = None,
+         capabilities: list | None = None,
+         findings: dict | None = None) -> dict:
     payload = {
         "sid": sid,
         "question": question,
@@ -395,6 +508,15 @@ def plan(sid: str, question: str, schema_text: str, df_names: list[str],
     # exactly the payload it always did.
     if live_tables:
         payload["live_tables"] = live_tables
+    # Narrative session 1: both ride only when given, so a call without them
+    # (Auto Analytics, the kill switch) posts exactly the old payload. The
+    # caller passes `settings.brain_capabilities()`; this module never reads
+    # the setting itself.
+    if capabilities:
+        payload["capabilities"] = list(capabilities)
+    compact_findings = _compact_findings_for_transport(findings) if findings else None
+    if compact_findings:
+        payload["findings"] = compact_findings
     return _post("/v1/plan", payload, sid)
 
 
@@ -405,7 +527,13 @@ def retry(sid: str, question: str, schema_text: str, df_names: list[str],
           user_email: str | None = None,
           dataset_profile: dict | None = None,
           sql: dict | None = None, sql_error: dict | None = None,
-          live_tables: list | None = None) -> dict:
+          live_tables: list | None = None,
+          capabilities: list | None = None) -> dict:
+    # B7.7: exception texts quote the value they failed on — scrub every
+    # quoted literal that is not an input column or df name.
+    keep = {str(n) for n in (df_names or [])}
+    for cols in (df_columns or {}).values():
+        keep.update(str(c) for c in (cols or []))
     payload = {
         "sid": sid,
         "question": question,
@@ -413,7 +541,7 @@ def retry(sid: str, question: str, schema_text: str, df_names: list[str],
         "df_names": df_names,
         "df_columns": df_columns,
         "history_rows": _sanitize_history_rows(history_rows),
-        "error_msg": error_msg,
+        "error_msg": _scrub_error_msg(error_msg, frozenset(keep)),
         "failed_code": failed_code,
         "use_pro": use_pro,
         "use_search": use_search,
@@ -433,6 +561,8 @@ def retry(sid: str, question: str, schema_text: str, df_names: list[str],
         payload["sql_error"] = sql_error
     if live_tables:
         payload["live_tables"] = live_tables
+    if capabilities:
+        payload["capabilities"] = list(capabilities)
     return _post("/v1/retry", payload, sid)
 
 
@@ -441,8 +571,9 @@ def describe(sid: str, question: str, code: str, user_email: str | None = None,
     body = {"sid": sid, "question": question, "code": code, "user_email": user_email}
     caveat = _compact_caveat_for_transport(data_caveat)
     if caveat:
-        # Only sent when the client's deterministic inspection fired — an
-        # absent field leaves the brain's describe prompt byte-identical.
+        # Only sent when the client's deterministic inspection fired or the
+        # turn carries FINDINGS (B7.4) — an absent field leaves the brain's
+        # describe prompt byte-identical.
         body["data_caveat"] = caveat
     return _post("/v1/describe", body, sid)
 

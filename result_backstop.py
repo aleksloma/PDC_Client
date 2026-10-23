@@ -41,7 +41,6 @@ _REL_TOL = 1e-6
 # Presence proves the model complied; absence triggers the client fallback.
 DATA_NOTE_MARKER = "[[DATA_NOTE]]"
 
-_VALUE_MAXLEN = 40      # constant-value hints crossing to the brain
 _MAX_FACTS = 6
 _ROUND_SIG = 4          # significant figures for series comparison
 
@@ -124,15 +123,6 @@ def values_are_constant(vals) -> bool:
     return len({str(v) for v in vals}) <= 1
 
 
-def _fmt_value(v) -> str:
-    try:
-        if _is_num(v) and float(v) == int(float(v)):
-            v = int(float(v))
-    except (TypeError, ValueError, OverflowError):
-        pass
-    return str(v)[:_VALUE_MAXLEN]
-
-
 def _round_sig(v):
     try:
         f = float(v)
@@ -181,9 +171,9 @@ def _constant_metric_facts(rows: list) -> Optional[list]:
         vals = [r.get(col) for r in rows if isinstance(r, dict)]
         if not values_are_constant(vals):
             return None
-        const = _clean(vals)[0]
-        facts.append(f"{col} is the same for every group in the chart "
-                     f"(= {_fmt_value(const)})")
+        # B7.6 (decision F1): a fact names the column and the finding, never
+        # the value — facts travel to /v1/describe as `data_caveat`.
+        facts.append(f"{col} is the same for every group in the chart")
     return facts
 
 
@@ -388,9 +378,8 @@ def _constant_columns_facts(df: pd.DataFrame, cols: list) -> Optional[list]:
         vals = list(df[col])
         if not values_are_constant(vals):
             return None
-        const = _clean(vals)[0]
-        facts.append(f"{col} is the same in every row of the table "
-                     f"(= {_fmt_value(const)})")
+        # B7.6 (decision F1): the column and the finding only, never the value.
+        facts.append(f"{col} is the same in every row of the table")
     return facts or None
 
 
