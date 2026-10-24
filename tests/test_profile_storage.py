@@ -148,6 +148,28 @@ def test_read_profile_rejects_wrong_version():
     assert local_store.read_profile(p, None) is None
 
 
+def test_stored_version_1_profile_is_recomputed():
+    """A sidecar written by the previous release (profile_version 1, whose
+    stock-vs-flow warnings counted both-zero rows) is not served after the
+    upgrade: the version mismatch makes ensure_chat_profiles recompute it and
+    rewrite the sidecar at the current version, even though the source file
+    (and so the staleness stamp) is unchanged."""
+    store, dfs = _chat_with_csv("c_v1profile")
+    path, stamp = local_store._profile_src_stamp_for_entry(store, {"file_name": "link.csv"})
+    local_store.write_profile(path, {"profile_version": 1, "rows": 1, "warnings": ["stale"]},
+                              stamp)
+
+    out = local_store.ensure_chat_profiles(store, dfs)
+    prof = out["link.csv"]
+    assert prof["profile_version"] == 2
+    assert "stale" not in prof["warnings"]
+    assert prof["rows"] == 4
+
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk["profile_version"] == 2
+    assert "stale" not in on_disk["warnings"]
+
+
 # --- transport ---------------------------------------------------------------
 
 def _capture_post(monkeypatch):

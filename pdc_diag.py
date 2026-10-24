@@ -486,6 +486,36 @@ def _jaccard(a: set, b: set) -> float:
     return len(a & b) / len(union)
 
 
+def _member_shares(series: pd.Series) -> dict:
+    """{member: share of the non-null rows} for one period's values."""
+    try:
+        clean = series.dropna()
+        if not len(clean):
+            return {}
+        return {k: float(v) for k, v in clean.value_counts(normalize=True, dropna=True).items()}
+    except Exception:
+        return {}      # unhashable members: this rule cannot judge the period
+
+
+def _member_share_shift(frames: list, dim, share_shift: float, vanish_share: float) -> bool:
+    """True when, between two consecutive periods that both hold a non-null
+    member of `dim`, some member's row share moves by more than `share_shift`
+    or a member above `vanish_share` of the earlier period disappears."""
+    previous: dict = {}
+    for sub in frames:
+        shares = _member_shares(sub[dim])
+        if previous and shares:
+            for member in set(previous) | set(shares):
+                before = previous.get(member, 0.0)
+                after = shares.get(member, 0.0)
+                if abs(after - before) > share_shift:
+                    return True
+                if before > vanish_share and after == 0.0:
+                    return True
+        previous = shares
+    return False
+
+
 def _unknown_mask(series: pd.Series) -> pd.Series:
     text = series.astype(str).str.strip().str.casefold()
     return series.isna() | text.isin(UNKNOWN_TOKENS)
@@ -493,10 +523,22 @@ def _unknown_mask(series: pd.Series) -> pd.Series:
 
 def coverage_check(df, period_col: str, dims: list, metrics: list, *, order=None,
                    ratio_low: float = 0.5, ratio_high: float = 2.0, jaccard_min: float = 0.5,
+                   share_shift: float = 0.5, vanish_share: float = 0.2,
                    unknown_share: float = 0.5, unit_cols: list | None = None,
                    as_of=None, prefix: str = "") -> dict:
     """Did the population behind the periods change (members, rows, nulls,
-    units)? — B8.3."""
+    units)? — B8.3.
+
+    A coverage dim (each of `dims` and `unit_cols`) counts as CHANGED when
+    any of three rules fires: its member-set size swings outside
+    [`ratio_low`, `ratio_high`] × the median size; the Jaccard overlap of the
+    first and last periods' member sets is below `jaccard_min`; or, between
+    two CONSECUTIVE periods that both hold a non-null member, a member's
+    share of the period's non-null rows moves by more than `share_shift`
+    (a member absent from a period has share 0), or a member holding more
+    than `vanish_share` of the earlier period's rows is absent from the later
+    one. `coverage_dim` is the changed dim with the lowest first/last Jaccard
+    (ties by argument order) and `coverage_jaccard` that dim's Jaccard."""
     prefix = _check_prefix(prefix)
     dims = _as_list(dims, "dims")
     metrics = _as_list(metrics, "metrics")
@@ -561,7 +603,8 @@ def coverage_check(df, period_col: str, dims: list, metrics: list, *, order=None
             jaccards[dim] = jac
             swing = any(size < ratio_low * median_size or size > ratio_high * median_size
                         for size in sizes)
-            if swing or jac < jaccard_min:
+            if swing or jac < jaccard_min or _member_share_shift(
+                    frames, dim, share_shift, vanish_share):
                 changed.append(dim)
         if coverage_dims:
             if changed:
@@ -1157,8 +1200,18 @@ def attribute_level(df, target, dims, numeric_cols, *, method: str = "auto",
 # B8.7 check_metric_overlap
 # ---------------------------------------------------------------------------
 def check_metric_overlap(df, metric_a, metric_b, *, equal_share: float = 0.5,
-                         rel_tol: float = 1e-9, prefix: str = "") -> dict:
-    """Are two metrics (mostly) the same numbers under two names? — B8.7."""
+                         rel_tol: float = 1e-9, min_compared_share: float = 0.1,
+                         prefix: str = "") -> dict:
+    """Are two metrics (mostly) the same numbers under two names? — B8.7.
+
+    The non-null rows are those where both metrics are set. A row where BOTH
+    are 0 says nothing about whether they measure the same thing (an empty
+    month of two flow metrics), so the equal share is taken over the COMPARED
+    rows only — non-null and not both zero. When no row is compared, or fewer
+    than `min_compared_share` of the non-null rows, the share is None and no
+    finding is set. VALUES: `overlap_equal_share` (over the compared rows),
+    `overlap_sum_ratio` (sum a / sum b over the non-null rows),
+    `overlap_rows` (the compared count), `overlap_nonnull_rows`."""
     prefix = _check_prefix(prefix)
     _require_columns(df, [metric_a], "metric_a")
     _require_columns(df, [metric_b], "metric_b")
@@ -1167,23 +1220,28 @@ def check_metric_overlap(df, metric_a, metric_b, *, equal_share: float = 0.5,
     both = pd.DataFrame({"a": _numeric(df[metric_a]).to_numpy(),
                          "b": _numeric(df[metric_b]).to_numpy()}).dropna()
     a, b = both["a"].to_numpy(dtype=float), both["b"].to_numpy(dtype=float)
-    n = int(len(both))
+    n_nonnull = int(len(both))
+    compared = ~((a == 0) & (b == 0))
+    n = int(compared.sum())
     findings: dict = {}
-    if n:
-        scale = np.maximum(np.maximum(np.abs(a), np.abs(b)), 1.0)
-        share = float((np.abs(a - b) <= rel_tol * scale).mean())
+    if n and n >= min_compared_share * n_nonnull:
+        ac, bc = a[compared], b[compared]
+        scale = np.maximum(np.maximum(np.abs(ac), np.abs(bc)), 1.0)
+        share = float((np.abs(ac - bc) <= rel_tol * scale).mean())
     else:
         share = None
-    sum_b = float(b.sum()) if n else 0.0
+    sum_b = float(b.sum()) if n_nonnull else 0.0
     sum_ratio = float(a.sum()) / sum_b if sum_b != 0 else None
     if share is not None and share >= equal_share:
         findings["metric_relation"] = "metric_definition_overlap"
     if share is not None and share >= 0.99:
         findings["metrics_identical"] = True
     table = pd.DataFrame([{"metric_a": str(metric_a), "metric_b": str(metric_b), "rows": n,
+                           "nonnull_rows": n_nonnull,
                            "equal_share": share if share is not None else float("nan"),
                            "sum_ratio": sum_ratio if sum_ratio is not None else float("nan")}])
-    values = {"overlap_equal_share": share, "overlap_sum_ratio": sum_ratio, "overlap_rows": n}
+    values = {"overlap_equal_share": share, "overlap_sum_ratio": sum_ratio, "overlap_rows": n,
+              "overlap_nonnull_rows": n_nonnull}
     return _result(table, values, findings, prefix)
 
 

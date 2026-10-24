@@ -98,6 +98,28 @@ def _overlap_frame(n_equal: int, n_total: int) -> pd.DataFrame:
     return pd.DataFrame({"a": a, "b": b})
 
 
+def _currency_switch_frame() -> pd.DataFrame:
+    """Four ISO months, 10 rows each, REGION cycling A/B; CURRENCY half UZS /
+    half USD in the first two months, UZS only in the last two — a two-value
+    switch neither the size-swing nor the first/last Jaccard rule sees."""
+    parts = []
+    for i, period in enumerate(["2025-01", "2025-02", "2025-03", "2025-04"]):
+        currency = ["UZS", "USD"] * 5 if i < 2 else ["UZS"] * 10
+        parts.append(pd.DataFrame({"period": [period] * 10, "REGION": ["A", "B"] * 5,
+                                   "CURRENCY": currency, "amount": [10.0] * 10}))
+    return pd.concat(parts, ignore_index=True)
+
+
+def _counts_frame(per_period: list, dim: str = "region") -> pd.DataFrame:
+    """One ISO month per entry of `per_period` ({member: row count})."""
+    rows = []
+    for i, counts in enumerate(per_period):
+        for member, k in counts.items():
+            rows.extend({"period": f"2025-{i + 1:02d}", dim: member, "amount": 10.0}
+                        for _ in range(k))
+    return pd.DataFrame(rows)
+
+
 def _assert_shape(out):
     assert isinstance(out, dict), type(out)
     assert set(out) == RETURN_KEYS, sorted(out)
@@ -119,7 +141,10 @@ def _all_outputs():
     mostly, same = _overlap_frame(19, 20), _overlap_frame(20, 20)
     units = _stable_frame()
     units["currency"] = ["USD", "UZS"] * 6
+    switch = _currency_switch_frame()
     return [
+        (pdc_diag.coverage_check(switch, "period", ["REGION"], ["amount"],
+                                 unit_cols=["CURRENCY"], as_of="2025-04-15"), switch),
         (pdc_diag.coverage_check(_member_change_frame(), "period", ["region"], ["amount"]),
          _member_change_frame()),
         (pdc_diag.coverage_check(_row_jump_frame(), "period", ["region"], ["amount"],
@@ -357,6 +382,55 @@ def test_coverage_check_degenerate_inputs_do_not_raise():
     one = pdc_diag.coverage_check(_rows("2025-01", 3, ["A", "B"]), "period", ["region"], ["amount"])
     _assert_shape(one)
     assert one["values"]["n_periods"] == 1
+
+
+# Follow-up (narrative s1): a member-share rule between CONSECUTIVE periods —
+# a member whose share of rows moves by more than `share_shift`, or a member
+# holding more than `vanish_share` of the rows that disappears, is a coverage
+# change even when the member-set size and the first/last Jaccard look fine.
+
+@pytest.mark.parametrize("kwargs", [
+    {"dims": ["REGION"], "unit_cols": ["CURRENCY"]},
+    {"dims": ["REGION", "CURRENCY"], "unit_cols": None},
+])
+def test_coverage_check_two_value_switch_is_a_change(kwargs):
+    df = _currency_switch_frame()
+    out = pdc_diag.coverage_check(df, "period", kwargs["dims"], ["amount"],
+                                  unit_cols=kwargs["unit_cols"])
+    f, v = out["findings"], out["values"]
+    assert f["coverage"] == "coverage_change"
+    assert f["coverage_dim"] == "CURRENCY"
+    assert v["coverage_dim_label"] == "CURRENCY"
+    # CURRENCY's first/last Jaccard ({UZS, USD} vs {UZS}); REGION is unchanged
+    assert v["coverage_jaccard"] == pytest.approx(0.5)
+
+
+def test_coverage_check_share_shift_rule():
+    # same members {A, B} every period; A's share 0.9 -> 0.2 -> 0.2 (shift 0.7)
+    moved = _counts_frame([{"A": 9, "B": 1}, {"A": 2, "B": 8}, {"A": 2, "B": 8}])
+    out = pdc_diag.coverage_check(moved, "period", ["region"], ["amount"])
+    assert out["findings"]["coverage"] == "coverage_change"
+    assert out["findings"]["coverage_dim"] == "region"
+    assert out["values"]["coverage_jaccard"] == pytest.approx(1.0)
+    # A's share 0.7 -> 0.3 -> 0.3 (shift 0.4, not above 0.5): stable
+    mild = _counts_frame([{"A": 7, "B": 3}, {"A": 3, "B": 7}, {"A": 3, "B": 7}])
+    out = pdc_diag.coverage_check(mild, "period", ["region"], ["amount"])
+    assert out["findings"]["coverage"] == "coverage_stable"
+    assert "coverage_dim" not in out["findings"]
+
+
+def test_coverage_check_vanished_minor_member_is_stable():
+    # C held 10% of the rows, then vanished: not above vanish_share (0.2)
+    minor = _counts_frame([{"A": 4, "B": 5, "C": 1}, {"A": 5, "B": 5}, {"A": 5, "B": 5}])
+    out = pdc_diag.coverage_check(minor, "period", ["region"], ["amount"])
+    assert out["findings"]["coverage"] == "coverage_stable"
+    assert "coverage_dim" not in out["findings"]
+    # C held 30% of the rows, then vanished: a coverage change
+    major = _counts_frame([{"A": 4, "B": 3, "C": 3}, {"A": 5, "B": 5}, {"A": 5, "B": 5}])
+    out = pdc_diag.coverage_check(major, "period", ["region"], ["amount"])
+    assert out["findings"]["coverage"] == "coverage_change"
+    assert out["findings"]["coverage_dim"] == "region"
+    assert out["values"]["coverage_jaccard"] == pytest.approx(2 / 3)
 
 
 # ---------------------------------------------------------------------------
@@ -667,6 +741,50 @@ def test_check_metric_overlap_nulls_and_tolerance():
     assert strict["values"]["overlap_equal_share"] == pytest.approx(17 / 18)
 
 
+# Follow-up (narrative s1): rows where both metrics are 0 are not compared;
+# below `min_compared_share` of the non-null rows the share is not judged.
+
+def _zero_padded_overlap(n_zero: int, a_tail, b_tail) -> pd.DataFrame:
+    return pd.DataFrame({"a": [0.0] * n_zero + [float(x) for x in a_tail],
+                         "b": [0.0] * n_zero + [float(x) for x in b_tail]})
+
+
+def test_check_metric_overlap_ignores_both_zero_rows():
+    # 98 both-zero rows, the 2 others differ: 2 of 100 compared — not judged
+    df = _zero_padded_overlap(98, [1, 2], [3, 4])
+    out = pdc_diag.check_metric_overlap(df, "a", "b")
+    f, v = out["findings"], out["values"]
+    assert "metric_relation" not in f
+    assert "metrics_identical" not in f
+    assert v["overlap_equal_share"] is None
+    assert v["overlap_rows"] == 2
+    assert v["overlap_nonnull_rows"] == 100
+
+    # 80 both-zero rows + 20 non-zero rows, 19 of them equal: 0.95 over 20
+    tail_a = [100 * k for k in range(1, 21)]
+    tail_b = list(tail_a)
+    tail_b[-1] = tail_b[-1] * 3 + 7
+    df = _zero_padded_overlap(80, tail_a, tail_b)
+    out = pdc_diag.check_metric_overlap(df, "a", "b")
+    f, v = out["findings"], out["values"]
+    assert f["metric_relation"] == "metric_definition_overlap"
+    assert "metrics_identical" not in f
+    assert v["overlap_equal_share"] == pytest.approx(0.95)
+    assert v["overlap_rows"] == 20
+    assert v["overlap_nonnull_rows"] == 100
+
+
+def test_check_metric_overlap_min_compared_share_kwarg():
+    # 95 both-zero rows + 5 equal non-zero rows
+    df = _zero_padded_overlap(95, [1, 2, 3, 4, 5], [1, 2, 3, 4, 5])
+    out = pdc_diag.check_metric_overlap(df, "a", "b")
+    assert "metric_relation" not in out["findings"]
+    assert out["values"]["overlap_equal_share"] is None
+    loose = pdc_diag.check_metric_overlap(df, "a", "b", min_compared_share=0.0)
+    assert loose["findings"]["metric_relation"] == "metric_definition_overlap"
+    assert loose["values"]["overlap_equal_share"] == pytest.approx(1.0)
+
+
 # ---------------------------------------------------------------------------
 # prefix, registry, value conventions, errors
 # ---------------------------------------------------------------------------
@@ -689,7 +807,8 @@ def test_prefix_applies_to_values_only():
     assert all(k.startswith("x_") for k in dec["values"])
     assert not any(k.startswith("x_") for k in dec["findings"])
     ov = pdc_diag.check_metric_overlap(_overlap_frame(20, 20), "a", "b", prefix="m2_")
-    assert set(ov["values"]) == {"m2_overlap_equal_share", "m2_overlap_sum_ratio", "m2_overlap_rows"}
+    assert set(ov["values"]) == {"m2_overlap_equal_share", "m2_overlap_sum_ratio", "m2_overlap_rows",
+                                 "m2_overlap_nonnull_rows"}
     at = pdc_diag.attribute_level(_attribution_frame(True), "target", ["segment"], ["noise"], prefix="p_")
     assert all(k.startswith("p_") for k in at["values"])
     assert "top_feature" in at["findings"]
