@@ -84,7 +84,10 @@ def test_dict_of_scalars_keeps_summarize_path(monkeypatch, dfs):
     result = _run(monkeypatch, dfs, code, summarize_calls=summarize_calls)
     assert result["table"] is None and result.get("tables") is None
     assert result["text"] == "summarized"
-    assert summarize_calls[0]["preview"] == {"total": 60, "stores": 3}
+    # A6 / decision F1: summarize never receives the preview; the value is
+    # shown through the local `value_display` line instead (display only).
+    assert summarize_calls[0]["preview"] is None
+    assert "total" in result["value_display"] and "60" in result["value_display"]
 
 
 def test_mixed_dict_takes_only_df_values(monkeypatch, dfs):

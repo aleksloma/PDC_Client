@@ -21,12 +21,14 @@ import secrets
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape as _xml_escape
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
 import brain_client
 import local_store
+import narrative as _narr
 from brain_client import TenantRevokedError, BrainError
 from exec_transport import log_safe_text
 from logger_utils import log_with_sid
@@ -217,8 +219,64 @@ def _resolve_chart_image(image_b64, sid):
     return image_b64, True
 
 
+# Record keys of a narrative-template turn (DIAGNOSTICS_SPEC A5.5).
+_NARR_RECORD_KEYS = ("narrative_template", "narrative_rendered", "caption_template",
+                     "caption_rendered", "caption_described", "value_display")
+
+
+def _is_narrative_record(ai_msg: dict) -> bool:
+    """A record written with narrative templates (any of the new keys, on
+    the record or on one of its chart entries). Older records keep today's
+    pair shape exactly — no `_display_text`."""
+    if any(k in ai_msg for k in _NARR_RECORD_KEYS):
+        return True
+    return any(isinstance(img, dict) and ("caption_template" in img or "phase" in img)
+               for img in (ai_msg.get("images") or []))
+
+
+def _brain_view(template, findings) -> str:
+    """The brain-safe view of a template (slots as `[name]`), "" without one."""
+    if not (isinstance(template, str) and template):
+        return ""
+    return _narr.brain_view(template, findings if isinstance(findings, dict) else {})
+
+
+def _join_text(*parts) -> str:
+    return "\n\n".join(p for p in parts if isinstance(p, str) and p)
+
+
+def _single_record_texts(ai_msg: dict) -> tuple:
+    """(brain-safe content, local display text) of a single-visual record
+    (A5.5 Report): the content is built from templates (`brain_view`) and
+    describe/summarize texts, the display from the rendered fields."""
+    finds = ai_msg.get("findings")
+    content = ai_msg.get("content") or ""
+    nt = ai_msg.get("narrative_template")
+    ct = ai_msg.get("caption_template")
+    if isinstance(nt, str) and nt:
+        cap_content = _brain_view(ct, finds) or (ai_msg.get("caption_described") or "")
+        # The template's presence decides: a caption rendered to "" stays "".
+        cap_display = (ai_msg.get("caption_rendered") if (isinstance(ct, str) and ct)
+                       else ai_msg.get("caption_described")) or ""
+        return (_join_text(_brain_view(nt, finds), cap_content),
+                _join_text(ai_msg.get("narrative_rendered") or "", cap_display))
+    if isinstance(ct, str) and ct:
+        bv = _brain_view(ct, finds)
+        cr = ai_msg.get("caption_rendered")
+        return bv, (cr if isinstance(cr, str) else bv)
+    vd = ai_msg.get("value_display")
+    if isinstance(vd, str) and vd:
+        return content, _join_text(content, vd)
+    return content, content
+
+
 def _build_qa_pairs(history: list, sid: str):
-    """Same pairing logic as B2C `_build_report_data`."""
+    """Same pairing logic as B2C `_build_report_data`.
+
+    Narrative-template records (A5.5): `ai.content` is the BRAIN-SAFE text —
+    `brain_view` of the templates, or a describe text — and `ai._display_text`
+    the rendered one for the local PDF/PPTX body. The first chart pair of a
+    record carries the narrative. Older records keep today's shape."""
     qa_pairs = []
     i = 0
     while i < len(history):
@@ -227,12 +285,27 @@ def _build_qa_pairs(history: list, sid: str):
             if i + 1 < len(history) and history[i + 1].get("role") == "ai":
                 ai_msg = history[i + 1]
                 images_array = ai_msg.get("images") or []
+                narrative_era = _is_narrative_record(ai_msg)
                 if images_array:
-                    for img_entry in images_array:
+                    finds = ai_msg.get("findings")
+                    narr_content = _brain_view(ai_msg.get("narrative_template"), finds)
+                    narr_display = ai_msg.get("narrative_rendered") or ""
+                    for idx, img_entry in enumerate(images_array):
                         resolved_img, is_chart = _resolve_chart_image(img_entry.get("image_base64", ""), sid)
+                        ai = {"content": img_entry.get("answer", ""), "image_base64": resolved_img, "_resolved_png": resolved_img}
+                        if narrative_era:
+                            answer = img_entry.get("answer") or ""
+                            content = (_brain_view(img_entry.get("caption_template"), finds)
+                                       or answer)
+                            display = answer
+                            if idx == 0:
+                                content = _join_text(narr_content, content)
+                                display = _join_text(narr_display, display)
+                            ai["content"] = content
+                            ai["_display_text"] = display
                         qa_pairs.append({
                             "human": msg,
-                            "ai": {"content": img_entry.get("answer", ""), "image_base64": resolved_img, "_resolved_png": resolved_img},
+                            "ai": ai,
                             "ai_index": i + 1,
                             "has_chart": is_chart,
                             "has_table": False,
@@ -242,6 +315,8 @@ def _build_qa_pairs(history: list, sid: str):
                     has_table = bool(ai_msg.get("table"))
                     has_text = bool((ai_msg.get("content") or "").strip())
                     ai_copy = dict(ai_msg)
+                    if narrative_era:
+                        ai_copy["content"], ai_copy["_display_text"] = _single_record_texts(ai_msg)
                     if is_chart:
                         ai_copy["_resolved_png"] = resolved_img
                     if is_chart or has_table or has_text:
@@ -260,21 +335,56 @@ def _sanitize_filename(name: str) -> str:
     return name[:30] or "report"
 
 
-def _build_findings_for_brain(qa_pairs: list) -> list[dict]:
+def _build_findings_for_brain(qa_pairs: list, input_columns=None) -> list[dict]:
     """The findings shape the brain expects on /v1/report — same shape the
-    B2C `_generate_report_structure` built internally."""
+    B2C `_generate_report_structure` built internally.
+
+    `table_columns` keeps only the chat's INPUT column names (A5.5 Report):
+    a pivot / crosstab header can be a category value or a date, so any
+    other result-table label is removed and the list may become `[]`.
+    Without `input_columns` nothing is kept (fail closed)."""
+    allowed = frozenset(str(c) for c in (input_columns or ()))
     out = []
     for idx, pair in enumerate(qa_pairs):
+        cols = (pair["ai"].get("table") or {}).get("columns") or []
         out.append({
             "index": idx,
             "question": (pair["human"].get("content") or "")[:500],
             "answer_text": (pair["ai"].get("content") or "")[:500],
             "has_chart": bool(pair["has_chart"]),
             "has_table": bool(pair["has_table"]),
-            "table_columns": ((pair["ai"].get("table") or {}).get("columns") or [])[:10],
+            "table_columns": [c for c in cols if str(c) in allowed][:10],
             "code_snippet": (pair["ai"].get("code") or "")[:300],
         })
     return out
+
+
+def _input_column_names(store, sid: str) -> frozenset:
+    """The chat's input column names (every `fields` key of its schema
+    docs) — the only table labels /v1/report may see. A failure answers the
+    empty set (fail closed) and is logged with the exception type only."""
+    try:
+        docs = store.schema_docs() or {}
+        return frozenset(str(col) for doc in docs.values() if isinstance(doc, dict)
+                         for col in (doc.get("fields") or {}))
+    except Exception as e:
+        log_with_sid(log_safe_text(str(sid), 254), "warning",
+                     f"REPORT_INPUT_COLUMNS_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return frozenset()
+
+
+def _finding_body(pair: dict, findings: list, i: int):
+    """The per-finding body of the local PDF/PPTX (A5.5 Report): the
+    rendered `_display_text` when the record has one (real numbers, no
+    `[slot]` placeholders), else the brain's narrative for the finding, else
+    the record text — display text through `narrative.plain`."""
+    ai = pair.get("ai") if isinstance(pair.get("ai"), dict) else {}
+    disp = ai.get("_display_text")
+    if isinstance(disp, str) and disp.strip():
+        return _narr.plain(disp)
+    if i < len(findings):
+        return findings[i].get("narrative")
+    return _narr.plain(ai.get("content") or "")
 
 
 def _slot_budgets_for(sid: str) -> dict:
@@ -342,7 +452,7 @@ def _build_payload(request: Request, chat_id: str, conv_id: str):
     if not qa_pairs:
         return JSONResponse({"error": "No reportable content"}, status_code=400)
 
-    findings = _build_findings_for_brain(qa_pairs)
+    findings = _build_findings_for_brain(qa_pairs, _input_column_names(store, sid))
     try:
         rsp = brain_client.report(sid=sid, qa_pairs=findings, user_email=email,
                                   slot_budgets=_slot_budgets_for(sid))
@@ -567,7 +677,7 @@ def _render_pptx_builtin(qa_pairs: list, report_structure: dict, sid: str) -> by
     findings = report_structure.get("findings") or []
     for i, pair in enumerate(qa_pairs):
         slide = prs.slides.add_slide(blank_layout)
-        narrative = findings[i].get("narrative") if i < len(findings) else (pair["ai"].get("content") or "")
+        narrative = _finding_body(pair, findings, i)
         question = (pair["human"].get("content") or "") if isinstance(pair.get("human"), dict) else ""
         page_title = _finding_title(findings[i].get("page_title") if i < len(findings) else "", question)
         _add_title(slide, _strip_emphasis(page_title))
@@ -1249,7 +1359,7 @@ def _render_pptx_native(qa_pairs: list, report_structure: dict, sid: str,
             regions.append({"kind": "branding", **br})
         question = (pair["human"].get("content") or "") if isinstance(pair.get("human"), dict) else ""
         page_title = _finding_title(findings[i].get("page_title") if i < len(findings) else "", question)
-        narrative = findings[i].get("narrative") if i < len(findings) else (pair["ai"].get("content") or "")
+        narrative = _finding_body(pair, findings, i)
         _add_text_region(slide, page_title, content_p.get("title") or {}, sid=sid, role="title")
         regions.append({"kind": "title", "text": page_title, **(content_p.get("title") or {})})
         _add_text_region(slide, narrative, content_p.get("body") or {}, sid=sid,
@@ -2152,7 +2262,7 @@ def _render_pptx_templated_clone(qa_pairs: list, report_structure: dict, sid: st
         c_logos = _logos_for(slide, content_spec)
         question = (pair["human"].get("content") or "") if isinstance(pair.get("human"), dict) else ""
         page_title = _finding_title(findings[i].get("page_title") if i < len(findings) else "", question)
-        narrative = findings[i].get("narrative") if i < len(findings) else (pair["ai"].get("content") or "")
+        narrative = _finding_body(pair, findings, i)
         chart_b64 = pair["ai"].get("_resolved_png") or pair["ai"].get("image_base64")
         has_chart = bool(chart_b64) and not _is_plotly_html(chart_b64)
         placed = _apply(slide, content_spec, c_logos, page_title=page_title, body_text=narrative,
@@ -2255,11 +2365,13 @@ def _render_pdf(qa_pairs: list, report_structure: dict, sid: str) -> bytes:
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=40, rightMargin=40, topMargin=40, bottomMargin=40)
     flow = []
 
-    flow.append(Paragraph(report_structure.get("report_title") or "Data Analysis Report", title_style))
+    # Every Paragraph text is XML-escaped: ReportLab parses its markup, and
+    # display text can carry a cell value (A5.5 Report).
+    flow.append(Paragraph(_xml_escape(report_structure.get("report_title") or "Data Analysis Report"), title_style))
     flow.append(Spacer(1, 12))
     es = report_structure.get("executive_summary") or ""
     if es:
-        flow.append(Paragraph(es, body))
+        flow.append(Paragraph(_xml_escape(str(es)), body))
         flow.append(Spacer(1, 12))
 
     findings = report_structure.get("findings") or []
@@ -2267,9 +2379,9 @@ def _render_pdf(qa_pairs: list, report_structure: dict, sid: str) -> bytes:
         flow.append(PageBreak())
         question = (pair["human"].get("content") or "") if isinstance(pair.get("human"), dict) else ""
         page_title = _finding_title(findings[i].get("page_title") if i < len(findings) else "", question)
-        narrative = findings[i].get("narrative") if i < len(findings) else (pair["ai"].get("content") or "")
-        flow.append(Paragraph(_strip_emphasis(page_title), h2))
-        flow.append(Paragraph(_strip_emphasis(narrative), body))
+        narrative = _finding_body(pair, findings, i)
+        flow.append(Paragraph(_xml_escape(_strip_emphasis(page_title)), h2))
+        flow.append(Paragraph(_xml_escape(_strip_emphasis(narrative)), body))
         flow.append(Spacer(1, 12))
 
         # Chart
@@ -2306,7 +2418,7 @@ def _render_pdf(qa_pairs: list, report_structure: dict, sid: str) -> bytes:
         flow.append(PageBreak())
         flow.append(Paragraph("Key Takeaways", h2))
         for t in takeaways:
-            flow.append(Paragraph(f"• {_strip_emphasis(t)}", body))
+            flow.append(Paragraph(_xml_escape(f"• {_strip_emphasis(t)}"), body))
 
     doc.build(flow)
     return buf.getvalue()

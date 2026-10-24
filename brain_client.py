@@ -428,12 +428,58 @@ _STRING_PREFIX_RE = re.compile(r"(?<![A-Za-z0-9_])[bBuUrRfF]{1,2}(?=['\"])")
 _SINGLE_QUOTED_RE = re.compile(r"(?<![A-Za-z0-9])'([^\n]*?)'(?![A-Za-z0-9])")
 _DOUBLE_QUOTED_RE = re.compile(r'(?<![A-Za-z0-9])"([^"\n]*)"')
 _SCRUBBED_LITERAL = "'<value>'"
+# A string literal of the FAILED CODE (single or double quoted, one line,
+# backslash escapes skipped) — its content was written by the brain.
+_CODE_STRING_RE = re.compile(r"'((?:[^'\\\n]|\\.)*)'|\"((?:[^\"\\\n]|\\.)*)\"")
 
 
-def _scrub_error_msg(text, keep) -> str:
+def _code_terms(code) -> tuple:
+    """(the code text with its string literals blanked out, the contents of
+    its string literals) — what the brain itself wrote into `failed_code`.
+    ("", ()) for anything that is not a non-empty str. Never raises."""
+    try:
+        if not isinstance(code, str) or not code:
+            return "", ()
+        lits = []
+
+        def _blank(m):
+            lits.append(m.group(1) if m.group(1) is not None else m.group(2))
+            return " "
+
+        bare = _CODE_STRING_RE.sub(_blank, code)
+        return bare, tuple(lits)
+    except Exception:
+        return "", ()
+
+
+def _written_in_code(literal: str, code: str, code_strings: tuple) -> bool:
+    """True when `literal` was written by the brain in the failed code: as a
+    whole identifier TOKEN of the code outside its strings (dotted names too:
+    `No module named 'a.b'`), or as one WHOLE string literal of the code
+    (exact equality — a part of a code string is never kept, or `'North'`
+    would be confirmed by code that only says `'North East'`). Such a literal
+    adds no information the brain does not already hold. Never raises."""
+    try:
+        if not literal:
+            return False
+        if code and all(part.isidentifier() for part in literal.split(".")):
+            if re.search(r"(?<!\w)" + re.escape(literal) + r"(?!\w)", code):
+                return True
+        return literal in code_strings
+    except Exception:
+        return False
+
+
+def _scrub_error_msg(text, keep, code=None) -> str:
     """The retry `error_msg` with every quoted literal replaced by '<value>'
     unless its content is a name in `keep` (the input column names and the df
-    names, so `KeyError: 'Department'` stays useful for self-correction).
+    names, so `KeyError: 'Department'` stays useful for self-correction) or
+    was written by the brain itself in `code` (the failed code: a whole
+    identifier token — `NameError: name 'df'`, a misspelt variable, a module
+    or attribute name — or EXACTLY one whole string literal of it, e.g. the
+    `'North'` of `df.loc['North']`, but not of `df.loc['North East']`). A
+    literal the code does not contain that way — a cell or category value —
+    is still scrubbed.
     Exception texts quote the value they choked on — a cell value of the
     customer's data (Article II, B7.7). Single-quoted literals are scrubbed
     first; a double-quoted literal that held one (pandas' `KeyError: "['x']
@@ -447,13 +493,17 @@ def _scrub_error_msg(text, keep) -> str:
         if not isinstance(text, str):
             return type(text).__name__
         names = frozenset(str(k) for k in (keep or ()))
+        code_text, code_strings = _code_terms(code)
+
+        def _kept(lit: str) -> bool:
+            return lit in names or _written_in_code(lit, code_text, code_strings)
 
         def _single(m):
-            return m.group(0) if m.group(1) in names else _SCRUBBED_LITERAL
+            return m.group(0) if _kept(m.group(1)) else _SCRUBBED_LITERAL
 
         def _double(m):
             inner = m.group(1)
-            if inner in names:
+            if _kept(inner):
                 return m.group(0)
             if _SINGLE_QUOTED_RE.search(inner):
                 return m.group(0)        # its single-quoted literals are already scrubbed
@@ -541,7 +591,7 @@ def retry(sid: str, question: str, schema_text: str, df_names: list[str],
         "df_names": df_names,
         "df_columns": df_columns,
         "history_rows": _sanitize_history_rows(history_rows),
-        "error_msg": _scrub_error_msg(error_msg, frozenset(keep)),
+        "error_msg": _scrub_error_msg(error_msg, frozenset(keep), failed_code),
         "failed_code": failed_code,
         "use_pro": use_pro,
         "use_search": use_search,

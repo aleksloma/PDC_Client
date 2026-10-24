@@ -785,6 +785,22 @@ button.danger:hover {
   font-weight: 600;
 }
 
+/* Narrative-template answers (DIAGNOSTICS_SPEC A5.6): the turn's narrative
+   message and the caption above a table — spacing only, no new colours.
+   dashboard.css has no generic .hidden, so the live narrative slot carries
+   its own. */
+.pdc-narrative .message-content {
+  margin: 0;
+}
+
+.pdc-narrative.hidden {
+  display: none;
+}
+
+.pdc-caption {
+  margin: 10px 0 4px;
+}
+
 /* Chat Input */
 .chat-input-container {
   padding: 16px 24px 24px;

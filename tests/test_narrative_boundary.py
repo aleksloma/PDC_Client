@@ -349,3 +349,296 @@ def test_scrub_error_msg_drops_python_string_prefixes():
     msg = "TypeError: can't multiply sequence by non-int of type 'Department'"
     assert brain_client._scrub_error_msg(msg, keep) == msg
     assert brain_client._scrub_error_msg("Bob's 'x'", keep) == "Bob's '<value>'"
+
+
+# =========================================================================
+# PR B — flow-level sentinel tests. The REAL payload builders run (only
+# `brain_client._post` is replaced) and the generated code runs for real (the
+# conftest executes it in-process). The sentinels live only in the DATA: the
+# code reads them out of the frame into VALUES / FINDINGS / RESULT, so a
+# sentinel in a payload can only have come from a result value. The fake
+# /v1/summarize answers like a real model would — it repeats the preview —
+# which is how a value used to reach `content` and then the next turn's
+# history.
+# =========================================================================
+
+import pandas as pd                                         # noqa: E402
+
+import pdc_diag                                             # noqa: E402
+import run_chat_local                                       # noqa: E402
+
+_CAVEAT_KEYS = {"findings", "kind", "facts", "grain", "catalog"}
+
+SENTINEL_VALUES_CODE = (
+    "VALUES['n'] = int(dfs['d.csv']['n'].iloc[0])\n"
+    "VALUES['cat'] = str(dfs['d.csv']['cat'].iloc[0])\n")
+
+
+@pytest.fixture
+def sentinel_dfs():
+    return {"d.csv": pd.DataFrame({"cat": [SENTINEL_CAT, "Other"],
+                                   "n": [SENTINEL_NUM, 5]})}
+
+
+@pytest.fixture
+def flow_env(monkeypatch):
+    # schema_text legitimately lists a short text column's categories; keep it
+    # out of the picture so only the flow's own payloads are judged.
+    monkeypatch.setattr(run_chat_local, "build_schema_text", lambda *a, **k: "schema")
+    monkeypatch.setattr(settings, "BRAIN_CAPABILITIES", "narrative_v1,diagnostics_v1")
+
+
+class _FakeBrain:
+    def __init__(self, monkeypatch, plans, retry=None):
+        self.posts = []                       # (path, payload)
+        self._plans = list(plans)
+        self._retry = retry
+        monkeypatch.setattr(brain_client, "_post", self._post)
+
+    def _post(self, path, payload, sid, **kw):
+        self.posts.append((path, copy.deepcopy(payload)))
+        if path == "/v1/plan":
+            return dict(self._plans.pop(0))
+        if path == "/v1/retry":
+            return dict(self._retry)
+        if path == "/v1/describe":
+            return {"text": "A table of totals.", "usage": {}}
+        if path == "/v1/summarize":
+            return {"text": f"The answer is {payload.get('preview')}.", "usage": {}}
+        return {}
+
+    def paths(self, path):
+        return [p for name, p in self.posts if name == path]
+
+    def assert_no_sentinel(self):
+        assert self.posts
+        for path, payload in self.posts:
+            blob = json.dumps(payload, default=str, ensure_ascii=False)
+            assert str(SENTINEL_NUM) not in blob, path
+            assert "987,654,321" not in blob, path
+            assert SENTINEL_CAT not in blob, path
+
+
+def _turn(dfs, question, history):
+    events = list(run_chat_local.run_chat_multi_plot(
+        sid="t", dfs=dfs, schema_docs={}, question=question,
+        history_rows=history, user_email="alice@acme.com"))
+    assert len(events) == 1 and events[0].get("single_response"), events
+    return events[0]["result"]
+
+
+def _stored_turn(question, result):
+    """The two history rows a turn leaves behind, built the way routes/chat.py
+    stores them: `content` is the result's (brain-safe) `text`, and every
+    other result field — VALUES, rendered texts — rides along on the record."""
+    rec = dict(result)
+    rec.update({"role": "ai", "content": result.get("text") or ""})
+    return [{"role": "user", "content": question}, rec]
+
+
+FIRST_PLAN = {"kind": "PYTHON", "raw_text": "", "usage": {},
+              "code": SENTINEL_VALUES_CODE + "RESULT = int(dfs['d.csv']['n'].iloc[0])",
+              "narrative": "The largest total is {{n:count}} for {{cat:text}}."}
+
+
+def _first_turn(sentinel_dfs):
+    first = _turn(sentinel_dfs, "which segment is largest?", [])
+    # the sentinel really was produced locally (and rendered for display)
+    # A2.2: a string VALUE rendered as text has its `_` markdown-escaped.
+    escaped_cat = SENTINEL_CAT.replace("_", "\\_")
+    assert first.get("narrative_rendered") == (
+        f"The largest total is 987,654,321 for {escaped_cat}.")
+    return _stored_turn("which segment is largest?", first)
+
+
+def test_values_never_in_plan_payload(monkeypatch, flow_env, sentinel_dfs):
+    brain = _FakeBrain(monkeypatch, [
+        FIRST_PLAN,
+        {"kind": "ANSWER", "code": "Sure.", "raw_text": "", "usage": {}},
+    ])
+
+    history = _first_turn(sentinel_dfs)
+    _turn(sentinel_dfs, "and the smallest?", history)
+
+    plans = brain.paths("/v1/plan")
+    assert len(plans) == 2
+    second_history = plans[1]["history_rows"]
+    assert len(second_history) == 2
+    # the template (not the value) is what the brain sees of the first answer
+    assert "{{n:count}}" in second_history[1]["content"]
+    assert brain.paths("/v1/summarize") == []      # narrative => no summarize
+    brain.assert_no_sentinel()
+
+
+def test_values_never_in_retry_payload(monkeypatch, flow_env, sentinel_dfs):
+    failing = SENTINEL_VALUES_CODE + "RESULT = dfs['d.csv']['no_such_column']"
+    brain = _FakeBrain(monkeypatch, [
+        FIRST_PLAN,
+        {"kind": "PYTHON", "raw_text": "", "usage": {}, "code": failing,
+         "narrative": "Smallest: {{n:count}}."},
+    ], retry={"kind": "PYTHON", "usage": {},
+              "code": SENTINEL_VALUES_CODE + "RESULT = int(dfs['d.csv']['n'].min())"})
+
+    history = _first_turn(sentinel_dfs)
+    _turn(sentinel_dfs, "and the smallest?", history)
+
+    retries = brain.paths("/v1/retry")
+    assert len(retries) == 1
+    assert len(retries[0]["history_rows"]) == 2
+    brain.assert_no_sentinel()
+
+
+def test_values_never_in_describe_payload(monkeypatch, flow_env, sentinel_dfs):
+    code = (SENTINEL_VALUES_CODE
+            + "FINDINGS['coverage'] = 'coverage_change'\n"
+            + "FINDINGS['seg'] = VALUES['cat']\n"
+            + "RESULT = dfs['d.csv'].groupby('cat')['n'].sum().reset_index()")
+    brain = _FakeBrain(monkeypatch, [
+        {"kind": "PYTHON", "raw_text": "", "usage": {}, "code": code,
+         "narrative": "Totals by segment, top {{cat:text}} at {{n:count}}."},
+    ])
+
+    result = _turn(sentinel_dfs, "totals by segment", [])
+
+    assert result.get("table") is not None
+    describes = brain.paths("/v1/describe")
+    assert len(describes) == 1                      # uncaptioned visual => describe
+    caveat = describes[0].get("data_caveat")
+    assert isinstance(caveat, dict)                 # the turn carries FINDINGS
+    assert set(caveat) <= _CAVEAT_KEYS
+    findings = caveat.get("findings") or {}
+    assert findings == {"coverage": "coverage_change"}   # data-built value dropped
+    input_columns = {"cat", "n"}
+    for value in findings.values():
+        assert isinstance(value, (bool, str))
+        assert (isinstance(value, bool) or value in pdc_diag.FINDINGS_ENUM
+                or value in input_columns)
+    brain.assert_no_sentinel()
+
+
+def test_summarize_preview_always_null(monkeypatch, flow_env, sentinel_dfs):
+    code = SENTINEL_VALUES_CODE + "RESULT = int(dfs['d.csv']['n'].iloc[0])"
+    plan = {"kind": "PYTHON", "raw_text": "", "usage": {}, "code": code}
+
+    # the chat single flow, no template from the brain
+    brain = _FakeBrain(monkeypatch, [plan])
+    result = _turn(sentinel_dfs, "what is the largest total?", [])
+    sums = brain.paths("/v1/summarize")
+    assert len(sums) == 1
+    assert "preview" in sums[0] and sums[0]["preview"] is None
+    brain.assert_no_sentinel()
+    assert str(SENTINEL_NUM) not in (result.get("text") or "")
+
+    # Auto Analytics (`run_chat` -> `_run_chat_body`)
+    brain = _FakeBrain(monkeypatch, [plan])
+    run_chat_local.run_chat(sid="t", dfs=sentinel_dfs, schema_docs={},
+                            question="what is the largest total?", history_rows=[],
+                            user_email="alice@acme.com")
+    sums = brain.paths("/v1/summarize")
+    assert len(sums) == 1
+    assert "preview" in sums[0] and sums[0]["preview"] is None
+    brain.assert_no_sentinel()
+
+
+# =========================================================================
+# B7.7 follow-up (localhost finding): the scrub must not remove an
+# identifier the BRAIN wrote. A quoted literal whose content appears in the
+# failed code itself — as a whole identifier token, or inside one of the
+# code's own string literals — carries no new information, so it is kept;
+# a literal the code does not contain (a cell / category value) is still
+# scrubbed.
+# =========================================================================
+
+_NO_DF_KEEP = frozenset({"sales.csv", "Department", "Quantity"})
+
+
+def _retry_with_code(code, error_msg):
+    return _retry(df_names=["sales.csv"],
+                  df_columns={"sales.csv": ["Department", "Quantity"]},
+                  failed_code=code, error_msg=error_msg)
+
+
+def test_scrub_keeps_identifier_written_in_code():
+    code = "result = df.groupby('Department')['Quantity'].sum()\nRESULT = reslt"
+    scrub = brain_client._scrub_error_msg
+    assert scrub("NameError: name 'df' is not defined", _NO_DF_KEEP, code) == \
+        "NameError: name 'df' is not defined"
+    # a misspelt variable the code uses
+    assert scrub("NameError: name 'reslt' is not defined", _NO_DF_KEEP, code) == \
+        "NameError: name 'reslt' is not defined"
+    # module / attribute names the code wrote
+    code2 = "import seabornx\nfig = px.barr(df)"
+    assert scrub("ModuleNotFoundError: No module named 'seabornx'", _NO_DF_KEEP, code2) == \
+        "ModuleNotFoundError: No module named 'seabornx'"
+    assert scrub("AttributeError: module 'plotly.express' has no attribute 'barr'",
+                 _NO_DF_KEEP, code2) == \
+        "AttributeError: module '<value>' has no attribute 'barr'"
+    # a whole TOKEN only: 'df' is not kept because the code says 'dfs'
+    assert scrub("NameError: name 'df' is not defined", _NO_DF_KEEP, "x = dfs") == \
+        "NameError: name '<value>' is not defined"
+
+
+def test_scrub_keeps_literal_from_code_string():
+    code = "RESULT = df[df['region'] == 'North'].sum()"
+    scrub = brain_client._scrub_error_msg
+    assert scrub("KeyError: 'North'", _NO_DF_KEEP, code) == "KeyError: 'North'"
+    assert scrub('KeyError: "North"', _NO_DF_KEEP, code) == 'KeyError: "North"'
+    # a literal with spaces the code itself quotes
+    code2 = "RESULT = df.loc['North East']"
+    assert scrub("KeyError: 'North East'", _NO_DF_KEEP, code2) == "KeyError: 'North East'"
+
+
+def test_scrub_value_absent_from_code_still_scrubbed():
+    code = "RESULT = df[df['region'] == 'North'].sum()"
+    scrub = brain_client._scrub_error_msg
+    assert scrub(f"KeyError: '{SENTINEL_CAT}'", _NO_DF_KEEP, code) == "KeyError: '<value>'"
+    assert scrub(f"KeyError: '{SENTINEL_NUM}'", _NO_DF_KEEP, code) == "KeyError: '<value>'"
+    out = scrub(f"ValueError: could not convert \"{SENTINEL_CAT}\" to float", _NO_DF_KEEP, code)
+    assert SENTINEL_CAT not in out
+    # a prefixed repr literal the code does not contain stays scrubbed
+    for prefix in ("b", "u", "rb", "B", "Rb"):
+        out = scrub(f"KeyError: {prefix}'{SENTINEL_CAT}'", _NO_DF_KEEP, code)
+        assert out == "KeyError: '<value>'"
+    # a cell value that merely CONTAINS a code identifier is not kept
+    assert scrub("KeyError: 'North Pole'", _NO_DF_KEEP, code) == "KeyError: '<value>'"
+    # no code -> exactly the old rule
+    assert scrub("KeyError: 'North'", _NO_DF_KEEP, None) == "KeyError: '<value>'"
+    assert scrub("KeyError: 'North'", _NO_DF_KEEP) == "KeyError: '<value>'"
+
+
+def test_scrub_with_code_never_raises():
+    scrub = brain_client._scrub_error_msg
+    for code in (None, "", 5, b"x = df", ["df"], {"df": 1}, "'" * 1000, "x = '"):
+        for text in (None, 5, "NameError: name 'df' is not defined", "", "'unterminated"):
+            assert isinstance(scrub(text, _NO_DF_KEEP, code), str)
+
+
+def test_retry_payload_keeps_identifier_from_failed_code(monkeypatch):
+    sent = _capture_post(monkeypatch)
+    _retry_with_code("RESULT = df['Quantity'].sum()",
+                     "NameError: name 'df' is not defined")
+    assert sent["payload"]["error_msg"] == "NameError: name 'df' is not defined"
+    _retry_with_code("RESULT = sales.loc['North']", "KeyError: 'North'")
+    assert sent["payload"]["error_msg"] == "KeyError: 'North'"
+    _retry_with_code("RESULT = sales.loc[key]", f"KeyError: '{SENTINEL_CAT}'")
+    assert sent["payload"]["error_msg"] == "KeyError: '<value>'"
+    assert SENTINEL_CAT not in json.dumps(sent["payload"])
+
+
+def test_scrub_literal_substring_of_code_string_still_scrubbed():
+    """The string-literal rule is EXACT equality with a whole string literal
+    of the failed code: 'North' is not something the brain wrote when the
+    code only says 'North East' (keeping it would confirm a data value). A
+    word inside a code string is not an identifier TOKEN either."""
+    scrub = brain_client._scrub_error_msg
+    code = "RESULT = df.loc['North East']"
+    assert scrub("KeyError: 'North'", _NO_DF_KEEP, code) == "KeyError: '<value>'"
+    assert scrub('KeyError: "East"', _NO_DF_KEEP, code) == "KeyError: '<value>'"
+    assert scrub("KeyError: 'North East'", _NO_DF_KEEP, code) == "KeyError: 'North East'"
+    code2 = 'x = "North"\nRESULT = df[df.region == "North-East"]'
+    assert scrub("KeyError: 'North'", _NO_DF_KEEP, code2) == "KeyError: 'North'"
+    assert scrub("KeyError: 'North-East'", _NO_DF_KEEP, code2) == "KeyError: 'North-East'"
+    assert scrub("KeyError: 'East'", _NO_DF_KEEP, code2) == "KeyError: '<value>'"
+    # identifier tokens of the code itself are still kept
+    assert scrub("NameError: name 'df' is not defined", _NO_DF_KEEP, code) == \
+        "NameError: name 'df' is not defined"
