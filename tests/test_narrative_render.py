@@ -325,7 +325,88 @@ def test_brain_view_carries_no_value():
     assert out == "[v] [w]"
 
 
+# ------------------------------------------------------- drop_na_sentences
+# The quality gate (BRB retest follow-up 3): a rendered sentence holding the
+# "n/a" token (a missing slot, a None value, or a literal the template typed)
+# is dropped before display. `render` itself keeps producing "n/a".
+
+def _drop(text, what="narrative"):
+    fn = getattr(narrative, "drop_na_sentences", None)
+    assert callable(fn), "narrative.drop_na_sentences is missing"
+    return fn(text, sid=SID, what=what)
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Total is 5. Change was n/a in Q3.", "Total is 5."),
+    ("n/a", ""),
+    ("- a: 1\n- b: n/a\n- c: 3", "- a: 1\n- c: 3"),
+    ("Sales grew! Was it n/a? Yes.", "Sales grew! Yes."),
+    ("First N/A here. Second stays.", "Second stays."),
+    ("Para one.\n\nPara two is n/a.\n\nPara three.", "Para one.\n\nPara three."),
+    ("Was n/a.", ""),
+    ("One n/a. Two n/a!", ""),
+])
+def test_drop_na_sentences_cases(logs, text, expected):
+    assert _drop(text) == expected
+
+
+def test_drop_na_sentences_token_not_inside_a_word(logs):
+    for text in ("Ratio of banana/apple is high.", "The kn/ab code is fine.",
+                 "Plain sentence. Another one."):
+        assert _drop(text) == text
+    assert _lines(logs, "NARRATIVE_SENTENCE_DROPPED") == []
+
+
+def test_drop_na_sentences_text_without_na_is_byte_identical(logs):
+    text = "Line  one.\n\n\nLine two.  "
+    assert _drop(text) == text
+    assert _lines(logs, "NARRATIVE_SENTENCE_DROPPED") == []
+
+
+def test_drop_na_sentences_decimal_point_is_not_a_sentence_end(logs):
+    # rendered numbers carry "." (float / pct / ratio / amount): a sentence
+    # holding n/a after one is dropped WHOLE, and a kept sentence's number
+    # stays intact
+    text = "Ratio was 7.9x while the change was n/a. Total is 1,234.57."
+    assert _drop(text) == "Total is 1,234.57."
+
+
+def test_drop_na_sentences_logs_count_once_without_text(logs):
+    text = f"Kept {SECRET}. Dropped {SECRET} n/a. Also n/a here! End."
+    out = _drop(text, what="caption")
+    assert out == f"Kept {SECRET}. End."
+    lines = _lines(logs, "NARRATIVE_SENTENCE_DROPPED")
+    assert len(lines) == 1
+    assert "reason=missing_slot" in lines[0]
+    assert "n=2" in lines[0]
+    assert "what=caption" in lines[0]
+    blob = "\n".join(r.getMessage() for r in logs.records)
+    assert SECRET not in blob and "Dropped" not in blob
+
+
+def test_drop_na_sentences_on_rendered_slots(logs):
+    rendered = _r("Total is {{t}}. Change was {{c}} in {{p}}.", {"t": 5, "p": "Q3"})
+    assert rendered == "Total is 5. Change was n/a in Q3."      # render is unchanged
+    assert _drop(rendered) == "Total is 5."
+    assert "n=1" in _lines(logs, "NARRATIVE_SENTENCE_DROPPED")[0]
+    # a None VALUE renders n/a too
+    bullets = _r("- a: {{a}}\n- b: {{b}}", {"a": 1, "b": None})
+    assert _drop(bullets) == "- a: 1"
+    # a slot standing alone
+    assert _drop(_r("{{x}}", {})) == ""
+
+
+@pytest.mark.parametrize("bad", [None, 5, ["n/a"], b"n/a"])
+def test_drop_na_sentences_never_raises_on_non_str(logs, bad):
+    assert _drop(bad) == ""
+
+
 # ------------------------------------------------------------- value_display
+
+def test_value_display_uz_ru_labels_pinned():
+    assert value_display(5, "uz").startswith("**Natija:**")
+    assert value_display(5, "ru").startswith("**Результат:**")
+
 
 def test_value_display_scalar(logs):
     assert value_display(1234, "en") == "**Result:** 1,234"

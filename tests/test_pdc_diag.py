@@ -454,8 +454,10 @@ def test_detect_anomalies_relative_spike():
     assert v["anomaly_ratio_prev"] == pytest.approx(100.0 / 12.0)
     assert v["n_periods"] == 6
     assert v["n_anomalies"] == 1
+    # `rows` / `is_data_gap` are the additive trailing columns of the BRB
+    # retest follow-up (B8.4 gap rule).
     assert list(t.columns) == ["period", "value", "robust_z", "ratio_prev", "ratio_median",
-                               "is_anomaly", "is_primary"]
+                               "is_anomaly", "is_primary", "rows", "is_data_gap"]
     assert list(t["period"]) == [f"2025-{m:02d}" for m in range(1, 7)]
     assert int(t["is_primary"].sum()) == 1
     assert bool(t.loc[t["period"] == "2025-05", "is_primary"].iloc[0]) is True
@@ -512,6 +514,114 @@ def test_detect_anomalies_multiple():
     assert out["values"]["n_anomalies"] == 2
     # primary = the largest |log(ratio_median)|: the 100
     assert out["values"]["anomaly_period"] == "2025-02"
+
+
+# --- degenerate periods (BRB retest follow-up: thin February) ---------------
+ANOMALY_VALUE_KEYS = {"anomaly_period", "anomaly_value", "baseline_value",
+                      "anomaly_ratio_median", "anomaly_prev_period", "anomaly_prev_value",
+                      "anomaly_ratio_prev", "n_periods", "n_anomalies"}
+
+
+def _counted_frame(periods, row_counts, totals, metric="amount") -> pd.DataFrame:
+    """Each period has `row_counts[i]` rows whose metric sums to `totals[i]`."""
+    parts = [pd.DataFrame({"period": [p] * n, metric: [t / n] * n})
+             for p, n, t in zip(periods, row_counts, totals)]
+    return pd.concat(parts, ignore_index=True)
+
+
+def _gap_flags(table) -> dict:
+    return {str(p): bool(g) for p, g in zip(table["period"], table["is_data_gap"])}
+
+
+def test_thin_period_ratio_constant_shared_with_coverage_check():
+    import inspect
+    assert getattr(pdc_diag, "THIN_PERIOD_RATIO", None) == 0.5
+    cov = inspect.signature(pdc_diag.coverage_check).parameters["ratio_low"].default
+    assert cov == pdc_diag.THIN_PERIOD_RATIO
+    det = inspect.signature(pdc_diag.detect_anomalies).parameters
+    assert "thin_ratio" in det
+    assert det["thin_ratio"].default == pdc_diag.THIN_PERIOD_RATIO
+
+
+def test_detect_anomalies_collapsed_month_is_a_data_gap():
+    periods = [f"2025-{m:02d}" for m in range(1, 6)]
+    df = _counted_frame(periods, [1000, 1000, 1, 1000, 1000], [1000, 1000, 1, 1000, 1000])
+    out = pdc_diag.detect_anomalies(df, "period", "amount")
+    _assert_shape(out)
+    f, v, t = out["findings"], out["values"], out["table"]
+    assert f.get("period_status") == "data_gap"
+    assert f["anomaly"] == "no_anomaly"
+    for key in ("anomaly_up", "anomaly_is_latest", "multiple_anomalies"):
+        assert key not in f
+    assert v["n_anomalies"] == 0
+    assert v["anomaly_period"] is None
+    assert list(t.columns)[-2:] == ["rows", "is_data_gap"]
+    assert [int(x) for x in t["rows"]] == [1000, 1000, 1, 1000, 1000]
+    assert _gap_flags(t) == {p: p == "2025-03" for p in periods}
+    assert not bool(t.loc[t["period"] == "2025-03", "is_anomaly"].iloc[0])
+    assert int(t["is_primary"].sum()) == 0
+    assert set(v) == ANOMALY_VALUE_KEYS
+
+
+def test_detect_anomalies_zero_between_nonzero_neighbours_is_a_data_gap():
+    periods = [f"2025-{m:02d}" for m in range(1, 6)]
+    df = _counted_frame(periods, [10] * 5, [100, 100, 0, 100, 100])
+    out = pdc_diag.detect_anomalies(df, "period", "amount")
+    f, t = out["findings"], out["table"]
+    assert f.get("period_status") == "data_gap"
+    assert f["anomaly"] == "no_anomaly"
+    assert out["values"]["n_anomalies"] == 0
+    assert _gap_flags(t) == {p: p == "2025-03" for p in periods}
+    assert [int(x) for x in t["rows"]] == [10] * 5
+
+
+def test_detect_anomalies_real_spike_with_normal_rows_unchanged():
+    out = pdc_diag.detect_anomalies(_series_frame([10, 11, 10, 12, 100, 11]), "period", "amount")
+    f, t = out["findings"], out["table"]
+    assert f["anomaly"] == "anomaly_confirmed"
+    assert "period_status" not in f
+    assert not any(bool(g) for g in t["is_data_gap"])
+    assert [int(x) for x in t["rows"]] == [1] * 6
+    assert t["is_data_gap"].dtype == bool
+
+
+def test_detect_anomalies_brb_thin_february():
+    """The Uzbek Q3 shape: February holds a fraction of the rows (3,792 of a
+    median 12,617) and a near-zero total. It is a gap, never the anomaly; the
+    primary anomaly is the March spike. Magnitudes invented."""
+    periods = ["2025 Ноябрь", "2025 Декабрь", "2026 Январь", "2026 Февраль", "2026 Март"]
+    rows = [26605, 12617, 11302, 3792, 33455]
+    totals = [4500.0, 602.0, 564.0, 0.004, 4739.0]
+    df = _counted_frame(periods, rows, totals, metric="npl")
+    out = pdc_diag.detect_anomalies(df, "period", "npl")
+    _assert_shape(out)
+    f, v, t = out["findings"], out["values"], out["table"]
+    assert list(t["period"]) == periods
+    assert [int(x) for x in t["rows"]] == rows
+    assert _gap_flags(t) == {p: p == "2026 Февраль" for p in periods}
+    assert f.get("period_status") == "data_gap"
+    assert f["anomaly"] == "anomaly_confirmed"
+    assert f.get("anomaly_up") is True
+    assert f.get("anomaly_is_latest") is True
+    assert f.get("multiple_anomalies") is True          # November and March
+    assert v["anomaly_period"] == "2026 Март"
+    assert v["n_anomalies"] == 2
+    assert list(t[t["is_primary"]]["period"]) == ["2026 Март"]
+    feb = t[t["period"] == "2026 Февраль"].iloc[0]
+    assert not bool(feb["is_anomaly"]) and not bool(feb["is_primary"])
+    assert set(v) == ANOMALY_VALUE_KEYS                  # no new VALUES keys
+
+
+def test_detect_anomalies_thin_ratio_kwarg():
+    periods = [f"2025-{m:02d}" for m in range(1, 6)]
+    # 300 rows of a median 1000: thin at the default 0.5, not thin at 0.2
+    df = _counted_frame(periods, [1000, 1000, 300, 1000, 1000], [1000, 1000, 1, 1000, 1000])
+    default = pdc_diag.detect_anomalies(df, "period", "amount")
+    assert default["findings"].get("period_status") == "data_gap"
+    loose = pdc_diag.detect_anomalies(df, "period", "amount", thin_ratio=0.2)
+    assert "period_status" not in loose["findings"]
+    assert loose["findings"]["anomaly"] == "anomaly_confirmed"
+    assert loose["values"]["anomaly_period"] == "2025-03"
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +739,125 @@ def test_decompose_change_missing_member_counts_as_zero_and_top_k():
     if len(new):
         assert new.iloc[0]["from_value"] == pytest.approx(0.0)
     assert out["values"]["change_top_member"] == "M3"
+
+
+# --- Unknown-dominated dimensions (BRB retest follow-up: SEKTOR) -----------
+def _sektor_region_frame(p1: dict, p2: dict, sektor_from, sektor_to) -> pd.DataFrame:
+    """Two periods by REGION; each row's SEKTOR cycles through the list."""
+    rows = []
+    for period, members, sektors in (("2025-01", p1, sektor_from), ("2025-02", p2, sektor_to)):
+        for i, (member, v) in enumerate(members.items()):
+            rows.append({"period": period, "REGION": member,
+                         "SEKTOR": sektors[i % len(sektors)], "amount": v})
+    return pd.DataFrame(rows)
+
+
+EVEN_BASE = {"A": 100, "B": 100, "C": 100, "D": 100}
+
+
+def test_decompose_change_skips_unknown_dominated_dim_concentrated():
+    df = _sektor_region_frame(EVEN_BASE, {"A": 300, "B": 100, "C": 100, "D": 100},
+                              ["Номаълум"], ["Номаълум"])
+    out = pdc_diag.decompose_change(df, "period", "amount", dims=["SEKTOR", "REGION"])
+    _assert_shape(out)
+    f, v, t = out["findings"], out["values"], out["table"]
+    assert f.get("unknown_dominated") is True
+    assert f.get("unknown_dim") == "SEKTOR"
+    assert f["change_shape"] == "concentrated_in_one_dim"
+    assert f["change_dim"] == "REGION"
+    assert v["change_dim_label"] == "REGION"
+    assert v["change_top_member"] == "A"
+    assert set(t["dim"]) == {"REGION"}                  # no SEKTOR rows
+
+
+def test_decompose_change_unknown_dim_never_becomes_the_top_member():
+    """The BRB shape: REGION's change is uneven but not concentrated, so the
+    all-Unknown SEKTOR (one member, 100 % of the delta) used to win the
+    scoring and give `change_top_member = Номаълум` with no dim label."""
+    df = _sektor_region_frame(EVEN_BASE, {"A": 150, "B": 140, "C": 100, "D": 100},
+                              ["Номаълум"], ["Номаълум"])
+    out = pdc_diag.decompose_change(df, "period", "amount", dims=["SEKTOR", "REGION"])
+    f, v, t = out["findings"], out["values"], out["table"]
+    assert f.get("unknown_dominated") is True
+    assert f.get("unknown_dim") == "SEKTOR"
+    assert v["change_top_member"] == "A"
+    assert v["change_dim_label"] == "REGION"
+    assert "SEKTOR" not in set(t["dim"])
+
+
+def test_decompose_change_all_dims_unknown_dominated():
+    rows = []
+    for period, vals in (("2025-01", [100, 100, 100]), ("2025-02", [300, 100, 100])):
+        for v in vals:
+            rows.append({"period": period, "SEKTOR": "Номаълум", "BRANCH": None,
+                         "amount": v})
+    df = pd.DataFrame(rows)
+    out = pdc_diag.decompose_change(df, "period", "amount", dims=["SEKTOR", "BRANCH"])
+    _assert_shape(out)
+    f, v, t = out["findings"], out["values"], out["table"]
+    assert f.get("unknown_dominated") is True
+    assert f.get("unknown_dim") == "SEKTOR"              # first in argument order
+    assert "change_dim" not in f
+    for key in ("change_dim_label", "change_top_member", "change_top_member_share",
+                "change_top_member_delta"):
+        assert v[key] is None, key
+    assert len(t) == 0
+    assert list(t.columns) == ["dim", "member", "from_value", "to_value", "delta",
+                               "share_of_delta", "share_of_base"]
+    assert v["change_abs"] == pytest.approx(200.0)       # the totals are still reported
+
+
+def test_decompose_change_unknown_only_in_to_period_is_skipped():
+    df = _sektor_region_frame(EVEN_BASE, {"A": 300, "B": 100, "C": 100, "D": 100},
+                              ["retail", "corp"], ["unknown", "unknown", "unknown", "corp"])
+    out = pdc_diag.decompose_change(df, "period", "amount", dims=["SEKTOR", "REGION"])
+    f, t = out["findings"], out["table"]
+    assert f.get("unknown_dominated") is True
+    assert f.get("unknown_dim") == "SEKTOR"
+    assert "SEKTOR" not in set(t["dim"])
+    assert out["values"]["change_dim_label"] == "REGION"
+
+
+def test_decompose_change_exactly_half_unknown_is_not_skipped():
+    df = _sektor_region_frame(EVEN_BASE, {"A": 300, "B": 100, "C": 100, "D": 100},
+                              ["unknown", "retail"], ["unknown", "retail"])
+    out = pdc_diag.decompose_change(df, "period", "amount", dims=["SEKTOR", "REGION"])
+    f, t = out["findings"], out["table"]
+    assert "unknown_dominated" not in f
+    assert "unknown_dim" not in f
+    assert "SEKTOR" in set(t["dim"])
+
+
+def test_decompose_change_unknown_share_kwarg():
+    # 3 of 4 rows Unknown in both periods: a share of 0.75
+    sektors = ["n/a", " N/A ", "-", "corp"]
+    df = _sektor_region_frame(EVEN_BASE, {"A": 300, "B": 100, "C": 100, "D": 100},
+                              sektors, sektors)
+    default = pdc_diag.decompose_change(df, "period", "amount", dims=["SEKTOR", "REGION"])
+    assert default["findings"].get("unknown_dim") == "SEKTOR"
+    assert "SEKTOR" not in set(default["table"]["dim"])
+    loose = pdc_diag.decompose_change(df, "period", "amount", dims=["SEKTOR", "REGION"],
+                                      unknown_share=0.8)
+    assert "unknown_dominated" not in loose["findings"]
+    assert "SEKTOR" in set(loose["table"]["dim"])
+
+
+def test_decompose_change_dim_label_set_when_spread_evenly():
+    df = _two_period_dim_frame(EVEN_BASE, {"A": 200, "B": 200, "C": 200, "D": 200})
+    out = pdc_diag.decompose_change(df, "period", "amount", dims=["region"])
+    f, v = out["findings"], out["values"]
+    assert f["change_shape"] == "spread_evenly"
+    assert v["change_top_member"] is not None
+    assert v["change_dim_label"] == "region"
+
+
+def test_decompose_change_dim_label_set_in_neither_branch():
+    df = _two_period_dim_frame(EVEN_BASE, {"A": 150, "B": 140, "C": 100, "D": 100})
+    out = pdc_diag.decompose_change(df, "period", "amount", dims=["region"])
+    v = out["values"]
+    assert "change_dim" not in out["findings"]           # not concentrated
+    assert v["change_top_member"] == "A"
+    assert v["change_dim_label"] == "region"
 
 
 # ---------------------------------------------------------------------------

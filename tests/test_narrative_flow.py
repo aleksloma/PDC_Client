@@ -294,7 +294,10 @@ CODE_B = "fig = chart_b\nVALUES['b'] = 2"
 
 
 def test_caption_uses_own_block_values_only(monkeypatch, dfs):
-    cap = "A={{a}} B={{b}}"
+    # Two sentences per caption: each block renders only its own value; the
+    # sentence naming the OTHER block's slot reads n/a and is dropped by the
+    # quality gate (BRB retest follow-up; this used to show "A=1 B=n/a").
+    cap = "A is {{a}}. B is {{b}}."
     brain = Brain(_multi_plan(("plot_code", CODE_A), ("plot_code", CODE_B),
                               narrative_t="Sum {{a}} {{b}}",
                               captions={"1": cap, "2": cap})).install(monkeypatch)
@@ -303,7 +306,7 @@ def test_caption_uses_own_block_values_only(monkeypatch, dfs):
     events = _run_multi(dfs)
 
     parts = _partials(events)
-    assert [p["answer"] for p in parts] == ["A=1 B=n/a", "A=n/a B=2"]
+    assert [p["answer"] for p in parts] == ["A is 1.", "B is 2."]
     assert [p.get("caption_template") for p in parts] == [cap, cap]
     assert [p.get("block_index") for p in parts] == [1, 2]
     assert [p.get("phase") for p in parts] == [1, 1]
@@ -420,7 +423,11 @@ def test_values_merge_order_collision_log(monkeypatch, dfs, caplog):
     assert any("FINDINGS_KEY_COLLISION n=1" in m for m in msgs)
 
 
-def test_failed_block_slot_renders_na(monkeypatch, dfs):
+def test_failed_block_slot_renders_na(monkeypatch, dfs, caplog):
+    """A failed block's slot renders n/a and the quality gate drops the
+    sentence holding it. "a={{a}} b={{b}}" is ONE sentence, so nothing is
+    left: the narrative is not used and the turn shows today's no-narrative
+    answer, the successful chart's describe text (it has no caption)."""
     code_ok = "fig = chart_ok\nVALUES['a'] = 1"
     code_bad = "fig = chart_bad\nVALUES['b'] = 5"
     brain = Brain(_multi_plan(("plot_code", code_ok), ("plot_code", code_bad),
@@ -430,14 +437,101 @@ def test_failed_block_slot_renders_na(monkeypatch, dfs):
            "values_dropped": 0, "findings": {}, "findings_dropped": 0}
     _install_renders(monkeypatch, {code_ok: _chart({"a": 1}), code_bad: bad})
 
-    events = _run_multi(dfs)
+    with caplog.at_level(logging.INFO, logger="datachat"):
+        events = _run_multi(dfs)
 
     assert len(brain.calls["retry"]) == 3             # the bad block used its retries
+    assert len(brain.calls["describe"]) == 1
+    assert brain.calls["describe"][0]["code"] == code_ok
+    assert _narrative_events(events) == []
+    done = _done(events)
+    assert done["display_answer"] == "described"
+    assert done["combined_answer"] == "described"
+    assert "n/a" not in done["display_answer"]
+    assert done["narrative_view"]["phase1"] is None
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("NARRATIVE_SENTENCE_DROPPED" in m and "reason=missing_slot" in m
+               and "n=1" in m and "what=narrative" in m for m in msgs), msgs
+    assert any("NARRATIVE_SKIPPED reason=all_sentences_dropped" in m for m in msgs), msgs
+
+
+def test_narrative_keeps_clean_sentence_drops_na_one(monkeypatch, dfs, caplog):
+    code_ok = "fig = chart_ok2\nVALUES['a'] = 1"
+    code_bad = "fig = chart_bad2\nVALUES['b'] = 5"
+    narr_t = "A is {{a}}. B is {{b}}."
+    brain = Brain(_multi_plan(("plot_code", code_ok), ("plot_code", code_bad),
+                              narrative_t=narr_t)).install(monkeypatch)
+    _install_renders(monkeypatch, {code_ok: _chart({"a": 1})})
+
+    with caplog.at_level(logging.INFO, logger="datachat"):
+        events = _run_multi(dfs)
+
     narr = _narrative_events(events)
     assert len(narr) == 1
-    assert narr[0]["text"] == "a=1 b=n/a"
-    assert narr[0]["values"] == {"a": 1}
-    assert _done(events)["display_answer"] == "a=1 b=n/a"
+    assert narr[0]["text"] == "A is 1."
+    done = _done(events)
+    assert done["display_answer"] == "A is 1."
+    assert done["narrative_view"]["phase1"]["narrative_rendered"] == "A is 1."
+    # the brain-safe content is still the template (R0)
+    assert done["combined_answer"] == narrative.history_content(narr_t, {})
+    msgs = [r.getMessage() for r in caplog.records]
+    dropped = [m for m in msgs if "NARRATIVE_SENTENCE_DROPPED" in m]
+    assert len(dropped) == 1 and "n=1" in dropped[0] and "what=narrative" in dropped[0]
+    assert not any("all_sentences_dropped" in m for m in msgs)
+    assert [kw["code"] for kw in brain.calls["describe"]] == [code_ok]
+
+
+def test_caption_with_none_value_goes_to_describe(monkeypatch, dfs, caplog):
+    code_x = "fig = chart_x\nVALUES['x'] = None"
+    code_y = "fig = chart_y\nVALUES['y'] = 3"
+    brain = Brain(_multi_plan(("plot_code", code_x), ("plot_code", code_y),
+                              captions={"1": "{{x}} here", "2": "Y is {{y}}."}),
+                  describe_text="described X").install(monkeypatch)
+    _install_renders(monkeypatch, {code_x: _chart({"x": None}), code_y: _chart({"y": 3})})
+
+    with caplog.at_level(logging.INFO, logger="datachat"):
+        events = _run_multi(dfs)
+
+    assert len(brain.calls["describe"]) == 1          # that visual only
+    assert brain.calls["describe"][0]["code"] == code_x
+    parts = _partials(events)
+    assert [p["answer"] for p in parts] == ["described X", "Y is 3."]
+    assert all("n/a" not in p["answer"] for p in parts)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("NARRATIVE_SENTENCE_DROPPED" in m and "what=caption" in m for m in msgs), msgs
+
+
+def test_single_scalar_all_dropped_narrative_falls_back_to_summarize(monkeypatch, dfs,
+                                                                    caplog):
+    plan = {"kind": "PYTHON", "code": "RESULT = 42", "raw_text": "", "usage": {},
+            "narrative": "{{missing}}"}
+    brain = Brain(plan, summarize_text="The answer is computed.").install(monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="datachat"):
+        result = _single(_run_multi(dfs, question="what is the total?"))
+
+    assert len(brain.calls["summarize"]) == 1
+    assert brain.calls["summarize"][0].get("preview", "missing") is None
+    assert result["text"] == "The answer is computed."
+    assert result["value_display"] == "**Result:** 42"
+    assert "narrative_rendered" not in result
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("NARRATIVE_SKIPPED reason=all_sentences_dropped" in m for m in msgs), msgs
+
+
+def test_single_table_all_dropped_narrative_uses_describe(monkeypatch, dfs):
+    code = "VALUES['a'] = None\nRESULT = dfs['f.csv']"
+    plan = {"kind": "PYTHON", "code": code, "raw_text": "", "usage": {},
+            "narrative": "The value is {{a}}."}
+    brain = Brain(plan).install(monkeypatch)
+    _install_renders(monkeypatch, {}, {code: _table({"a": None})})
+
+    result = _single(_run_multi(dfs))
+
+    assert len(brain.calls["describe"]) == 1
+    assert result["text"] == "described"
+    assert "narrative_rendered" not in result
+    assert "narrative_template" not in result
 
 
 def test_no_successful_block_drops_narrative(monkeypatch, dfs):
