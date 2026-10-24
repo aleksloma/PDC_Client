@@ -105,7 +105,7 @@ the convenience `kind` + `code` from `_extract_code_kind`.
   "user_email": "alice@acme.com",
   "dataset_profile": {                     // OPTIONAL — omitted by pre-profile clients
     "sales.csv": {
-      "profile_version": 1, "rows": 12480, "duplicate_row_count": 0,
+      "profile_version": 2, "rows": 12480, "duplicate_row_count": 0,
       "computed_at": "2026-08-23T09:14:02+00:00", "sampled": false,
       "grain": { "columns": ["order_id"], "kind": "single", "text": "one row per (order_id)" },
       "warnings": ["Quantity is constant"],  // the value is never sent (narrative release on)

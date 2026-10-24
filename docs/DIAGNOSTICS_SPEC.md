@@ -774,6 +774,7 @@ The bool means "order known". Rules, in order:
 ```python
 def coverage_check(df, period_col: str, dims: list, metrics: list, *, order=None,
                    ratio_low: float = 0.5, ratio_high: float = 2.0, jaccard_min: float = 0.5,
+                   share_shift: float = 0.5, vanish_share: float = 0.2,
                    unknown_share: float = 0.5, unit_cols: list | None = None,
                    as_of=None, prefix: str = "") -> dict
 ```
@@ -784,7 +785,7 @@ Let `P` be the ordered periods and `n_p` the rows per period.
 
 **Findings:**
 - `coverage`:
-  - `"coverage_change"` when some dim `d` (dims ∪ unit_cols) has a period with `|S_p| < ratio_low·median|S|` or `|S_p| > ratio_high·median|S|`, or when `Jaccard(S_first, S_last) < jaccard_min`;
+  - `"coverage_change"` when some dim `d` (dims ∪ unit_cols) has a period with `|S_p| < ratio_low·median|S|` or `|S_p| > ratio_high·median|S|`, or when `Jaccard(S_first, S_last) < jaccard_min`, or when, between two consecutive periods that both hold a non-null member of `d`, some member's share of the period's non-null rows moves by more than `share_shift` (absolute; a missing member counts as 0) or a member holding more than `vanish_share` of the earlier period is absent from the later one (a period where `d` is entirely null breaks the chain: the periods on either side of it are not compared). The last rule catches a clean two-value switch (two currencies 50/50, then one), whose Jaccard is exactly 0.5;
   - otherwise `"coverage_stable"`.
 - `coverage_dim`: the dim with the lowest Jaccard (ties → argument order), when the change holds.
 - `thin_period`: some `n_p < ratio_low · median(n_p)`.
@@ -886,14 +887,15 @@ def attribute_level(df, target, dims, numeric_cols, *, method: str = "auto",
 
 ```python
 def check_metric_overlap(df, metric_a, metric_b, *, equal_share: float = 0.5,
-                         rel_tol: float = 1e-9, prefix: str = "") -> dict
+                         rel_tol: float = 1e-9, min_compared_share: float = 0.1,
+                         prefix: str = "") -> dict
 ```
 
-- Uses rows where both metrics are non-null. Two values are equal iff `|a−b| ≤ rel_tol·max(|a|, |b|, 1)`.
+- Compares the rows where both metrics are non-null AND not both zero (two sparse metrics that are zero in most rows are not the same metric). When no row, or fewer than `min_compared_share` of the non-null rows, is compared, the equal share is `None` and no finding is emitted. Two values are equal iff `|a−b| ≤ rel_tol·max(|a|, |b|, 1)`.
 - **Findings:**
   - `metric_relation = "metric_definition_overlap"` iff the equal share ≥ `equal_share`;
   - `metrics_identical` iff the equal share ≥ 0.99.
-- **VALUES:** `overlap_equal_share` (fraction), `overlap_sum_ratio` (Σa/Σb), `overlap_rows`.
+- **VALUES:** `overlap_equal_share` (fraction of the compared rows), `overlap_sum_ratio` (Σa/Σb over the non-null rows), `overlap_rows` (the compared rows), `overlap_nonnull_rows`.
 - **Table:** one summary row.
 
 #### B8.8 Chart helpers
@@ -1242,7 +1244,7 @@ playbook:
       top_member, top_member_target, overall_target; FINDINGS attribution, top_feature, second_feature,
       method_fallback
     check_metric_overlap: >
-      VALUES overlap_equal_share, overlap_sum_ratio, overlap_rows; FINDINGS metric_relation, metrics_identical
+      VALUES overlap_equal_share, overlap_sum_ratio, overlap_rows, overlap_nonnull_rows; FINDINGS metric_relation, metrics_identical
     slot_rule: >
       A narrative slot must be one of these VALUES keys (with the prefix= you passed) or a key the code sets
       itself with VALUES["..."] = …; never an invented name.
@@ -1486,7 +1488,7 @@ Their tests are named in B7.6, B7.7 and A2.2. Docs: `AI_CONSTITUTION.md` Art. II
 - **Return shapes at the exec sites.** `code_exec._execute_in_process` writes the four keys EXPLICITLY in its success return literal (`"values": outputs["values"], "values_dropped": …`), not `**outputs`; each success return of `plot_utils._render_in_process` is `out = {...}; return _with_outputs(out, env)`. Both keep the success dicts literals with constant string keys, which the AST pins in `tests/test_executor_dispatch.py` read (`test_the_transport_python_key_list_matches_the_in_process_success_return` compares code_exec's success key set with `exec_transport._PYTHON_KEYS`; `test_the_transport_plot_key_list_covers_every_in_process_return` checks plot_utils' literals against `_PLOT_KEYS`).
 - **`.item()` only on numpy scalars.** `exec_transport` converts a value through numpy's own `np.generic.item` only when it is an `np.generic`, and inspects EXACT types (`type(x) is …`, an exact `dict` read through `dict.items`). An arbitrary object with an `.item()` method — or a subclass overriding `item()`, `items()` or `__len__` — is dropped without any of its methods running: the capture runs after the timed exec, where code-defined methods could loop forever. (A3.1 said "a non-builtin with a callable `.item()`".)
 - **Retry `error_msg` scrub (B7.7).** `_scrub_error_msg` drops a `b` / `u` / `r` / `f` string prefix before matching, so a `b'…'` literal is scrubbed too; replaces a literal whatever its length (no 200-character limit); and KEEPS, besides the input column and df names, any literal the failed code itself contains — as a whole identifier token (dotted names too) or inside one of the code's own string literals — since the brain wrote that text (`NameError: name 'totl'`, the `'North'` of `df.loc['North']`).
-- **Stock-vs-flow profile warning (not in this spec).** `dataset_profile` adds the warning `<a> equals <b> in <pct>% of rows: likely a stock, not a flow` for two numeric (non-bool, non-constant) columns equal in more than 90 % of the rows where both are set (`np.isclose`, `rtol=1e-9`); one warning per equality group (k mutually equal columns warn once), two all-unique columns equal in every row (ids, row numbers) are skipped, and the scan is skipped above 30 numeric columns. Names and an integer percentage only.
+- **Stock-vs-flow profile warning (not in this spec).** `dataset_profile` adds the warning `<a> equals <b> in <pct>% of rows: likely a stock, not a flow` for two numeric (non-bool, non-constant) columns equal in more than 90 % of the COMPARED rows — both set and not both zero (`np.isclose`, `rtol=1e-9`); the percentage is over those rows, and a pair with fewer than 10 % of its both-set rows compared is not judged (`EQUAL_PAIR_MIN_COMPARED_SHARE`), so two sparse columns that are zero in most rows never warn; one warning per equality group (k mutually equal columns warn once), two all-unique columns equal in every row (ids, row numbers) are skipped, and the scan is skipped above 30 numeric columns. Names and an integer percentage only. The zero rule raised `dataset_profile.PROFILE_VERSION` to 2: a stored profile of version 1 is read as missing, so uploaded files and snapshot tables recompute theirs at the next question, while a LIVE table's sampled profile is omitted from the plan until the administrator re-profiles the table (Refresh now, or a mode change).
 - **`two_phase_v1` filtered out.** `settings.brain_capabilities()` recognises only `narrative_v1` and `diagnostics_v1`; a configured `two_phase_v1` is dropped, and without `narrative_v1` nothing is sent at all (`diagnostics_v1` alone is not announced).
 - **Single-chart multi turns.** A `run_chat_multi_plot` turn that produced exactly one chart is stored as a single-visual record (no `images[]`, unless that chart is phase 2), so the chart's caption goes into the record's `caption_template` / `caption_rendered` (an uncaptioned chart of a narrated turn: `caption_described`); a stopped single-chart record appends the stop note to that field.
 - **Title.** `_answer_for_title` uses `brain_view` of the narrative template, else (single flow) of the caption template; a multi turn without a narrative passes its brain-safe `content` with any caption template in it bracketed by `brain_view`.
