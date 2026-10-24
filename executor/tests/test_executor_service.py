@@ -289,8 +289,31 @@ def test_scalar_result(executor_env):
     assert isinstance(response.get("peak_rss_mb"), (int, float)), response
     assert response.get("exit_code") == 0, response
     decoded = _decode(response, job_dir)
-    assert decoded == {"error": None, "result": 42, "preview": 42, "image_base64": None}, decoded
+    # The success payload carries the narrative outputs too (spec A3.1):
+    # empty dicts and zero drop counts when the code sets nothing.
+    assert decoded == {"error": None, "result": 42, "preview": 42, "image_base64": None,
+                       "values": {}, "values_dropped": 0,
+                       "findings": {}, "findings_dropped": 0}, decoded
     assert wall < COLD_JOB_BUDGET_S, wall
+
+
+def test_values_and_findings_cross_the_real_runner(executor_env):
+    code = "\n".join([
+        "VALUES['n'] = 3",
+        "VALUES['frame'] = dfs['sales']",      # a DataFrame: dropped and counted
+        "FINDINGS['coverage'] = 'coverage_stable'",
+        "FINDINGS['bad'] = 7",                 # a number: dropped and counted
+        "RESULT = pdc_diag.fmt(1234567, 'count')",
+    ])
+    with _client() as client:
+        job_dir, response, _ = _submit(client, executor_env, code)
+    assert response.get("status") == "ok", response
+    decoded = _decode(response, job_dir)
+    assert decoded["result"] == "1,234,567", decoded
+    assert decoded["values"] == {"n": 3}, decoded
+    assert decoded["values_dropped"] == 1, decoded
+    assert decoded["findings"] == {"coverage": "coverage_stable"}, decoded
+    assert decoded["findings_dropped"] == 1, decoded
 
 
 def test_dataframe_result_reads_back_equal(executor_env):
