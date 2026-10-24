@@ -88,6 +88,7 @@ FORBIDDEN_EXECUTOR_PACKAGES = [
 RUNTIME_COPY_SOURCES = {
     "code_exec.py", "plot_utils.py", "exec_sanitizer.py", "sandbox_guard.py",
     "outlier_utils.py", "logger_utils.py", "settings.py", "exec_transport.py",
+    "pdc_diag.py",
     "static/fonts/DejaVuSans.ttf",
     "executor/__init__.py", "executor/app.py", "executor/runner.py",
     "executor/requirements.txt",

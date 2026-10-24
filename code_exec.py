@@ -54,6 +54,9 @@ except ImportError:
     calplot = None
 from plot_utils import upset_plot_from_sets
 from outlier_utils import outlier_mask, drop_extreme_outliers
+# The sandbox diagnostics library (DIAGNOSTICS_SPEC B8) — a leaf module,
+# registered at BOTH exec sites like the outlier helpers.
+import pdc_diag
 try:
     from adjustText import adjust_text
 except ImportError:
@@ -219,7 +222,8 @@ def _execute_in_process(code: str, dfs: dict, sid: str | None = None, timeout: f
         sid: Session ID for logging
         timeout: Execution timeout in seconds (default: CODE_EXEC_TIMEOUT_SECONDS)
 
-    Returns a dict with possible keys: error, result, preview, image_base64.
+    Returns a dict with possible keys: error, result, preview, image_base64,
+    and on success values, values_dropped, findings, findings_dropped.
     """
     if timeout is None:
         timeout = CODE_EXEC_TIMEOUT_SECONDS
@@ -242,6 +246,11 @@ def _execute_in_process(code: str, dfs: dict, sid: str | None = None, timeout: f
         # generated code to call these instead of re-implementing detection
         "outlier_mask": outlier_mask,
         "drop_extreme_outliers": drop_extreme_outliers,
+        # Diagnostics library + the two dicts generated code fills
+        # (DIAGNOSTICS_SPEC A3.1): FRESH per job, so item assignment works
+        # without an assignment and nothing leaks from the previous job.
+        "pdc_diag": pdc_diag,
+        "VALUES": {}, "FINDINGS": {},
         # Machine Learning
         "train_test_split": train_test_split,
         "LogisticRegression": LogisticRegression,
@@ -324,4 +333,9 @@ def _execute_in_process(code: str, dfs: dict, sid: str | None = None, timeout: f
         log_with_sid(sid or "exec", "info", f"EXEC_OK code_hash={h}", **meta)
     except Exception:
         pass
-    return {"error": None, "result": result, "preview": preview, "image_base64": image_b64}
+    # VALUES / FINDINGS: filtered here, dropped entries only COUNTED (never
+    # logged — their content may be a customer value). Never raises.
+    outputs = exec_transport.capture_outputs(env)
+    return {"error": None, "result": result, "preview": preview, "image_base64": image_b64,
+            "values": outputs["values"], "values_dropped": outputs["values_dropped"],
+            "findings": outputs["findings"], "findings_dropped": outputs["findings_dropped"]}
