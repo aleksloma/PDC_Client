@@ -205,7 +205,7 @@ def test_profile_without_equal_columns_byte_identical():
         '"top_values": [["x", 1], ["y", 1], ["z", 1], ["w", 1]]}}, '
         '"duplicate_row_count": 0, '
         '"grain": {"columns": ["a"], "kind": "single", "text": "one row per (a)"}, '
-        '"profile_version": 1, "rows": 4, "sampled": false, "warnings": []}')
+        '"profile_version": 2, "rows": 4, "sampled": false, "warnings": []}')
     assert json.dumps(prof, sort_keys=True) == json.dumps(expected, sort_keys=True)
 
 
@@ -225,3 +225,49 @@ def test_stock_not_flow_skips_identical_unique_id_columns():
     df = pd.DataFrame({"ROW_NO": np.arange(1, n + 1), "ID": np.arange(1, n + 1),
                        "amount": np.arange(n) % 7})
     assert not any("equals" in w for w in dp.compute_profile(df)["warnings"])
+
+
+# Follow-up (narrative s1): a row where BOTH columns are 0 says nothing about
+# whether the two columns measure the same thing — two flow columns that are
+# mostly empty months look "equal" there. Such rows are left out of the
+# comparison; when fewer than 10% of the both-non-null rows remain, the pair
+# is not judged at all.
+
+def test_stock_not_flow_ignores_rows_where_both_are_zero():
+    n = 100
+    granted = np.arange(1, n + 1, dtype=np.int64) * 3          # never 0
+    loan = granted.copy()
+    loan[94:] = loan[94:] + 1000                                # 94 of 100 equal
+    new_count = np.zeros(n, dtype=np.int64)
+    new_amount = np.zeros(n, dtype=np.int64)
+    new_count[98:] = [1, 2]                                     # 98 both-zero rows,
+    new_amount[98:] = [5, 7]                                    # the 2 others differ
+    df = pd.DataFrame({"GRANTED_LOAN_COUNT": granted, "LOAN_COUNT": loan,
+                       "NEW_LOAN_COUNT": new_count, "NEW_LOAN_AMOUNT": new_amount,
+                       "label": [f"l{i}" for i in range(n)]})
+    warnings = dp.compute_profile(df)["warnings"]
+    expected = "GRANTED_LOAN_COUNT equals LOAN_COUNT in 94% of rows: likely a stock, not a flow"
+    assert expected in warnings
+    assert not any("NEW_LOAN" in w and "equals" in w for w in warnings), warnings
+    assert [w for w in warnings if "equals" in w] == [expected]
+
+
+def test_stock_not_flow_emits_nothing_under_ten_percent_compared():
+    n = 100
+    # 95 both-zero rows, the 5 others equal: only 5% of the rows compared
+    x = np.zeros(n, dtype=np.int64)
+    x[95:] = np.arange(1, 6)
+    df = pd.DataFrame({"X": x, "Y": x.copy(), "label": [f"l{i}" for i in range(n)]})
+    assert not any("equals" in w for w in dp.compute_profile(df)["warnings"])
+
+    # 10 non-zero equal rows of 100: exactly 10% compared, judged, 100% equal
+    x = np.zeros(n, dtype=np.int64)
+    x[90:] = np.arange(1, 11)
+    df = pd.DataFrame({"X": x, "Y": x.copy(), "label": [f"l{i}" for i in range(n)]})
+    eq = [w for w in dp.compute_profile(df)["warnings"] if "equals" in w]
+    assert eq == ["X equals Y in 100% of rows: likely a stock, not a flow"]
+
+
+def test_profile_version_is_2():
+    assert dp.PROFILE_VERSION == 2
+    assert dp.EQUAL_PAIR_MIN_COMPARED_SHARE == 0.10

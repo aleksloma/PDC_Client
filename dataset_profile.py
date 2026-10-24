@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-PROFILE_VERSION = 1
+PROFILE_VERSION = 2
 SAMPLE_THRESHOLD = 1_000_000   # above this, stats run on a sample
 SAMPLE_ROWS = 500_000
 PAIR_SCAN_MAX_ROWS = 500_000   # pair-grain scan only at or below this
@@ -35,6 +35,7 @@ TOP_VALUE_MAXLEN = 40
 LOW_CARDINALITY_MAX = 20       # top_values emitted when nunique <= this
 NULL_PCT_WARN = 30.0
 EQUAL_PAIR_MIN_SHARE = 0.90    # "stock, not a flow": equal in MORE than this share
+EQUAL_PAIR_MIN_COMPARED_SHARE = 0.10   # pair judged only when this share of rows is compared
 EQUAL_PAIR_MAX_NUMERIC_COLS = 30   # the pair scan is skipped above this many
 
 
@@ -226,8 +227,13 @@ def _build_warnings(work: pd.DataFrame, col_profiles: dict,
 def _equal_pair_warnings(work: pd.DataFrame, col_profiles: dict) -> list:
     """The warning "<a> equals <b> in <pct>% of rows: likely a stock, not a
     flow" for every unordered pair of numeric (non-bool) columns, in frame order, that hold the
-    same value in MORE than EQUAL_PAIR_MIN_SHARE of the rows where both are
-    non-null (np.isclose, rtol=1e-9, atol=0). Constant and all-null columns are
+    same value in MORE than EQUAL_PAIR_MIN_SHARE of the COMPARED rows
+    (np.isclose, rtol=1e-9, atol=0). The compared rows are those where both
+    are non-null and NOT both zero — a row where both are 0 (an empty month of
+    two flow columns) says nothing about whether they measure the same thing.
+    When fewer than EQUAL_PAIR_MIN_COMPARED_SHARE of the both-non-null rows
+    are compared, the pair is not judged (no warning, joins no group); the
+    percentage is taken over the compared rows. Constant and all-null columns are
     skipped; so is the whole scan above EQUAL_PAIR_MAX_NUMERIC_COLS numeric
     columns. Two all-unique columns equal in EVERY row (row numbers, ids) are
     not a stock-vs-flow pair. k mutually equal columns give ONE warning: the
@@ -264,10 +270,15 @@ def _equal_pair_warnings(work: pd.DataFrame, col_profiles: dict) -> list:
                     n_both = int(both.sum())
                     if n_both == 0:
                         continue
-                    equal = int(np.isclose(arr_a[both], arr_b[both], rtol=1e-9, atol=0).sum())
-                    if equal / n_both <= EQUAL_PAIR_MIN_SHARE:
+                    va, vb = arr_a[both], arr_b[both]      # non-null on both sides
+                    compared = ~((va == 0) & (vb == 0))
+                    n_compared = int(compared.sum())
+                    if n_compared == 0 or n_compared < EQUAL_PAIR_MIN_COMPARED_SHARE * n_both:
                         continue
-                    if (equal == n_both
+                    equal = int(np.isclose(va[compared], vb[compared], rtol=1e-9, atol=0).sum())
+                    if equal / n_compared <= EQUAL_PAIR_MIN_SHARE:
+                        continue
+                    if (equal == n_compared
                             and (col_profiles.get(str(a)) or {}).get("all_unique")
                             and (col_profiles.get(str(b)) or {}).get("all_unique")):
                         continue
@@ -277,7 +288,7 @@ def _equal_pair_warnings(work: pd.DataFrame, col_profiles: dict) -> list:
                         group_of[j] = group
                         continue
                     group_of[i] = group_of[j] = i
-                    pct = (equal * 100) // n_both
+                    pct = (equal * 100) // n_compared
                     out.append(f"{a} equals {b} in {pct}% of rows: "
                                f"likely a stock, not a flow")
                 except Exception:
