@@ -31,6 +31,8 @@ EXAMPLES = [
     (3.27, "ratio", "3.3x"),
     (12, "ratio", "12.0x"),
     (0.48, "ratio", "0.5x"),
+    (6.6e-6, "ratio", "<0.1x"),
+    (1e9, "ratio", ">1000x"),
     (2345678901, "amount", "2.35 bln"),
     (7250000, "amount", "7.25 mln"),
     (999999, "amount", "999,999"),
@@ -86,6 +88,33 @@ def test_fmt_never_scientific(value, kind):
     # and "%"/"x" carry no "e", so the check is exact for these kinds.)
     assert "e" not in out.lower(), out
     assert "+" not in out, out
+
+
+# --- ratio edges (BRB retest follow-up: a 6.6e-6 ratio rendered "0.0x") -------
+
+@pytest.mark.parametrize("value,expected", [
+    (0.0, "<0.1x"),
+    (6.6e-6, "<0.1x"),
+    (0.049, "<0.1x"),
+    (0.05, "0.1x"),
+    (0.48, "0.5x"),
+    (3.27, "3.3x"),
+    (1000, "1,000.0x"),
+    (1000.5, ">1000x"),
+    (1e9, ">1000x"),
+    (np.float64(6.6e-6), "<0.1x"),
+    (np.int64(5000), ">1000x"),
+])
+def test_fmt_ratio_edges(value, expected):
+    assert fmt(value, "ratio") == expected
+
+
+def test_fmt_ratio_negative_keeps_fixed_point_rule():
+    # the edge rule covers 0 <= v < 0.05 and v > 1000 only; a negative ratio
+    # keeps ",.1f" + "x" with the negative-zero rule (rule 9)
+    assert fmt(-0.04, "ratio") == "0.0x"
+    assert fmt(-1.5, "ratio") == "-1.5x"
+    assert fmt(-5000, "ratio") == "-5,000.0x"
 
 
 # --- rule 3: bool before int ---------------------------------------------------

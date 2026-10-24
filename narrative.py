@@ -57,6 +57,12 @@ _LEADING_DASH_RE = re.compile(r"^(\s*)-")
 _NA = "n/a"
 _ELLIPSIS = "…"
 
+# The quality gate (`drop_na_sentences`): the "n/a" token, not inside a word;
+# a sentence ends at ".", "!" or "?" followed by whitespace (or the line end),
+# so the decimal point of a rendered number never splits a sentence.
+_NA_TOKEN_RE = re.compile(r"(?<!\w)n/a(?!\w)", re.IGNORECASE)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])(\s+)")
+
 # FINDINGS (B7.1).
 _FINDING_KEY_RE = re.compile(r"[a-z][a-z0-9_]{0,39}\Z")
 _NEEDS_PHASE2 = "needs_phase2"
@@ -257,6 +263,55 @@ def plain(text: str) -> str:
     if not isinstance(text, str):
         return ""
     return text.replace("\\*", "*").replace("\\_", "_").replace("\\-", "-")
+
+
+def _drop_na_line(line: str) -> tuple:
+    """`(kept line, dropped count, emptied)` for one line without "\\n"."""
+    parts = _SENTENCE_SPLIT_RE.split(line)
+    pieces = []                                  # (sentence, whitespace after)
+    for i in range(0, len(parts), 2):
+        sep = parts[i + 1] if i + 1 < len(parts) else ""
+        pieces.append((parts[i], sep))
+    kept = [(text, sep) for text, sep in pieces if not _NA_TOKEN_RE.search(text)]
+    dropped = len(pieces) - len(kept)
+    if not dropped:
+        return line, 0, False
+    out = "".join(text + sep for text, sep in kept).rstrip()
+    return out, dropped, not out.strip()
+
+
+def drop_na_sentences(text, *, sid: str, what: str) -> str:
+    """The quality gate on a RENDERED text: every sentence (or line) holding
+    the "n/a" token — a missing slot, a None value, or a literal the template
+    typed — is dropped, then the A2.2 whitespace post-processing runs again.
+    A text without the token is returned byte-identical. Logs one
+    `NARRATIVE_SENTENCE_DROPPED reason=missing_slot n=<n> what=<what>` line
+    when something was dropped — never the text. Non-str -> "". Never raises
+    (a failure logs its type and returns the input)."""
+    if not isinstance(text, str):
+        return ""
+    try:
+        if not _NA_TOKEN_RE.search(text):
+            return text
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        kept_lines = []
+        total = 0
+        for line in lines:
+            out, dropped, emptied = _drop_na_line(line)
+            total += dropped
+            if emptied:
+                continue                         # the line goes with its newline
+            kept_lines.append(out)
+        result = _post("\n".join(kept_lines), max(len(text), 1))
+        if total:
+            log_with_sid(sid, "info",
+                         f"NARRATIVE_SENTENCE_DROPPED reason=missing_slot n={int(total)} "
+                         f"what={log_safe_value(what, 20)}")
+        return result
+    except Exception as e:
+        log_with_sid(sid, "warning",
+                     f"NARRATIVE_SENTENCE_GATE_FAILED error={log_safe_value(type(e).__name__, 80)}")
+        return text
 
 
 # ---------------------------------------------------- received templates

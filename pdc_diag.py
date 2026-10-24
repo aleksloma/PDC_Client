@@ -105,6 +105,12 @@ _NUMERIC_KINDS = ("count", "float", "pct", "ratio", "amount")
 _LOCALES = {"default": {"thousands": ",", "decimal": ".", "mln": "mln", "bln": "bln",
                         "trln": "trln"}}
 FMT_MAX_LEN = 32
+# A period holding fewer than THIN_PERIOD_RATIO x the median period's rows is
+# thin (coverage_check `ratio_low`) and, for detect_anomalies, a data gap.
+THIN_PERIOD_RATIO = 0.5
+# `ratio` edges: 0 <= v < RATIO_FLOOR -> "<0.1x", v > RATIO_CEILING -> ">1000x".
+RATIO_FLOOR = 0.05
+RATIO_CEILING = 1000
 _TEXT_MAX = 200
 _NA = "n/a"
 
@@ -172,6 +178,12 @@ def _format_number(value, kind):
     if kind == "pct":
         return format(value * 100, ",.1f"), "%"
     if kind == "ratio":
+        # Edges: a ratio that would print "0.0x" or a long run of digits
+        # says what it means instead (A4 rule 8). Negatives keep ",.1f".
+        if 0 <= value < RATIO_FLOOR:
+            return "<0.1", "x"
+        if value > RATIO_CEILING:
+            return ">1000", "x"
         return format(value, ",.1f"), "x"
     # amount
     magnitude = abs(value)
@@ -522,7 +534,8 @@ def _unknown_mask(series: pd.Series) -> pd.Series:
 
 
 def coverage_check(df, period_col: str, dims: list, metrics: list, *, order=None,
-                   ratio_low: float = 0.5, ratio_high: float = 2.0, jaccard_min: float = 0.5,
+                   ratio_low: float = THIN_PERIOD_RATIO, ratio_high: float = 2.0,
+                   jaccard_min: float = 0.5,
                    share_shift: float = 0.5, vanish_share: float = 0.2,
                    unknown_share: float = 0.5, unit_cols: list | None = None,
                    as_of=None, prefix: str = "") -> dict:
@@ -672,7 +685,10 @@ def coverage_check(df, period_col: str, dims: list, metrics: list, *, order=None
 # ---------------------------------------------------------------------------
 # B8.4 detect_anomalies
 # ---------------------------------------------------------------------------
-def _anomaly_core(values: list, z: float, ratio: float) -> dict:
+def _anomaly_core(values: list, z: float, ratio: float, skip=None) -> dict:
+    """`skip`: period indexes (data gaps) that are never flagged nor primary;
+    the median / MAD statistics stay computed over every period."""
+    skip = set(skip or ())
     v = np.asarray(values, dtype=float)
     n = len(v)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -694,6 +710,9 @@ def _anomaly_core(values: list, z: float, ratio: float) -> dict:
                 ratio_prev[i] = v[i] / v[i - 1]
         flagged = []
         for i in range(n):
+            if i in skip:
+                flagged.append(False)
+                continue
             hit = bool(math.isfinite(robust_z[i]) and abs(robust_z[i]) >= z)
             r = ratio_med[i]
             if not hit and math.isfinite(r):
@@ -720,9 +739,38 @@ def _anomaly_core(values: list, z: float, ratio: float) -> dict:
             "flagged": flagged, "primary": primary}
 
 
+def _data_gaps(values: list, rows: list, thin_ratio: float) -> list:
+    """Indexes of the DATA-GAP periods: fewer rows than `thin_ratio` x the
+    median period's rows, or an aggregated value of exactly 0 while every
+    existing neighbour is non-zero and finite."""
+    n = len(values)
+    if not n:
+        return []
+    median_rows = float(np.median(rows))
+    gaps = []
+    for i in range(n):
+        if rows[i] < thin_ratio * median_rows:
+            gaps.append(i)
+            continue
+        v = values[i]
+        if not (isinstance(v, (int, float)) and math.isfinite(v) and v == 0):
+            continue
+        neighbours = [values[j] for j in (i - 1, i + 1) if 0 <= j < n]
+        if neighbours and all(isinstance(w, (int, float)) and math.isfinite(w) and w != 0
+                              for w in neighbours):
+            gaps.append(i)
+    return gaps
+
+
 def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
-                     z: float = 3.5, ratio: float = 2.0, prefix: str = "") -> dict:
-    """Is one period far from the others? (robust z or ratio to the median) — B8.4."""
+                     z: float = 3.5, ratio: float = 2.0, thin_ratio: float = THIN_PERIOD_RATIO,
+                     prefix: str = "") -> dict:
+    """Is one period far from the others? (robust z or ratio to the median) — B8.4.
+
+    A DATA-GAP period (`_data_gaps`: thin rows, or a zero between non-zero
+    neighbours) is never an anomaly nor the primary one; any gap sets
+    `period_status = "data_gap"`. The table's trailing `rows` / `is_data_gap`
+    columns carry the per-period row count and the gap flag."""
     prefix = _check_prefix(prefix)
     agg = _check_agg(agg)
     _require_columns(df, [period_col], "period_col")
@@ -730,8 +778,15 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
     if agg in _NUMERIC_AGGS:
         _require_numeric(df, metric, "metric")
 
+    try:
+        thin_ratio = float(thin_ratio)
+    except Exception:
+        raise ValueError("thin_ratio: must be a number") from None
+
     labels, _known, _stamps = _order_with_stamps(df[period_col], order)
-    v = _period_values(df, period_col, metric, labels, agg)
+    frames = _period_frames(df, period_col, labels)
+    v = [_agg_series(sub[metric], agg) for sub in frames]
+    rows = [int(len(sub)) for sub in frames]
     n = len(labels)
     findings: dict = {}
     values: dict = {
@@ -740,20 +795,24 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
         "anomaly_ratio_prev": None, "n_periods": n, "n_anomalies": 0,
     }
     columns = ["period", "value", "robust_z", "ratio_prev", "ratio_median", "is_anomaly",
-               "is_primary"]
+               "is_primary", "rows", "is_data_gap"]
     if n < 3:
         findings["too_few_periods"] = True
         table = pd.DataFrame({
             "period": labels, "value": v, "robust_z": [np.nan] * n, "ratio_prev": [np.nan] * n,
             "ratio_median": [np.nan] * n, "is_anomaly": [False] * n, "is_primary": [False] * n,
+            "rows": rows, "is_data_gap": [False] * n,
         }, columns=columns)
         table["is_anomaly"] = table["is_anomaly"].astype(bool)
         table["is_primary"] = table["is_primary"].astype(bool)
+        table["rows"] = table["rows"].astype(int)
+        table["is_data_gap"] = table["is_data_gap"].astype(bool)
         if n:
             values["baseline_value"] = _num(np.median(v))
         return _result(table, values, findings, prefix)
 
-    core = _anomaly_core(v, z, ratio)
+    gaps = set(_data_gaps(v, rows, thin_ratio))
+    core = _anomaly_core(v, z, ratio, skip=gaps)
     flagged, primary = core["flagged"], core["primary"]
     table = pd.DataFrame({
         "period": labels,
@@ -763,10 +822,16 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
         "ratio_median": [float(x) for x in core["ratio_med"]],
         "is_anomaly": flagged,
         "is_primary": [i == primary for i in range(n)],
+        "rows": rows,
+        "is_data_gap": [i in gaps for i in range(n)],
     }, columns=columns)
     table["is_anomaly"] = table["is_anomaly"].astype(bool)
     table["is_primary"] = table["is_primary"].astype(bool)
+    table["rows"] = table["rows"].astype(int)
+    table["is_data_gap"] = table["is_data_gap"].astype(bool)
     table.attrs["pdc_metric"] = str(metric)
+    if gaps:
+        findings["period_status"] = "data_gap"
 
     n_anomalies = int(sum(flagged))
     values["baseline_value"] = _num(core["median"])
@@ -822,9 +887,16 @@ def _member_aggs(sub: pd.DataFrame, dim, metric, agg: str) -> dict:
 
 def decompose_change(df, period_col, metric, from_period=None, to_period=None, dims=(), *,
                      agg: str = "sum", order=None, top_k: int = 5, concentrated_share: float = 0.6,
-                     even_tolerance: float = 0.15, large_ratio: float = 2.0, prefix: str = "") -> dict:
+                     even_tolerance: float = 0.15, large_ratio: float = 2.0,
+                     unknown_share: float = 0.5, prefix: str = "") -> dict:
     """Which members of which dimension carry the change between two
-    periods? — B8.5."""
+    periods? — B8.5.
+
+    A dim whose Unknown-like share (`_unknown_mask`) in the from OR the to
+    period is above `unknown_share` is SKIPPED — no table rows, no part in
+    the shape / choice — and reported as `unknown_dominated` / `unknown_dim`
+    (the first such dim in argument order). `change_dim_label` names the dim
+    of `change_top_member` whenever one is set."""
     prefix = _check_prefix(prefix)
     agg = _check_agg(agg)
     dims = _as_list(dims, "dims")
@@ -837,6 +909,10 @@ def decompose_change(df, period_col, metric, from_period=None, to_period=None, d
         top_k = max(int(top_k), 0)
     except Exception:
         raise ValueError("top_k: must be a whole number") from None
+    try:
+        unknown_share = float(unknown_share)
+    except Exception:
+        raise ValueError("unknown_share: must be a number") from None
 
     labels, _known, _stamps = _order_with_stamps(df[period_col], order)
     findings: dict = {}
@@ -897,9 +973,23 @@ def decompose_change(df, period_col, metric, from_period=None, to_period=None, d
         if change_ratio >= large_ratio or (large_ratio > 0 and change_ratio <= 1.0 / large_ratio):
             findings["change_large"] = True
 
+    usable = []
+    for dim in dims:
+        dominated = False
+        for sub in (sub_from, sub_to):
+            if len(sub) and float(_unknown_mask(sub[dim]).mean()) > unknown_share:
+                dominated = True
+                break
+        if dominated:
+            if not findings.get("unknown_dominated"):
+                findings["unknown_dominated"] = True
+                findings["unknown_dim"] = dim
+        else:
+            usable.append(dim)
+
     rows = []
     per_dim = {}
-    for dim in dims:
+    for dim in usable:
         agg_from = _member_aggs(sub_from, dim, metric, agg)
         agg_to = _member_aggs(sub_to, dim, metric, agg)
         members = list(dict.fromkeys(list(agg_from) + list(agg_to)))
@@ -943,26 +1033,26 @@ def decompose_change(df, period_col, metric, from_period=None, to_period=None, d
     table = pd.DataFrame(rows, columns=_DECOMPOSE_COLUMNS) if rows else empty
     table.attrs["pdc_metric"] = str(metric)
 
-    if dims:
-        concentrated_dims = [d for d in dims if per_dim[d]["concentrated"]]
+    if usable:
+        concentrated_dims = [d for d in usable if per_dim[d]["concentrated"]]
         if concentrated_dims:
             chosen = max(concentrated_dims,
-                         key=lambda d: (per_dim[d]["top"]["sod"], -dims.index(d)))
+                         key=lambda d: (per_dim[d]["top"]["sod"], -usable.index(d)))
             findings["change_shape"] = "concentrated_in_one_dim"
             findings["change_dim"] = chosen
-            values["change_dim_label"] = str(chosen)
         else:
-            if all(per_dim[d]["even"] for d in dims):
+            if all(per_dim[d]["even"] for d in usable):
                 findings["change_shape"] = "spread_evenly"
-            scored = [d for d in dims if per_dim[d]["top"] is not None]
+            scored = [d for d in usable if per_dim[d]["top"] is not None]
             chosen = (max(scored, key=lambda d: (
                 abs(per_dim[d]["top"]["sod"]) if math.isfinite(per_dim[d]["top"]["sod"]) else -1.0,
-                -dims.index(d))) if scored else None)
+                -usable.index(d))) if scored else None)
         top = per_dim[chosen]["top"] if chosen is not None else None
         if top is not None:
             values["change_top_member"] = _label_str(top["member"])
             values["change_top_member_share"] = _num(top["sod"])
             values["change_top_member_delta"] = _num(top["delta"])
+            values["change_dim_label"] = str(chosen)
     return _result(table, values, findings, prefix)
 
 

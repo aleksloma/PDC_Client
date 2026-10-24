@@ -68,3 +68,95 @@ def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
 # Full builtins minus the real __import__ — everything generated code
 # legitimately uses (print, len, range, sorted, Exception, ...) keeps working.
 SANDBOX_BUILTINS = {**vars(_builtins), "__import__": _guarded_import}
+
+
+# ---------------------------------------------------------------------------
+# `pdc_diag` cannot be redefined (BRB retest follow-up)
+# ---------------------------------------------------------------------------
+# A retry block once "replicated" the diagnostics library
+# (`def detect_anomalies(...)`, `FINDINGS = ""`) and silently replaced the
+# real findings with its own. Both exec sites run this AST check BEFORE
+# anything executes and refuse such a block with the fixed text below, which
+# carries no code (it travels to the brain's retry prompt).
+#
+# HONEST LIMITS (defense in depth, not a boundary): `setattr(pdc_diag, ...)`,
+# `globals()["pdc_diag"] = ...` and `pdc_diag.__dict__[...] = ...` are not
+# caught; a name that merely CONTAINS `pdc_diag` (`pdc_diag_out`,
+# `my_pdc_diag`) is accepted; a plain `import pdc_diag` (or
+# `import pdc_diag as pdc_diag`) is accepted because it rebinds the real
+# module. Code that does not parse is left to exec, which reports Python's
+# own SyntaxError as today.
+
+import ast as _ast
+
+PDC_DIAG_REDEFINED_TEXT = "pdc_diag cannot be redefined"
+
+_PDC_DIAG = "pdc_diag"
+
+PDC_DIAG_PUBLIC = frozenset({
+    "fmt", "coverage_check", "detect_anomalies", "decompose_change",
+    "attribute_level", "check_metric_overlap",
+    "plot_highlighted_series", "plot_waterfall", "plot_importance",
+})
+
+_STORE_DEL = (_ast.Store, _ast.Del)
+
+
+def _node_redefines(node) -> bool:
+    if isinstance(node, _ast.Name):
+        return node.id == _PDC_DIAG and isinstance(node.ctx, _STORE_DEL)
+    if isinstance(node, _ast.Attribute):
+        return (isinstance(node.ctx, _STORE_DEL)
+                and isinstance(node.value, _ast.Name)
+                and node.value.id == _PDC_DIAG)
+    if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+        return node.name == _PDC_DIAG or node.name in PDC_DIAG_PUBLIC
+    if isinstance(node, _ast.ClassDef):
+        return node.name == _PDC_DIAG
+    if isinstance(node, _ast.ExceptHandler):
+        return node.name == _PDC_DIAG
+    if isinstance(node, (_ast.Global, _ast.Nonlocal)):
+        return _PDC_DIAG in node.names
+    if isinstance(node, _ast.Import):
+        # `import X as pdc_diag` binds another module under the name;
+        # `import pdc_diag` / `import pdc_diag as pdc_diag` rebinds the real one.
+        return any(a.asname == _PDC_DIAG and a.name != _PDC_DIAG for a in node.names)
+    if isinstance(node, _ast.ImportFrom):
+        # `from M import pdc_diag` / `from M import N as pdc_diag` bind
+        # whatever M exposes — never assumed to be the real module.
+        return any((a.asname or a.name) == _PDC_DIAG for a in node.names)
+    return False
+
+
+def _log_guard_event(level: str, message: str) -> None:
+    """Value-free log line (constant text + exception type only). The logger
+    is imported lazily so this module stays a stdlib-only leaf at import."""
+    try:
+        from logger_utils import log_with_sid
+        log_with_sid("exec", level, message)
+    except Exception:
+        pass
+
+
+def pdc_diag_redefinition(code) -> str | None:
+    """`PDC_DIAG_REDEFINED_TEXT` when `code` rebinds, deletes or mutates
+    `pdc_diag`, or defines a function under one of its public names; else
+    None (also for non-str, empty or unparseable code). Never raises."""
+    try:
+        if not isinstance(code, str) or not code.strip():
+            return None
+        try:
+            tree = _ast.parse(code)
+        except Exception as e:
+            # Unparseable: exec reports Python's own SyntaxError as today.
+            _log_guard_event("debug", f"PDC_DIAG_GUARD_PARSE_SKIPPED error={type(e).__name__}")
+            return None
+        for node in _ast.walk(tree):
+            if _node_redefines(node):
+                return PDC_DIAG_REDEFINED_TEXT
+        return None
+    except Exception as e:
+        # A guard failure must never turn into an exec failure; the exec
+        # itself still runs under SANDBOX_BUILTINS.
+        _log_guard_event("warning", f"PDC_DIAG_GUARD_FAILED error={type(e).__name__}")
+        return None

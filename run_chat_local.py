@@ -1202,6 +1202,9 @@ class _NarrState:
     ok_blocks: int = 0
     block_findings: dict = field(default_factory=dict)
     captions_used: set = field(default_factory=set)
+    # captions the quality gate emptied (every sentence held "n/a"): their
+    # visuals go to describe, and a later visual of the block does too
+    captions_dropped: set = field(default_factory=set)
     described: int = 0
     display_answers: list = field(default_factory=list)
     rendered: Optional[str] = None
@@ -1274,10 +1277,12 @@ class _NarrState:
 
     def caption(self, block_index: int, block_values: dict):
         """(template, rendered) of caption `block_index`, rendered with THAT
-        block's VALUES and FINDINGS only; None when there is none or it was
-        already used (the first visual of the block takes it)."""
+        block's VALUES and FINDINGS only; None when there is none, it was
+        already used (the first visual of the block takes it), or the quality
+        gate dropped every sentence of it (the visual then goes to describe)."""
         try:
-            if block_index in self.captions_used or block_index not in self.captions:
+            if (block_index in self.captions_used or block_index in self.captions_dropped
+                    or block_index not in self.captions):
                 return None
             self.captions_used.add(block_index)
             template = self.captions[block_index]
@@ -1285,6 +1290,14 @@ class _NarrState:
                                         self.block_findings_for(block_index),
                                         sid=self.sid,
                                         max_len=narrative.CAPTION_RENDERED_MAX)
+            rendered = narrative.drop_na_sentences(rendered, sid=self.sid, what="caption")
+            if not rendered.strip():
+                self.captions_used.discard(block_index)
+                self.captions_dropped.add(block_index)
+                log_with_sid(log_safe_text(self.sid, 200), "info",
+                             f"CAPTION_SKIPPED block={int(block_index)} "
+                             "reason=all_sentences_dropped")
+                return None
             return template, rendered
         except Exception as e:                               # noqa: BLE001
             log_with_sid(log_safe_text(self.sid, 200), "warning",
@@ -1304,8 +1317,18 @@ class _NarrState:
             if self.ok_blocks < 1:
                 log_with_sid(log_safe_text(self.sid, 200), "info", "NARRATIVE_SKIPPED reason=no_successful_block")
                 return None
-            self.rendered = narrative.render(self.template, self.values, self.findings,
-                                             sid=self.sid)
+            rendered = narrative.render(self.template, self.values, self.findings,
+                                        sid=self.sid)
+            # Quality gate: a sentence holding "n/a" (a missing slot or a None
+            # value) is dropped; nothing left -> the narrative is not used and
+            # the turn takes today's describe / summarize path.
+            rendered = narrative.drop_na_sentences(rendered, sid=self.sid, what="narrative")
+            if not rendered.strip():
+                self.rendered = None
+                log_with_sid(log_safe_text(self.sid, 200), "info",
+                             "NARRATIVE_SKIPPED reason=all_sentences_dropped")
+                return None
+            self.rendered = rendered
             slots, missing = _slot_counts(self.template, self.values)
             log_with_sid(log_safe_text(self.sid, 200), "info",
                          f"NARRATIVE_USED phase={int(self.phase)} slots={int(slots)} "
@@ -2659,7 +2682,10 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
                                     narrative.answer_lang_code(context_decision, question))
     if shown:
         out["value_display"] = shown
-    narr.finish()                      # merges the block's FINDINGS (no template here)
+    if not narr.template:
+        narr.finish()                  # merges the block's FINDINGS (no template here)
+    # with a template `_compose` above already ran `finish` (the narrative was
+    # dropped whole by the quality gate) and merged the FINDINGS
     if narr.findings:
         out["findings"] = dict(narr.findings)
     return out

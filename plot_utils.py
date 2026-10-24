@@ -1949,8 +1949,22 @@ def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: b
     # Same guarded builtins as `code_exec._execute_in_process` — chart code
     # must not import DB drivers / credential modules either (Article VII).
     # dict(): per-call copy so one execution can't mutate the shared guard.
-    from sandbox_guard import SANDBOX_BUILTINS
+    from sandbox_guard import SANDBOX_BUILTINS, PDC_DIAG_REDEFINED_TEXT, pdc_diag_redefinition
     env["__builtins__"] = dict(SANDBOX_BUILTINS)
+
+    # `pdc_diag` cannot be redefined (sandbox_guard): refused BEFORE the
+    # strips and the exec, with a fixed text that carries no code. The log
+    # line carries a code hash and a fixed reason only.
+    if pdc_diag_redefinition(code) is not None:
+        try:
+            import hashlib as _hashlib
+            _h = _hashlib.sha256(str(code).encode("utf-8", errors="ignore")).hexdigest()[:10]
+            logging.warning(f"[PLOT_RENDER] PLOT_RENDER_REJECTED code_hash={_h} "
+                            "reason=pdc_diag_redefined")
+        except Exception as _e:
+            logging.warning(f"[PLOT_RENDER] PLOT_RENDER_REJECTED reason=pdc_diag_redefined "
+                            f"log_error={type(_e).__name__}")
+        return {"ok": False, "error": PDC_DIAG_REDEFINED_TEXT, "trace": ""}
 
     # Strip direct upsetplot imports — the library's UpSet class has rendering
     # bugs (NaN RGBA errors). Use upset_plot_from_sets() from scope instead.

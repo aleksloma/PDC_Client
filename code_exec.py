@@ -19,7 +19,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from logger_utils import log_with_sid
 from settings import settings
-from sandbox_guard import SANDBOX_BUILTINS
+from sandbox_guard import SANDBOX_BUILTINS, PDC_DIAG_REDEFINED_TEXT, pdc_diag_redefinition
 from exec_sanitizer import sanitize_for_execution
 import exec_transport
 
@@ -231,6 +231,18 @@ def _execute_in_process(code: str, dfs: dict, sid: str | None = None, timeout: f
     # Article XIII gate: generated code must only ever see standard dtypes.
     # Rebinding the local `dfs` covers both env["dfs"] and the `df` alias.
     dfs = sanitize_for_execution(dfs, sid or "exec")
+
+    # `pdc_diag` cannot be redefined (sandbox_guard): refused BEFORE anything
+    # executes, with a fixed text that carries no code. Logged with the code
+    # hash and a fixed reason only.
+    if pdc_diag_redefinition(code) is not None:
+        try:
+            h = hashlib.sha256(str(code).encode("utf-8", errors="ignore")).hexdigest()[:10]
+            log_with_sid(sid or "exec", "error", "EXEC_ERROR", code_hash=h, status="rejected",
+                         reason="pdc_diag_redefined")
+        except Exception:
+            pass
+        return {"error": PDC_DIAG_REDEFINED_TEXT}
 
     env = {
         "pd": pd, "np": np, "plt": plt,
