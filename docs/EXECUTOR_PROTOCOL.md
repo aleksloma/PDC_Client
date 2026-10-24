@@ -203,7 +203,43 @@ service now writes a truncated tail of the last two onto its own
 `EXEC_ERROR` / `EXEC_TIMEOUT` lines. That tail is the only durable copy of a
 failing block's traceback: the sandbox has no log file and logs no job text
 (§8). **Nothing new crosses to the Brain**: the retry text stays
-exactly `payload["error"]`.
+exactly `payload["error"]` (the web service's `brain_client.retry` then
+replaces every quoted literal in it that is not an input column or df name,
+nor text the failed code itself contains, with `'<value>'` before it is
+posted). The plot path's `NearZeroChartError`
+is a fixed sentence — "All bar values are near zero. This likely indicates a
+data type error …" — with no `max=` / `range=` numbers, so no magnitude of
+the data reaches a retry prompt or a log line through it.
+
+### `values` / `findings` — the narrative outputs
+
+Every SUCCESS payload of both kinds carries four more keys: `values`,
+`values_dropped`, `findings`, `findings_dropped`. PYTHON adds them in
+`code_exec._execute_in_process`'s success return literal; PLOT adds them to
+each of the four success returns of `plot_utils._render_in_process` through
+`_with_outputs` (a capture failure keeps the chart and reports `{}` / `0`).
+Error payloads carry none of them. They come from the two dicts generated code
+fills, `VALUES` and `FINDINGS`, which each job gets EMPTY (at the plot site in
+its own copy of `GLOBAL_PLOT_SCOPE`, never the shared dict), and are filtered
+in the sandbox by `exec_transport.capture_outputs` → `encode_values` /
+`encode_findings`. The rules are SHAPE only; a rejected entry is dropped and
+counted, never logged (its content may be a customer value), and nothing
+raises:
+
+| | `values` | `findings` |
+|---|---|---|
+| container | an EXACT `dict` (a subclass, or anything else not `None`, counts as one drop; `None` → `{}`, 0), read through `dict.items` so no method generated code could have overridden runs | same |
+| key | an exact `str` matching `[A-Za-z_][A-Za-z0-9_]{0,39}` | an exact `str` matching `[a-z][a-z0-9_]{0,39}` |
+| value | an EXACT `bool`, `int`, `float` (NaN/±inf kept), `None`, or a `str` of at most 200 characters | an EXACT `bool`, or a `str` of 1–64 characters without a C0 control |
+| numpy scalar | converted once through numpy's own `np.generic.item` (a subclass's `item()` override never runs); kept only when that yields an accepted type. Any other object with an `.item()` is dropped without being called | same |
+| cap | the first 40 accepted keys; the rest counted as dropped | the first 32 accepted keys |
+
+Anything else — a `Timestamp`, a list, a dict, a frame, `Decimal`, a longer
+string — is dropped and counted. `*_dropped` is that count. FINDINGS get their
+semantic check (planner-literal or registry key; a value that is a boolean,
+an input column name or a fixed code; at most 24 after merging) only in the
+main app, `narrative.validate_findings`; the sandbox never knows the input
+column names.
 
 ### Serialization matrix (`result`)
 
@@ -237,7 +273,9 @@ error, `ResultSerializationError: …`.
 ### `preview` and the data boundary
 
 `preview` exists only to feed the web service's `_safe_preview` guard, whose
-verdict must not change. The encoder therefore **mirrors that guard exactly**,
+verdict must not change. Since the narrative release that verdict stays on the
+client: it feeds the local value line (`value_display`) and the implicit
+`result` template slot, and `/v1/summarize` always gets `preview: null`. The encoder therefore **mirrors that guard exactly**,
 including its quirks: a dict passes only when every key is a plain
 `str|int|float|bool` and every value is a scalar, `None`, or an object whose
 `.item()` yields one; anything else becomes an opaque marker, which the guard
@@ -246,8 +284,10 @@ then drops exactly as it drops a `Timestamp` today.
 **NaN and Inf travel as NaN and Inf**, never as `null`. The whole hop uses
 Python's JSON dialect (`allow_nan=True`) and the executor answers with a plain
 response rather than the framework's JSON response, which would refuse them.
-This is not cosmetic: `_safe_preview(nan)` returns `nan` today and the Brain
-receives the literal token, so coercing it would be a protocol-visible change.
+This is not cosmetic: `_safe_preview(nan)` returns `nan`, which the local
+value line shows as `n/a` (before the narrative release the Brain received the
+literal token on `/v1/summarize`), so coercing it would change what the user
+sees.
 A test asserts wire-byte parity with the in-process guard across the whole
 matrix of scalars, numpy types, keys and container shapes.
 
@@ -310,6 +350,14 @@ Any violation is reported as a failed execution
 (`ExecutorResponseError: …` / `ResultTooLarge: …`), never as an exception into
 the request. Inline strings, chart data and error text are capped; unknown
 payload keys are dropped.
+
+The four narrative keys are decoded as hostile input under the SAME rules
+(`decode_values` / `decode_findings`, the functions §5's encoders use) and
+never cause a violation: a malformed `values` or `findings` degrades to `{}`
+plus a drop count, and a `*_dropped` that is not a non-negative integer up to
+100 000 reads as 0; the decoder's own drops are added to it. A response
+without the keys — an older sandbox image — reads cleanly and adds none of
+them, so the turn simply has no VALUES (its template slots render `n/a`).
 
 **Residual risk, accepted:** a deliberately crafted single batch can still
 exceed the decoded cap in one step. The web service is nonetheless strictly
@@ -583,9 +631,12 @@ unprivileged-container requirement that the rest of the stack already meets. A s
 the default target ends unprivileged with no test runner in it.
 
 The image copies **only** the modules the runner imports — the two execution
-modules, the dtype gate, the sandbox guard, the outlier helpers, the logger,
-the settings module and the transport — plus the Georgian font and the offline
-plotly bundle. Never `COPY . .`. There is no `local_store`, no `db_*`, no
+modules, the dtype gate, the sandbox guard, the outlier helpers, the
+diagnostics helper library (`pdc_diag.py`, a leaf module the generated code
+calls), the logger, the settings module and the transport — plus the Georgian
+font and the offline plotly bundle. An older sandbox image without `pdc_diag`
+makes code that calls it fail with a `NameError`, which goes through the
+ordinary retries. Never `COPY . .`. There is no `local_store`, no `db_*`, no
 brain client, no route, no template. The image sets `PDC_EXECUTOR=1`, which
 makes the shared logger write to stdout only (§8).
 

@@ -1936,34 +1936,11 @@ async function openConversation(chatId, convId) {
         welcomeRendered = true;
         return;
       }
-      if (msg.images && Array.isArray(msg.images) && msg.images.length > 0) {
-        // Multi-chart history entry: render each chart as a separate assistant
-        // message. New records persist per-chart code + chart_data, so Show code
-        // / Show data appear on EVERY chart after reload. Backward compat: old
-        // records lack img.code/img.chart_data → split the legacy JOINED
-        // msg.code on ###NEXT_PLOT### and give chart idx its own clean segment
-        // (refresh + Show code work per chart); charts with no matching segment
-        // stay code-less. Show data stays omitted for legacy records.
-        const legacySegs = _splitJoinedCode(msg.code);
-        msg.images.forEach((img, idx) => {
-          const code = img.code || legacySegs[idx] || null;
-          appendMessage('assistant', img.answer || '', img.image_base64, null, null,
-            { code: code, chartData: img.chart_data || null,
-              chartRef: { conv_id: convId, ai_index: rowIdx, image_index: idx } });
-        });
-        // Mixed dashboard record: the tables ride after the charts.
-        if (msg.tables && msg.tables.length) {
-          appendMessage('assistant', '', null, null, null,
-            { tables: msg.tables, fullTableKeys: msg.full_table_keys || null });
-        }
+      if (isAi) {
+        // Every AI row (charts, tables, narrative) through the one renderer.
+        renderAiRecord(msg, convId, rowIdx);
       } else {
-        // Single-chart / table / text entry. New single-chart records persist
-        // chart_data on the record → Show data on reload; old records omit it.
-        // Multi-table records carry msg.tables (+ per-table full keys).
-        appendMessage(msg.role === 'human' ? 'user' : 'assistant', msg.content, msg.image_base64, msg.table, msg.full_table_key,
-          msg.role === 'human' ? null : { code: msg.code, chartData: msg.chart_data || null,
-            tables: msg.tables || null, fullTableKeys: msg.full_table_keys || null,
-            chartRef: { conv_id: convId, ai_index: rowIdx, image_index: 0 } });
+        appendMessage('user', msg.content, msg.image_base64, msg.table, msg.full_table_key, null);
       }
     });
 
@@ -2429,8 +2406,17 @@ function appendMessage(role, content, imageBase64, table, fullTableKey, extras) 
   const multiTables = extras && Array.isArray(extras.tables) ? extras.tables : null;
   if (multiTables && multiTables.length) {
     const keys = (extras && Array.isArray(extras.fullTableKeys)) ? extras.fullTableKeys : [];
+    // extras.tableCaptions: the rendered caption of each table, aligned with
+    // extras.tables (narrative-template turns), shown above its block.
+    const tableCaptions = (extras && Array.isArray(extras.tableCaptions)) ? extras.tableCaptions : [];
     multiTables.forEach((t, i) => {
       if (!(t && t.columns && t.rows)) return;
+      if (typeof tableCaptions[i] === 'string' && tableCaptions[i]) {
+        const capDiv = document.createElement('div');
+        capDiv.className = 'pdc-caption';
+        capDiv.innerHTML = renderMarkdown(tableCaptions[i]);
+        contentDiv.appendChild(capDiv);
+      }
       const wrap = document.createElement('div');
       wrap.className = 'pdc-table-block';
       wrap._pdcTable = t;                        // pin-to-dashboard payload
@@ -2470,7 +2456,21 @@ function renderMarkdown(text) {
   };
   
   let html = escapeHtml(text);
-  
+
+  // Literal characters of narrative text values (DIAGNOSTICS_SPEC A2.2):
+  // the renderer writes `*`, `_` and a leading `-` of a value as \*, \_, \-.
+  // They are taken out BEFORE the bold / bullet rules (an escaped asterisk
+  // never opens bold text, an escaped dash never starts a bullet) and put
+  // back as the plain characters at the end.
+  const literals = [];
+  const keepLiteral = (ch) => {
+    literals.push(ch);
+    return '' + (literals.length - 1) + '';
+  };
+  html = html.replace(/\\\*/g, () => keepLiteral('*'))
+    .replace(/\\_/g, () => keepLiteral('_'))
+    .replace(/\\-/g, () => keepLiteral('-'));
+
   // Bold: **text** -> <strong>text</strong>
   html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
   
@@ -2488,8 +2488,161 @@ function renderMarkdown(text) {
   if (!html.startsWith('<ul>') && !html.startsWith('<p>')) {
     html = '<p>' + html + '</p>';
   }
-  
+
+  // The protected literals back as plain characters.
+  if (literals.length) {
+    html = html.replace(/(\d+)/g,
+      (m, i) => (literals[Number(i)] !== undefined ? literals[Number(i)] : m));
+  }
+
   return html;
+}
+
+// One narrative message (DIAGNOSTICS_SPEC A5.6): the rendered narrative of a
+// turn, shown above its charts and tables. Markdown through renderMarkdown,
+// which escapes first.
+function appendNarrativeMessage(text, phase) {
+  const messageDiv = document.createElement('div');
+  messageDiv.className = 'message assistant pdc-narrative';
+  messageDiv.dataset.phase = String(phase === 2 ? 2 : 1);
+  const contentDiv = document.createElement('div');
+  contentDiv.className = 'message-content';
+  contentDiv.innerHTML = renderMarkdown(text || '');
+  messageDiv.appendChild(contentDiv);
+  chatMessages.appendChild(messageDiv);
+  return messageDiv;
+}
+
+// A hidden narrative slot for the live stream, placed before `beforeEl` (the
+// loading bubble) so the narrative reads above the charts once it is filled.
+function _createNarrativeSlot(phase, beforeEl) {
+  const slot = appendNarrativeMessage('', phase);
+  slot.classList.add('hidden');
+  if (beforeEl && beforeEl.parentNode === chatMessages) {
+    chatMessages.insertBefore(slot, beforeEl);
+  }
+  return slot;
+}
+
+// Fill a narrative slot and show it.
+function _fillNarrativeSlot(slot, text) {
+  const content = slot.querySelector('.message-content');
+  if (content) content.innerHTML = renderMarkdown(text || '');
+  // A narrative that rendered to "" stays hidden (removed at done / stop).
+  if (text) slot.classList.remove('hidden');
+}
+
+// Whether a single answer has anything to show: text, a chart, a table or
+// tables. A narrated answer without any of them gets no empty bubble.
+function _hasAnswerContent(text, image, table, tables) {
+  return !!(text || image || (table && table.columns) || (Array.isArray(tables) && tables.length));
+}
+
+// Slots no narrative event filled are removed at done / stop.
+function _removeHiddenNarrativeSlots(slots) {
+  Object.keys(slots || {}).forEach((k) => {
+    const s = slots[k];
+    if (s && s.parentNode && s.classList.contains('hidden')) s.remove();
+  });
+}
+
+// One stored AI record -> the page (DIAGNOSTICS_SPEC A5.6). The ONE renderer
+// of a persisted AI row: the history reload, _tryRecoverResponse and
+// editAndRegenerate (its `record_view`) all call it, with the row's index in
+// the served history (the chart PNG reference). Order: the phase-1
+// narrative, the phase-1 charts (or the single visual), the phase-1 tables
+// with their captions, then phase 2. A record without the narrative keys
+// renders exactly as before.
+function renderAiRecord(msg, convId, rowIdx) {
+  if (!msg) return;
+  if (typeof msg.narrative_rendered === 'string' && msg.narrative_rendered) {
+    appendNarrativeMessage(msg.narrative_rendered, 1);
+  }
+  const phaseOf = (p) => (p === 2 ? 2 : 1);
+  const hasImages = Array.isArray(msg.images) && msg.images.length > 0;
+  // The record's tables of one phase, keys and captions kept aligned. A
+  // record without table_phases has every table in phase 1.
+  const tablesOf = (phase) => {
+    const tables = Array.isArray(msg.tables) ? msg.tables : [];
+    const phases = Array.isArray(msg.table_phases) ? msg.table_phases : null;
+    if (!phases) {
+      return phase === 1
+        ? { tables: tables, keys: msg.full_table_keys || null,
+            caps: Array.isArray(msg.table_captions) ? msg.table_captions : null }
+        : { tables: [], keys: null, caps: null };
+    }
+    const keys = Array.isArray(msg.full_table_keys) ? msg.full_table_keys : [];
+    const caps = Array.isArray(msg.table_captions) ? msg.table_captions : [];
+    const out = { tables: [], keys: [], caps: [] };
+    tables.forEach((t, i) => {
+      if (phaseOf(phases[i]) !== phase) return;
+      out.tables.push(t);
+      out.keys.push(keys[i] || null);
+      out.caps.push(caps[i] || '');
+    });
+    return out;
+  };
+  // Multi-chart record: each chart as its own assistant message. New records
+  // persist per-chart code + chart_data (Show code / Show data on every chart
+  // after reload); old records lack them, so the legacy JOINED msg.code is
+  // split on ###NEXT_PLOT### and chart idx gets its own segment.
+  const drawImages = (phase) => {
+    if (!hasImages) return;
+    const legacySegs = _splitJoinedCode(msg.code);
+    msg.images.forEach((img, idx) => {
+      if (phaseOf(img.phase) !== phase) return;
+      const code = img.code || legacySegs[idx] || null;
+      appendMessage('assistant', img.answer || '', img.image_base64, null, null,
+        { code: code, chartData: img.chart_data || null,
+          chartRef: { conv_id: convId, ai_index: rowIdx, image_index: idx } });
+    });
+  };
+  const drawTables = (phase) => {
+    const t = tablesOf(phase);
+    if (t.tables && t.tables.length) {
+      appendMessage('assistant', '', null, null, null,
+        { tables: t.tables, fullTableKeys: t.keys, tableCaptions: t.caps });
+    }
+  };
+  if (hasImages) {
+    drawImages(1);
+    // Mixed dashboard record: the tables ride after the charts.
+    drawTables(1);
+  } else {
+    // Single-chart / table / text entry. New single-chart records persist
+    // chart_data on the record -> Show data on reload; old records omit it.
+    // Multi-table records carry msg.tables (+ per-table full keys).
+    // The PRESENCE of a template decides (never the truthiness of its
+    // rendering): a narrative or caption that rendered to "" shows "", never
+    // the record content, which holds the brain-safe marker + raw template.
+    const narrated = typeof msg.narrative_template === 'string' && msg.narrative_template !== '';
+    const captioned = typeof msg.caption_template === 'string' && msg.caption_template !== '';
+    const newShape = narrated || captioned || msg.narrative_rendered !== undefined;
+    const text = (narrated || msg.narrative_rendered !== undefined)
+      ? ((captioned ? msg.caption_rendered : msg.caption_described) || '')
+      : (captioned
+        ? (msg.caption_rendered || '')
+        : (msg.caption_rendered ?? (msg.value_display ? msg.content + '\n\n' + msg.value_display : msg.content)));
+    const phased = Array.isArray(msg.table_phases);
+    const single = tablesOf(1);
+    const singleTables = phased ? single.tables : (msg.tables || null);
+    // A narrated scalar answer has no caption, chart or table: no empty
+    // bubble under the narrative. Old records render exactly as before.
+    if (!newShape || _hasAnswerContent(text, msg.image_base64, msg.table, singleTables)) {
+      appendMessage('assistant', text, msg.image_base64, msg.table, msg.full_table_key,
+        { code: msg.code, chartData: msg.chart_data || null,
+          chartDataKey: msg.chart_data_key || null,
+          tables: singleTables,
+          fullTableKeys: phased ? single.keys : (msg.full_table_keys || null),
+          tableCaptions: single.caps,
+          chartRef: { conv_id: convId, ai_index: rowIdx, image_index: 0 } });
+    }
+  }
+  if (msg.phase2 && typeof msg.phase2.narrative_rendered === 'string' && msg.phase2.narrative_rendered) {
+    appendNarrativeMessage(msg.phase2.narrative_rendered, 2);
+  }
+  drawImages(2);
+  drawTables(2);
 }
 
 // Create fullscreen image viewer
@@ -3119,21 +3272,9 @@ async function _tryRecoverResponse(chatId, convId, loadingDiv) {
       if (!hasContent) continue;
       // Recovery successful - display the saved response
       loadingDiv.remove();
-      if (last.images && Array.isArray(last.images) && last.images.length > 0) {
-        // Same per-chart code resolution as the history renderer: prefer the
-        // persisted per-chart code, else the matching legacy joined segment.
-        const recSegs = _splitJoinedCode(last.code);
-        last.images.forEach((img, idx) => {
-          const code = img.code || recSegs[idx] || null;
-          appendMessage('assistant', img.answer || '', img.image_base64, null, null,
-            { code: code, chartData: img.chart_data || null,
-              chartRef: { conv_id: convId, ai_index: history.length - 1, image_index: idx } });
-        });
-      } else {
-        appendMessage('assistant', last.content || '', last.image_base64, last.table, last.full_table_key,
-          { code: last.code,
-            chartRef: { conv_id: convId, ai_index: history.length - 1, image_index: 0 } });
-      }
+      // The same renderer as the history reload (narrative, charts, tables),
+      // with the saved row's index for the chart references.
+      renderAiRecord(last, convId, history.length - 1);
       chatMessages.scrollTop = chatMessages.scrollHeight;
       console.log(`Response recovered from saved history (attempt ${attempt + 1})`);
       return true;
@@ -3172,6 +3313,12 @@ async function sendMessage() {
   chatMessages.appendChild(loadingDiv);
   chatMessages.scrollTop = chatMessages.scrollHeight;
   const statusTextEl = loadingDiv.querySelector('.loading-status-text');
+  // Phase-1 narrative slot (DIAGNOSTICS_SPEC A5.6): hidden until a narrative
+  // event fills it; it sits above the charts, so the narrative reads first.
+  // A slot still hidden at done / stop is removed.
+  const narrativeSlots = { 1: _createNarrativeSlot(1, loadingDiv) };
+  let narrativeShown = false;
+  let tablesStreamed = 0;
 
   // Abort controller with 240s timeout (Cloud Run has 300s, leave margin)
   const controller = new AbortController();
@@ -3196,6 +3343,7 @@ async function sendMessage() {
       loadingBubbleVisible = false;
     }
     if (streamLoadingDiv) { streamLoadingDiv.remove(); streamLoadingDiv = null; }
+    _removeHiddenNarrativeSlots(narrativeSlots);
     _appendStoppedNote();
     activeStopHandler = null;
     setGenerating(false);   // re-enable input immediately for the next question
@@ -3274,11 +3422,70 @@ async function sendMessage() {
             continue;
           }
 
+          // Narrative (A5.6): fill the phase's slot — it does not end the stream.
+          // (`=== true`: a single answer's done event carries `narrative` as
+          // its rendered TEXT and must reach the done branch below.)
+          if (data.narrative === true) {
+            const ph = data.phase === 2 ? 2 : 1;
+            let slot = narrativeSlots[ph];
+            if (!slot || !slot.parentNode) {
+              slot = appendNarrativeMessage('', ph);
+              narrativeSlots[ph] = slot;
+            }
+            _fillNarrativeSlot(slot, data.text || '');
+            narrativeShown = true;
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+            continue;
+          }
+
+          // Phase-2 progress: the phase-2 slot, then a status bubble.
+          if (data.progress && data.phase === 2) {
+            if (loadingBubbleVisible) {
+              loadingDiv.remove();
+              loadingBubbleVisible = false;
+            }
+            if (streamLoadingDiv) {
+              streamLoadingDiv.remove();
+              streamLoadingDiv = null;
+            }
+            const slot2 = appendNarrativeMessage('', 2);
+            slot2.classList.add('hidden');
+            narrativeSlots[2] = slot2;
+            streamLoadingDiv = document.createElement('div');
+            streamLoadingDiv.className = 'message assistant thinking-msg';
+            streamLoadingDiv.innerHTML = '<div class="message-content"><div class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="loading-status-text"></span></div></div>';
+            const p2Text = streamLoadingDiv.querySelector('.loading-status-text');
+            if (p2Text) p2Text.textContent = _t(data.message_key || 'lab.phase2_progress', data.message || '');
+            chatMessages.appendChild(streamLoadingDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+            continue;
+          }
+
           // Handle real-time progress events from the server
           if (data.progress) {
             if (statusTextEl && loadingBubbleVisible) {
               statusTextEl.textContent = data.message || 'Processing...';
             }
+            continue;
+          }
+
+          // Tables partial: tables (with captions) without a chart — never
+          // counted as a chart.
+          if (data.partial && !data.image_base64 && data.tables) {
+            if (loadingBubbleVisible) {
+              loadingDiv.remove();
+              loadingBubbleVisible = false;
+              clearTimeout(timeoutId);
+            }
+            if (streamLoadingDiv) {
+              streamLoadingDiv.remove();
+              streamLoadingDiv = null;
+            }
+            appendMessage('assistant', '', null, null, null,
+              { tables: data.tables, fullTableKeys: data.full_table_keys || null,
+                tableCaptions: data.table_captions || null });
+            tablesStreamed++;
+            chatMessages.scrollTop = chatMessages.scrollHeight;
             continue;
           }
 
@@ -3322,26 +3529,46 @@ async function sendMessage() {
               streamLoadingDiv.remove();
               streamLoadingDiv = null;
             }
+            _removeHiddenNarrativeSlots(narrativeSlots);
 
             // For single-response (non-multi-plot) that came via SSE
-            if (chartCount === 0) {
-              const answer = data.answer || '';
-              const hasContent = answer || data.image_base64 || (data.table && data.table.columns)
-                || (data.tables && data.tables.length);
-              if (!hasContent) {
-                appendMessage('assistant', 'I processed your request but could not generate a response. Please try rephrasing your question.');
-              } else {
-                appendMessage('assistant', answer, data.image_base64, data.table, data.full_table_key,
+            if (chartCount === 0 && tablesStreamed === 0) {
+              if (typeof data.narrative === 'string') {
+                // Single answer with a narrative: the narrative, then the
+                // visual with its own caption — a template rendered to ""
+                // shows nothing (never the brain-safe answer), and a scalar
+                // answer gets no empty bubble.
+                if (data.narrative) appendNarrativeMessage(data.narrative, 1);
+                if (_hasAnswerContent(data.caption || '', data.image_base64, data.table, data.tables)) {
+                  appendMessage('assistant', data.caption || '', data.image_base64, data.table, data.full_table_key,
           { code: data.code, chartDataKey: data.chart_data_key,
             tables: data.tables || null, fullTableKeys: data.full_table_keys || null,
             chartRef: data.chart_ref ? { chart_ref: data.chart_ref } : null });
+                }
+              } else {
+                // A narrative already streamed is not repeated as the answer.
+                const answer = narrativeShown ? '' : (data.answer || '');
+                const hasContent = answer || data.image_base64 || (data.table && data.table.columns)
+                  || (data.tables && data.tables.length);
+                if (!hasContent) {
+                  if (!narrativeShown) {
+                    appendMessage('assistant', 'I processed your request but could not generate a response. Please try rephrasing your question.');
+                  }
+                } else {
+                  appendMessage('assistant', answer, data.image_base64, data.table, data.full_table_key,
+          { code: data.code, chartDataKey: data.chart_data_key,
+            tables: data.tables || null, fullTableKeys: data.full_table_keys || null,
+            tableCaptions: data.table_captions || null,
+            chartRef: data.chart_ref ? { chart_ref: data.chart_ref } : null });
+                }
               }
               chatMessages.scrollTop = chatMessages.scrollHeight;
             } else if (data.tables && data.tables.length) {
               // Mixed dashboard answer: charts already streamed as partials —
               // append the KPI/table blocks' tables as a final message.
               appendMessage('assistant', '', null, null, null,
-                { tables: data.tables, fullTableKeys: data.full_table_keys || null });
+                { tables: data.tables, fullTableKeys: data.full_table_keys || null,
+                  tableCaptions: data.table_captions || null });
               chatMessages.scrollTop = chatMessages.scrollHeight;
             }
 
@@ -3450,6 +3677,7 @@ async function sendMessage() {
     }
   } finally {
     clearTimeout(timeoutId);
+    _removeHiddenNarrativeSlots(narrativeSlots);
     // Only touch the button/handler if a NEWER send hasn't taken over (an
     // instant Stop lets the user fire a new question while this one unwinds).
     if (myToken === currentSendToken) {
@@ -3621,7 +3849,11 @@ async function editAndRegenerate(messageDiv, editedQuestion) {
     const hasContent = answer || data.image_base64 || (data.table && data.table.columns)
       || (data.tables && data.tables.length);
 
-    if (!hasContent) {
+    if (data.record_view && typeof data.ai_index === 'number') {
+      // The persisted record, rendered like a reloaded row (narrative,
+      // every chart, tables with captions); `ai_index` is its row index.
+      renderAiRecord(data.record_view, currentConvId, data.ai_index);
+    } else if (!hasContent) {
       console.warn('Empty response from server:', data);
       appendMessage('assistant', 'I processed your request but could not generate a response. Please try rephrasing your question.');
     } else {

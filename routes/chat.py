@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import html_sanitize
 import local_store
+import narrative
 import run_chat_local
 import brain_client
 from brain_client import TenantRevokedError, BrainError, BrainTimeoutError
@@ -487,7 +488,202 @@ def _build_chart_entry(c: dict) -> dict:
     cd = _persistable_chart_data(c.get("chart_data"))
     if cd is not None:
         entry["chart_data"] = cd
+    # Narrative-template turns (DIAGNOSTICS_SPEC A5.5): the caption TEMPLATE
+    # (brain-safe) beside the rendered `answer` (display), and the phase.
+    if isinstance(c.get("caption_template"), str) and c["caption_template"]:
+        entry["caption_template"] = c["caption_template"]
+    if c.get("phase") in (1, 2):
+        entry["phase"] = c["phase"]
     return entry
+
+
+def _use_images_array(imgs: list) -> bool:
+    """A multi-chart record keeps its charts in `images[]` when there are two
+    or more, or when any of them belongs to phase 2 (A5.5)."""
+    return len(imgs) >= 2 or any(c.get("phase") == 2 for c in imgs)
+
+
+# Record fields of a narrative-template turn (DIAGNOSTICS_SPEC A5.5). The
+# RENDERED texts (`narrative_rendered`, `caption_rendered`, `value_display`)
+# are display-only: brain_client._sanitize_history_rows is an allowlist
+# (role/content/code), so none of them reaches the brain (A5.2 R0).
+_NARR_KEYS = ("narrative_template", "narrative_rendered", "values", "findings",
+              "caption_template", "caption_rendered", "caption_described",
+              "value_display", "table_captions", "table_caption_templates",
+              "table_phases", "phase2", "phase2_status")
+_PHASE1_KEYS = ("narrative_template", "narrative_rendered", "values", "findings")
+_PARA = "\n\n"
+
+
+def _narr_value_present(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (str, dict, list)):
+        return bool(value)
+    return True
+
+
+def _has_template(src, key: str) -> bool:
+    return isinstance(src, dict) and isinstance(src.get(key), str) and bool(src[key])
+
+
+def _str_or_empty(value) -> str:
+    return value if isinstance(value, str) else ""
+
+
+# A rendered text is kept even when it is "" as long as its TEMPLATE is
+# present: an empty rendering must not read as "no narrative" downstream
+# (the page would then show the brain-safe content — the raw template).
+_RENDERED_OF = {"narrative_rendered": "narrative_template",
+                "caption_rendered": "caption_template"}
+
+
+def _narr_field_kept(src: dict, key: str) -> bool:
+    value = src.get(key)
+    if key in _RENDERED_OF and isinstance(value, str):
+        return _has_template(src, _RENDERED_OF[key])
+    return _narr_value_present(value)
+
+
+def _apply_narrative_fields(rec: dict, src) -> dict:
+    """Copy the narrative fields `src` carries onto a history record — only
+    the keys that are present, so an old-shape turn keeps today's shape.
+
+    `src` is a single result dict (its keys top-level), or a multi-plot
+    source: the done event's `narrative_view` (`{"phase1": {...} | None,
+    "phase2": {...} | None, "phase2_status": str | None}`) plus the table
+    arrays aligned with the record's `tables`."""
+    if not isinstance(rec, dict) or not isinstance(src, dict):
+        return rec
+    view = src.get("narrative_view")
+    if isinstance(view, dict):
+        p1 = view.get("phase1")
+        if isinstance(p1, dict):
+            for k in _PHASE1_KEYS:
+                if _narr_field_kept(p1, k):
+                    rec[k] = p1[k]
+        p2 = view.get("phase2")
+        if isinstance(p2, dict) and p2:
+            rec["phase2"] = {k: p2[k] for k in _PHASE1_KEYS if _narr_field_kept(p2, k)}
+        if isinstance(view.get("phase2_status"), str) and view["phase2_status"]:
+            rec["phase2_status"] = view["phase2_status"]
+    for k in _NARR_KEYS:
+        if k in src and _narr_field_kept(src, k):
+            rec[k] = src[k]
+    return rec
+
+
+def _single_chart_caption(rec: dict, chart: dict) -> dict:
+    """A multi-plot turn that produced ONE chart is stored as a single-visual
+    record (no `images[]`), so the chart's own text moves to the record's
+    single-visual fields (A5.5): a captioned chart keeps its template and the
+    rendered caption; an uncaptioned chart of a narrated turn keeps its
+    describe text as `caption_described`. Call AFTER the narrative fields."""
+    ct = chart.get("caption_template")
+    if isinstance(ct, str) and ct:
+        rec["caption_template"] = ct
+        rec["caption_rendered"] = chart.get("answer", "") or ""
+    elif rec.get("narrative_template") and chart.get("answer"):
+        rec["caption_described"] = chart.get("answer")
+    return rec
+
+
+def _narr_event_view(narr_event) -> dict | None:
+    """A phase-1 narrative EVENT in the `narrative_view` shape (the stop
+    path, where no done event arrived); None without a template."""
+    if not (isinstance(narr_event, dict) and isinstance(narr_event.get("template"), str)
+            and narr_event.get("template")):
+        return None
+    return {"phase1": {"narrative_template": narr_event.get("template"),
+                       "narrative_rendered": narr_event.get("text") or "",
+                       "values": narr_event.get("values") or {},
+                       "findings": narr_event.get("findings") or {}},
+            "phase2": None, "phase2_status": None}
+
+
+def _event_table_fields(event: dict, n: int) -> tuple:
+    """The caption / caption template / phase of each of an event's `n`
+    tables, aligned by index, plus whether the event carried captions at all
+    (an older generator's done event carries none)."""
+    caps = event.get("table_captions")
+    tpls = event.get("table_caption_templates")
+    phases = event.get("table_phases")
+    phase = event.get("phase") if event.get("phase") in (1, 2) else 1
+
+    def _at(seq, i):
+        return seq[i] if isinstance(seq, list) and i < len(seq) else None
+
+    out_caps = [c if isinstance(c := _at(caps, i), str) else "" for i in range(n)]
+    out_tpls = [t if isinstance(t := _at(tpls, i), str) else "" for i in range(n)]
+    out_phases = [p if (p := _at(phases, i)) in (1, 2) else phase for i in range(n)]
+    return out_caps, out_tpls, out_phases, isinstance(caps, list)
+
+
+def _single_display(result: dict) -> dict:
+    """What the page shows for a single answer (A5.6): `answer` is the
+    display text — the rendered narrative (+ the visual's caption), else the
+    rendered caption, else the brain-safe text (+ the local value line).
+    `narrative` / `caption` are set only when a narrative was rendered."""
+    if not isinstance(result, dict):
+        return {"answer": ""}
+    text = result.get("text", "") or ""
+    # The PRESENCE of a template decides, never the truthiness of its
+    # rendering: a template that rendered to "" shows "", because the
+    # brain-safe `text` holds the marker + the raw template.
+    if _has_template(result, "narrative_template"):
+        nr = _str_or_empty(result.get("narrative_rendered"))
+        if _has_template(result, "caption_template"):
+            cap = _str_or_empty(result.get("caption_rendered"))
+        else:
+            cap = _str_or_empty(result.get("caption_described"))
+        return {"answer": nr + (_PARA + cap if (nr and cap) else cap),
+                "narrative": nr, "caption": cap}
+    if _has_template(result, "caption_template"):
+        return {"answer": _str_or_empty(result.get("caption_rendered"))}
+    vd = result.get("value_display")
+    if isinstance(vd, str) and vd:
+        return {"answer": (text + _PARA + vd) if text else vd}
+    return {"answer": text}
+
+
+def _record_view_of_done(ev: dict) -> dict:
+    """The `record_view` a multi done event sends the page (A5.4): the
+    rendered narrative(s) and the phase-2 status — display fields only."""
+    view = ev.get("narrative_view") if isinstance(ev, dict) else None
+    out: dict = {}
+    if not isinstance(view, dict):
+        return out
+    # Kept even when "" while the template is present (an empty rendering
+    # is still the narrative's display text).
+    p1 = view.get("phase1")
+    if isinstance(p1, dict) and _narr_field_kept(p1, "narrative_rendered"):
+        out["narrative_rendered"] = p1["narrative_rendered"]
+    p2 = view.get("phase2")
+    if isinstance(p2, dict) and _narr_field_kept(p2, "narrative_rendered"):
+        out["phase2"] = {"narrative_rendered": p2["narrative_rendered"]}
+    if isinstance(view.get("phase2_status"), str) and view["phase2_status"]:
+        out["phase2_status"] = view["phase2_status"]
+    return out
+
+
+def _answer_for_title(single, view, combined) -> str:
+    """The answer text /v1/title sees: `narrative.brain_view` of the
+    template when one exists (slots as `[name]`, no value), else the
+    record's brain-safe `content` (A5.5 Title)."""
+    if single is not None:
+        finds = single.get("findings") if isinstance(single.get("findings"), dict) else {}
+        for key in ("narrative_template", "caption_template"):
+            t = single.get(key)
+            if isinstance(t, str) and t:
+                return narrative.brain_view(t, finds)
+        return single.get("text", "") or ""
+    p1 = view.get("phase1") if isinstance(view, dict) else None
+    if _has_template(p1, "narrative_template"):
+        finds = p1.get("findings") if isinstance(p1.get("findings"), dict) else {}
+        return narrative.brain_view(p1["narrative_template"], finds)
+    text = combined or ""
+    # Caption templates joined into the content: their slots as `[name]`.
+    return narrative.brain_view(text, {}) if "{{" in text else text
 
 
 def _attach_live_fields(rec: dict, src) -> dict:
@@ -508,7 +704,7 @@ def _attach_live_fields(rec: dict, src) -> dict:
 def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
                              usage, charts, full_table_key=None,
                              full_table_keys=None, combined_tables=None,
-                             live_fields=None):
+                             live_fields=None, narrative_src=None):
     """Build the AI-turn history record persisted EXACTLY ONCE by the worker.
 
     Returns None when there is nothing to persist (never writes an empty turn).
@@ -520,6 +716,9 @@ def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
     Live tables: the single result's / the done event's (`live_fields`) `sql`,
     `live_truncated` and `live_rows` are persisted so the refresh paths can
     re-run the same query.
+    Narrative-template turns: the single result's narrative keys, or
+    `narrative_src` (the done event's `narrative_view` + the table arrays)
+    for a multi turn, through `_apply_narrative_fields`.
     """
     if err_msg:
         return {"role": "ai", "content": err_msg, "ts": time.time()}
@@ -546,6 +745,7 @@ def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
         cd = _persistable_chart_data(single.get("chart_data"))
         if cd is not None:
             rec["chart_data"] = cd
+        _apply_narrative_fields(rec, single)
         return rec
     if combined_answer is not None:
         imgs = [c for c in charts if c.get("image_base64")]
@@ -558,7 +758,7 @@ def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
             "usage": usage or {},
             "ts": time.time(),
         }
-        if len(imgs) >= 2:
+        if _use_images_array(imgs):
             rec["images"] = [_build_chart_entry(c) for c in imgs]
         elif len(imgs) == 1:
             c = imgs[0]
@@ -575,12 +775,16 @@ def _build_ai_history_record(err_msg, single, combined_answer, combined_codes,
             if full_table_keys:
                 rec["full_table_keys"] = full_table_keys
         _attach_live_fields(rec, live_fields)
+        _apply_narrative_fields(rec, narrative_src)
+        if len(imgs) == 1 and not _use_images_array(imgs):
+            _single_chart_caption(rec, imgs[0])
         return rec
     return None
 
 
 def _build_stopped_record(combined_answer, combined_codes, usage, charts,
-                          live_fields=None):
+                          live_fields=None, narr_event=None, combined_tables=None,
+                          full_table_keys=None, narrative_src=None):
     """Persist a STOPPED AI turn (user clicked Stop) — never the planner
     NO_CODE fallback or a late single-shot result.
 
@@ -590,12 +794,24 @@ def _build_stopped_record(combined_answer, combined_codes, usage, charts,
     by user." turn. Returns a record dict (never None — a stop always yields a
     turn so reload shows it consistently). Reuses _build_chart_entry /
     _persistable_chart_data so per-chart Show data/code survive reload.
+
+    `content` stays brain-safe (A5.2 R0): each chart contributes its caption
+    TEMPLATE, or its describe text (`answer`) when it has none — never a
+    rendered caption. After the phase-1 narrative event (`narr_event`) it is
+    `history_content(template, findings)` + the stop note, and the record
+    carries that event's narrative fields. Tables already streamed (a tables
+    partial) are kept with their durable keys and `narrative_src` arrays.
     """
     note = "Response stopped by user."
     imgs = [c for c in charts if c.get("image_base64")]
-    if imgs:
-        answers = [c.get("answer", "") for c in imgs if c.get("answer")]
-        base = "\n\n".join(a for a in answers if a)
+    view = _narr_event_view(narr_event)
+    if imgs or view or combined_tables:
+        if view:
+            p1 = view["phase1"]
+            base = narrative.history_content(p1["narrative_template"], p1["findings"])
+        else:
+            parts = [c.get("caption_template") or c.get("answer", "") for c in imgs]
+            base = "\n\n".join(p for p in parts if p)
         content = (base + "\n\n⏹ " + note).strip() if base else ("⏹ " + note)
         rec = {
             "role": "ai",
@@ -607,7 +823,7 @@ def _build_stopped_record(combined_answer, combined_codes, usage, charts,
             "stopped": True,
             "ts": time.time(),
         }
-        if len(imgs) >= 2:
+        if _use_images_array(imgs):
             rec["images"] = [_build_chart_entry(c) for c in imgs]
         elif len(imgs) == 1:
             c = imgs[0]
@@ -617,7 +833,22 @@ def _build_stopped_record(combined_answer, combined_codes, usage, charts,
             cd = _persistable_chart_data(c.get("chart_data"))
             if cd is not None:
                 rec["chart_data"] = cd
+        if combined_tables:
+            rec["tables"] = combined_tables
+            if full_table_keys:
+                rec["full_table_keys"] = full_table_keys
         _attach_live_fields(rec, live_fields)
+        src = dict(narrative_src) if isinstance(narrative_src, dict) else {}
+        if view:
+            src["narrative_view"] = view
+        _apply_narrative_fields(rec, src)
+        if len(imgs) == 1 and not _use_images_array(imgs):
+            _single_chart_caption(rec, imgs[0])
+            # The single visual's display text keeps the stop note, as the
+            # content of an older stopped record showed it.
+            for key in ("caption_rendered", "caption_described"):
+                if key in rec:
+                    rec[key] = ((rec[key] or "") + "\n\n⏹ " + note).strip()
         return rec
     return {
         "role": "ai",
@@ -1637,6 +1868,13 @@ async def chat_stream(request: Request, chat_id: str):
             w_full_table_keys = None        # per-table keys for a multi-table result
             w_combined_tables = None        # tables of a mixed charts+tables answer
             w_live: dict = {}               # sql / live_truncated / live_rows of the turn
+            w_narr: dict = {}               # {phase: narrative event} — the stop path only
+            w_view = None                   # the done event's narrative_view (authoritative)
+            w_tables: list = []             # a multi turn's tables (tables partials + done), in order
+            w_table_keys: list = []         # their durable keys, aligned
+            w_table_fields = {"table_captions": [], "table_caption_templates": [],
+                              "table_phases": []}
+            w_table_captioned = False       # any table event carried captions
             err_msg = None
             cancelled = False               # STOP requested mid-generation
             w_inflight: list = []           # codes registered for refresh/pin
@@ -1688,10 +1926,13 @@ async def chat_stream(request: Request, chat_id: str):
                                 _keys.append(_k)
                             event["full_table_keys"] = _keys
                             w_full_table_keys = _keys
-                    # Mixed dashboard done event (charts + KPI/table blocks):
-                    # persist each table with its OWN block code + dict entry.
-                    if (isinstance(event, dict) and event.get("done")
-                            and not event.get("single_response") and event.get("tables")):
+                    # Mixed dashboard tables (charts + KPI/table blocks) — on
+                    # the done event or on a tables partial (A5.5): persist
+                    # each table with its OWN block code + dict entry, and keep
+                    # it with its caption for the record.
+                    if (isinstance(event, dict) and not event.get("single_response")
+                            and event.get("tables")
+                            and (event.get("done") or event.get("table_codes"))):
                         _tbls = event.get("tables") or []
                         _codes = event.get("table_codes") or []
                         _rkeys = event.get("table_result_keys") or []
@@ -1704,6 +1945,15 @@ async def chat_stream(request: Request, chat_id: str):
                                 sql=event.get("sql"),
                                 first_key=next(iter(dfs), None)))
                         event["full_table_keys"] = _keys
+                        _caps, _tpls, _phs, _has = _event_table_fields(event, len(_tbls))
+                        w_tables.extend(_tbls)
+                        w_table_keys.extend(_keys)
+                        w_table_fields["table_captions"].extend(_caps)
+                        w_table_fields["table_caption_templates"].extend(_tpls)
+                        w_table_fields["table_phases"].extend(_phs)
+                        w_table_captioned = w_table_captioned or _has
+                        w_combined_tables = w_tables
+                        w_full_table_keys = w_table_keys
                     # Register the codes this event shows BEFORE the browser can
                     # see it: its refresh / pin buttons work while the turn is
                     # still being generated. Removed after persistence below.
@@ -1721,7 +1971,11 @@ async def chat_stream(request: Request, chat_id: str):
                     loop.call_soon_threadsafe(queue.put_nowait, ("event", event))
                     try:
                         if isinstance(event, dict):
-                            if event.get("partial"):
+                            if event.get("narrative"):
+                                w_narr[event.get("phase") or 1] = event
+                            elif event.get("progress"):
+                                pass
+                            elif event.get("partial"):
                                 w_usage = event.get("usage") or w_usage
                                 if event.get("image_base64"):
                                     w_charts.append({
@@ -1729,14 +1983,14 @@ async def chat_stream(request: Request, chat_id: str):
                                         "answer": event.get("answer", ""),
                                         "code": event.get("code"),
                                         "chart_data": event.get("chart_data"),
+                                        "caption_template": event.get("caption_template"),
+                                        "phase": event.get("phase"),
                                     })
                             elif event.get("done") and not event.get("single_response"):
                                 w_combined_answer = event.get("combined_answer", "")
                                 w_combined_codes = event.get("combined_codes") or []
                                 w_usage = event.get("total_usage") or {}
-                                if event.get("tables"):
-                                    w_combined_tables = event.get("tables")
-                                    w_full_table_keys = event.get("full_table_keys") or w_full_table_keys
+                                w_view = event.get("narrative_view")
                             elif event.get("single_response"):
                                 w_single = event.get("result") or {}
                     except Exception:
@@ -1753,15 +2007,27 @@ async def chat_stream(request: Request, chat_id: str):
                 # (so persistence + the client's done handler behave normally) and
                 # emit a done so the live stream finalizes and shows the partial.
                 if cancelled and w_single is None and w_combined_answer is None:
+                    # Brain-safe: each chart's caption TEMPLATE, else its
+                    # describe text. The browser gets the DISPLAY text (the
+                    # rendered answers), never the templates (A5.5).
+                    w_display = None
                     if w_charts:
+                        parts = [c.get("caption_template") or c.get("answer", "")
+                                 for c in w_charts]
+                        parts = [p for p in parts if p]
+                        w_combined_answer = "\n\n".join(parts) if parts else "Analysis stopped."
                         answers = [c.get("answer", "") for c in w_charts if c.get("answer")]
-                        w_combined_answer = "\n\n".join(answers) if answers else "Analysis stopped."
+                        w_display = "\n\n".join(answers) if answers else "Analysis stopped."
                         w_combined_codes = [c.get("code") for c in w_charts if c.get("code")]
+                    if w_display is None and isinstance(w_narr.get(1), dict):
+                        w_display = w_narr[1].get("text") or ""
                     loop.call_soon_threadsafe(queue.put_nowait, ("event", {
                         "partial": False, "done": True,
                         "combined_answer": w_combined_answer or "",
+                        "display_answer": w_display or "",
                         "combined_codes": w_combined_codes,
                         "total_usage": w_usage,
+                        "narrative_view": _narr_event_view(w_narr.get(1)),
                     }))
             except TenantRevokedError:
                 err_msg = "Service unavailable. Please contact your administrator."
@@ -1788,26 +2054,31 @@ async def chat_stream(request: Request, chat_id: str):
 
             # ── Exactly-once AI-turn persistence (Articles IV & V) ──
             try:
+                # The table arrays ride only when a table event carried them.
+                w_tbl_src = dict(w_table_fields) if (w_tables and w_table_captioned) else {}
                 if cancelled:
                     # User clicked Stop. Persist a STOPPED turn — the partial
                     # charts (if any) or a short "stopped by user" note — never
                     # the planner NO_CODE error or a late single-shot result.
                     record = _build_stopped_record(
                         w_combined_answer, w_combined_codes, w_usage, w_charts,
-                        live_fields=w_live)
+                        live_fields=w_live, narr_event=w_narr.get(1),
+                        combined_tables=w_combined_tables,
+                        full_table_keys=w_full_table_keys,
+                        narrative_src=w_tbl_src)
                 else:
+                    w_tbl_src["narrative_view"] = w_view
                     record = _build_ai_history_record(
                         err_msg, w_single, w_combined_answer, w_combined_codes,
                         w_usage, w_charts, full_table_key=w_full_table_key,
                         full_table_keys=w_full_table_keys,
                         combined_tables=w_combined_tables,
-                        live_fields=w_live)
+                        live_fields=w_live, narrative_src=w_tbl_src)
                 if record is not None:
                     store.append_history(conv_id, record)
                     if not err_msg and not cancelled:
-                        answer_for_title = (
-                            (w_single or {}).get("text", "") if w_single is not None
-                            else (w_combined_answer or ""))
+                        answer_for_title = _answer_for_title(
+                            w_single, w_view, w_combined_answer)
                         try:
                             human_count = sum(
                                 1 for m in store.get_history(conv_id)
@@ -1851,6 +2122,32 @@ async def chat_stream(request: Request, chat_id: str):
                 continue
             if tag == "event":
                 ev = payload
+                # ── Narrative (A5.4): the rendered text only — never the
+                # template, VALUES or FINDINGS. Does not end the stream. ──
+                if ev.get("narrative"):
+                    narr_out = {"narrative": True, "phase": ev.get("phase") or 1,
+                                "text": ev.get("text") or "", "conv_id": conv_id}
+                    yield f"data: {json.dumps(_json_safe(narr_out), ensure_ascii=False)}\n\n"
+                    continue
+                # ── Progress (phase 2 status line) ──
+                if ev.get("progress"):
+                    prog_out = {k: ev[k] for k in ("progress", "phase", "message_key", "message")
+                                if k in ev}
+                    prog_out["conv_id"] = conv_id
+                    yield f"data: {json.dumps(_json_safe(prog_out), ensure_ascii=False)}\n\n"
+                    continue
+                # ── Tables partial: tables without a chart (never a chart) ──
+                if ev.get("partial") and not ev.get("image_base64") and ev.get("tables"):
+                    tbl_out = {
+                        "partial": True, "phase": ev.get("phase") or 1,
+                        "tables": ev.get("tables"),
+                        "full_table_keys": ev.get("full_table_keys"),
+                        "table_captions": _event_table_fields(
+                            ev, len(ev.get("tables") or []))[0],
+                        "conv_id": conv_id,
+                    }
+                    yield f"data: {json.dumps(_json_safe(tbl_out), ensure_ascii=False)}\n\n"
+                    continue
                 # ── Multi-plot: per-chart partial event (live UX only) ──
                 if ev.get("partial"):
                     img = ev.get("image_base64")
@@ -1877,6 +2174,8 @@ async def chat_stream(request: Request, chat_id: str):
                         # export never takes chart markup from the browser).
                         "chart_ref": _chart_ref_for(email, chat_id, img),
                     }
+                    if ev.get("phase") in (1, 2):
+                        partial_payload["phase"] = ev["phase"]
                     yield f"data: {json.dumps(_json_safe(partial_payload), ensure_ascii=False)}\n\n"
                     if img:
                         try:
@@ -1889,7 +2188,10 @@ async def chat_stream(request: Request, chat_id: str):
 
                 # ── Multi-plot: final done event (live UX only) ──
                 if ev.get("done") and not ev.get("single_response"):
-                    answer = ev.get("combined_answer", "")
+                    # The browser gets the DISPLAY text; `combined_answer` is
+                    # the brain-safe one the record keeps (A5.4).
+                    answer = (ev.get("display_answer") if "display_answer" in ev
+                              else ev.get("combined_answer", ""))
                     codes = ev.get("combined_codes") or []
                     usage = ev.get("total_usage") or {}
                     out = {
@@ -1903,8 +2205,20 @@ async def chat_stream(request: Request, chat_id: str):
                         "full_table_keys": ev.get("full_table_keys"),
                         "code": "\n\n###NEXT_PLOT###\n\n".join(codes),
                         "tokens": usage,
+                        "record_view": _record_view_of_done(ev),
                     }
+                    if ev.get("tables"):
+                        out["table_captions"] = _event_table_fields(
+                            ev, len(ev.get("tables") or []))[0]
                     yield f"data: {json.dumps(_json_safe(out), ensure_ascii=False)}\n\n"
+                    continue
+
+                # ── Anything else is not an event this consumer knows: drop
+                # it, naming its KEYS only (never a value). ──
+                if not ev.get("single_response"):
+                    unknown_keys = ",".join(sorted(str(k) for k in ev))
+                    log_with_sid(sid, "warning",
+                                 f"SSE_EVENT_UNKNOWN keys={log_safe_text(unknown_keys, 300)}")
                     continue
 
                 # ── Single-shot path: {single_response: True, result: ...} ─
@@ -1930,7 +2244,6 @@ async def chat_stream(request: Request, chat_id: str):
                     "done": True,
                     "partial": False,
                     "conv_id": conv_id,
-                    "answer": result.get("text", ""),
                     "image_base64": result.get("image_base64"),
                     "table": result.get("table"),
                     "tables": result.get("tables"),
@@ -1941,6 +2254,9 @@ async def chat_stream(request: Request, chat_id: str):
                     "tokens": result.get("usage") or {},
                     "chart_ref": _chart_ref_for(email, chat_id, result.get("image_base64")),
                 }
+                # Display text (A5.6): `answer`, plus `narrative` / `caption`
+                # when the single answer rendered a narrative.
+                out.update(_single_display(result))
                 yield f"data: {json.dumps(_json_safe(out), ensure_ascii=False)}\n\n"
 
     return StreamingResponse(_sse_generator(), media_type="text/event-stream", headers={
@@ -1961,7 +2277,10 @@ async def edit_regenerate(request: Request, chat_id: str):
 
     Body: {edited_question: str, conv_id: str}
     Returns: {answer, image_base64?, table?, full_table_key?, conv_id, tokens}
-    (or, for multi-chart responses, {answer, images: [...], conv_id, tokens}).
+    (or, for multi-chart responses, {answer, images: [...], conv_id, tokens}),
+    plus `record_view` (the persisted record, as the history route serves it)
+    and `ai_index` (its row index). `answer` is the DISPLAY text — never the
+    brain-safe `combined_answer` / `result.text` (DIAGNOSTICS_SPEC A5.5).
 
     Mirrors global's truncate-then-rerun behavior:
       1. Truncate the conv history to drop the last human turn (and everything
@@ -2083,13 +2402,40 @@ async def edit_regenerate(request: Request, chat_id: str):
             status_code=500,
         )
 
-    # Accumulate multi-plot images (same shape used in the normal SSE path so
-    # persistence + frontend rendering match exactly).
-    all_images: list[str] = []
-    all_answers: list[str] = []
-    single_result: dict | None = None
-    combined_codes: list[str] = []
-    final_usage: dict = {}
+    # Accumulate the turn exactly as the streaming worker does, and build the
+    # record with the SAME builder, so persistence + reload rendering match:
+    # charts (with caption template + phase), tables partials, the done
+    # event's tables, the narrative view (DIAGNOSTICS_SPEC A5.5).
+    all_charts: list[dict] = []
+    acc_tables: list = []
+    acc_keys: list = []
+    acc_fields = {"table_captions": [], "table_caption_templates": [], "table_phases": []}
+    acc_captioned = False
+
+    def _persist_event_tables(ev: dict) -> None:
+        nonlocal acc_captioned
+        tbls = ev.get("tables") or []
+        codes_per = ev.get("table_codes") or []
+        rkeys = ev.get("table_result_keys") or []
+        keys = [
+            _persist_full_table(store, t,
+                                codes_per[i] if i < len(codes_per) else None,
+                                result_key=rkeys[i] if i < len(rkeys) else None,
+                                sql=ev.get("sql"),
+                                first_key=next(iter(dfs), None))
+            for i, t in enumerate(tbls)
+        ]
+        caps, tpls, phases, has = _event_table_fields(ev, len(tbls))
+        acc_tables.extend(tbls)
+        acc_keys.extend(keys)
+        acc_fields["table_captions"].extend(caps)
+        acc_fields["table_caption_templates"].extend(tpls)
+        acc_fields["table_phases"].extend(phases)
+        acc_captioned = acc_captioned or has
+
+    def _append_and_index(record: dict) -> int:
+        store.append_history(conv_id, record)
+        return len(store.get_history(conv_id)) - 1
 
     # The answer is persisted inside this loop; its codes count as stored
     # until then (same registry the streaming worker uses).
@@ -2099,50 +2445,43 @@ async def edit_regenerate(request: Request, chat_id: str):
             _inflight_add(chat_id, c, sql=_event_sql(ev))
     try:
         for ev in events:
+            if ev.get("narrative") or ev.get("progress"):
+                continue
+            if ev.get("partial") and not ev.get("image_base64") and ev.get("tables"):
+                _persist_event_tables(ev)
+                continue
             if ev.get("partial"):
-                img = ev.get("image_base64")
-                if img:
-                    all_images.append(img)
-                    all_answers.append(ev.get("answer", ""))
+                if ev.get("image_base64"):
+                    all_charts.append({
+                        "image_base64": ev.get("image_base64"),
+                        "answer": ev.get("answer", ""),
+                        "code": ev.get("code"),
+                        "chart_data": ev.get("chart_data"),
+                        "caption_template": ev.get("caption_template"),
+                        "phase": ev.get("phase"),
+                    })
                 continue
             if ev.get("done") and not ev.get("single_response"):
                 combined_codes = ev.get("combined_codes") or []
                 final_usage = ev.get("total_usage") or {}
-                combined_answer = ev.get("combined_answer", "")
-                history_obj: dict = {
-                    "role": "ai", "content": combined_answer,
-                    "image_base64": None, "table": None,
-                    "code": "\n\n###NEXT_PLOT###\n\n".join(combined_codes),
-                    "usage": final_usage, "ts": time.time(),
-                }
-                if len(all_images) >= 2:
-                    history_obj["images"] = [
-                        {"image_base64": img, "answer": ans}
-                        for img, ans in zip(all_images, all_answers) if img
-                    ]
-                elif len(all_images) == 1:
-                    history_obj["image_base64"] = all_images[0]
-                _attach_live_fields(history_obj, ev)
-                # Mixed dashboard answer: persist the KPI/table blocks' tables with
-                # per-table durable keys (same as chat_stream's worker).
-                tbls = ev.get("tables") or []
-                if tbls:
-                    codes_per = ev.get("table_codes") or []
-                    rkeys = ev.get("table_result_keys") or []
-                    keys = [
-                        _persist_full_table(store, t,
-                                            codes_per[i] if i < len(codes_per) else None,
-                                            result_key=rkeys[i] if i < len(rkeys) else None,
-                                            sql=ev.get("sql"),
-                                            first_key=next(iter(dfs), None))
-                        for i, t in enumerate(tbls)
-                    ]
-                    history_obj["tables"] = tbls
-                    history_obj["full_table_keys"] = keys
-                store.append_history(conv_id, history_obj)
+                if ev.get("tables"):
+                    _persist_event_tables(ev)
+                narr_src = dict(acc_fields) if (acc_tables and acc_captioned) else {}
+                narr_src["narrative_view"] = ev.get("narrative_view")
+                history_obj = _build_ai_history_record(
+                    None, None, ev.get("combined_answer", ""), combined_codes,
+                    final_usage, all_charts,
+                    full_table_keys=acc_keys or None,
+                    combined_tables=acc_tables or None,
+                    live_fields=ev, narrative_src=narr_src)
+                ai_index = _append_and_index(history_obj)
+                # The page gets the DISPLAY text, never the brain-safe
+                # combined answer (the marker + template).
+                answer = (ev.get("display_answer") if "display_answer" in ev
+                          else ev.get("combined_answer", ""))
                 out: dict = {
                     "ok": True, "done": True, "conv_id": conv_id,
-                    "answer": combined_answer,
+                    "answer": answer,
                     "image_base64": None, "table": None,
                     "code": "\n\n###NEXT_PLOT###\n\n".join(combined_codes),
                     "tokens": final_usage,
@@ -2151,9 +2490,11 @@ async def edit_regenerate(request: Request, chat_id: str):
                     out["images"] = history_obj["images"]
                 elif history_obj.get("image_base64"):
                     out["image_base64"] = history_obj["image_base64"]
-                if tbls:
-                    out["tables"] = tbls
+                if acc_tables:
+                    out["tables"] = acc_tables
                     out["full_table_keys"] = history_obj.get("full_table_keys")
+                out["record_view"] = _clean_history_rows([history_obj])[0]
+                out["ai_index"] = ai_index
                 return JSONResponse(_json_safe(_with_chart_refs(out, email, chat_id)))
 
             # Single-shot path
@@ -2180,30 +2521,16 @@ async def edit_regenerate(request: Request, chat_id: str):
                                             first_key=next(iter(dfs), None))
                         for t in tbls
                     ]
-                ai_record = {
-                    "role": "ai",
-                    "content": single_result.get("text", ""),
-                    "image_base64": single_result.get("image_base64"),
-                    "table": single_result.get("table"),
-                    "code": single_result.get("code"),
-                    "usage": single_result.get("usage"),
-                    "ts": time.time(),
-                }
-                _attach_live_fields(ai_record, single_result)
-                if full_table_key:
-                    ai_record["full_table_key"] = full_table_key
-                if tbls:
-                    ai_record["tables"] = tbls
-                    if full_table_keys:
-                        ai_record["full_table_keys"] = full_table_keys
-                store.append_history(conv_id, ai_record)
+                ai_record = _build_ai_history_record(
+                    None, single_result, None, [], {}, [],
+                    full_table_key=full_table_key, full_table_keys=full_table_keys)
+                ai_index = _append_and_index(ai_record)
                 chart_data_key = None
                 cd = single_result.get("chart_data")
                 if isinstance(cd, dict) and (cd.get("rows") or cd.get("tables")):
                     chart_data_key = _cache_full_table(cd)
                 out = {
                     "ok": True, "done": True, "conv_id": conv_id,
-                    "answer": single_result.get("text", ""),
                     "image_base64": single_result.get("image_base64"),
                     "table": single_result.get("table"),
                     "tables": single_result.get("tables"),
@@ -2213,6 +2540,16 @@ async def edit_regenerate(request: Request, chat_id: str):
                     "code": single_result.get("code"),
                     "tokens": single_result.get("usage") or {},
                 }
+                # Display text, never `result.text` when a narrative exists.
+                out.update(_single_display(single_result))
+                view = dict(_clean_history_rows([ai_record])[0])
+                # Chart data over the persist cap is not on the record; the
+                # live cache key keeps "Show data" for this response (the
+                # stored row never carries it, so a reload is unchanged).
+                if chart_data_key and "chart_data" not in view:
+                    view["chart_data_key"] = chart_data_key
+                out["record_view"] = view
+                out["ai_index"] = ai_index
                 return JSONResponse(_json_safe(_with_chart_refs(out, email, chat_id)))
     finally:
         _inflight_discard(chat_id, inflight)

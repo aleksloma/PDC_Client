@@ -21,8 +21,9 @@ is listed in `CUSTOMER_INSTALL.md` → "What leaves your network" and in
 
 Raw data values stay in the client. The brain receives question text, schema
 metadata (column names, data types, descriptions, the values of
-low-cardinality text columns), capped statistics and short result previews,
-as the data-boundary table describes. Columns you list in
+low-cardinality text columns), profile counts and flags, and answer templates
+whose blanks the client fills in locally — no computed result value — as the
+data-boundary table describes. Columns you list in
 `SCHEMA_VALUE_DENY_COLUMNS` send no values at all.
 
 ## 2. The language model

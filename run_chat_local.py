@@ -16,21 +16,26 @@ logic of this flow — only split it across the client and brain containers."):
      the B2C retry policy).
   5. Client → POST /v1/describe to get the natural-language intro,
      OR POST /v1/summarize when the result is a scalar or a flat dict of
-     scalars (no chart/table).
+     scalars (no chart/table) — or, when the brain wrote the answer as a
+     TEMPLATE (`narrative`, `captions`), neither: the client fills the
+     template locally from the VALUES the code set (DIAGNOSTICS_SPEC A5).
 
 Raw data rows stay on the client. The brain sees: the question, the schema
 text (column names, dtypes, descriptions, and the values of text columns
 with at most 20 distinct values — none for a SCHEMA_VALUE_DENY_COLUMNS
-column), the dataset profile, generated code, execution error text, and the
-summarize preview. `_safe_preview` lets through a scalar or a flat dict whose
-values are all plain scalars; `brain_client` caps it in transport (a string
-at 500 characters, a dict at 20 keys plus `_truncated_keys`).
+column), the dataset profile, generated code, the (scrubbed) execution error
+text and validated FINDINGS (bools, input column names, fixed codes). The
+summarize call carries NO preview any more (`preview=None`, decision F1);
+`_safe_preview` now only feeds the local `value_display` line and the
+implicit `result` slot. Rendered texts (`narrative.render`) are display only
+and never reach a brain call or `content` (R0).
 """
 from __future__ import annotations
 
 import hashlib
 import re
 import time as _time
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import pandas as pd
@@ -38,6 +43,7 @@ import pandas as pd
 import brain_client
 import executor_client
 import html_sanitize
+import narrative
 import result_backstop
 from code_exec import safe_execute
 from plot_utils import render_plot_safe, _is_noninteractive_standard_chart
@@ -45,7 +51,7 @@ from exec_transport import log_safe_text
 from logger_utils import log_with_sid
 from schema_builder import schema_text as build_schema_text
 from schema_builder import _detect_language as _detect_answer_language
-from settings import settings
+from settings import brain_capabilities, settings
 
 
 # Caps for capturing a pandas Styler's rendered HTML. A Styler renders the
@@ -460,14 +466,24 @@ def _ensure_live(sid, dfs: dict, schema_docs, code: str, state: dict,
 def _finish_live_result(out: dict, state: dict, question: str, sid) -> dict:
     """Attach the live fields (`sql`, `live_truncated`, `live_rows`) to a
     turn's result dict and append the localized truncation note to its
-    text when a capped fetch fed the answer."""
+    text when a capped fetch fed the answer.
+
+    A narrative answer keeps its brain-safe `text` (marker + template, or a
+    caption template) untouched: the note goes on the RENDERED text the user
+    reads — `narrative_rendered`, else `caption_rendered` (A5.1)."""
     try:
         out = dict(out or {})
         out["sql"] = dict(state.get("sql_used") or {})
         out["live_truncated"] = bool(state.get("truncated"))
         out["live_rows"] = dict(state.get("live_rows") or {})
-        if state.get("truncated") and out.get("text"):
-            out["text"] = _append_live_notes(out["text"], state, question)
+        if state.get("truncated"):
+            for key in ("narrative_rendered", "caption_rendered"):
+                if out.get(key):
+                    out[key] = _append_live_notes(out[key], state, question)
+                    break
+            else:
+                if out.get("text") and not out.get("caption_template"):
+                    out["text"] = _append_live_notes(out["text"], state, question)
         return out
     except Exception as e:                                   # noqa: BLE001
         log_with_sid(sid, "warning",
@@ -959,7 +975,6 @@ def _run_chat_body(*, sid, dfs, schema_docs, question, history_rows, user_email,
 
     # PYTHON branch
     result_obj = exec_out.get("result")
-    preview = exec_out.get("preview")
     table = _build_table_from_result(result_obj)
     if table and (int(table.get("total_rows", 0)) <= 0 or not (table.get("rows") or [])):
         table = None
@@ -976,11 +991,12 @@ def _run_chat_body(*, sid, dfs, schema_docs, question, history_rows, user_email,
                                     result_obj=result_obj, dataset_profile=dataset_profile)
         return {"text": d.get("text", ""), "image_base64": None, "table": table, "tables": tables, "code": code, "usage": _sum_usage(usage, d.get("usage") or {})}
 
-    # Scalar result — safe to forward to the summarizer
-    safe_p = _safe_preview(preview)
+    # Scalar result — the summarizer gets the question and the history only:
+    # the preview is never sent (DIAGNOSTICS_SPEC A6, decision F1). This text
+    # feeds /v1/report (Auto Analytics), so no local value line is added.
     s = brain_client.summarize(
         sid=sid, question=question, schema_text=schema_str,
-        history_rows=history_rows, preview=safe_p,
+        history_rows=history_rows, preview=None,
         context_decision=context_decision,
         user_email=user_email,
     )
@@ -1036,22 +1052,35 @@ def _describe_with_backstop(sid: str, question: str, code: str,
                             user_email: str | None = None, *,
                             chart_data=None, chart_data_list=None,
                             result_obj=None,
-                            dataset_profile: dict | None = None) -> dict:
+                            dataset_profile: dict | None = None,
+                            findings: dict | None = None) -> dict:
     """brain_client.describe + the deterministic flat-result backstop.
 
-    No detection -> a plain describe call with unchanged behavior (errors
-    propagate exactly as before). Detection -> the facts ride along as
-    `data_caveat`, and the answer is guaranteed to carry the explanation."""
+    No detection and no FINDINGS -> a plain describe call with unchanged
+    behavior (errors propagate exactly as before). FINDINGS only -> the
+    describe carries `data_caveat={"findings": ...}` (B7.4). Detection -> the
+    facts ride along as `data_caveat` (plus `findings` when there are any),
+    and the answer is guaranteed to carry the explanation.
+
+    `findings` must already be VALIDATED (`narrative.validate_findings`):
+    they cross the data boundary."""
     det = result_backstop.inspect_outputs(
         chart_data=chart_data, chart_data_list=chart_data_list,
         result_obj=result_obj, sid=sid)
+    finds = dict(findings) if isinstance(findings, dict) and findings else None
     if not det:
+        if finds:
+            return brain_client.describe(sid=sid, question=question, code=code,
+                                         user_email=user_email,
+                                         data_caveat={"findings": finds})
         return brain_client.describe(sid=sid, question=question, code=code,
                                      user_email=user_email)
 
     grain, catalog = _profile_caveat_facts(code, dataset_profile)
     caveat = {"kind": det["kind"], "facts": det.get("facts") or [],
               "grain": grain, "catalog": catalog}
+    if finds:
+        caveat["findings"] = finds
     log_with_sid(sid, "info",
                  f"RESULT_BACKSTOP_FIRED kind={det['kind']} "
                  f"facts={len(caveat['facts'])} catalog={catalog}")
@@ -1083,6 +1112,223 @@ def _describe_with_backstop(sid: str, question: str, code: str,
     log_with_sid(sid, "info", f"RESULT_BACKSTOP_NOTE_PREPENDED reason={reason}")
     combined = f"{sentence}\n\n{text}".strip() if text else sentence
     return {"text": combined, "usage": d.get("usage") or {}}
+
+
+# ── Narrative templates, VALUES and FINDINGS (DIAGNOSTICS_SPEC A5.1) ─────────
+# The brain writes the answer as a TEMPLATE next to the code (`narrative`,
+# `captions{"n"}`); the client fills it here from the VALUES the executed code
+# set, so no result value ever reaches the brain (Article II). A rendered text
+# is DISPLAY text only (R0): brain-bound text is built from templates
+# (`narrative.history_content`) and describe/summarize replies.
+
+def _backstop_prefix(lang: str, det: dict | None, catalog: bool) -> str:
+    """The value-free fallback sentence + blank line that a CAPTIONED visual
+    carries when the result backstop fired for it (A5.1) — the caption
+    replaces the describe call, so the client states the note itself, with no
+    brain call. "" when nothing fired. Never raises."""
+    if not det:
+        return ""
+    try:
+        sentence = result_backstop.fallback_sentence(
+            lang, catalog=bool(catalog), matrix=bool(det.get("matrix")),
+            flat=det.get("kind") != "matrix_readability")
+        return f"{sentence}\n\n" if sentence else ""
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid("narrative", "warning",
+                     f"CAPTION_BACKSTOP_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return ""
+
+
+def _visual_backstop_prefix(sid, question, code, *, chart_data=None,
+                            chart_data_list=None, result_obj=None,
+                            dataset_profile=None) -> str:
+    """`_backstop_prefix` for one executed visual: the same inspection
+    `_describe_with_backstop` runs, in the question's language."""
+    try:
+        det = result_backstop.inspect_outputs(
+            chart_data=chart_data, chart_data_list=chart_data_list,
+            result_obj=result_obj, sid=sid)
+        if not det:
+            return ""
+        _grain, catalog = _profile_caveat_facts(code, dataset_profile)
+        log_with_sid(sid, "info",
+                     f"RESULT_BACKSTOP_CAPTION_NOTE kind={det['kind']} catalog={catalog}")
+        return _backstop_prefix(_detect_answer_language(question), det, catalog)
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid(sid, "warning",
+                     f"CAPTION_BACKSTOP_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return ""
+
+
+def _positive_count(value) -> int:
+    """A sandbox-reported drop count as a non-negative int (0 otherwise)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _slot_counts(template: str, values: dict) -> tuple[int, int]:
+    """(distinct slot names, how many of them have no VALUE) — for the
+    NARRATIVE_USED log line only. (0, 0) for a template that does not parse."""
+    try:
+        names: set = set()
+
+        def walk(nodes):
+            for node in nodes:
+                if node[0] == "slot":
+                    names.add(node[1])
+                elif node[0] == "section":
+                    walk(node[3])
+
+        walk(narrative.parse(template))
+        return len(names), len([n for n in names if n not in (values or {})])
+    except Exception:                                        # noqa: BLE001
+        return 0, 0
+
+
+@dataclass
+class _NarrState:
+    """One phase's narrative state (A5.1): the received templates, the
+    merged VALUES, the per-block validated FINDINGS and the counters the
+    NARRATIVE_USED line reports. Every method logs and degrades instead of
+    raising (Article IV) — a narrative problem never breaks an answer."""
+    phase: int
+    template: Optional[str]
+    captions: dict
+    input_columns: frozenset
+    sid: str
+    values: dict = field(default_factory=dict)
+    findings: dict = field(default_factory=dict)
+    ok_blocks: int = 0
+    block_findings: dict = field(default_factory=dict)
+    captions_used: set = field(default_factory=set)
+    described: int = 0
+    display_answers: list = field(default_factory=list)
+    rendered: Optional[str] = None
+
+    @classmethod
+    def from_reply(cls, reply, input_columns, sid, phase: int = 1) -> "_NarrState":
+        reply = reply if isinstance(reply, dict) else {}
+        return cls(
+            phase=phase,
+            template=narrative.clean_template(reply.get("narrative"),
+                                              max_len=narrative.TEMPLATE_MAX,
+                                              sid=sid, what="narrative"),
+            captions=narrative.clean_captions(reply.get("captions"), sid=sid),
+            input_columns=frozenset(input_columns or ()),
+            sid=sid)
+
+    def take_retry_reply(self, reply, *, block_index: int, single: bool) -> None:
+        """A1.5: a retry reply's `caption:1` replaces caption `block_index`
+        (absent -> kept); its `narrative` replaces the plan's only in the
+        single flow (the multi flow ignores it)."""
+        try:
+            if not isinstance(reply, dict):
+                return
+            if single:
+                t = narrative.clean_template(reply.get("narrative"),
+                                             max_len=narrative.TEMPLATE_MAX,
+                                             sid=self.sid, what="narrative")
+                if t:
+                    self.template = t
+            caps = narrative.clean_captions(reply.get("captions"), sid=self.sid)
+            if 1 in caps:
+                self.captions[block_index] = caps[1]
+        except Exception as e:                               # noqa: BLE001
+            log_with_sid(log_safe_text(self.sid, 200), "warning",
+                         f"NARRATIVE_RETRY_REPLY_FAILED error={log_safe_text(type(e).__name__, 80)}")
+
+    def absorb(self, exec_out, code, block_index: int) -> dict:
+        """After a SUCCESSFUL block: merge its VALUES (later wins), validate
+        its FINDINGS against its own code, count it. Returns the block's own
+        VALUES (what its caption renders with)."""
+        try:
+            out = exec_out if isinstance(exec_out, dict) else {}
+            raw = out.get("values")
+            block_values = dict(raw) if isinstance(raw, dict) else {}
+            narrative.merge_values(self.values, block_values, sid=self.sid)
+            values_dropped = _positive_count(out.get("values_dropped"))
+            findings_dropped = _positive_count(out.get("findings_dropped"))
+            if values_dropped:
+                log_with_sid(log_safe_text(self.sid, 200), "info", f"VALUES_DROPPED n={int(values_dropped)}")
+            if findings_dropped:
+                log_with_sid(log_safe_text(self.sid, 200), "info", f"FINDINGS_DROPPED n={int(findings_dropped)}")
+            validated = narrative.validate_findings(out.get("findings"), code or "",
+                                                    self.input_columns, self.sid)
+            if block_index in self.block_findings:
+                # the children of a multi-axes regen share their block's index
+                narrative.merge_findings(self.block_findings[block_index], validated,
+                                         sid=self.sid)
+            else:
+                self.block_findings[block_index] = validated
+            self.ok_blocks += 1
+            return block_values
+        except Exception as e:                               # noqa: BLE001
+            log_with_sid(log_safe_text(self.sid, 200), "warning",
+                         f"NARRATIVE_ABSORB_FAILED error={log_safe_text(type(e).__name__, 80)}")
+            return {}
+
+    def block_findings_for(self, block_index: int) -> dict:
+        found = self.block_findings.get(block_index)
+        return dict(found) if isinstance(found, dict) else {}
+
+    def caption(self, block_index: int, block_values: dict):
+        """(template, rendered) of caption `block_index`, rendered with THAT
+        block's VALUES and FINDINGS only; None when there is none or it was
+        already used (the first visual of the block takes it)."""
+        try:
+            if block_index in self.captions_used or block_index not in self.captions:
+                return None
+            self.captions_used.add(block_index)
+            template = self.captions[block_index]
+            rendered = narrative.render(template, block_values or {},
+                                        self.block_findings_for(block_index),
+                                        sid=self.sid,
+                                        max_len=narrative.CAPTION_RENDERED_MAX)
+            return template, rendered
+        except Exception as e:                               # noqa: BLE001
+            log_with_sid(log_safe_text(self.sid, 200), "warning",
+                         f"CAPTION_RENDER_FAILED error={log_safe_text(type(e).__name__, 80)}")
+            return None
+
+    def finish(self) -> Optional[str]:
+        """Merge the blocks' FINDINGS in block_index order (B7.2) and render
+        the narrative — only when a template exists and at least one block
+        succeeded. Returns the rendered text, or None (narrative not used)."""
+        try:
+            self.findings = {}
+            for n in sorted(self.block_findings):
+                narrative.merge_findings(self.findings, self.block_findings[n], sid=self.sid)
+            if not self.template:
+                return None
+            if self.ok_blocks < 1:
+                log_with_sid(log_safe_text(self.sid, 200), "info", "NARRATIVE_SKIPPED reason=no_successful_block")
+                return None
+            self.rendered = narrative.render(self.template, self.values, self.findings,
+                                             sid=self.sid)
+            slots, missing = _slot_counts(self.template, self.values)
+            log_with_sid(log_safe_text(self.sid, 200), "info",
+                         f"NARRATIVE_USED phase={int(self.phase)} slots={int(slots)} "
+                         f"missing={int(missing)} captions={len(self.captions_used)} "
+                         f"described={int(self.described)}")
+            return self.rendered
+        except Exception as e:                               # noqa: BLE001
+            log_with_sid(log_safe_text(self.sid, 200), "warning",
+                         f"NARRATIVE_FINISH_FAILED error={log_safe_text(type(e).__name__, 80)}")
+            self.rendered = None
+            return None
+
+    def phase_view(self, rendered: Optional[str] = None) -> Optional[dict]:
+        """The `narrative_view.phase1` dict of the done event (`rendered`
+        overrides the stored text, e.g. with the live notes appended). When
+        the narrative was not used but validated FINDINGS exist, only
+        `{"findings": ...}` — the record keeps them (A5.5) while its content
+        stays today's text; None when there is neither."""
+        if self.rendered is None or not self.template:
+            return {"findings": dict(self.findings)} if self.findings else None
+        return {"narrative_template": self.template,
+                "narrative_rendered": rendered if rendered is not None else self.rendered,
+                "values": dict(self.values), "findings": dict(self.findings)}
 
 
 # ---------------------------------------------------------------------------
@@ -1565,14 +1811,29 @@ def run_chat_multi_plot(
       - {"partial": False, "done": True, "combined_answer", "combined_codes", "total_usage"
          [, "tables", "table_codes", "table_result_keys"]}
     For non-multi-plot responses, yields a single {"single_response": True, "result": {...}} item.
+
+    Narrative templates (DIAGNOSTICS_SPEC A5.4): every chart partial also
+    carries `caption_template` (or None), `phase: 1` and `block_index`, and
+    its `answer` is the rendered caption or the describe text; when the plan's
+    narrative is used, a `{"narrative": True, "phase": 1, "text", "template",
+    "values", "findings"}` event follows the last block; the done event adds
+    `display_answer`, `narrative_view` and, with tables, `table_captions` /
+    `table_caption_templates` / `table_phases`. `combined_answer` stays
+    brain-safe (templates and describe texts only, R0).
     """
     df_names = list(dfs.keys())
     df_columns = {name: list(df.columns) for name, df in dfs.items()}
+    # The FINDINGS validator's column set (A5.1): the registered/uploaded
+    # column names, taken BEFORE the plan and the live pre-fetch.
+    input_columns = frozenset(str(c) for cols in df_columns.values() for c in cols)
     schema_str = build_schema_text(
         schema_docs or {}, dfs, common_fields,
         other_tables=_other_registered_tables(schema_docs, dfs, user_email))
 
     live_tables = _live_tables_for_brain(_live_specs(schema_docs, dfs))
+    # Read ONCE per turn and passed explicitly to the plan and to every retry
+    # made from this turn (brain_client never reads the setting itself).
+    caps = brain_capabilities()
 
     # 1) Plan once — reuse the raw_text for single-vs-multi detection
     plan_out = brain_client.plan(
@@ -1580,6 +1841,7 @@ def run_chat_multi_plot(
         df_names=df_names, history_rows=history_rows,
         common_fields=common_fields, user_email=user_email,
         dataset_profile=dataset_profile, live_tables=live_tables,
+        capabilities=caps,
     )
     raw_text = plan_out.get("raw_text") or ""
     plan_usage = plan_out.get("usage") or {}
@@ -1625,17 +1887,30 @@ def run_chat_multi_plot(
                 context_decision=context_decision,
                 dataset_profile=dataset_profile,
                 state=state, live_tables=live_tables,
+                plan_narrative=plan_out.get("narrative"),
+                plan_captions=plan_out.get("captions"),
+                capabilities=caps, input_columns=input_columns,
             )
             yield {"single_response": True, "result": result}
             return
+
+    # The phase's narrative state: the plan's templates, the merged VALUES and
+    # the per-block FINDINGS (A5.1).
+    narr = _NarrState.from_reply(plan_out, input_columns, sid)
+
+    # Block numbers are the planner's own positions (1-based), assigned BEFORE
+    # the table blocks are pulled out — `caption:n` names the n-th fence of the
+    # reply, table or chart (2.2).
+    numbered = list(enumerate(plot_blocks, start=1))
 
     # Mixed dashboard answers (KPI table + charts): pull TABLE blocks out of
     # the worklist — they execute via safe_execute and land on the done event
     # as `tables` instead of dying in the chart renderer (which silently
     # dropped the table part of every mixed answer before).
-    table_blocks = [b for b in plot_blocks if _looks_like_table_block(b)]
+    table_blocks = [(n, b) for n, b in numbered if _looks_like_table_block(b)]
+    plot_blocks = numbered
     if table_blocks:
-        plot_blocks = [b for b in plot_blocks if not _looks_like_table_block(b)]
+        plot_blocks = [(n, b) for n, b in numbered if not _looks_like_table_block(b)]
         table_blocks = table_blocks[:_MAX_MIXED_TABLE_BLOCKS]
         log_with_sid(sid, "info",
                      f"MIXED_TABLE_BLOCKS extracted={len(table_blocks)} charts={len(plot_blocks)}")
@@ -1649,7 +1924,11 @@ def run_chat_multi_plot(
         plot_blocks = plot_blocks[:_MAX_MULTI_PLOT_CANDIDATES]
 
     total_usage = dict(plan_usage)
+    # Brain-safe texts (caption TEMPLATES, describe texts, fixed sentences) —
+    # what builds `combined_answer`, i.e. the stored `content` (R0) ...
     combined_answers: list[str] = []
+    # ... and the matching texts the user reads (rendered captions instead).
+    display_answers = narr.display_answers
     combined_codes: list[str] = []
     # Analysis signatures of charts already EMITTED this response — used to drop
     # near-duplicate charts (same measure by the same dimension) the planner or a
@@ -1660,11 +1939,32 @@ def run_chat_multi_plot(
     # column renames). See _chart_data_signature.
     produced_data_sigs: list = []
 
+    def _visual_text(n, block_values, code_, **inspect_kw):
+        """The text of one visual of block `n`: its rendered caption (with
+        the backstop note, no brain call) when caption n exists, else the
+        per-visual describe with that block's validated FINDINGS. Returns
+        (brain_safe_text, display_text, caption_template_or_None, usage)."""
+        cap = narr.caption(n, block_values)
+        if cap is not None:
+            template, rendered = cap
+            prefix = _visual_backstop_prefix(sid, question, code_,
+                                             dataset_profile=dataset_profile,
+                                             **inspect_kw)
+            return prefix + template, prefix + rendered, prefix + template, {}
+        d = _describe_with_backstop(sid, question, code_, user_email,
+                                    dataset_profile=dataset_profile,
+                                    findings=narr.block_findings_for(n),
+                                    **inspect_kw)
+        narr.described += 1
+        text_ = d.get("text") or ""
+        return text_, text_, None, d.get("usage") or {}
+
     # Worklist so a single block can EXPAND into several (when a multi-axes block
     # is regenerated as separate ###NEXT_PLOT### blocks). Each item:
-    # (code, n_multi_axes_retry, n_plotly_retry, n_matrix_retry).
+    # (code, n_multi_axes_retry, n_plotly_retry, n_matrix_retry, block_index);
+    # the children of a regenerated block keep its block_index.
     from collections import deque
-    work = deque((blk, 0, 0, 0) for blk in plot_blocks)
+    work = deque((blk, 0, 0, 0, n) for n, blk in plot_blocks)
     produced = 0
     # The sentence recorded once the analysis sandbox itself proved to be down
     # — it stops the chart worklist below AND the table blocks after it, which
@@ -1683,7 +1983,7 @@ def run_chat_multi_plot(
         if produced >= _MAX_MULTI_PLOTS:
             log_with_sid(sid, "info", f"MULTI_PLOT_EMIT_CAP reached={produced}")
             break
-        code, ma_retry, np_retry, mx_retry = work.popleft()
+        code, ma_retry, np_retry, mx_retry, block_n = work.popleft()
         try:
             ch = hashlib.sha256(code.encode("utf-8", errors="ignore")).hexdigest()[:settings.CODE_HASH_LEN]
             log_with_sid(sid, "info", f"MULTI_PLOT_EXEC produced={produced} remaining={len(work)} code_hash={ch}")
@@ -1717,7 +2017,7 @@ def run_chat_multi_plot(
                 use_pro=use_pro, use_search=use_search, user_email=user_email,
                 dataset_profile=dataset_profile,
                 sql=_retry_sql(state), sql_error=_retry_sql_error(state),
-                live_tables=live_tables,
+                live_tables=live_tables, capabilities=caps,
             )
             _merge_retry_sql(state, retry_out)
             new_code = retry_out.get("code") or ""
@@ -1728,6 +2028,10 @@ def run_chat_multi_plot(
             # not a reason to abort the block: keep retrying with escalation.
             if not new_code:
                 continue
+            if new_kind in ("PLOT_CODE", "PYTHON"):
+                # A1.5: the reply's caption:1 replaces caption n (its
+                # narrative is ignored in the multi flow).
+                narr.take_retry_reply(retry_out, block_index=block_n, single=False)
             if new_kind == "PLOT_CODE":
                 code = new_code
                 plot_out = _render(code)
@@ -1764,6 +2068,7 @@ def run_chat_multi_plot(
         # the zero-charts fallback ("Something went wrong…") never fires.
         if infra_text:
             combined_answers.append(infra_text)
+            display_answers.append(infra_text)
             service_down_text = infra_text
             break
 
@@ -1779,20 +2084,26 @@ def run_chat_multi_plot(
                     use_pro=True, use_search=False, user_email=user_email,
                     dataset_profile=dataset_profile,
                     sql=_retry_sql(state), sql_error=None,
-                    live_tables=live_tables,
+                    live_tables=live_tables, capabilities=caps,
                 )
                 _merge_retry_sql(state, retry_out)
                 total_usage = _sum_usage(total_usage, retry_out.get("usage") or {})
                 new_code = retry_out.get("code") or ""
                 if new_code:
+                    # A1.5: caption:1 -> the first child (block n); the other
+                    # children have no caption (the first visual takes it).
+                    narr.take_retry_reply(retry_out, block_index=block_n, single=False)
                     blocks = _split_code_on_delimiter(new_code) or [new_code]
                     for b in blocks:
-                        work.append((b, ma_retry + 1, np_retry, mx_retry))
+                        work.append((b, ma_retry + 1, np_retry, mx_retry, block_n))
                     continue
             # Fallback: split the rendered figure into one image (+ data) per axis.
             split_out = _render(code, split_multi_axes=True)
             sub = [c for c in (split_out.get("multi_charts") or []) if c.get("image")]
             if sub:
+                # The block executed successfully: its VALUES count even if
+                # the group is dropped as a duplicate below (A3.2).
+                block_values = narr.absorb(split_out, code, block_n)
                 # Dedup: a split group is ONE analysis (all sub-charts share this
                 # block's code) — drop the whole group if near-identical to an
                 # already-emitted chart. The sub-charts within it are distinct
@@ -1802,17 +2113,19 @@ def run_chat_multi_plot(
                     log_with_sid(sid, "info", "MULTI_PLOT_DEDUP_SKIP split")
                     continue
                 produced_sigs.append(sig)
-                d = _describe_with_backstop(
-                    sid, question, code, user_email,
-                    chart_data_list=[c.get("chart_data") for c in sub],
-                    dataset_profile=dataset_profile)
-                base_txt = d.get("text") or ""
-                total_usage = _sum_usage(total_usage, d.get("usage") or {})
+                base_safe, base_shown, base_tmpl, d_usage = _visual_text(
+                    block_n, block_values, code,
+                    chart_data_list=[c.get("chart_data") for c in sub])
+                total_usage = _sum_usage(total_usage, d_usage)
                 log_with_sid(sid, "info", f"MULTI_AXES_SPLIT_EMIT charts={len(sub)}")
                 for i, cobj in enumerate(sub):
                     produced += 1
-                    txt = base_txt if i == 0 else (cobj.get("title") or "")
-                    combined_answers.append(txt)
+                    # caption n (or the describe text) on sub-chart 0, the
+                    # others keep their own title (A5.1)
+                    title = cobj.get("title") or ""
+                    txt = base_shown if i == 0 else title
+                    combined_answers.append(base_safe if i == 0 else title)
+                    display_answers.append(txt)
                     if i == 0:
                         combined_codes.append(code)
                     sub_data_sig = (None if _has_hidden_color_measure(code)
@@ -1825,6 +2138,8 @@ def run_chat_multi_plot(
                         "usage": dict(total_usage), "code": code,
                         "chart_data": cobj.get("chart_data"),
                         "sql": dict(state["sql_used"]),
+                        "caption_template": base_tmpl if i == 0 else None,
+                        "phase": 1, "block_index": block_n,
                     }
                     # A split block can expand into several axes — respect the
                     # emit cap within the group too.
@@ -1833,6 +2148,8 @@ def run_chat_multi_plot(
             continue
 
         if plot_out.get("error"):
+            # Never absorbed: a block that failed every retry contributes no
+            # VALUES, so its slots render "n/a" (A3.2).
             log_with_sid(sid, "warning", "MULTI_PLOT_SKIP after retries")
             last_live_failure = (_live_exhausted_text(state)
                                  if plot_out.get("live_failed") else None)
@@ -1852,13 +2169,15 @@ def run_chat_multi_plot(
                 use_pro=False, use_search=False, user_email=user_email,
                 dataset_profile=dataset_profile,
                 sql=_retry_sql(state), sql_error=None, live_tables=live_tables,
+                capabilities=caps,
             )
             _merge_retry_sql(state, retry_out)
             total_usage = _sum_usage(total_usage, retry_out.get("usage") or {})
             new_code = retry_out.get("code") or ""
             if new_code and retry_out.get("kind") == "PLOT_CODE":
+                narr.take_retry_reply(retry_out, block_index=block_n, single=False)
                 # Reprocess this item next (preserve order); np_retry+1 caps it.
-                work.appendleft((new_code, ma_retry, np_retry + 1, mx_retry))
+                work.appendleft((new_code, ma_retry, np_retry + 1, mx_retry, block_n))
                 continue
 
         # ── Readable-encoding enforcement (count matrix -> grouped bar) ──
@@ -1881,14 +2200,21 @@ def run_chat_multi_plot(
                 use_pro=False, use_search=False, user_email=user_email,
                 dataset_profile=dataset_profile,
                 sql=_retry_sql(state), sql_error=None, live_tables=live_tables,
+                capabilities=caps,
             )
             _merge_retry_sql(state, retry_out)
             total_usage = _sum_usage(total_usage, retry_out.get("usage") or {})
             new_code = retry_out.get("code") or ""
             if new_code and retry_out.get("kind") == "PLOT_CODE":
-                work.appendleft((new_code, ma_retry, np_retry, mx_retry + 1))
+                narr.take_retry_reply(retry_out, block_index=block_n, single=False)
+                work.appendleft((new_code, ma_retry, np_retry, mx_retry + 1, block_n))
                 continue
             log_with_sid(sid, "info", "MATRIX_REGEN_KEPT_ORIGINAL")
+
+        # The block executed successfully and is final: its VALUES merge now,
+        # BEFORE the degenerate / dedup skips below, so a dropped chart still
+        # contributes them (A3.2).
+        block_values = narr.absorb(plot_out, code, block_n)
 
         # ── Degenerate (zero-variance) chart skip ──
         # Drop a chart whose every numeric series is effectively constant (no
@@ -1933,15 +2259,15 @@ def run_chat_multi_plot(
             img_b64 = plot_out.get("plotly_html")
         else:
             img_b64 = plot_out.get("image")
-        # Describe from code (brain — no data leaves)
-        d = _describe_with_backstop(sid, question, code, user_email,
-                                    chart_data=plot_out.get("chart_data"),
-                                    dataset_profile=dataset_profile)
-        text = d.get("text") or ""
-        total_usage = _sum_usage(total_usage, d.get("usage") or {})
+        # Caption n (rendered locally) or describe from code (brain — no data
+        # leaves)
+        safe_text, text, caption_tmpl, d_usage = _visual_text(
+            block_n, block_values, code, chart_data=plot_out.get("chart_data"))
+        total_usage = _sum_usage(total_usage, d_usage)
 
         produced += 1
-        combined_answers.append(text)
+        combined_answers.append(safe_text)
+        display_answers.append(text)
         combined_codes.append(code)
         log_with_sid(sid, "info", f"PLOT_RENDERED chart={produced} plotly={plot_out.get('is_plotly')}")
 
@@ -1951,6 +2277,7 @@ def run_chat_multi_plot(
             "usage": dict(total_usage), "code": code,
             "chart_data": plot_out.get("chart_data"),
             "sql": dict(state["sql_used"]),
+            "caption_template": caption_tmpl, "phase": 1, "block_index": block_n,
         }
 
     # Execute the extracted TABLE blocks (mixed dashboard answers). Each block
@@ -1960,7 +2287,12 @@ def run_chat_multi_plot(
     combined_tables: list = []
     table_codes: list = []
     table_result_keys: list = []
-    for tb in table_blocks if table_blocks else []:
+    # Aligned with `combined_tables`: the rendered caption (None without one,
+    # "" on the 2nd+ table of a captioned dict result), its template, its phase.
+    table_captions: list = []
+    table_caption_templates: list = []
+    table_phases: list = []
+    for block_n, tb in table_blocks if table_blocks else []:
         # The chart loop already established that the sandbox is down, and
         # these blocks dispatch through the SAME hop: each would wait the full
         # dispatch queue (ten minutes by default) to be told the same thing,
@@ -1987,6 +2319,7 @@ def run_chat_multi_plot(
                     service_down_text = infra_text
                     if infra_text not in combined_answers:
                         combined_answers.append(infra_text)
+                        display_answers.append(infra_text)
                     log_with_sid(sid, "warning", "MIXED_TABLE_BLOCKS_SKIPPED service_down")
                     break
                 log_with_sid(sid, "warning",
@@ -1995,6 +2328,9 @@ def run_chat_multi_plot(
                 last_live_failure = (_live_exhausted_text(state)
                                      if exec_out.get("live_failed") else None)
                 continue
+            # Executed successfully: VALUES merge even when no table comes
+            # out of it (A3.2).
+            block_values = narr.absorb(exec_out, tb, block_n)
             result_obj = exec_out.get("result")
             t = _build_table_from_result(result_obj)
             if t and (int(t.get("total_rows", 0)) <= 0 or not (t.get("rows") or [])):
@@ -2005,16 +2341,28 @@ def run_chat_multi_plot(
             emitted = ([t] if t else []) + (ts or [])
             if not emitted:
                 continue
-            d = _describe_with_backstop(sid, question, tb, user_email,
-                                        result_obj=result_obj,
-                                        dataset_profile=dataset_profile)
-            total_usage = _sum_usage(total_usage, d.get("usage") or {})
-            if d.get("text"):
-                combined_answers.append(d["text"])
-            for entry in emitted:
+            safe_text, text, caption_tmpl, d_usage = _visual_text(
+                block_n, block_values, tb, result_obj=result_obj)
+            total_usage = _sum_usage(total_usage, d_usage)
+            if caption_tmpl is None and text:
+                # the per-block describe text, as today
+                combined_answers.append(safe_text)
+                display_answers.append(text)
+            for i, entry in enumerate(emitted):
                 combined_tables.append(entry)
                 table_codes.append(tb)
                 table_result_keys.append(entry.get("title") if ts else None)
+                if caption_tmpl is not None:
+                    # caption n on the first table of the block, "" on the others
+                    table_captions.append(text if i == 0 else "")
+                    table_caption_templates.append(caption_tmpl if i == 0 else "")
+                else:
+                    table_captions.append(None)
+                    table_caption_templates.append(None)
+                table_phases.append(1)
+            if caption_tmpl is not None:
+                combined_answers.append(safe_text)
+                display_answers.append(text)
             log_with_sid(sid, "info", f"MIXED_TABLE_EMIT tables={len(emitted)}")
         except Exception as e:
             # Raised while building the table from the executed RESULT, so the
@@ -2022,30 +2370,61 @@ def run_chat_multi_plot(
             log_with_sid(sid, "warning",
                          f"MIXED_TABLE_BLOCK_FAILED: {log_safe_text(str(e), 200)}")
 
+    # The phase's narrative, rendered once every block has run (A5.1).
+    rendered = narr.finish()
+    narrative_used = rendered is not None
+
     # If every block failed all its retries we rendered ZERO charts — surface a
     # clear failure rather than the misleading bare "Analysis complete." (a run
     # that still emitted tables is not a failure).
     if combined_answers:
         combined_text = "\n\n".join([a for a in combined_answers if a])
+        display_text = "\n\n".join([a for a in display_answers if a])
     elif combined_tables:
-        combined_text = "Analysis complete."
+        combined_text = display_text = "Analysis complete."
     else:
-        combined_text = (last_live_failure
-                         or "Something went wrong with this analysis. Please try again.")
-    if state["truncated"] and combined_text:
-        combined_text = _append_live_notes(combined_text, state, question)
+        combined_text = display_text = (
+            last_live_failure
+            or "Something went wrong with this analysis. Please try again.")
+
+    if narrative_used:
+        # Brain-safe: the FINDINGS marker + the TEMPLATE, never a value (R0);
+        # the live notes go on the rendered text only.
+        combined_text = narrative.history_content(narr.template, narr.findings)
+        display_text = rendered
+        if state["truncated"] and display_text:
+            display_text = _append_live_notes(display_text, state, question)
+        yield {"narrative": True, "phase": 1, "text": display_text,
+               "template": narr.template, "values": dict(narr.values),
+               "findings": dict(narr.findings)}
+    elif state["truncated"]:
+        if display_text:
+            display_text = _append_live_notes(display_text, state, question)
+        # Today's behaviour for an answer built from describe texts only; an
+        # answer carrying caption templates keeps its brain-safe text clean.
+        if combined_text and not narr.captions_used:
+            combined_text = _append_live_notes(combined_text, state, question)
+
     log_with_sid(sid, "info", f"MULTI_PLOT_DONE rendered={produced}")
     done_event = {
         "partial": False, "done": True,
         "combined_answer": combined_text,
+        "display_answer": display_text,
         "combined_codes": combined_codes,
         "total_usage": total_usage,
+        "narrative_view": {
+            "phase1": narr.phase_view(display_text if narrative_used else None),
+            "phase2": None, "phase2_status": None,
+        },
         **_live_fields(),
     }
     if combined_tables:
         done_event["tables"] = combined_tables
         done_event["table_codes"] = table_codes
         done_event["table_result_keys"] = table_result_keys
+        done_event["table_captions"] = table_captions
+        done_event["table_caption_templates"] = table_caption_templates
+        done_event["table_phases"] = table_phases
     yield done_event
 
 
@@ -2054,7 +2433,10 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
                            kind, code, usage, context_decision,
                            dataset_profile: dict | None = None,
                            state: dict | None = None,
-                           live_tables: list | None = None) -> dict:
+                           live_tables: list | None = None,
+                           plan_narrative=None, plan_captions=None,
+                           capabilities: list | None = None,
+                           input_columns: frozenset | None = None) -> dict:
     """Execute one already-planned response (kind/code from a prior /v1/plan)
     locally, reusing the same retry + describe/summarize flow as run_chat.
 
@@ -2065,6 +2447,13 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
     `state` is the turn's live state (the caller's, built from the plan
     response's `sql`); `live_tables` the payload rows for the retry calls.
     The result carries `sql`, `live_truncated` and `live_rows`.
+
+    `plan_narrative` / `plan_captions` are the plan's templates, `capabilities`
+    the turn's list (sent on every retry), `input_columns` the FINDINGS
+    validator's column set. The result then carries the A5.3 keys
+    (`narrative_template`, `narrative_rendered`, `values`, `findings`,
+    `caption_template`, `caption_rendered`, `caption_described`,
+    `value_display`) — each only when present; `text` stays brain-safe.
     """
     if state is None:
         state = _new_live_state()
@@ -2075,14 +2464,19 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
                            kind=kind, code=code, usage=usage,
                            context_decision=context_decision,
                            dataset_profile=dataset_profile, state=state,
-                           live_tables=live_tables)
+                           live_tables=live_tables,
+                           plan_narrative=plan_narrative, plan_captions=plan_captions,
+                           capabilities=capabilities,
+                           input_columns=input_columns)
     return _finish_live_result(out, state, question, sid)
 
 
 def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
                      question, history_rows, user_email,
                      kind, code, usage, context_decision,
-                     dataset_profile, state, live_tables) -> dict:
+                     dataset_profile, state, live_tables,
+                     plan_narrative=None, plan_captions=None,
+                     capabilities=None, input_columns=None) -> dict:
     def _exec(code_, kind_):
         if not _ensure_live(sid, dfs, schema_docs, code_, state, user_email):
             return _live_failure_out(state)
@@ -2099,6 +2493,9 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
                     "code": None, "usage": _sum_usage(usage, g.get("usage", {}))}
         return {"text": "I couldn't generate analysis code for this question. Try rephrasing.",
                 "image_base64": None, "table": None, "code": None, "usage": usage}
+
+    narr = _NarrState.from_reply({"narrative": plan_narrative, "captions": plan_captions},
+                                 input_columns, sid)
 
     exec_out = _exec(code, kind)
 
@@ -2129,7 +2526,7 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
             user_email=user_email,
             dataset_profile=dataset_profile,
             sql=_retry_sql(state), sql_error=_retry_sql_error(state),
-            live_tables=live_tables,
+            live_tables=live_tables, capabilities=capabilities,
         )
         _merge_retry_sql(state, retry_out)
         new_code = retry_out.get("code") or ""
@@ -2141,27 +2538,87 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
         # with escalation. Prose text must never reach an executor.
         if not new_code or new_kind in ("NO_CODE", "CLARIFICATION", "ANSWER", "MISSING_DATA"):
             continue
+        # A1.5 (single flow): a narrative in the reply REPLACES the plan's,
+        # its caption:1 replaces caption 1; absent -> kept.
+        narr.take_retry_reply(retry_out, block_index=1, single=True)
         code = new_code
         kind = new_kind
         exec_out = _exec(code, kind)
 
     if exec_out.get("live_role_denied"):
+        narr.finish()
         return _live_role_denied_result(state, code, usage)
     if exec_out.get("error"):
+        # Never absorbed; the narrative is not used (no successful block).
+        narr.finish()
         live_text = _live_exhausted_text(state) if exec_out.get("live_failed") else None
         return {
             "text": live_text or "I couldn't run this analysis with your current data. Try rephrasing.",
             "image_base64": None, "table": None, "code": code, "usage": usage,
         }
 
+    block_values = narr.absorb(exec_out, code, 1)
+    # The implicit `result` slot (A3.2): a scalar RESULT fills it unless the
+    # code set its own.
+    safe_p = _safe_preview(exec_out.get("preview")) if kind != "PLOT_CODE" else None
+    if isinstance(safe_p, (str, int, float, bool)):
+        narr.values.setdefault("result", safe_p)
+        block_values.setdefault("result", safe_p)
+
+    def _visual(**inspect_kw) -> tuple[dict, dict]:
+        """Caption 1 (rendered locally, with the backstop note, no brain call)
+        or the describe text with the validated FINDINGS. Returns (fields,
+        usage) where fields holds `caption_template` / `caption_rendered`, or
+        `described`."""
+        cap = narr.caption(1, block_values)
+        if cap is not None:
+            template, rendered_cap = cap
+            prefix = _visual_backstop_prefix(sid, question, code,
+                                             dataset_profile=dataset_profile,
+                                             **inspect_kw)
+            return ({"caption_template": prefix + template,
+                     "caption_rendered": prefix + rendered_cap}, {})
+        d = _describe_with_backstop(sid, question, code, user_email,
+                                    dataset_profile=dataset_profile,
+                                    findings=narr.block_findings_for(1),
+                                    **inspect_kw)
+        narr.described += 1
+        return {"described": d.get("text", "")}, d.get("usage") or {}
+
+    def _compose(visual: dict | None) -> dict:
+        """The A5.3 keys and the brain-safe `text`, from the visual's fields
+        and the rendered narrative."""
+        rendered = narr.finish()
+        fields: dict = {}
+        visual = visual or {}
+        if rendered is not None:
+            fields["narrative_template"] = narr.template
+            fields["narrative_rendered"] = rendered
+            fields["text"] = narrative.history_content(narr.template, narr.findings)
+            if "described" in visual:
+                fields["caption_described"] = visual["described"]
+        elif "caption_template" in visual:
+            fields["text"] = visual["caption_template"]        # never the rendered one (R0)
+        elif "described" in visual:
+            fields["text"] = visual["described"]
+        if "caption_template" in visual:
+            fields["caption_template"] = visual["caption_template"]
+            fields["caption_rendered"] = visual["caption_rendered"]
+        if rendered is not None or "caption_template" in visual:
+            fields["values"] = dict(narr.values)
+            fields["findings"] = dict(narr.findings)
+        elif narr.findings:
+            # A describe-only turn keeps its validated FINDINGS on the record
+            # (A5.5); `text` stays the describe text (no marker).
+            fields["findings"] = dict(narr.findings)
+        return fields
+
     if kind == "PLOT_CODE":
         img_b64 = exec_out.get("plotly_html") if exec_out.get("is_plotly") else exec_out.get("image")
-        d = _describe_with_backstop(sid, question, code, user_email,
-                                    chart_data=exec_out.get("chart_data"),
-                                    dataset_profile=dataset_profile)
-        return {"text": d.get("text", ""), "image_base64": img_b64, "table": None,
+        visual, d_usage = _visual(chart_data=exec_out.get("chart_data"))
+        return {"image_base64": img_b64, "table": None,
                 "code": code, "chart_data": exec_out.get("chart_data"),
-                "usage": _sum_usage(usage, d.get("usage") or {})}
+                "usage": _sum_usage(usage, d_usage), **_compose(visual)}
 
     # PYTHON
     result_obj = exec_out.get("result")
@@ -2172,22 +2629,37 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
     img_b64 = exec_out.get("image_base64")
 
     if img_b64:
-        d = _describe_with_backstop(sid, question, code, user_email,
-                                    result_obj=result_obj, dataset_profile=dataset_profile)
-        return {"text": d.get("text", ""), "image_base64": img_b64, "table": table,
-                "tables": tables, "code": code, "usage": _sum_usage(usage, d.get("usage") or {})}
+        visual, d_usage = _visual(result_obj=result_obj)
+        return {"image_base64": img_b64, "table": table,
+                "tables": tables, "code": code, "usage": _sum_usage(usage, d_usage),
+                **_compose(visual)}
     if table or tables:
-        d = _describe_with_backstop(sid, question, code, user_email,
-                                    result_obj=result_obj, dataset_profile=dataset_profile)
-        return {"text": d.get("text", ""), "image_base64": None, "table": table,
-                "tables": tables, "code": code, "usage": _sum_usage(usage, d.get("usage") or {})}
+        visual, d_usage = _visual(result_obj=result_obj)
+        return {"image_base64": None, "table": table,
+                "tables": tables, "code": code, "usage": _sum_usage(usage, d_usage),
+                **_compose(visual)}
 
-    preview = exec_out.get("preview")
-    safe_p = _safe_preview(preview)
+    # A scalar / flat-dict result. With a narrative, the answer IS the
+    # rendered narrative: no summarize call. Without one, summarize gets no
+    # preview (A6, decision F1) and the value is shown through the local
+    # `value_display` line (display only, R0).
+    if narr.template:
+        fields = _compose(None)
+        if "text" in fields:
+            return {"image_base64": None, "table": None, "code": code,
+                    "usage": usage, **fields}
     s = brain_client.summarize(
         sid=sid, question=question, schema_text=schema_str,
-        history_rows=history_rows, preview=safe_p,
+        history_rows=history_rows, preview=None,
         context_decision=context_decision, user_email=user_email,
     )
-    return {"text": s.get("text", ""), "image_base64": None, "table": None,
-            "code": code, "usage": _sum_usage(usage, s.get("usage") or {})}
+    out = {"text": s.get("text", ""), "image_base64": None, "table": None,
+           "code": code, "usage": _sum_usage(usage, s.get("usage") or {})}
+    shown = narrative.value_display(_safe_preview(exec_out.get("preview")),
+                                    narrative.answer_lang_code(context_decision, question))
+    if shown:
+        out["value_display"] = shown
+    narr.finish()                      # merges the block's FINDINGS (no template here)
+    if narr.findings:
+        out["findings"] = dict(narr.findings)
+    return out

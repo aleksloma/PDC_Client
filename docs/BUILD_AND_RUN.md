@@ -215,6 +215,13 @@ parse falls back to the default instead of stopping the boot):
 | `SSO_AUTO_PROVISION` | Microsoft SSO: `true` creates and binds an account for an Entra identity that has none (`SSO_ACCOUNT_PROVISIONED`); default `false` ⇒ refused, nothing created (`SSO_UNKNOWN_ACCOUNT`). Set it only with "Assignment required? = Yes" on the Entra enterprise application. |
 | `SHARE_ALLOWED_DOMAINS` | Recipient domains a chat, conversation or dashboard share may reach (comma-separated, case-insensitive, a leading `@` tolerated; default empty). Empty ⇒ the domains of the administrator accounts, or, when none has an email address, of every account with one, derived at call time (`routes.auth.share_allowed_domains`); none at all ⇒ every share is refused (`SHARE_DOMAINS_UNCONFIGURED`, logged once). An out-of-domain recipient refuses the whole share with `400 RECIPIENT_DOMAIN_NOT_ALLOWED` and creates no account. |
 
+
+Answer-template setting (see `client.env.example`):
+
+| Var | Purpose |
+|---|---|
+| `BRAIN_CAPABILITIES` | The features the client announces to the brain on `/v1/plan` and `/v1/retry` (comma-separated; default `narrative_v1,diagnostics_v1`). With `narrative_v1` the brain writes the answer as a template and the client fills in the values locally (`docs/CLIENT_ENDPOINTS.md`, "Narrative-template answers"); `diagnostics_v1` adds the diagnostic playbook and is sent only together with `narrative_v1`. Only those two names are recognised — `two_phase_v1` is ignored in this release. Empty (`BRAIN_CAPABILITIES=`) sends no capabilities at all, which restores the earlier prompts and responses (the kill switch). The value is read from the environment when the web container starts (restart it after a change) and parsed once per chat question; Auto Analytics sends no capabilities. The null summarize preview and the value scrubs of the profile, the result caveat and the retry error text apply whatever the setting. |
+
 ---
 
 ## 3. Local testing — ALWAYS the Docker stack, ALWAYS the persistent data

@@ -659,8 +659,9 @@ What is true now:
   client, inside the plan or retry response; the client sends the question,
   the schema text (with a live marker and a dialect name, both metadata),
   the `live_tables` rows (df key, dialect, row cap, filtered flag), the
-  sampled profile (aggregates and truncated top values, already permitted
-  for snapshot tables), and on a retry the brain's own SQL echoed back plus
+  sampled profile (aggregates only, as for snapshot tables — min, max and
+  top values stay in the stored profile), and on a retry the brain's own
+  SQL echoed back plus
   `sql_error` — a class and, for a guard refusal, the guard's
   identifier-level sentence. Results never leave; the driver's message never
   leaves the process.

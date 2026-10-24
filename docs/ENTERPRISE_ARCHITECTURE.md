@@ -105,8 +105,8 @@ the two containers.
 
 | Boundary | Out | In |
 |---|---|---|
-| client → brain | question text, schema and column metadata, aggregate profiles, generated code, error text, scalar previews. **Never rows, tables or charts.** | generated Python, narrative text |
-| client → sandbox | the code to run, and the input frames as parquet written per job | the result (parquet, chart HTML or PNG, a scalar preview), plus a capped tail of the sandbox's stderr and traceback for the local log. A job's stdout crosses in the same response but is NOT written to the web log. The sandbox keeps no log file and logs only the lengths of a job's stdout and stderr, so what a job printed is logged nowhere |
+| client → brain | question text, schema and column metadata, aggregate profiles (no min/max, top or constant values), generated code, error text with quoted literals scrubbed, FINDINGS (booleans, input column names, fixed codes), the capability list, unfilled answer templates in history. **Never rows, tables, charts or a result value** (summarize gets `preview: null`). | generated Python, narrative text, answer templates |
+| client → sandbox | the code to run, and the input frames as parquet written per job | the result (parquet, chart HTML or PNG, a scalar preview), the job's `VALUES` / `FINDINGS` (filtered plain scalars; §10d), plus a capped tail of the sandbox's stderr and traceback for the local log. A job's stdout crosses in the same response but is NOT written to the web log. The sandbox keeps no log file and logs only the lengths of a job's stdout and stderr, so what a job printed is logged nowhere |
 | sandbox → anywhere else | nothing. It has no network route and no credentials. | — |
 
 ### Brain (PowerDataChat GCP — enterprise only)
@@ -269,9 +269,11 @@ returns `403 {"detail": "Tenant <status>"}` before any LLM call when
    attempts).
 8. For chart turns the client also POSTs to `/v1/describe` (per chart) to
    get the natural-language intro. For scalar/non-chart answers it POSTs
-   to `/v1/summarize` with a `_safe_preview`-filtered scalar — the
-   `_safe_preview` guard ensures only `str | int | float | bool` cross
-   the boundary; dicts, lists, and DataFrames become `None`.
+   to `/v1/summarize` with `preview: null` — no result value crosses; the
+   `_safe_preview` verdict (`str | int | float | bool` or a flat dict of
+   them) is shown locally as a value line. With a narrative template
+   (§10d) the client fills the brain's template locally instead and skips
+   both calls, except describe for a visual without a caption.
 
 ---
 
@@ -1001,9 +1003,9 @@ refused as a snapshot (`LIVE_REQUIRED`), and a count that times out counts
 as above that limit; an edit keeps the table's stored mode. Registering a
 table live takes no snapshot. Instead the client profiles a bounded head
 sample (at most 10 000 rows) locally, so the registry and the dataset
-profile still describe it; only the truncated sampled hints already
-permitted for snapshot tables (profile aggregates, top values up to 40
-characters) reach the brain, never rows. An administrator or a scoped power
+profile still describe it; only the profile aggregates permitted for
+snapshot tables (counts and flags — min, max and top values stay in the
+stored profile) reach the brain, never rows. An administrator or a scoped power
 user can switch a table between modes (`POST /api/admin/tables/{tid}/mode`,
 audited `table.mode`); switching to live keeps any old parquet, switching
 back counts again and always takes a fresh snapshot (a failed snapshot
@@ -1436,6 +1438,60 @@ brain gets no `narrative` and falls back to describe and summarize, but
 its null summarize preview gets no reading guide there. Client
 kill-switch: `BRAIN_CAPABILITIES=""` makes the client send no
 capabilities, which restores the earlier prompts and responses.
+
+**Client implementation (session 1).** What ships in the client:
+- **Sandbox layer.** `pdc_diag.py` (the deterministic helpers the playbook
+  names — coverage check, anomaly detection, change decomposition, level
+  attribution, metric-overlap check, three chart helpers and the `fmt`
+  number formatter) is registered at both exec sites and copied into both
+  images. Every job gets fresh `VALUES` / `FINDINGS` dicts; the sandbox
+  filters them to plain scalars (`exec_transport.capture_outputs`) and the
+  web service decodes them as hostile input (`EXECUTOR_PROTOCOL.md` §5–§6).
+- **Renderer.** `narrative.py` parses and fills templates (slots formatted
+  by `pdc_diag.fmt`, sections chosen by FINDINGS, string values
+  markdown-escaped, `n/a` for a missing slot, a value-free fallback on a
+  grammar error), validates FINDINGS per block against that block's code
+  and the input column names, builds the `[Findings: …]` history marker and
+  the slot-free `brain_view` that `/v1/title` and `/v1/report` get.
+- **Flows.** `run_chat_local` keeps one `_NarrState` per turn: VALUES merge
+  after each successful block, captions render with their own block's
+  VALUES, the narrative renders once after the last block. A captioned
+  visual needs no describe call; summarize gets `preview: null` and the
+  value is shown through a local value line.
+- **Records and stream.** `routes/chat.py` stores the template, the rendered
+  text, VALUES, FINDINGS and per-chart / per-table captions additively; the
+  record's `content` is the marker + the unfilled template. The stream adds a
+  `narrative` event, `phase` on chart partials and `record_view` on `done`;
+  edit-regenerate answers with the persisted record. Reports send
+  `brain_view` to the brain and render the filled text locally.
+- **UI.** `/lab` renders every AI row through one function
+  (`renderAiRecord`): narrative first, then charts and tables with captions.
+- **Value scrubs in existing payloads.** The dataset profile no longer
+  sends `min`, `max`, top values or a constant value; `data_caveat` facts
+  carry no value; the retry `error_msg` has its quoted literals replaced
+  (input column and df names, and text the failed code itself contains,
+  kept); `/v1/report` `table_columns` keeps
+  input column names only.
+
+Kill switch: `BRAIN_CAPABILITIES=""` (default `narrative_v1,diagnostics_v1`;
+`two_phase_v1` is ignored by this release). The scrubs and the null
+summarize preview apply regardless of the setting. Deferred: the two-phase
+flow (session 3); re-rendering narratives and captions on per-item Refresh
+and in dashboard tiles (a caption keeps the values of the turn that produced
+it); templates in Auto Analytics; locale-specific number formatting for ru /
+uz (one default format today).
+
+**Decision (2026-10-24).** Answer text that quotes a computed value is
+produced by filling a brain-written template on the client, never by
+sending the value to the brain. The pre-existing value channels are closed
+in the same release rather than kept for compatibility (decisions F1, F2 of
+`DIAGNOSTICS_SPEC.md`): the summarize preview, the profile's min/max and
+top values, constant-value hints in `data_caveat` and in profile warnings,
+quoted literals in the retry `error_msg`, and non-input labels in report
+`table_columns`. Kept by decision: the category list of a text column with
+at most 20 distinct values in `schema_text` (`SCHEMA_VALUE_DENY_COLUMNS`
+removes it per column), and history rows written before this release, which
+may carry a value in their answer text.
 
 Wire shapes: `PROTOCOL.md`. Design: `docs/DIAGNOSTICS_SPEC.md` in the
 client repository.

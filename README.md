@@ -37,28 +37,31 @@ the chat UI surfaces a single "service unavailable" error.
 No uploaded file, DataFrame, query result set, or rendered chart is ever
 transmitted. What does cross to the brain over HTTPS is listed in the table
 below: the question text, the schema text (names, dtypes, descriptions and the
-values of low-cardinality text columns), capped profile statistics, a capped
-result preview for the summarize step, and truncated answer text for titles
-and reports. Some of these carry individual values from your data: the
-categories of a text column with at most 20 distinct values, a column's
-minimum and maximum, a constant value, a scalar result. A column named in
-`SCHEMA_VALUE_DENY_COLUMNS` sends its name, dtype and counts only, never a
-value. User email is sent for tenant routing.
+values of low-cardinality text columns), profile counts and flags, and
+truncated answer text for titles and reports. Computed results are not sent:
+the brain writes the answer as a TEMPLATE and this client fills in the values
+locally (`narrative.py`; the brain sees the template, never the filled text).
+Some of what is sent can still carry individual values from your data: the
+categories of a text column with at most 20 distinct values, Excel header
+text, and the answer text of history rows stored before the narrative
+release. A column named in `SCHEMA_VALUE_DENY_COLUMNS` sends its name, dtype
+and counts only, never a value. User email is sent for tenant routing.
 
-- The summarizer's `_safe_preview` helper in
-  [`run_chat_local.py`](run_chat_local.py) is the hard guard: a
-  `str | int | float | bool` passes, and so does a flat dict whose keys and
-  values are all such scalars (numpy scalars are converted first); a list, a
-  DataFrame, or a dict holding anything else becomes `None`. What passes is
-  capped in transport by `brain_client`: a string at 500 characters, a dict at
-  its first 20 keys (the number dropped is sent as `_truncated_keys`), each
-  string value at 500 characters. Do not weaken either.
+- `/v1/summarize` always gets `preview: null`. The `_safe_preview` helper in
+  [`run_chat_local.py`](run_chat_local.py) still decides what a scalar result
+  is (a `str | int | float | bool`, or a flat dict whose keys and values are
+  all such scalars; anything else becomes `None`), but its output feeds only
+  the local value line under the answer and the template's `result` slot.
+  Rendered template text never goes into a stored `content` or a brain call;
+  FINDINGS (true/false flags, fixed codes, input column names) cross only
+  after `narrative.validate_findings`. Do not weaken either.
 - `SCHEMA_VALUE_DENY_COLUMNS` (comma-separated column names, case-insensitive,
   empty by default) removes a column's values from the schema text, the
   technical descriptions, the dataset profile and the schema-autofill hints.
   Use it for columns such as account numbers or national ids. It does not
-  filter what an analysis computes: result previews, answer text and past
-  answers in the conversation history can still carry values.
+  filter what an analysis computes: the answer the user reads (which stays on
+  this server) and past answers stored before the narrative release, which
+  travel back as history, can still carry values.
 - The `/lab` page loads **no third-party script** by default (no analytics, no
   billing widget): `settings.ENABLE_THIRD_PARTY_SCRIPTS` is False, so the
   browser talks only to this server. The analysis sandbox transmits nothing at
@@ -69,21 +72,23 @@ value. User email is sent for tenant routing.
 | What | Sent when | Shape |
 |---|---|---|
 | Question text | Every question | Verbatim, as typed |
-| Conversation history | Every question | Past turns: role, content, generated code |
+| Conversation history | Every question | Past turns: role, content, generated code. For a templated answer `content` is a `[Findings: …]` line (flags, fixed codes, column names) plus the UNFILLED template — never the filled-in values. Rows stored before the narrative release are sent as stored |
 | Schema text and column metadata | Every question | Table/sheet names, column names, dtypes, business descriptions and a technical line per column (dtype, fill count). A text column with at most 20 distinct values lists those values, each cut to 40 characters; any other text column sends its distinct count only; numeric and date columns send no value. Value descriptions written for categorical values (keyed by the value). A `SCHEMA_VALUE_DENY_COLUMNS` column sends dtype and fill count only, and no value descriptions. Technical lines stored by an earlier release are cut to the same rule when the text is built. For a database table: its qualified name, snapshot date or, for a live table, dialect and row cap |
 | Other registered tables | Every question on a chat that uses database tables | Display names, column NAMES and declared join keys of registered tables the user's role may add but that are not loaded in the chat — never values |
 | Live-table fields | Plan and retry, only when the chat has a live table | `live_tables` (name, dialect, row cap, filtered flag); on retry `sql` (the SELECT the planner wrote, as run) and `sql_error` (table, dialect, error class, and the client's own refusal sentence — never the database's error text) |
-| Dataset profile | Every question | Row/duplicate counts, per-column distinct and null counts, null rates, min/max of numeric and date columns, constant and all-unique flags, grain (column names), up to 6 warnings (a constant column's warning names its value). Up to 5 top values, each cut to 40 characters, only for a column with at most 20 distinct values. A `SCHEMA_VALUE_DENY_COLUMNS` column sends dtype, distinct and null counts and the two flags only. Profiles stored by an earlier release are filtered to this rule before sending |
-| Generated code and execution errors | Every question and retry | Python source, traceback text |
+| Dataset profile | Every question | Row/duplicate counts, per-column distinct and null counts, null rates, constant and all-unique flags, grain (column names), up to 6 warnings (a constant column's warning reads `<col> is constant`; the stock-vs-flow warning names two columns and an integer percent). No `min`, `max` or top values for any column — they stay in the stored profile. A `SCHEMA_VALUE_DENY_COLUMNS` column sends dtype, distinct and null counts and the two flags only. Profiles stored by an earlier release are filtered to this rule before sending |
+| Capabilities | Plan and retry of a chat question | `capabilities`: a fixed list of feature names from `BRAIN_CAPABILITIES` (default `narrative_v1`, `diagnostics_v1`) — no data |
+| Generated code and execution errors | Every question and retry | Python source, traceback text. The retry `error_msg` has every quoted literal replaced by `'<value>'` unless it is an input column name, a df name or text the failed code itself contains |
 | Excel header text above a table | Upload, when a sheet has text above the table and no description | The extracted text VERBATIM, truncated to 2000 characters — it is read from your file, so treat it as content |
 | File and sheet names | Upload and every question | The name as STORED after sanitization, plus sheet names |
 | Share invitations | Sharing a chat or dashboard | Recipient addresses, the item title, and the note the sender types |
 | Schema-autofill hints | Upload, Add Data, database-table registration (AI descriptions) | Column names and dtypes. A column with at most 10 distinct values (`SCHEMA_AUTOFILL_UNIQUE_THRESHOLD`) sends those values, each cut to 60 characters; any other column sends one `[profile: …]` summary (dtype, distinct count, null share; for text a character mask, lengths and frequent first words; for numbers min/max/mean at two significant figures; for dates the year-month range). A `SCHEMA_VALUE_DENY_COLUMNS` column sends `[profile: dtype=…, distinct=…, nulls=…%]` only |
-| Result preview | Summarize step | A single `str`/`int`/`float`/`bool` value or a flat dict of such values; a string capped at 500 characters, a dict at its first 20 keys plus `_truncated_keys` (the count dropped). Lists and DataFrames are dropped |
-| Result caveat | Describe step, only when the client's result check fires (a constant metric, identical series, or a count matrix that reads better as a bar chart) | Finding kind and up to 6 short facts naming result columns; a constant metric's fact includes its value |
-| Answer text | Conversation title | Question and the first 300 characters of the answer |
-| Answer text | Report generation | Question and answer truncated to 500 characters, code snippet to 300 |
-| Table column names | Report generation | Column NAMES only, first 10 — never rows |
+| Result preview | Never | `/v1/summarize` gets `preview: null`; the value is shown locally (`value_display`) |
+| Result caveat | Describe step, only when the client's result check fires (a constant metric, identical series, or a count matrix that reads better as a bar chart) | Finding kind and up to 6 short facts naming result columns — never a value |
+| FINDINGS | Describe step (`data_caveat.findings`), for a visual without a caption; and inside the history line of a templated answer | Check outcomes the generated code recorded: booleans, fixed codes and input column NAMES, at most 24, validated by `narrative.validate_findings` — never a number, category value or date |
+| Answer text | Conversation title | Question and the first 300 characters of the answer's brain-safe text — for a templated answer the template with slots shown as `[name]` (`narrative.brain_view`), never the filled-in text |
+| Answer text | Report generation | Question and answer truncated to 500 characters (a templated answer: `brain_view` of its templates), code snippet to 300 |
+| Table column names | Report generation | INPUT column NAMES only, first 10 — other result-table labels (pivot/crosstab headers) are removed; never rows |
 | User email | Every call | Tenant routing and per-user activity |
 | Activity events | Login, upload, chat, report | Event name, user email, lightweight counters |
 | Password-reset payload | Password reset and invitation | The e-mail address, whether it is a reset or an invitation, and a single-use link (valid 30 minutes for a reset, 30 days for an invitation), relayed through the brain's mail service; until it is used or expires the link sets the account's password |
@@ -99,6 +104,8 @@ PDC_Client/
 ├── app.py                   # FastAPI app + lifespan
 ├── brain_client.py          # HTTP client to brain (bearer token)
 ├── run_chat_local.py        # local execution + _safe_preview guard
+├── narrative.py             # answer templates: fill slots locally, FINDINGS validator, brain_view
+├── pdc_diag.py              # diagnostics helpers generated code calls in the sandbox (both images)
 ├── local_store.py           # users + chats + conversations on local disk
 ├── signin_domains.py        # approved sign-in domains (DATA_ROOT/signin_domains.json)
 ├── schema_builder.py        # _schema_text builder
