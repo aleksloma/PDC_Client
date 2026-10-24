@@ -65,7 +65,7 @@ are unchanged.
 | `df_columns`        | `{name: list(df.columns)}` (only sent on retry, for column self-correction) | client |
 | `history_rows`      | the `history_rows` arg to `generate_pandas_code` / `summarize_answer`. Each row carries **only** `role`, `content`, and (when present) `code` — the client's `brain_client._sanitize_history_rows` strips every other persisted field (`image_base64`, `chart_data`, `table`, `usage`, `full_table_key`, `ts`, …) before the POST, so raw data values in locally persisted records never cross the boundary (Article II). From its narrative release the client writes the `content` of a templated AI turn as a `[Findings: …]` marker line plus the unfilled template (see `/v1/plan` "History") | client (`local_store.get_history`, sanitized in `brain_client.plan/retry/summarize`) |
 | `common_fields`     | the `common_fields` arg to `generate_pandas_code` | client |
-| `error_msg`         | `exec_out["error"]` from `safe_execute`. From its narrative release the client replaces every quoted literal that is not an input column name or a df name with `'<value>'`, and the `NearZeroChartError` text carries no number | client |
+| `error_msg`         | `exec_out["error"]` from `safe_execute`. From its narrative release the client replaces every quoted literal that is not an input column name, a df name or text the failed code itself contains (a whole identifier token, or text inside one of the code's string literals) with `'<value>'`, and the `NearZeroChartError` text carries no number | client |
 | `failed_code`       | the failed code block | client |
 | `preview` (summarize) | the `_safe_preview` value: a `str`/`int`/`float`/`bool`, a flat object whose keys and values are all such scalars (or null values), or `null` — lists, tables and objects holding anything else become `null`. Capped in transport: a string at 500 characters + `…[truncated]`; an object at its first 20 keys, each string key/value cut the same way, plus `"_truncated_keys": <number dropped>` when more existed. From its narrative release the client always sends `null` (see `/v1/summarize`) | client (`run_chat_local._safe_preview`, capped by `brain_client._compact_preview_for_transport`) |
 | `qa_pairs` (report) | the `findings_for_llm` list the B2C `_generate_report_structure` already builds | client |
@@ -108,9 +108,9 @@ the convenience `kind` + `code` from `_extract_code_kind`.
       "profile_version": 1, "rows": 12480, "duplicate_row_count": 0,
       "computed_at": "2026-08-23T09:14:02+00:00", "sampled": false,
       "grain": { "columns": ["order_id"], "kind": "single", "text": "one row per (order_id)" },
-      "warnings": ["Quantity is constant: every value = 1"],
+      "warnings": ["Quantity is constant"],  // the value is never sent (narrative release on)
       "columns": { "salary": { "dtype": "int64", "nunique": 240, "null_count": 0,
-                                "null_pct": 0.0, "min": 900, "max": 21000,
+                                "null_pct": 0.0,  // no min / max / top_values (narrative release on)
                                 "constant": false, "all_unique": false } }
     }
   },
@@ -488,7 +488,8 @@ and its `caption:1` replaces that block's caption. `BRAIN_RETRY` logs
 own SQL text (in the response, echoed on a retry) and an error CLASS cross;
 the rows a SELECT returns never leave the client — they reach the analysis
 sandbox as an ordinary input frame and the brain sees, as always, only the
-code, the schema text and the capped summarize preview.
+code and the schema text (and, from a client before its narrative release,
+the capped summarize preview; the current client sends `preview: null`).
 
 ---
 
@@ -515,7 +516,7 @@ from **the code only**, never the result. No data values ever sent.
     // not — a count matrix small enough to read as a grouped bar. The client
     // asks the planner for one redraw first; the caveat is the fallback.)
     "kind": "constant_metric",
-    "facts": ["Quantity is the same for every group in the chart (= 1)"],
+    "facts": ["Quantity is the same for every group in the chart"],
     "grain": ["cl prod link: one row per (client_id, product_id)"],
     "catalog": true,                     // catalog/link grain, not measured quantities
     "findings": {                        // OPTIONAL — accepted with or without `kind`
@@ -526,10 +527,12 @@ from **the code only**, never the result. No data values ever sent.
 }
 ```
 
-`data_caveat` carries aggregate findings, column NAMES, and 40-char-truncated
-constant-value hints only — the same Article II class as `dataset_profile`
-(guarded client-side by `_compact_caveat_for_transport`: known keys, known
-`kind`, ≤6 items × ≤200 chars). The brain renders it as a MANDATORY DATA NOTE
+`data_caveat` carries aggregate findings and column NAMES only — never a
+value; the same Article II class as `dataset_profile` (guarded client-side by
+`_compact_caveat_for_transport`: known keys, known `kind`, ≤6 items × ≤200
+chars, and any fact ending in a `(= …)` value hint dropped). A client before
+its narrative release appended a 40-char-truncated constant-value hint to a
+fact (`… (= 1)`); the current client writes none. The brain renders it as a MANDATORY DATA NOTE
 block and requires the description to START with the explanation, prefixed by
 the literal marker `[[DATA_NOTE]]`. The client strips that marker before
 display and, if it is absent (or the call failed), prepends its own localized
@@ -580,11 +583,12 @@ LLM can mention the user's uploaded file names in the reply — no data.
 ## `POST /v1/summarize`
 
 Mirror of `agent.summarize_answer`. Used only for results without a table
-or image. The client is responsible for filtering `preview`: its
-`_safe_preview` guard passes a scalar or a flat object of scalars and turns
-anything else into `null`, and `brain_client` then caps it — a string at 500
-characters (+ `…[truncated]`), an object at its first 20 keys plus
-`"_truncated_keys": <number dropped>`.
+or image. The client is responsible for filtering `preview`. A client from
+its narrative release always sends `null` and shows the value itself. An
+older client's `_safe_preview` guard passes a scalar or a flat object of
+scalars and turns anything else into `null`, and its `brain_client` then caps
+it — a string at 500 characters (+ `…[truncated]`), an object at its first 20
+keys plus `"_truncated_keys": <number dropped>`.
 
 ### Request
 
@@ -594,7 +598,8 @@ characters (+ `…[truncated]`), an object at its first 20 keys plus
   "question": "what is the highest salary?",
   "schema_text": "...",
   "history_rows": [ ... ],
-  "preview": 162000,                      // scalar or flat object of scalars; capped (500 chars / 20 keys); or null
+  "preview": null,                        // narrative-release client: always null; an older client: a scalar
+                                          //   or flat object of scalars, capped (500 chars / 20 keys), or null
   "context_decision": { "complexity": "simple", ... },
   "user_email": "..."
 }
@@ -603,7 +608,8 @@ characters (+ `…[truncated]`), an object at its first 20 keys plus
 ### Response
 
 ```jsonc
-{ "text": "The highest salary in the dataset is **$162,000**.", "usage": { ... } }
+{ "text": "This is the highest salary across all employees in the dataset.", "usage": { ... } }
+// with "preview": null the reply names no value; the client shows it locally
 ```
 
 **Null preview.** When `preview` is `null` or absent (or cannot be
@@ -1120,7 +1126,8 @@ rendered.
       "answer_text": "Below is the average salary for each department.",
       "has_chart": false,
       "has_table": true,
-      "table_columns": ["department", "salary"],     // column NAMES only
+      "table_columns": ["department", "salary"],     // column NAMES only — from the narrative release, INPUT
+                                                     //   column names only (a pivot/crosstab label is removed; may be [])
       "code_snippet": "result = df.groupby('department')['salary'].mean()"
     }
   ],

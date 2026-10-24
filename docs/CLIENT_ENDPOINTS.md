@@ -977,6 +977,25 @@ algorithm the planner prompt used to spell out inline; QA 2.6); data
 `dfs` (+ a `df` first-frame alias at the python site) and `RESULT`; guarded
 `__builtins__` (per-call copy of `SANDBOX_BUILTINS`).
 
+**Narrative templates: `pdc_diag`, `VALUES`, `FINDINGS`.** Both sites also
+inject **`pdc_diag`** (`pdc_diag.py`, the diagnostics helper library:
+`coverage_check`, `detect_anomalies`, `decompose_change`, `attribute_level`,
+`check_metric_overlap`, the chart helpers `plot_highlighted_series`,
+`plot_waterfall`, `plot_importance`, and `fmt`; a leaf module — stdlib, numpy
+and pandas at import time — that never prints or logs) and two dicts,
+**`VALUES`** and **`FINDINGS`**, created EMPTY for every job (at the plot site
+they go into the job's own copy of `GLOBAL_PLOT_SCOPE`, never into the shared
+dict). Generated code puts the numbers and labels a narrative template quotes
+into `VALUES`, and check outcomes (booleans, fixed codes, input column names)
+into `FINDINGS`. After a successful job the sandbox filters both
+(`exec_transport.capture_outputs`) and returns them as four extra keys of the
+success payload — `values`, `values_dropped`, `findings`, `findings_dropped`
+(rules in `docs/EXECUTOR_PROTOCOL.md` §5). A failed job returns none of them.
+VALUES never leave the client; FINDINGS are validated again in the main app
+(`narrative.validate_findings`) before anything is sent to the brain.
+`pdc_diag` is not on the sandbox import denylist (`sandbox_guard`); it ships
+in both images' COPY lists.
+
 ---
 
 ## Chat (SSE stream)
@@ -1005,9 +1024,10 @@ data: {"done": true, "partial": false, "conv_id": "cv_...",
        "tokens": {...}}\n\n
 ```
 
-`{partial: true, answer, image_base64, chart_n, chart_total}` is part of the
-contract (for multi-chart responses) — the on-prem build currently emits a
-single final event but the frontend handles both paths identically.
+`{partial: true, answer, image_base64, chart_n, chart_total}` is emitted once
+per chart by a multi-chart turn (see "Multi-chart streaming" below); a
+single-chart, table or text answer ends with one `done` event. The frontend
+handles both paths.
 
 Each `partial` event and the single-shot `done` event also carry `chart_ref`:
 the server's reference to that chart for the PNG export (`null` for a
@@ -1015,6 +1035,87 @@ matplotlib chart, or when registering it failed). The edit-regenerate JSON
 carries it too: top-level beside `image_base64`, and on each entry of
 `images`. See "Chart
 references" under Downloads.
+
+**Narrative-template answers (`narrative_v1`).** When the client announces
+the capability (`BRAIN_CAPABILITIES`, below) and the brain's plan carries a
+`narrative` template and/or `captions` (`PROTOCOL.md`, `/v1/plan`), the
+answer text is filled locally from the `VALUES` the executed code set
+(`narrative.render`, slots formatted by `pdc_diag.fmt`, sections chosen by the
+block's validated FINDINGS, a missing slot shown as `n/a`). A rendered text is
+DISPLAY text only: it reaches the page, the local record and the local
+PDF/PPTX, never `content` and never a brain call. What changes on the stream:
+
+| Event | Shape on the stream | Notes |
+|---|---|---|
+| narrative (NEW) | `{"narrative": true, "phase": 1, "text": "<rendered narrative>", "conv_id"}` | Multi-chart turn only, once, after the last block, when the plan's narrative was used (at least one block succeeded). Carries the rendered text only — never the template, VALUES or FINDINGS. Does NOT end the stream: the page fills a hidden slot above the charts (`.pdc-narrative[data-phase]`) |
+| progress, phase 2 (reserved) | `{"progress": true, "phase": 2, "message_key": "lab.phase2_progress", "message", "conv_id"}` | Not emitted in this release (two-phase ships later). The consumer forwards it and the page shows it as a status bubble; the ordinary `{"progress": true, "message"}` event is unchanged |
+| tables partial | `{"partial": true, "phase", "tables", "full_table_keys", "table_captions", "conv_id"}` — no `image_base64` | Tables without a chart, never counted as a chart. In this release the generator still puts a turn's tables on its `done` event; the consumer, the persistence worker and the page already accept the partial form (reserved for phase 2) |
+| chart partial | existing keys + `phase` (`1`) | `answer` is the chart's RENDERED caption (with the result-backstop sentence in front when that check fired for the chart; no describe call) or, without a caption, the describe text as before. The caption template is not sent |
+| multi `done` | existing keys; `answer` = the display text; + `record_view` = `{narrative_rendered?, phase2?: {narrative_rendered}, phase2_status?}`; + `table_captions` (aligned with `tables`, `""` where a table has none) when the turn has tables | `answer` is the rendered narrative when it was used, else the rendered captions / describe texts joined. The brain-safe `combined_answer` the record keeps is never sent |
+| single-shot `done` | existing keys; `answer` = the display text; + `narrative` and `caption` only when a narrative was rendered | `answer` = the rendered narrative + a blank line + the visual's caption (rendered, or its describe text) when a narrative exists; else the rendered caption; else the brain text + a blank line + the local value line (`value_display`, below); else the brain text |
+
+Any other event the generator yields is dropped by the consumer and logged
+`SSE_EVENT_UNKNOWN keys=<sorted key names>` (key names only). Stop: the
+`done` the server synthesizes for a cancelled turn carries the RENDERED chart
+answers (or the narrative text) as `answer`, never templates.
+
+Brain calls of a narrative turn: describe runs only for a visual without a
+caption (with that block's validated FINDINGS as `data_caveat.findings` when
+there are any); summarize never runs when a narrative exists. When it does
+run (a scalar or flat-dict result without a narrative) it gets
+`preview: null` — always, from this release, also for Auto Analytics — and the
+chat answer shows the value through a local line: `**Result:** <value>` for a
+scalar, up to 20 `- key: value` lines (then `- …`) for a flat dict
+(`narrative.value_display`; label in en/ka/ru/uz; never sent anywhere). A
+retry reply's `caption:1` replaces the failed block's caption; its
+`narrative` replaces the plan's in the single flow only. Not in this release:
+the per-item Refresh and dashboard tiles re-run the code but do not re-render
+a narrative or caption (a caption keeps the values of the turn that produced
+it), and Auto Analytics uses no templates.
+
+**AI record fields of a narrative turn** (additive; written only when present
+and non-empty, so a turn without templates keeps today's shape — except that
+every chart entry of a multi-chart turn from this release carries `phase`,
+and such a turn with tables carries the three table arrays; old records load
+and render unchanged):
+
+| Field | Content |
+|---|---|
+| `content` | BRAIN-SAFE. Narrative used ⇒ a `[Findings: key=value; …]` marker line (sorted keys, booleans as `true`/`false`, at most 400 characters; omitted when there are no FINDINGS) + a newline + the UNFILLED template (`narrative.history_content`). No narrative but a caption ⇒ the caption template (multi: the caption templates and describe texts joined). Otherwise the describe / summarize text as before. Never a rendered value |
+| `narrative_template` / `narrative_rendered` | the plan's narrative and its rendered text (live-table truncation notes are appended to the rendered text only) |
+| `values` / `findings` | the merged VALUES (later block wins) and the merged validated FINDINGS (block order, at most 24 keys) — local only; the brain sees FINDINGS only through the marker |
+| `caption_template` / `caption_rendered` | a single-visual record with a caption — also a multi-chart turn that produced exactly one chart, which is stored as a single-visual record |
+| `caption_described` | a single-visual record of a narrative turn whose visual had no caption: its describe text |
+| `value_display` | the local value line of the summarize fallback |
+| `images[i].answer` | the rendered caption when the entry has `caption_template`, else the describe text |
+| `images[i].caption_template` / `images[i].phase` | the chart's caption template; its phase (`1` in this release) |
+| `table_captions` / `table_caption_templates` / `table_phases` | arrays aligned with `tables` (`""` for a table without a caption; a dict RESULT puts its caption on its first table) |
+| `phase2` / `phase2_status` | reserved for two-phase answers; not written in this release |
+
+A multi-chart record keeps its charts in `images[]` when there are two or
+more, or when any of them belongs to phase 2; reload handles a one-entry
+array. A stopped turn builds `content` from caption templates and describe
+texts (after a narrative event: the marker + template), then `⏹ Response
+stopped by user.`; tables already persisted are kept. The history routes
+serve these fields as stored; `brain_client._sanitize_history_rows` is an
+allowlist (`role`, `content`, `code`), so none of the new fields reaches the
+brain. `/lab` renders every AI row through one function, `renderAiRecord`
+(history reload, response recovery and edit-regenerate): the narrative
+first, then the charts (or the single visual with its caption), then the
+tables with their captions. Narrative and caption text goes through
+`renderMarkdown`, which escapes HTML first and shows a value's `\*`, `\_`
+and leading `\-` (escaped by the renderer) as the plain characters.
+
+**Capabilities (`BRAIN_CAPABILITIES`).** Read from the environment at
+startup like every setting, parsed once per turn by `run_chat_multi_plot`
+(`settings.brain_capabilities()`) and sent
+as `capabilities` on `/v1/plan` and on every `/v1/retry` of that turn. Default
+`narrative_v1,diagnostics_v1`; only those two names are recognised
+(`two_phase_v1` is dropped in this release); `diagnostics_v1` is sent only
+together with `narrative_v1`; empty (or no `narrative_v1`) ⇒ no
+`capabilities` key at all, i.e. the earlier prompts and responses — the kill
+switch. Auto Analytics (`run_chat`) sends none. The client sends no `findings`
+on `/v1/plan` in this release (phase 2 only).
 
 **Chart HTML is offline-safe.** Interactive Plotly charts travel as a full HTML
 document in `image_base64` (the frontend sniffs the leading `<`). Generated
@@ -1158,6 +1259,9 @@ The full enterprise split inside one turn:
    Please try again." (never the bare "Analysis complete.").
 5. POST → `/v1/describe` (or `/v1/summarize` for scalar results) → brain
    returns the natural-language intro. No row values cross the boundary.
+   With a narrative template (`narrative_v1`) the client fills the brain's
+   template locally instead and calls neither, except describe for a visual
+   that has no caption; summarize, when it runs, gets `preview: null`.
 6. A plan of kind `CLARIFICATION` or `ANSWER` skips execution entirely — the
    text is returned to the user as-is (`ANSWER` = a context-based explanation,
    e.g. "how did you compute this?").
@@ -1173,6 +1277,27 @@ The full enterprise split inside one turn:
 
 Both call `/v1/report` (no values) to get `report_structure` JSON, then merge
 the narrative into the client's own template locally.
+
+**Narrative-template records.** For a record written with templates (any of
+`narrative_template`, `narrative_rendered`, `caption_template`,
+`caption_rendered`, `caption_described`, `value_display`, or a chart entry
+with `caption_template` / `phase`), `_build_qa_pairs` gives each finding two
+texts: `content`, BRAIN-SAFE — `narrative.brain_view` of the narrative and
+caption templates (sections resolved with the record's FINDINGS, every slot
+written `[slot name]`, no value), or the describe text of an uncaptioned
+chart — which is what `/v1/report` receives as `answer_text`; and
+`_display_text`, the rendered text, used locally as the finding's body in the
+PDF and every PPTX path (with the renderer's markdown escapes removed,
+`narrative.plain`), so a report shows the real numbers and no `[slot]`
+placeholders. The first chart of a record carries the narrative. Older
+records keep today's shape and body. `table_columns` on `/v1/report` keeps
+only the chat's INPUT column names (every `fields` key of its schema docs):
+a pivot or crosstab header can be a category value or a date, so any other
+label is removed and the list may be `[]` (fail closed — when the schema
+cannot be read nothing is kept, `REPORT_INPUT_COLUMNS_FAILED`). Every text the
+PDF hands to a ReportLab `Paragraph` (report title, executive summary, page
+title, body, takeaways) is XML-escaped first, because display text can quote
+a cell value.
 
 **Per-tenant PowerPoint template (PPTX exports + Auto Analytics):**
 
@@ -1524,12 +1649,12 @@ values leave the client.
 | `GET  /api/chat/{id}/conversation/{conv_id}/share` | owner only (`_require_chat_owner`: no session → `401`, anyone but the chat's owner → `403 {"error": "Access denied"}`); `{conv_id}` must be a conversation of this chat in the owner's OWN conversation list, else `404 {"error": "Conversation not found"}` (a recipient's copy id included). Returns `{shared_with: [...]}` — the addresses THIS conversation is recorded as shared with (`ChatDataStore.conv_share_recipients`), sorted, each once however often it was shared; `[]` for a conversation without a record (never shared, or shared before the record existed). The `/lab` Share Conversation dialog lists these, each with a Remove button |
 | `DELETE /api/chat/{id}/conversation/{conv_id}/share/{recipient}` | owner only, same `401` / `403` / `404` as the `GET`; `{recipient}` must match `routes.auth._EMAIL_RE` after strip + lower-case, else `400 {"error": "Provide a valid email address."}`. `ChatDataStore.remove_conv_share`: takes the address off this conversation's record and deletes every copy that record holds for it (the row in the recipient's conversation list and the copy's file; a per-copy failure is logged `CONV_SHARE_COPY_DELETE_FAILED`), then ends the recipient's chat access — exactly what `DELETE /api/chat/{id}/share/{recipient}` does — only when a conversation share created it and nothing else needs it (see Sharing rules, "Conversations"). Answers `200 {ok: true, shared_with: [...], chat_access_removed: bool}` (`shared_with` = this conversation's remaining addresses). Idempotent: an address not recorded for the conversation changes nothing and answers `chat_access_removed: false`. A store failure → `500 {"error": "Could not remove access."}` (logged `CONV_UNSHARE_FAILED` with the exception type). Must send `Content-Type: application/json` (else `415`). Logged `CONV_UNSHARED` (route) and `CONV_SHARE_REMOVED` (store: copy count and the verdict). Nothing is mailed |
 | `GET  /api/chat/{id}/full_table/{key}` | returns the full result table for `key`. The chat stream sets `full_table_key` on responses that contain a tabular result; the key names a durable record (`conversations/full/{key}.json`: preview rows, `code`, optional `result_key` and `sql`). The route re-executes the stored code (a live table re-fetched with the stored SQL) and answers `{columns, rows, total_rows}`; when that yields nothing it answers the stored record. **Live-table gate:** before any re-execution, an item whose stored code references a LIVE table the requester's role does not cover (by the pre-fetch's own rule: a quoted df key, a generic `dfs` walk, or the `df` alias of the first frame) → `403 {"ok": false, "code": "ROLE_DENIED", "blocked_tables": [<display names>], "error": "Your role does not include this table's data — refresh is unavailable."}`, logged `FULL_TABLE_ROLE_DENIED` / `DOWNLOAD_EXCEL_ROLE_DENIED`; no database query is issued. The gate is consulted only where a live fetch can happen: a record without stored code, or a chat that holds no live table, is served without it, and a table the role does not cover that is a SNAPSHOT is served too (viewing existing data is never blocked retroactively). On a chat holding a live table — or when that cannot be determined — the gate FAILS CLOSED: any error inside it (including a failing role read) answers the same 403 with `blocked_tables: []`, logged `LIVE_REEXEC_GATE_FAILED error=<type>`. 403 rather than the refresh path's 200 because the success answer of `download_excel` is a byte stream. |
-| Conversation title generation | After the 2nd human message, the chat stream fires a background `brain_client.title()` call and renames the conversation via `AuthStore.rename_conversation` |
+| Conversation title generation | After the 2nd human message, the chat stream fires a background `brain_client.title()` call and renames the conversation via `AuthStore.rename_conversation`. The `answer` it sends is never rendered text: for a narrative turn `narrative.brain_view` of the narrative template (single flow: else of the caption template), slots as `[slot name]`; otherwise the record's brain-safe `content` (caption templates in it bracketed the same way) |
 | Activity logging | `auth.py` (login), `upload.py` (file_uploaded), `chat.py` (plot_generated, per chart), `report.py` (report_exported), `auto_analytics.py` (auto_analytics_completed) all call `brain_client.post_activity` → brain `/v1/activity`. Fire-and-forget: the post runs on a single background worker thread (ordered), so a slow brain can never block a request or the event loop — telemetry lags instead. |
 | **Auto Analytics** | `POST /api/chat/{id}/auto_analysis/start` kicks a background job → brain `/v1/auto_analytics_plan` (planner returns 3-15 natural-language analytical instructions) → client executes each via `run_chat_local.run_chat` against the local dataframes (bounded 4-worker pool; loaded WITHOUT live tables — `include_live` off — so a live table is never queried by the job and its findings cover the snapshot and file tables only) → brain `/v1/report` for narrative → client renders PPTX via `routes/report._render_pptx` → persists to `chatdata/{id}/auto_analysis.pptx`. `GET /auto_analysis/status` reports `{status: idle|processing|done, progress, error, pptx_path}`. `GET /auto_analysis/download` streams the deck. Raw row data never leaves the client |
-| **Multi-chart streaming** | The chat SSE stream uses `run_chat_multi_plot` (a generator port of global's). The brain Agent classifier sets `suggested_approach` to "Decompose into multiple PLOT_CODE blocks ... separated by ###NEXT_PLOT###" for dashboard/overview-style queries; the planner emits the multi-block raw_text; the client splits it via `_extract_multi_plot_blocks` and executes each block locally with retry, yielding a `{partial: true, chart_n, chart_total, image_base64, answer}` SSE event per chart and a final `{done: true}` combined event. Capped at 6 charts per response. Single-chart queries fall through to the existing one-shot path |
-| **Edit-regenerate** | `POST /api/chat/{id}/edit-regenerate` — verbatim port of global's `edit_regenerate_api` (`backend/routes/chat.py` L1136-1296). dashboard.js fires this from the pencil-edit affordance on a past user message. Server-side: find last `human` turn, `truncate_conv_history` to drop it (and everything after), append the edited human turn, run `run_chat_multi_plot` against the local dfs, persist the AI turn in the same shape the SSE stream uses (`image_base64` for 0/1 charts, `images: [...]` for 2+). Returns a single JSON (NOT SSE — global's is also a one-shot JSON response) |
-| **Chart persistence across refresh / reopen** | `routes/chat.py` accumulates each multi-plot partial's `(image_base64, answer)` while streaming. On the final `done` event the AI turn is appended to `conversations/{conv_id}.jsonl` using global's shape (`backend/routes/chat.py` L1088–1105): 0 images → no image fields, 1 image → top-level `image_base64`, 2+ images → `images: [{image_base64, answer}, ...]`. The single-chart path already stored `image_base64` directly. `dashboard.js` reopens the conversation via `GET /api/chat/{id}/conversation/{conv_id}/history`; lines 1551 and 2184 render `msg.images` as one assistant bubble per chart, otherwise render `msg.image_base64` — identical to global. **Bug fixed (May 2026):** multi-plot history previously persisted `image_base64: null` and no `images` field, so charts vanished on refresh |
+| **Multi-chart streaming** | The chat SSE stream uses `run_chat_multi_plot` (a generator port of global's). The brain Agent classifier sets `suggested_approach` to "Decompose into multiple PLOT_CODE blocks ... separated by ###NEXT_PLOT###" for dashboard/overview-style queries; the planner emits the multi-block raw_text; the client splits it via `_extract_multi_plot_blocks` and executes each block locally with retry, yielding a `{partial: true, chart_n, chart_total, image_base64, answer}` SSE event per chart and a final `{done: true}` combined event; with a narrative template a `{narrative: true, phase, text}` event comes before the `done` (see "Narrative-template answers" under Chat). Capped at 6 charts per response. Single-chart queries fall through to the existing one-shot path |
+| **Edit-regenerate** | `POST /api/chat/{id}/edit-regenerate` — verbatim port of global's `edit_regenerate_api` (`backend/routes/chat.py` L1136-1296). dashboard.js fires this from the pencil-edit affordance on a past user message. Server-side: find last `human` turn, `truncate_conv_history` to drop it (and everything after), append the edited human turn, run `run_chat_multi_plot` against the local dfs, persist the AI turn with the SAME builder the SSE stream uses (`_build_ai_history_record`: `image_base64` for 0/1 charts, `images: [...]` for 2+ or any phase-2 chart, the narrative fields; tables of a tables partial or the `done` event persisted with their durable keys and captions). Returns a single JSON (NOT SSE — global's is also a one-shot JSON response) whose `answer` is the DISPLAY text (never the brain-safe `combined_answer` / `result.text`), plus `record_view` — the persisted record as the history route serves it — and `ai_index`, its row index in the conversation; the page renders `record_view` through `renderAiRecord`, so every chart, the narrative and the table captions appear exactly as after a reload. Never runs a second phase |
+| **Chart persistence across refresh / reopen** | `routes/chat.py` accumulates each multi-plot partial's `(image_base64, answer)` while streaming. On the final `done` event the AI turn is appended to `conversations/{conv_id}.jsonl` using global's shape (`backend/routes/chat.py` L1088–1105): 0 images → no image fields, 1 image → top-level `image_base64`, 2+ images (or any image with `phase: 2`) → `images: [{image_base64, answer, …}, ...]`. The single-chart path already stored `image_base64` directly. `dashboard.js` reopens the conversation via `GET /api/chat/{id}/conversation/{conv_id}/history`; lines 1551 and 2184 render `msg.images` as one assistant bubble per chart, otherwise render `msg.image_base64` — identical to global. **Bug fixed (May 2026):** multi-plot history previously persisted `image_base64: null` and no `images` field, so charts vanished on refresh |
 
 ### Sharing rules
 

@@ -4,8 +4,8 @@
 > enterprise (on-prem) edition. Adapted from the original B2C constitution
 > for the brain/client split.
 
-**Version:** 1.9 (enterprise)
-**Last Updated:** 2026-10-23
+**Version:** 1.10 (enterprise)
+**Last Updated:** 2026-10-24
 
 ---
 
@@ -41,17 +41,37 @@ The split is the whole product. Violating it defeats the on-prem promise.
   same rule when the text is built (`schema_builder._safe_technical_description`).
 - Conversation history of past **text** turns (role/content/code), never
   values.
-- Generated code (Python) and execution error text.
+- Generated code (Python) and execution error text. The retry `error_msg`
+  is scrubbed first (`brain_client._scrub_error_msg`, inside
+  `brain_client.retry`): every quoted literal (`'…'` / `"…"`, whatever its
+  length, a `b'…'` / `u'…'` prefix included) becomes `'<value>'` unless its
+  content is an input column name, a df name, or text the brain itself
+  wrote into the failed code (a whole identifier token, or text inside one
+  of the code's own string literals), so `KeyError: 'Department'` and
+  `NameError: name 'totl'` stay useful while an exception that quotes a cell
+  value the code does not contain does not carry it. The plot path's `NearZeroChartError` is a fixed sentence without
+  numbers.
 - Findings for reports — `{question, answer_text, has_chart, has_table,
-  table_columns (NAMES only), code_snippet}`.
+  table_columns, code_snippet}`. `answer_text` is the record's brain-safe
+  text (for a templated record the slot-free `brain_view` of its templates);
+  `table_columns` keeps only the chat's INPUT column names — a result-table
+  label that is not one (a pivot or crosstab header can be a category value
+  or a date) is removed.
 - The aggregate dataset profile (`dataset_profile` on `/v1/plan` /
-  `/v1/retry`) — row counts, duplicate counts, null rates, min/max,
-  constant/all-unique flags, detected grain, deterministic warnings, and
-  top-value hints truncated to 40 chars — only for a column with at most 20
-  distinct values. Same class as the cardinality hints `schema_text` already
-  carries; never row data. The client's
+  `/v1/retry`) — row counts, duplicate counts, distinct and null counts and
+  rates, constant/all-unique flags, detected grain (column names) and
+  deterministic warnings: a constant column's warning reads `<col> is
+  constant` without its value, and the stock-vs-flow warning names two
+  columns and an integer percentage. `min`, `max` and `top_values` stay in
+  the stored sidecar profile but are dropped from EVERY column on the way
+  out. Never row data, never a cell value. The client's
   `brain_client._compact_profiles_for_transport` is the boundary guard for
   this field; the brain logs only `profile_tables=N`, never the body.
+- `data_caveat` on `/v1/describe` — the client's deterministic result
+  check: a finding kind, short facts that name result columns, grain lines
+  and a catalog flag. A fact never carries a value (`result_backstop` writes
+  none, and `brain_client._compact_caveat_for_transport` also drops any fact
+  ending in a `(= …)` hint).
 - Live-table metadata: `live_tables` on `/v1/plan` / `/v1/retry` — per live
   table its df key, the connector dialect key, the effective row cap and
   whether an administrator row filter applies; the brain-written `sql` map
@@ -61,7 +81,9 @@ The split is the whole product. Violating it defeats the on-prem promise.
   `other`) plus, for a guard refusal only, the guard's own sentence, which
   names at most an identifier. `brain_client.live_sql_error` is the one
   builder of that shape.
-- The first 300 characters of an answer, for `/v1/title`.
+- The first 300 characters of an answer's brain-safe text, for
+  `/v1/title` — for a templated answer the slot-free `brain_view` of its
+  template (every slot written `[slot name]`), never the rendered text.
 - Operational events for `/v1/activity` — `event`, `user_email`, lightweight
   metadata.
 - The titles of the user's own chats: `existing_names` on `/v1/chat_metadata`
@@ -70,7 +92,8 @@ The split is the whole product. Violating it defeats the on-prem promise.
   brain logs only their count, never the titles.
 - `capabilities` on `/v1/plan` / `/v1/retry` — a constant list of the
   feature names the client supports (`narrative_v1`, `diagnostics_v1`,
-  `two_phase_v1`). No data.
+  `two_phase_v1`; the current client sends at most the first two, from the
+  `BRAIN_CAPABILITIES` setting). No data.
 - FINDINGS: `findings` on `/v1/plan` (the second pass of a two-phase
   diagnostic) and `data_caveat.findings` on `/v1/describe`, at most 24
   keys. FINDINGS are check outcomes derived from the data — booleans, fixed
@@ -83,8 +106,8 @@ The split is the whole product. Violating it defeats the on-prem promise.
 - AI history rows of a templated turn, whose `content` is a
   `[Findings: …]` marker line plus the unfilled template: the brain's own
   text with slots, never a filled-in value.
-- `preview: null` on `/v1/summarize` — a client that uses templates sends
-  no preview value at all.
+- `preview: null` on `/v1/summarize` — the current client sends no
+  preview value at all, on every summarize call.
 
 ### What MUST NOT cross
 - DataFrame rows, cell values, or computed result tables.
@@ -104,25 +127,41 @@ The split is the whole product. Violating it defeats the on-prem promise.
   as the marker.
 
 ### The guard
-The summarizer's `_safe_preview` helper (in
-[`client/run_chat_local.py`](../client/run_chat_local.py)) is the hard guard
-against accidental row leakage in `/v1/summarize`: a `str | int | float |
-bool` passes, and so does a flat dict whose keys and values are all such
-scalars (numpy scalars are converted first, `None` values allowed); lists,
-DataFrames and any dict holding anything else are dropped to `None`.
-`brain_client._compact_preview_for_transport` then caps what passed: a string
-at 500 characters, a dict at its first 20 keys (the number dropped is sent as
-`_truncated_keys`), each string key or value at 500 characters. Do not weaken
-or bypass either.
+`/v1/summarize` no longer receives a result value at all: every summarize
+call sends `preview: null` (the chat's single answers and Auto Analytics
+alike). The `_safe_preview` helper (in
+[`run_chat_local.py`](../run_chat_local.py)) still decides what a scalar
+result IS — a `str | int | float | bool`, or a flat dict whose keys and values
+are all such scalars (numpy scalars are converted first, `None` values
+allowed); lists, DataFrames and any dict holding anything else become
+`None` — but its output now feeds only LOCAL display: the value line shown
+under a summarize answer (`narrative.value_display`) and the implicit
+`result` slot of a template. `brain_client._compact_preview_for_transport`
+remains as the transport cap should a non-null preview ever be passed (a
+string at 500 characters, a dict at its first 20 keys plus
+`_truncated_keys`). Do not weaken or bypass either.
+
+Templated answers follow one rule (R0): a text produced by
+`narrative.render` or `narrative.value_display` is never stored in a
+record's `content`, never passed to a `brain_client.*` function, and never
+placed where `/v1/title` or `/v1/report` read. Brain-bound text is built only
+from templates (`narrative.history_content`, `narrative.brain_view`),
+describe/summarize replies and fixed client sentences. FINDINGS cross only
+after `narrative.validate_findings` (per block, against that block's code)
+and the shape guard `brain_client._compact_findings_for_transport`.
+`brain_client._sanitize_history_rows` keeps history to `role`, `content` and
+`code`, so the stored `values`, `findings` and rendered fields never travel.
 
 `SCHEMA_VALUE_DENY_COLUMNS` (client setting, comma-separated column names,
 case-insensitive) is the per-column switch for values that must not cross
 even as low-cardinality categories (account numbers, national ids): such a
 column reaches the brain as its name, dtype and counts only — in the schema
 text (no category list, no value descriptions), the technical description,
-the dataset profile (no min/max, no top values, a constant warning without
-its value) and the schema-autofill hints. It does not filter computed results
-(preview, answer text, report findings).
+the dataset profile (counts and flags only — `min`, `max`, top values and
+constant values no longer cross for any column) and the schema-autofill
+hints. It does not filter computed results: the rendered answer the user
+reads (which stays on the client), and the answer text of history rows
+written before the narrative release, which can still carry a value.
 
 ### Brain-side mirror
 The brain must NOT log full payloads. Use truncated logging
@@ -775,7 +814,7 @@ To modify this constitution:
 
 | Rule         | Summary                                                                   |
 |--------------|---------------------------------------------------------------------------|
-| Data boundary| Raw values never cross to brain. `_safe_preview` is the guard.            |
+| Data boundary| Raw values never cross to brain. Templates are filled locally; brain-bound text comes from templates only (R0); summarize gets `preview: null`. |
 | LLM calls    | REST API only, no LangChain. Tier via `_eff()`.                            |
 | Storage      | Local filesystem. JSONL for history, JSON for metadata. No GCSPath. Direct-to-GCS upload hop only with `GCS_UPLOAD_BUCKET` (demo). |
 | Errors       | Catch → log with sid → return fallback. Never crash silently.             |

@@ -1,6 +1,6 @@
 # Narrative-Template Answers & Diagnostic Analytics — Design Spec
 
-**Status:** Design — not yet implemented (2026-10-23). Decisions of 2026-10-23 applied (section F). Sessions 1 and 2 are approved for implementation. Session 2 shipped in PDC_Brain PRs #2–#4; B10.2, B10.3 and B10.5 are synced to the merged brain texts (PITFALLS block, pdc_diag key map, block-isolation routing, pitfall 5 on `latest_is_past_period`). Session 3 (two-phase) is decided after sessions 1+2 have been tested on the BRB questions; its design stays in this spec, gated behind the capability `two_phase_v1`.
+**Status:** Decisions of 2026-10-23 applied (section F). Session 1 (client, task list C12) is implemented (2026-10-24): client PR #21 (the sandbox layer — `pdc_diag`, VALUES/FINDINGS capture and transport —, the `narrative.py` renderer and the value scrubs of B7.6/B7.7) and PR B (branch `feat/narrative-1b-flows-ui`: the single and multi flows, the record fields, the SSE events, the report path, the `/lab` UI and the docs); its deliberate deviations from this spec are listed under "Session 1 implementation notes" at the end of C12 session 1. Session 2 shipped in PDC_Brain PRs #2–#4; B10.2, B10.3 and B10.5 are synced to the merged brain texts (PITFALLS block, pdc_diag key map, block-isolation routing, pitfall 5 on `latest_is_past_period`). Session 3 (two-phase) is decided after sessions 1+2 have been tested on the BRB questions; its design stays in this spec, gated behind the capability `two_phase_v1`.
 **Location:** `PDC_Client/docs/DIAGNOSTICS_SPEC.md` (client repo; referenced from the DRAFT section of `PROTOCOL.md` in both repos)
 **Audience:** the three implementation sessions (client, brain, two-phase integration), reviewers of the data boundary (Article II), the lead.
 
@@ -498,7 +498,7 @@ Existing keys stay. These keys are added, only when present:
   3. Any other event is dropped and logged `SSE_EVENT_UNKNOWN keys=<sorted key names>`.
   4. The worker (`:1693-1765`) uses the same predicates.
 
-  Tests: `tests/test_chat_stream_phases.py::test_narrative_event_does_not_end_stream` and `::test_tables_partial_not_rendered_as_chart`.
+  Tests: `tests/test_chat_stream_phases.py::test_narrative_event_does_not_end_stream` and `::test_tables_partial_not_rendered_as_chart`. Session 1 ships the first as `tests/test_narrative_sse.py::test_narrative_event_does_not_end_stream`; `tests/test_chat_stream_phases.py` belongs to session 3.
 
 #### A5.5 Record fields (`routes/chat.py`)
 
@@ -1481,6 +1481,17 @@ Their tests are named in B7.6, B7.7 and A2.2. Docs: `AI_CONSTITUTION.md` Art. II
 - against an old brain (no `narrative`) the UX is today's, except the null summarize preview + `value_display`;
 - `/smoke-test` on :8091 against a new brain;
 - a reviewer agent pass on the data boundary.
+
+**Session 1 implementation notes (deliberate deviations; the code is authoritative):**
+- **Return shapes at the exec sites.** `code_exec._execute_in_process` writes the four keys EXPLICITLY in its success return literal (`"values": outputs["values"], "values_dropped": …`), not `**outputs`; each success return of `plot_utils._render_in_process` is `out = {...}; return _with_outputs(out, env)`. Both keep the success dicts literals with constant string keys, which the AST pins in `tests/test_executor_dispatch.py` read (`test_the_transport_python_key_list_matches_the_in_process_success_return` compares code_exec's success key set with `exec_transport._PYTHON_KEYS`; `test_the_transport_plot_key_list_covers_every_in_process_return` checks plot_utils' literals against `_PLOT_KEYS`).
+- **`.item()` only on numpy scalars.** `exec_transport` converts a value through numpy's own `np.generic.item` only when it is an `np.generic`, and inspects EXACT types (`type(x) is …`, an exact `dict` read through `dict.items`). An arbitrary object with an `.item()` method — or a subclass overriding `item()`, `items()` or `__len__` — is dropped without any of its methods running: the capture runs after the timed exec, where code-defined methods could loop forever. (A3.1 said "a non-builtin with a callable `.item()`".)
+- **Retry `error_msg` scrub (B7.7).** `_scrub_error_msg` drops a `b` / `u` / `r` / `f` string prefix before matching, so a `b'…'` literal is scrubbed too; replaces a literal whatever its length (no 200-character limit); and KEEPS, besides the input column and df names, any literal the failed code itself contains — as a whole identifier token (dotted names too) or inside one of the code's own string literals — since the brain wrote that text (`NameError: name 'totl'`, the `'North'` of `df.loc['North']`).
+- **Stock-vs-flow profile warning (not in this spec).** `dataset_profile` adds the warning `<a> equals <b> in <pct>% of rows: likely a stock, not a flow` for two numeric (non-bool, non-constant) columns equal in more than 90 % of the rows where both are set (`np.isclose`, `rtol=1e-9`); one warning per equality group (k mutually equal columns warn once), two all-unique columns equal in every row (ids, row numbers) are skipped, and the scan is skipped above 30 numeric columns. Names and an integer percentage only.
+- **`two_phase_v1` filtered out.** `settings.brain_capabilities()` recognises only `narrative_v1` and `diagnostics_v1`; a configured `two_phase_v1` is dropped, and without `narrative_v1` nothing is sent at all (`diagnostics_v1` alone is not announced).
+- **Single-chart multi turns.** A `run_chat_multi_plot` turn that produced exactly one chart is stored as a single-visual record (no `images[]`, unless that chart is phase 2), so the chart's caption goes into the record's `caption_template` / `caption_rendered` (an uncaptioned chart of a narrated turn: `caption_described`); a stopped single-chart record appends the stop note to that field.
+- **Title.** `_answer_for_title` uses `brain_view` of the narrative template, else (single flow) of the caption template; a multi turn without a narrative passes its brain-safe `content` with any caption template in it bracketed by `brain_view`.
+- **Edit-regenerate.** It builds the record with the same `_build_ai_history_record` as the stream and answers `record_view` (the persisted record as the history route serves it) plus `ai_index`; the page renders EVERY chart, the narrative and the table captions from `record_view` through `renderAiRecord`.
+- **Smaller points.** Tables partials are accepted by the consumer, the worker and the page but not emitted by the session-1 generator (tables stay on `done`). `/v1/report` `table_columns` keeps nothing when the input column names cannot be read (fail closed). `_NarrState` also carries the bookkeeping the flows need (`sid`, `captions_used`, `described`, `display_answers`, `rendered`).
 
 #### Session 2 — Brain (capabilities, extraction, prompts, classifier, YAML, summarize, describe)
 
