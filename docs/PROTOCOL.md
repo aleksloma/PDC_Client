@@ -344,7 +344,11 @@ in the answer language:
 - a slot is `{{name}}` or `{{name:kind}}`: `name` = letters, digits and
   underscores, at most 40 characters; `kind` is `count`, `float`, `pct`
   (the value is a fraction: 0.125 is shown as 12.5%), `ratio`, `amount`,
-  `text` or `period`. A slot no block sets is shown as `n/a`;
+  `text` or `period`. A slot no block sets, or whose value is null,
+  renders `n/a`, and the client removes every sentence holding one
+  before display (a caption emptied that way is described instead; a
+  narrative emptied that way is not used). So a sentence should depend
+  only on values its own section guarantees;
 - `{{#flag}}…{{/flag}}` is shown when FINDINGS has `flag` true, holds a
   column name or code under `flag`, or `flag` is a code some FINDINGS value
   equals; `{{^flag}}…{{/flag}}` is shown otherwise. One level only;
