@@ -1041,7 +1041,14 @@ the capability (`BRAIN_CAPABILITIES`, below) and the brain's plan carries a
 `narrative` template and/or `captions` (`PROTOCOL.md`, `/v1/plan`), the
 answer text is filled locally from the `VALUES` the executed code set
 (`narrative.render`, slots formatted by `pdc_diag.fmt`, sections chosen by the
-block's validated FINDINGS, a missing slot shown as `n/a`). A rendered text is
+block's validated FINDINGS). Before display, every sentence that would show
+`n/a` (a slot the code did not set, a None or non-finite value) is removed
+from the rendered narrative and from each rendered caption
+(`narrative.drop_na_sentences`, logged `NARRATIVE_SENTENCE_DROPPED
+reason=missing_slot n=<count> what=<narrative|caption>`). A caption the gate
+empties counts as missing (describe runs for that visual); a narrative it
+empties is not used (`NARRATIVE_SKIPPED reason=all_sentences_dropped`), and
+the answer is built as for a turn without a narrative. A rendered text is
 DISPLAY text only: it reaches the page, the local record and the local
 PDF/PPTX, never `content` and never a brain call. What changes on the stream:
 

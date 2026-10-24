@@ -219,7 +219,7 @@ _TOKEN_RE = re.compile(
 
 #### A2.2 Semantics
 
-- **Slot.** If `values[name]` exists, render `pdc_diag.fmt(values[name], kind_or_None)`. If it is missing, render `"n/a"` and log one `NARRATIVE_SLOT_MISSING name=<name>` line per name per render (the name only).
+- **Slot.** If `values[name]` exists, render `pdc_diag.fmt(values[name], kind_or_None)`. If it is missing, render `"n/a"` and log one `NARRATIVE_SLOT_MISSING name=<name>` line per name per render (the name only). `render` itself keeps the `"n/a"`; the display flows then remove every sentence that holds one (the A5.1 quality gate), so the user never sees it.
 - **`{{#flag}}…{{/flag}}`** is shown when any of these holds:
   - (a) `findings.get(flag) is True`;
   - (b) `flag in findings` and the value is not a bool (a column name or code);
@@ -379,7 +379,7 @@ Rules, applied in order:
    - `count`: an `int` → `format(v, ",")` (exact, with no float conversion); a `float` → `",.0f"`;
    - `float`: `",.2f"`;
    - `pct`: `format(v * 100, ",.1f") + "%"` — the input is a fraction;
-   - `ratio`: `",.1f"` + `"x"`;
+   - `ratio`: `0 ≤ v < 0.05` ⇒ `"<0.1x"`; `v > 1000` ⇒ `">1000x"`; otherwise `",.1f"` + `"x"` (a negative ratio keeps the fixed-point rule). A collapse such as 6.6e-6 therefore never reads as `"0.0x"`;
    - `amount`: `|v| ≥ 1e12` ⇒ `format(v / 1e12, ",.2f") + " " + trln` (decision F12); `|v| ≥ 1e9` ⇒ `format(v / 1e9, ",.2f") + " " + bln`; `|v| ≥ 1e6` ⇒ the same with `/1e6` and `mln`; otherwise the count rule.
 9. Negative zero: if the result starts with `"-"` and contains no digit 1–9, drop the `"-"`.
 10. Locale: when `locale` names an entry other than `default`, swap the separators through a placeholder (`,` → `\0`, `.` → decimal, `\0` → thousands) and swap the `mln`/`bln`/`trln` words. An unknown locale ⇒ default.
@@ -406,6 +406,8 @@ Rules, applied in order:
 | `12.5` | pct | `1,250.0%` |
 | `3.27` | ratio | `3.3x` |
 | `12` | ratio | `12.0x` |
+| `6.6e-6` | ratio | `<0.1x` |
+| `1e9` | ratio | `>1000x` |
 | `0.48` | ratio | `0.5x` |
 | `2345678901` | amount | `2.35 bln` |
 | `7250000` | amount | `7.25 mln` |
@@ -458,7 +460,9 @@ class _NarrState:                 # one per phase
   - With the split-axes fallback (`run_chat_local.py:1812-1828`), caption n goes on sub-chart 0 and the others keep `cobj.title`.
   - if `result_backstop.inspect_outputs` fires for that visual, prepend `result_backstop.fallback_sentence(lang, …)` + `"\n\n"` to both the template and the rendered caption (a value-free sentence; no brain call);
   - if caption `n` is missing, today's per-chart `_describe_with_backstop` runs for that visual only (A6).
-- **Narrative.** After all blocks of the phase finish, and only if `ok_blocks ≥ 1`: `render(template, values, findings, sid=sid)`, then `_append_live_notes` (`run_chat_local.py:478`) on the RENDERED text only. If `ok_blocks == 0`, the narrative is not used (`NARRATIVE_SKIPPED reason=no_successful_block`) and today's failure texts apply.
+  - the rendered caption passes the quality gate below (`what=caption`); a caption the gate empties counts as missing, so describe runs for that visual.
+- **Narrative.** After all blocks of the phase finish, and only if `ok_blocks ≥ 1`: `render(template, values, findings, sid=sid)`, then the quality gate (`what=narrative`), then `_append_live_notes` (`run_chat_local.py:478`) on the RENDERED text only. If `ok_blocks == 0`, the narrative is not used (`NARRATIVE_SKIPPED reason=no_successful_block`) and today's failure texts apply. If the gate empties the text, the narrative is not used either (`NARRATIVE_SKIPPED reason=all_sentences_dropped`) and the answer takes today's no-narrative path: the per-visual describe / caption texts, or summarize plus `value_display` for a scalar.
+- **Quality gate** — `narrative.drop_na_sentences(text, *, sid, what) -> str`, applied to every rendered text before display. The text is split on newlines and after `.` / `!` / `?` followed by whitespace or the end (so `7.9x` or `1,234.57` is not a sentence end). Every piece holding the token `n/a` (case-insensitive, not inside a word) is removed, then the A2.2 space/newline post-processing runs again. A missing slot, a slot whose value is None and a non-finite value all render `n/a`, so a sentence about a value the code did not produce never reaches the user. One line `NARRATIVE_SENTENCE_DROPPED reason=missing_slot n=<pieces> what=<narrative|caption>` per text, never the text. The stored template and VALUES are unchanged; a text without `n/a` is returned as it is. Never raises. Known limits: a value or template text that legitimately reads `N/A` (a category named so) drops its sentence too, and is still logged as `missing_slot`; an abbreviation such as `e.g. ` counts as a sentence end.
 - Log after each phase: `NARRATIVE_USED phase=<p> slots=<n> missing=<n> captions=<n> described=<n>`.
 
 #### A5.2 Brain-safe text vs display text — one rule
@@ -595,7 +599,8 @@ def _apply_narrative_fields(rec: dict, src: dict | None) -> dict
 | No narrative (old brain, model omitted it, dropped by caps or kind) | today's describe per visual (with `data_caveat.findings` when FINDINGS exist, B7.4); summarize for a scalar with `preview=None` + local `value_display` |
 | Narrative present, a visual has no caption | user item A.5: today's per-chart describe for THAT visual only (unchanged prompt; `data_caveat.findings` added when FINDINGS exist; backstop caveat as today). The answer-level text stays the narrative; summarize is never called. See F27 |
 | No narrative, some captions present | captioned visuals use the rendered caption (no describe); uncaptioned visuals → describe with an unchanged prompt (+ findings caveat) |
-| Render error | `fallback_text` (sections removed, slots `"n/a"`), `NARRATIVE_RENDER_FAILED error=<Type>` |
+| Render error | `fallback_text` (sections removed, slots `"n/a"`), `NARRATIVE_RENDER_FAILED error=<Type>`; the quality gate then drops every sentence that held a slot |
+| A rendered sentence holds `n/a` (missing slot, None or non-finite value) | that sentence is dropped (A5.1 quality gate); a caption left empty ⇒ describe for that visual; a narrative left empty ⇒ the "No narrative" row |
 | Every block of the phase failed | narrative not used; today's failure texts |
 | Summarize fallback | `brain_client.summarize(..., preview=None)` at `run_chat_local.py:981` and `:2187`; then `value_display = narrative.value_display(_safe_preview(preview), lang)` is appended to the display only |
 
@@ -631,7 +636,8 @@ FINDINGS_ENUM = ("coverage_change", "coverage_stable", "partial_period", "metric
                  "dominant_feature", "anomaly_confirmed", "no_anomaly",
                  "data_gap", "outlier_driven", "seasonal_pattern")
 # needs_phase2 is NOT a value (decision F14); it is only the reserved boolean KEY.
-# data_gap / outlier_driven / seasonal_pattern are not emitted by pdc_diag v1; planner code may set them
+# data_gap is emitted by detect_anomalies as period_status="data_gap" (B8.4).
+# outlier_driven / seasonal_pattern are not emitted by pdc_diag v1; planner code may set them
 # (e.g. FINDINGS["pattern"] = "seasonal_pattern") from its own checks.
 ```
 
@@ -722,6 +728,14 @@ The brain's `_findings_block` text is in B10.7.
 
 **"Import whitelist."** None exists: `sandbox_guard.DENIED_MODULES` (`sandbox_guard.py:28-55`) is a denylist, and `pdc_diag` must NOT be added to it. The required change is therefore the three COPY/list entries above.
 
+**Redefinition guard.** Generated code may call `pdc_diag` but never replace it (a BRB retry once wrote its own `detect_anomalies_mock` and erased the real findings). `sandbox_guard.pdc_diag_redefinition(code)` walks the AST before anything runs, at BOTH exec sites (`code_exec._execute_in_process`, `plot_utils._render_in_process`), and refuses:
+- the name `pdc_diag` as a target: plain, augmented, annotated, tuple/list unpack, walrus, `for`, `with … as`, `except … as`, comprehension, `del`, `global` / `nonlocal`;
+- `class pdc_diag` / `def pdc_diag`, and a `def` / `async def` named after a public function (`PDC_DIAG_PUBLIC`: `fmt`, `coverage_check`, `detect_anomalies`, `decompose_change`, `attribute_level`, `check_metric_overlap`, `plot_highlighted_series`, `plot_waterfall`, `plot_importance`), at any nesting;
+- an import that binds `pdc_diag` to something else (`import numpy as pdc_diag`, `from m import x as pdc_diag`, `from m import pdc_diag`); a plain `import pdc_diag` rebinds the real module and is accepted;
+- an attribute write or delete on `pdc_diag` (`pdc_diag.fmt = …`, `pdc_diag.x += 1`, `del pdc_diag.fmt`).
+
+A refused block is an ordinary execution error with the fixed text `pdc_diag cannot be redefined` (`PDC_DIAG_REDEFINED_TEXT`; the PYTHON site answers `{"error": …}`, the PLOT site `{"ok": False, "error": …, "trace": ""}`), so the retry loop asks the planner for a new block; the text carries no code and the log line carries the code hash only. An unparsable block is left to `exec`, which reports its own `SyntaxError`. Not caught (defence in depth, not a boundary): `setattr(pdc_diag, …)`, `globals()["pdc_diag"] = …`, writes through `__dict__`. The guard also applies when stored code is re-run (per-item Refresh, dashboard tiles, full-table re-execution, Download Excel): a stored block that defines e.g. `def fmt(…)` now fails there with the same text and the button is frozen. On the local test volume 1 of 161 stored blocks is refused, and it is a BRB retry block that defined `detect_anomalies`.
+
 **Error behaviour.**
 - The functions never print or log (they run in the sandbox).
 - A missing column or a non-numeric metric raises `ValueError` with a fixed message naming the parameter and the column. That is schema-level information, so it helps retries.
@@ -731,6 +745,7 @@ The brain's `_findings_block` text is in B10.7.
 
 ```python
 PDC_DIAG_VERSION = 1
+THIN_PERIOD_RATIO = 0.5                            # a period with rows < 0.5 × median rows is thin (B8.3, B8.4)
 FINDINGS_ENUM = (...)                              # B7.1
 PDC_DIAG_FINDING_KEYS = frozenset({
   "coverage", "coverage_dim", "thin_period", "period_status", "unknown_dominated", "unknown_dim",
@@ -773,7 +788,7 @@ The bool means "order known". Rules, in order:
 
 ```python
 def coverage_check(df, period_col: str, dims: list, metrics: list, *, order=None,
-                   ratio_low: float = 0.5, ratio_high: float = 2.0, jaccard_min: float = 0.5,
+                   ratio_low: float = THIN_PERIOD_RATIO, ratio_high: float = 2.0, jaccard_min: float = 0.5,
                    share_shift: float = 0.5, vanish_share: float = 0.2,
                    unknown_share: float = 0.5, unit_cols: list | None = None,
                    as_of=None, prefix: str = "") -> dict
@@ -803,35 +818,41 @@ Let `P` be the ordered periods and `n_p` the rows per period.
 
 ```python
 def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
-                     z: float = 3.5, ratio: float = 2.0, prefix: str = "") -> dict
+                     z: float = 3.5, ratio: float = 2.0, thin_ratio: float = THIN_PERIOD_RATIO,
+                     prefix: str = "") -> dict
 ```
 
-- `agg ∈ {"sum", "mean", "median", "count", "nunique"}`; `v_p` = the aggregate per period.
+- `agg ∈ {"sum", "mean", "median", "count", "nunique"}`; `v_p` = the aggregate per period; `n_p` = the rows per period.
 - `len(P) < 3` ⇒ `too_few_periods: True` and no `anomaly`.
-- `m = median(v)`, `MAD = median(|v - m|)`.
+- `m = median(v)`, `MAD = median(|v - m|)` — over ALL periods, data gaps included.
 - Robust z = `0.6745·(v_p - m)/MAD`. If MAD = 0, use the mean absolute deviation instead; if that is also 0, z = 0.
 - `ratio_med_p = v_p/m` (NaN unless m > 0).
 - `ratio_prev_p = v_p/v_{p-1}` (NaN unless `v_{p-1} > 0`).
-- A period `p` is flagged iff `|z_p| ≥ z` OR `max(ratio_med_p, 1/ratio_med_p) ≥ ratio`.
+- **Data gap.** A period is a gap when `n_p < thin_ratio · median(n)` (the `coverage_check` thin rule) or when `v_p == 0` while every existing neighbour is finite and non-zero. A gap is a coverage problem, not a business anomaly: it is never flagged and never primary. (BRB: February 2026 has 3,792 rows against a median of 12,617 and NPL_COUNT 1; it used to be the primary anomaly, read as a "sharp increase".)
+- A non-gap period `p` is flagged iff `|z_p| ≥ z` OR `max(ratio_med_p, 1/ratio_med_p) ≥ ratio`.
 - Primary = the flagged period with the largest `|log(ratio_med_p)|`; ties go to the later period.
 
 **Findings:**
-- `anomaly` (`"anomaly_confirmed"` / `"no_anomaly"`);
-- `anomaly_up`, `anomaly_is_latest`, `multiple_anomalies`, `too_few_periods`.
+- `anomaly` (`"anomaly_confirmed"` iff at least one non-gap period is flagged, else `"no_anomaly"`);
+- `anomaly_up`, `anomaly_is_latest`, `multiple_anomalies` — over non-gap flagged periods only; `too_few_periods`;
+- `period_status = "data_gap"` when some period is a gap (the existing key and code: a template writes `{{#data_gap}}…{{/data_gap}}`). `coverage_check` uses the same key for `"partial_period"`; in a block that copies both results into FINDINGS the later copy wins, and the thin month is still reported by `coverage_check`'s `thin_period`.
 
-**VALUES:** `anomaly_period, anomaly_value, baseline_value (=m), anomaly_ratio_median, anomaly_prev_period, anomaly_prev_value, anomaly_ratio_prev, n_periods, n_anomalies`.
+**VALUES:** `anomaly_period, anomaly_value, baseline_value (=m), anomaly_ratio_median, anomaly_prev_period, anomaly_prev_value, anomaly_ratio_prev, n_periods, n_anomalies` (unchanged; `n_anomalies` counts non-gap flagged periods).
 
-**Table:** `period, value, robust_z, ratio_prev, ratio_median, is_anomaly, is_primary`.
+**Table:** `period, value, robust_z, ratio_prev, ratio_median, is_anomaly, is_primary, rows, is_data_gap` (`rows` and `is_data_gap` are additive trailing columns).
 
 #### B8.5 `decompose_change`
 
 ```python
 def decompose_change(df, period_col, metric, from_period=None, to_period=None, dims=(), *,
                      agg: str = "sum", order=None, top_k: int = 5, concentrated_share: float = 0.6,
-                     even_tolerance: float = 0.15, large_ratio: float = 2.0, prefix: str = "") -> dict
+                     even_tolerance: float = 0.15, large_ratio: float = 2.0, unknown_share: float = 0.5,
+                     prefix: str = "") -> dict
 ```
 
 **Defaults.** `to_period=None` ⇒ the latest period. `from_period=None` ⇒ the period before `to_period`. Fewer than 2 periods ⇒ `too_few_periods`.
+
+**Unknown-dominated dims.** A dim whose share of rows with a null or `UNKNOWN_TOKENS` member is above `unknown_share` in the from period OR the to period cannot explain the change. It is skipped: no table rows, never `change_dim`, never the source of `change_top_member`, and it takes no part in the `change_shape` decision. The first such dim (argument order) is reported as `unknown_dominated: True` + `unknown_dim`. (BRB: SEKTOR is 100 % `Номаълум` in January and February, so it once produced `change_top_member = Номаълум` with share 1.0.)
 
 **Per dim** (members of both periods; a missing member counts as 0):
 - `from_v`, `to_v`, `delta = to_v - from_v`;
@@ -849,7 +870,7 @@ A dim is *concentrated* iff its top-`|delta|` member has `share_of_delta ≥ con
 - `change_up` = Σdelta > 0.
 - `change_large` = `to/from ≥ large_ratio` or `to/from ≤ 1/large_ratio`.
 
-**VALUES:** `change_from_period, change_to_period, change_from_value, change_to_value, change_abs, change_ratio, change_pct (fraction), change_top_member, change_top_member_share, change_top_member_delta, change_dim_label` (`change_dim_label` = the column name of `change_dim`, as `str`).
+**VALUES:** `change_from_period, change_to_period, change_from_value, change_to_value, change_abs, change_ratio, change_pct (fraction), change_top_member, change_top_member_share, change_top_member_delta, change_dim_label` (`change_dim_label` = the column name of the dim the top member comes from, as `str`: `change_dim` when the change is concentrated, otherwise the usable dim with the largest top share). `change_dim_label` is set exactly when `change_top_member` is; with no usable dim all four `change_top_member*` / `change_dim_label` values are None.
 
 **`to_period="primary_anomaly"`.** `decompose_change` runs `detect_anomalies(df, period_col, metric, agg=agg, order=order)` internally and uses its primary anomaly period as `to_period`; the period before it is the default `from_period`. If no anomaly is found, the latest period is used and `anomaly` is set to `"no_anomaly"` in findings. This lets phase 2 target the anomaly without seeing phase-1 values.
 
