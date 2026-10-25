@@ -1072,7 +1072,10 @@ record as `headline_display`, never in `content`; a single answer that already
 shows its value line (`value_display`) gets none. A section named
 `<prefix>_<code>` (`{{#ovl_metric_definition_overlap}}`) counts as that FINDINGS
 code when the block's code passes that prefix (`prefix="ovl_"`); `no_` / `not_`
-names are never resolved. After the
+names are never resolved. A section name that is neither but a VALUES key
+holding a bool (`{{#has_uzs}}` with VALUES `has_uzs = True`) is that bool —
+not a finding, so it never counts as a stated finding and never reaches
+/v1/title or /v1/report (`NARRATIVE_SECTION_FROM_VALUES n=<count>`). After the
 template, one fixed sentence in the answer language (en / uz / ru / ka) is
 added for each data-quality finding no shown section states: mixed units, a
 coverage change, a thin period or data gap, an Unknown-dominated dimension, a
