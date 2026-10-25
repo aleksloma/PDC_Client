@@ -65,7 +65,7 @@ are unchanged.
 | `df_columns`        | `{name: list(df.columns)}` (only sent on retry, for column self-correction) | client |
 | `history_rows`      | the `history_rows` arg to `generate_pandas_code` / `summarize_answer`. Each row carries **only** `role`, `content`, and (when present) `code` — the client's `brain_client._sanitize_history_rows` strips every other persisted field (`image_base64`, `chart_data`, `table`, `usage`, `full_table_key`, `ts`, …) before the POST, so raw data values in locally persisted records never cross the boundary (Article II). From its narrative release the client writes the `content` of a templated AI turn as a `[Findings: …]` marker line plus the unfilled template (see `/v1/plan` "History") | client (`local_store.get_history`, sanitized in `brain_client.plan/retry/summarize`) |
 | `common_fields`     | the `common_fields` arg to `generate_pandas_code` | client |
-| `error_msg`         | `exec_out["error"]` from `safe_execute`. From its narrative release the client replaces every quoted literal that is not an input column name, a df name or text the failed code itself contains (a whole identifier token, or text inside one of the code's string literals) with `'<value>'`, and the `NearZeroChartError` text carries no number. With `narrative_v1` the client also sends one request that is not an execution error: `narrative_invalid: <nested|unclosed|mismatched|first_sentence>`, the narrative-only retry (see `/v1/retry`), with `failed_code` the code that already ran and `use_pro: true`; it uses only the reply's `narrative` | client |
+| `error_msg`         | `exec_out["error"]` from `safe_execute`. From its narrative release the client replaces every quoted literal that is not an input column name, a df name or text the failed code itself contains (a whole identifier token, or text inside one of the code's string literals) with `'<value>'`, and the `NearZeroChartError` text carries no number. With `narrative_v1` the client also sends one request that is not an execution error: `narrative_invalid: <nested|unclosed|mismatched|first_sentence>`, the narrative-only retry (see `/v1/retry`), with `failed_code` the code that already ran and `use_pro: true`; when a slot made the first sentence show `n/a` it is `narrative_invalid: first_sentence slot=<name> cause=<missing|none|nan>` (the slot name is a template identifier, never a value). The client waits at most 45 s for that reply and uses only its `narrative` | client |
 | `failed_code`       | the failed code block | client |
 | `preview` (summarize) | the `_safe_preview` value: a `str`/`int`/`float`/`bool`, a flat object whose keys and values are all such scalars (or null values), or `null` — lists, tables and objects holding anything else become `null`. Capped in transport: a string at 500 characters + `…[truncated]`; an object at its first 20 keys, each string key/value cut the same way, plus `"_truncated_keys": <number dropped>` when more existed. From its narrative release the client always sends `null` (see `/v1/summarize`) | client (`run_chat_local._safe_preview`, capped by `brain_client._compact_preview_for_transport`) |
 | `qa_pairs` (report) | the `findings_for_llm` list the B2C `_generate_report_structure` already builds | client |
@@ -358,7 +358,8 @@ grammar (DIAGNOSTICS_SPEC A2.1, the same token regex), without rendering:
   slots keep their prefix). A prefix the code never passes (`no_`, `not_`,
   `has_`) is never rewritten — it could flip the condition. Any other name
   is an `unknown section <name>`.
-- **One correction call.** When a template is invalid, the brain calls the
+- **One correction call** (`/v1/plan` and the code retry; never on the
+  narrative-only retry). When a template is invalid, the brain calls the
   model once more with the same system instruction, model and settings and
   the same prompt plus a fixed correction block: the problem classes with
   the section names involved (which section is opened inside which, which
@@ -393,7 +394,12 @@ in the answer language:
   only on values its own section guarantees. The FIRST sentence is never
   dropped: when it would show `n/a`, or when the template's sections do not
   nest correctly, the client asks once for a new template (the
-  narrative-only retry under `/v1/retry`);
+  narrative-only retry under `/v1/retry`). A slot in the first sentence
+  must therefore never be None: never a value computed from a subset that
+  may be empty, and a headline VALUES assignment carries a defined default
+  (`planner_narrative_system`). When the template is dropped after that
+  retry, the client shows one local sentence with the main figure
+  (`Result: …`) when VALUES has a key `result`, `total` or `*_total`;
 - `{{#flag}}…{{/flag}}` is shown when FINDINGS has `flag` true, holds a
   column name or code under `flag`, or `flag` is a code some FINDINGS value
   equals; `{{^flag}}…{{/flag}}` is shown otherwise. One level only. On
@@ -562,7 +568,11 @@ starts with `narrative_invalid:` (any case, leading whitespace allowed)
 asks for a new template for code that already ran, not for corrected code.
 The text after the colon is the kind of problem the client found:
 exactly `nested`, `unclosed` or `mismatched` (the template's sections do
-not parse) or `first_sentence` (the first sentence would show `n/a`); the
+not parse) or `first_sentence` (the first sentence would show `n/a`),
+optionally followed by the slot that caused it:
+`first_sentence slot=<name> cause=<missing|none|nan>` (`name` in the slot
+grammar, at most 40 characters; the key was absent, its value None, or a
+non-finite number); the
 brain also accepts `unknown section <name>`. Any other text is passed on
 with its whitespace collapsed, at most 200 characters. `failed_code` is
 the code that ran, unchanged: the whole answer, its blocks joined by
@@ -574,18 +584,23 @@ the code that ran, unchanged: the whole answer, its blocks joined by
   `# answer_language:` line), the question, the schema and columns, the
   micro profile lines, the problem with one fixed sentence explaining its
   kind (for `first_sentence`: use only slots the code assigns at the top
-  level of the block that computes the answer), and the code, marked as
-  kept unchanged. It runs on the complex tier (model, temperature,
-  thinking), like a narrative plan; `use_pro` (the client sends `true`),
-  `use_search`, `history_rows`, `live_tables`, `sql` and `sql_error` are
-  ignored. The correction call's block here carries no code (the code is
-  already in the prompt and is not rewritten).
+  level of the block that computes the answer; with a slot cause instead:
+  "The slot <name> was missing / None / NaN at execution; rewrite the
+  first sentence so it uses only values the code sets unconditionally and
+  that cannot be None. The code is not run again, so the new first
+  sentence must use only the VALUES the existing code already sets."), and
+  the code, marked as kept unchanged. It runs on the complex tier (model,
+  temperature, thinking), like a narrative plan; `use_pro` (the client
+  sends `true`), `use_search`, `history_rows`, `live_tables`, `sql` and
+  `sql_error` are ignored.
 - **Response.** `code` is `failed_code` byte-for-byte; `kind` is
   `PLOT_CODE` for several blocks or chart code, else `PYTHON`; `raw_text`
   is the code re-fenced per block; `narrative` / `captions` are new
-  (captions numbered by the code's blocks) and validated with the one
-  correction call above. Never `sql`, never `diagnostic`. A narrative still
-  invalid after the correction call, a failed model call or any other
+  (captions numbered by the code's blocks) and validated like any template
+  above, but with NO correction call: this path makes exactly one model
+  call (the client time-boxes it at 45 s). An invalid narrative or caption
+  is dropped, a valid one kept. Never `sql`, never `diagnostic`. An invalid
+  narrative, a failed model call or any other
   failure on this path comes back without `narrative`, `code` still
   unchanged — the client then answers without a narrative. An empty or
   blank `failed_code` gives `kind: "NO_CODE"`, empty `code` and no model
@@ -598,7 +613,10 @@ the code that ran, unchanged: the whole answer, its blocks joined by
   (`nested` / `unclosed` / `mismatched` / `first_sentence` / `unknown` /
   `other`) instead of
   the raw `error_msg`, so a section name never reaches the log;
-  `NARRATIVE_ONLY_RETRY` logs the model and the same class word, and
+  `NARRATIVE_ONLY_RETRY` logs the model and the same class word (plus
+  `cause=` for a slot cause — never the slot name),
+  `NARRATIVE_RETRY_INVALID templates= nested= unclosed= mismatched=
+  unknown=` an invalid reply template, and
   `NARRATIVE_ONLY_RETRY_FAILED error=<Type>` a failure on this path;
   `BRAIN_RETRY_DONE` adds `narrative_only=True`.
 
@@ -625,7 +643,7 @@ A narrative-only retry (`error_msg` "narrative_invalid: …") answers:
   "raw_text": "```python\n...\n```",      // the failed code re-fenced per block
   "kind": "PYTHON",                       // PYTHON | PLOT_CODE (NO_CODE for an empty failed_code)
   "code": "<failed_code, byte-for-byte>",
-  "usage": { ... },                       // both calls when a correction call ran
+  "usage": { ... },                       // the one model call
   "model_used": "gemini-2.5-pro",
   "narrative": "...",                     // OPTIONAL — absent ⇒ the client describes the result
   "captions": { "1": "..." }              // OPTIONAL

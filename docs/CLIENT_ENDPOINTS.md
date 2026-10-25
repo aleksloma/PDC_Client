@@ -1052,12 +1052,24 @@ the answer is built as for a turn without a narrative. The first sentence is
 never dropped that way: when it would show `n/a`, or when the template's
 sections do not nest correctly (`NARRATIVE_PARSE_FAILED kind=…`), the client
 asks the brain ONCE for a new template through `/v1/retry`, with `error_msg`
-exactly `narrative_invalid: <nested|unclosed|mismatched|first_sentence>` and
+exactly `narrative_invalid: <nested|unclosed|mismatched|first_sentence>` — for
+a first sentence a slot broke, `narrative_invalid: first_sentence slot=<name>
+cause=<missing|none|nan>` (the slot name is a template identifier, logged the
+same way in `NARRATIVE_INVALID`) — and
 the code that already ran as `failed_code` (it runs none of the reply's code);
 a second unusable template logs `NARRATIVE_INVALID_TWICE` and the answer is
-built as for a turn without a narrative. In a multi-chart turn that retry runs
+built as for a turn without a narrative. That retry waits at most 45 s
+(`NARRATIVE_RETRY_TIMEOUT elapsed_ms= timeout_s=45`, then the same fallback),
+and while it runs the stream carries a progress event (`lab.narrative_retry`,
+below). In a multi-chart turn that retry runs
 after the last chart, so the `narrative` event can arrive one model call after
-it (`NARRATIVE_RETRY_DONE kind= elapsed_ms= narrative=`). A section named
+it (`NARRATIVE_RETRY_DONE kind= elapsed_ms= narrative=`). When the template is
+dropped that way and the executed code set VALUES `result`, `total` or a
+`*_total` key to a number, the answer starts with one local sentence carrying
+that figure in the answer language (`Result: 61.58 trln.`, uz `Natija: 61,58
+trln.`; `NARRATIVE_HEADLINE_FALLBACK key= lang=`) — display text, kept on the
+record as `headline_display`, never in `content`; a single answer that already
+shows its value line (`value_display`) gets none. A section named
 `<prefix>_<code>` (`{{#ovl_metric_definition_overlap}}`) counts as that FINDINGS
 code when the block's code passes that prefix (`prefix="ovl_"`); `no_` / `not_`
 names are never resolved. After the
@@ -1074,11 +1086,13 @@ PDF/PPTX, never `content` and never a brain call. What changes on the stream:
 | Event | Shape on the stream | Notes |
 |---|---|---|
 | narrative (NEW) | `{"narrative": true, "phase": 1, "text": "<rendered narrative>", "conv_id"}` | Multi-chart turn only, once, after the last block, when the plan's narrative was used (at least one block succeeded). Carries the rendered text only — never the template, VALUES or FINDINGS. Does NOT end the stream: the page fills a hidden slot above the charts (`.pdc-narrative[data-phase]`) |
+| progress, narrative retry | `{"progress": true, "message_key": "lab.narrative_retry", "message": "Writing the summary…", "conv_id"}` | Emitted once, right before the narrative-only retry (single and multi-chart turns). The page shows `_t(message_key, message)` (en / geo / ru) in the loading bubble, or — after the charts — in a status bubble that `done` removes. Any progress event with a `message_key` is translated the same way |
+| narrative, headline fallback | `{"narrative": true, "phase": 1, "text": "<headline sentence>", "conv_id"}` | Multi-chart turn whose template was dropped after the narrative-only retry and whose VALUES hold `result` / `total` / `*_total`: fills the phase-1 slot above the charts. The single-shot `done` carries it as `narrative` instead (below) |
 | progress, phase 2 (reserved) | `{"progress": true, "phase": 2, "message_key": "lab.phase2_progress", "message", "conv_id"}` | Not emitted in this release (two-phase ships later). The consumer forwards it and the page shows it as a status bubble; the ordinary `{"progress": true, "message"}` event is unchanged |
 | tables partial | `{"partial": true, "phase", "tables", "full_table_keys", "table_captions", "conv_id"}` — no `image_base64` | Tables without a chart, never counted as a chart. In this release the generator still puts a turn's tables on its `done` event; the consumer, the persistence worker and the page already accept the partial form (reserved for phase 2) |
 | chart partial | existing keys + `phase` (`1`) | `answer` is the chart's RENDERED caption (with the result-backstop sentence in front when that check fired for the chart; no describe call) or, without a caption, the describe text as before. The caption template is not sent |
 | multi `done` | existing keys; `answer` = the display text; + `record_view` = `{narrative_rendered?, phase2?: {narrative_rendered}, phase2_status?}`; + `table_captions` (aligned with `tables`, `""` where a table has none) when the turn has tables | `answer` is the rendered narrative when it was used, else the rendered captions / describe texts joined. The brain-safe `combined_answer` the record keeps is never sent |
-| single-shot `done` | existing keys; `answer` = the display text; + `narrative` and `caption` only when a narrative was rendered | `answer` = the rendered narrative + a blank line + the visual's caption (rendered, or its describe text) when a narrative exists; else the rendered caption; else the brain text + a blank line + the local value line (`value_display`, below); else the brain text |
+| single-shot `done` | existing keys; `answer` = the display text; + `narrative` and `caption` only when a narrative was rendered or the headline fallback applies | `answer` = the rendered narrative + a blank line + the visual's caption (rendered, or its describe text) when a narrative exists; else the rendered caption; else the brain text + a blank line + the local value line (`value_display`, below); else the brain text. With a headline fallback (`headline_display`, no narrative template): `narrative` = the headline, `caption` = that answer, `answer` = headline + a blank line + it |
 
 Any other event the generator yields is dropped by the consumer and logged
 `SSE_EVENT_UNKNOWN keys=<sorted key names>` (key names only). Stop: the
@@ -1113,6 +1127,7 @@ and render unchanged):
 | `caption_template` / `caption_rendered` | a single-visual record with a caption — also a multi-chart turn that produced exactly one chart, which is stored as a single-visual record |
 | `caption_described` | a single-visual record of a narrative turn whose visual had no caption: its describe text |
 | `value_display` | the local value line of the summarize fallback |
+| `headline_display` | the headline fallback sentence (`Result: <figure>.` in the answer language) when the template was dropped after the narrative-only retry; reload shows it first, above the answer. Display only — not read by the report (its PDF/PPTX keeps the describe text) |
 | `images[i].answer` | the rendered caption when the entry has `caption_template`, else the describe text |
 | `images[i].caption_template` / `images[i].phase` | the chart's caption template; its phase (`1` in this release) |
 | `table_captions` / `table_caption_templates` / `table_phases` | arrays aligned with `tables` (`""` for a table without a caption; a dict RESULT puts its caption on its first table) |

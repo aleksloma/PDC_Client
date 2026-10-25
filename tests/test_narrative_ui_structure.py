@@ -233,3 +233,51 @@ def test_i18n_phase2_progress_key():
         block = _lang_block(lang)
         m = re.search(r"""['"]lab\.phase2_progress['"]\s*:\s*(['"])(.+?)(?<!\\)\1""", block)
         assert m and m.group(2).strip(), f"lab.phase2_progress missing in {lang}"
+
+
+# ---------------------------------------------------------------------------
+# Narrative follow-up (item 2 / item 3): the narrative-only retry's progress
+# line and the dropped template's local headline.
+# ---------------------------------------------------------------------------
+def _generic_progress_branch(src: str) -> str:
+    """The body of the stream's GENERIC `if (data.progress) {` branch (not
+    the `data.progress && data.phase === 2` one); "" when absent."""
+    m = re.search(r"if\s*\(\s*data\.progress\s*\)\s*\{", src)
+    if not m:
+        return ""
+    start = m.end() - 1
+    depth = 0
+    for i in range(start, len(src)):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start:i + 1]
+    return src[start:]
+
+
+def test_i18n_narrative_retry_progress_key():
+    for lang in ("en", "geo", "ru"):
+        block = _lang_block(lang)
+        m = re.search(r"""['"]lab\.narrative_retry['"]\s*:\s*(['"])(.+?)(?<!\\)\1""", block)
+        assert m and m.group(2).strip(), f"lab.narrative_retry missing in {lang}"
+        if lang == "en":
+            assert m.group(2) == "Writing the summary…", m.group(2)
+
+
+def test_generic_progress_branch_translates_message_key():
+    send = _function_body(DASH, "sendMessage")
+    branch = _generic_progress_branch(send)
+    assert branch, "the generic `if (data.progress) {` branch is missing"
+    assert "data.phase === 2" not in branch
+    assert "_t(data.message_key" in branch, branch
+
+
+def test_render_ai_record_shows_headline_display():
+    rec = _function_body(DASH, "renderAiRecord")
+    at = rec.find("msg.headline_display")
+    assert at >= 0, "renderAiRecord never reads msg.headline_display"
+    window = rec[at:at + 400]
+    calls = _calls(window, "appendNarrativeMessage")
+    assert calls, "msg.headline_display is not shown through appendNarrativeMessage"

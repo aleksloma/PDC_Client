@@ -2557,6 +2557,9 @@ function renderAiRecord(msg, convId, rowIdx) {
   if (!msg) return;
   if (typeof msg.narrative_rendered === 'string' && msg.narrative_rendered) {
     appendNarrativeMessage(msg.narrative_rendered, 1);
+  } else if (typeof msg.headline_display === 'string' && msg.headline_display) {
+    // A dropped narrative's local headline (display only): slot 1.
+    appendNarrativeMessage(msg.headline_display, 1);
   }
   const phaseOf = (p) => (p === 2 ? 2 : 1);
   const hasImages = Array.isArray(msg.images) && msg.images.length > 0;
@@ -3461,10 +3464,28 @@ async function sendMessage() {
             continue;
           }
 
-          // Handle real-time progress events from the server
+          // Handle real-time progress events from the server. A keyed event
+          // (the narrative-only retry's `lab.narrative_retry`) is translated;
+          // after the charts the loading bubble is gone, so it gets its own
+          // status bubble (the done handler removes streamLoadingDiv).
           if (data.progress) {
+            const progressText = data.message_key
+              ? _t(data.message_key, data.message || '')
+              : (data.message || 'Processing...');
             if (statusTextEl && loadingBubbleVisible) {
-              statusTextEl.textContent = data.message || 'Processing...';
+              statusTextEl.textContent = progressText;
+            } else if (data.message_key) {
+              if (streamLoadingDiv) {
+                streamLoadingDiv.remove();
+                streamLoadingDiv = null;
+              }
+              streamLoadingDiv = document.createElement('div');
+              streamLoadingDiv.className = 'message assistant thinking-msg';
+              streamLoadingDiv.innerHTML = '<div class="message-content"><div class="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="loading-status-text"></span></div></div>';
+              const statusEl = streamLoadingDiv.querySelector('.loading-status-text');
+              if (statusEl) statusEl.textContent = progressText;
+              chatMessages.appendChild(streamLoadingDiv);
+              chatMessages.scrollTop = chatMessages.scrollHeight;
             }
             continue;
           }

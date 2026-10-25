@@ -116,7 +116,9 @@ FMT_MAX_LEN = 32
 THIN_PERIOD_RATIO = 0.5
 # A finite value >= 0 below COLLAPSE_RATIO x every existing neighbour (each
 # finite and > 0) is a collapsed period: detect_anomalies treats it as a data
-# gap even when the frame holds one row per period (pre-aggregated input).
+# gap ONLY when the frame holds one row per period (pre-aggregated input,
+# where the row-count rule cannot fire). On raw rows the row count is the gap
+# signal, and a collapsed value with a normal row count is a business change.
 COLLAPSE_RATIO = 0.01
 # `ratio` edges: 0 <= v < RATIO_FLOOR -> "<0.1x", v > RATIO_CEILING -> ">1000x".
 RATIO_FLOOR = 0.05
@@ -757,13 +759,17 @@ def _anomaly_core(values: list, z: float, ratio: float, skip=None) -> dict:
 def _data_gaps(values: list, rows: list, thin_ratio: float) -> list:
     """Indexes of the DATA-GAP periods: fewer rows than `thin_ratio` x the
     median period's rows; an aggregated value of exactly 0 while every
-    existing neighbour is non-zero and finite; or a COLLAPSED value — finite,
-    >= 0 and below `COLLAPSE_RATIO` x every existing neighbour, each of them
-    finite and > 0 (what a pre-aggregated, one-row-per-period frame shows)."""
+    existing neighbour is non-zero and finite; or — only when every period
+    holds at most one row (`max(rows) <= 1`, a pre-aggregated frame where the
+    row-count rule cannot fire) — a COLLAPSED value: finite, >= 0 and below
+    `COLLAPSE_RATIO` x every existing neighbour, each of them finite and > 0.
+    On raw rows a collapsed value with a normal row count is a business
+    change, not a data gap; the row-count and zero rules apply there."""
     n = len(values)
     if not n:
         return []
     median_rows = float(np.median(rows))
+    one_row_per_period = max(rows) <= 1
     gaps = []
     for i in range(n):
         if rows[i] < thin_ratio * median_rows:
@@ -779,8 +785,9 @@ def _data_gaps(values: list, rows: list, thin_ratio: float) -> list:
                           for w in neighbours):
             gaps.append(i)
             continue
-        if v >= 0 and all(isinstance(w, (int, float)) and math.isfinite(w) and w > 0
-                          and v < COLLAPSE_RATIO * w for w in neighbours):
+        if one_row_per_period and v >= 0 and all(
+                isinstance(w, (int, float)) and math.isfinite(w) and w > 0
+                and v < COLLAPSE_RATIO * w for w in neighbours):
             gaps.append(i)
     return gaps
 
@@ -804,8 +811,10 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
                      prefix: str = "") -> dict:
     """Is one period far from the others? (robust z or ratio to the median) — B8.4.
 
-    A DATA-GAP period (`_data_gaps`: thin rows, or a zero between non-zero
-    neighbours) is never an anomaly nor the primary one; any gap sets
+    A DATA-GAP period (`_data_gaps`: thin rows, a zero between non-zero
+    neighbours, or — in a one-row-per-period frame only — a value collapsed
+    below `COLLAPSE_RATIO` x its neighbours) is never an anomaly nor the
+    primary one; any gap sets
     `period_status = "data_gap"`. The table's trailing `rows` / `is_data_gap`
     columns carry the per-period row count and the gap flag."""
     prefix = _check_prefix(prefix)

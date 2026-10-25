@@ -578,7 +578,11 @@ def retry(sid: str, question: str, schema_text: str, df_names: list[str],
           dataset_profile: dict | None = None,
           sql: dict | None = None, sql_error: dict | None = None,
           live_tables: list | None = None,
-          capabilities: list | None = None) -> dict:
+          capabilities: list | None = None,
+          timeout: float | None = None) -> dict:
+    # `timeout` overrides the client-wide BRAIN_REQUEST_TIMEOUT (the
+    # narrative-only retry's time-box); a transport setting, never a payload
+    # field. None -> the client default, as before.
     # B7.7: exception texts quote the value they failed on — scrub every
     # quoted literal that is not an input column or df name.
     keep = {str(n) for n in (df_names or [])}
@@ -613,6 +617,9 @@ def retry(sid: str, question: str, schema_text: str, df_names: list[str],
         payload["live_tables"] = live_tables
     if capabilities:
         payload["capabilities"] = list(capabilities)
+    if timeout is not None:
+        return _post("/v1/retry", payload, sid, timeout=timeout)
+    # no override: the exact pre-time-box call (client-wide default)
     return _post("/v1/retry", payload, sid)
 
 

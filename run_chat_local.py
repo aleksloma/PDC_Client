@@ -1191,6 +1191,36 @@ def _slot_counts(template: str, values: dict) -> tuple[int, int]:
 _PASSED_PREFIX_ARG_RE = re.compile(r"\bprefix\s*=\s*(['\"])([a-z][a-z0-9]{0,9}_)\1")
 
 
+# The narrative-only retry's own time-box (A5.1): a slow retry is cut here and
+# the answer takes the no-narrative path (describe / summarize + value line),
+# instead of waiting the client-wide BRAIN_REQUEST_TIMEOUT.
+NARRATIVE_RETRY_TIMEOUT_S = 45.0
+# The live status line shown while the narrative-only retry runs (A5.4).
+_NARRATIVE_RETRY_PROGRESS = {"progress": True, "message_key": "lab.narrative_retry",
+                             "message": "Writing the summary…"}
+
+
+def _emit_narrative_progress(sid, on_progress) -> None:
+    """Hand the page the narrative-retry progress event through `on_progress`
+    (None -> nothing). A raising callback is logged (type only) and ignored:
+    a status line never breaks the answer."""
+    if on_progress is None:
+        return
+    try:
+        on_progress(dict(_NARRATIVE_RETRY_PROGRESS))
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid(sid, "warning",
+                     f"NARRATIVE_PROGRESS_FAILED error={log_safe_text(type(e).__name__, 80)}")
+
+
+def _log_narrative_retry_timeout(sid, started: float) -> None:
+    """`NARRATIVE_RETRY_TIMEOUT elapsed_ms= timeout_s=` — the retry hit
+    NARRATIVE_RETRY_TIMEOUT_S; no narrative, today's no-narrative path."""
+    log_with_sid(sid, "warning",
+                 f"NARRATIVE_RETRY_TIMEOUT elapsed_ms={int((_time.monotonic() - started) * 1000)} "
+                 f"timeout_s={int(NARRATIVE_RETRY_TIMEOUT_S)}")
+
+
 def _log_narrative_retry_done(sid, kind, started: float, reply) -> None:
     """`NARRATIVE_RETRY_DONE kind= elapsed_ms= narrative=` — whether the
     reply carries a non-blank narrative, never its text."""
@@ -1238,6 +1268,13 @@ class _NarrState:
     # pdc_diag helper (`prefix="ovl_"`), by block index: a caption resolves
     # its own block's, the narrative the union of the phase's (A2.2)
     block_prefixes: dict = field(default_factory=dict)
+    # the (slot name, cause) of the last first-sentence-invalid template
+    # (`narrative.first_sentence_na_slot`), None otherwise: the narrative-only
+    # retry's `error_msg` names it (`narrative.invalid_error_msg`)
+    invalid_slot: Optional[tuple] = None
+    # the local headline of a DROPPED narrative (`NARRATIVE_INVALID_TWICE`,
+    # `narrative.headline_sentence`); display text only (R0)
+    headline: Optional[str] = None
 
     @classmethod
     def from_reply(cls, reply, input_columns, sid, phase: int = 1,
@@ -1357,7 +1394,11 @@ class _NarrState:
         """`(invalid_kind, rendered, sections)` of `template`: a parse error
         (`NARRATIVE_PARSE_FAILED kind=`) or a FIRST sentence holding "n/a"
         before the quality gate (`NARRATIVE_INVALID reason=first_sentence`)
-        makes it invalid — `(kind, None, None)`; else `(None, text, sections)`."""
+        makes it invalid — `(kind, None, None)`; else `(None, text, sections)`.
+        A first-sentence verdict caused by a slot (missing key, None or
+        non-finite value) stores `(name, cause)` on `self.invalid_slot` and
+        names it in the log line; any other "n/a" leaves it None."""
+        self.invalid_slot = None
         kind = narrative.template_error_kind(template)
         if kind is not None:
             log_with_sid(log_safe_text(self.sid, 200), "warning",
@@ -1367,8 +1408,18 @@ class _NarrState:
             template, self.values, self.findings, sid=self.sid, locale=self.locale,
             prefixes=self.prefixes)
         if narrative.first_sentence_has_na(rendered):
-            log_with_sid(log_safe_text(self.sid, 200), "warning",
-                         "NARRATIVE_INVALID reason=first_sentence")
+            slot = narrative.first_sentence_na_slot(
+                template, self.values, self.findings, locale=self.locale,
+                prefixes=self.prefixes, sid=self.sid)
+            self.invalid_slot = slot
+            if slot is not None:
+                log_with_sid(log_safe_text(self.sid, 200), "warning",
+                             "NARRATIVE_INVALID reason=first_sentence "
+                             f"slot={log_safe_text(slot[0], 40)} "
+                             f"cause={log_safe_text(slot[1], 10)}")
+            else:
+                log_with_sid(log_safe_text(self.sid, 200), "warning",
+                             "NARRATIVE_INVALID reason=first_sentence")
             return "first_sentence", None, None
         return None, rendered, sections
 
@@ -1401,7 +1452,13 @@ class _NarrState:
         its reply replaces `self.template`, anything else logs
         `NARRATIVE_INVALID_TWICE` and the narrative is not used. A valid
         template passes the quality gate, then gains the FINDING sentences
-        of every finding no stated section covers (display text, R0)."""
+        of every finding no stated section covers (display text, R0).
+
+        On both `NARRATIVE_INVALID_TWICE` returns (the retry gave no
+        narrative, raised or timed out, or its template is invalid too)
+        `self.headline` gets the local headline sentence of the main figure
+        (`narrative.headline_sentence`, None when no VALUES key qualifies)."""
+        self.headline = None
         try:
             self.findings = {}
             for n in sorted(self.block_findings):
@@ -1419,6 +1476,8 @@ class _NarrState:
                     self.rendered = None
                     log_with_sid(log_safe_text(self.sid, 200), "warning",
                                  "NARRATIVE_INVALID_TWICE reason=no_narrative")
+                    self.headline = narrative.headline_sentence(self.values, self.lang,
+                                                                sid=self.sid)
                     return None
                 kind, rendered, sections = self._checked_render(new_template)
                 if kind is not None:
@@ -1426,6 +1485,8 @@ class _NarrState:
                     log_with_sid(log_safe_text(self.sid, 200), "warning",
                                  "NARRATIVE_INVALID_TWICE reason=invalid "
                                  f"kind={log_safe_text(kind, 20)}")
+                    self.headline = narrative.headline_sentence(self.values, self.lang,
+                                                                sid=self.sid)
                     return None
                 self.template = new_template
             # Quality gate: a sentence holding "n/a" (a missing slot or a None
@@ -1940,6 +2001,7 @@ def run_chat_multi_plot(
     user_email: str,
     common_fields: list | None = None,
     dataset_profile: dict | None = None,
+    on_progress=None,
 ):
     """Generator port of global `agent.run_chat_multi_plot`. Yields:
       - {"partial": True,  "answer", "image_base64", "chart_n", "chart_total", "usage", "code"}
@@ -1955,6 +2017,17 @@ def run_chat_multi_plot(
     `display_answer`, `narrative_view` and, with tables, `table_captions` /
     `table_caption_templates` / `table_phases`. `combined_answer` stays
     brain-safe (templates and describe texts only, R0).
+
+    When the narrative is dropped (`NARRATIVE_INVALID_TWICE`) and VALUES hold
+    a main figure, a `{"narrative": True, "phase": 1, "text": <headline>}`
+    event (no template) precedes the done event, `display_answer` starts with
+    the headline and `narrative_view["headline_display"]` carries it —
+    display text only; `combined_answer` never does (R0).
+
+    `on_progress` (optional, called from this generator's thread): receives
+    the narrative-only retry's `{"progress": True, "message_key":
+    "lab.narrative_retry", "message"}` right before that retry, in the multi
+    and the single flow. A raising callback is logged and ignored.
     """
     df_names = list(dfs.keys())
     df_columns = {name: list(df.columns) for name, df in dfs.items()}
@@ -2025,6 +2098,7 @@ def run_chat_multi_plot(
                 plan_narrative=plan_out.get("narrative"),
                 plan_captions=plan_out.get("captions"),
                 capabilities=caps, input_columns=input_columns,
+                on_progress=on_progress,
             )
             yield {"single_response": True, "result": result}
             return
@@ -2155,6 +2229,7 @@ def run_chat_multi_plot(
                 dataset_profile=dataset_profile,
                 sql=_retry_sql(state), sql_error=_retry_sql_error(state),
                 live_tables=live_tables, capabilities=caps,
+                timeout=None,                 # the client-wide BRAIN_REQUEST_TIMEOUT
             )
             _merge_retry_sql(state, retry_out)
             new_code = retry_out.get("code") or ""
@@ -2509,27 +2584,34 @@ def run_chat_multi_plot(
 
     def _retry_narrative(kind: str):
         """ONE narrative-only retry (A5.1): the exec-error retry's keywords,
-        `error_msg = "narrative_invalid: <kind>"`, the emitted codes as
-        `failed_code`. Only the reply's narrative is used — its code never
-        runs, so the SQL map is not merged. A raise -> no reply."""
+        `error_msg = narrative.invalid_error_msg(kind, narr.invalid_slot)`,
+        the emitted codes as `failed_code`, time-boxed to
+        NARRATIVE_RETRY_TIMEOUT_S and announced through `on_progress` right
+        before. Only the reply's narrative is used — its code never runs, so
+        the SQL map is not merged. A raise or a timeout -> no reply."""
         nonlocal total_usage
+        _emit_narrative_progress(sid, on_progress)
         started = _time.monotonic()
         try:
             emitted = list(dict.fromkeys(list(combined_codes) + list(table_codes)))
             retry_out = brain_client.retry(
                 sid=sid, question=question, schema_text=schema_str,
                 df_names=df_names, df_columns=df_columns, history_rows=history_rows,
-                error_msg=f"narrative_invalid: {kind}",
+                error_msg=narrative.invalid_error_msg(kind, narr.invalid_slot),
                 failed_code="\n###NEXT_PLOT###\n".join(emitted),
                 use_pro=True, use_search=False, user_email=user_email,
                 dataset_profile=dataset_profile,
                 sql=_retry_sql(state), sql_error=None,
                 live_tables=live_tables, capabilities=caps,
+                timeout=NARRATIVE_RETRY_TIMEOUT_S,
             )
             if isinstance(retry_out, dict):
                 total_usage = _sum_usage(total_usage, retry_out.get("usage") or {})
             _log_narrative_retry_done(sid, kind, started, retry_out)
             return retry_out
+        except brain_client.BrainTimeoutError:
+            _log_narrative_retry_timeout(sid, started)
+            return None
         except Exception as e:                               # noqa: BLE001
             log_with_sid(sid, "warning",
                          f"NARRATIVE_RETRY_FAILED error={log_safe_text(type(e).__name__, 80)}")
@@ -2570,6 +2652,14 @@ def run_chat_multi_plot(
         if combined_text and not narr.captions_used:
             combined_text = _append_live_notes(combined_text, state, question)
 
+    # A dropped narrative (NARRATIVE_INVALID_TWICE) with a main figure in
+    # VALUES: the local headline fills slot 1 above the charts and leads the
+    # display text. Display only (R0) — `combined_text` never carries it.
+    headline = narr.headline if not narrative_used else None
+    if headline:
+        yield {"narrative": True, "phase": 1, "text": headline}
+        display_text = headline + "\n\n" + display_text if display_text else headline
+
     log_with_sid(sid, "info", f"MULTI_PLOT_DONE rendered={produced}")
     done_event = {
         "partial": False, "done": True,
@@ -2583,6 +2673,8 @@ def run_chat_multi_plot(
         },
         **_live_fields(),
     }
+    if headline:
+        done_event["narrative_view"]["headline_display"] = headline
     if combined_tables:
         done_event["tables"] = combined_tables
         done_event["table_codes"] = table_codes
@@ -2601,7 +2693,8 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
                            live_tables: list | None = None,
                            plan_narrative=None, plan_captions=None,
                            capabilities: list | None = None,
-                           input_columns: frozenset | None = None) -> dict:
+                           input_columns: frozenset | None = None,
+                           on_progress=None) -> dict:
     """Execute one already-planned response (kind/code from a prior /v1/plan)
     locally, reusing the same retry + describe/summarize flow as run_chat.
 
@@ -2618,7 +2711,9 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
     validator's column set. The result then carries the A5.3 keys
     (`narrative_template`, `narrative_rendered`, `values`, `findings`,
     `caption_template`, `caption_rendered`, `caption_described`,
-    `value_display`) — each only when present; `text` stays brain-safe.
+    `value_display`, and `headline_display` for a dropped narrative without
+    a value line) — each only when present; `text` stays brain-safe.
+    `on_progress` gets the narrative-only retry's progress event.
     """
     if state is None:
         state = _new_live_state()
@@ -2632,7 +2727,8 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
                            live_tables=live_tables,
                            plan_narrative=plan_narrative, plan_captions=plan_captions,
                            capabilities=capabilities,
-                           input_columns=input_columns)
+                           input_columns=input_columns,
+                           on_progress=on_progress)
     return _finish_live_result(out, state, question, sid)
 
 
@@ -2641,7 +2737,8 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
                      kind, code, usage, context_decision,
                      dataset_profile, state, live_tables,
                      plan_narrative=None, plan_captions=None,
-                     capabilities=None, input_columns=None) -> dict:
+                     capabilities=None, input_columns=None,
+                     on_progress=None) -> dict:
     def _exec(code_, kind_):
         if not _ensure_live(sid, dfs, schema_docs, code_, state, user_email):
             return _live_failure_out(state)
@@ -2668,26 +2765,34 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
 
     def _retry_narrative(kind: str):
         """ONE narrative-only retry (A5.1): the exec-error retry's keywords,
-        `error_msg = "narrative_invalid: <kind>"`, the executed `code` as
-        `failed_code`. Only the reply's narrative is used — its code never
-        runs, so the SQL map is not merged. A raise -> no reply."""
+        `error_msg = narrative.invalid_error_msg(kind, narr.invalid_slot)`,
+        the executed `code` as `failed_code`, time-boxed to
+        NARRATIVE_RETRY_TIMEOUT_S and announced through `on_progress` right
+        before. Only the reply's narrative is used — its code never runs, so
+        the SQL map is not merged. A raise or a timeout -> no reply."""
+        _emit_narrative_progress(sid, on_progress)
         started = _time.monotonic()
         try:
             retry_out = brain_client.retry(
                 sid=sid, question=question, schema_text=schema_str,
                 df_names=df_names, df_columns=df_columns,
                 history_rows=history_rows,
-                error_msg=f"narrative_invalid: {kind}", failed_code=code,
+                error_msg=narrative.invalid_error_msg(kind, narr.invalid_slot),
+                failed_code=code,
                 use_pro=True, use_search=False,
                 user_email=user_email,
                 dataset_profile=dataset_profile,
                 sql=_retry_sql(state), sql_error=None,
                 live_tables=live_tables, capabilities=capabilities,
+                timeout=NARRATIVE_RETRY_TIMEOUT_S,
             )
             if isinstance(retry_out, dict):
                 narr_usage.update(_sum_usage(narr_usage, retry_out.get("usage") or {}))
             _log_narrative_retry_done(sid, kind, started, retry_out)
             return retry_out
+        except brain_client.BrainTimeoutError:
+            _log_narrative_retry_timeout(sid, started)
+            return None
         except Exception as e:                               # noqa: BLE001
             log_with_sid(sid, "warning",
                          f"NARRATIVE_RETRY_FAILED error={log_safe_text(type(e).__name__, 80)}")
@@ -2723,6 +2828,7 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
             dataset_profile=dataset_profile,
             sql=_retry_sql(state), sql_error=_retry_sql_error(state),
             live_tables=live_tables, capabilities=capabilities,
+            timeout=None,                     # the client-wide BRAIN_REQUEST_TIMEOUT
         )
         _merge_retry_sql(state, retry_out)
         new_code = retry_out.get("code") or ""
@@ -2807,6 +2913,11 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
             # A describe-only turn keeps its validated FINDINGS on the record
             # (A5.5); `text` stays the describe text (no marker).
             fields["findings"] = dict(narr.findings)
+        if rendered is None and narr.headline:
+            # The dropped narrative's local headline (display only, R0). The
+            # scalar / flat-dict path discards these fields (no `text`) and
+            # shows the figure through its `value_display` line instead.
+            fields["headline_display"] = narr.headline
         return fields
 
     if kind == "PLOT_CODE":
@@ -2859,6 +2970,9 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
                                     narrative.answer_lang_code(context_decision, question))
     if shown:
         out["value_display"] = shown
+    elif narr.headline:
+        # no value line to show the figure: the dropped narrative's headline
+        out["headline_display"] = narr.headline
     if not narr.template:
         narr.finish()                  # merges the block's FINDINGS (no template here)
     # with a template `_compose` above already ran `finish` (the narrative was
