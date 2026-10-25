@@ -45,7 +45,9 @@ PDC_DIAG_VERSION = 1
 FINDINGS_ENUM = ("coverage_change", "coverage_stable", "partial_period", "metric_definition_overlap",
                  "mixed_units", "concentrated_in_one_dim", "spread_evenly", "weak_signal",
                  "dominant_feature", "anomaly_confirmed", "no_anomaly",
-                 "data_gap", "outlier_driven", "seasonal_pattern")
+                 "data_gap", "outlier_driven", "seasonal_pattern",
+                 # appended (BRB run 3): the order above stays stable
+                 "scope_change", "label_disappeared")
 # needs_phase2 is NOT a value (decision F14); it is only the reserved boolean KEY.
 
 PDC_DIAG_FINDING_KEYS = frozenset({
@@ -54,7 +56,7 @@ PDC_DIAG_FINDING_KEYS = frozenset({
     "anomaly", "anomaly_up", "anomaly_is_latest", "multiple_anomalies", "too_few_periods",
     "change_shape", "change_dim", "change_up", "change_large",
     "attribution", "top_feature", "second_feature", "method_fallback",
-    "metric_relation", "metrics_identical"})
+    "metric_relation", "metrics_identical", "label_disappeared", "rate_up", "rate_down"})
 
 UNKNOWN_TOKENS = frozenset({"", "unknown", "n/a", "na", "none", "null", "nan", "-", "?",
                             "не указано", "неизвестно", "неизвестный", "номаълум", "noma'lum",
@@ -124,6 +126,10 @@ THIN_PERIOD_RATIO = 0.5
 # where the row-count rule cannot fire). On raw rows the row count is the gap
 # signal, and a collapsed value with a normal row count is a business change.
 COLLAPSE_RATIO = 0.01
+# A primary anomaly whose row count is more than SCOPE_ROWS_FACTOR x (or below
+# 1 / SCOPE_ROWS_FACTOR x) the rows of the period right before it is a change
+# of reporting SCOPE, not a business change (detect_anomalies "scope_change").
+SCOPE_ROWS_FACTOR = 3.0
 # `ratio` edges: 0 <= v < RATIO_FLOOR -> "<0.1x", v > RATIO_CEILING -> ">1000x".
 RATIO_FLOOR = 0.05
 RATIO_CEILING = 1000
@@ -603,7 +609,21 @@ def coverage_check(df, period_col: str, dims: list, metrics: list, *, order=None
     (a member absent from a period has share 0), or a member holding more
     than `vanish_share` of the earlier period's rows is absent from the later
     one. `coverage_dim` is the changed dim with the lowest first/last Jaccard
-    (ties by argument order) and `coverage_jaccard` that dim's Jaccard."""
+    (ties by argument order) and `coverage_jaccard` that dim's Jaccard.
+
+    UNKNOWN DIM: a dim is a candidate when its highest Unknown-like share
+    over the periods (M) reaches `unknown_share`; the candidate with the
+    highest share in the LATEST period (L) wins (ties: higher M, then
+    argument order), and `unknown_dim` / `unknown_dim_label` /
+    `unknown_share_max` (= its M) all name that one dim. Without a candidate
+    `unknown_share_max` is the highest M of any dim.
+
+    LABEL DISAPPEARANCE (`unit_cols` only): a label whose last period with
+    rows is before the last period, while every later period still holds a
+    non-null value of that column, sets `label_disappeared`; with several,
+    the label with the most rows wins (ties: first appearance, unit columns
+    in argument order) — VALUES `disappeared_label` /
+    `disappeared_after_period`."""
     prefix = _check_prefix(prefix)
     dims = _as_list(dims, "dims")
     metrics = _as_list(metrics, "metrics")
@@ -656,6 +676,8 @@ def coverage_check(df, period_col: str, dims: list, metrics: list, *, order=None
         "as_of_period": str(as_of_stamp.to_period("M")),
         "coverage_dim_label": None,
         "unknown_dim_label": None,
+        "disappeared_label": None,
+        "disappeared_after_period": None,
     }
 
     if labels:
@@ -697,20 +719,49 @@ def coverage_check(df, period_col: str, dims: list, metrics: list, *, order=None
             if rows[-1] < ratio_low * others:
                 findings["period_status"] = "partial_period"
 
-        # unknown-dominated dims
-        best_share, best_dim = 0.0, None
-        for dim in dims:
-            for sub in frames:
-                if not len(sub):
-                    continue
-                share = float(_unknown_mask(sub[dim]).mean())
-                if share > best_share:
-                    best_share, best_dim = share, dim
-        values["unknown_share_max"] = best_share
-        if best_dim is not None and best_share >= unknown_share:
+        # unknown-dominated dims: the candidate (max share M >= unknown_share)
+        # with the highest LATEST-period share L wins, so the finding, the
+        # label and the share always name the same dim
+        unknown_stats = {}
+        for index, dim in enumerate(dims):
+            shares = [float(_unknown_mask(sub[dim]).mean()) for sub in frames if len(sub)]
+            max_share = max(shares) if shares else 0.0
+            latest = frames[-1]
+            latest_share = float(_unknown_mask(latest[dim]).mean()) if len(latest) else 0.0
+            unknown_stats[dim] = (latest_share, max_share, -index)
+        candidates = [dim for dim in dims if unknown_stats[dim][1] >= unknown_share]
+        if candidates:
+            chosen = max(candidates, key=lambda d: unknown_stats[d])
             findings["unknown_dominated"] = True
-            findings["unknown_dim"] = best_dim
-            values["unknown_dim_label"] = str(best_dim)
+            findings["unknown_dim"] = chosen
+            values["unknown_dim_label"] = str(chosen)
+            values["unknown_share_max"] = unknown_stats[chosen][1]
+        else:
+            values["unknown_share_max"] = max((s[1] for s in unknown_stats.values()),
+                                              default=0.0)
+
+        # a unit label whose rows end before the last period while the column
+        # stays filled: a 0 for it later means no rows, not no activity
+        disappeared = None          # (rows overall, label, last period index)
+        n_periods = len(frames)
+        for unit in unit_cols:
+            sets = member_sets[unit]
+            for label in _first_appearance(df[unit].dropna()):
+                present = [i for i, members in enumerate(sets) if label in members]
+                if not present:
+                    continue
+                last = present[-1]
+                if last >= n_periods - 1:
+                    continue
+                if not all(sets[j] for j in range(last + 1, n_periods)):
+                    continue
+                count = int((df[unit] == label).sum())
+                if disappeared is None or count > disappeared[0]:
+                    disappeared = (count, label, last)
+        if disappeared is not None:
+            findings["label_disappeared"] = True
+            values["disappeared_label"] = _plain(disappeared[1])
+            values["disappeared_after_period"] = _label_str(labels[disappeared[2]])
 
         # mixed units
         for unit in unit_cols:
@@ -794,7 +845,7 @@ def _anomaly_core(values: list, z: float, ratio: float, skip=None) -> dict:
             "flagged": flagged, "primary": primary}
 
 
-def _data_gaps(values: list, rows: list, thin_ratio: float) -> list:
+def _data_gaps(values: list, rows: list, thin_ratio: float, *, collapse: bool = True) -> list:
     """Indexes of the DATA-GAP periods: fewer rows than `thin_ratio` x the
     median period's rows; an aggregated value of exactly 0 while every
     existing neighbour is non-zero and finite; or — only when every period
@@ -802,12 +853,14 @@ def _data_gaps(values: list, rows: list, thin_ratio: float) -> list:
     row-count rule cannot fire) — a COLLAPSED value: finite, >= 0 and below
     `COLLAPSE_RATIO` x every existing neighbour, each of them finite and > 0.
     On raw rows a collapsed value with a normal row count is a business
-    change, not a data gap; the row-count and zero rules apply there."""
+    change, not a data gap; the row-count and zero rules apply there.
+    `collapse=False` (counts from a `rows_col`, i.e. known) turns the
+    collapsed-value rule off whatever the counts are."""
     n = len(values)
     if not n:
         return []
     median_rows = float(np.median(rows))
-    one_row_per_period = max(rows) <= 1
+    one_row_per_period = collapse and max(rows) <= 1
     gaps = []
     for i in range(n):
         if rows[i] < thin_ratio * median_rows:
@@ -844,9 +897,38 @@ def _gap_period(labels: list, values: list, rows: list, gaps) -> str | None:
     return _label_str(labels[min(gaps, key=key)])
 
 
+def _scope_change(primary: int, rows: list, rows_known: bool, frames: list,
+                  dims: list) -> tuple:
+    """`(is_scope_change, rows_ratio)` for the primary anomaly, compared with
+    the period right before it (gap or not). A scope change: known rows that
+    moved past `SCOPE_ROWS_FACTOR` either way (a zero previous count with
+    rows in the primary counts as past it), or a `dims` column whose coverage
+    changed between the two periods. `rows_ratio` is None when it cannot be
+    computed."""
+    if primary <= 0:
+        return False, None
+    prev = primary - 1
+    scope = False
+    rows_ratio = None
+    if rows_known:
+        if rows[prev] > 0:
+            rows_ratio = float(rows[primary] / rows[prev])
+            scope = (rows_ratio > SCOPE_ROWS_FACTOR or rows_ratio < 1.0 / SCOPE_ROWS_FACTOR)
+        else:
+            scope = rows[prev] == 0 and rows[primary] > 0
+    pair = [frames[prev], frames[primary]]
+    for dim in dims:
+        before = set(_first_appearance(pair[0][dim].dropna()))
+        after = set(_first_appearance(pair[1][dim].dropna()))
+        if _jaccard(before, after) < 0.5 or _member_share_shift(pair, dim, 0.5, 0.2):
+            scope = True
+            break
+    return scope, rows_ratio
+
+
 def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
                      z: float = 3.5, ratio: float = 2.0, thin_ratio: float = THIN_PERIOD_RATIO,
-                     prefix: str = "") -> dict:
+                     rows_col=None, dims=None, prefix: str = "") -> dict:
     """Is one period far from the others? (robust z or ratio to the median) — B8.4.
 
     A DATA-GAP period (`_data_gaps`: thin rows, a zero between non-zero
@@ -854,13 +936,33 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
     below `COLLAPSE_RATIO` x its neighbours) is never an anomaly nor the
     primary one; any gap sets
     `period_status = "data_gap"`. The table's trailing `rows` / `is_data_gap`
-    columns carry the per-period row count and the gap flag."""
+    columns carry the per-period row count and the gap flag.
+
+    `rows_col` (a numeric column, e.g. a pre-aggregated row count): the
+    per-period rows are its sums instead of the frame's row counts, for the
+    `rows` column and the gap rules alike (NaN cells count as 0, and a
+    non-finite sum counts as 0 rows). With `rows_col` the counts are known,
+    so the `COLLAPSE_RATIO` rule is off: only the thin-rows and zero rules
+    find a gap. SCOPE CHANGE: when the primary anomaly's rows are more than
+    `SCOPE_ROWS_FACTOR` x (or below 1 / `SCOPE_ROWS_FACTOR` x) the rows of
+    the period right before it (gap or not; a previous count of 0 counts
+    only when the primary has rows; rows are known when they sum above 0 and
+    `rows_col` is given or some period holds more than one row), or a `dims` column changes coverage between those two
+    periods (Jaccard < 0.5 or a member share shift), `anomaly` is
+    `"scope_change"` instead of `"anomaly_confirmed"` and neither
+    `anomaly_up` nor `anomaly_is_latest` is set. VALUE `rows_ratio` = the
+    primary's rows / the previous period's rows, whenever computable."""
     prefix = _check_prefix(prefix)
     agg = _check_agg(agg)
     _require_columns(df, [period_col], "period_col")
     _require_columns(df, [metric], "metric")
     if agg in _NUMERIC_AGGS:
         _require_numeric(df, metric, "metric")
+    if rows_col is not None:
+        _require_columns(df, [rows_col], "rows_col")
+        _require_numeric(df, rows_col, "rows_col")
+    dims = _as_list(dims, "dims")
+    _require_columns(df, dims, "dims")
 
     try:
         thin_ratio = float(thin_ratio)
@@ -870,10 +972,19 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
     labels, _known, _stamps = _order_with_stamps(df[period_col], order)
     frames = _period_frames(df, period_col, labels)
     v = [_agg_series(sub[metric], agg) for sub in frames]
-    rows = [int(len(sub)) for sub in frames]
+    if rows_col is not None:
+        rows = [_int_or_float(_numeric(sub[rows_col]).fillna(0.0).sum()) or 0 for sub in frames]
+    else:
+        rows = [int(len(sub)) for sub in frames]
+    # row counts say something only when they exist: an all-zero / all-NaN
+    # rows_col (or a frame of one row per period) knows no rows
+    rows_known = bool(rows) and sum(rows) > 0 and (rows_col is not None or max(rows) > 1)
+    # a rows_col sum that is not whole keeps its fraction in the table
+    rows_dtype = int if all(isinstance(r, int) for r in rows) else float
     n = len(labels)
     findings: dict = {}
     values: dict = {
+        "rows_ratio": None,
         "anomaly_period": None, "anomaly_value": None, "baseline_value": None,
         "anomaly_ratio_median": None, "anomaly_prev_period": None, "anomaly_prev_value": None,
         "anomaly_ratio_prev": None, "n_periods": n, "n_anomalies": 0,
@@ -892,13 +1003,13 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
         }, columns=columns)
         table["is_anomaly"] = table["is_anomaly"].astype(bool)
         table["is_primary"] = table["is_primary"].astype(bool)
-        table["rows"] = table["rows"].astype(int)
+        table["rows"] = table["rows"].astype(rows_dtype)
         table["is_data_gap"] = table["is_data_gap"].astype(bool)
         if n:
             values["baseline_value"] = _num(np.median(v))
         return _result(table, values, findings, prefix, "detect_anomalies")
 
-    gaps = set(_data_gaps(v, rows, thin_ratio))
+    gaps = set(_data_gaps(v, rows, thin_ratio, collapse=rows_col is None))
     core = _anomaly_core(v, z, ratio, skip=gaps)
     flagged, primary = core["flagged"], core["primary"]
     table = pd.DataFrame({
@@ -914,7 +1025,7 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
     }, columns=columns)
     table["is_anomaly"] = table["is_anomaly"].astype(bool)
     table["is_primary"] = table["is_primary"].astype(bool)
-    table["rows"] = table["rows"].astype(int)
+    table["rows"] = table["rows"].astype(rows_dtype)
     table["is_data_gap"] = table["is_data_gap"].astype(bool)
     table.attrs["pdc_metric"] = str(metric)
     if gaps:
@@ -927,11 +1038,15 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
     if primary is None:
         findings["anomaly"] = "no_anomaly"
     else:
-        findings["anomaly"] = "anomaly_confirmed"
-        if v[primary] > core["median"]:
-            findings["anomaly_up"] = True
-        if primary == n - 1:
-            findings["anomaly_is_latest"] = True
+        scope, values["rows_ratio"] = _scope_change(primary, rows, rows_known, frames, dims)
+        if scope:
+            findings["anomaly"] = "scope_change"
+        else:
+            findings["anomaly"] = "anomaly_confirmed"
+            if v[primary] > core["median"]:
+                findings["anomaly_up"] = True
+            if primary == n - 1:
+                findings["anomaly_is_latest"] = True
         values["anomaly_period"] = _label_str(labels[primary])
         values["anomaly_value"] = _num(v[primary])
         values["anomaly_ratio_median"] = _num(core["ratio_med"][primary])
@@ -976,7 +1091,7 @@ def _member_aggs(sub: pd.DataFrame, dim, metric, agg: str) -> dict:
 def decompose_change(df, period_col, metric, from_period=None, to_period=None, dims=(), *,
                      agg: str = "sum", order=None, top_k: int = 5, concentrated_share: float = 0.6,
                      even_tolerance: float = 0.15, large_ratio: float = 2.0,
-                     unknown_share: float = 0.5, prefix: str = "") -> dict:
+                     unknown_share: float = 0.5, rows_col=None, prefix: str = "") -> dict:
     """Which members of which dimension carry the change between two
     periods? — B8.5.
 
@@ -984,7 +1099,14 @@ def decompose_change(df, period_col, metric, from_period=None, to_period=None, d
     period is above `unknown_share` is SKIPPED — no table rows, no part in
     the shape / choice — and reported as `unknown_dominated` / `unknown_dim`
     (the first such dim in argument order). `change_dim_label` names the dim
-    of `change_top_member` whenever one is set."""
+    of `change_top_member` whenever one is set.
+
+    With `to_period="primary_anomaly"` the period comes from
+    `detect_anomalies(..., rows_col=rows_col)` (no dims passed). When that
+    reports a SCOPE CHANGE, the totals and `change_*` VALUES are computed as
+    usual but no member is attributed: `change_shape` and `anomaly` are
+    `"scope_change"`, the table is empty and `change_top_member*` /
+    `change_dim_label` stay None."""
     prefix = _check_prefix(prefix)
     agg = _check_agg(agg)
     dims = _as_list(dims, "dims")
@@ -1013,13 +1135,17 @@ def decompose_change(df, period_col, metric, from_period=None, to_period=None, d
     empty = pd.DataFrame(columns=_DECOMPOSE_COLUMNS)
 
     to_index = None
+    scope_change = False
     if isinstance(to_period, str) and to_period == "primary_anomaly":
-        detected = detect_anomalies(df, period_col, metric, agg=agg, order=order)
+        detected = detect_anomalies(df, period_col, metric, agg=agg, order=order,
+                                    rows_col=rows_col)
         table = detected["table"]
-        if detected["findings"].get("anomaly") == "anomaly_confirmed" and len(table):
+        anomaly = detected["findings"].get("anomaly")
+        if anomaly in ("anomaly_confirmed", "scope_change") and len(table):
             hits = [i for i, flag in enumerate(table["is_primary"].tolist()) if flag]
             if hits:
                 to_index = hits[0]
+                scope_change = anomaly == "scope_change"
         elif detected["findings"].get("anomaly") == "no_anomaly":
             findings["anomaly"] = "no_anomaly"
         to_period = None
@@ -1060,6 +1186,16 @@ def decompose_change(df, period_col, metric, from_period=None, to_period=None, d
     if change_ratio is not None and from_total > 0 and change_ratio >= 0:
         if change_ratio >= large_ratio or (large_ratio > 0 and change_ratio <= 1.0 / large_ratio):
             findings["change_large"] = True
+
+    if scope_change:
+        # the row count moved, not the business: no member attribution
+        findings["change_shape"] = "scope_change"
+        findings["anomaly"] = "scope_change"
+        table = pd.DataFrame(columns=_DECOMPOSE_COLUMNS)
+        table.attrs["pdc_metric"] = str(metric)
+        table.attrs["pdc_from_period"] = values["change_from_period"]
+        table.attrs["pdc_to_period"] = values["change_to_period"]
+        return _result(table, values, findings, prefix, "decompose_change")
 
     usable = []
     for dim in dims:
@@ -1537,3 +1673,68 @@ def plot_importance(table, *, title=None, x_title="Share of variation explained"
         showlegend=False,
     )
     return fig
+
+
+# ---------------------------------------------------------------------------
+# B8.9 rate_by_period
+# ---------------------------------------------------------------------------
+_RATE_COLUMNS = ["period", "numerator", "denominator", "rate"]
+
+
+def rate_by_period(df, period_col, numerator, denominator, *, order=None,
+                   prefix: str = "") -> dict:
+    """How does a RATE (numerator sum / denominator sum per period) move? —
+    B8.9. The view to compare when the totals move with the row count (a
+    `scope_change`).
+
+    Table `period, numerator, denominator, rate` over the ordered periods; a
+    rate is NaN when the period's denominator is 0 or not finite. VALUES:
+    `rate_first` / `rate_last` (fractions, from the first and the last period
+    with a finite rate), `rate_change_pp` = (last - first) x 100,
+    `rate_first_period` / `rate_last_period`, `period_from` / `period_to`
+    (the first and last periods) and `n_periods`; None when not computable.
+    FINDINGS: `rate_up` above +0.5 pp, `rate_down` below -0.5 pp; fewer than
+    two finite rates -> `too_few_periods` (and no change)."""
+    prefix = _check_prefix(prefix)
+    _require_columns(df, [period_col], "period_col")
+    _require_columns(df, [numerator], "numerator")
+    _require_columns(df, [denominator], "denominator")
+    _require_numeric(df, numerator, "numerator")
+    _require_numeric(df, denominator, "denominator")
+
+    labels, _known, _stamps = _order_with_stamps(df[period_col], order)
+    frames = _period_frames(df, period_col, labels)
+    nums = [_agg_series(sub[numerator], "sum") for sub in frames]
+    dens = [_agg_series(sub[denominator], "sum") for sub in frames]
+    rates = [num / den if (math.isfinite(den) and den != 0) else float("nan")
+             for num, den in zip(nums, dens)]
+    table = pd.DataFrame({"period": labels, "numerator": nums, "denominator": dens,
+                          "rate": rates}, columns=_RATE_COLUMNS)
+    table.attrs["pdc_numerator"] = str(numerator)
+    table.attrs["pdc_denominator"] = str(denominator)
+
+    findings: dict = {}
+    values: dict = {
+        "rate_first": None, "rate_last": None, "rate_change_pp": None,
+        "rate_first_period": None, "rate_last_period": None,
+        "period_from": _label_str(labels[0]) if labels else None,
+        "period_to": _label_str(labels[-1]) if labels else None,
+        "n_periods": len(labels),
+    }
+    finite = [i for i, rate in enumerate(rates) if math.isfinite(rate)]
+    if finite:
+        first, last = finite[0], finite[-1]
+        values["rate_first"] = _num(rates[first])
+        values["rate_last"] = _num(rates[last])
+        values["rate_first_period"] = _label_str(labels[first])
+        values["rate_last_period"] = _label_str(labels[last])
+    if len(finite) < 2:
+        findings["too_few_periods"] = True
+    else:
+        change_pp = (rates[finite[-1]] - rates[finite[0]]) * 100.0
+        values["rate_change_pp"] = _num(change_pp)
+        if change_pp > 0.5:
+            findings["rate_up"] = True
+        elif change_pp < -0.5:
+            findings["rate_down"] = True
+    return _result(table, values, findings, prefix, "rate_by_period")

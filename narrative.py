@@ -21,9 +21,11 @@ never raise (Article IV).
 """
 from __future__ import annotations
 
+import ast
 import math
 import numbers
 import re
+import textwrap
 
 import pdc_diag
 from logger_utils import log_safe_value, log_with_sid
@@ -506,6 +508,72 @@ def drop_na_sentences(text, *, sid: str, what: str) -> str:
         return text
 
 
+# A STRONG node: a construct prose almost never parses into. A bare
+# assignment ("Margin = Revenue - Cost"), an `if`, or a call of a plain name
+# ("Revenue (USD)" parses as Call(Name)) alone never count — headings, label
+# lists and formulas parse as those.
+_STRONG_NODES = (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef,
+                 ast.ClassDef, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith,
+                 ast.Try, ast.Return, ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp,
+                 ast.GeneratorExp, ast.Dict)
+_CODE_WINDOW = 3
+
+
+def _is_strong(node) -> bool:
+    if isinstance(node, _STRONG_NODES):
+        return True
+    if isinstance(node, ast.Call):
+        # a method call (`df.groupby(...)`) or keyword arguments (`x=...`)
+        return isinstance(node.func, ast.Attribute) or bool(node.keywords)
+    if isinstance(node, ast.Subscript):
+        # a string key (`dfs['x']`)
+        return isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str)
+    return False
+
+
+def _window_is_code(window: str) -> bool:
+    try:
+        tree = ast.parse(textwrap.dedent(window))
+    except (SyntaxError, ValueError, RecursionError):
+        # deliberate control flow, not a failure: most windows of prose do
+        # not parse, and a log line per window would flood the log
+        return False
+    return any(_is_strong(node) for node in ast.walk(tree))
+
+
+def contains_code(text, *, sid: str = "narrative") -> bool:
+    """True when `text` holds code rather than prose: a "```" fence, or
+    three consecutive non-blank lines that parse as Python and hold a STRONG
+    construct (`_is_strong`: an import, def / class, loop, with / try,
+    return, lambda, comprehension, dict literal, method call, keyword
+    arguments or a string subscript). Non-str -> False. Never raises (a
+    failure logs `NARRATIVE_CODE_CHECK_FAILED` under `sid` -> False)."""
+    try:
+        if not isinstance(text, str):
+            return False
+        if "```" in text:
+            return True
+        lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+        for start in range(len(lines) - _CODE_WINDOW + 1):
+            if _window_is_code("\n".join(lines[start:start + _CODE_WINDOW])):
+                return True
+        return False
+    except Exception as e:
+        log_with_sid(sid, "warning",
+                     f"NARRATIVE_CODE_CHECK_FAILED error={log_safe_value(type(e).__name__, 80)}")
+        return False
+
+
+def code_in_text(text, *, sid: str, what: str) -> bool:
+    """The code-in-text gate on a text meant for display (a rendered
+    caption / narrative): `contains_code(text)`; when True it logs
+    `NARRATIVE_CODE_IN_TEXT what=<what>` — never the text. Never raises."""
+    found = contains_code(text, sid=sid)
+    if found:
+        log_with_sid(sid, "warning", f"NARRATIVE_CODE_IN_TEXT what={log_safe_value(what, 40)}")
+    return found
+
+
 # ---------------------------------------------------- received templates
 
 def clean_template(value, *, max_len: int, sid: str, what: str) -> str | None:
@@ -789,11 +857,13 @@ def covered_codes(text, sections) -> set:
 
 # ------------------------------------------------------- FINDING sentences
 # A5.1: the fixed sentence of every finding no rendered section states.
-# `{finding: {lang: (base, paren)}}` — `base` holds "{paren}" where the
-# parenthesis goes; `paren` is its content, parts separated by "; ", each
-# part kept only when every placeholder in it has a value (no part -> no
-# parenthesis at all). Display text only (R0): never in `content`, never in
-# a brain payload.
+# `{finding: {lang: (base, paren)}}` or `(base, paren, full)` — `base` holds
+# "{paren}" where the parenthesis goes; `paren` is its content, parts
+# separated by "; ", each part kept only when every placeholder in it has a
+# value (no part -> no parenthesis at all). `full`, when present, states the
+# values inline and is used only when EVERY placeholder in it has a value;
+# otherwise `base` with its parenthesis. Display text only (R0): never in
+# `content`, never in a brain payload.
 
 FINDING_SENTENCES = {
     "mixed_units": {
@@ -866,12 +936,74 @@ FINDING_SENTENCES = {
                "последний период: {period}"),
         "ka": ("მონაცემები მიმდინარე თვემდე მთავრდება{paren}.", "ბოლო პერიოდი: {period}"),
     },
+    "scope_change": {
+        "en": ("One period{paren} has a very different number of rows than the previous "
+               "period, so its totals reflect a change in reporting scope, not a business "
+               "change; compare rates or per-row averages instead.", "{period}",
+               "{period} has {ratio} the rows of the previous period, so its totals reflect a "
+               "change in reporting scope, not a business change; compare rates or per-row "
+               "averages instead."),
+        "uz": ("Bir davrda{paren} qatorlar soni oldingi davrdagidan keskin farq qiladi, "
+               "shuning uchun bu davrning jami ko'rsatkichlari biznesdagi o'zgarishni emas, "
+               "balki hisobot qamrovining o'zgarishini aks ettiradi; buning o'rniga ulushlarni "
+               "yoki bir qatorga to'g'ri keladigan o'rtacha qiymatlarni solishtiring.",
+               "{period}",
+               "{period}: qatorlar soni oldingi davrga nisbatan {ratio}, shuning uchun bu "
+               "davrning jami ko'rsatkichlari biznesdagi o'zgarishni emas, balki hisobot "
+               "qamrovining o'zgarishini aks ettiradi; buning o'rniga ulushlarni yoki bir "
+               "qatorga to'g'ri keladigan o'rtacha qiymatlarni solishtiring."),
+        "ru": ("В одном периоде{paren} число строк резко отличается от предыдущего периода, "
+               "поэтому его итоги отражают изменение охвата отчётности, а не изменение в "
+               "бизнесе; вместо этого сравнивайте доли или средние значения на одну строку.",
+               "{period}",
+               "{period}: число строк относительно предыдущего периода — {ratio}, поэтому "
+               "итоги этого периода отражают изменение охвата отчётности, а не изменение в "
+               "бизнесе; вместо этого сравнивайте доли или средние значения на одну строку."),
+        "ka": ("ერთ პერიოდში{paren} ჩანაწერების რაოდენობა მკვეთრად განსხვავდება წინა "
+               "პერიოდისგან, ამიტომ მისი ჯამები ასახავს ანგარიშგების ფარგლების ცვლილებას და "
+               "არა ბიზნესის ცვლილებას; ამის ნაცვლად შეადარეთ წილები ან ერთ ჩანაწერზე საშუალო "
+               "მნიშვნელობები.", "{period}",
+               "{period}: ჩანაწერების რაოდენობა წინა პერიოდთან შედარებით არის {ratio}, ამიტომ "
+               "ამ პერიოდის ჯამები ასახავს ანგარიშგების ფარგლების ცვლილებას და არა ბიზნესის "
+               "ცვლილებას; ამის ნაცვლად შეადარეთ წილები ან ერთ ჩანაწერზე საშუალო "
+               "მნიშვნელობები."),
+    },
+    "label_disappeared": {
+        "en": ("Rows of one label end before the last period{paren}; later periods carry only "
+               "the other label(s), so a 0 for that label in a later period means no rows, not "
+               "no activity.", "{label}",
+               "Rows labelled {label} end after {period}; later periods carry only the other "
+               "label(s), so a 0 for {label} in a later period means no rows, not no "
+               "activity."),
+        "uz": ("Belgilardan birining qatorlari oxirgi davrdan oldin tugaydi{paren}; keyingi "
+               "davrlarda faqat boshqa belgi(lar) bor, shuning uchun keyingi davrda bu belgi uchun 0 "
+               "faoliyat yo'qligini emas, balki qatorlar yo'qligini bildiradi.", "{label}",
+               "{label} belgili qatorlar {period} davridan keyin tugaydi; keyingi davrlarda "
+               "faqat boshqa belgi(lar) bor, shuning uchun keyingi davrda {label} uchun 0 "
+               "faoliyat yo'qligini emas, balki qatorlar yo'qligini bildiradi."),
+        "ru": ("Строки с одной из меток заканчиваются раньше последнего периода{paren}; в "
+               "более поздних периодах есть только другие метки, поэтому 0 для этой метки в "
+               "более позднем периоде означает отсутствие строк, а не отсутствие активности.",
+               "{label}",
+               "Строки с меткой {label} заканчиваются после периода {period}; в более поздних "
+               "периодах есть только другие метки, поэтому 0 для {label} в более позднем "
+               "периоде означает отсутствие строк, а не отсутствие активности."),
+        "ka": ("ერთ-ერთი მნიშვნელობის მქონე ჩანაწერები ბოლო პერიოდამდე მთავრდება{paren}; "
+               "შემდგომ პერიოდებში მხოლოდ სხვა მნიშვნელობები გვხვდება, ამიტომ შემდგომ პერიოდში "
+               "ამ მნიშვნელობის 0 ნიშნავს, რომ ჩანაწერები არ არის, და არა იმას, რომ აქტივობა "
+               "არ ყოფილა.", "{label}",
+               "{label} მნიშვნელობის მქონე ჩანაწერები მთავრდება {period} პერიოდის შემდეგ; შემდგომ "
+               "პერიოდებში მხოლოდ სხვა მნიშვნელობები გვხვდება, ამიტომ შემდგომ პერიოდში "
+               "{label}-ის 0 ნიშნავს, რომ ჩანაწერები არ არის, და არა იმას, რომ აქტივობა არ "
+               "ყოფილა."),
+    },
 }
 
 # The order the sentences are added in, and the resolved section codes
 # (`render_with_sections`) whose stated body already covers each finding.
-_FINDING_ORDER = ("mixed_units", "coverage_change", "thin_period", "unknown_dominated",
-                  "metric_definition_overlap", "latest_is_past_period")
+_FINDING_ORDER = ("mixed_units", "coverage_change", "label_disappeared", "thin_period",
+                  "scope_change", "unknown_dominated", "metric_definition_overlap",
+                  "latest_is_past_period")
 _FINDING_COVERED_BY = {
     "mixed_units": frozenset({"mixed_units", "units"}),
     "coverage_change": frozenset({"coverage_change"}),
@@ -880,8 +1012,10 @@ _FINDING_COVERED_BY = {
     "metric_definition_overlap": frozenset({"metric_definition_overlap", "metrics_identical",
                                             "metric_relation"}),
     "latest_is_past_period": frozenset({"latest_is_past_period"}),
+    "scope_change": frozenset({"scope_change"}),
+    "label_disappeared": frozenset({"label_disappeared"}),
 }
-_PLACEHOLDER_RE = re.compile(r"\{(dim|share|period)\}")
+_PLACEHOLDER_RE = re.compile(r"\{(dim|share|period|ratio|label)\}")
 _VALUE_PREFIX_MAX = 10
 
 # A READING GUIDE names a visual: the added paragraph goes before it.
@@ -925,6 +1059,9 @@ def _finding_fires(finding: str, findings: dict) -> bool:
         return findings.get("thin_period") is True or findings.get("period_status") == "data_gap"
     if finding == "metric_definition_overlap":
         return findings.get("metric_relation") == "metric_definition_overlap"
+    if finding == "scope_change":
+        return (findings.get("anomaly") == "scope_change"
+                or findings.get("change_shape") == "scope_change")
     return findings.get(finding) is True
 
 
@@ -941,8 +1078,22 @@ def _finding_parts(finding: str, findings: dict, values: dict, locale) -> dict:
         if period is None:
             period = _part(_value_lookup(values, "data_gap_period"), "text", locale)
         parts["period"] = period
+    elif finding == "scope_change":
+        period = _part(_value_lookup(values, "anomaly_period"), "text", locale)
+        if period is None:
+            period = _part(_value_lookup(values, "change_to_period"), "text", locale)
+        parts["period"] = period
+        parts["ratio"] = _part(_value_lookup(values, "rows_ratio"), "ratio", locale)
+    elif finding == "label_disappeared":
+        parts["label"] = _part(_value_lookup(values, "disappeared_label"), "text", locale)
+        parts["period"] = _part(_value_lookup(values, "disappeared_after_period"), "text",
+                                locale)
     elif finding == "unknown_dominated":
-        dim = _part(_value_lookup(values, "unknown_dim_label"), "text", locale)
+        label = _value_lookup(values, "unknown_dim_label")
+        # the label and its share are used only when they name the dim the
+        # FINDING names (another call's coverage_check may have set them)
+        same_dim = "unknown_dim" not in findings or label == findings.get("unknown_dim")
+        dim = _part(label, "text", locale) if same_dim else None
         if dim is not None:
             parts["dim"] = dim
             parts["share"] = _part(_value_lookup(values, "unknown_share_max"), "pct", locale)
@@ -957,8 +1108,13 @@ def _finding_parts(finding: str, findings: dict, values: dict, locale) -> dict:
 
 
 def _finding_sentence(finding: str, lang: str, findings: dict, values: dict, locale) -> str:
-    base, paren = FINDING_SENTENCES[finding][lang]
+    entry = FINDING_SENTENCES[finding][lang]
+    base, paren = entry[0], entry[1]
     available = _finding_parts(finding, findings, values, locale)
+    full = entry[2] if len(entry) > 2 else ""
+    names = _PLACEHOLDER_RE.findall(full)
+    if names and all(n in available for n in names):
+        return _PLACEHOLDER_RE.sub(lambda m: available[m.group(1)], full)
     kept = []
     for piece in paren.split("; ") if paren else []:
         names = _PLACEHOLDER_RE.findall(piece)
@@ -993,7 +1149,11 @@ def add_finding_sentences(text, findings, values, covered, lang, *, sid: str) ->
     `covered_codes`), in the table order, in `lang` (unknown -> en); the
     parenthesis values come from VALUES (exact key, else a prefixed one) or
     the findings, formatted in the language's locale, and a missing one
-    drops its part — never "n/a". Nothing fires -> `text` unchanged. Logs
+    drops its part — never "n/a"; an entry's `full` form (values inline) is
+    used only when every one of its values is present. `scope_change` fires
+    on `anomaly` or `change_shape` == "scope_change"; the Unknown sentence
+    quotes `unknown_dim_label` / `unknown_share_max` only when that label is
+    the dim the finding names. Nothing fires -> `text` unchanged. Logs
     `FINDING_SENTENCES_ADDED n= lang=` (a count). Never raises."""
     if not isinstance(text, str):
         text = ""

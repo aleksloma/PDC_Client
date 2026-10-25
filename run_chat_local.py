@@ -32,6 +32,7 @@ and never reach a brain call or `content` (R0).
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import re
 import time as _time
@@ -115,6 +116,95 @@ _LIVE_EXHAUSTED_TEXT = ("I couldn't run this analysis: the live query for "
 # default read ran instead), so it is reported as not run.
 _FILTERED_SQL_MESSAGE = ("The table is filtered by the administrator; "
                          "no SELECT is accepted for it.")
+
+# ---------------------------------------------------------------------------
+# Prose kinds: the plan's `code` is TEXT shown to the user as is — unless it
+# holds runnable Python (`_code_from_prose_reply`), a reply the planner
+# mislabelled. Code is never display text: it is extracted and run on the
+# normal path, and describe / summarize write the answer. A ```sql / ```json
+# block in an explanation is not Python and stays part of the answer.
+# ---------------------------------------------------------------------------
+_PROSE_KINDS = ("CLARIFICATION", "ANSWER", "MISSING_DATA")
+_FENCE_OPEN_RE = re.compile(r"[ \t]*```[ \t]*([A-Za-z0-9_+.#-]*)[ \t]*\Z")
+_FENCE_CLOSE_RE = re.compile(r"[ \t]*```[ \t]*\Z")
+_PYTHON_FENCE_TAGS = ("python", "py", "")
+_PROSE_FIG_RE = re.compile(r"\bfig\s*=")
+_PROSE_RESULT_RE = re.compile(r"\bRESULT\s*=")
+
+
+def _fenced_blocks(text: str) -> list:
+    """`[(language tag lower-cased, content)]` of the ``` fences of `text`,
+    one per opening line that holds only the fence and its tag; an unclosed
+    fence runs to the end of the text."""
+    blocks = []
+    tag = None
+    body: list = []
+    for line in text.splitlines():
+        if tag is None:
+            match = _FENCE_OPEN_RE.match(line)
+            if match:
+                tag, body = match.group(1).lower(), []
+        elif _FENCE_CLOSE_RE.match(line):
+            blocks.append((tag, "\n".join(body)))
+            tag = None
+        else:
+            body.append(line)
+    if tag is not None:
+        blocks.append((tag, "\n".join(body)))
+    return blocks
+
+
+def _prose_code_kind(code: str) -> str:
+    if _PROSE_FIG_RE.search(code) and not _PROSE_RESULT_RE.search(code):
+        return "PLOT_CODE"
+    return "PYTHON"
+
+
+def _parses(code: str) -> bool:
+    try:
+        ast.parse(code)
+        return True
+    except (SyntaxError, ValueError, RecursionError):
+        # deliberate control flow, not a failure: prose does not parse
+        return False
+
+
+def _code_from_prose_reply(text, sid) -> tuple[str, str] | None:
+    """`(kind, code)` when a prose reply holds RUNNABLE Python, else None
+    (the text is shown as is). Python is the content of the first
+    ```python / ```py fence that parses (however short — the tag declares
+    it code), or of the first bare ``` fence that `narrative.contains_code`
+    accepts; a text with no ``` at all counts as a whole when it parses
+    (`ast.parse`) and `contains_code` accepts it. A text whose fences are
+    all another language (```sql, ```json) or not code answers None. kind
+    "PLOT_CODE" when the code assigns `fig` and not `RESULT`, else "PYTHON".
+    Never raises (a failure logs `PROSE_CODE_EXTRACT_FAILED` -> None)."""
+    try:
+        if not isinstance(text, str) or not text.strip():
+            return None
+        if "```" in text:
+            for tag, body in _fenced_blocks(text):
+                code = body.strip()
+                if tag not in _PYTHON_FENCE_TAGS or not code:
+                    continue
+                # a fence tagged python / py declares its content code: it
+                # runs whenever it parses, however short; a bare fence must
+                # look like code too
+                if tag and _parses(code):
+                    return _prose_code_kind(code), code
+                if narrative.contains_code(code, sid=sid):
+                    return _prose_code_kind(code), code
+            return None
+        code = text.strip()
+        if not _parses(code):
+            return None
+        if narrative.contains_code(code, sid=sid):
+            return _prose_code_kind(code), code
+        return None
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid(log_safe_text(sid, 200), "warning",
+                     f"PROSE_CODE_EXTRACT_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return None
 
 
 def _new_live_state(plan_out: dict | None = None) -> dict:
@@ -842,9 +932,15 @@ def _run_chat_body(*, sid, dfs, schema_docs, question, history_rows, user_email,
                  f"PLAN kind={log_safe_text(str(kind), 40)} "
                  f"model={log_safe_text(str(plan_out.get('model_used')), 80)}")
 
-    # Clarification / text answer — return as text
-    if kind in ("CLARIFICATION", "ANSWER", "MISSING_DATA"):
-        return {"text": code, "image_base64": None, "table": None, "code": None, "usage": usage}
+    # Clarification / text answer — return as text. A prose reply that holds
+    # runnable Python (the planner mislabelled it) is never shown: it runs.
+    if kind in _PROSE_KINDS:
+        extracted = _code_from_prose_reply(code, sid)
+        if extracted is None:
+            return {"text": code, "image_base64": None, "table": None, "code": None,
+                    "usage": usage}
+        kind, code = extracted
+        log_with_sid(sid, "warning", "NARRATIVE_CODE_IN_TEXT what=answer")
 
     # Greeting — call brain for natural reply
     if kind == "NO_CODE":
@@ -894,6 +990,7 @@ def _run_chat_body(*, sid, dfs, schema_docs, question, history_rows, user_email,
         # A retry that returns prose (NO_CODE/CLARIFICATION/ANSWER/MISSING_DATA)
         # or no code is a FAILED attempt, not a reason to abort: keep retrying
         # with escalation. Prose text must never reach an executor.
+        # Only the first plan reply's prose is searched for code (_code_from_prose_reply).
         if not new_code or new_kind in ("NO_CODE", "CLARIFICATION", "ANSWER", "MISSING_DATA"):
             continue
         code = new_code
@@ -1377,6 +1474,14 @@ class _NarrState:
                                         locale=self.locale,
                                         prefixes=self.block_prefixes.get(block_index))
             rendered = narrative.drop_na_sentences(rendered, sid=self.sid, what="caption")
+            if narrative.code_in_text(rendered, sid=self.sid, what="caption"):
+                # code is never display text: the visual goes to describe
+                self.captions_used.discard(block_index)
+                self.captions_dropped.add(block_index)
+                log_with_sid(log_safe_text(self.sid, 200), "info",
+                             f"CAPTION_SKIPPED block={int(block_index)} "
+                             "reason=code_in_text")
+                return None
             if not rendered.strip():
                 self.captions_used.discard(block_index)
                 self.captions_dropped.add(block_index)
@@ -1493,6 +1598,13 @@ class _NarrState:
             # value) is dropped. The first sentence is protected above, so an
             # empty result is a guard only.
             rendered = narrative.drop_na_sentences(rendered, sid=self.sid, what="narrative")
+            if narrative.code_in_text(rendered, sid=self.sid, what="narrative"):
+                # code is never display text: the caption / describe /
+                # summarize fallback answers instead
+                self.rendered = None
+                log_with_sid(log_safe_text(self.sid, 200), "info",
+                             "NARRATIVE_SKIPPED reason=code_in_text")
+                return None
             if not rendered.strip():
                 self.rendered = None
                 log_with_sid(log_safe_text(self.sid, 200), "info",
@@ -2269,7 +2381,8 @@ def run_chat_multi_plot(
                     break
                 continue
             # Any other kind (CLARIFICATION, ANSWER, MISSING_DATA, …) → failed
-            # attempt; keep retrying.
+            # attempt; keep retrying. Only the first plan reply's prose is searched for
+            # code (_code_from_prose_reply).
             continue
 
         # The sandbox itself failed: STOP the whole worklist. The remaining
@@ -2745,8 +2858,14 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
         fn = render_plot_safe if kind_ == "PLOT_CODE" else safe_execute
         return fn(code_, dfs, sid)
 
-    if kind in ("CLARIFICATION", "ANSWER", "MISSING_DATA"):
-        return {"text": code, "image_base64": None, "table": None, "code": None, "usage": usage}
+    # a prose reply that holds runnable Python runs it instead of showing it
+    if kind in _PROSE_KINDS:
+        extracted = _code_from_prose_reply(code, sid)
+        if extracted is None:
+            return {"text": code, "image_base64": None, "table": None, "code": None,
+                    "usage": usage}
+        kind, code = extracted
+        log_with_sid(sid, "warning", "NARRATIVE_CODE_IN_TEXT what=answer")
 
     if kind == "NO_CODE":
         if context_decision.get("is_greeting"):
@@ -2838,6 +2957,7 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
         # A retry that returns prose (NO_CODE/CLARIFICATION/ANSWER/MISSING_DATA)
         # or no code is a FAILED attempt, not a reason to abort: keep retrying
         # with escalation. Prose text must never reach an executor.
+        # Only the first plan reply's prose is searched for code (_code_from_prose_reply).
         if not new_code or new_kind in ("NO_CODE", "CLARIFICATION", "ANSWER", "MISSING_DATA"):
             continue
         # A1.5 (single flow): a narrative in the reply REPLACES the plan's,

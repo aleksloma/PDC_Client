@@ -816,16 +816,19 @@ def _locale(lang):
 def test_finding_sentences_table_has_every_finding_and_language():
     table = getattr(narrative, "FINDING_SENTENCES", None)
     assert isinstance(table, dict), "narrative.FINDING_SENTENCES is missing"
-    assert len(table) == 6
+    # 6 entries + the BRB run-3 follow-up's scope_change / label_disappeared
+    assert len(table) == 8
     for key in ("mixed_units", "coverage_change", "unknown_dominated",
-                "metric_definition_overlap", "latest_is_past_period"):
+                "metric_definition_overlap", "latest_is_past_period",
+                "scope_change", "label_disappeared"):
         assert key in table, key
     assert {"thin_period", "data_gap"} & set(table), sorted(table)
     for key, by_lang in table.items():
         assert set(LANGS) <= set(by_lang), (key, sorted(by_lang))
         for lang in LANGS:
             entry = by_lang[lang]
-            assert isinstance(entry, tuple) and len(entry) == 2, (key, lang)
+            # (base, paren) or, since the run-3 follow-up, (base, paren, full)
+            assert isinstance(entry, tuple) and len(entry) in (2, 3), (key, lang)
             assert all(isinstance(part, str) for part in entry), (key, lang)
             assert entry[0].strip(), (key, lang)
 

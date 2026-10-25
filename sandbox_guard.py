@@ -94,7 +94,7 @@ PDC_DIAG_REDEFINED_TEXT = "pdc_diag cannot be redefined"
 _PDC_DIAG = "pdc_diag"
 
 PDC_DIAG_PUBLIC = frozenset({
-    "fmt", "coverage_check", "detect_anomalies", "decompose_change",
+    "fmt", "coverage_check", "detect_anomalies", "decompose_change", "rate_by_period",
     "attribute_level", "check_metric_overlap",
     "plot_highlighted_series", "plot_waterfall", "plot_importance",
 })
