@@ -424,10 +424,13 @@ def test_values_merge_order_collision_log(monkeypatch, dfs, caplog):
 
 
 def test_failed_block_slot_renders_na(monkeypatch, dfs, caplog):
-    """A failed block's slot renders n/a and the quality gate drops the
-    sentence holding it. "a={{a}} b={{b}}" is ONE sentence, so nothing is
-    left: the narrative is not used and the turn shows today's no-narrative
-    answer, the successful chart's describe text (it has no caption)."""
+    """A failed block's slot renders n/a. "a={{a}} b={{b}}" is ONE sentence,
+    so the FIRST sentence holds n/a: the template is invalid (BRB retest 2
+    follow-up, kind `first_sentence`) and ONE narrative-only retry asks for a
+    new one — 3 exec retries of the bad block + 1 narrative retry. The fake
+    reply carries no narrative, so the narrative is not used and the turn
+    shows today's no-narrative answer, the successful chart's describe text
+    (it has no caption)."""
     code_ok = "fig = chart_ok\nVALUES['a'] = 1"
     code_bad = "fig = chart_bad\nVALUES['b'] = 5"
     brain = Brain(_multi_plan(("plot_code", code_ok), ("plot_code", code_bad),
@@ -440,7 +443,12 @@ def test_failed_block_slot_renders_na(monkeypatch, dfs, caplog):
     with caplog.at_level(logging.INFO, logger="datachat"):
         events = _run_multi(dfs)
 
-    assert len(brain.calls["retry"]) == 3             # the bad block used its retries
+    assert len(brain.calls["retry"]) == 4             # 3 exec retries + 1 narrative retry
+    narr_retries = [kw for kw in brain.calls["retry"]
+                    if str(kw.get("error_msg", "")).startswith("narrative_invalid")]
+    assert len(narr_retries) == 1
+    assert narr_retries[0]["error_msg"] == "narrative_invalid: first_sentence"
+    assert narr_retries[0]["failed_code"] == code_ok      # the emitted code only
     assert len(brain.calls["describe"]) == 1
     assert brain.calls["describe"][0]["code"] == code_ok
     assert _narrative_events(events) == []
@@ -450,9 +458,9 @@ def test_failed_block_slot_renders_na(monkeypatch, dfs, caplog):
     assert "n/a" not in done["display_answer"]
     assert done["narrative_view"]["phase1"] is None
     msgs = [r.getMessage() for r in caplog.records]
-    assert any("NARRATIVE_SENTENCE_DROPPED" in m and "reason=missing_slot" in m
-               and "n=1" in m and "what=narrative" in m for m in msgs), msgs
-    assert any("NARRATIVE_SKIPPED reason=all_sentences_dropped" in m for m in msgs), msgs
+    assert any("NARRATIVE_INVALID reason=first_sentence" in m for m in msgs), msgs
+    assert any("NARRATIVE_INVALID_TWICE reason=no_narrative" in m for m in msgs), msgs
+    assert not any("all_sentences_dropped" in m for m in msgs), msgs
 
 
 def test_narrative_keeps_clean_sentence_drops_na_one(monkeypatch, dfs, caplog):
@@ -503,6 +511,9 @@ def test_caption_with_none_value_goes_to_describe(monkeypatch, dfs, caplog):
 
 def test_single_scalar_all_dropped_narrative_falls_back_to_summarize(monkeypatch, dfs,
                                                                     caplog):
+    """"{{missing}}" renders "n/a" in the FIRST sentence: the template is
+    invalid (BRB retest 2 follow-up), one narrative-only retry is made, the
+    fake reply carries no narrative, so the turn takes today's summarize path."""
     plan = {"kind": "PYTHON", "code": "RESULT = 42", "raw_text": "", "usage": {},
             "narrative": "{{missing}}"}
     brain = Brain(plan, summarize_text="The answer is computed.").install(monkeypatch)
@@ -510,13 +521,17 @@ def test_single_scalar_all_dropped_narrative_falls_back_to_summarize(monkeypatch
     with caplog.at_level(logging.INFO, logger="datachat"):
         result = _single(_run_multi(dfs, question="what is the total?"))
 
+    assert len(brain.calls["retry"]) == 1
+    assert brain.calls["retry"][0]["error_msg"] == "narrative_invalid: first_sentence"
+    assert brain.calls["retry"][0]["failed_code"] == "RESULT = 42"
     assert len(brain.calls["summarize"]) == 1
     assert brain.calls["summarize"][0].get("preview", "missing") is None
     assert result["text"] == "The answer is computed."
     assert result["value_display"] == "**Result:** 42"
     assert "narrative_rendered" not in result
     msgs = [r.getMessage() for r in caplog.records]
-    assert any("NARRATIVE_SKIPPED reason=all_sentences_dropped" in m for m in msgs), msgs
+    assert any("NARRATIVE_INVALID_TWICE reason=no_narrative" in m for m in msgs), msgs
+    assert not any("all_sentences_dropped" in m for m in msgs), msgs
 
 
 def test_single_table_all_dropped_narrative_uses_describe(monkeypatch, dfs):
@@ -528,6 +543,10 @@ def test_single_table_all_dropped_narrative_uses_describe(monkeypatch, dfs):
 
     result = _single(_run_multi(dfs))
 
+    # the only sentence holds n/a: one narrative-only retry (no narrative in
+    # the fake reply), then today's describe path
+    assert [kw["error_msg"] for kw in brain.calls["retry"]] == [
+        "narrative_invalid: first_sentence"]
     assert len(brain.calls["describe"]) == 1
     assert result["text"] == "described"
     assert "narrative_rendered" not in result
@@ -853,3 +872,364 @@ def test_multi_without_findings_or_narrative_phase1_none(monkeypatch, dfs):
     done = _done(_run_multi(dfs))
 
     assert done["narrative_view"]["phase1"] is None
+
+
+# =========================================================================
+# BRB retest 2 follow-up (DIAGNOSTICS_SPEC A5.1): an INVALID narrative
+# template (a parse error, or a first sentence holding "n/a") gets ONE
+# narrative-only retry: `brain_client.retry` with the flow's usual keywords,
+# `error_msg = "narrative_invalid: <kind>"`, `use_pro=True` and the executed
+# code as `failed_code`. Only the reply's `narrative` is used — its code never
+# runs. A valid template gains the fixed FINDING sentences for every finding
+# no rendered section covers (display text only, R0).
+# =========================================================================
+
+import re                                                       # noqa: E402
+
+NARR_DELIM = "\n###NEXT_PLOT###\n"
+NESTED = "{{#a}}x{{#b}}y{{/b}}{{/a}}"
+REPLY_CODE = "fig = chart_reply_never_run\nVALUES['a'] = 999"
+
+
+def _recording_renders(monkeypatch, charts: dict, tables: dict | None = None):
+    """`_install_renders` that also records every code it was asked to run."""
+    seen = []
+
+    def render(code, dfs, sid, **kw):
+        seen.append(code)
+        out = charts.get(code)
+        return dict(out) if out is not None else {"ok": False, "error": "ValueError: boom",
+                                                  "trace": ""}
+
+    def execute(code, dfs, sid, **kw):
+        seen.append(code)
+        out = (tables or {}).get(code)
+        return dict(out) if out is not None else {"error": "ValueError: boom"}
+
+    monkeypatch.setattr(run_chat_local, "render_plot_safe", render)
+    monkeypatch.setattr(run_chat_local, "safe_execute", execute)
+    return seen
+
+
+def _narr_reply(narrative_t=None, code=REPLY_CODE, usage=None):
+    out = {"kind": "PLOT_CODE", "code": code, "usage": dict(usage or {}),
+           "captions": {"1": "REPLY CAPTION {{a}}"}}
+    if narrative_t is not None:
+        out["narrative"] = narrative_t
+    return out
+
+
+def _narr_retries(brain):
+    return [kw for kw in brain.calls["retry"]
+            if str(kw.get("error_msg", "")).startswith("narrative_invalid")]
+
+
+def _msgs(caplog):
+    return [r.getMessage() for r in caplog.records]
+
+
+def test_multi_nested_template_one_narrative_retry(monkeypatch, dfs, caplog):
+    brain = Brain(_multi_plan(("plot_code", CODE_A), ("plot_code", CODE_B), narrative_t=NESTED),
+                  retry=_narr_reply("Fixed {{a}} and {{b}}.",
+                                    usage={"input_tokens": 7})).install(monkeypatch)
+    seen = _recording_renders(monkeypatch, {CODE_A: _chart({"a": 1}), CODE_B: _chart({"b": 2})})
+
+    with caplog.at_level(logging.INFO, logger="datachat"):
+        events = _run_multi(dfs)
+
+    assert len(brain.calls["retry"]) == 1
+    kw = brain.calls["retry"][0]
+    assert kw["error_msg"] == "narrative_invalid: nested"
+    assert kw["use_pro"] is True
+    assert kw["failed_code"] == NARR_DELIM.join([CODE_A, CODE_B])
+    assert list(kw.get("capabilities") or []) == _caps()
+    assert kw.get("sql_error") is None
+    # the reply's code never runs
+    assert REPLY_CODE not in seen
+    assert seen.count(CODE_A) == 1 and seen.count(CODE_B) == 1
+    narr = _narrative_events(events)
+    assert len(narr) == 1
+    assert narr[0]["text"] == "Fixed 1 and 2."
+    assert narr[0]["template"] == "Fixed {{a}} and {{b}}."
+    done = _done(events)
+    assert done["display_answer"] == "Fixed 1 and 2."
+    assert done["combined_answer"] == narrative.history_content("Fixed {{a}} and {{b}}.", {})
+    assert done["total_usage"]["input_tokens"] >= 7           # the retry's usage counted
+    msgs = _msgs(caplog)
+    assert any("NARRATIVE_PARSE_FAILED kind=nested" in m for m in msgs), msgs
+    assert not any("all_sentences_dropped" in m for m in msgs), msgs
+    assert not any("NARRATIVE_INVALID_TWICE" in m for m in msgs), msgs
+    done_lines = [m for m in msgs if "NARRATIVE_RETRY_DONE" in m]
+    assert len(done_lines) == 1, msgs
+    assert "kind=nested" in done_lines[0] and "narrative=True" in done_lines[0]
+    assert re.search(r"elapsed_ms=\d+", done_lines[0]), done_lines
+
+
+def test_multi_narrative_retry_uses_exec_retry_keywords(monkeypatch, dfs):
+    """The narrative-only retry is built with the same keywords as the flow's
+    exec-error retry (only the values differ)."""
+    fixed = "fig = chart_fixed_kw\nVALUES['b'] = 2"
+
+    def retry(kw):
+        if str(kw.get("error_msg", "")).startswith("narrative_invalid"):
+            return _narr_reply("Fixed {{a}}.")
+        return {"kind": "PLOT_CODE", "code": fixed, "usage": {}}
+
+    brain = Brain(_multi_plan(("plot_code", CODE_A), ("plot_code", "fig = chart_fails_once"),
+                              narrative_t=NESTED), retry=retry).install(monkeypatch)
+    _recording_renders(monkeypatch, {CODE_A: _chart({"a": 1}), fixed: _chart({"b": 2})})
+
+    events = _run_multi(dfs)
+
+    narr_kw = _narr_retries(brain)
+    exec_kw = [kw for kw in brain.calls["retry"] if kw not in narr_kw]
+    assert len(narr_kw) == 1 and len(exec_kw) == 1
+    assert set(narr_kw[0]) == set(exec_kw[0])
+    assert narr_kw[0]["failed_code"] == NARR_DELIM.join([CODE_A, fixed])
+    assert _narrative_events(events)[0]["text"] == "Fixed 1."
+
+
+def test_multi_second_template_invalid_falls_back_to_describe(monkeypatch, dfs, caplog):
+    brain = Brain(_multi_plan(("plot_code", CODE_A), narrative_t=NESTED),
+                  retry=_narr_reply("{{#a}}x{{/b}}")).install(monkeypatch)
+    seen = _recording_renders(monkeypatch, {CODE_A: _chart({"a": 1})})
+
+    with caplog.at_level(logging.INFO, logger="datachat"):
+        events = _run_multi(dfs)
+
+    assert len(brain.calls["retry"]) == 1                     # never a second one
+    assert REPLY_CODE not in seen
+    assert _narrative_events(events) == []
+    done = _done(events)
+    assert done["display_answer"] == "described"
+    assert done["combined_answer"] == "described"
+    assert done["narrative_view"]["phase1"] is None
+    msgs = _msgs(caplog)
+    assert any("NARRATIVE_INVALID_TWICE reason=invalid kind=mismatched" in m for m in msgs), msgs
+    assert not any("reason=no_narrative" in m for m in msgs), msgs
+    assert not any("all_sentences_dropped" in m for m in msgs), msgs
+
+
+def test_multi_first_sentence_protection(monkeypatch, dfs, caplog):
+    brain = Brain(_multi_plan(("plot_code", CODE_A),
+                              narrative_t="Total is {{missing}}. Second sentence."),
+                  retry=_narr_reply(None)).install(monkeypatch)
+    seen = _recording_renders(monkeypatch, {CODE_A: _chart({"a": 1})})
+
+    with caplog.at_level(logging.INFO, logger="datachat"):
+        events = _run_multi(dfs)
+
+    assert len(brain.calls["retry"]) == 1
+    kw = brain.calls["retry"][0]
+    assert kw["error_msg"] == "narrative_invalid: first_sentence"
+    assert kw["use_pro"] is True
+    assert kw["failed_code"] == CODE_A
+    assert REPLY_CODE not in seen
+    assert _narrative_events(events) == []
+    done = _done(events)
+    assert done["display_answer"] == "described"
+    assert "Second sentence" not in done["display_answer"]
+    msgs = _msgs(caplog)
+    assert any("NARRATIVE_INVALID reason=first_sentence" in m for m in msgs), msgs
+    assert any("NARRATIVE_INVALID_TWICE reason=no_narrative" in m for m in msgs), msgs
+    assert any("NARRATIVE_RETRY_DONE kind=first_sentence" in m and "narrative=False" in m
+               for m in msgs), msgs
+
+
+def test_multi_narrative_retry_raise_is_no_reply(monkeypatch, dfs, caplog):
+    def retry(kw):
+        raise RuntimeError("brain down")
+
+    Brain(_multi_plan(("plot_code", CODE_A), narrative_t=NESTED),
+          retry=retry).install(monkeypatch)
+    _recording_renders(monkeypatch, {CODE_A: _chart({"a": 1})})
+
+    with caplog.at_level(logging.INFO, logger="datachat"):
+        events = _run_multi(dfs)
+
+    assert _narrative_events(events) == []
+    assert _done(events)["display_answer"] == "described"
+    msgs = _msgs(caplog)
+    assert any("NARRATIVE_RETRY_FAILED error=RuntimeError" in m for m in msgs), msgs
+    assert any("NARRATIVE_INVALID_TWICE reason=no_narrative" in m for m in msgs), msgs
+    assert not any("brain down" in m for m in msgs)
+
+
+def test_multi_first_sentence_retry_reply_rendered(monkeypatch, dfs):
+    brain = Brain(_multi_plan(("plot_code", CODE_A),
+                              narrative_t="Total is {{missing}}. Second sentence."),
+                  retry=_narr_reply("Total is {{a}}.")).install(monkeypatch)
+    _recording_renders(monkeypatch, {CODE_A: _chart({"a": 1})})
+
+    events = _run_multi(dfs)
+
+    assert len(_narr_retries(brain)) == 1
+    narr = _narrative_events(events)
+    assert len(narr) == 1 and narr[0]["text"] == "Total is 1."
+
+
+def test_multi_valid_template_makes_no_narrative_retry(monkeypatch, dfs):
+    brain = Brain(_multi_plan(("plot_code", CODE_A),
+                              narrative_t="Total is {{a}}. Second is {{missing}}.")
+                  ).install(monkeypatch)
+    _recording_renders(monkeypatch, {CODE_A: _chart({"a": 1})})
+
+    events = _run_multi(dfs)
+
+    assert brain.calls["retry"] == []
+    assert _narrative_events(events)[0]["text"] == "Total is 1."
+
+
+SINGLE_TABLE_CODE = "VALUES['total'] = 3\nRESULT = dfs['f.csv']"
+
+
+def test_single_nested_template_one_narrative_retry(monkeypatch, dfs, caplog):
+    plan = {"kind": "PYTHON", "code": SINGLE_TABLE_CODE, "raw_text": "", "usage": {},
+            "narrative": NESTED.replace("{{#a}}x", "{{#a}}{{total}}")}
+    reply = {"kind": "PYTHON", "usage": {"input_tokens": 5},
+             "code": "VALUES['total'] = 999\nRESULT = dfs['f.csv']",
+             "narrative": "Rows: {{total}}."}
+    brain = Brain(plan, retry=reply).install(monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="datachat"):
+        result = _single(_run_multi(dfs))
+
+    assert len(brain.calls["retry"]) == 1
+    kw = brain.calls["retry"][0]
+    assert kw["error_msg"] == "narrative_invalid: nested"
+    assert kw["use_pro"] is True
+    assert kw["failed_code"] == SINGLE_TABLE_CODE
+    # the reply's code never ran: VALUES still hold the plan code's 3
+    assert result["narrative_template"] == "Rows: {{total}}."
+    assert result["narrative_rendered"] == "Rows: 3."
+    assert result["values"]["total"] == 3
+    assert result["code"] == SINGLE_TABLE_CODE
+    # brain-safe text = history_content of the NEW template (R0)
+    assert result["text"] == narrative.history_content("Rows: {{total}}.", result.get("findings") or {})
+    assert result["usage"]["input_tokens"] >= 5
+    msgs = _msgs(caplog)
+    assert any("NARRATIVE_PARSE_FAILED kind=nested" in m for m in msgs), msgs
+
+
+# ------------------------------------------------- finding sentences, flow
+
+OVERLAP_FINDINGS = {"metric_relation": "metric_definition_overlap"}
+OVERLAP_VALUES = {"t": 5, "overlap_equal_share": 0.976}
+OVERLAP_EN = ("In most rows this metric equals another metric of the data (97.6% of rows), "
+              "so it counts a stock, not new items.")
+CODE_OVL = "fig = chart_ovl\nVALUES['t'] = 5"
+
+
+# the block passes `prefix='ovl_'` to a pdc_diag helper: only then does an
+# `ovl_`-prefixed section resolve (the brain's template-validation rule)
+CODE_OVL_PREFIXED = ("ov = pdc_diag.check_metric_overlap(df, 'a', 'b', prefix='ovl_')\n"
+                     "fig = chart_ovl\nVALUES['t'] = 5")
+
+
+def _overlap_turn(monkeypatch, dfs, template, code=CODE_OVL):
+    Brain(_multi_plan(("plot_code", code), narrative_t=template)).install(monkeypatch)
+    _recording_renders(monkeypatch, {code: _chart(OVERLAP_VALUES, OVERLAP_FINDINGS)})
+    events = _run_multi(dfs)
+    narr = _narrative_events(events)
+    assert len(narr) == 1, events
+    return narr[0]["text"], _done(events)
+
+
+def test_flow_uncovered_finding_gets_sentence(monkeypatch, dfs):
+    text, done = _overlap_turn(monkeypatch, dfs, "Total is {{t}}.")
+    assert text == f"Total is 5.\n\n{OVERLAP_EN}"
+    assert done["display_answer"] == text
+    # display only: the brain-safe text is the marker + the template (R0)
+    assert done["combined_answer"] == narrative.history_content("Total is {{t}}.",
+                                                                OVERLAP_FINDINGS)
+    assert "97.6" not in done["combined_answer"]
+
+
+def test_flow_exact_section_covers_finding(monkeypatch, dfs):
+    t = ("Total is {{t}}. {{#metric_definition_overlap}}It counts a stock."
+         "{{/metric_definition_overlap}}")
+    text, _done_ev = _overlap_turn(monkeypatch, dfs, t)
+    assert text == "Total is 5. It counts a stock."
+
+
+def test_flow_prefixed_section_covers_finding(monkeypatch, dfs):
+    t = ("Total is {{t}}. {{#ovl_metric_definition_overlap}}It counts a stock."
+         "{{/ovl_metric_definition_overlap}}")
+    text, _done_ev = _overlap_turn(monkeypatch, dfs, t, code=CODE_OVL_PREFIXED)
+    assert text == "Total is 5. It counts a stock."
+
+
+def test_flow_prefix_not_passed_by_code_does_not_resolve(monkeypatch, dfs, caplog):
+    """The block code never passes `prefix='ovl_'`: the prefixed section is an
+    unknown name (false), so the finding gets its fixed sentence instead."""
+    t = ("Total is {{t}}. {{#ovl_metric_definition_overlap}}It counts a stock."
+         "{{/ovl_metric_definition_overlap}}")
+    with caplog.at_level(logging.INFO, logger="datachat"):
+        text, _done_ev = _overlap_turn(monkeypatch, dfs, t)
+    assert text == f"Total is 5.\n\n{OVERLAP_EN}"
+    assert any("NARRATIVE_SECTION_UNKNOWN" in m and "name=ovl_metric_definition_overlap" in m
+               for m in _msgs(caplog))
+
+
+def test_flow_negating_prefix_is_not_the_bare_code(monkeypatch, dfs):
+    """`{{#no_metric_definition_overlap}}` must never be shown when the
+    overlap finding fires (it means the opposite)."""
+    t = ("Total is {{t}}. {{#no_metric_definition_overlap}}The metrics are separate."
+         "{{/no_metric_definition_overlap}}")
+    text, _done_ev = _overlap_turn(monkeypatch, dfs, t, code=CODE_OVL_PREFIXED)
+    assert "separate" not in text
+    assert text == f"Total is 5.\n\n{OVERLAP_EN}"
+
+
+def test_flow_inverted_section_does_not_cover(monkeypatch, dfs):
+    t = "Total is {{t}}. {{^metrics_identical}}The two metrics differ.{{/metrics_identical}}"
+    text, _done_ev = _overlap_turn(monkeypatch, dfs, t)
+    assert text == f"Total is 5. The two metrics differ.\n\n{OVERLAP_EN}"
+
+
+def test_flow_section_dropped_by_gate_does_not_cover(monkeypatch, dfs):
+    t = ("Total is {{t}}. {{#metric_definition_overlap}}It equals {{missing}} rows."
+         "{{/metric_definition_overlap}}")
+    text, _done_ev = _overlap_turn(monkeypatch, dfs, t)
+    assert text == f"Total is 5.\n\n{OVERLAP_EN}"
+    assert "n/a" not in text
+
+
+def _fragment(finding: str, lang: str) -> str:
+    """The longest literal piece of a FINDING_SENTENCES entry (placeholders
+    and parentheses removed) — wording-agnostic evidence the entry was used."""
+    entry = narrative.FINDING_SENTENCES[finding][lang]
+    base = entry[0] if isinstance(entry, tuple) else entry
+    pieces = re.split(r"\{[^}]*\}|\([^)]*\)|[()]", base)
+    return max((p.strip(" ,;:.") for p in pieces), key=len)
+
+
+def test_flow_uzbek_finding_sentences_and_number_format(monkeypatch, dfs):
+    code = "fig = chart_uz\nVALUES['total'] = 2345678901"
+    findings = {"units": "mixed_units", "unknown_dominated": True, "unknown_dim": "region"}
+    template = "Jami: {{total:amount}}."
+    plan = _multi_plan(("plot_code", code), narrative_t=template)
+    plan["context_decision"] = {"answer_language": "Uzbek"}
+    Brain(plan).install(monkeypatch)
+    _recording_renders(monkeypatch, {code: _chart({"total": 2345678901}, findings)})
+
+    events = _run_multi(dfs, question="qancha miqdorda kredit ajratildi")
+
+    narr = _narrative_events(events)
+    assert len(narr) == 1
+    text = narr[0]["text"]
+    assert text.startswith("Jami: 2,35 mlrd.")
+    table = getattr(narrative, "FINDING_SENTENCES", None)
+    assert isinstance(table, dict), "narrative.FINDING_SENTENCES is missing"
+    for finding in ("mixed_units", "unknown_dominated"):
+        frag = _fragment(finding, "uz")
+        assert frag and frag in text, (finding, frag, text)
+        assert _fragment(finding, "en") not in text
+    # the unknown_dim finding inside the parenthesis, without a share
+    assert re.search(r"\([^)]*region[^)]*\)", text), text
+    assert text == narrative.add_finding_sentences(
+        "Jami: 2,35 mlrd.", findings, {"total": 2345678901}, set(), "uz", sid="t")
+    done = _done(events)
+    assert done["combined_answer"] == narrative.history_content(template, findings)
+    for frag in (_fragment("mixed_units", "uz"), "2,35"):
+        assert frag not in done["combined_answer"]

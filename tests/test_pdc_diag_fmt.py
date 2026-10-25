@@ -358,3 +358,50 @@ def test_fmt_result_always_a_str_and_bounded():
         assert len(out) <= 200
         if kind not in ("text", "period") and not isinstance(value, (str, bool)):
             assert len(out) <= pdc_diag.FMT_MAX_LEN or out == "n/a"
+
+
+# --- BRB retest 2 follow-up: the uz / ru locales (A4, decision F20) -----------
+# Thousands separator: a NO-BREAK space (U+00A0); decimal separator: a comma;
+# magnitude words in the language. The default locale is unchanged.
+NBSP = " "
+
+LOCALE_EXAMPLES = [
+    ("uz", 1234567, "count", f"1{NBSP}234{NBSP}567"),
+    ("uz", 2345678901, "amount", "2,35 mlrd"),
+    ("uz", 7250000, "amount", "7,25 mln"),
+    ("uz", 5e12, "amount", "5,00 trln"),
+    ("uz", 1234.5678, "float", f"1{NBSP}234,57"),
+    ("ru", 1234567, "count", f"1{NBSP}234{NBSP}567"),
+    ("ru", 2345678901, "amount", "2,35 млрд"),
+    ("ru", 7250000, "amount", "7,25 млн"),
+    ("ru", 5e12, "amount", "5,00 трлн"),
+    ("ru", 0.375, "pct", "37,5%"),
+    ("ru", 3.27, "ratio", "3,3x"),
+    ("ru", 6.6e-6, "ratio", "<0,1x"),
+]
+
+
+@pytest.mark.parametrize("locale,value,kind,expected", LOCALE_EXAMPLES,
+                         ids=[f"{loc}:{k}:{i}" for i, (loc, _v, k, _e) in enumerate(LOCALE_EXAMPLES)])
+def test_fmt_uz_ru_locale_rows(locale, value, kind, expected):
+    assert fmt(value, kind, locale=locale) == expected
+
+
+def test_fmt_uz_ru_locale_entries():
+    assert pdc_diag._LOCALES.get("uz") == {"thousands": NBSP, "decimal": ",", "mln": "mln",
+                                           "bln": "mlrd", "trln": "trln"}
+    assert pdc_diag._LOCALES.get("ru") == {"thousands": NBSP, "decimal": ",", "mln": "млн",
+                                           "bln": "млрд", "trln": "трлн"}
+
+
+def test_fmt_default_locale_unchanged_by_uz_ru():
+    d = pdc_diag._LOCALES["default"]
+    assert d == {"thousands": ",", "decimal": ".", "mln": "mln", "bln": "bln", "trln": "trln"}
+    assert fmt(1234567, "count") == "1,234,567"
+    assert fmt(2345678901, "amount") == "2.35 bln"
+    assert fmt(0.375, "pct", locale=None) == "37.5%"
+    # text, n/a and booleans are never localized
+    for loc in ("uz", "ru"):
+        assert fmt("2026 Март", "text", locale=loc) == "2026 Март"
+        assert fmt(None, "count", locale=loc) == "n/a"
+        assert fmt(True, "count", locale=loc) == "true"

@@ -1186,6 +1186,29 @@ def _slot_counts(template: str, values: dict) -> tuple[int, int]:
         return 0, 0
 
 
+# A pdc_diag `prefix=` argument in a block's code: the prefix it PASSED (the
+# only prefixes a section name may resolve through, A2.2).
+_PASSED_PREFIX_ARG_RE = re.compile(r"\bprefix\s*=\s*(['\"])([a-z][a-z0-9]{0,9}_)\1")
+
+
+def _log_narrative_retry_done(sid, kind, started: float, reply) -> None:
+    """`NARRATIVE_RETRY_DONE kind= elapsed_ms= narrative=` — whether the
+    reply carries a non-blank narrative, never its text."""
+    has = isinstance(reply, dict) and isinstance(reply.get("narrative"), str) \
+        and bool(reply.get("narrative").strip())
+    log_with_sid(sid, "info",
+                 f"NARRATIVE_RETRY_DONE kind={log_safe_text(kind, 20)} "
+                 f"elapsed_ms={int((_time.monotonic() - started) * 1000)} "
+                 f"narrative={bool(has)}")
+
+
+def _passed_prefixes(code) -> frozenset:
+    """The section-name prefixes `code` passes as `prefix="<p>_"`."""
+    if not isinstance(code, str):
+        return frozenset()
+    return frozenset(m.group(2) for m in _PASSED_PREFIX_ARG_RE.finditer(code))
+
+
 @dataclass
 class _NarrState:
     """One phase's narrative state (A5.1): the received templates, the
@@ -1208,9 +1231,17 @@ class _NarrState:
     described: int = 0
     display_answers: list = field(default_factory=list)
     rendered: Optional[str] = None
+    # the answer language code ("en" | "ka" | "ru" | "uz"): the locale of
+    # every rendered number and the language of the FINDING sentences
+    lang: str = "en"
+    # the section-name prefixes each absorbed block's code PASSED to a
+    # pdc_diag helper (`prefix="ovl_"`), by block index: a caption resolves
+    # its own block's, the narrative the union of the phase's (A2.2)
+    block_prefixes: dict = field(default_factory=dict)
 
     @classmethod
-    def from_reply(cls, reply, input_columns, sid, phase: int = 1) -> "_NarrState":
+    def from_reply(cls, reply, input_columns, sid, phase: int = 1,
+                   lang: str = "en") -> "_NarrState":
         reply = reply if isinstance(reply, dict) else {}
         return cls(
             phase=phase,
@@ -1219,7 +1250,20 @@ class _NarrState:
                                               sid=sid, what="narrative"),
             captions=narrative.clean_captions(reply.get("captions"), sid=sid),
             input_columns=frozenset(input_columns or ()),
-            sid=sid)
+            sid=sid,
+            lang=lang if isinstance(lang, str) and lang else "en")
+
+    @property
+    def locale(self) -> Optional[str]:
+        return narrative.locale_for(self.lang)
+
+    @property
+    def prefixes(self) -> frozenset:
+        """The phase's passed prefixes: the union over every absorbed block."""
+        out: set = set()
+        for found in self.block_prefixes.values():
+            out |= found
+        return frozenset(out)
 
     def take_retry_reply(self, reply, *, block_index: int, single: bool) -> None:
         """A1.5: a retry reply's `caption:1` replaces caption `block_index`
@@ -1258,6 +1302,9 @@ class _NarrState:
                 log_with_sid(log_safe_text(self.sid, 200), "info", f"FINDINGS_DROPPED n={int(findings_dropped)}")
             validated = narrative.validate_findings(out.get("findings"), code or "",
                                                     self.input_columns, self.sid)
+            passed = _passed_prefixes(code)
+            self.block_prefixes[block_index] = (
+                self.block_prefixes.get(block_index, frozenset()) | passed)
             if block_index in self.block_findings:
                 # the children of a multi-axes regen share their block's index
                 narrative.merge_findings(self.block_findings[block_index], validated,
@@ -1289,7 +1336,9 @@ class _NarrState:
             rendered = narrative.render(template, block_values or {},
                                         self.block_findings_for(block_index),
                                         sid=self.sid,
-                                        max_len=narrative.CAPTION_RENDERED_MAX)
+                                        max_len=narrative.CAPTION_RENDERED_MAX,
+                                        locale=self.locale,
+                                        prefixes=self.block_prefixes.get(block_index))
             rendered = narrative.drop_na_sentences(rendered, sid=self.sid, what="caption")
             if not rendered.strip():
                 self.captions_used.discard(block_index)
@@ -1304,10 +1353,55 @@ class _NarrState:
                          f"CAPTION_RENDER_FAILED error={log_safe_text(type(e).__name__, 80)}")
             return None
 
-    def finish(self) -> Optional[str]:
+    def _checked_render(self, template: str) -> tuple:
+        """`(invalid_kind, rendered, sections)` of `template`: a parse error
+        (`NARRATIVE_PARSE_FAILED kind=`) or a FIRST sentence holding "n/a"
+        before the quality gate (`NARRATIVE_INVALID reason=first_sentence`)
+        makes it invalid — `(kind, None, None)`; else `(None, text, sections)`."""
+        kind = narrative.template_error_kind(template)
+        if kind is not None:
+            log_with_sid(log_safe_text(self.sid, 200), "warning",
+                         f"NARRATIVE_PARSE_FAILED kind={log_safe_text(kind, 20)}")
+            return kind, None, None
+        rendered, sections = narrative.render_with_sections(
+            template, self.values, self.findings, sid=self.sid, locale=self.locale,
+            prefixes=self.prefixes)
+        if narrative.first_sentence_has_na(rendered):
+            log_with_sid(log_safe_text(self.sid, 200), "warning",
+                         "NARRATIVE_INVALID reason=first_sentence")
+            return "first_sentence", None, None
+        return None, rendered, sections
+
+    def _retry_template(self, kind: str, retry_narrative) -> Optional[str]:
+        """The narrative of ONE narrative-only retry reply (`clean_template`),
+        or None — no callback, a raise (logged, type only), no reply or no
+        narrative. Only the narrative is read: the reply's code and captions
+        are ignored and nothing re-runs."""
+        if retry_narrative is None:
+            return None
+        try:
+            reply = retry_narrative(kind)
+        except Exception as e:                               # noqa: BLE001
+            log_with_sid(log_safe_text(self.sid, 200), "warning",
+                         f"NARRATIVE_RETRY_FAILED error={log_safe_text(type(e).__name__, 80)}")
+            return None
+        if not isinstance(reply, dict):
+            return None
+        return narrative.clean_template(reply.get("narrative"),
+                                        max_len=narrative.TEMPLATE_MAX,
+                                        sid=self.sid, what="narrative")
+
+    def finish(self, retry_narrative=None) -> Optional[str]:
         """Merge the blocks' FINDINGS in block_index order (B7.2) and render
         the narrative — only when a template exists and at least one block
-        succeeded. Returns the rendered text, or None (narrative not used)."""
+        succeeded. Returns the rendered text, or None (narrative not used).
+
+        An INVALID template (a parse error, or a first sentence holding
+        "n/a") gets ONE `retry_narrative(kind)` call; a valid narrative in
+        its reply replaces `self.template`, anything else logs
+        `NARRATIVE_INVALID_TWICE` and the narrative is not used. A valid
+        template passes the quality gate, then gains the FINDING sentences
+        of every finding no stated section covers (display text, R0)."""
         try:
             self.findings = {}
             for n in sorted(self.block_findings):
@@ -1317,17 +1411,35 @@ class _NarrState:
             if self.ok_blocks < 1:
                 log_with_sid(log_safe_text(self.sid, 200), "info", "NARRATIVE_SKIPPED reason=no_successful_block")
                 return None
-            rendered = narrative.render(self.template, self.values, self.findings,
-                                        sid=self.sid)
+            kind, rendered, sections = self._checked_render(self.template)
+            if kind is not None:
+                new_template = self._retry_template(kind, retry_narrative)
+                if new_template is None:
+                    # no callback, a raise, no reply or a reply without a narrative
+                    self.rendered = None
+                    log_with_sid(log_safe_text(self.sid, 200), "warning",
+                                 "NARRATIVE_INVALID_TWICE reason=no_narrative")
+                    return None
+                kind, rendered, sections = self._checked_render(new_template)
+                if kind is not None:
+                    self.rendered = None
+                    log_with_sid(log_safe_text(self.sid, 200), "warning",
+                                 "NARRATIVE_INVALID_TWICE reason=invalid "
+                                 f"kind={log_safe_text(kind, 20)}")
+                    return None
+                self.template = new_template
             # Quality gate: a sentence holding "n/a" (a missing slot or a None
-            # value) is dropped; nothing left -> the narrative is not used and
-            # the turn takes today's describe / summarize path.
+            # value) is dropped. The first sentence is protected above, so an
+            # empty result is a guard only.
             rendered = narrative.drop_na_sentences(rendered, sid=self.sid, what="narrative")
             if not rendered.strip():
                 self.rendered = None
                 log_with_sid(log_safe_text(self.sid, 200), "info",
                              "NARRATIVE_SKIPPED reason=all_sentences_dropped")
                 return None
+            covered = narrative.covered_codes(rendered, sections)
+            rendered = narrative.add_finding_sentences(rendered, self.findings, self.values,
+                                                       covered, self.lang, sid=self.sid)
             self.rendered = rendered
             slots, missing = _slot_counts(self.template, self.values)
             log_with_sid(log_safe_text(self.sid, 200), "info",
@@ -1919,7 +2031,9 @@ def run_chat_multi_plot(
 
     # The phase's narrative state: the plan's templates, the merged VALUES and
     # the per-block FINDINGS (A5.1).
-    narr = _NarrState.from_reply(plan_out, input_columns, sid)
+    narr = _NarrState.from_reply(
+        plan_out, input_columns, sid,
+        lang=narrative.answer_lang_code(plan_out.get("context_decision"), question))
 
     # Block numbers are the planner's own positions (1-based), assigned BEFORE
     # the table blocks are pulled out — `caption:n` names the n-th fence of the
@@ -2393,8 +2507,36 @@ def run_chat_multi_plot(
             log_with_sid(sid, "warning",
                          f"MIXED_TABLE_BLOCK_FAILED: {log_safe_text(str(e), 200)}")
 
+    def _retry_narrative(kind: str):
+        """ONE narrative-only retry (A5.1): the exec-error retry's keywords,
+        `error_msg = "narrative_invalid: <kind>"`, the emitted codes as
+        `failed_code`. Only the reply's narrative is used — its code never
+        runs, so the SQL map is not merged. A raise -> no reply."""
+        nonlocal total_usage
+        started = _time.monotonic()
+        try:
+            emitted = list(dict.fromkeys(list(combined_codes) + list(table_codes)))
+            retry_out = brain_client.retry(
+                sid=sid, question=question, schema_text=schema_str,
+                df_names=df_names, df_columns=df_columns, history_rows=history_rows,
+                error_msg=f"narrative_invalid: {kind}",
+                failed_code="\n###NEXT_PLOT###\n".join(emitted),
+                use_pro=True, use_search=False, user_email=user_email,
+                dataset_profile=dataset_profile,
+                sql=_retry_sql(state), sql_error=None,
+                live_tables=live_tables, capabilities=caps,
+            )
+            if isinstance(retry_out, dict):
+                total_usage = _sum_usage(total_usage, retry_out.get("usage") or {})
+            _log_narrative_retry_done(sid, kind, started, retry_out)
+            return retry_out
+        except Exception as e:                               # noqa: BLE001
+            log_with_sid(sid, "warning",
+                         f"NARRATIVE_RETRY_FAILED error={log_safe_text(type(e).__name__, 80)}")
+            return None
+
     # The phase's narrative, rendered once every block has run (A5.1).
-    rendered = narr.finish()
+    rendered = narr.finish(retry_narrative=_retry_narrative)
     narrative_used = rendered is not None
 
     # If every block failed all its retries we rendered ZERO charts — surface a
@@ -2518,7 +2660,38 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
                 "image_base64": None, "table": None, "code": None, "usage": usage}
 
     narr = _NarrState.from_reply({"narrative": plan_narrative, "captions": plan_captions},
-                                 input_columns, sid)
+                                 input_columns, sid,
+                                 lang=narrative.answer_lang_code(context_decision, question))
+    # The usage of the narrative-only retry (`_retry_narrative`), added to
+    # every answer `_compose` builds.
+    narr_usage: dict = {}
+
+    def _retry_narrative(kind: str):
+        """ONE narrative-only retry (A5.1): the exec-error retry's keywords,
+        `error_msg = "narrative_invalid: <kind>"`, the executed `code` as
+        `failed_code`. Only the reply's narrative is used — its code never
+        runs, so the SQL map is not merged. A raise -> no reply."""
+        started = _time.monotonic()
+        try:
+            retry_out = brain_client.retry(
+                sid=sid, question=question, schema_text=schema_str,
+                df_names=df_names, df_columns=df_columns,
+                history_rows=history_rows,
+                error_msg=f"narrative_invalid: {kind}", failed_code=code,
+                use_pro=True, use_search=False,
+                user_email=user_email,
+                dataset_profile=dataset_profile,
+                sql=_retry_sql(state), sql_error=None,
+                live_tables=live_tables, capabilities=capabilities,
+            )
+            if isinstance(retry_out, dict):
+                narr_usage.update(_sum_usage(narr_usage, retry_out.get("usage") or {}))
+            _log_narrative_retry_done(sid, kind, started, retry_out)
+            return retry_out
+        except Exception as e:                               # noqa: BLE001
+            log_with_sid(sid, "warning",
+                         f"NARRATIVE_RETRY_FAILED error={log_safe_text(type(e).__name__, 80)}")
+            return None
 
     exec_out = _exec(code, kind)
 
@@ -2611,7 +2784,7 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
     def _compose(visual: dict | None) -> dict:
         """The A5.3 keys and the brain-safe `text`, from the visual's fields
         and the rendered narrative."""
-        rendered = narr.finish()
+        rendered = narr.finish(retry_narrative=_retry_narrative)
         fields: dict = {}
         visual = visual or {}
         if rendered is not None:
@@ -2639,9 +2812,10 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
     if kind == "PLOT_CODE":
         img_b64 = exec_out.get("plotly_html") if exec_out.get("is_plotly") else exec_out.get("image")
         visual, d_usage = _visual(chart_data=exec_out.get("chart_data"))
+        fields = _compose(visual)
         return {"image_base64": img_b64, "table": None,
                 "code": code, "chart_data": exec_out.get("chart_data"),
-                "usage": _sum_usage(usage, d_usage), **_compose(visual)}
+                "usage": _sum_usage(_sum_usage(usage, d_usage), narr_usage), **fields}
 
     # PYTHON
     result_obj = exec_out.get("result")
@@ -2653,14 +2827,16 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
 
     if img_b64:
         visual, d_usage = _visual(result_obj=result_obj)
+        fields = _compose(visual)
         return {"image_base64": img_b64, "table": table,
-                "tables": tables, "code": code, "usage": _sum_usage(usage, d_usage),
-                **_compose(visual)}
+                "tables": tables, "code": code,
+                "usage": _sum_usage(_sum_usage(usage, d_usage), narr_usage), **fields}
     if table or tables:
         visual, d_usage = _visual(result_obj=result_obj)
+        fields = _compose(visual)
         return {"image_base64": None, "table": table,
-                "tables": tables, "code": code, "usage": _sum_usage(usage, d_usage),
-                **_compose(visual)}
+                "tables": tables, "code": code,
+                "usage": _sum_usage(_sum_usage(usage, d_usage), narr_usage), **fields}
 
     # A scalar / flat-dict result. With a narrative, the answer IS the
     # rendered narrative: no summarize call. Without one, summarize gets no
@@ -2670,14 +2846,15 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
         fields = _compose(None)
         if "text" in fields:
             return {"image_base64": None, "table": None, "code": code,
-                    "usage": usage, **fields}
+                    "usage": _sum_usage(usage, narr_usage), **fields}
     s = brain_client.summarize(
         sid=sid, question=question, schema_text=schema_str,
         history_rows=history_rows, preview=None,
         context_decision=context_decision, user_email=user_email,
     )
     out = {"text": s.get("text", ""), "image_base64": None, "table": None,
-           "code": code, "usage": _sum_usage(usage, s.get("usage") or {})}
+           "code": code,
+           "usage": _sum_usage(_sum_usage(usage, s.get("usage") or {}), narr_usage)}
     shown = narrative.value_display(_safe_preview(exec_out.get("preview")),
                                     narrative.answer_lang_code(context_decision, question))
     if shown:

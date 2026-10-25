@@ -102,12 +102,22 @@ _PALETTE = {"base": "#4C78A8", "highlight": "#E45756", "up": "#54A24B", "down": 
 # ---------------------------------------------------------------------------
 KINDS = ("count", "float", "pct", "ratio", "amount", "text", "period")
 _NUMERIC_KINDS = ("count", "float", "pct", "ratio", "amount")
+# uz / ru (decision F20): a NO-BREAK space (U+00A0) groups thousands, a comma
+# is the decimal separator, the magnitude words are the language's own.
 _LOCALES = {"default": {"thousands": ",", "decimal": ".", "mln": "mln", "bln": "bln",
-                        "trln": "trln"}}
+                        "trln": "trln"},
+            "uz": {"thousands": " ", "decimal": ",", "mln": "mln", "bln": "mlrd",
+                   "trln": "trln"},
+            "ru": {"thousands": " ", "decimal": ",", "mln": "млн",
+                   "bln": "млрд", "trln": "трлн"}}
 FMT_MAX_LEN = 32
 # A period holding fewer than THIN_PERIOD_RATIO x the median period's rows is
 # thin (coverage_check `ratio_low`) and, for detect_anomalies, a data gap.
 THIN_PERIOD_RATIO = 0.5
+# A finite value >= 0 below COLLAPSE_RATIO x every existing neighbour (each
+# finite and > 0) is a collapsed period: detect_anomalies treats it as a data
+# gap even when the frame holds one row per period (pre-aggregated input).
+COLLAPSE_RATIO = 0.01
 # `ratio` edges: 0 <= v < RATIO_FLOOR -> "<0.1x", v > RATIO_CEILING -> ">1000x".
 RATIO_FLOOR = 0.05
 RATIO_CEILING = 1000
@@ -214,8 +224,13 @@ def _localize(number: str, unit: str, locale) -> str:
 # ---------------------------------------------------------------------------
 def _check_prefix(prefix) -> str:
     if not isinstance(prefix, str) or not _PREFIX_RE.fullmatch(prefix):
-        raise ValueError("prefix: must be empty or lowercase letters/digits (at most 10, "
-                         "starting with a letter) followed by '_'")
+        # No quoted literal here: the client's retry scrub turns every quoted
+        # literal the failed code does not contain into '<value>', which hid
+        # the trailing-underscore rule from the planner.
+        raise ValueError("prefix: must be empty, or 1 to 10 lowercase letters or digits "
+                         "starting with a letter and then exactly one underscore at the "
+                         "end, for example ovl_; an underscore inside the prefix is not "
+                         "allowed")
     return prefix
 
 
@@ -741,8 +756,10 @@ def _anomaly_core(values: list, z: float, ratio: float, skip=None) -> dict:
 
 def _data_gaps(values: list, rows: list, thin_ratio: float) -> list:
     """Indexes of the DATA-GAP periods: fewer rows than `thin_ratio` x the
-    median period's rows, or an aggregated value of exactly 0 while every
-    existing neighbour is non-zero and finite."""
+    median period's rows; an aggregated value of exactly 0 while every
+    existing neighbour is non-zero and finite; or a COLLAPSED value — finite,
+    >= 0 and below `COLLAPSE_RATIO` x every existing neighbour, each of them
+    finite and > 0 (what a pre-aggregated, one-row-per-period frame shows)."""
     n = len(values)
     if not n:
         return []
@@ -753,13 +770,33 @@ def _data_gaps(values: list, rows: list, thin_ratio: float) -> list:
             gaps.append(i)
             continue
         v = values[i]
-        if not (isinstance(v, (int, float)) and math.isfinite(v) and v == 0):
+        if not (isinstance(v, (int, float)) and math.isfinite(v)):
             continue
         neighbours = [values[j] for j in (i - 1, i + 1) if 0 <= j < n]
-        if neighbours and all(isinstance(w, (int, float)) and math.isfinite(w) and w != 0
-                              for w in neighbours):
+        if not neighbours:
+            continue
+        if v == 0 and all(isinstance(w, (int, float)) and math.isfinite(w) and w != 0
+                          for w in neighbours):
+            gaps.append(i)
+            continue
+        if v >= 0 and all(isinstance(w, (int, float)) and math.isfinite(w) and w > 0
+                          and v < COLLAPSE_RATIO * w for w in neighbours):
             gaps.append(i)
     return gaps
+
+
+def _gap_period(labels: list, values: list, rows: list, gaps) -> str | None:
+    """The label of the gap period with the fewest rows (ties: the lowest
+    value, then the earliest period), else None."""
+    if not gaps:
+        return None
+
+    def key(i):
+        v = values[i]
+        v = v if isinstance(v, (int, float)) and math.isfinite(v) else math.inf
+        return (rows[i], v, i)
+
+    return _label_str(labels[min(gaps, key=key)])
 
 
 def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
@@ -793,6 +830,7 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
         "anomaly_period": None, "anomaly_value": None, "baseline_value": None,
         "anomaly_ratio_median": None, "anomaly_prev_period": None, "anomaly_prev_value": None,
         "anomaly_ratio_prev": None, "n_periods": n, "n_anomalies": 0,
+        "data_gap_period": None,
     }
     columns = ["period", "value", "robust_z", "ratio_prev", "ratio_median", "is_anomaly",
                "is_primary", "rows", "is_data_gap"]
@@ -832,6 +870,7 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
     table.attrs["pdc_metric"] = str(metric)
     if gaps:
         findings["period_status"] = "data_gap"
+        values["data_gap_period"] = _gap_period(labels, v, rows, gaps)
 
     n_anomalies = int(sum(flagged))
     values["baseline_value"] = _num(core["median"])
@@ -1032,6 +1071,8 @@ def decompose_change(df, period_col, metric, from_period=None, to_period=None, d
 
     table = pd.DataFrame(rows, columns=_DECOMPOSE_COLUMNS) if rows else empty
     table.attrs["pdc_metric"] = str(metric)
+    table.attrs["pdc_from_period"] = values["change_from_period"]
+    table.attrs["pdc_to_period"] = values["change_to_period"]
 
     if usable:
         concentrated_dims = [d for d in usable if per_dim[d]["concentrated"]]
@@ -1053,6 +1094,7 @@ def decompose_change(df, period_col, metric, from_period=None, to_period=None, d
             values["change_top_member_share"] = _num(top["sod"])
             values["change_top_member_delta"] = _num(top["delta"])
             values["change_dim_label"] = str(chosen)
+            table.attrs["pdc_change_dim"] = str(chosen)
     return _result(table, values, findings, prefix)
 
 
@@ -1372,12 +1414,19 @@ def plot_highlighted_series(table, period_col="period", value_col="value", *,
 
 def plot_waterfall(table, *, dim=None, title=None, y_title=None):
     """From a `decompose_change` table: start = Σfrom, one bar per member
-    delta of `dim` (default: the first dim), end = Σto."""
+    delta of the dim, end = Σto. The dim is the one `decompose_change` chose
+    (`attrs["pdc_change_dim"]`) whenever it is in the table — a conflicting
+    `dim=` is ignored, so the chart always shows what the text names — else
+    `dim`, else the first dim. The title (given or default) ends with
+    " (<dim>)" unless it already names the dim (case-insensitive)."""
     _require_table(table, ["dim", "member", "from_value", "to_value", "delta"], "plot_waterfall")
     import plotly.graph_objects as go
 
     dims = list(dict.fromkeys(table["dim"].tolist()))
-    if dim is None:
+    chosen = table.attrs.get("pdc_change_dim")
+    if chosen is not None and chosen in dims:
+        dim = chosen
+    elif dim is None:
         if not dims:
             raise ValueError("table: plot_waterfall needs at least one row")
         dim = dims[0]
@@ -1389,6 +1438,16 @@ def plot_waterfall(table, *, dim=None, title=None, y_title=None):
     deltas = pd.to_numeric(part["delta"], errors="coerce").fillna(0).astype(float).tolist()
     labels = ["Start"] + [str(m) for m in part["member"].tolist()] + ["End"]
     metric = table.attrs.get("pdc_metric") or "value"
+    if title is None:
+        from_p = table.attrs.get("pdc_from_period")
+        to_p = table.attrs.get("pdc_to_period")
+        if from_p is not None and to_p is not None:
+            title = f"What changed: {metric} by {dim}, {from_p} to {to_p}"
+        else:
+            title = f"What changed: {metric} by {dim}"
+    title = str(title)
+    if str(dim).lower() not in title.lower():
+        title = f"{title} ({dim})"
     fig = go.Figure(go.Waterfall(
         x=labels,
         y=[start] + deltas + [end],
@@ -1399,7 +1458,7 @@ def plot_waterfall(table, *, dim=None, title=None, y_title=None):
     ))
     fig.update_layout(
         template="plotly_white",
-        title=title if title is not None else f"What changed: {metric} from first to last period",
+        title=title,
         xaxis_title=str(dim),
         yaxis_title=y_title if y_title is not None else str(metric),
         showlegend=False,
