@@ -225,6 +225,8 @@ _TOKEN_RE = re.compile(
   - (b) `flag in findings` and the value is not a bool (a column name or code);
   - (c) `flag ∈ pdc_diag.FINDINGS_ENUM` and some value in `findings.values()` equals `flag`.
 - **`{{^flag}}…{{/flag}}`** is shown exactly when the `#` condition is false.
+- **Section names (`_resolve_section`).** An exact FINDINGS key wins. A `FINDINGS_ENUM` code or a `pdc_diag` registry key is itself. Otherwise a name `<prefix>_<code>` whose `<code>` is an enum code or a registry key counts as that code, but ONLY when `<prefix>_` is a prefix the phase's executed code passes to `pdc_diag` (`prefix\s*=\s*['"]([a-z][a-z0-9]{0,9}_)['"]`, collected per absorbed block and handed to `render` as `prefixes=`): `prefix=` renames VALUES keys only, so a planner that passes `prefix="ovl_"` and writes `{{#ovl_metric_definition_overlap}}` means `metric_definition_overlap` (the BRB run-2 English stock warning was lost to this). A prefix the code never passes (`no_`, `not_`, `has_`) is never resolved, because stripping it would flip the condition; this is the brain's template-validation rule too. `brain_view` (title, report) gets no prefixes, so a prefixed section is false there. Any other name is false and logs `NARRATIVE_SECTION_UNKNOWN name=<name>` once per render (the name is a template identifier, escaped and capped at 40 characters). `brain_view` resolves the same way.
+- **Parse errors** carry a kind (`TemplateError.kind`, `narrative.template_error_kind(template)`): `nested` (a section inside a section), `unclosed` (an open never closed), `mismatched` (a close whose name differs, or a close without an open).
 - Unused VALUES are ignored.
 - **Default kind** (unknown or absent kind): bool → `text` (`"true"`/`"false"`), int → `count`, float → `float`, str → `text`, None → `"n/a"`.
 - **Post-processing**, in this order:
@@ -382,7 +384,7 @@ Rules, applied in order:
    - `ratio`: `0 ≤ v < 0.05` ⇒ `"<0.1x"`; `v > 1000` ⇒ `">1000x"`; otherwise `",.1f"` + `"x"` (a negative ratio keeps the fixed-point rule). A collapse such as 6.6e-6 therefore never reads as `"0.0x"`;
    - `amount`: `|v| ≥ 1e12` ⇒ `format(v / 1e12, ",.2f") + " " + trln` (decision F12); `|v| ≥ 1e9` ⇒ `format(v / 1e9, ",.2f") + " " + bln`; `|v| ≥ 1e6` ⇒ the same with `/1e6` and `mln`; otherwise the count rule.
 9. Negative zero: if the result starts with `"-"` and contains no digit 1–9, drop the `"-"`.
-10. Locale: when `locale` names an entry other than `default`, swap the separators through a placeholder (`,` → `\0`, `.` → decimal, `\0` → thousands) and swap the `mln`/`bln`/`trln` words. An unknown locale ⇒ default.
+10. Locale: when `locale` names an entry other than `default`, swap the separators through a placeholder (`,` → `\0`, `.` → decimal, `\0` → thousands) and swap the `mln`/`bln`/`trln` words. An unknown locale ⇒ default. Two locales exist besides `default` (decision F20, 2026-10-25): `uz` = thousands U+00A0 (no-break space), decimal `,`, words `mln` / `mlrd` / `trln`; `ru` = the same separators, words `млн` / `млрд` / `трлн`. `narrative` picks the locale from the answer language (`locale_for(lang)`: uz → `uz`, ru → `ru`, everything else default) for every slot, caption, `value_display` line and finding sentence. Period labels are shown in the file's own form (month names are not translated).
 11. A result longer than `FMT_MAX_LEN` (32) ⇒ `"n/a"`.
 
 **Example table** (pinned by `tests/test_pdc_diag_fmt.py::test_fmt_examples_table`; every magnitude is invented):
@@ -408,6 +410,12 @@ Rules, applied in order:
 | `12` | ratio | `12.0x` |
 | `6.6e-6` | ratio | `<0.1x` |
 | `1e9` | ratio | `>1000x` |
+| `1234567` | count, `uz` / `ru` | `1 234 567` (U+00A0) |
+| `2345678901` | amount, `uz` / `ru` | `2,35 mlrd` / `2,35 млрд` |
+| `7250000` | amount, `uz` / `ru` | `7,25 mln` / `7,25 млн` |
+| `5e12` | amount, `uz` / `ru` | `5,00 trln` / `5,00 трлн` |
+| `0.375` | pct, `ru` | `37,5%` |
+| `6.6e-6` | ratio, `ru` | `<0,1x` |
 | `0.48` | ratio | `0.5x` |
 | `2345678901` | amount | `2.35 bln` |
 | `7250000` | amount | `7.25 mln` |
@@ -463,6 +471,8 @@ class _NarrState:                 # one per phase
   - the rendered caption passes the quality gate below (`what=caption`); a caption the gate empties counts as missing, so describe runs for that visual.
 - **Narrative.** After all blocks of the phase finish, and only if `ok_blocks ≥ 1`: `render(template, values, findings, sid=sid)`, then the quality gate (`what=narrative`), then `_append_live_notes` (`run_chat_local.py:478`) on the RENDERED text only. If `ok_blocks == 0`, the narrative is not used (`NARRATIVE_SKIPPED reason=no_successful_block`) and today's failure texts apply. If the gate empties the text, the narrative is not used either (`NARRATIVE_SKIPPED reason=all_sentences_dropped`) and the answer takes today's no-narrative path: the per-visual describe / caption texts, or summarize plus `value_display` for a scalar.
 - **Quality gate** — `narrative.drop_na_sentences(text, *, sid, what) -> str`, applied to every rendered text before display. The text is split on newlines and after `.` / `!` / `?` followed by whitespace or the end (so `7.9x` or `1,234.57` is not a sentence end). Every piece holding the token `n/a` (case-insensitive, not inside a word) is removed, then the A2.2 space/newline post-processing runs again. A missing slot, a slot whose value is None and a non-finite value all render `n/a`, so a sentence about a value the code did not produce never reaches the user. One line `NARRATIVE_SENTENCE_DROPPED reason=missing_slot n=<pieces> what=<narrative|caption>` per text, never the text. The stored template and VALUES are unchanged; a text without `n/a` is returned as it is. Never raises. Known limits: a value or template text that legitimately reads `N/A` (a category named so) drops its sentence too, and is still logged as `missing_slot`; an abbreviation such as `e.g. ` counts as a sentence end.
+- **Invalid template.** Before the gate, `finish` checks the template: a parse error (`NARRATIVE_PARSE_FAILED kind=nested|unclosed|mismatched`) or a FIRST rendered sentence holding `n/a` (`NARRATIVE_INVALID reason=first_sentence`) makes it invalid; the headline is never dropped silently and `fallback_text` is no longer shown as a narrative. An invalid template gets ONE narrative-only retry through `/v1/retry`: the flow's exec-error retry keywords with `error_msg = "narrative_invalid: <kind>"` (kind `nested`, `unclosed`, `mismatched` or `first_sentence`), `failed_code` = the code that already ran (single: the block's code; multi: the emitted chart codes then the table codes, joined with `\n###NEXT_PLOT###\n`), `use_pro = true`, `sql` = what ran, `sql_error = null`. Only the reply's `narrative` is read (through `clean_template`); its code and captions are ignored and nothing re-runs (the SQL map is not merged). Its usage is added to the turn. The reply's template is checked the same way: valid ⇒ it replaces the plan's template (also in `content` = `history_content`), invalid or absent ⇒ `NARRATIVE_INVALID_TWICE` and the turn takes the no-narrative path (A6). A raise in the retry logs `NARRATIVE_RETRY_FAILED error=<Type>` and counts as no reply.
+- **Finding sentences** (`narrative.FINDING_SENTENCES`, `add_finding_sentences`). After the gate, `finish` appends one fixed sentence, in the answer language (en / uz / ru / ka from `answer_lang_code`; unknown ⇒ en), for each data-quality finding present in the merged FINDINGS that no shown section already states. A section states a finding when it was shown as `{{#<code>}}` (after the prefix resolution of A2.2, never `{{^…}}`) and one of its body sentences survived the gate. Findings, in this order: `mixed_units` (`units == "mixed_units"`; covered by `mixed_units`, `units`), `coverage_change` (`coverage == "coverage_change"`; covered by `coverage_change`; slot `coverage_dim_label`, else the `coverage_dim` finding), thin period / data gap (`thin_period` or `period_status == "data_gap"`; covered by `thin_period`, `data_gap`; slot `thin_period_label`, else `data_gap_period`), `unknown_dominated` (covered by `unknown_dominated`; slots `unknown_dim_label` + `unknown_share_max`, else the `unknown_dim` finding alone), `metric_definition_overlap` (`metric_relation`; covered by `metric_definition_overlap`, `metrics_identical`, `metric_relation`; slot `overlap_equal_share`), `latest_is_past_period` (covered by itself; slot `latest_period`). A slot is looked up by its exact VALUES key, else the first key `^[a-z][a-z0-9]{0,9}_<name>$` (prefixed VALUES). Every value is formatted with the answer locale and lives in a parenthesis; a missing, None or `n/a` value drops its part, and with no part left the whole parenthesis goes, so a finding sentence never shows `n/a`. The sentences form ONE new paragraph: before the last sentence when that sentence is a reading guide (it names a visual: en table/chart/graph/bar/waterfall, uz jadval/grafik/diagramma, ru таблиц/график/диаграмм, ka ცხრილ/გრაფიკ/დიაგრამ; and it is not the first sentence), else at the end. Logged `FINDING_SENTENCES_ADDED n=<n> lang=<code>`. Display text only (R0): `content` stays `history_content(template, findings)`. English wording: "Amounts carry more than one currency or unit label, so they are reported per label and never added together." / "The set of values in one dimension changes between periods (CURRENCY), so totals are not comparable across periods." / "One period looks incomplete (2026 Февраль): it has far fewer rows or almost no value compared with the other periods, so it is treated as a data gap, not a business change." (one wording for both causes: the row rule and the value collapse) / "Many rows have no value in one dimension (SEKTOR; up to 100.0% Unknown), so that dimension cannot explain any change." / "In most rows this metric equals another metric of the data (97.6% of rows), so it counts a stock, not new items." / "The data ends before the current month (latest period: 2026 Март)." (uz / ru / ka: `narrative.FINDING_SENTENCES`).
 - Log after each phase: `NARRATIVE_USED phase=<p> slots=<n> missing=<n> captions=<n> described=<n>`.
 
 #### A5.2 Brain-safe text vs display text — one rule
@@ -599,7 +609,9 @@ def _apply_narrative_fields(rec: dict, src: dict | None) -> dict
 | No narrative (old brain, model omitted it, dropped by caps or kind) | today's describe per visual (with `data_caveat.findings` when FINDINGS exist, B7.4); summarize for a scalar with `preview=None` + local `value_display` |
 | Narrative present, a visual has no caption | user item A.5: today's per-chart describe for THAT visual only (unchanged prompt; `data_caveat.findings` added when FINDINGS exist; backstop caveat as today). The answer-level text stays the narrative; summarize is never called. See F27 |
 | No narrative, some captions present | captioned visuals use the rendered caption (no describe); uncaptioned visuals → describe with an unchanged prompt (+ findings caveat) |
-| Render error | `fallback_text` (sections removed, slots `"n/a"`), `NARRATIVE_RENDER_FAILED error=<Type>`; the quality gate then drops every sentence that held a slot |
+| Render error (caption) | `fallback_text` (sections removed, slots `"n/a"`), `NARRATIVE_RENDER_FAILED error=<Type>`; the quality gate then drops every sentence that held a slot |
+| Narrative template invalid (parse error, or a first sentence holding `n/a`) | ONE narrative-only retry (`narrative_invalid: <kind>`, A5.1); its valid narrative is rendered, else `NARRATIVE_INVALID_TWICE` and the "No narrative" row |
+| A finding no shown section states | one fixed sentence per finding, in the answer language (A5.1) |
 | A rendered sentence holds `n/a` (missing slot, None or non-finite value) | that sentence is dropped (A5.1 quality gate); a caption left empty ⇒ describe for that visual; a narrative left empty ⇒ the "No narrative" row |
 | Every block of the phase failed | narrative not used; today's failure texts |
 | Summarize fallback | `brain_client.summarize(..., preview=None)` at `run_chat_local.py:981` and `:2187`; then `value_display = narrative.value_display(_safe_preview(preview), lang)` is appended to the display only |
@@ -768,7 +780,7 @@ _MONTHS = {...}   # casefolded month names -> 1..12: en full+3-letter; ru nomina
 - A column-valued finding holds the caller's column name.
 - No finding ever carries a category value or a number; those go to `values`.
 
-**`prefix`** (default `""`; must match `^([a-z][a-z0-9]{0,9}_)?$`, else `ValueError`) prefixes VALUES keys only. FINDINGS keys are fixed.
+**`prefix`** (default `""`; must match `^([a-z][a-z0-9]{0,9}_)?$`, else `ValueError`) prefixes VALUES keys only. FINDINGS keys are fixed. The error text states the rule in words and quotes nothing ("…then exactly one underscore at the end, for example ovl_…"): the retry scrub (B7.7) turns a quoted literal the failed code does not contain into `'<value>'`, and the earlier `followed by '_'` reached the planner as `followed by '<value>'`, so a prefix such as `granted_vs_new_` was retried unchanged.
 
 #### B8.2 Period ordering — `_order_periods(series, order=None) -> tuple[list, bool]`
 
@@ -828,7 +840,7 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
 - Robust z = `0.6745·(v_p - m)/MAD`. If MAD = 0, use the mean absolute deviation instead; if that is also 0, z = 0.
 - `ratio_med_p = v_p/m` (NaN unless m > 0).
 - `ratio_prev_p = v_p/v_{p-1}` (NaN unless `v_{p-1} > 0`).
-- **Data gap.** A period is a gap when `n_p < thin_ratio · median(n)` (the `coverage_check` thin rule) or when `v_p == 0` while every existing neighbour is finite and non-zero. A gap is a coverage problem, not a business anomaly: it is never flagged and never primary. (BRB: February 2026 has 3,792 rows against a median of 12,617 and NPL_COUNT 1; it used to be the primary anomaly, read as a "sharp increase".)
+- **Data gap.** A period is a gap when `n_p < thin_ratio · median(n)` (the `coverage_check` thin rule) or when `v_p == 0` while every existing neighbour is finite and non-zero, or (the COLLAPSE rule, which also works on pre-aggregated input with one row per period) when `v_p ≥ 0` is below `COLLAPSE_RATIO` (0.01) × every existing neighbour, each finite and > 0 (BRB run 2, English q3: February 4,000,000 against 563.70 bn and 4,739.29 bn, passed as one row per month). A gap is a coverage problem, not a business anomaly: it is never flagged and never primary. (BRB: February 2026 has 3,792 rows against a median of 12,617 and NPL_COUNT 1; it used to be the primary anomaly, read as a "sharp increase".)
 - A non-gap period `p` is flagged iff `|z_p| ≥ z` OR `max(ratio_med_p, 1/ratio_med_p) ≥ ratio`.
 - Primary = the flagged period with the largest `|log(ratio_med_p)|`; ties go to the later period.
 
@@ -837,7 +849,7 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
 - `anomaly_up`, `anomaly_is_latest`, `multiple_anomalies` — over non-gap flagged periods only; `too_few_periods`;
 - `period_status = "data_gap"` when some period is a gap (the existing key and code: a template writes `{{#data_gap}}…{{/data_gap}}`). `coverage_check` uses the same key for `"partial_period"`; in a block that copies both results into FINDINGS the later copy wins, and the thin month is still reported by `coverage_check`'s `thin_period`.
 
-**VALUES:** `anomaly_period, anomaly_value, baseline_value (=m), anomaly_ratio_median, anomaly_prev_period, anomaly_prev_value, anomaly_ratio_prev, n_periods, n_anomalies` (unchanged; `n_anomalies` counts non-gap flagged periods).
+**VALUES:** `anomaly_period, anomaly_value, baseline_value (=m), anomaly_ratio_median, anomaly_prev_period, anomaly_prev_value, anomaly_ratio_prev, n_periods, n_anomalies, data_gap_period` (`n_anomalies` counts non-gap flagged periods; `data_gap_period` is the label of the gap with the fewest rows, then the lowest value, then the earliest, None without a gap).
 
 **Table:** `period, value, robust_z, ratio_prev, ratio_median, is_anomaly, is_primary, rows, is_data_gap` (`rows` and `is_data_gap` are additive trailing columns).
 
@@ -874,7 +886,7 @@ A dim is *concentrated* iff its top-`|delta|` member has `share_of_delta ≥ con
 
 **`to_period="primary_anomaly"`.** `decompose_change` runs `detect_anomalies(df, period_col, metric, agg=agg, order=order)` internally and uses its primary anomaly period as `to_period`; the period before it is the default `from_period`. If no anomaly is found, the latest period is used and `anomaly` is set to `"no_anomaly"` in findings. This lets phase 2 target the anomaly without seeing phase-1 values.
 
-**Table:** `dim, member, from_value, to_value, delta, share_of_delta, share_of_base`. It holds the top_k members per dim by `|delta|`, plus one `"(other)"` row per dim.
+**Table:** `dim, member, from_value, to_value, delta, share_of_delta, share_of_base`. It holds the top_k members per dim by `|delta|`, plus one `"(other)"` row per dim. `table.attrs` carries `pdc_metric`, `pdc_from_period` / `pdc_to_period` and, whenever a top member is set, `pdc_change_dim` = the dim `change_dim_label` names.
 
 #### B8.6 `attribute_level`
 
@@ -934,7 +946,8 @@ def plot_importance(table, *, title=None, x_title="Share of variation explained"
 
 - The caller writes `fig = pdc_diag.plot_…(r["table"], …)`.
 - A table that lacks the required columns ⇒ `ValueError`.
-- Default titles: `"<value_col> by period — highlighted period"`, `"What changed: <metric> from first to last period"`, `"What explains <target>"`.
+- Default titles: `"<value_col> by period — highlighted period"`, `"What changed: <metric> by <dim>, <from> to <to>"`, `"What explains <target>"`.
+- `plot_waterfall` plots `table.attrs["pdc_change_dim"]` when present and in the table, even when another `dim=` is passed, so the chart always shows the dimension the findings and the text name; a table without it (built by hand) uses `dim`, else its first dim. The title (given or default) gains `" (<dim>)"` unless it already names the dim (case-insensitive).
 
 ### B9. Two-phase flow (D8)
 
@@ -1686,7 +1699,7 @@ Every brain payload is built from named arguments. History goes through the `_sa
 | F17 | Downgrade shows raw templates | Acceptable. |
 | F18 | Default capabilities | `narrative_v1` and `diagnostics_v1` on by default; per-tenant switch later. `two_phase_v1` only with session 3. |
 | F19 | Markdown injection via text VALUES | Escape `*`, `_` and a leading `-` (A2.2). |
-| F20 | ru/uz locale number formatting | Deferred; to be done right after this work (hook `_LOCALES` exists). |
+| F20 | ru/uz locale number formatting | Decided 2026-10-25: `uz` and `ru` locales in `pdc_diag._LOCALES` (no-break-space thousands, comma decimal, mln/mlrd/trln and млн/млрд/трлн), chosen from the answer language (A4 rule 10). Month names stay in the file's own form. |
 | F21 | `attribute_level` default | Keep variance. |
 | F22 | "This month" timezone | Deferred; UTC for now. |
 | F23 | Live SELECT aliases | Closed (`input_columns` holds registered names only). |
