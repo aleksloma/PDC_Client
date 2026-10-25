@@ -284,7 +284,8 @@ response. Unknown fields in the response are ignored.
 
 `kind` semantics: `PYTHON` / `PLOT_CODE` carry executable code in `code`;
 `CLARIFICATION` carries the clarifying question in `code`; `NO_CODE` is
-greetings-only (empty `code`); `ANSWER` carries a plain-text/markdown answer
+greetings-only (empty `code`) — and also any prose reply that starts with none
+of the outcome keywords; `ANSWER` carries a plain-text/markdown answer
 in `code` for questions about an EXISTING result or method (e.g. "how did
 you compute this?") that need no new computation. `MISSING_DATA` carries, in
 `code`, a plain-text notice that the loaded data cannot answer the question —
@@ -295,6 +296,15 @@ from domain context. The client returns `CLARIFICATION`, `ANSWER`, and
 `MISSING_DATA` text to the user directly without executing anything; a flow
 that requires code treats `ANSWER` and `MISSING_DATA` exactly like `NO_CODE`
 (retry loops count them as failed prose attempts).
+
+How the brain reads the model reply into `kind`: `ANSWER`, `MISSING_DATA` and
+`CLARIFICATION` (also written `CLARIFY` / `NEED_CLARIFICATION`) count only as
+the first word of the reply's first line, followed by the end of the line,
+`:`, a space or a tab; the keyword is removed from `code`. A reply that holds a
+```` ```python ````, ```` ```plot_code ```` or bare ```` ``` ```` code block is
+never `CLARIFICATION` (BRB run 3: a code comment saying "clarify" showed the
+code as the answer), and the word "clarify" anywhere else no longer makes a
+reply a `CLARIFICATION` — such prose is `NO_CODE`.
 
 **Narrative and captions.** With `narrative_v1` the brain asks for the
 answer text as a template. The system instruction gains the narrative
