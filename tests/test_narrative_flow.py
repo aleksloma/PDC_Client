@@ -447,7 +447,9 @@ def test_failed_block_slot_renders_na(monkeypatch, dfs, caplog):
     narr_retries = [kw for kw in brain.calls["retry"]
                     if str(kw.get("error_msg", "")).startswith("narrative_invalid")]
     assert len(narr_retries) == 1
-    assert narr_retries[0]["error_msg"] == "narrative_invalid: first_sentence"
+    # the slot cause names the missing `b` (narrative follow-up, item 1)
+    assert narr_retries[0]["error_msg"] == \
+        "narrative_invalid: first_sentence slot=b cause=missing"
     assert narr_retries[0]["failed_code"] == code_ok      # the emitted code only
     assert len(brain.calls["describe"]) == 1
     assert brain.calls["describe"][0]["code"] == code_ok
@@ -522,7 +524,8 @@ def test_single_scalar_all_dropped_narrative_falls_back_to_summarize(monkeypatch
         result = _single(_run_multi(dfs, question="what is the total?"))
 
     assert len(brain.calls["retry"]) == 1
-    assert brain.calls["retry"][0]["error_msg"] == "narrative_invalid: first_sentence"
+    assert brain.calls["retry"][0]["error_msg"] == \
+        "narrative_invalid: first_sentence slot=missing cause=missing"
     assert brain.calls["retry"][0]["failed_code"] == "RESULT = 42"
     assert len(brain.calls["summarize"]) == 1
     assert brain.calls["summarize"][0].get("preview", "missing") is None
@@ -546,7 +549,7 @@ def test_single_table_all_dropped_narrative_uses_describe(monkeypatch, dfs):
     # the only sentence holds n/a: one narrative-only retry (no narrative in
     # the fake reply), then today's describe path
     assert [kw["error_msg"] for kw in brain.calls["retry"]] == [
-        "narrative_invalid: first_sentence"]
+        "narrative_invalid: first_sentence slot=a cause=none"]
     assert len(brain.calls["describe"]) == 1
     assert result["text"] == "described"
     assert "narrative_rendered" not in result
@@ -1021,7 +1024,7 @@ def test_multi_first_sentence_protection(monkeypatch, dfs, caplog):
 
     assert len(brain.calls["retry"]) == 1
     kw = brain.calls["retry"][0]
-    assert kw["error_msg"] == "narrative_invalid: first_sentence"
+    assert kw["error_msg"] == "narrative_invalid: first_sentence slot=missing cause=missing"
     assert kw["use_pro"] is True
     assert kw["failed_code"] == CODE_A
     assert REPLY_CODE not in seen

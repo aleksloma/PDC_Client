@@ -21,6 +21,8 @@ never raise (Article IV).
 """
 from __future__ import annotations
 
+import math
+import numbers
 import re
 
 import pdc_diag
@@ -72,6 +74,16 @@ _ELLIPSIS = "…"
 # so the decimal point of a rendered number never splits a sentence.
 _NA_TOKEN_RE = re.compile(r"(?<!\w)n/a(?!\w)", re.IGNORECASE)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])(\s+)")
+
+# The first-sentence slot cause (A5.1, `first_sentence_na_slot`): in marking
+# mode a slot that would render "n/a" because its key is missing, its value is
+# None or non-finite renders a private-use marker holding its index instead —
+# no ".!?" and no whitespace, so the sentence split matches the "n/a" render.
+_MARK_OPEN = ""
+_MARK_CLOSE = ""
+_MARK_RE = re.compile(_MARK_OPEN + r"(\d{1,4})" + _MARK_CLOSE)
+SLOT_CAUSES = ("missing", "none", "nan")
+_SLOT_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}\Z")
 
 # FINDINGS (B7.1).
 _FINDING_KEY_RE = re.compile(r"[a-z][a-z0-9_]{0,39}\Z")
@@ -313,15 +325,38 @@ def render(template: str, values: dict, findings: dict, *, sid: str,
                                 locale=locale, prefixes=prefixes)[0]
 
 
+def _na_slot_cause(values: dict, name: str) -> str | None:
+    """Why slot `name` renders "n/a" — "missing" (no key), "none" (None) or
+    "nan" (a non-finite number) — or None for any other value (a fmt
+    overflow or an unsupported type is no slot cause)."""
+    if name not in values:
+        return "missing"
+    value = values[name]
+    if value is None:
+        return "none"
+    if isinstance(value, numbers.Real) and not isinstance(value, bool):
+        try:
+            return None if math.isfinite(value) else "nan"
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return None
+
+
 def render_with_sections(template: str, values: dict, findings: dict, *, sid: str,
                          max_len: int = RENDERED_MAX,
-                         locale: str | None = None, prefixes=None) -> tuple:
+                         locale: str | None = None, prefixes=None,
+                         _marks: list | None = None) -> tuple:
     """`(text, sections)`: the `render` text, and `(resolved code, body text)`
     of every `{{#…}}` section the render showed (a `{{^…}}` section is never
     listed — it says something is NOT the case). `prefixes`: the section-name
     prefixes the code passed (None / empty -> no prefixed name resolves). A
     section name resolving to nothing logs `NARRATIVE_SECTION_UNKNOWN name=`
-    once per render. On a failure: `(fallback_text, [])`. Never raises."""
+    once per render. On a failure: `(fallback_text, [])`. Never raises.
+
+    `_marks` (private, `first_sentence_na_slot` only): a list that turns on
+    MARKING mode — a slot with a slot cause (`_na_slot_cause`) renders a
+    private-use marker instead of "n/a" and appends `(name, cause)`; the
+    missing / unknown log lines are not repeated for this diagnostic pass."""
     try:
         passed = passed_prefixes(prefixes)
         nodes = parse(template)
@@ -332,6 +367,11 @@ def render_with_sections(template: str, values: dict, findings: dict, *, sid: st
         unknown: list = []
 
         def slot_text(name, kind):
+            if _marks is not None:
+                cause = _na_slot_cause(vals, name)
+                if cause is not None:
+                    _marks.append((name, cause))
+                    return f"{_MARK_OPEN}{len(_marks) - 1}{_MARK_CLOSE}"
             if name in vals:
                 return _fmt_value(vals[name], kind, locale)
             if name not in missing:
@@ -340,12 +380,13 @@ def render_with_sections(template: str, values: dict, findings: dict, *, sid: st
 
         text = _walk(nodes, finds, slot_text, shown_sections=sections, unknown=unknown,
                      prefixes=passed)
-        for name in missing:
-            log_with_sid(sid, "warning",
-                         f"NARRATIVE_SLOT_MISSING name={log_safe_value(name, 40)}")
-        for name in unknown:
-            log_with_sid(sid, "info",
-                         f"NARRATIVE_SECTION_UNKNOWN name={log_safe_value(name, _SECTION_LOG_MAX)}")
+        if _marks is None:
+            for name in missing:
+                log_with_sid(sid, "warning",
+                             f"NARRATIVE_SLOT_MISSING name={log_safe_value(name, 40)}")
+            for name in unknown:
+                log_with_sid(sid, "info",
+                             f"NARRATIVE_SECTION_UNKNOWN name={log_safe_value(name, _SECTION_LOG_MAX)}")
         shown = [(code, _post(body, max(len(body), 1))) for code, body in sections]
         return _post(text, max_len), shown
     except Exception as e:
@@ -607,6 +648,16 @@ def history_content(template: str, findings: dict) -> str:
 _WS_RUN_RE = re.compile(r"\s+")
 
 
+def _first_sentence(text: str) -> str | None:
+    """The first sentence of `text`: the first non-blank line, cut at the
+    first sentence end; None when every line is blank."""
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not line.strip():
+            continue
+        return _SENTENCE_SPLIT_RE.split(line.strip(), maxsplit=1)[0]
+    return None
+
+
 def first_sentence_has_na(text) -> bool:
     """True when the FIRST sentence of a rendered text (the first non-blank
     line, cut at the first sentence end) holds the "n/a" token — the
@@ -615,17 +666,59 @@ def first_sentence_has_na(text) -> bool:
     try:
         if not isinstance(text, str):
             return False
-        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-            if not line.strip():
-                continue
-            first = _SENTENCE_SPLIT_RE.split(line.strip(), maxsplit=1)[0]
-            return _NA_TOKEN_RE.search(first) is not None
-        return False
+        first = _first_sentence(text)
+        return first is not None and _NA_TOKEN_RE.search(first) is not None
     except Exception as e:
         log_with_sid("narrative", "warning",
                      "NARRATIVE_FIRST_SENTENCE_CHECK_FAILED "
                      f"error={log_safe_value(type(e).__name__, 80)}")
         return False
+
+
+def first_sentence_na_slot(template, values, findings, *, locale=None, prefixes=None,
+                           sid: str = "") -> tuple | None:
+    """`(name, cause)` of the FIRST slot that renders "n/a" inside the first
+    sentence (the `first_sentence_has_na` rule) because its key is missing
+    ("missing"), its value is None ("none") or a non-finite number ("nan");
+    None when no such slot is there — a clean first sentence, or "n/a" for
+    another reason (a literal the template typed, a fmt overflow, an
+    unsupported value type). Same sections / locale / passed prefixes as the
+    render. `name` is a planner literal of the template grammar, never a
+    value. A template that does not parse -> None. Never raises."""
+    try:
+        if not isinstance(template, str) or template_error_kind(template) is not None:
+            return None
+        marks: list = []
+        text, _sections = render_with_sections(template, values, findings,
+                                                sid=sid or "narrative", locale=locale,
+                                                prefixes=prefixes, _marks=marks)
+        if not marks or not isinstance(text, str):
+            return None
+        first = _first_sentence(text)
+        m = _MARK_RE.search(first) if first is not None else None
+        if m is None:
+            return None
+        index = int(m.group(1))
+        return marks[index] if 0 <= index < len(marks) else None
+    except Exception as e:
+        log_with_sid(log_safe_value(sid or "narrative", 200), "warning",
+                     "NARRATIVE_SLOT_CAUSE_FAILED "
+                     f"error={log_safe_value(type(e).__name__, 80)}")
+        return None
+
+
+def invalid_error_msg(kind, slot=None) -> str:
+    """The narrative-only retry's `error_msg` (PROTOCOL /v1/retry):
+    `narrative_invalid: <kind>`, plus ` slot=<name> cause=<cause>` for a
+    "first_sentence" kind whose `slot` is a `(name, cause)` of the template
+    grammar (`[A-Za-z_][A-Za-z0-9_]{0,39}`) and one of SLOT_CAUSES. No
+    quotes, so `brain_client._scrub_error_msg` leaves it unchanged."""
+    msg = f"narrative_invalid: {kind}"
+    if kind == "first_sentence" and isinstance(slot, tuple) and len(slot) == 2:
+        name, cause = slot
+        if isinstance(name, str) and _SLOT_NAME_RE.match(name) and cause in SLOT_CAUSES:
+            msg += f" slot={name} cause={cause}"
+    return msg
 
 
 def _norm_ws(text: str) -> str:
@@ -933,6 +1026,40 @@ def value_display(safe_preview, lang: str) -> str | None:
     except Exception as e:
         log_with_sid("narrative", "warning",
                      f"VALUE_DISPLAY_FAILED error={log_safe_value(type(e).__name__, 80)}")
+        return None
+
+
+def headline_sentence(values, lang, *, sid: str = "") -> str | None:
+    """The local headline of a DROPPED narrative (A5.1, `NARRATIVE_INVALID_TWICE`):
+    `"<Result label>: <amount>."` in `lang` (unknown -> en) over the first of
+    VALUES "result", "total", then the keys ending "_total" (VALUES order)
+    whose value is a finite int / float (never a bool, None, NaN / inf or a
+    str). None when no key qualifies. Logs `NARRATIVE_HEADLINE_FALLBACK key=
+    lang=` — the key, never the value. Display text only (R0): never in
+    `content`, never in a brain payload. Never raises."""
+    try:
+        if not isinstance(values, dict):
+            return None
+        code = lang if isinstance(lang, str) and lang in _RESULT_LABEL else "en"
+        keys = [k for k in ("result", "total") if k in values]
+        keys += [k for k in values if isinstance(k, str) and k.endswith("_total")]
+        for key in keys:
+            value = values[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if isinstance(value, float) and not math.isfinite(value):
+                continue
+            shown = pdc_diag.fmt(value, "amount", locale_for(code))
+            if not isinstance(shown, str) or not shown.strip() or _NA_TOKEN_RE.search(shown):
+                continue
+            log_with_sid(log_safe_value(sid or "narrative", 200), "info",
+                         f"NARRATIVE_HEADLINE_FALLBACK key={log_safe_value(key, 40)} "
+                         f"lang={log_safe_value(code, 8)}")
+            return f"{_RESULT_LABEL[code]}: {shown}."
+        return None
+    except Exception as e:
+        log_with_sid(log_safe_value(sid or "narrative", 200), "warning",
+                     f"NARRATIVE_HEADLINE_FAILED error={log_safe_value(type(e).__name__, 80)}")
         return None
 
 

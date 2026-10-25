@@ -504,13 +504,14 @@ def _use_images_array(imgs: list) -> bool:
 
 
 # Record fields of a narrative-template turn (DIAGNOSTICS_SPEC A5.5). The
-# RENDERED texts (`narrative_rendered`, `caption_rendered`, `value_display`)
-# are display-only: brain_client._sanitize_history_rows is an allowlist
-# (role/content/code), so none of them reaches the brain (A5.2 R0).
+# RENDERED texts (`narrative_rendered`, `caption_rendered`, `value_display`,
+# the dropped narrative's `headline_display`) are display-only:
+# brain_client._sanitize_history_rows is an allowlist (role/content/code), so
+# none of them reaches the brain (A5.2 R0).
 _NARR_KEYS = ("narrative_template", "narrative_rendered", "values", "findings",
               "caption_template", "caption_rendered", "caption_described",
-              "value_display", "table_captions", "table_caption_templates",
-              "table_phases", "phase2", "phase2_status")
+              "value_display", "headline_display", "table_captions",
+              "table_caption_templates", "table_phases", "phase2", "phase2_status")
 _PHASE1_KEYS = ("narrative_template", "narrative_rendered", "values", "findings")
 _PARA = "\n\n"
 
@@ -551,8 +552,9 @@ def _apply_narrative_fields(rec: dict, src) -> dict:
 
     `src` is a single result dict (its keys top-level), or a multi-plot
     source: the done event's `narrative_view` (`{"phase1": {...} | None,
-    "phase2": {...} | None, "phase2_status": str | None}`) plus the table
-    arrays aligned with the record's `tables`."""
+    "phase2": {...} | None, "phase2_status": str | None}`, plus
+    `headline_display` when the narrative was dropped) plus the table arrays
+    aligned with the record's `tables`."""
     if not isinstance(rec, dict) or not isinstance(src, dict):
         return rec
     view = src.get("narrative_view")
@@ -567,6 +569,8 @@ def _apply_narrative_fields(rec: dict, src) -> dict:
             rec["phase2"] = {k: p2[k] for k in _PHASE1_KEYS if _narr_field_kept(p2, k)}
         if isinstance(view.get("phase2_status"), str) and view["phase2_status"]:
             rec["phase2_status"] = view["phase2_status"]
+        if isinstance(view.get("headline_display"), str) and view["headline_display"]:
+            rec["headline_display"] = view["headline_display"]
     for k in _NARR_KEYS:
         if k in src and _narr_field_kept(src, k):
             rec[k] = src[k]
@@ -623,7 +627,9 @@ def _single_display(result: dict) -> dict:
     """What the page shows for a single answer (A5.6): `answer` is the
     display text — the rendered narrative (+ the visual's caption), else the
     rendered caption, else the brain-safe text (+ the local value line).
-    `narrative` / `caption` are set only when a narrative was rendered."""
+    `narrative` / `caption` are set only when a narrative was rendered — or,
+    without a narrative template, when the dropped narrative left a local
+    `headline_display`: it is the `narrative`, the base answer the `caption`."""
     if not isinstance(result, dict):
         return {"answer": ""}
     text = result.get("text", "") or ""
@@ -639,11 +645,15 @@ def _single_display(result: dict) -> dict:
         return {"answer": nr + (_PARA + cap if (nr and cap) else cap),
                 "narrative": nr, "caption": cap}
     if _has_template(result, "caption_template"):
-        return {"answer": _str_or_empty(result.get("caption_rendered"))}
-    vd = result.get("value_display")
-    if isinstance(vd, str) and vd:
-        return {"answer": (text + _PARA + vd) if text else vd}
-    return {"answer": text}
+        base = _str_or_empty(result.get("caption_rendered"))
+    else:
+        vd = result.get("value_display")
+        base = ((text + _PARA + vd) if text else vd) if (isinstance(vd, str) and vd) else text
+    headline = result.get("headline_display")
+    if isinstance(headline, str) and headline:
+        return {"answer": headline + (_PARA + base if base else ""),
+                "narrative": headline, "caption": base}
+    return {"answer": base}
 
 
 def _record_view_of_done(ev: dict) -> dict:
@@ -663,6 +673,8 @@ def _record_view_of_done(ev: dict) -> dict:
         out["phase2"] = {"narrative_rendered": p2["narrative_rendered"]}
     if isinstance(view.get("phase2_status"), str) and view["phase2_status"]:
         out["phase2_status"] = view["phase2_status"]
+    if isinstance(view.get("headline_display"), str) and view["headline_display"]:
+        out["headline_display"] = view["headline_display"]
     return out
 
 
@@ -1888,11 +1900,19 @@ async def chat_stream(request: Request, chat_id: str):
                 # Use the multi-plot generator: it yields per-chart partials when
                 # the planner emitted ###NEXT_PLOT### blocks, and a single
                 # {single_response, result} for normal one-shot answers.
+                # `on_progress`: a status event the flow pushes from inside a
+                # block (the narrative-only retry's "Writing the summary…")
+                # goes straight to the consumer, whose progress branch
+                # forwards it (live UX only — the accumulation never sees it).
+                def _on_progress(ev):
+                    loop.call_soon_threadsafe(queue.put_nowait, ("event", ev))
+
                 gen = _denied_events(denied_text) if denied_text else \
                     run_chat_local.run_chat_multi_plot(
                         sid=sid, dfs=dfs, schema_docs=schema_docs,
                         question=question, history_rows=history_rows,
                         user_email=email, dataset_profile=dataset_profiles,
+                        on_progress=_on_progress,
                     )
                 for event in gen:
                     # Durable full-table persistence for a single-shot tabular
