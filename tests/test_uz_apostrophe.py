@@ -6,7 +6,8 @@ look-alike (ʻ U+02BB, ʼ U+02BC, ‘ U+2018, ’ U+2019, ` U+0060, ´ U+00B4) s
 into one sentence would make the same word look different across sentences
 and break text search / copy. This pins every uz display string the client
 produces itself:
-- `narrative.FINDING_SENTENCES[*]["uz"]` (base and parenthesis),
+- `narrative.FINDING_SENTENCES[*]["uz"]` (base, parenthesis and, for the
+  three-part entries of the BRB run-3 follow-up, the `full` form),
 - `narrative._RESULT_LABEL["uz"]`,
 - `pdc_diag._LOCALES["uz"]` (number-format words),
 - `narrative.headline_sentence(..., "uz")` (the dropped-template headline),
@@ -25,10 +26,14 @@ WORDS = ("o'lchov", "ma'lumotlardagi", "bo'yicha", "o'zgaradi")
 
 ALL_FINDINGS = {"units": "mixed_units", "coverage": "coverage_change", "thin_period": True,
                 "unknown_dominated": True, "metric_relation": "metric_definition_overlap",
-                "latest_is_past_period": True}
+                "latest_is_past_period": True,
+                # BRB run-3 follow-up
+                "anomaly": "scope_change", "label_disappeared": True}
 ALL_VALUES = {"coverage_dim_label": "VALYUTA", "thin_period_label": "2026 Fevral",
               "unknown_dim_label": "SEKTOR", "unknown_share_max": 0.5,
-              "overlap_equal_share": 0.976, "latest_period": "2026 Mart"}
+              "overlap_equal_share": 0.976, "latest_period": "2026 Mart",
+              "anomaly_period": "2026 Mart", "rows_ratio": 8.82,
+              "disappeared_label": "UZS", "disappeared_after_period": "2025 Dekabr"}
 
 
 def _assert_ascii_apostrophe(text, where):
@@ -40,15 +45,17 @@ def _assert_ascii_apostrophe(text, where):
 def _uz_finding_strings():
     out = []
     for finding, langs in narrative.FINDING_SENTENCES.items():
-        base, paren = langs["uz"]
-        out.append((f"FINDING_SENTENCES[{finding}].uz base", base))
-        out.append((f"FINDING_SENTENCES[{finding}].uz paren", paren))
+        entry = langs["uz"]
+        assert len(entry) in (2, 3), finding
+        for name, text in zip(("base", "paren", "full"), entry):
+            out.append((f"FINDING_SENTENCES[{finding}].uz {name}", text))
     return out
 
 
 def test_uz_finding_sentences_use_ascii_apostrophe():
     strings = _uz_finding_strings()
-    assert len(strings) == 2 * len(narrative.FINDING_SENTENCES)
+    assert len(strings) == sum(len(langs["uz"]) for langs in narrative.FINDING_SENTENCES.values())
+    assert len(strings) >= 2 * len(narrative.FINDING_SENTENCES)
     for where, text in strings:
         _assert_ascii_apostrophe(text, where)
 
@@ -80,3 +87,19 @@ def test_uz_headline_sentence():
     text = fn({"uzs_total": 61576335238995.79}, "uz")
     assert text == "Natija: 61,58 trln."
     _assert_ascii_apostrophe(text, "headline_sentence uz")
+
+
+def test_uz_run3_sentences_present_and_ascii():
+    """The two run-3 entries exist with a `full` form, and their rendered uz
+    paragraph (full forms: every placeholder has a value) keeps the ASCII
+    apostrophe."""
+    for finding in ("scope_change", "label_disappeared"):
+        entry = narrative.FINDING_SENTENCES[finding]["uz"]
+        assert len(entry) == 3, finding
+        for text in entry:
+            _assert_ascii_apostrophe(text, f"{finding}.uz")
+    text = narrative.add_finding_sentences(
+        "", {"anomaly": "scope_change", "label_disappeared": True}, ALL_VALUES, set(), "uz",
+        sid="t")
+    _assert_ascii_apostrophe(text, "add_finding_sentences uz run3")
+    assert "ko'rsatkichlari" in text and "yo'qligini" in text

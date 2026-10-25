@@ -142,6 +142,15 @@ def _all_outputs():
     units = _stable_frame()
     units["currency"] = ["USD", "UZS"] * 6
     switch = _currency_switch_frame()
+    # one row per period, 10x the rows in the spike period (rows_col)
+    scope = pd.DataFrame({"period": [f"2025-{m:02d}" for m in range(1, 7)],
+                          "region": ["A"] * 6, "amount": [10, 11, 10, 12, 100, 11],
+                          "n": [100, 100, 100, 100, 1000, 100]})
+    # currency USD ends after 2025-02 while UZS stays
+    gone = switch.copy()
+    gone["currency"] = ["USD", "UZS"] * 10 + ["UZS"] * 20
+    rates = pd.DataFrame({"period": [f"2025-{m:02d}" for m in range(1, 5)],
+                          "a": [50.0, 52.0, 55.0, 60.0], "b": [1000.0] * 4})
     return [
         (pdc_diag.coverage_check(switch, "period", ["REGION"], ["amount"],
                                  unit_cols=["CURRENCY"], as_of="2025-04-15"), switch),
@@ -161,6 +170,14 @@ def _all_outputs():
         (pdc_diag.attribute_level(weak, "target", ["segment"], ["noise"]), weak),
         (pdc_diag.check_metric_overlap(mostly, "a", "b"), mostly),
         (pdc_diag.check_metric_overlap(same, "a", "b"), same),
+        # BRB run-3 follow-up: scope change, label disappearance, rates
+        (pdc_diag.detect_anomalies(scope, "period", "amount", rows_col="n"), scope),
+        (pdc_diag.decompose_change(scope, "period", "amount", to_period="primary_anomaly",
+                                   dims=["region"], rows_col="n"), scope),
+        (pdc_diag.coverage_check(gone, "period", ["REGION"], ["amount"],
+                                 unit_cols=["currency"], as_of="2025-04-15"), gone),
+        (pdc_diag.rate_by_period(rates, "period", "a", "b"), rates),
+        (pdc_diag.rate_by_period(rates[rates["period"] == "2025-01"], "period", "a", "b"), rates),
     ]
 
 
@@ -523,7 +540,9 @@ ANOMALY_VALUE_KEYS = {"anomaly_period", "anomaly_value", "baseline_value",
                       "anomaly_ratio_median", "anomaly_prev_period", "anomaly_prev_value",
                       "anomaly_ratio_prev", "n_periods", "n_anomalies", "data_gap_period",
                       # the alias VALUES (BRB run 3 read period names that did not exist): first / last period label
-                      "period_from", "period_to"}
+                      "period_from", "period_to",
+                      # BRB run 3: the primary's row count over the period before it
+                      "rows_ratio"}
 
 
 def _counted_frame(periods, row_counts, totals, metric="amount") -> pd.DataFrame:
@@ -604,9 +623,12 @@ def test_detect_anomalies_brb_thin_february():
     assert [int(x) for x in t["rows"]] == rows
     assert _gap_flags(t) == {p: p == "2026 Февраль" for p in periods}
     assert f.get("period_status") == "data_gap"
-    assert f["anomaly"] == "anomaly_confirmed"
-    assert f.get("anomaly_up") is True
-    assert f.get("anomaly_is_latest") is True
+    # BRB run-3 follow-up (B8.4): March holds 33,455 rows against February's
+    # 3,792 (8.8x), so the spike is a change of reporting scope, not a
+    # business anomaly — no "up" / "latest" spike section may open.
+    assert f["anomaly"] == "scope_change"
+    assert "anomaly_up" not in f and "anomaly_is_latest" not in f
+    assert v["rows_ratio"] == pytest.approx(33455 / 3792)
     assert f.get("multiple_anomalies") is True          # November and March
     assert v["anomaly_period"] == "2026 Март"
     assert v["n_anomalies"] == 2
@@ -627,8 +649,11 @@ def test_detect_anomalies_thin_ratio_kwarg():
     assert default["findings"].get("period_status") == "data_gap"
     loose = pdc_diag.detect_anomalies(df, "period", "amount", thin_ratio=0.2)
     assert "period_status" not in loose["findings"]
-    assert loose["findings"]["anomaly"] == "anomaly_confirmed"
+    # 300 rows after 1000 (0.3x, below 1/SCOPE_ROWS_FACTOR): the flagged
+    # period is a change of scope once it is no longer a gap (B8.4).
+    assert loose["findings"]["anomaly"] == "scope_change"
     assert loose["values"]["anomaly_period"] == "2025-03"
+    assert loose["values"]["rows_ratio"] == pytest.approx(0.3)
 
 
 # ---------------------------------------------------------------------------
@@ -1092,12 +1117,17 @@ def test_constants():
         "anomaly", "anomaly_up", "anomaly_is_latest", "multiple_anomalies", "too_few_periods",
         "change_shape", "change_dim", "change_up", "change_large",
         "attribution", "top_feature", "second_feature", "method_fallback",
-        "metric_relation", "metrics_identical"})
+        "metric_relation", "metrics_identical",
+        # BRB run-3 follow-up: label disappearance and rate_by_period
+        "label_disappeared", "rate_up", "rate_down"})
     assert tuple(pdc_diag.FINDINGS_ENUM) == (
         "coverage_change", "coverage_stable", "partial_period", "metric_definition_overlap",
         "mixed_units", "concentrated_in_one_dim", "spread_evenly", "weak_signal",
         "dominant_feature", "anomaly_confirmed", "no_anomaly",
-        "data_gap", "outlier_driven", "seasonal_pattern")
+        "data_gap", "outlier_driven", "seasonal_pattern",
+        # BRB run-3 follow-up, appended at the end
+        "scope_change", "label_disappeared")
+    assert getattr(pdc_diag, "SCOPE_ROWS_FACTOR", None) == 3.0
     assert "needs_phase2" not in pdc_diag.FINDINGS_ENUM
     assert "needs_phase2" not in pdc_diag.PDC_DIAG_FINDING_KEYS
     assert "unknown" in pdc_diag.UNKNOWN_TOKENS and "" in pdc_diag.UNKNOWN_TOKENS
@@ -1300,7 +1330,8 @@ def test_pdc_diag_top_level_imports_are_leaf():
 
 def test_pdc_diag_public_surface():
     for name in ("fmt", "coverage_check", "detect_anomalies", "decompose_change",
-                 "attribute_level", "check_metric_overlap", "plot_highlighted_series",
+                 "attribute_level", "check_metric_overlap", "rate_by_period",
+                 "plot_highlighted_series",
                  "plot_waterfall", "plot_importance", "_order_periods", "_parse_period_label"):
         assert callable(getattr(pdc_diag, name, None)), name
 
@@ -1314,14 +1345,23 @@ BRB_ROWS = [26605, 12617, 11302, 3792, 33455]
 BRB_NPL = [4500.50e9, 602.44e9, 563.70e9, 4.0e6, 4739.29e9]
 
 
-def _assert_brb_result(out):
+def _assert_brb_result(out, *, scope_change=False):
+    """`scope_change`: the row counts are known (raw rows), so March's 8.8x
+    rows against February make it a change of scope (BRB run-3 follow-up);
+    on one-row-per-period input the counts are unknown and it stays an
+    anomaly."""
     _assert_shape(out)
     f, v, t = out["findings"], out["values"], out["table"]
     assert list(t["period"]) == BRB_PERIODS
     assert _gap_flags(t) == {p: p == "2026 Февраль" for p in BRB_PERIODS}
     assert f.get("period_status") == "data_gap"
-    assert f["anomaly"] == "anomaly_confirmed"
-    assert f.get("anomaly_up") is True
+    if scope_change:
+        assert f["anomaly"] == "scope_change"
+        assert "anomaly_up" not in f
+        assert v["rows_ratio"] == pytest.approx(33455 / 3792)
+    else:
+        assert f["anomaly"] == "anomaly_confirmed"
+        assert f.get("anomaly_up") is True
     assert v["anomaly_period"] == "2026 Март"
     assert list(t[t["is_primary"]]["period"]) == ["2026 Март"]
     feb = t[t["period"] == "2026 Февраль"].iloc[0]
@@ -1333,7 +1373,7 @@ def test_detect_anomalies_brb_shape_raw_rows():
     """The exact BRB row shape (en q3): one row per loan, NPL spread over the
     rows. February is thin (rows rule) AND collapsed; March is the spike."""
     df = _counted_frame(BRB_PERIODS, BRB_ROWS, BRB_NPL, metric="npl")
-    _assert_brb_result(pdc_diag.detect_anomalies(df, "period", "npl"))
+    _assert_brb_result(pdc_diag.detect_anomalies(df, "period", "npl"), scope_change=True)
 
 
 def test_detect_anomalies_brb_shape_pre_aggregated():

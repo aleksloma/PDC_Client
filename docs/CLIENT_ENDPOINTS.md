@@ -1078,9 +1078,22 @@ not a finding, so it never counts as a stated finding and never reaches
 /v1/title or /v1/report (`NARRATIVE_SECTION_FROM_VALUES n=<count>`). After the
 template, one fixed sentence in the answer language (en / uz / ru / ka) is
 added for each data-quality finding no shown section states: mixed units, a
-coverage change, a thin period or data gap, an Unknown-dominated dimension, a
-metric overlap (stock, not flow) and data that ends before the current month
-(`FINDING_SENTENCES_ADDED n= lang=`). Numbers in Uzbek and Russian answers use
+coverage change, a unit label whose rows end before the last period ("Rows
+labelled UZS end after 2025 Декабрь; … a 0 for UZS in a later period means no
+rows, not no activity."), a thin period or data gap, a change of reporting
+scope ("2026 Март has 8.8x the rows of the previous period, so its totals
+reflect a change in reporting scope, not a business change; compare rates or
+per-row averages instead."), an Unknown-dominated dimension (named together
+with its own share, never another call's), a metric overlap (stock, not flow)
+and data that ends before the current month (`FINDING_SENTENCES_ADDED n=
+lang=`). Code is never answer text: a rendered caption or narrative holding a
+code fence or three lines of Python code is not used (describe / the
+no-narrative path answers; `NARRATIVE_CODE_IN_TEXT what=`, `CAPTION_SKIPPED …
+/ NARRATIVE_SKIPPED reason=code_in_text`), and a plan the brain labels
+CLARIFICATION / ANSWER / MISSING_DATA whose text holds runnable Python (a
+python / py / bare fence, or unfenced code that parses) has that code run
+instead of shown (`what=answer`), so the answer comes from describe or
+summarize; a ```sql or ```json explanation is still shown as the answer. Numbers in Uzbek and Russian answers use
 a no-break-space thousands separator, a decimal comma and mln/mlrd/trln
 (uz) or млн/млрд/трлн (ru). A rendered text is
 DISPLAY text only: it reaches the page, the local record and the local
