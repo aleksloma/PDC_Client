@@ -212,7 +212,8 @@ def _resolve_section(name: str, findings: dict, prefixes: frozenset = frozenset(
       `metric_definition_overlap` when the code passed "ovl_"). A prefix
       the code never passes (`no_`, `not_`, `has_`) never resolves, so a
       negated name is never shown as the bare code;
-    - anything else is unknown: `(False, None)`."""
+    - anything else is unknown: `(False, None)` — `_walk` then tries a VALUES
+      bool (`render_with_sections` only; not a finding, so no code)."""
     if name in findings or _is_code(name):
         return _flag_shown(name, findings), name
     if prefixes:
@@ -270,11 +271,16 @@ def _post(text: str, max_len: int) -> str:
 
 
 def _walk(nodes: list, findings: dict, slot_text, *, shown_sections=None,
-          unknown=None, prefixes: frozenset = frozenset()) -> str:
+          unknown=None, prefixes: frozenset = frozenset(), values=None,
+          from_values=None) -> str:
     """The text of `nodes`. `shown_sections` (a list) collects
     `(code, body text)` of every `{{#…}}` section shown; `unknown` (a list)
     collects every section name that resolves to nothing, once each;
-    `prefixes` are the passed section-name prefixes (`passed_prefixes`)."""
+    `prefixes` are the passed section-name prefixes (`passed_prefixes`).
+    `values` (a dict, `render_with_sections` only): a name `_resolve_section`
+    leaves unknown that is a VALUES key holding a bool is that bool — not a
+    finding, so never in `shown_sections` nor `unknown`; `from_values` (a
+    list) collects such names, once each."""
     out: list = []
 
     def emit(items, sink):
@@ -287,7 +293,12 @@ def _walk(nodes: list, findings: dict, slot_text, *, shown_sections=None,
     for node in nodes:
         if node[0] == "section":
             shown, code = _resolve_section(node[2], findings, prefixes)
-            if code is None and unknown is not None and node[2] not in unknown:
+            if (code is None and isinstance(values, dict) and node[2] in values
+                    and isinstance(values[node[2]], bool)):
+                shown = values[node[2]]
+                if from_values is not None and node[2] not in from_values:
+                    from_values.append(node[2])
+            elif code is None and unknown is not None and node[2] not in unknown:
                 unknown.append(node[2])
             if (node[1] == "#") == shown:
                 body: list = []
@@ -318,7 +329,8 @@ def render(template: str, values: dict, findings: dict, *, sid: str,
            prefixes=None) -> str:
     """The template filled with VALUES (slots, formatted in `locale`) and
     FINDINGS (sections; a prefixed section name resolves only through a
-    PASSED prefix in `prefixes`). A missing slot renders "n/a" and logs its
+    PASSED prefix in `prefixes`; a name that is none of those but a VALUES
+    bool is that bool). A missing slot renders "n/a" and logs its
     NAME once per render. On a TemplateError or any other failure:
     `fallback_text`. Never raises."""
     return render_with_sections(template, values, findings, sid=sid, max_len=max_len,
@@ -350,8 +362,13 @@ def render_with_sections(template: str, values: dict, findings: dict, *, sid: st
     of every `{{#…}}` section the render showed (a `{{^…}}` section is never
     listed — it says something is NOT the case). `prefixes`: the section-name
     prefixes the code passed (None / empty -> no prefixed name resolves). A
-    section name resolving to nothing logs `NARRATIVE_SECTION_UNKNOWN name=`
-    once per render. On a failure: `(fallback_text, [])`. Never raises.
+    name that resolves to no FINDINGS key, code or passed prefix but is a
+    VALUES key holding a bool is that bool (`{{#x}}` shown when True,
+    `{{^x}}` when False); it is not a finding, so it is never listed, and one
+    `NARRATIVE_SECTION_FROM_VALUES n=<count>` line per render counts such
+    names (never names them). A section name resolving to nothing logs
+    `NARRATIVE_SECTION_UNKNOWN name=` once per render. On a failure:
+    `(fallback_text, [])`. Never raises.
 
     `_marks` (private, `first_sentence_na_slot` only): a list that turns on
     MARKING mode — a slot with a slot cause (`_na_slot_cause`) renders a
@@ -365,6 +382,7 @@ def render_with_sections(template: str, values: dict, findings: dict, *, sid: st
         missing: list = []
         sections: list = []
         unknown: list = []
+        from_values: list = []
 
         def slot_text(name, kind):
             if _marks is not None:
@@ -379,7 +397,7 @@ def render_with_sections(template: str, values: dict, findings: dict, *, sid: st
             return _NA
 
         text = _walk(nodes, finds, slot_text, shown_sections=sections, unknown=unknown,
-                     prefixes=passed)
+                     prefixes=passed, values=vals, from_values=from_values)
         if _marks is None:
             for name in missing:
                 log_with_sid(sid, "warning",
@@ -387,6 +405,8 @@ def render_with_sections(template: str, values: dict, findings: dict, *, sid: st
             for name in unknown:
                 log_with_sid(sid, "info",
                              f"NARRATIVE_SECTION_UNKNOWN name={log_safe_value(name, _SECTION_LOG_MAX)}")
+            if from_values:
+                log_with_sid(sid, "info", f"NARRATIVE_SECTION_FROM_VALUES n={len(from_values)}")
         shown = [(code, _post(body, max(len(body), 1))) for code, body in sections]
         return _post(text, max_len), shown
     except Exception as e:
@@ -410,8 +430,10 @@ def fallback_text(template: str, *, max_len: int = RENDERED_MAX) -> str:
 def brain_view(template: str, findings: dict, *, prefixes=None) -> str:
     """The text /v1/title and /v1/report see: sections resolved with FINDINGS
     exactly as `render` does, every slot `[name with spaces]` — no value. Its
-    callers pass no `prefixes`, so a prefixed section is false there (the
-    safe direction). A parse error -> the fallback with "[value]" slots.
+    callers pass no `prefixes`, so a prefixed section is false there, and it
+    has no VALUES, so a VALUES-bool section is false there too (the safe
+    direction: no VALUES-derived bit reaches the brain). A parse error -> the
+    fallback with "[value]" slots.
     Never raises."""
     try:
         try:

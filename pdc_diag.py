@@ -11,7 +11,11 @@ shap -> forest -> variance).
 It runs in the sandbox, so it never prints and never logs.
 
 Every analysis function returns `{"table": DataFrame, "values": dict,
-"findings": dict}`:
+"findings": dict}` — the result, its VALUES and its FINDINGS are `_ResultDict`
+(a dict subclass): a missing key raises `KeyError` naming the function, the
+part and every key pdc_diag set when it built the dict (key names only, never
+a value; a key the code adds later is never listed); `.get`, `in` and
+everything else are plain dict:
 - VALUES are plain Python scalars (str / int / float / bool / None) — the
   numbers and labels a narrative template may quote. They stay on the client.
 - FINDINGS are a bool, a `FINDINGS_ENUM` code or one of the CALLER'S column
@@ -333,8 +337,39 @@ def _prefixed(values: dict, prefix: str) -> dict:
     return {prefix + key: _plain(value) for key, value in values.items()}
 
 
-def _result(table: pd.DataFrame, values: dict, findings: dict, prefix: str) -> dict:
-    return {"table": table, "values": _prefixed(values, prefix), "findings": dict(findings)}
+_KEY_REPR_MAX = 80
+
+
+class _ResultDict(dict):
+    """A pdc_diag result dict (the result, its VALUES, its FINDINGS). A
+    missing key raises a `KeyError` naming the available keys — key names
+    only, never a value — so a retry reads the right name instead of
+    guessing another. The names listed are the ones pdc_diag set when it
+    built the dict (`_names`): a key the generated code adds later may be
+    data-derived (`"total_" + currency`), so it is never listed. `.get`,
+    `in`, `pop`, iteration, `dict(...)`, deepcopy and pickle are plain
+    dict (`_what` / `_names` live in `__dict__`, which both restore)."""
+
+    _what = "pdc_diag result"
+    _names: tuple = ()
+
+    def __init__(self, data=(), what=None):
+        super().__init__(data)
+        if what is not None:
+            self._what = what
+        self._names = tuple(sorted(str(k) for k in self))
+
+    def __missing__(self, key):
+        listed = ", ".join(self._names) or "none"
+        raise KeyError(f"{repr(key)[:_KEY_REPR_MAX]} is not a key of {self._what}; "
+                       f"available keys: {listed}")
+
+
+def _result(table: pd.DataFrame, values: dict, findings: dict, prefix: str, fn: str) -> dict:
+    return _ResultDict({"table": table,
+                        "values": _ResultDict(_prefixed(values, prefix), f"{fn} values"),
+                        "findings": _ResultDict(findings, f"{fn} findings")},
+                       f"{fn} result")
 
 
 def _agg_series(series: pd.Series, agg: str):
@@ -610,6 +645,9 @@ def coverage_check(df, period_col: str, dims: list, metrics: list, *, order=None
         "n_periods": len(labels),
         "first_period": _label_str(labels[0]) if labels else None,
         "latest_period": _label_str(labels[-1]) if labels else None,
+        # aliases: the names the planner's period-scope rule has the code set
+        "period_from": _label_str(labels[0]) if labels else None,
+        "period_to": _label_str(labels[-1]) if labels else None,
         "latest_rows": rows[-1] if rows else None,
         "median_rows": _int_or_float(np.median(rows)) if rows else None,
         "thin_period_label": None,
@@ -696,7 +734,7 @@ def coverage_check(df, period_col: str, dims: list, metrics: list, *, order=None
         if latest < current:
             findings["latest_is_past_period"] = True
 
-    return _result(table, values, findings, prefix)
+    return _result(table, values, findings, prefix, "coverage_check")
 
 
 # ---------------------------------------------------------------------------
@@ -840,6 +878,8 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
         "anomaly_ratio_median": None, "anomaly_prev_period": None, "anomaly_prev_value": None,
         "anomaly_ratio_prev": None, "n_periods": n, "n_anomalies": 0,
         "data_gap_period": None,
+        "period_from": _label_str(labels[0]) if labels else None,
+        "period_to": _label_str(labels[-1]) if labels else None,
     }
     columns = ["period", "value", "robust_z", "ratio_prev", "ratio_median", "is_anomaly",
                "is_primary", "rows", "is_data_gap"]
@@ -856,7 +896,7 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
         table["is_data_gap"] = table["is_data_gap"].astype(bool)
         if n:
             values["baseline_value"] = _num(np.median(v))
-        return _result(table, values, findings, prefix)
+        return _result(table, values, findings, prefix, "detect_anomalies")
 
     gaps = set(_data_gaps(v, rows, thin_ratio))
     core = _anomaly_core(v, z, ratio, skip=gaps)
@@ -901,7 +941,7 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
             values["anomaly_ratio_prev"] = _num(core["ratio_prev"][primary])
     if n_anomalies > 1:
         findings["multiple_anomalies"] = True
-    return _result(table, values, findings, prefix)
+    return _result(table, values, findings, prefix, "detect_anomalies")
 
 
 # ---------------------------------------------------------------------------
@@ -985,7 +1025,7 @@ def decompose_change(df, period_col, metric, from_period=None, to_period=None, d
         to_period = None
     if len(labels) < 2:
         findings["too_few_periods"] = True
-        return _result(empty, values, findings, prefix)
+        return _result(empty, values, findings, prefix, "decompose_change")
     if to_index is None:
         to_index = (len(labels) - 1 if to_period is None
                     else _find_period(labels, to_period, "to_period", period_col))
@@ -993,7 +1033,7 @@ def decompose_change(df, period_col, metric, from_period=None, to_period=None, d
         from_index = to_index - 1
         if from_index < 0:
             findings["too_few_periods"] = True
-            return _result(empty, values, findings, prefix)
+            return _result(empty, values, findings, prefix, "decompose_change")
     else:
         from_index = _find_period(labels, from_period, "from_period", period_col)
 
@@ -1104,7 +1144,7 @@ def decompose_change(df, period_col, metric, from_period=None, to_period=None, d
             values["change_top_member_delta"] = _num(top["delta"])
             values["change_dim_label"] = str(chosen)
             table.attrs["pdc_change_dim"] = str(chosen)
-    return _result(table, values, findings, prefix)
+    return _result(table, values, findings, prefix, "decompose_change")
 
 
 # ---------------------------------------------------------------------------
@@ -1273,7 +1313,8 @@ def attribute_level(df, target, dims, numeric_cols, *, method: str = "auto",
     table_columns = ["feature", "kind", "importance", "top_member", "top_member_target"]
     features = dims + [c for c in numeric_cols if c not in dims]
     if not len(data) or not features:
-        return _result(pd.DataFrame(columns=table_columns), values, findings, prefix)
+        return _result(pd.DataFrame(columns=table_columns), values, findings, prefix,
+                       "attribute_level")
 
     importance = None
     fell_back = False
@@ -1334,7 +1375,7 @@ def attribute_level(df, target, dims, numeric_cols, *, method: str = "auto",
     if hit:
         values["top_member"] = _label_str(hit[0])
         values["top_member_target"] = _num(hit[1])
-    return _result(table, values, findings, prefix)
+    return _result(table, values, findings, prefix, "attribute_level")
 
 
 # ---------------------------------------------------------------------------
@@ -1383,7 +1424,7 @@ def check_metric_overlap(df, metric_a, metric_b, *, equal_share: float = 0.5,
                            "sum_ratio": sum_ratio if sum_ratio is not None else float("nan")}])
     values = {"overlap_equal_share": share, "overlap_sum_ratio": sum_ratio, "overlap_rows": n,
               "overlap_nonnull_rows": n_nonnull}
-    return _result(table, values, findings, prefix)
+    return _result(table, values, findings, prefix, "check_metric_overlap")
 
 
 # ---------------------------------------------------------------------------

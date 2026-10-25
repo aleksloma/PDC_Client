@@ -1937,6 +1937,13 @@ def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: b
     import logging
     import re as _re
     logging.info(f"[PLOT_RENDER] Starting plot execution, go={go is not None}, px={px is not None}")
+    # Resolve pdc_diag's result dict class for the capture BEFORE any
+    # generated code runs (cached per process; never raises itself).
+    try:
+        import exec_transport
+        exec_transport._pdc_result_type()
+    except Exception as _e:
+        logging.warning(f"[PLOT_RENDER] PDC_RESULT_TYPE_PRIME_FAILED error={type(_e).__name__}")
     env = dict(GLOBAL_PLOT_SCOPE)
     # The two dicts generated code fills (DIAGNOSTICS_SPEC A3.1): fresh per job.
     env["VALUES"] = {}
