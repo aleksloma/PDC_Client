@@ -395,6 +395,70 @@ Remove the check's throwaway account and dashboard afterwards.
 
 ## Deploy history
 
+**2026-10-25 — `main` at `c0474e3` (PRs #16–#31).** Narrative templates:
+the planner's answer and caption templates are filled locally from the
+sandbox's `VALUES` / `FINDINGS` (`pdc_diag`, `narrative.py`), with the n/a
+sentence gate, the narrative-only retry, finding sentences, data-gap and
+scope-change detection, the rate view and the code-as-text gate; approved
+sign-in domains; pillow 13. Deployed after the brain went live on `d6864eb`
+(`pdcbrain-00032-cir`), which carries the narrative support;
+`BRAIN_CAPABILITIES` stays at the code default (not set on the service).
+Built ONCE by Cloud Build `3a9eeefd-5c6a-4514-9f6f-734a9cac3165` from a clean
+clone of `c0474e3` (both images stamped `c0474e3`,
+`BUILD_TIME=2026-10-25T22:32:31Z`) and deployed here first, then to
+`pdcclient-brb`:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:c0474e3` | `sha256:1c7749a85630557ad722049b8c4a3be6c925dd844693697b734f86db965f1fab` |
+| `pdcexecutor-demo:c0474e3` | `sha256:38cd17676dccc3496496c79672b1daad0ba7adbe15c36abba9f77572e6c5012b` |
+
+Revision `pdcclient-demo-c0474e3`, serving 100 % since 2026-10-25 ~22:54 UTC;
+it resolved exactly the two digests above. It replaced
+`pdcclient-demo-0ff6638`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-demo-0ff6638=100
+```
+
+Backup taken before the deploy:
+`gs://pdc-enterprise-client-demo-data-backups/20261025-223258/`, which matched
+the data bucket in size (442,954,700 bytes) and in its 595 object names.
+
+The spec change was image-only (two `image:` lines and the template name),
+checked by a diff against the export before the Admin API `PUT`.
+`client.powerdatachat.com` is mapped to this service only (domain mapping
+`client.powerdatachat.com` → `pdcclient-demo`). Candidate checks
+(`candidate---…` URL):
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `c0474e3`. Revision
+  log: `LADMIN_PRESENT`, `RESET_TOKEN_INDEX_FILLED count=1`,
+  `EXECUTOR_HANDSHAKE_OK version=c0474e3`; no error lines, no 5xx, no
+  `BACKEND_REQUEST_REFUSED`.
+- `ladmin` signed in (302 → `/admin/data_sources`) with the password in
+  `CLIENT_DEMO_LADMIN_PASSWORD`; 15 users listed (the 16 profile folders of
+  the backup minus `ladmin`); the bucket held 25 chats and 7 dashboards.
+- Existing records: three existing chats and one dashboard opened by hand in
+  the browser rendered as before (charts, tables, text).
+- A self-registered throwaway account (browser, Chrome) created a
+  `sample_sales.csv` chat; "how many rows are there?" rendered one narrative
+  sentence ("The dataset contains 6 rows.") above the table. A second chat
+  from a synthetic 2,500-row CSV gave "The dataset contains a total of 2,500
+  rows." (comma-grouped) above the table.
+- "based on this data, what problems are there?" rendered two charts and a
+  coverage table, each with a caption; no template, `[Findings:` marker or
+  code in the answer. No narrative bubble on that answer: the brain dropped
+  the planner's narrative as over its length cap
+  (`NARRATIVE_EXTRACT … too_long=1`), so each visual got a describe caption
+  (the designed fallback); the plan call alone took 146 s
+  (`gemini-4-argon`). Brain-side, recorded, not blocking.
+- The throwaway accounts (four, two of them left by failed script runs)
+  were removed through `POST /api/admin/users/remove` (3 chats deleted).
+- After the shift, `client.powerdatachat.com` reported the same `/version`
+  and `/health`, the revision log stayed free of errors and 5xx, and
+  `pdcbrain` gained no revision (`pdcbrain-00032-cir` serving before and
+  after).
+
 **2026-10-05 — `main` at `0ff6638` (PR #14).** Share dialog: its body scrolls
 inside the dialog, so Cancel / Share stay visible on a small window; and each
 conversation share is recorded in the chat meta (`sharing.conv_shares`,
