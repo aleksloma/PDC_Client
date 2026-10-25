@@ -974,16 +974,45 @@ def _accept_finding(value: Any):
     return False, None
 
 
-def _filter_outputs(raw: Any, key_re, accept, max_keys: int) -> tuple:
+# The resolved `_pdc_result_type()` — empty until the first call, then one
+# element (the class, or None when it could not be resolved).
+_PDC_RESULT_TYPE: list = []
+
+
+def _pdc_result_type():
+    """pdc_diag's own result dict class (`pdc_diag._ResultDict`), or None.
+    Imported here, lazily, so this module never depends on pdc_diag at
+    import time. Resolved ONCE per process and cached (None too, so a
+    failure logs once). Both exec sites call it BEFORE the job's code runs
+    (each sandbox job is a fresh runner process), so the capture never looks
+    anything up on a module generated code could have changed — a module
+    `__getattr__` it installed never runs here. Never raises."""
+    if _PDC_RESULT_TYPE:
+        return _PDC_RESULT_TYPE[0]
+    kind = None
+    try:
+        import pdc_diag
+        found = getattr(pdc_diag, "_ResultDict", None)
+        kind = found if isinstance(found, type) and issubclass(found, dict) else None
+    except Exception as e:
+        log_with_sid("exec", "warning",
+                     f"PDC_DIAG_RESULT_TYPE_UNAVAILABLE error={log_safe_text(type(e).__name__, 80)}")
+    _PDC_RESULT_TYPE.append(kind)
+    return kind
+
+
+def _filter_outputs(raw: Any, key_re, accept, max_keys: int, also_type=None) -> tuple:
     """`(kept, dropped)` under one rule set. Never raises.
 
-    Only an EXACT `dict` is read, and through `dict.items` (the base-class
-    method): a subclass — whose `items()` / `__iter__` generated code may
-    have made endless — counts as one drop without any of its methods
-    running. Keys must be exact `str` for the same reason."""
+    Only an EXACT `dict` is read — or, on the sandbox side, an object whose
+    type IS `also_type` (pdc_diag's own result dict, so `VALUES =
+    r["values"]` works) — and always through `dict.items` (the base-class
+    method): any other subclass — whose `items()` / `__iter__` generated
+    code may have made endless — counts as one drop, and no method of
+    either kind runs. Keys must be exact `str` for the same reason."""
     if raw is None:
         return {}, 0
-    if type(raw) is not dict:
+    if type(raw) is not dict and (also_type is None or type(raw) is not also_type):
         return {}, 1
     kept: dict = {}
     dropped = 0
@@ -1005,8 +1034,10 @@ def _filter_outputs(raw: Any, key_re, accept, max_keys: int) -> tuple:
 
 
 def encode_values(raw: Any) -> tuple:
-    """The sandbox side of VALUES: `(kept, dropped)`. Never raises."""
-    return _filter_outputs(raw, VALUE_KEY_RE, _accept_value, VALUES_MAX_KEYS)
+    """The sandbox side of VALUES: `(kept, dropped)`; a pdc_diag result dict
+    is accepted too. Never raises."""
+    return _filter_outputs(raw, VALUE_KEY_RE, _accept_value, VALUES_MAX_KEYS,
+                           also_type=_pdc_result_type())
 
 
 def decode_values(raw: Any) -> tuple:
@@ -1016,8 +1047,10 @@ def decode_values(raw: Any) -> tuple:
 
 def encode_findings(raw: Any) -> tuple:
     """The sandbox side of FINDINGS: `(kept, dropped)`. Shape only — the
-    semantic check is `narrative.validate_findings` in the main app."""
-    return _filter_outputs(raw, FINDING_KEY_RE, _accept_finding, FINDINGS_PREFILTER_MAX_KEYS)
+    semantic check is `narrative.validate_findings` in the main app. A
+    pdc_diag result dict is accepted too."""
+    return _filter_outputs(raw, FINDING_KEY_RE, _accept_finding, FINDINGS_PREFILTER_MAX_KEYS,
+                           also_type=_pdc_result_type())
 
 
 def decode_findings(raw: Any) -> tuple:

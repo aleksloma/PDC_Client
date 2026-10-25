@@ -228,7 +228,7 @@ raises:
 
 | | `values` | `findings` |
 |---|---|---|
-| container | an EXACT `dict` (a subclass, or anything else not `None`, counts as one drop; `None` → `{}`, 0), read through `dict.items` so no method generated code could have overridden runs | same |
+| container | an EXACT `dict` (a subclass, or anything else not `None`, counts as one drop; `None` → `{}`, 0), read through `dict.items` so no method generated code could have overridden runs. In the sandbox an object whose type IS `pdc_diag._ResultDict` (a pdc_diag result's `values` / `findings`: `VALUES = r["values"]`) is accepted too, read the same way (the class is resolved once per process, before the job's code runs, so nothing the code changes on the module is looked up); the main-app decode stays exact-`dict` only | same |
 | key | an exact `str` matching `[A-Za-z_][A-Za-z0-9_]{0,39}` | an exact `str` matching `[a-z][a-z0-9_]{0,39}` |
 | value | an EXACT `bool`, `int`, `float` (NaN/±inf kept), `None`, or a `str` of at most 200 characters | an EXACT `bool`, or a `str` of 1–64 characters without a C0 control |
 | numpy scalar | converted once through numpy's own `np.generic.item` (a subclass's `item()` override never runs); kept only when that yields an accepted type. Any other object with an `.item()` is dropped without being called | same |

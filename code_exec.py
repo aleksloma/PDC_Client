@@ -228,6 +228,10 @@ def _execute_in_process(code: str, dfs: dict, sid: str | None = None, timeout: f
     if timeout is None:
         timeout = CODE_EXEC_TIMEOUT_SECONDS
 
+    # Resolve pdc_diag's result dict class for the capture BEFORE any
+    # generated code runs (cached per process; never raises).
+    exec_transport._pdc_result_type()
+
     # Article XIII gate: generated code must only ever see standard dtypes.
     # Rebinding the local `dfs` covers both env["dfs"] and the `df` alias.
     dfs = sanitize_for_execution(dfs, sid or "exec")

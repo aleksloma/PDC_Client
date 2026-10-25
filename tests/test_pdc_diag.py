@@ -521,7 +521,9 @@ def test_detect_anomalies_multiple():
 # the label of the gap period with the fewest rows, else None.
 ANOMALY_VALUE_KEYS = {"anomaly_period", "anomaly_value", "baseline_value",
                       "anomaly_ratio_median", "anomaly_prev_period", "anomaly_prev_value",
-                      "anomaly_ratio_prev", "n_periods", "n_anomalies", "data_gap_period"}
+                      "anomaly_ratio_prev", "n_periods", "n_anomalies", "data_gap_period",
+                      # the alias VALUES (BRB run 3 read period names that did not exist): first / last period label
+                      "period_from", "period_to"}
 
 
 def _counted_frame(periods, row_counts, totals, metric="amount") -> pd.DataFrame:
