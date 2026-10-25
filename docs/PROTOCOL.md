@@ -65,7 +65,7 @@ are unchanged.
 | `df_columns`        | `{name: list(df.columns)}` (only sent on retry, for column self-correction) | client |
 | `history_rows`      | the `history_rows` arg to `generate_pandas_code` / `summarize_answer`. Each row carries **only** `role`, `content`, and (when present) `code` — the client's `brain_client._sanitize_history_rows` strips every other persisted field (`image_base64`, `chart_data`, `table`, `usage`, `full_table_key`, `ts`, …) before the POST, so raw data values in locally persisted records never cross the boundary (Article II). From its narrative release the client writes the `content` of a templated AI turn as a `[Findings: …]` marker line plus the unfilled template (see `/v1/plan` "History") | client (`local_store.get_history`, sanitized in `brain_client.plan/retry/summarize`) |
 | `common_fields`     | the `common_fields` arg to `generate_pandas_code` | client |
-| `error_msg`         | `exec_out["error"]` from `safe_execute`. From its narrative release the client replaces every quoted literal that is not an input column name, a df name or text the failed code itself contains (a whole identifier token, or text inside one of the code's string literals) with `'<value>'`, and the `NearZeroChartError` text carries no number | client |
+| `error_msg`         | `exec_out["error"]` from `safe_execute`. From its narrative release the client replaces every quoted literal that is not an input column name, a df name or text the failed code itself contains (a whole identifier token, or text inside one of the code's string literals) with `'<value>'`, and the `NearZeroChartError` text carries no number. With `narrative_v1` the client also sends one request that is not an execution error: `narrative_invalid: <nested|unclosed|mismatched|first_sentence>`, the narrative-only retry (see `/v1/retry`), with `failed_code` the code that already ran and `use_pro: true`; it uses only the reply's `narrative` | client |
 | `failed_code`       | the failed code block | client |
 | `preview` (summarize) | the `_safe_preview` value: a `str`/`int`/`float`/`bool`, a flat object whose keys and values are all such scalars (or null values), or `null` — lists, tables and objects holding anything else become `null`. Capped in transport: a string at 500 characters + `…[truncated]`; an object at its first 20 keys, each string key/value cut the same way, plus `"_truncated_keys": <number dropped>` when more existed. From its narrative release the client always sends `null` (see `/v1/summarize`) | client (`run_chat_local._safe_preview`, capped by `brain_client._compact_preview_for_transport`) |
 | `qa_pairs` (report) | the `findings_for_llm` list the B2C `_generate_report_structure` already builds | client |
@@ -390,10 +390,25 @@ in the answer language:
   renders `n/a`, and the client removes every sentence holding one
   before display (a caption emptied that way is described instead; a
   narrative emptied that way is not used). So a sentence should depend
-  only on values its own section guarantees;
+  only on values its own section guarantees. The FIRST sentence is never
+  dropped: when it would show `n/a`, or when the template's sections do not
+  nest correctly, the client asks once for a new template (the
+  narrative-only retry under `/v1/retry`);
 - `{{#flag}}…{{/flag}}` is shown when FINDINGS has `flag` true, holds a
   column name or code under `flag`, or `flag` is a code some FINDINGS value
-  equals; `{{^flag}}…{{/flag}}` is shown otherwise. One level only;
+  equals; `{{^flag}}…{{/flag}}` is shown otherwise. One level only. On
+  the client a name `<prefix>_<code>` whose `<code>` is a FINDINGS code or
+  key counts as that code when the block's code passes that prefix as
+  `prefix="<prefix>_"` (the brain's template-validation rule, applied to
+  a template the brain did not rewrite); a prefix the code never passes
+  is never resolved, and any other name the FINDINGS do not hold is
+  false. After the template, the client appends one fixed
+  sentence in the answer language for each data-quality finding (mixed
+  units, coverage change, thin period or data gap, Unknown-dominated
+  dimension, metric overlap, latest period in the past) that no shown
+  section already states, and formats Uzbek and Russian numbers in their
+  own locale (no-break-space thousands, decimal comma, mln/mlrd/trln or
+  млн/млрд/трлн);
 - plain markdown only (bold, `- ` bullets, blank lines), never three
   backticks. The model never writes a value itself: every number, name and
   date is a slot.

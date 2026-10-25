@@ -1048,7 +1048,26 @@ from the rendered narrative and from each rendered caption
 reason=missing_slot n=<count> what=<narrative|caption>`). A caption the gate
 empties counts as missing (describe runs for that visual); a narrative it
 empties is not used (`NARRATIVE_SKIPPED reason=all_sentences_dropped`), and
-the answer is built as for a turn without a narrative. A rendered text is
+the answer is built as for a turn without a narrative. The first sentence is
+never dropped that way: when it would show `n/a`, or when the template's
+sections do not nest correctly (`NARRATIVE_PARSE_FAILED kind=…`), the client
+asks the brain ONCE for a new template through `/v1/retry`, with `error_msg`
+exactly `narrative_invalid: <nested|unclosed|mismatched|first_sentence>` and
+the code that already ran as `failed_code` (it runs none of the reply's code);
+a second unusable template logs `NARRATIVE_INVALID_TWICE` and the answer is
+built as for a turn without a narrative. In a multi-chart turn that retry runs
+after the last chart, so the `narrative` event can arrive one model call after
+it (`NARRATIVE_RETRY_DONE kind= elapsed_ms= narrative=`). A section named
+`<prefix>_<code>` (`{{#ovl_metric_definition_overlap}}`) counts as that FINDINGS
+code when the block's code passes that prefix (`prefix="ovl_"`); `no_` / `not_`
+names are never resolved. After the
+template, one fixed sentence in the answer language (en / uz / ru / ka) is
+added for each data-quality finding no shown section states: mixed units, a
+coverage change, a thin period or data gap, an Unknown-dominated dimension, a
+metric overlap (stock, not flow) and data that ends before the current month
+(`FINDING_SENTENCES_ADDED n= lang=`). Numbers in Uzbek and Russian answers use
+a no-break-space thousands separator, a decimal comma and mln/mlrd/trln
+(uz) or млн/млрд/трлн (ru). A rendered text is
 DISPLAY text only: it reaches the page, the local record and the local
 PDF/PPTX, never `content` and never a brain call. What changes on the stream:
 

@@ -1451,7 +1451,9 @@ capabilities, which restores the earlier prompts and responses.
   by `pdc_diag.fmt`, sections chosen by FINDINGS, string values
   markdown-escaped, `n/a` for a missing slot, a value-free fallback on a
   grammar error; every sentence that would show `n/a` is removed before
-  display, `drop_na_sentences`), validates FINDINGS per block against that block's code
+  display, `drop_na_sentences`; a prefixed section name resolves to its
+  FINDINGS code; uz/ru numbers use their own locale; one fixed sentence per
+  data-quality finding no section states, `add_finding_sentences`), validates FINDINGS per block against that block's code
   and the input column names, builds the `[Findings: …]` history marker and
   the slot-free `brain_view` that `/v1/title` and `/v1/report` get.
 - **Flows.** `run_chat_local` keeps one `_NarrState` per turn: VALUES merge
