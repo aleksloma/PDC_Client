@@ -517,9 +517,11 @@ def test_detect_anomalies_multiple():
 
 
 # --- degenerate periods (BRB retest follow-up: thin February) ---------------
+# `data_gap_period` is the additive VALUE of the BRB retest 2 follow-up (B8.4):
+# the label of the gap period with the fewest rows, else None.
 ANOMALY_VALUE_KEYS = {"anomaly_period", "anomaly_value", "baseline_value",
                       "anomaly_ratio_median", "anomaly_prev_period", "anomaly_prev_value",
-                      "anomaly_ratio_prev", "n_periods", "n_anomalies"}
+                      "anomaly_ratio_prev", "n_periods", "n_anomalies", "data_gap_period"}
 
 
 def _counted_frame(periods, row_counts, totals, metric="amount") -> pd.DataFrame:
@@ -609,13 +611,16 @@ def test_detect_anomalies_brb_thin_february():
     assert list(t[t["is_primary"]]["period"]) == ["2026 Март"]
     feb = t[t["period"] == "2026 Февраль"].iloc[0]
     assert not bool(feb["is_anomaly"]) and not bool(feb["is_primary"])
-    assert set(v) == ANOMALY_VALUE_KEYS                  # no new VALUES keys
+    assert set(v) == ANOMALY_VALUE_KEYS
+    assert v["data_gap_period"] == "2026 Февраль"
 
 
 def test_detect_anomalies_thin_ratio_kwarg():
     periods = [f"2025-{m:02d}" for m in range(1, 6)]
-    # 300 rows of a median 1000: thin at the default 0.5, not thin at 0.2
-    df = _counted_frame(periods, [1000, 1000, 300, 1000, 1000], [1000, 1000, 1, 1000, 1000])
+    # 300 rows of a median 1000: thin at the default 0.5, not thin at 0.2.
+    # The middle value is 2% of its neighbours, above COLLAPSE_RATIO (1%), so
+    # only the row rule decides here.
+    df = _counted_frame(periods, [1000, 1000, 300, 1000, 1000], [1000, 1000, 20, 1000, 1000])
     default = pdc_diag.detect_anomalies(df, "period", "amount")
     assert default["findings"].get("period_status") == "data_gap"
     loose = pdc_diag.detect_anomalies(df, "period", "amount", thin_ratio=0.2)
@@ -1043,6 +1048,25 @@ def test_prefix_applies_to_values_only():
     assert "top_feature" in at["findings"]
 
 
+def test_prefix_error_survives_the_retry_scrub():
+    """The prefix error reaches the planner's retry prompt through
+    `brain_client._scrub_error_msg`, which turns every quoted literal the
+    failed code does not contain into '<value>'. The old text ended with a
+    quoted '_', so the planner was never told the prefix must end with an
+    underscore and retried the same invalid prefix (BRB run-2 follow-up:
+    prefix="granted_vs_new_" failed four times). The message names the rule
+    in words and quotes nothing."""
+    import brain_client
+    code = "r = pdc_diag.check_metric_overlap(df, 'A', 'B', prefix='granted_vs_new_')"
+    with pytest.raises(ValueError) as caught:
+        pdc_diag.coverage_check(_stable_frame(), "period", ["region"], ["amount"],
+                                prefix="granted_vs_new_")
+    text = f"ValueError: {caught.value}"
+    assert "'" not in str(caught.value) and '"' not in str(caught.value)
+    assert "underscore" in str(caught.value)
+    assert brain_client._scrub_error_msg(text, frozenset({"A", "B"}), code) == text
+
+
 @pytest.mark.parametrize("bad", ["Q3_", "q3", "3q_", "abcdefghijk_", "q-3_", "q3__", "_", "q 3_"])
 def test_prefix_rejected_with_value_error(bad):
     with pytest.raises(ValueError):
@@ -1173,7 +1197,8 @@ def test_plot_helpers_return_one_plotly_figure():
     assert _is_plotly_white(fig2)
     assert "What changed" in (fig2.layout.title.text or "")
     fig2b = pdc_diag.plot_waterfall(change["table"], dim="region", title="W")
-    assert fig2b.layout.title.text == "W"
+    # BRB retest 2 follow-up (B8.5/B8.8): the plotted dim is named in the title
+    assert fig2b.layout.title.text == "W (region)"
 
     imp = pdc_diag.attribute_level(_attribution_frame(True), "target", ["segment"], ["noise"])
     fig3 = pdc_diag.plot_importance(imp["table"])
@@ -1276,3 +1301,177 @@ def test_pdc_diag_public_surface():
                  "attribute_level", "check_metric_overlap", "plot_highlighted_series",
                  "plot_waterfall", "plot_importance", "_order_periods", "_parse_period_label"):
         assert callable(getattr(pdc_diag, name, None)), name
+
+
+
+# ---------------------------------------------------------------------------
+# BRB retest 2 follow-up (B8.4): value-collapse gaps, `data_gap_period`
+# ---------------------------------------------------------------------------
+BRB_PERIODS = ["2025 Ноябрь", "2025 Декабрь", "2026 Январь", "2026 Февраль", "2026 Март"]
+BRB_ROWS = [26605, 12617, 11302, 3792, 33455]
+BRB_NPL = [4500.50e9, 602.44e9, 563.70e9, 4.0e6, 4739.29e9]
+
+
+def _assert_brb_result(out):
+    _assert_shape(out)
+    f, v, t = out["findings"], out["values"], out["table"]
+    assert list(t["period"]) == BRB_PERIODS
+    assert _gap_flags(t) == {p: p == "2026 Февраль" for p in BRB_PERIODS}
+    assert f.get("period_status") == "data_gap"
+    assert f["anomaly"] == "anomaly_confirmed"
+    assert f.get("anomaly_up") is True
+    assert v["anomaly_period"] == "2026 Март"
+    assert list(t[t["is_primary"]]["period"]) == ["2026 Март"]
+    feb = t[t["period"] == "2026 Февраль"].iloc[0]
+    assert not bool(feb["is_anomaly"]) and not bool(feb["is_primary"])
+    assert v.get("data_gap_period") == "2026 Февраль"
+
+
+def test_detect_anomalies_brb_shape_raw_rows():
+    """The exact BRB row shape (en q3): one row per loan, NPL spread over the
+    rows. February is thin (rows rule) AND collapsed; March is the spike."""
+    df = _counted_frame(BRB_PERIODS, BRB_ROWS, BRB_NPL, metric="npl")
+    _assert_brb_result(pdc_diag.detect_anomalies(df, "period", "npl"))
+
+
+def test_detect_anomalies_brb_shape_pre_aggregated():
+    """The en q3 bug: the code passed ONE ROW PER MONTH, so the rows rule
+    cannot fire and February became the primary 'spike'. The value-collapse
+    rule makes the aggregated frame give the same answer as the raw one."""
+    df = pd.DataFrame({"period": BRB_PERIODS, "npl": BRB_NPL})
+    out = pdc_diag.detect_anomalies(df, "period", "npl")
+    assert [int(x) for x in out["table"]["rows"]] == [1] * 5
+    _assert_brb_result(out)
+
+
+def test_collapse_ratio_constant():
+    assert getattr(pdc_diag, "COLLAPSE_RATIO", None) == 0.01
+
+
+def _agg_flags(values):
+    periods = [f"2025-{m:02d}" for m in range(1, len(values) + 1)]
+    df = pd.DataFrame({"period": periods, "amount": [float(x) for x in values]})
+    out = pdc_diag.detect_anomalies(df, "period", "amount")
+    return [bool(g) for g in out["table"]["is_data_gap"]], out
+
+
+def test_collapse_rule_half_percent_of_both_neighbours_is_a_gap():
+    flags, out = _agg_flags([100, 100, 0.5, 100, 100])
+    assert flags == [False, False, True, False, False]
+    assert out["findings"].get("period_status") == "data_gap"
+    assert out["values"].get("data_gap_period") == "2025-03"
+    assert out["findings"]["anomaly"] == "no_anomaly"
+
+
+def test_collapse_rule_two_percent_is_not_a_gap():
+    flags, out = _agg_flags([100, 100, 2, 100, 100])
+    assert flags == [False] * 5
+    assert "period_status" not in out["findings"]
+    assert out["values"].get("data_gap_period") is None
+
+
+def test_collapse_rule_needs_every_neighbour_positive():
+    # 0.5 sits next to a 0: not a gap by collapse. The 0 itself is a gap by
+    # the zero rule, since both of its neighbours are non-zero.
+    flags, _out = _agg_flags([100, 0, 0.5, 100, 100])
+    assert flags[2] is False
+    assert flags[1] is True
+
+
+def test_collapse_rule_first_and_last_period_one_neighbour():
+    first, _ = _agg_flags([0.5, 100, 100, 100, 100])
+    assert first == [True, False, False, False, False]
+    last, _ = _agg_flags([100, 100, 100, 100, 0.5])
+    assert last == [False, False, False, False, True]
+    not_first, _ = _agg_flags([2, 100, 100, 100, 100])
+    assert not_first[0] is False
+
+
+def test_data_gap_period_fewest_rows_then_lowest_value():
+    periods = [f"2025-{m:02d}" for m in range(1, 6)]
+    # two thin periods: 100 rows and 50 rows of a median 1000 -> the 50
+    df = _counted_frame(periods, [1000, 100, 1000, 50, 1000], [1000, 1000, 1000, 1000, 1000])
+    out = pdc_diag.detect_anomalies(df, "period", "amount")
+    assert _gap_flags(out["table"]) == {p: p in ("2025-02", "2025-04") for p in periods}
+    assert out["values"]["data_gap_period"] == "2025-04"
+    # a tie on rows (one row each) -> the lowest value
+    _flags, agg = _agg_flags([100, 0.5, 100, 0.2, 100])
+    assert agg["values"]["data_gap_period"] == "2025-04"
+
+
+def test_data_gap_period_none_without_gap_and_prefixed():
+    out = pdc_diag.detect_anomalies(_series_frame([10, 11, 10, 12, 100, 11]), "period", "amount")
+    assert "data_gap_period" in out["values"]
+    assert out["values"]["data_gap_period"] is None
+    short = pdc_diag.detect_anomalies(_series_frame([10, 11]), "period", "amount")
+    assert short["values"].get("data_gap_period") is None
+    pref = pdc_diag.detect_anomalies(_series_frame([100, 100, 0.5, 100, 100]), "period", "amount",
+                                     prefix="ga_")
+    assert pref["values"].get("ga_data_gap_period") == "2025-03"
+    assert "data_gap_period" not in pref["values"]
+
+
+# ---------------------------------------------------------------------------
+# BRB retest 2 follow-up (B8.5 / B8.8): the waterfall plots the chosen dim
+# ---------------------------------------------------------------------------
+def _two_dim_frame() -> pd.DataFrame:
+    """REGION changes evenly (A +200, B +200), TYPE is concentrated (X +400,
+    Y 0): decompose_change chooses TYPE although REGION comes first."""
+    rows = []
+    p1 = {("A", "X"): 100, ("A", "Y"): 100, ("B", "X"): 100, ("B", "Y"): 100}
+    p2 = {("A", "X"): 300, ("A", "Y"): 100, ("B", "X"): 300, ("B", "Y"): 100}
+    for period, cells in (("2025-01", p1), ("2025-02", p2)):
+        for (region, typ), v in cells.items():
+            rows.append({"period": period, "region": region, "type": typ, "amount": v})
+    return pd.DataFrame(rows)
+
+
+def test_decompose_change_sets_change_dim_attrs():
+    out = pdc_diag.decompose_change(_two_dim_frame(), "period", "amount", dims=["region", "type"])
+    v, t = out["values"], out["table"]
+    assert v["change_dim_label"] == "type"
+    assert list(dict.fromkeys(t["dim"])) == ["region", "type"]
+    assert t.attrs.get("pdc_change_dim") == "type"
+    assert t.attrs.get("pdc_from_period") == "2025-01"
+    assert t.attrs.get("pdc_to_period") == "2025-02"
+    assert t.attrs.get("pdc_metric") == "amount"
+
+
+def test_decompose_change_no_change_dim_attr_without_top_member():
+    df = pd.DataFrame({"period": ["2025-01"] * 4 + ["2025-02"] * 4,
+                       "region": ["Unknown"] * 8, "amount": [1.0] * 4 + [2.0] * 4})
+    out = pdc_diag.decompose_change(df, "period", "amount", dims=["region"])
+    assert out["values"]["change_dim_label"] is None
+    assert out["table"].attrs.get("pdc_change_dim") is None
+
+
+def test_plot_waterfall_plots_the_chosen_dim_and_ignores_conflicting_dim():
+    pytest.importorskip("plotly.graph_objects")
+    table = pdc_diag.decompose_change(_two_dim_frame(), "period", "amount",
+                                      dims=["region", "type"])["table"]
+    for kwargs in ({}, {"dim": "region"}):
+        fig = pdc_diag.plot_waterfall(table, **kwargs)
+        assert fig.layout.xaxis.title.text == "type", kwargs
+        members = list(fig.data[0].x)[1:-1]
+        assert "X" in members and "A" not in members and "B" not in members, kwargs
+        assert fig.layout.title.text == "What changed: amount by type, 2025-01 to 2025-02"
+    fig = pdc_diag.plot_waterfall(table, dim="region", title="Loans moved")
+    assert fig.layout.title.text == "Loans moved (type)"
+    fig = pdc_diag.plot_waterfall(table, title="Change by TYPE")
+    assert fig.layout.title.text == "Change by TYPE"          # already names the dim
+
+
+def test_plot_waterfall_hand_built_table_keeps_dim_argument():
+    pytest.importorskip("plotly.graph_objects")
+    table = pd.DataFrame({
+        "dim": ["region", "region", "type", "type"],
+        "member": ["A", "B", "X", "Y"],
+        "from_value": [1.0, 1.0, 1.0, 1.0], "to_value": [2.0, 1.0, 3.0, 1.0],
+        "delta": [1.0, 0.0, 2.0, 0.0],
+    })
+    fig = pdc_diag.plot_waterfall(table, dim="type", title="W")
+    assert fig.layout.xaxis.title.text == "type"
+    assert fig.layout.title.text == "W (type)"
+    fig = pdc_diag.plot_waterfall(table, title="W")
+    assert fig.layout.xaxis.title.text == "region"
+    assert fig.layout.title.text == "W (region)"

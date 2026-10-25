@@ -37,7 +37,17 @@ MARKER_MAX = 400
 
 
 class TemplateError(ValueError):
-    """A template that does not follow the A2.1 grammar."""
+    """A template that does not follow the A2.1 grammar. `kind` names the
+    error: "nested" (a section inside a section), "unclosed" (an open section
+    never closed) or "mismatched" (a close whose name differs from the open,
+    or a close without an open)."""
+
+    def __init__(self, message: str, kind: str = "mismatched"):
+        super().__init__(message)
+        self.kind = kind
+
+
+PARSE_ERROR_KINDS = ("nested", "unclosed", "mismatched")
 
 
 _TOKEN_RE = re.compile(
@@ -78,6 +88,14 @@ _VALUE_DISPLAY_KEY_MAX = 80
 
 _CAPTION_INDEX_RE = re.compile(r"([1-9]|1[0-2])\Z")
 
+# A section-name prefix (A2.2): a lower-case letter, up to 9 more letters /
+# digits, "_" — pdc_diag's own `prefix=` rule — then a FINDINGS_ENUM code or
+# a registry key. The prefix holds no "_" before its last character, so the
+# split is at the first underscore. It resolves only when PASSED.
+_PASSED_PREFIX_RE = re.compile(r"[a-z][a-z0-9]{0,9}_\Z")
+_SECTION_PREFIX_RE = re.compile(r"([a-z][a-z0-9]{0,9}_)(.+)\Z")
+_SECTION_LOG_MAX = 40
+
 
 # ---------------------------------------------------------------- parsing
 
@@ -97,14 +115,14 @@ def parse(template: str) -> list:
         sec = m.group("sec")
         if sec in ("#", "^"):
             if open_section is not None:
-                raise TemplateError("section inside a section")
+                raise TemplateError("section inside a section", "nested")
             open_section = (sec, m.group("sname"), [])
             current = open_section[2]
         elif sec == "/":
             if open_section is None:
-                raise TemplateError("close without an open section")
+                raise TemplateError("close without an open section", "mismatched")
             if m.group("sname") != open_section[1]:
-                raise TemplateError("close name differs from the open section")
+                raise TemplateError("close name differs from the open section", "mismatched")
             nodes.append(("section", open_section[0], open_section[1], open_section[2]))
             current = nodes
             open_section = None
@@ -113,13 +131,31 @@ def parse(template: str) -> list:
     if pos < len(template):
         current.append(("text", template[pos:]))
     if open_section is not None:
-        raise TemplateError("open section never closed")
+        raise TemplateError("open section never closed", "unclosed")
     return nodes
+
+
+def template_error_kind(template) -> str | None:
+    """The parse-error kind of `template` ("nested" | "unclosed" |
+    "mismatched"), or None when it parses (or is not a str). Never raises."""
+    if not isinstance(template, str):
+        return None
+    try:
+        parse(template)
+        return None
+    except TemplateError as e:
+        kind = getattr(e, "kind", None)
+        return kind if kind in PARSE_ERROR_KINDS else "mismatched"
+    except Exception as e:
+        # A crash is no verdict on the template: never worth a brain retry.
+        log_with_sid("narrative", "warning",
+                     f"NARRATIVE_TEMPLATE_CHECK_FAILED error={log_safe_value(type(e).__name__, 80)}")
+        return None
 
 
 # --------------------------------------------------------- shared helpers
 
-def _section_shown(flag: str, findings: dict) -> bool:
+def _flag_shown(flag: str, findings: dict) -> bool:
     """The `{{#flag}}` condition (A2.2): (a) findings[flag] is True, (b) flag
     present with a non-bool value, (c) flag is a FINDINGS_ENUM code and some
     finding value equals it."""
@@ -134,16 +170,64 @@ def _section_shown(flag: str, findings: dict) -> bool:
     return False
 
 
+def _is_code(name: str) -> bool:
+    return name in pdc_diag.FINDINGS_ENUM or name in pdc_diag.PDC_DIAG_FINDING_KEYS
+
+
+def passed_prefixes(prefixes) -> frozenset:
+    """The PASSED prefixes as a frozenset: every str of the iterable that
+    matches `[a-z][a-z0-9]{0,9}_` (pdc_diag's own prefix rule). None, a
+    non-iterable or junk -> empty. Never raises."""
+    try:
+        if prefixes is None:
+            return frozenset()
+        if isinstance(prefixes, str):
+            prefixes = (prefixes,)
+        return frozenset(p for p in prefixes
+                         if isinstance(p, str) and _PASSED_PREFIX_RE.match(p))
+    except Exception:
+        return frozenset()
+
+
+def _resolve_section(name: str, findings: dict, prefixes: frozenset = frozenset()) -> tuple:
+    """`(shown, code)` of the section name `name` (A2.2):
+    - an exact findings key wins (its own condition, no prefix lookup);
+    - a FINDINGS_ENUM code or a `pdc_diag` registry key is itself;
+    - otherwise `<p><code>` resolves to <code> (an enum code or a registry
+      key) ONLY when `<p>` is one of the PASSED `prefixes` — the prefixes
+      the block code hands a pdc_diag helper as `prefix="<p>"`, the brain's
+      template-validation rule (`ovl_metric_definition_overlap` ->
+      `metric_definition_overlap` when the code passed "ovl_"). A prefix
+      the code never passes (`no_`, `not_`, `has_`) never resolves, so a
+      negated name is never shown as the bare code;
+    - anything else is unknown: `(False, None)`."""
+    if name in findings or _is_code(name):
+        return _flag_shown(name, findings), name
+    if prefixes:
+        m = _SECTION_PREFIX_RE.match(name)
+        if m is not None and m.group(1) in prefixes and _is_code(m.group(2)):
+            code = m.group(2)
+            return _flag_shown(code, findings), code
+    return False, None
+
+
+def _section_shown(flag: str, findings: dict, prefixes=None) -> bool:
+    """The resolved `{{#flag}}` condition (`_resolve_section`)."""
+    return _resolve_section(flag, findings, passed_prefixes(prefixes))[0]
+
+
 def _md_escape(text: str) -> str:
     """Markdown escaping of a STRING value: `*`, `_` and a leading `-`."""
     text = text.replace("*", "\\*").replace("_", "\\_")
     return _LEADING_DASH_RE.sub(lambda m: m.group(1) + "\\-", text, count=1)
 
 
-def _fmt_value(value, kind) -> str:
+def _fmt_value(value, kind, locale=None) -> str:
     """One value as display text: `pdc_diag.fmt` (unknown kind -> the type's
-    default kind), a string value markdown-escaped; numbers never escaped."""
-    text = pdc_diag.fmt(value, kind if kind in KINDS else None)
+    default kind) in `locale`, a string value markdown-escaped; numbers never
+    escaped."""
+    text = pdc_diag.fmt(value, kind if kind in KINDS else None,
+                        locale if isinstance(locale, str) else None)
     if isinstance(value, str) and not isinstance(value, bool):
         text = _md_escape(text)
     return text
@@ -173,23 +257,35 @@ def _post(text: str, max_len: int) -> str:
     return _cap(text, max_len)
 
 
-def _walk(nodes: list, findings: dict, slot_text) -> str:
+def _walk(nodes: list, findings: dict, slot_text, *, shown_sections=None,
+          unknown=None, prefixes: frozenset = frozenset()) -> str:
+    """The text of `nodes`. `shown_sections` (a list) collects
+    `(code, body text)` of every `{{#…}}` section shown; `unknown` (a list)
+    collects every section name that resolves to nothing, once each;
+    `prefixes` are the passed section-name prefixes (`passed_prefixes`)."""
     out: list = []
 
-    def emit(items):
+    def emit(items, sink):
         for node in items:
             if node[0] == "text":
-                out.append(node[1])
+                sink.append(node[1])
             elif node[0] == "slot":
-                out.append(slot_text(node[1], node[2]))
+                sink.append(slot_text(node[1], node[2]))
 
     for node in nodes:
         if node[0] == "section":
-            shown = _section_shown(node[2], findings)
+            shown, code = _resolve_section(node[2], findings, prefixes)
+            if code is None and unknown is not None and node[2] not in unknown:
+                unknown.append(node[2])
             if (node[1] == "#") == shown:
-                emit(node[3])
+                body: list = []
+                emit(node[3], body)
+                text = "".join(body)
+                out.append(text)
+                if node[1] == "#" and code is not None and shown_sections is not None:
+                    shown_sections.append((code, text))
         else:
-            emit([node])
+            emit([node], out)
     return "".join(out)
 
 
@@ -206,32 +302,62 @@ def _fallback(template, max_len: int, placeholder: str) -> str:
 # ------------------------------------------------------------- rendering
 
 def render(template: str, values: dict, findings: dict, *, sid: str,
-           max_len: int = RENDERED_MAX) -> str:
-    """The template filled with VALUES (slots) and FINDINGS (sections).
-    A missing slot renders "n/a" and logs its NAME once per render. On a
-    TemplateError or any other failure: `fallback_text`. Never raises."""
+           max_len: int = RENDERED_MAX, locale: str | None = None,
+           prefixes=None) -> str:
+    """The template filled with VALUES (slots, formatted in `locale`) and
+    FINDINGS (sections; a prefixed section name resolves only through a
+    PASSED prefix in `prefixes`). A missing slot renders "n/a" and logs its
+    NAME once per render. On a TemplateError or any other failure:
+    `fallback_text`. Never raises."""
+    return render_with_sections(template, values, findings, sid=sid, max_len=max_len,
+                                locale=locale, prefixes=prefixes)[0]
+
+
+def render_with_sections(template: str, values: dict, findings: dict, *, sid: str,
+                         max_len: int = RENDERED_MAX,
+                         locale: str | None = None, prefixes=None) -> tuple:
+    """`(text, sections)`: the `render` text, and `(resolved code, body text)`
+    of every `{{#…}}` section the render showed (a `{{^…}}` section is never
+    listed — it says something is NOT the case). `prefixes`: the section-name
+    prefixes the code passed (None / empty -> no prefixed name resolves). A
+    section name resolving to nothing logs `NARRATIVE_SECTION_UNKNOWN name=`
+    once per render. On a failure: `(fallback_text, [])`. Never raises."""
     try:
+        passed = passed_prefixes(prefixes)
         nodes = parse(template)
         vals = values if isinstance(values, dict) else {}
         finds = findings if isinstance(findings, dict) else {}
         missing: list = []
+        sections: list = []
+        unknown: list = []
 
         def slot_text(name, kind):
             if name in vals:
-                return _fmt_value(vals[name], kind)
+                return _fmt_value(vals[name], kind, locale)
             if name not in missing:
                 missing.append(name)
             return _NA
 
-        text = _walk(nodes, finds, slot_text)
+        text = _walk(nodes, finds, slot_text, shown_sections=sections, unknown=unknown,
+                     prefixes=passed)
         for name in missing:
             log_with_sid(sid, "warning",
                          f"NARRATIVE_SLOT_MISSING name={log_safe_value(name, 40)}")
-        return _post(text, max_len)
+        for name in unknown:
+            log_with_sid(sid, "info",
+                         f"NARRATIVE_SECTION_UNKNOWN name={log_safe_value(name, _SECTION_LOG_MAX)}")
+        shown = [(code, _post(body, max(len(body), 1))) for code, body in sections]
+        return _post(text, max_len), shown
     except Exception as e:
         log_with_sid(sid, "warning",
                      f"NARRATIVE_RENDER_FAILED error={log_safe_value(type(e).__name__, 80)}")
-        return fallback_text(template, max_len=max_len)
+        return fallback_text(template, max_len=max_len), []
+
+
+def locale_for(lang) -> str | None:
+    """The `pdc_diag.fmt` locale of an answer language code: "uz" / "ru"
+    for those languages, None (the default locale) for every other."""
+    return lang if isinstance(lang, str) and lang in ("uz", "ru") else None
 
 
 def fallback_text(template: str, *, max_len: int = RENDERED_MAX) -> str:
@@ -240,10 +366,12 @@ def fallback_text(template: str, *, max_len: int = RENDERED_MAX) -> str:
     return _fallback(template, max_len, _NA)
 
 
-def brain_view(template: str, findings: dict) -> str:
+def brain_view(template: str, findings: dict, *, prefixes=None) -> str:
     """The text /v1/title and /v1/report see: sections resolved with FINDINGS
-    exactly as `render` does, every slot `[name with spaces]` — no value. A
-    parse error -> the fallback with "[value]" slots. Never raises."""
+    exactly as `render` does, every slot `[name with spaces]` — no value. Its
+    callers pass no `prefixes`, so a prefixed section is false there (the
+    safe direction). A parse error -> the fallback with "[value]" slots.
+    Never raises."""
     try:
         try:
             nodes = parse(template)
@@ -251,7 +379,8 @@ def brain_view(template: str, findings: dict) -> str:
             return _fallback(template, RENDERED_MAX, "[value]")
         finds = findings if isinstance(findings, dict) else {}
         text = _walk(nodes, finds,
-                     lambda name, _kind: "[" + name.replace("_", " ") + "]")
+                     lambda name, _kind: "[" + name.replace("_", " ") + "]",
+                     prefixes=passed_prefixes(prefixes))
         return _post(text, RENDERED_MAX)
     except Exception:
         return ""
@@ -473,6 +602,311 @@ def history_content(template: str, findings: dict) -> str:
     return marker + "\n" + text if marker else text
 
 
+# ------------------------------------------------- first sentence, coverage
+
+_WS_RUN_RE = re.compile(r"\s+")
+
+
+def first_sentence_has_na(text) -> bool:
+    """True when the FIRST sentence of a rendered text (the first non-blank
+    line, cut at the first sentence end) holds the "n/a" token — the
+    headline of the answer would be lost to the quality gate, so the
+    template counts as invalid (A5.1). Never raises."""
+    try:
+        if not isinstance(text, str):
+            return False
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            if not line.strip():
+                continue
+            first = _SENTENCE_SPLIT_RE.split(line.strip(), maxsplit=1)[0]
+            return _NA_TOKEN_RE.search(first) is not None
+        return False
+    except Exception as e:
+        log_with_sid("narrative", "warning",
+                     "NARRATIVE_FIRST_SENTENCE_CHECK_FAILED "
+                     f"error={log_safe_value(type(e).__name__, 80)}")
+        return False
+
+
+def _norm_ws(text: str) -> str:
+    return _WS_RUN_RE.sub(" ", text).strip()
+
+
+def _sentences(text: str) -> list:
+    out = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        parts = _SENTENCE_SPLIT_RE.split(line)
+        for i in range(0, len(parts), 2):
+            piece = parts[i].strip()
+            if piece:
+                out.append(piece)
+    return out
+
+
+def covered_codes(text, sections) -> set:
+    """The resolved codes of the shown sections (`render_with_sections`)
+    that one of their body sentences still states in `text` — the text AFTER
+    the quality gate, so a section whose every sentence was dropped covers
+    nothing. Never raises."""
+    covered: set = set()
+    try:
+        if not isinstance(text, str) or not isinstance(sections, (list, tuple)):
+            return covered
+        final = _norm_ws(text)
+        for item in sections:
+            if not (isinstance(item, tuple) and len(item) == 2):
+                continue
+            code, body = item
+            if not isinstance(code, str) or not isinstance(body, str):
+                continue
+            for sentence in _sentences(body):
+                if _NA_TOKEN_RE.search(sentence):
+                    continue
+                if _norm_ws(sentence) in final:
+                    covered.add(code)
+                    break
+        return covered
+    except Exception as e:
+        log_with_sid("narrative", "warning",
+                     f"NARRATIVE_COVERED_CHECK_FAILED error={log_safe_value(type(e).__name__, 80)}")
+        return covered
+
+
+# ------------------------------------------------------- FINDING sentences
+# A5.1: the fixed sentence of every finding no rendered section states.
+# `{finding: {lang: (base, paren)}}` — `base` holds "{paren}" where the
+# parenthesis goes; `paren` is its content, parts separated by "; ", each
+# part kept only when every placeholder in it has a value (no part -> no
+# parenthesis at all). Display text only (R0): never in `content`, never in
+# a brain payload.
+
+FINDING_SENTENCES = {
+    "mixed_units": {
+        "en": ("Amounts carry more than one currency or unit label, so they are reported "
+               "per label and never added together.", ""),
+        "uz": ("Summalar bir nechta valyuta yoki o'lchov birligida berilgan, shuning uchun "
+               "ular har bir belgi bo'yicha alohida ko'rsatiladi va hech qachon bir-biriga "
+               "qo'shilmaydi.", ""),
+        "ru": ("Суммы указаны в нескольких валютах или единицах измерения, поэтому они "
+               "приводятся отдельно по каждой из них и никогда не складываются.", ""),
+        "ka": ("თანხები ერთზე მეტი ვალუტით ან ერთეულით არის მოცემული, ამიტომ ისინი "
+               "თითოეული ნიშნულის მიხედვით ცალ-ცალკე არის ნაჩვენები და არასოდეს ჯამდება.",
+               ""),
+    },
+    "coverage_change": {
+        "en": ("The set of values in one dimension changes between periods{paren}, so totals "
+               "are not comparable across periods.", "{dim}"),
+        "uz": ("Bitta o'lchovdagi qiymatlar to'plami davrlar orasida o'zgaradi{paren}, "
+               "shuning uchun jami ko'rsatkichlarni davrlar bo'yicha solishtirib bo'lmaydi.",
+               "{dim}"),
+        "ru": ("Набор значений одного измерения меняется от периода к периоду{paren}, "
+               "поэтому итоги за разные периоды несопоставимы.", "{dim}"),
+        "ka": ("ერთი განზომილების მნიშვნელობების ნაკრები პერიოდებს შორის იცვლება{paren}, "
+               "ამიტომ ჯამები პერიოდებს შორის შეუდარებელია.", "{dim}"),
+    },
+    "thin_period": {
+        # one entry for both gap causes (thin rows, or a collapsed value in a
+        # pre-aggregated frame), so the wording names both
+        "en": ("One period looks incomplete{paren}: it has far fewer rows or almost no value "
+               "compared with the other periods, so it is treated as a data gap, not a "
+               "business change.", "{period}"),
+        "uz": ("Bir davr to'liq emasga o'xshaydi{paren}: unda boshqa davrlarga qaraganda "
+               "qatorlar ancha kam yoki qiymat deyarli yo'q, shuning uchun u biznesdagi "
+               "o'zgarish emas, balki ma'lumotlardagi bo'shliq deb hisoblanadi.", "{period}"),
+        "ru": ("Один период выглядит неполным{paren}: в нём намного меньше строк или почти "
+               "нет значения по сравнению с остальными периодами, поэтому он считается "
+               "пробелом в данных, а не изменением в бизнесе.", "{period}"),
+        "ka": ("ერთი პერიოდი არასრული ჩანს{paren}: მასში დანარჩენ პერიოდებთან შედარებით "
+               "გაცილებით ნაკლები ჩანაწერია ან მნიშვნელობა თითქმის არ არის, ამიტომ ის "
+               "მონაცემთა ხარვეზად ითვლება და არა ბიზნესის ცვლილებად.", "{period}"),
+    },
+    "unknown_dominated": {
+        "en": ("Many rows have no value in one dimension{paren}, so that dimension cannot "
+               "explain any change.", "{dim}; up to {share} Unknown"),
+        "uz": ("Ko'p qatorlarda bitta o'lchov bo'yicha qiymat yo'q{paren}, shuning uchun bu "
+               "o'lchov hech qanday o'zgarishni tushuntira olmaydi.",
+               "{dim}; {share} gacha noma'lum"),
+        "ru": ("Во многих строках у одного измерения нет значения{paren}, поэтому это "
+               "измерение не может объяснить изменения.", "{dim}; до {share} неизвестных"),
+        "ka": ("ბევრ ჩანაწერში ერთ განზომილებას მნიშვნელობა არ აქვს{paren}, ამიტომ ეს "
+               "განზომილება ვერცერთ ცვლილებას ვერ ხსნის.", "{dim}; {share}-მდე უცნობი"),
+    },
+    "metric_definition_overlap": {
+        "en": ("In most rows this metric equals another metric of the data{paren}, so it "
+               "counts a stock, not new items.", "{share} of rows"),
+        "uz": ("Ko'pchilik qatorlarda bu ko'rsatkich ma'lumotlardagi boshqa ko'rsatkichga "
+               "teng{paren}, shuning uchun u yangi qo'shilganlarni emas, balki mavjud "
+               "qoldiqni hisoblaydi.", "qatorlarning {share}"),
+        "ru": ("В большинстве строк этот показатель совпадает с другим показателем "
+               "данных{paren}, поэтому он отражает остаток, а не новые позиции.",
+               "{share} строк"),
+        "ka": ("ჩანაწერების უმეტესობაში ეს მაჩვენებელი მონაცემების სხვა მაჩვენებლის "
+               "ტოლია{paren}, ამიტომ ის ნაშთს ასახავს და არა ახალ ერთეულებს.",
+               "ჩანაწერების {share}"),
+    },
+    "latest_is_past_period": {
+        "en": ("The data ends before the current month{paren}.", "latest period: {period}"),
+        "uz": ("Ma'lumotlar joriy oydan oldin tugaydi{paren}.", "oxirgi davr: {period}"),
+        "ru": ("Данные заканчиваются раньше текущего месяца{paren}.",
+               "последний период: {period}"),
+        "ka": ("მონაცემები მიმდინარე თვემდე მთავრდება{paren}.", "ბოლო პერიოდი: {period}"),
+    },
+}
+
+# The order the sentences are added in, and the resolved section codes
+# (`render_with_sections`) whose stated body already covers each finding.
+_FINDING_ORDER = ("mixed_units", "coverage_change", "thin_period", "unknown_dominated",
+                  "metric_definition_overlap", "latest_is_past_period")
+_FINDING_COVERED_BY = {
+    "mixed_units": frozenset({"mixed_units", "units"}),
+    "coverage_change": frozenset({"coverage_change"}),
+    "thin_period": frozenset({"thin_period", "data_gap"}),
+    "unknown_dominated": frozenset({"unknown_dominated"}),
+    "metric_definition_overlap": frozenset({"metric_definition_overlap", "metrics_identical",
+                                            "metric_relation"}),
+    "latest_is_past_period": frozenset({"latest_is_past_period"}),
+}
+_PLACEHOLDER_RE = re.compile(r"\{(dim|share|period)\}")
+_VALUE_PREFIX_MAX = 10
+
+# A READING GUIDE names a visual: the added paragraph goes before it.
+_READING_GUIDE_RE = {
+    "en": re.compile(r"\b(?:tables?|charts?|graphs?|bars?|waterfalls?)\b", re.IGNORECASE),
+    "uz": re.compile(r"\b(?:jadval|grafik|diagramma)", re.IGNORECASE),
+    "ru": re.compile(r"\b(?:таблиц|график|диаграмм)", re.IGNORECASE),
+    "ka": re.compile(r"(?:ცხრილ|გრაფიკ|დიაგრამ)"),
+}
+_LAST_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])[ \t]+|\n+")
+
+
+def _value_lookup(values: dict, name: str):
+    """VALUES[name], else the first `<prefix>_<name>` key (a `pdc_diag`
+    `prefix=`), else None."""
+    if name in values:
+        return values[name]
+    pattern = re.compile(r"[a-z][a-z0-9]{0,%d}_%s\Z" % (_VALUE_PREFIX_MAX - 1, re.escape(name)))
+    for key in values:
+        if isinstance(key, str) and pattern.match(key):
+            return values[key]
+    return None
+
+
+def _part(value, kind, locale) -> str | None:
+    """One formatted parenthesis value, or None (missing, None or n/a)."""
+    if value is None:
+        return None
+    text = _fmt_value(value, kind, locale)
+    if not isinstance(text, str) or not text.strip() or _NA_TOKEN_RE.search(text):
+        return None
+    return text
+
+
+def _finding_fires(finding: str, findings: dict) -> bool:
+    if finding == "mixed_units":
+        return findings.get("units") == "mixed_units"
+    if finding == "coverage_change":
+        return findings.get("coverage") == "coverage_change"
+    if finding == "thin_period":
+        return findings.get("thin_period") is True or findings.get("period_status") == "data_gap"
+    if finding == "metric_definition_overlap":
+        return findings.get("metric_relation") == "metric_definition_overlap"
+    return findings.get(finding) is True
+
+
+def _finding_parts(finding: str, findings: dict, values: dict, locale) -> dict:
+    """The placeholder texts available for `finding`."""
+    parts: dict = {}
+    if finding == "coverage_change":
+        dim = _part(_value_lookup(values, "coverage_dim_label"), "text", locale)
+        if dim is None:
+            dim = _part(findings.get("coverage_dim"), "text", locale)
+        parts["dim"] = dim
+    elif finding == "thin_period":
+        period = _part(_value_lookup(values, "thin_period_label"), "text", locale)
+        if period is None:
+            period = _part(_value_lookup(values, "data_gap_period"), "text", locale)
+        parts["period"] = period
+    elif finding == "unknown_dominated":
+        dim = _part(_value_lookup(values, "unknown_dim_label"), "text", locale)
+        if dim is not None:
+            parts["dim"] = dim
+            parts["share"] = _part(_value_lookup(values, "unknown_share_max"), "pct", locale)
+        else:
+            # the max share belongs to coverage_check's dim, not this one
+            parts["dim"] = _part(findings.get("unknown_dim"), "text", locale)
+    elif finding == "metric_definition_overlap":
+        parts["share"] = _part(_value_lookup(values, "overlap_equal_share"), "pct", locale)
+    elif finding == "latest_is_past_period":
+        parts["period"] = _part(_value_lookup(values, "latest_period"), "text", locale)
+    return {k: v for k, v in parts.items() if v is not None}
+
+
+def _finding_sentence(finding: str, lang: str, findings: dict, values: dict, locale) -> str:
+    base, paren = FINDING_SENTENCES[finding][lang]
+    available = _finding_parts(finding, findings, values, locale)
+    kept = []
+    for piece in paren.split("; ") if paren else []:
+        names = _PLACEHOLDER_RE.findall(piece)
+        if names and all(n in available for n in names):
+            kept.append(_PLACEHOLDER_RE.sub(lambda m: available[m.group(1)], piece))
+    inside = "; ".join(kept)
+    return base.replace("{paren}", f" ({inside})" if inside else "")
+
+
+def _place_paragraph(text: str, paragraph: str, lang: str) -> str:
+    """`paragraph` as a new paragraph of `text`: before the last sentence
+    when that sentence is a reading guide and not the only one, else at the
+    end."""
+    body = text.rstrip()
+    if not body:
+        return paragraph
+    splits = list(_LAST_SENTENCE_SPLIT_RE.finditer(body))
+    if splits:
+        last = splits[-1]
+        tail = body[last.end():]
+        guide = _READING_GUIDE_RE.get(lang, _READING_GUIDE_RE["en"])
+        if tail.strip() and guide.search(tail):
+            head = body[:last.start()].rstrip()
+            if head:
+                return head + "\n\n" + paragraph + "\n\n" + tail.strip()
+    return body + "\n\n" + paragraph
+
+
+def add_finding_sentences(text, findings, values, covered, lang, *, sid: str) -> str:
+    """`text` with one new paragraph holding the fixed FINDING_SENTENCES
+    sentence of every fired finding no shown section covers (`covered` =
+    `covered_codes`), in the table order, in `lang` (unknown -> en); the
+    parenthesis values come from VALUES (exact key, else a prefixed one) or
+    the findings, formatted in the language's locale, and a missing one
+    drops its part — never "n/a". Nothing fires -> `text` unchanged. Logs
+    `FINDING_SENTENCES_ADDED n= lang=` (a count). Never raises."""
+    if not isinstance(text, str):
+        text = ""
+    try:
+        finds = findings if isinstance(findings, dict) else {}
+        vals = values if isinstance(values, dict) else {}
+        cov = set(covered) if covered else set()
+        code = lang if isinstance(lang, str) and lang in ("en", "uz", "ru", "ka") else "en"
+        locale = locale_for(code)
+        added = []
+        for finding in _FINDING_ORDER:
+            if not _finding_fires(finding, finds):
+                continue
+            if cov & _FINDING_COVERED_BY[finding]:
+                continue
+            added.append(_finding_sentence(finding, code, finds, vals, locale))
+        if not added:
+            return text
+        out = _place_paragraph(text, " ".join(added), code)
+        log_with_sid(sid, "info",
+                     f"FINDING_SENTENCES_ADDED n={len(added)} lang={log_safe_value(code, 8)}")
+        return out
+    except Exception as e:
+        log_with_sid(sid, "warning",
+                     f"FINDING_SENTENCES_FAILED error={log_safe_value(type(e).__name__, 80)}")
+        return text
+
+
 # ---------------------------------------------------------- display line
 
 def value_display(safe_preview, lang: str) -> str | None:
@@ -482,13 +916,14 @@ def value_display(safe_preview, lang: str) -> str | None:
     try:
         label = _RESULT_LABEL.get(lang) if isinstance(lang, str) else None
         label = label or _RESULT_LABEL["en"]
+        locale = locale_for(lang)
         if isinstance(safe_preview, (bool, int, float, str)):
-            text = f"**{label}:** {_fmt_value(safe_preview, None)}"
+            text = f"**{label}:** {_fmt_value(safe_preview, None, locale)}"
             log_with_sid("narrative", "info", "VALUE_DISPLAY_APPENDED kind=scalar")
             return _post(text, RENDERED_MAX)
         if isinstance(safe_preview, dict) and safe_preview:
             items = list(safe_preview.items())
-            lines = [f"- {_md_escape(str(k)[:_VALUE_DISPLAY_KEY_MAX])}: {_fmt_value(v, None)}"
+            lines = [f"- {_md_escape(str(k)[:_VALUE_DISPLAY_KEY_MAX])}: {_fmt_value(v, None, locale)}"
                      for k, v in items[:_VALUE_DISPLAY_MAX_LINES]]
             if len(items) > _VALUE_DISPLAY_MAX_LINES:
                 lines.append("- " + _ELLIPSIS)

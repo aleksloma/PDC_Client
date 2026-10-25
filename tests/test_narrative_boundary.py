@@ -642,3 +642,77 @@ def test_scrub_literal_substring_of_code_string_still_scrubbed():
     # identifier tokens of the code itself are still kept
     assert scrub("NameError: name 'df' is not defined", _NO_DF_KEEP, code) == \
         "NameError: name 'df' is not defined"
+
+
+# =========================================================================
+# BRB retest 2 follow-up (A5.1, PROTOCOL `error_msg`): the narrative-only
+# retry. Through the REAL `brain_client.retry` payload builder (only `_post`
+# is replaced): its payload has exactly the key set of an ordinary exec-error
+# retry of the same flow, its `error_msg` is the fixed text, and no rendered
+# value or VALUES sentinel rides on it.
+# =========================================================================
+
+_NARR_CODE_OK = "fig = chart_sentinel\nVALUES['n'] = top_n\nVALUES['cat'] = top_cat"
+_NARR_CODE_FAILS = "fig = chart_fails_first"
+_NARR_CODE_FIXED = "fig = chart_fixed_after_retry\nVALUES['m'] = 1"
+
+
+def _narr_chart(values):
+    return {"ok": True, "error": None, "is_plotly": True, "plotly_html": "<div>c</div>",
+            "chart_data": None, "values": dict(values), "values_dropped": 0,
+            "findings": {"coverage": "coverage_change"}, "findings_dropped": 0}
+
+
+def test_narrative_retry_payload_matches_exec_retry_and_carries_no_value(monkeypatch, flow_env):
+    charts = {_NARR_CODE_OK: _narr_chart({"n": SENTINEL_NUM, "cat": SENTINEL_CAT}),
+              _NARR_CODE_FIXED: _narr_chart({"m": 1})}
+
+    def render(code, dfs, sid, **kw):
+        out = charts.get(code)
+        return dict(out) if out is not None else {"ok": False, "error": "ValueError: boom",
+                                                  "trace": ""}
+
+    monkeypatch.setattr(run_chat_local, "render_plot_safe", render)
+    posts = []
+
+    def fake_post(path, payload, sid, **kw):
+        posts.append((path, copy.deepcopy(payload)))
+        if path == "/v1/plan":
+            body = "\n###NEXT_PLOT###\n".join(
+                f"```plot_code\n{c}\n```" for c in (_NARR_CODE_OK, _NARR_CODE_FAILS))
+            return {"raw_text": body + "\n###NEXT_PLOT###\n", "kind": "PLOT_CODE", "code": "",
+                    "usage": {},
+                    # nested sections: a parse error -> one narrative-only retry
+                    "narrative": "{{#a}}{{n:count}}{{#b}}{{cat}}{{/b}}{{/a}}"}
+        if path == "/v1/retry":
+            if str(payload.get("error_msg", "")).startswith("narrative_invalid"):
+                return {"kind": "PLOT_CODE", "code": "fig = never_run", "usage": {},
+                        "narrative": "Largest: {{n:count}} for {{cat}}."}
+            return {"kind": "PLOT_CODE", "code": _NARR_CODE_FIXED, "usage": {}}
+        if path == "/v1/describe":
+            return {"text": "A chart.", "usage": {}}
+        return {}
+
+    monkeypatch.setattr(brain_client, "_post", fake_post)
+    dfs = {"d.csv": pd.DataFrame({"cat": [SENTINEL_CAT, "Other"], "n": [SENTINEL_NUM, 5]})}
+
+    events = list(run_chat_local.run_chat_multi_plot(
+        sid="t", dfs=dfs, schema_docs={}, question="largest segment?",
+        history_rows=[], user_email="alice@acme.com"))
+
+    retries = [p for name, p in posts if name == "/v1/retry"]
+    narr = [p for p in retries if str(p.get("error_msg", "")).startswith("narrative_invalid")]
+    exec_ = [p for p in retries if p not in narr]
+    assert len(narr) == 1 and len(exec_) == 1, [p.get("error_msg") for p in retries]
+    assert set(narr[0]) == set(exec_[0])
+    assert narr[0]["error_msg"] == "narrative_invalid: nested"
+    assert narr[0]["failed_code"] == "\n###NEXT_PLOT###\n".join([_NARR_CODE_OK, _NARR_CODE_FIXED])
+    # the rendered text exists locally …
+    shown = [e for e in events if e.get("narrative")]
+    assert len(shown) == 1 and "987,654,321" in shown[0]["text"]
+    # … but no payload carries a rendered value or a VALUES sentinel
+    for path, payload in posts:
+        blob = json.dumps(payload, default=str, ensure_ascii=False)
+        assert "987,654,321" not in blob, path
+        assert str(SENTINEL_NUM) not in blob, path
+        assert "CATEGORY" not in blob, path              # raw or markdown-escaped

@@ -491,3 +491,528 @@ def test_render_never_raises_fuzz():
         bv = brain_view(t, findings)
         assert isinstance(bv, str)
         assert isinstance(fallback_text(t), str)
+
+
+# =========================================================================
+# BRB retest 2 follow-up (DIAGNOSTICS_SPEC A2, A4, A5.1): section-name
+# prefixes, parse-error kinds, locales, the sections a render showed, and the
+# fixed FINDING sentences. Every new symbol is read through `getattr` inside
+# the test so the file collects before the code exists.
+# =========================================================================
+
+import re                                                       # noqa: E402
+
+NBSP = " "
+LANGS = ("en", "uz", "ru", "ka")
+
+
+def _fn(name):
+    fn = getattr(narrative, name, None)
+    assert callable(fn), f"narrative.{name} is missing"
+    return fn
+
+
+# ------------------------------------------------------- section prefixes
+
+# A prefix resolves only when the block code PASSED it (`prefix="ovl_"`, the
+# brain's template-validation rule): the caller hands the passed set in as
+# `prefixes`. Reviewer fix: a bare `[a-z0-9]{1,10}_` strip turned
+# `{{#no_thin_period}}` into `thin_period` and showed it exactly when the
+# author meant the opposite.
+
+def test_prefixed_section_resolves_to_enum_code():
+    t = "A{{#ovl_metric_definition_overlap}} stock{{/ovl_metric_definition_overlap}}."
+    ovl = {"ovl_"}
+    assert _r(t, {}, {"metric_relation": "metric_definition_overlap"}, prefixes=ovl) == "A stock."
+    assert _r(t, {}, {"metric_relation": "other"}, prefixes=ovl) == "A."
+    assert _r(t, {}, {}, prefixes=ovl) == "A."
+
+
+def test_prefixed_section_resolves_to_registry_key():
+    t = "{{#lg_thin_period}}thin{{/lg_thin_period}}{{^lg_thin_period}}full{{/lg_thin_period}}"
+    assert _r(t, {}, {"thin_period": True}, prefixes={"lg_"}) == "thin"
+    assert _r(t, {}, {}, prefixes={"lg_"}) == "full"
+    # digits are allowed in the prefix after its first letter, up to 10 characters
+    assert _r("{{#q3_thin_period}}x{{/q3_thin_period}}", {}, {"thin_period": True},
+              prefixes={"q3_"}) == "x"
+    assert _r("{{#abcdefghij_thin_period}}x{{/abcdefghij_thin_period}}", {},
+              {"thin_period": True}, prefixes=["abcdefghij_"]) == "x"
+
+
+def test_passed_prefix_resolves_others_do_not():
+    t = "{{#ovl_thin_period}}x{{/ovl_thin_period}}"
+    f = {"thin_period": True}
+    assert _r(t, {}, f, prefixes={"ovl_"}) == "x"
+    assert _r(t, {}, f, prefixes={"ovl_", "lg_"}) == "x"
+    assert _r(t, {}, f, prefixes={"lg_"}) == ""
+    assert _r(t, {}, f, prefixes=None) == ""
+    assert _r(t, {}, f, prefixes=set()) == ""
+    assert _r(t, {}, f) == ""
+    # only `[a-z][a-z0-9]{0,9}_` strings count as passed prefixes
+    passed = narrative.passed_prefixes({"3q_", "ovl_", "Ovl_", "abcdefghijk_", "a", 5})
+    assert passed == frozenset({"ovl_"})
+    assert narrative.passed_prefixes(None) == frozenset()
+
+
+@pytest.mark.parametrize("name", ["no_thin_period", "not_mixed_units", "has_coverage_change"])
+@pytest.mark.parametrize("prefixes", [None, {"ovl_"}])
+def test_negating_prefix_never_resolves(name, prefixes, logs):
+    findings = {"thin_period": True, "units": "mixed_units", "coverage": "coverage_change"}
+    t = "{{#" + name + "}}x{{/" + name + "}}{{^" + name + "}}y{{/" + name + "}}"
+    # never shown as the bare code: the author meant the opposite
+    assert _r(t, {}, findings, prefixes=prefixes) == "y"
+    assert len(_lines(logs, "NARRATIVE_SECTION_UNKNOWN")) == 1
+
+
+def test_exact_section_name_wins_over_prefix():
+    t = "{{#lg_thin_period}}x{{/lg_thin_period}}"
+    # the exact name is a findings key (False): the prefix is not consulted
+    assert _r(t, {}, {"lg_thin_period": False, "thin_period": True}, prefixes={"lg_"}) == ""
+    assert _r(t, {}, {"lg_thin_period": True}) == "x"
+    assert _r("{{#thin_period}}x{{/thin_period}}", {}, {"thin_period": True}) == "x"
+    assert _r("{{#metric_definition_overlap}}x{{/metric_definition_overlap}}", {},
+              {"metric_relation": "metric_definition_overlap"}) == "x"
+
+
+@pytest.mark.parametrize("name,prefix", [
+    ("abcdefghijk_thin_period", "abcdefghijk_"),     # 11-character prefix
+    ("LG_thin_period", "LG_"),                       # uppercase prefix
+    ("lg_thin_periodx", "lg_"),                      # not a code after the prefix
+    ("_thin_period", "_"),                           # empty prefix
+])
+def test_bad_prefix_does_not_resolve(name, prefix, logs):
+    # even when "passed": a prefix outside `[a-z][a-z0-9]{0,9}_` never resolves
+    t = "{{#" + name + "}}x{{/" + name + "}}"
+    assert _r(t, {}, {"thin_period": True}, prefixes={prefix}) == ""
+
+
+def test_unknown_section_logs_once_per_render(logs):
+    t = "{{#zz_flag}}a{{/zz_flag}} b {{#zz_flag}}c{{/zz_flag}} {{^zz_flag}}d{{/zz_flag}}"
+    assert _r(t, {}, {}) == "b d"
+    lines = _lines(logs, "NARRATIVE_SECTION_UNKNOWN")
+    assert len(lines) == 1
+    assert "name=zz_flag" in lines[0]
+    _r(t, {}, {})
+    assert len(_lines(logs, "NARRATIVE_SECTION_UNKNOWN")) == 2
+
+
+def test_known_section_names_are_not_unknown(logs):
+    # a findings key, an enum code, a registry key and a resolvable prefix —
+    # absent or present — never log as unknown
+    _r("{{#flag}}x{{/flag}}", {}, {"flag": True})
+    _r("{{#no_anomaly}}x{{/no_anomaly}}", {}, {})
+    _r("{{#thin_period}}x{{/thin_period}}", {}, {})
+    _r("{{#lg_thin_period}}x{{/lg_thin_period}}", {}, {}, prefixes={"lg_"})
+    _r("{{#ovl_metric_definition_overlap}}x{{/ovl_metric_definition_overlap}}", {}, {},
+       prefixes={"ovl_"})
+    assert _lines(logs, "NARRATIVE_SECTION_UNKNOWN") == []
+
+
+def test_prefixed_name_without_passed_prefix_is_unknown(logs):
+    assert _r("{{#lg_thin_period}}x{{/lg_thin_period}}", {}, {"thin_period": True}) == ""
+    lines = _lines(logs, "NARRATIVE_SECTION_UNKNOWN")
+    assert len(lines) == 1 and "name=lg_thin_period" in lines[0]
+
+
+def test_unknown_section_log_is_escaped_and_capped(logs):
+    name = "zz_" + "q" * 37                      # 40 characters, the grammar's maximum
+    _r("{{#" + name + "}}x{{/" + name + "}}", {}, {})
+    lines = _lines(logs, "NARRATIVE_SECTION_UNKNOWN")
+    assert len(lines) == 1 and ("name=" + name) in lines[0]
+
+
+def test_brain_view_resolves_prefixed_sections():
+    t = ("{{#ovl_metric_definition_overlap}}stock {{share:pct}}"
+         "{{/ovl_metric_definition_overlap}}{{#lg_thin_period}} thin{{/lg_thin_period}}")
+    f = {"metric_relation": "metric_definition_overlap", "thin_period": True}
+    out = brain_view(t, f, prefixes={"ovl_", "lg_"})
+    assert out == "stock [share] thin"
+    assert brain_view(t, {}, prefixes={"ovl_", "lg_"}) == ""
+    # no passed prefixes (routes/report.py, the title): prefixed sections are false
+    assert brain_view(t, f) == ""
+    assert brain_view("{{#no_thin_period}}x{{/no_thin_period}}", {"thin_period": True}) == ""
+
+
+# ------------------------------------------------------- parse-error kinds
+
+@pytest.mark.parametrize("template,kind", [
+    ("{{#a}}x{{#b}}y{{/b}}{{/a}}", "nested"),
+    ("{{#a}}x", "unclosed"),
+    ("{{#a}}x{{/b}}", "mismatched"),
+    ("x {{/a}} y", "mismatched"),               # a close without an open
+])
+def test_template_error_kind(template, kind):
+    with pytest.raises(TemplateError) as err:
+        parse(template)
+    assert getattr(err.value, "kind", None) == kind
+    assert _fn("template_error_kind")(template) == kind
+
+
+@pytest.mark.parametrize("template", ["", "plain", "a {{x}} {{#f}}y{{/f}} {{^g}}z{{/g}}",
+                                      "{{ x }} {{1x}}"])
+def test_template_error_kind_none_for_valid(template):
+    assert _fn("template_error_kind")(template) is None
+
+
+def test_template_error_kind_crash_is_logged_and_none(monkeypatch, logs):
+    """A crash that is not a TemplateError is no verdict on the template: it
+    must never spend a brain retry (Article IV: logged, safe fallback)."""
+    def boom(_t):
+        raise RuntimeError("secret template text")
+
+    monkeypatch.setattr(narrative, "parse", boom)
+    assert _fn("template_error_kind")("{{#a}}x{{/a}}") is None
+    lines = _lines(logs, "NARRATIVE_TEMPLATE_CHECK_FAILED")
+    assert len(lines) == 1 and "error=RuntimeError" in lines[0]
+    assert "secret" not in "\n".join(r.getMessage() for r in logs.records)
+
+
+class _Exploding(str):
+    def replace(self, *a, **k):
+        raise RuntimeError("secret text")
+
+    def __contains__(self, item):
+        raise RuntimeError("secret text")
+
+
+def test_first_sentence_has_na_crash_is_logged(logs):
+    assert narrative.first_sentence_has_na(_Exploding("Total is n/a.")) is False
+    lines = _lines(logs, "NARRATIVE_FIRST_SENTENCE_CHECK_FAILED")
+    assert len(lines) == 1 and "error=RuntimeError" in lines[0]
+    assert "secret" not in "\n".join(r.getMessage() for r in logs.records)
+
+
+def test_covered_codes_crash_is_logged(logs):
+    assert narrative.covered_codes("It counts.", [("units", _Exploding("It counts."))]) == set()
+    lines = _lines(logs, "NARRATIVE_COVERED_CHECK_FAILED")
+    assert len(lines) == 1 and "error=RuntimeError" in lines[0]
+    assert "secret" not in "\n".join(r.getMessage() for r in logs.records)
+
+
+# ------------------------------------------------------------------ locale
+
+def test_locale_for():
+    locale_for = _fn("locale_for")
+    assert locale_for("uz") == "uz"
+    assert locale_for("ru") == "ru"
+    for lang in ("en", "ka", "xx", "", None):
+        assert locale_for(lang) is None
+
+
+def test_render_with_locale():
+    out = render("{{a:amount}} | {{c:count}}", {"a": 2345678901, "c": 1234567}, {},
+                 sid=SID, locale="uz")
+    assert out == f"2,35 mlrd | 1{NBSP}234{NBSP}567"
+    ru = render("{{a:amount}} {{p:pct}}", {"a": 2345678901, "p": 0.375}, {}, sid=SID, locale="ru")
+    assert ru == "2,35 млрд 37,5%"
+    # no locale: the default, unchanged
+    assert render("{{c:count}}", {"c": 1234567}, {}, sid=SID) == "1,234,567"
+    assert render("{{c:count}}", {"c": 1234567}, {}, sid=SID, locale=None) == "1,234,567"
+
+
+def test_value_display_uses_language_locale():
+    assert value_display(1234567, "ru") == f"**Результат:** 1{NBSP}234{NBSP}567"
+    assert value_display(1234567, "uz") == f"**Natija:** 1{NBSP}234{NBSP}567"
+    assert value_display(1234567, "en") == "**Result:** 1,234,567"
+    assert value_display(1234567, "ka") == "**შედეგი:** 1,234,567"
+    assert value_display({"a": 2345678901.0}, "ru") == f"- a: 2{NBSP}345{NBSP}678{NBSP}901,00"
+
+
+# ------------------------------------------------------- render_with_sections
+
+def test_render_with_sections_reports_shown_sections():
+    rws = _fn("render_with_sections")
+    t = ("Total {{t}}. {{#metric_definition_overlap}}It counts a stock.{{/metric_definition_overlap}}"
+         " {{#lg_thin_period}}One month is thin.{{/lg_thin_period}}")
+    findings = {"metric_relation": "metric_definition_overlap", "thin_period": True}
+    text, sections = rws(t, {"t": 5}, findings, sid=SID, prefixes={"lg_"})
+    assert text == "Total 5. It counts a stock. One month is thin."
+    assert text == render(t, {"t": 5}, findings, sid=SID, prefixes={"lg_"})
+    shown = {(code, body.strip()) for code, body in sections}
+    assert ("metric_definition_overlap", "It counts a stock.") in shown
+    assert ("thin_period", "One month is thin.") in shown      # the prefix resolved
+
+
+def test_render_with_sections_prefixed_body_renders_slots():
+    rws = _fn("render_with_sections")
+    t = "{{#ovl_metric_definition_overlap}}Equal in {{s:pct}} of rows.{{/ovl_metric_definition_overlap}}"
+    text, sections = rws(t, {"s": 0.976}, {"metric_relation": "metric_definition_overlap"},
+                         sid=SID, prefixes={"ovl_"})
+    assert text == "Equal in 97.6% of rows."
+    assert [(c, b.strip()) for c, b in sections] == [("metric_definition_overlap",
+                                                      "Equal in 97.6% of rows.")]
+
+
+def test_render_with_sections_hidden_section_not_reported():
+    rws = _fn("render_with_sections")
+    t = "A. {{#metric_definition_overlap}}Stock.{{/metric_definition_overlap}}"
+    text, sections = rws(t, {}, {}, sid=SID)
+    assert text == "A."
+    assert all(code != "metric_definition_overlap" for code, _b in sections)
+
+
+def test_render_with_sections_locale():
+    rws = _fn("render_with_sections")
+    text, _sections = rws("{{a:amount}}", {"a": 7250000}, {}, sid=SID, locale="ru")
+    assert text == "7,25 млн"
+
+
+# --------------------------------------------------------- FINDING sentences
+# The English wording is pinned exactly (the plan's six sentences); the uz,
+# ru and ka wording is the code writer's, so only its STRUCTURE is pinned:
+# the formatted values inside "(…)", no "(" and no "n/a" without values.
+
+EN_WITH = {
+    "mixed_units": "Amounts carry more than one currency or unit label, so they are "
+                   "reported per label and never added together.",
+    "coverage_change": "The set of values in one dimension changes between periods (CURRENCY), "
+                       "so totals are not comparable across periods.",
+    "thin": "One period looks incomplete (2026 Февраль): it has far fewer rows or almost no "
+            "value compared with the other periods, so it is treated as a data gap, not a "
+            "business change.",
+    "unknown_dominated": "Many rows have no value in one dimension (SEKTOR; up to 100.0% "
+                         "Unknown), so that dimension cannot explain any change.",
+    "metric_definition_overlap": "In most rows this metric equals another metric of the data "
+                                 "(97.6% of rows), so it counts a stock, not new items.",
+    "latest_is_past_period": "The data ends before the current month (latest period: 2026 Март).",
+}
+EN_WITHOUT = {k: re.sub(r" \([^)]*\)", "", v) for k, v in EN_WITH.items()}
+
+# (findings that fire it, VALUES with every slot, the expected formatted
+# parts as (value, kind) for the parenthesis)
+CASES = {
+    "mixed_units": ({"units": "mixed_units"}, {}, []),
+    "coverage_change": ({"coverage": "coverage_change"}, {"coverage_dim_label": "CURRENCY"},
+                        [("CURRENCY", "text")]),
+    "thin": ({"thin_period": True}, {"thin_period_label": "2026 Февраль"},
+             [("2026 Февраль", "text")]),
+    "unknown_dominated": ({"unknown_dominated": True},
+                          {"unknown_dim_label": "SEKTOR", "unknown_share_max": 1.0},
+                          [("SEKTOR", "text"), (1.0, "pct")]),
+    "metric_definition_overlap": ({"metric_relation": "metric_definition_overlap"},
+                                  {"overlap_equal_share": 0.976}, [(0.976, "pct")]),
+    "latest_is_past_period": ({"latest_is_past_period": True}, {"latest_period": "2026 Март"},
+                              [("2026 Март", "text")]),
+}
+# the base each case is added to: one sentence, so the new paragraph goes last
+BASE = {"en": "Total is 5.", "uz": "Jami 5.", "ru": "Итого 5.", "ka": "სულ 5."}
+
+
+def _add(text, findings, values, covered=(), lang="en"):
+    return _fn("add_finding_sentences")(text, findings, values, set(covered), lang, sid=SID)
+
+
+def _added(lang, findings, values, covered=()):
+    base = BASE[lang]
+    out = _add(base, findings, values, covered, lang)
+    assert out.startswith(base), out
+    return out[len(base):].strip()
+
+
+def _locale(lang):
+    return _fn("locale_for")(lang)
+
+
+def test_finding_sentences_table_has_every_finding_and_language():
+    table = getattr(narrative, "FINDING_SENTENCES", None)
+    assert isinstance(table, dict), "narrative.FINDING_SENTENCES is missing"
+    assert len(table) == 6
+    for key in ("mixed_units", "coverage_change", "unknown_dominated",
+                "metric_definition_overlap", "latest_is_past_period"):
+        assert key in table, key
+    assert {"thin_period", "data_gap"} & set(table), sorted(table)
+    for key, by_lang in table.items():
+        assert set(LANGS) <= set(by_lang), (key, sorted(by_lang))
+        for lang in LANGS:
+            entry = by_lang[lang]
+            assert isinstance(entry, tuple) and len(entry) == 2, (key, lang)
+            assert all(isinstance(part, str) for part in entry), (key, lang)
+            assert entry[0].strip(), (key, lang)
+
+
+@pytest.mark.parametrize("finding", list(EN_WITH))
+def test_finding_sentence_english_wording_exact(finding):
+    findings, values, _parts = CASES[finding]
+    assert _added("en", findings, values) == EN_WITH[finding]
+    assert _added("en", findings, {}) == EN_WITHOUT[finding]
+
+
+@pytest.mark.parametrize("lang", LANGS)
+@pytest.mark.parametrize("finding", list(CASES))
+def test_finding_sentence_with_values_has_formatted_parenthesis(finding, lang):
+    findings, values, parts = CASES[finding]
+    added = _added(lang, findings, values)
+    assert added and "n/a" not in added
+    if not parts:
+        assert "(" not in added
+        assert added == _added(lang, findings, {})       # no slots: same sentence
+        return
+    groups = re.findall(r"\(([^)]*)\)", added)
+    assert groups, added
+    for value, kind in parts:
+        shown = pdc_diag.fmt(value, kind, _locale(lang))
+        assert any(shown in g for g in groups), (finding, lang, shown, added)
+
+
+@pytest.mark.parametrize("lang", LANGS)
+@pytest.mark.parametrize("finding", list(CASES))
+def test_finding_sentence_without_values_has_no_parenthesis(finding, lang):
+    findings, _values, _parts = CASES[finding]
+    added = _added(lang, findings, {})
+    assert added
+    assert "(" not in added and ")" not in added
+    assert "n/a" not in added.lower()
+
+
+def test_finding_sentences_uz_and_ru_use_their_locale():
+    _f, values, _p = CASES["metric_definition_overlap"]
+    findings = CASES["metric_definition_overlap"][0]
+    assert "97,6%" in _added("uz", findings, values)
+    assert "97,6%" in _added("ru", findings, values)
+    assert "97.6%" in _added("ka", findings, values)
+    assert "97.6%" in _added("en", findings, values)
+
+
+@pytest.mark.parametrize("findings", [
+    {"units": "single_unit"}, {"coverage": "coverage_stable"}, {"thin_period": False},
+    {"period_status": "partial_period"}, {"unknown_dominated": False},
+    {"metric_relation": "other"}, {"latest_is_past_period": False},
+    {"latest_is_current_period": True}, {},
+])
+def test_finding_sentences_not_fired(findings, logs):
+    text = "Total is 5. The chart shows it."
+    assert _add(text, findings, {"coverage_dim_label": "CURRENCY"}) == text
+
+
+def test_thin_fires_on_data_gap_status_and_falls_back_to_gap_period():
+    added = _added("en", {"period_status": "data_gap"}, {"data_gap_period": "2026 Февраль"})
+    assert added == EN_WITH["thin"]
+    # thin_period_label wins over data_gap_period
+    added = _added("en", {"thin_period": True, "period_status": "data_gap"},
+                   {"thin_period_label": "2026 Февраль", "data_gap_period": "2025 Ноябрь"})
+    assert added == EN_WITH["thin"]
+    # both fire on one finding sentence, never two
+    assert added.count("looks incomplete") == 1
+
+
+def test_coverage_falls_back_to_coverage_dim_finding():
+    added = _added("en", {"coverage": "coverage_change", "coverage_dim": "CURRENCY"}, {})
+    assert added == EN_WITH["coverage_change"]
+
+
+def test_unknown_falls_back_to_unknown_dim_finding_without_share():
+    added = _added("en", {"unknown_dominated": True, "unknown_dim": "SEKTOR"},
+                   {"unknown_share_max": 1.0})
+    assert added == ("Many rows have no value in one dimension (SEKTOR), so that dimension "
+                     "cannot explain any change.")
+    assert "%" not in added
+
+
+def test_prefixed_value_key_is_found():
+    added = _added("en", {"metric_relation": "metric_definition_overlap"},
+                   {"ovl_overlap_equal_share": 0.976})
+    assert added == EN_WITH["metric_definition_overlap"]
+    added = _added("en", {"latest_is_past_period": True}, {"cov_latest_period": "2026 Март"})
+    assert added == EN_WITH["latest_is_past_period"]
+
+
+def test_none_or_na_value_drops_the_part():
+    findings = {"unknown_dominated": True}
+    added = _added("en", findings, {"unknown_dim_label": "SEKTOR", "unknown_share_max": None})
+    assert added == ("Many rows have no value in one dimension (SEKTOR), so that dimension "
+                     "cannot explain any change.")
+    added = _added("en", {"latest_is_past_period": True}, {"latest_period": None})
+    assert added == EN_WITHOUT["latest_is_past_period"]
+    added = _added("en", {"coverage": "coverage_change"}, {"coverage_dim_label": "n/a"})
+    assert added == EN_WITHOUT["coverage_change"]
+
+
+@pytest.mark.parametrize("finding,codes", [
+    ("mixed_units", ["mixed_units", "units"]),
+    ("coverage_change", ["coverage_change"]),
+    ("thin", ["thin_period", "data_gap"]),
+    ("unknown_dominated", ["unknown_dominated"]),
+    ("metric_definition_overlap", ["metric_definition_overlap", "metrics_identical",
+                                   "metric_relation"]),
+    ("latest_is_past_period", ["latest_is_past_period"]),
+])
+def test_covered_finding_gets_no_sentence(finding, codes):
+    findings, values, _parts = CASES[finding]
+    base = "Total is 5."
+    for code in codes:
+        assert _add(base, findings, values, [code]) == base, code
+
+
+def test_all_six_in_table_order_one_paragraph():
+    findings, values = {}, {}
+    for f, v, _p in CASES.values():
+        findings.update(f)
+        values.update(v)
+    out = _add("Total is 5.", findings, values)
+    paragraphs = out.split("\n\n")
+    assert paragraphs[0] == "Total is 5."
+    assert len(paragraphs) == 2, out
+    added = paragraphs[1]
+    order = ["mixed_units", "coverage_change", "thin", "unknown_dominated",
+             "metric_definition_overlap", "latest_is_past_period"]
+    positions = [added.find(EN_WITH[k]) for k in order]
+    assert all(p >= 0 for p in positions), (positions, added)
+    assert positions == sorted(positions)
+
+
+MIXED = EN_WITH["mixed_units"]
+
+
+def test_placement_before_reading_guide():
+    head = "Total is 5. Most loans are in Tashkent."
+    guide = "The table below shows the totals by region."
+    out = _add(f"{head} {guide}", {"units": "mixed_units"}, {})
+    assert out.split("\n\n") == [head, MIXED, guide]
+
+
+@pytest.mark.parametrize("guide", ["The chart shows the monthly trend.",
+                                   "See the bar for each branch.",
+                                   "The waterfall breaks the change down.",
+                                   "The graph compares both years."])
+def test_placement_reading_guide_words(guide):
+    out = _add(f"Total is 5. {guide}", {"units": "mixed_units"}, {})
+    assert out.split("\n\n") == ["Total is 5.", MIXED, guide]
+
+
+@pytest.mark.parametrize("lang,head,guide", [
+    ("uz", "Jami 5.", "Quyidagi jadval hududlar kesimida jamini ko'rsatadi."),
+    ("uz", "Jami 5.", "Oylik o'zgarish grafikda ko'rsatilgan."),
+    ("ru", "Итого 5.", "Ниже в таблице показаны итоги по регионам."),
+    ("ru", "Итого 5.", "На графике показана динамика."),
+    ("ka", "სულ 5.", "ცხრილში ნაჩვენებია ჯამები რეგიონების მიხედვით."),
+])
+def test_placement_reading_guide_other_languages(lang, head, guide):
+    out = _add(f"{head} {guide}", {"units": "mixed_units"}, {}, lang=lang)
+    paragraphs = out.split("\n\n")
+    assert len(paragraphs) == 3, out
+    assert paragraphs[0] == head and paragraphs[2] == guide
+    assert paragraphs[1] == _added(lang, {"units": "mixed_units"}, {})
+
+
+def test_placement_at_end_without_reading_guide():
+    text = "Total is 5. Most loans are in Tashkent."
+    assert _add(text, {"units": "mixed_units"}, {}).split("\n\n") == [text, MIXED]
+
+
+def test_placement_single_sentence_reading_guide_appends_after():
+    text = "The table below shows the totals by region."
+    assert _add(text, {"units": "mixed_units"}, {}).split("\n\n") == [text, MIXED]
+
+
+def test_finding_sentences_log_count_without_values(logs):
+    secret_dim = "SECRETDIM987"
+    secret_period = "SECRETPERIOD654"
+    findings = {"coverage": "coverage_change", "latest_is_past_period": True}
+    values = {"coverage_dim_label": secret_dim, "latest_period": secret_period}
+    out = _add("Total is 5.", findings, values, lang="uz")
+    assert secret_dim in out and secret_period in out
+    lines = _lines(logs, "FINDING_SENTENCES_ADDED")
+    assert len(lines) == 1
+    assert "n=2" in lines[0] and "lang=uz" in lines[0]
+    blob = "\n".join(r.getMessage() for r in logs.records)
+    assert secret_dim not in blob and secret_period not in blob
