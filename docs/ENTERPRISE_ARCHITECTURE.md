@@ -1441,9 +1441,10 @@ capabilities, which restores the earlier prompts and responses.
 
 **Client implementation (session 1).** What ships in the client:
 - **Sandbox layer.** `pdc_diag.py` (the deterministic helpers the playbook
-  names — coverage check, anomaly detection, change decomposition, level
-  attribution, metric-overlap check, three chart helpers and the `fmt`
-  number formatter) is registered at both exec sites and copied into both
+  names — coverage check, anomaly detection (a period whose row count jumps
+  is reported as a scope change, not an anomaly), change decomposition,
+  level attribution, metric-overlap check, a per-period rate view, three
+  chart helpers and the `fmt` number formatter) is registered at both exec sites and copied into both
   images. Every job gets fresh `VALUES` / `FINDINGS` dicts; the sandbox
   filters them to plain scalars (`exec_transport.capture_outputs`) and the
   web service decodes them as hostile input (`EXECUTOR_PROTOCOL.md` §5–§6).
@@ -1453,7 +1454,8 @@ capabilities, which restores the earlier prompts and responses.
   grammar error; every sentence that would show `n/a` is removed before
   display, `drop_na_sentences`; a prefixed section name resolves to its
   FINDINGS code; uz/ru numbers use their own locale; one fixed sentence per
-  data-quality finding no section states, `add_finding_sentences`), validates FINDINGS per block against that block's code
+  data-quality finding no section states, `add_finding_sentences`; a caption
+  or narrative holding code is never displayed, `contains_code`), validates FINDINGS per block against that block's code
   and the input column names, builds the `[Findings: …]` history marker and
   the slot-free `brain_view` that `/v1/title` and `/v1/report` get.
 - **Flows.** `run_chat_local` keeps one `_NarrState` per turn: VALUES merge

@@ -475,7 +475,8 @@ class _NarrState:                 # one per phase
 - **Invalid template.** Before the gate, `finish` checks the template: a parse error (`NARRATIVE_PARSE_FAILED kind=nested|unclosed|mismatched`) or a FIRST rendered sentence holding `n/a` (`NARRATIVE_INVALID reason=first_sentence`) makes it invalid; the headline is never dropped silently and `fallback_text` is no longer shown as a narrative. An invalid template gets ONE narrative-only retry through `/v1/retry`: the flow's exec-error retry keywords with `error_msg = "narrative_invalid: <kind>"` (kind `nested`, `unclosed`, `mismatched` or `first_sentence`; when a SLOT made the first sentence show `n/a`, `"narrative_invalid: first_sentence slot=<name> cause=<missing|none|nan>"` — `narrative.first_sentence_na_slot` finds the first slot of the first sentence whose key is absent, whose value is None or whose value is non-finite, through a marking pass of `render_with_sections`; `narrative.invalid_error_msg` builds the string, and the same detail is logged `NARRATIVE_INVALID reason=first_sentence slot=<name> cause=<cause>`. The slot name is a template identifier, never a value; any other `n/a` — a literal one, a fmt overflow, an unsupported type — sends the plain kind), `failed_code` = the code that already ran (single: the block's code; multi: the emitted chart codes then the table codes, joined with `\n###NEXT_PLOT###\n`), `use_pro = true`, `sql` = what ran, `sql_error = null`. Only the reply's `narrative` is read (through `clean_template`); its code and captions are ignored and nothing re-runs (the SQL map is not merged). Its usage is added to the turn. The reply's template is checked the same way: valid ⇒ it replaces the plan's template (also in `content` = `history_content`), invalid or absent ⇒ `NARRATIVE_INVALID_TWICE` and the turn takes the no-narrative path (A6). A raise in the retry logs `NARRATIVE_RETRY_FAILED error=<Type>` and counts as no reply.
 - **Retry time-box and progress.** The narrative-only retry passes `timeout = NARRATIVE_RETRY_TIMEOUT_S` (45 s) to `brain_client.retry` (the exec-error retries pass `timeout=None`, the client-wide default). A `BrainTimeoutError` logs `NARRATIVE_RETRY_TIMEOUT elapsed_ms=<n> timeout_s=45` and counts as no reply, so the turn describes as today. Right before the call, the flow emits `{"progress": True, "message_key": "lab.narrative_retry", "message": "Writing the summary…"}` through the `on_progress` callback of `run_chat_multi_plot` (threaded to the single flow); the stream worker enqueues it for the SSE consumer (A5.4). A raising callback logs `NARRATIVE_PROGRESS_FAILED error=<Type>` and is ignored. Edit-regenerate passes no callback.
 - **Headline fallback.** When the template is dropped after the retry (every `NARRATIVE_INVALID_TWICE` path, a timeout included) and VALUES holds `result`, `total` or a key ending `_total` (in that order, the first whose value is a finite int or float), `narrative.headline_sentence` builds ONE fixed sentence in the answer language, `f"{_RESULT_LABEL[lang]}: {fmt(v, 'amount', locale)}."` (uz: `Natija: 61,58 trln.`), logged `NARRATIVE_HEADLINE_FALLBACK key=<name> lang=<code>` (the key name only). Multi flow: a `{"narrative": True, "phase": 1, "text": <headline>}` event before done (it fills the phase-1 slot above the charts), `display_answer` starts with it, `narrative_view.headline_display` carries it. Single flow: `headline_display` on the result, only when there is no `value_display` (that line already shows the figure). Display text only (R0): never in `content` / `combined_answer` or any brain payload; the record keeps it as `headline_display` (A5.5) and reload shows it first. No key ⇒ today's answer.
-- **Finding sentences** (`narrative.FINDING_SENTENCES`, `add_finding_sentences`). After the gate, `finish` appends one fixed sentence, in the answer language (en / uz / ru / ka from `answer_lang_code`; unknown ⇒ en), for each data-quality finding present in the merged FINDINGS that no shown section already states. A section states a finding when it was shown as `{{#<code>}}` (after the prefix resolution of A2.2, never `{{^…}}`) and one of its body sentences survived the gate. Findings, in this order: `mixed_units` (`units == "mixed_units"`; covered by `mixed_units`, `units`), `coverage_change` (`coverage == "coverage_change"`; covered by `coverage_change`; slot `coverage_dim_label`, else the `coverage_dim` finding), thin period / data gap (`thin_period` or `period_status == "data_gap"`; covered by `thin_period`, `data_gap`; slot `thin_period_label`, else `data_gap_period`), `unknown_dominated` (covered by `unknown_dominated`; slots `unknown_dim_label` + `unknown_share_max`, else the `unknown_dim` finding alone), `metric_definition_overlap` (`metric_relation`; covered by `metric_definition_overlap`, `metrics_identical`, `metric_relation`; slot `overlap_equal_share`), `latest_is_past_period` (covered by itself; slot `latest_period`). A slot is looked up by its exact VALUES key, else the first key `^[a-z][a-z0-9]{0,9}_<name>$` (prefixed VALUES). Every value is formatted with the answer locale and lives in a parenthesis; a missing, None or `n/a` value drops its part, and with no part left the whole parenthesis goes, so a finding sentence never shows `n/a`. The sentences form ONE new paragraph: before the last sentence when that sentence is a reading guide (it names a visual: en table/chart/graph/bar/waterfall, uz jadval/grafik/diagramma, ru таблиц/график/диаграмм, ka ცხრილ/გრაფიკ/დიაგრამ; and it is not the first sentence), else at the end. Logged `FINDING_SENTENCES_ADDED n=<n> lang=<code>`. Display text only (R0): `content` stays `history_content(template, findings)`. English wording: "Amounts carry more than one currency or unit label, so they are reported per label and never added together." / "The set of values in one dimension changes between periods (CURRENCY), so totals are not comparable across periods." / "One period looks incomplete (2026 Февраль): it has far fewer rows or almost no value compared with the other periods, so it is treated as a data gap, not a business change." (one wording for both causes: the row rule and the value collapse) / "Many rows have no value in one dimension (SEKTOR; up to 100.0% Unknown), so that dimension cannot explain any change." / "In most rows this metric equals another metric of the data (97.6% of rows), so it counts a stock, not new items." / "The data ends before the current month (latest period: 2026 Март)." (uz / ru / ka: `narrative.FINDING_SENTENCES`).
+- **Finding sentences** (`narrative.FINDING_SENTENCES`, `add_finding_sentences`). After the gate, `finish` appends one fixed sentence, in the answer language (en / uz / ru / ka from `answer_lang_code`; unknown ⇒ en), for each data-quality finding present in the merged FINDINGS that no shown section already states. A section states a finding when it was shown as `{{#<code>}}` (after the prefix resolution of A2.2, never `{{^…}}`) and one of its body sentences survived the gate. Findings, in this order: `mixed_units` (`units == "mixed_units"`; covered by `mixed_units`, `units`), `coverage_change` (`coverage == "coverage_change"`; covered by `coverage_change`; slot `coverage_dim_label`, else the `coverage_dim` finding), `label_disappeared` (`label_disappeared` true; covered by itself; slots `disappeared_label` + `disappeared_after_period`), thin period / data gap (`thin_period` or `period_status == "data_gap"`; covered by `thin_period`, `data_gap`; slot `thin_period_label`, else `data_gap_period`), `scope_change` (`anomaly == "scope_change"` or `change_shape == "scope_change"`; covered by `scope_change`; slots `anomaly_period`, else `change_to_period`, + `rows_ratio` formatted as a ratio), `unknown_dominated` (covered by `unknown_dominated`; slots `unknown_dim_label` + `unknown_share_max` only when that label equals the `unknown_dim` finding or no `unknown_dim` is present, else the `unknown_dim` finding alone without a share — so the dimension and its share always come from one result; BRB run 3 en q3 showed the SEKTOR finding with another call's SEGMENT share), `metric_definition_overlap` (`metric_relation`; covered by `metric_definition_overlap`, `metrics_identical`, `metric_relation`; slot `overlap_equal_share`), `latest_is_past_period` (covered by itself; slot `latest_period`). A slot is looked up by its exact VALUES key, else the first key `^[a-z][a-z0-9]{0,9}_<name>$` (prefixed VALUES). Every value is formatted with the answer locale and lives in a parenthesis; a missing, None or `n/a` value drops its part, and with no part left the whole parenthesis goes, so a finding sentence never shows `n/a`. `scope_change` and `label_disappeared` also carry a FULL form with the values inline (`FINDING_SENTENCES[code][lang]` is then `(base, paren, full)`), used only when every value it names is present; otherwise their value-free base sentence follows the parenthesis rule. The sentences form ONE new paragraph: before the last sentence when that sentence is a reading guide (it names a visual: en table/chart/graph/bar/waterfall, uz jadval/grafik/diagramma, ru таблиц/график/диаграмм, ka ცხრილ/გრაფიკ/დიაგრამ; and it is not the first sentence), else at the end. Logged `FINDING_SENTENCES_ADDED n=<n> lang=<code>`. Display text only (R0): `content` stays `history_content(template, findings)`. English wording: "Amounts carry more than one currency or unit label, so they are reported per label and never added together." / "The set of values in one dimension changes between periods (CURRENCY), so totals are not comparable across periods." / "One period looks incomplete (2026 Февраль): it has far fewer rows or almost no value compared with the other periods, so it is treated as a data gap, not a business change." (one wording for both causes: the row rule and the value collapse) / "Many rows have no value in one dimension (SEKTOR; up to 100.0% Unknown), so that dimension cannot explain any change." / "In most rows this metric equals another metric of the data (97.6% of rows), so it counts a stock, not new items." / "The data ends before the current month (latest period: 2026 Март)." / full forms: "Rows labelled Ўзбек Сўми (UZS) end after 2025 Декабрь; later periods carry only the other label(s), so a 0 for Ўзбек Сўми (UZS) in a later period means no rows, not no activity." / "2026 Март has 8.8x the rows of the previous period, so its totals reflect a change in reporting scope, not a business change; compare rates or per-row averages instead." (order: mixed_units, coverage_change, label_disappeared, thin period, scope_change, unknown_dominated, metric_definition_overlap, latest_is_past_period; uz / ru / ka and the value-free base forms: `narrative.FINDING_SENTENCES`).
+- **Code gate** (BRB run 3, en q4 showed raw Python). `narrative.contains_code(text) -> bool` is True for a ``` fence, or for three consecutive non-blank lines that parse as Python (`ast.parse`) and hold a STRONG construct (an import, def / class, for / while / with / try / return, a lambda, a comprehension or generator, a dict literal, a method call, a call with keyword arguments or a string subscript such as `dfs['x']`); an assignment, an `if` or a call of a plain name alone does not count, so label lists (`Revenue (USD)`), formula lines (`Margin = Revenue - Cost`) and `Q1 = 5` lists are prose; an annotation (`Result: 5`), bare names, numbers and prose never count; never raises. `narrative.code_in_text(text, *, sid, what)` adds one `NARRATIVE_CODE_IN_TEXT what=<answer|caption|narrative>` line, never the text. After the `n/a` gate, a caption holding code counts as missing (`CAPTION_SKIPPED block=<n> reason=code_in_text`, describe runs for that visual) and a narrative holding code is not used (`NARRATIVE_SKIPPED reason=code_in_text`, the no-narrative path). A PROSE reply (plan kind CLARIFICATION / ANSWER / MISSING_DATA, whose text is shown as is) that holds code is never shown: `run_chat_local._code_from_prose_reply(text, sid) -> (kind, code) | None` takes the first ```python / ```py fence that parses (however short: the tag declares it code) or the first bare ``` fence whose content `contains_code` accepts, or — for a text with no fence at all — the whole text when it parses and `contains_code` accepts it; anything else is None and the prose is shown (a ```sql or ```json explanation stays an answer). Kind PLOT_CODE when it assigns `fig` and not `RESULT`, else PYTHON, and the turn logs `NARRATIVE_CODE_IN_TEXT what=answer` once and runs it on the normal path (`run_chat` and the single flow; retry loop on failure, describe / summarize for the text — no narrative, the brain drops it for a prose kind). A prose reply without runnable Python is shown as before. Only the first plan reply is searched: a prose-kind RETRY reply stays a failed attempt.
 - Log after each phase: `NARRATIVE_USED phase=<p> slots=<n> missing=<n> captions=<n> described=<n>`.
 
 #### A5.2 Brain-safe text vs display text — one rule
@@ -620,6 +621,8 @@ def _apply_narrative_fields(rec: dict, src: dict | None) -> dict
 | Narrative-only retry exceeds 45 s | `NARRATIVE_RETRY_TIMEOUT`; counts as no reply (the row above) |
 | A finding no shown section states | one fixed sentence per finding, in the answer language (A5.1) |
 | A rendered sentence holds `n/a` (missing slot, None or non-finite value) | that sentence is dropped (A5.1 quality gate); a caption left empty ⇒ describe for that visual; a narrative left empty ⇒ the "No narrative" row |
+| A rendered narrative or caption holds code (A5.1 code gate) | the caption counts as missing (describe for that visual); the narrative is not used (the "No narrative" row) |
+| A prose-kind reply (CLARIFICATION / ANSWER / MISSING_DATA) holds runnable Python (a python / py / bare fence, or a fence-free text that parses as code) | its code is extracted and run on the normal path; describe / summarize write the text (A5.1) |
 | Every block of the phase failed | narrative not used; today's failure texts |
 | Summarize fallback | `brain_client.summarize(..., preview=None)` at `run_chat_local.py:981` and `:2187`; then `value_display = narrative.value_display(_safe_preview(preview), lang)` is appended to the display only |
 
@@ -653,8 +656,13 @@ ENUM v1:
 FINDINGS_ENUM = ("coverage_change", "coverage_stable", "partial_period", "metric_definition_overlap",
                  "mixed_units", "concentrated_in_one_dim", "spread_evenly", "weak_signal",
                  "dominant_feature", "anomaly_confirmed", "no_anomaly",
-                 "data_gap", "outlier_driven", "seasonal_pattern")
+                 "data_gap", "outlier_driven", "seasonal_pattern",
+                 "scope_change", "label_disappeared")   # appended (BRB run 3)
 # needs_phase2 is NOT a value (decision F14); it is only the reserved boolean KEY.
+# scope_change is emitted by detect_anomalies as anomaly="scope_change" and by
+# decompose_change as change_shape="scope_change" (B8.4, B8.5); label_disappeared is a
+# boolean coverage_check finding (B8.3), listed here as a code so {{#label_disappeared}}
+# reads like the other codes.
 # data_gap is emitted by detect_anomalies as period_status="data_gap" (B8.4).
 # outlier_driven / seasonal_pattern are not emitted by pdc_diag v1; planner code may set them
 # (e.g. FINDINGS["pattern"] = "seasonal_pattern") from its own checks.
@@ -665,7 +673,7 @@ FINDINGS_ENUM = ("coverage_change", "coverage_stable", "partial_period", "metric
 Each block's validated FINDINGS are kept until its phase completes. They are then merged in `block_index` order, NOT execution order: table blocks run after chart blocks (`run_chat_local.py:1636-1638`, `:1963`), and execution order would let the cap cut block 1's coverage findings.
 - A later `block_index` wins, logged as `FINDINGS_KEY_COLLISION n=`.
 - The cap `FINDINGS_MAX_KEYS = 24` is applied with this priority: `needs_phase2` first, then `pdc_diag.PDC_DIAG_FINDING_KEYS` members in block_index order, then planner-literal keys in block_index order.
-- The worst case per phase (coverage_check 10 + detect_anomalies 5 + check_metric_overlap 2 + needs_phase2 1 = 18 registry keys) fits under 24.
+- The worst case per phase (coverage_check 11 + detect_anomalies 5 + check_metric_overlap 2 + needs_phase2 1 = 19 registry keys) fits under 24.
 
 Phase-2 FINDINGS are validated against phase-2 code and merged only into `phase2.findings`.
 
@@ -749,7 +757,7 @@ The brain's `_findings_block` text is in B10.7.
 
 **Redefinition guard.** Generated code may call `pdc_diag` but never replace it (a BRB retry once wrote its own `detect_anomalies_mock` and erased the real findings). `sandbox_guard.pdc_diag_redefinition(code)` walks the AST before anything runs, at BOTH exec sites (`code_exec._execute_in_process`, `plot_utils._render_in_process`), and refuses:
 - the name `pdc_diag` as a target: plain, augmented, annotated, tuple/list unpack, walrus, `for`, `with … as`, `except … as`, comprehension, `del`, `global` / `nonlocal`;
-- `class pdc_diag` / `def pdc_diag`, and a `def` / `async def` named after a public function (`PDC_DIAG_PUBLIC`: `fmt`, `coverage_check`, `detect_anomalies`, `decompose_change`, `attribute_level`, `check_metric_overlap`, `plot_highlighted_series`, `plot_waterfall`, `plot_importance`), at any nesting;
+- `class pdc_diag` / `def pdc_diag`, and a `def` / `async def` named after a public function (`PDC_DIAG_PUBLIC`: `fmt`, `coverage_check`, `detect_anomalies`, `decompose_change`, `rate_by_period`, `attribute_level`, `check_metric_overlap`, `plot_highlighted_series`, `plot_waterfall`, `plot_importance`), at any nesting;
 - an import that binds `pdc_diag` to something else (`import numpy as pdc_diag`, `from m import x as pdc_diag`, `from m import pdc_diag`); a plain `import pdc_diag` rebinds the real module and is accepted;
 - an attribute write or delete on `pdc_diag` (`pdc_diag.fmt = …`, `pdc_diag.x += 1`, `del pdc_diag.fmt`).
 
@@ -766,6 +774,7 @@ A refused block is an ordinary execution error with the fixed text `pdc_diag can
 ```python
 PDC_DIAG_VERSION = 1
 THIN_PERIOD_RATIO = 0.5                            # a period with rows < 0.5 × median rows is thin (B8.3, B8.4)
+SCOPE_ROWS_FACTOR = 3.0                            # an anomaly with > 3× / < 1/3× the previous period's rows is a scope change (B8.4)
 FINDINGS_ENUM = (...)                              # B7.1
 PDC_DIAG_FINDING_KEYS = frozenset({
   "coverage", "coverage_dim", "thin_period", "period_status", "unknown_dominated", "unknown_dim",
@@ -773,7 +782,7 @@ PDC_DIAG_FINDING_KEYS = frozenset({
   "anomaly", "anomaly_up", "anomaly_is_latest", "multiple_anomalies", "too_few_periods",
   "change_shape", "change_dim", "change_up", "change_large",
   "attribution", "top_feature", "second_feature", "method_fallback",
-  "metric_relation", "metrics_identical"})
+  "metric_relation", "metrics_identical", "label_disappeared", "rate_up", "rate_down"})
 UNKNOWN_TOKENS = frozenset({"", "unknown", "n/a", "na", "none", "null", "nan", "-", "?",
   "не указано", "неизвестно", "неизвестный", "номаълум", "noma'lum", "nomaʼlum", "nomalum", "უცნობი"})
 _MONTHS = {...}   # casefolded month names -> 1..12: en full+3-letter; ru nominative+genitive;
@@ -825,21 +834,22 @@ Let `P` be the ordered periods and `n_p` the rows per period.
 - `coverage_dim`: the dim with the lowest Jaccard (ties → argument order), when the change holds.
 - `thin_period`: some `n_p < ratio_low · median(n_p)`.
 - `period_status = "partial_period"`: the LAST period's `n_last < ratio_low · median(n of the other periods)`.
-- `unknown_dominated` + `unknown_dim`: some dim whose share of rows with a null or `UNKNOWN_TOKENS` member (casefolded, stripped) is ≥ `unknown_share` in some period.
+- `unknown_dominated` + `unknown_dim`: some dim whose share of rows with a null or `UNKNOWN_TOKENS` member (casefolded, stripped) is ≥ `unknown_share` in some period. Among those candidates the dim with the highest share in the LATEST period wins (ties: the higher maximum share, then argument order), and `unknown_dim`, `unknown_dim_label` and `unknown_share_max` (= that dim's highest share over the periods) all name it. Without a candidate, `unknown_share_max` is the highest share of any dim and no label is set. (BRB run 3: SEGMENT peaked at 58.1 % in one month and was reported, while SEKTOR is 100 % Unknown in every 2026 month.)
+- `label_disappeared` (`unit_cols` only): a label whose last period with rows is before the last period, while every later period still holds a non-null value of that column — a 0 for it later means no rows, not no activity. With several such labels, the one with the most rows overall (ties: first appearance, unit columns in argument order). BRB: `Ўзбек Сўми (UZS)` ends after 2025 Декабрь; every 2026 row is `Бошқа Валюталар`.
 - `units = "mixed_units"`: some unit col has ≥2 distinct non-null members overall.
 - `metric_gap`: some metric is entirely null in a period while non-null in another.
 - `period_order_unknown`.
 - `latest_is_current_period`: the latest parsed period's month equals `pd.Timestamp(as_of or pd.Timestamp.now()).to_period("M")`. Emitted (True or False) only when the periods were parsed.
 - `latest_is_past_period`: True only when the periods were parsed AND the latest period's month is before the current month. It is a positive flag, so a template can say "no data for the current month" without a negative section that would also fire on unparsed periods.
 
-**VALUES:** `n_periods, first_period, latest_period, period_from, period_to, latest_rows, median_rows, thin_period_label, coverage_jaccard, unknown_share_max, as_of_period, coverage_dim_label, unknown_dim_label` (labels as `str`; the two `*_dim_label` values are the caller's column names, so templates can name the dimension; `period_from` / `period_to` are aliases of `first_period` / `latest_period` — the names the planner's period-scope rule tells the code to set for the headline).
+**VALUES:** `n_periods, first_period, latest_period, period_from, period_to, latest_rows, median_rows, thin_period_label, coverage_jaccard, unknown_share_max, as_of_period, coverage_dim_label, unknown_dim_label, disappeared_label, disappeared_after_period` (`disappeared_label` is the label text — a category value, a VALUE only, never a finding; `disappeared_after_period` the last period that has it; both None without the finding; labels as `str`; the two `*_dim_label` values are the caller's column names, so templates can name the dimension; `period_from` / `period_to` are aliases of `first_period` / `latest_period` — the names the planner's period-scope rule tells the code to set for the headline).
 
 #### B8.4 `detect_anomalies`
 
 ```python
 def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
                      z: float = 3.5, ratio: float = 2.0, thin_ratio: float = THIN_PERIOD_RATIO,
-                     prefix: str = "") -> dict
+                     rows_col=None, dims=None, prefix: str = "") -> dict
 ```
 
 - `agg ∈ {"sum", "mean", "median", "count", "nunique"}`; `v_p` = the aggregate per period; `n_p` = the rows per period.
@@ -851,13 +861,15 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
 - **Data gap.** A period is a gap when `n_p < thin_ratio · median(n)` (the `coverage_check` thin rule) or when `v_p == 0` while every existing neighbour is finite and non-zero, or (the COLLAPSE rule, applied ONLY to pre-aggregated input — every period holds at most one row, `max(n) ≤ 1`; on raw rows the row-count rule, with the zero rule, alone decides, so a real value collapse over normal row counts stays an anomaly) when `v_p ≥ 0` is below `COLLAPSE_RATIO` (0.01) × every existing neighbour, each finite and > 0 (BRB run 2, English q3: February 4,000,000 against 563.70 bn and 4,739.29 bn, passed as one row per month). A gap is a coverage problem, not a business anomaly: it is never flagged and never primary. (BRB: February 2026 has 3,792 rows against a median of 12,617 and NPL_COUNT 1; it used to be the primary anomaly, read as a "sharp increase".)
 - A non-gap period `p` is flagged iff `|z_p| ≥ z` OR `max(ratio_med_p, 1/ratio_med_p) ≥ ratio`.
 - Primary = the flagged period with the largest `|log(ratio_med_p)|`; ties go to the later period.
+- **Row counts.** `n_p` is the period's row count, or — with `rows_col` (a numeric column; missing / non-numeric ⇒ `ValueError` naming `rows_col`) — the period's sum of it, for the table's `rows` and the gap rules alike. Rows are KNOWN with `rows_col` or when some period holds more than one row (raw rows), and only while the rows sum above 0 (an all-zero / all-NaN `rows_col` leaves them unknown). NaN cells and a non-finite sum count as 0 rows. With `rows_col` the COLLAPSE rule is off (the counts are known; the thin-rows and zero rules decide).
+- **Scope change.** The primary `p` (when `p > 0`) is compared with the period right before it, `p-1`, data gap or not: with known rows, `n_p / n_{p-1} > SCOPE_ROWS_FACTOR` or `< 1 / SCOPE_ROWS_FACTOR` (an `n_{p-1}` of 0 counts as past it only when `n_p > 0`); or, with `dims`, a dim whose member sets of the two periods have Jaccard < 0.5 or whose member row shares shift (the B8.3 share rule, 0.5 / 0.2). Either ⇒ the period's totals reflect a change of reporting SCOPE, not a business change: `anomaly = "scope_change"` instead of `"anomaly_confirmed"`, and neither `anomaly_up` nor `anomaly_is_latest` is set (no spike section opens); the anomaly VALUES stay. BRB run 3: March holds 33,455 rows against February's 3,792 (8.82×) and about 10× January's portfolio, while the NPL rate fell (8.69 % → 7.53 %); both q3 answers had called it "the primary problem". (Measured against the previous NON-gap period, January, the ratio is 2.96 and would not fire; decided 2026-10-25: the period right before.)
 
 **Findings:**
-- `anomaly` (`"anomaly_confirmed"` iff at least one non-gap period is flagged, else `"no_anomaly"`);
+- `anomaly` (`"anomaly_confirmed"` iff at least one non-gap period is flagged and the primary is not a scope change, `"scope_change"` when it is, else `"no_anomaly"`);
 - `anomaly_up`, `anomaly_is_latest`, `multiple_anomalies` — over non-gap flagged periods only; `too_few_periods`;
 - `period_status = "data_gap"` when some period is a gap (the existing key and code: a template writes `{{#data_gap}}…{{/data_gap}}`). `coverage_check` uses the same key for `"partial_period"`; in a block that copies both results into FINDINGS the later copy wins, and the thin month is still reported by `coverage_check`'s `thin_period`.
 
-**VALUES:** `anomaly_period, anomaly_value, baseline_value (=m), anomaly_ratio_median, anomaly_prev_period, anomaly_prev_value, anomaly_ratio_prev, n_periods, n_anomalies, data_gap_period, period_from, period_to` (`n_anomalies` counts non-gap flagged periods; `data_gap_period` is the label of the gap with the fewest rows, then the lowest value, then the earliest, None without a gap; `period_from` / `period_to` are the first / last period label, None without periods).
+**VALUES:** `anomaly_period, anomaly_value, baseline_value (=m), anomaly_ratio_median, anomaly_prev_period, anomaly_prev_value, anomaly_ratio_prev, n_periods, n_anomalies, data_gap_period, period_from, period_to, rows_ratio` (`rows_ratio` = `n_p / n_{p-1}` for the primary whenever the rows are known and `n_{p-1} > 0`, scope change or not, else None; `n_anomalies` counts non-gap flagged periods; `data_gap_period` is the label of the gap with the fewest rows, then the lowest value, then the earliest, None without a gap; `period_from` / `period_to` are the first / last period label, None without periods).
 
 **Table:** `period, value, robust_z, ratio_prev, ratio_median, is_anomaly, is_primary, rows, is_data_gap` (`rows` and `is_data_gap` are additive trailing columns).
 
@@ -867,7 +879,7 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
 def decompose_change(df, period_col, metric, from_period=None, to_period=None, dims=(), *,
                      agg: str = "sum", order=None, top_k: int = 5, concentrated_share: float = 0.6,
                      even_tolerance: float = 0.15, large_ratio: float = 2.0, unknown_share: float = 0.5,
-                     prefix: str = "") -> dict
+                     rows_col=None, prefix: str = "") -> dict
 ```
 
 **Defaults.** `to_period=None` ⇒ the latest period. `from_period=None` ⇒ the period before `to_period`. Fewer than 2 periods ⇒ `too_few_periods`.
@@ -886,13 +898,14 @@ A dim is *concentrated* iff its top-`|delta|` member has `share_of_delta ≥ con
 - `change_shape`:
   - `"concentrated_in_one_dim"` if any dim is concentrated, with `change_dim` = the dim with the largest top share;
   - otherwise `"spread_evenly"` if every dim is even;
+  - `"scope_change"` when `to_period="primary_anomaly"` lands on a scope change (below);
   - otherwise absent.
 - `change_up` = Σdelta > 0.
 - `change_large` = `to/from ≥ large_ratio` or `to/from ≤ 1/large_ratio`.
 
 **VALUES:** `change_from_period, change_to_period, change_from_value, change_to_value, change_abs, change_ratio, change_pct (fraction), change_top_member, change_top_member_share, change_top_member_delta, change_dim_label` (`change_dim_label` = the column name of the dim the top member comes from, as `str`: `change_dim` when the change is concentrated, otherwise the usable dim with the largest top share). `change_dim_label` is set exactly when `change_top_member` is; with no usable dim all four `change_top_member*` / `change_dim_label` values are None.
 
-**`to_period="primary_anomaly"`.** `decompose_change` runs `detect_anomalies(df, period_col, metric, agg=agg, order=order)` internally and uses its primary anomaly period as `to_period`; the period before it is the default `from_period`. If no anomaly is found, the latest period is used and `anomaly` is set to `"no_anomaly"` in findings. This lets phase 2 target the anomaly without seeing phase-1 values.
+**`to_period="primary_anomaly"`.** `decompose_change` runs `detect_anomalies(df, period_col, metric, agg=agg, order=order)` internally and uses its primary anomaly period as `to_period`; the period before it is the default `from_period`. If no anomaly is found, the latest period is used and `anomaly` is set to `"no_anomaly"` in findings. The internal call gets `rows_col` (never `dims`, so a decomposition dim cannot turn an anomaly into a scope change). When it reports `"scope_change"`, that primary period is the to period, the totals and `change_*` VALUES are computed as usual (`change_up` / `change_large` too), but NO member is attributed: `change_shape = "scope_change"`, `anomaly = "scope_change"`, an empty table (attrs `pdc_metric`, `pdc_from_period`, `pdc_to_period`, no `pdc_change_dim`), `change_top_member*` / `change_dim_label` None, no `change_dim` and no `unknown_dominated`. (BRB run 3 en q3 credited Юридик with 73.9 % of a change measured from the data-gap month.) This lets phase 2 target the anomaly without seeing phase-1 values.
 
 **Table:** `dim, member, from_value, to_value, delta, share_of_delta, share_of_base`. It holds the top_k members per dim by `|delta|`, plus one `"(other)"` row per dim. `table.attrs` carries `pdc_metric`, `pdc_from_period` / `pdc_to_period` and, whenever a top member is set, `pdc_change_dim` = the dim `change_dim_label` names.
 
@@ -956,6 +969,19 @@ def plot_importance(table, *, title=None, x_title="Share of variation explained"
 - A table that lacks the required columns ⇒ `ValueError`.
 - Default titles: `"<value_col> by period — highlighted period"`, `"What changed: <metric> by <dim>, <from> to <to>"`, `"What explains <target>"`.
 - `plot_waterfall` plots `table.attrs["pdc_change_dim"]` when present and in the table, even when another `dim=` is passed, so the chart always shows the dimension the findings and the text name; a table without it (built by hand) uses `dim`, else its first dim. The title (given or default) gains `" (<dim>)"` unless it already names the dim (case-insensitive).
+
+#### B8.9 `rate_by_period`
+
+```python
+def rate_by_period(df, period_col, numerator, denominator, *, order=None, prefix: str = "") -> dict
+```
+
+The rate view to compare when totals move with the row count (`scope_change`): numerator sum / denominator sum per period (BRB: NPL_AMOUNT / LOAN_AMOUNT).
+- Periods ordered as B8.2; `numerator` / `denominator` must exist and be numeric (`ValueError` naming the parameter).
+- **Table:** `period, numerator, denominator, rate` (the per-period sums; `rate` NaN when the denominator is 0 or not finite); attrs `pdc_numerator`, `pdc_denominator`.
+- **VALUES:** `rate_first`, `rate_last` (fractions — the `:pct` kind — of the first and the last period with a finite rate), `rate_change_pp` = (last − first) × 100 (percentage points), `rate_first_period`, `rate_last_period`, `period_from`, `period_to` (the first and last periods), `n_periods`; None when not computable.
+- **Findings:** `rate_up` when `rate_change_pp > 0.5`, `rate_down` when `< -0.5`; fewer than two finite rates ⇒ `too_few_periods` (no change, no up / down).
+- First vs last period, by decision (2026-10-25): on BRB that is 17.96 % (2025 Ноябрь) → 7.53 % (2026 Март), `rate_down`; the January → March view (8.69 % → 7.53 %) is read from the table.
 
 ### B9. Two-phase flow (D8)
 
@@ -1283,14 +1309,24 @@ playbook:
       are required, pass both on every call. VALUES n_periods, first_period, latest_period, period_from,
       period_to (the same values as first_period and latest_period), latest_rows, median_rows,
       thin_period_label, coverage_jaccard, unknown_share_max, as_of_period, coverage_dim_label,
-      unknown_dim_label;
+      unknown_dim_label, disappeared_label, disappeared_after_period (unknown_dim_label and
+      unknown_share_max name the same dim as the unknown_dim finding);
       FINDINGS coverage, coverage_dim, thin_period, period_status, unknown_dominated, unknown_dim, units,
-      metric_gap, period_order_unknown, latest_is_current_period, latest_is_past_period
+      metric_gap, period_order_unknown, latest_is_current_period, latest_is_past_period,
+      label_disappeared (a unit_cols label whose rows end before the last period: a 0 for
+      disappeared_label in a later period means no rows, so never print that 0 outside
+      {{#label_disappeared}})
     detect_anomalies: >
+      Optional rows_col= (the row-count column of pre-aggregated input) and dims= (coverage dims).
       VALUES anomaly_period, anomaly_value, baseline_value, anomaly_ratio_median, anomaly_prev_period,
-      anomaly_prev_value, anomaly_ratio_prev, n_periods, period_from, period_to (the first and the last
-      period), n_anomalies;
-      FINDINGS anomaly, anomaly_up, anomaly_is_latest, multiple_anomalies, too_few_periods,
+      anomaly_prev_value, anomaly_ratio_prev, rows_ratio (the anomaly period's rows over the previous
+      period's rows), n_periods, period_from, period_to (the first and the last period), n_anomalies;
+      FINDINGS anomaly (anomaly_confirmed, no_anomaly, or scope_change: the anomaly period has more
+      than 3x or less than 1/3 of the previous period's rows, or a dims= coverage changed, so its
+      total reflects a change of reporting scope, not a business change; then anomaly_up and
+      anomaly_is_latest are not set: write {{#scope_change}} and compare a rate with
+      rate_by_period instead of calling the total a problem), anomaly_up, anomaly_is_latest,
+      multiple_anomalies, too_few_periods,
       period_status (data_gap); TABLE period, value, robust_z, ratio_prev, ratio_median, is_anomaly,
       is_primary, rows, is_data_gap. A data-gap period is never flagged or primary, so anomaly_period and
       n_anomalies never count it; a ratio slot shows <0.1x below 0.05 and >1000x above 1000. Chart:
@@ -1300,17 +1336,27 @@ playbook:
       change_ratio, change_pct, change_top_member, change_top_member_share, change_top_member_delta,
       change_dim_label (change_ratio and change_pct are None when the from value is 0, so a change_pct slot
       outside {{#change_large}} can be n/a when the change starts from 0; change_dim_label is set exactly
-      when change_top_member is); FINDINGS change_shape, change_dim, change_up, change_large
+      when change_top_member is); FINDINGS change_shape (concentrated_in_one_dim, spread_evenly, or
+      scope_change: the to period is a change of scope, no member is attributed and the
+      change_top_member* / change_dim_label values stay None), change_dim, change_up, change_large
       (only when the from value is above 0), unknown_dominated, unknown_dim (the first dim dominated by
       unknown members, left out of the decomposition; it sets no unknown_dim_label, that slot comes from
       coverage_check), too_few_periods, anomaly (no_anomaly when
-      to_period="primary_anomaly" finds none)
+      to_period="primary_anomaly" finds none, scope_change when it lands on one); optional
+      rows_col= as in detect_anomalies
     attribute_level: >
       VALUES top_feature_label, second_feature_label, top_feature_share, second_feature_share, n_rows_used,
       top_member, top_member_target, overall_target; FINDINGS attribution, top_feature, second_feature,
       method_fallback
     check_metric_overlap: >
       VALUES overlap_equal_share, overlap_sum_ratio, overlap_rows, overlap_nonnull_rows; FINDINGS metric_relation, metrics_identical
+    rate_by_period: >
+      Call rate_by_period(df, period_col, numerator, denominator) for a ratio of two summed metrics
+      per period (for example a share of a portfolio); use it when the totals move with the row
+      count ({{#scope_change}}). VALUES rate_first, rate_last (fractions: the :pct kind),
+      rate_change_pp (percentage points: the :float kind), rate_first_period, rate_last_period,
+      period_from, period_to, n_periods; FINDINGS rate_up, rate_down (a move of more than 0.5
+      percentage points), too_few_periods; TABLE period, numerator, denominator, rate
     slot_rule: >
       A narrative slot must be one of these VALUES keys (with the prefix= you passed) or a key the code sets
       itself with VALUES["..."] = …; never an invented name.
