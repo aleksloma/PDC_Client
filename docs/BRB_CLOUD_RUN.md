@@ -218,6 +218,66 @@ the demo export is kept in `BRB_Database_template/docs/BRB_SERVICE_DIFF.md`.
 
 ## Deploy history
 
+**2026-10-25 — `main` at `c0474e3` (PRs #16–#31).** Narrative templates
+filled locally from the sandbox's `VALUES` / `FINDINGS`, with the n/a gate,
+the narrative-only retry, finding sentences, data-gap and scope-change
+detection, the rate view and the code-as-text gate; approved sign-in
+domains; pillow 13 (see the `pdcclient-demo` entry). Deployed after the brain
+went live on `d6864eb` (`pdcbrain-00032-cir`); `BRAIN_CAPABILITIES` not set.
+Same images as `pdcclient-demo` (Cloud Build
+`3a9eeefd-5c6a-4514-9f6f-734a9cac3165`, `BUILD_TIME=2026-10-25T22:32:31Z`),
+deployed right after the demo; the revision resolved exactly these digests:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:c0474e3` | `sha256:1c7749a85630557ad722049b8c4a3be6c925dd844693697b734f86db965f1fab` |
+| `pdcexecutor-demo:c0474e3` | `sha256:38cd17676dccc3496496c79672b1daad0ba7adbe15c36abba9f77572e6c5012b` |
+
+Revision `pdcclient-brb-c0474e3`, serving 100 % since 2026-10-25 ~23:02 UTC.
+It replaced `pdcclient-brb-0ff6638`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-brb --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-brb-0ff6638=100
+```
+
+Backups taken before the deploy:
+- Data bucket: `gs://pdc-enterprise-client-brb-data-backups/20261025-225517/`,
+  which matched the data bucket in size (285,452,466 bytes) and in its 346
+  object names.
+- Database (the first Cloud SQL export of `brb-demo-pg`):
+  `gs://pdc-enterprise-client-brb-data-backups/20261025-225517-sql/brb_demo.sql.gz`
+  (180,645,193 bytes), by `gcloud sql export sql brb-demo-pg <uri>
+  --database=brb_demo`. For it the instance's service account
+  `p873133613631-4j8yg2@gcp-sa-cloud-sql.iam.gserviceaccount.com` was given
+  `roles/storage.objectCreator` on the backups bucket (kept, for the next
+  exports). Restore: `gcloud sql import sql brb-demo-pg <uri> --database=brb_demo`.
+
+The spec change was image-only (two `image:` lines and the template name;
+the `cloudsql-instances` annotation, secrets, buckets and resources carried
+over), checked by a diff against the export before the Admin API `PUT`.
+Candidate checks (`candidate---…` URL):
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `c0474e3`. Revision
+  log: `LADMIN_PRESENT`, `RESET_TOKEN_INDEX_FILLED count=9`,
+  `EXECUTOR_HANDSHAKE_OK version=c0474e3`, `DB_SCHEDULER_STARTED`; no error
+  lines, no 5xx, no `BACKEND_REQUEST_REFUSED`.
+- `ladmin`: a scripted sign-in with `CLIENT_BRB_LADMIN_PASSWORD` answered
+  401 (the secret still predates the 2026-10-03 password change; one attempt
+  only); the sign-in was confirmed by hand in the browser. The bucket held 10
+  profiles, 17 chats and 12 dashboards (`brbtest@powerdatachat.com`: 6
+  dashboards, 7 chat-list rows).
+- Existing records: `brbtest@powerdatachat.com`'s showcase chats, dashboards
+  and predictive analysis opened by hand in the browser and rendered as
+  before.
+- Not run here: the new-chat checks (upload, row-count sentence, diagnostic
+  question). This instance is invitation-only, so no throwaway account was
+  created; they passed on the `pdcclient-demo` candidate with the same two
+  digests.
+- After the shift, `brb.powerdatachat.com` reported the same `/version` and
+  `/health`, the revision log stayed free of errors and 5xx; `pdcbrain`
+  gained no revision (`pdcbrain-00032-cir`) and `pdcclient-demo` stayed on
+  `pdcclient-demo-c0474e3`.
+
 **2026-10-05 — `main` at `0ff6638` (PR #14).** Share dialog: its body scrolls
 inside the dialog, so Cancel / Share stay visible on a small window; and each
 conversation share is recorded, so the Share Conversation dialog lists only
