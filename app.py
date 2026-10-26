@@ -212,6 +212,16 @@ async def lifespan(app: FastAPI):
         log_with_sid("startup", "error",
                      f"EXECUTOR_STARTUP_FAILED {log_safe_text(type(e).__name__, 80)}: "
                      f"{log_safe_text(str(e), 200)}")
+    # Oracle driver mode (ORACLE_THICK_MODE, default thin), decided BEFORE the
+    # scheduler: oracledb settles on thin mode at its first connect, so a
+    # scheduled refresh must not open a thin connection first. It never
+    # raises; wrapped anyway so a defect costs thick mode, never the boot.
+    try:
+        import db_connector
+        db_connector.ensure_oracle_thick_mode()
+    except Exception as e:
+        log_with_sid("startup", "error",
+                     f"ORACLE_THICK_MODE_STARTUP_FAILED {log_safe_text(type(e).__name__, 80)}")
     import db_scheduler
     db_scheduler.start()
     yield

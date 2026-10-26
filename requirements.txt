@@ -73,8 +73,10 @@ reportlab==4.2.5
 
 # Database sources (admin-registered tables → parquet snapshots).
 # Connector is SELECT/introspection-only; drivers are DENIED inside the
-# code-exec sandbox (sandbox_guard.py). oracledb runs in thin mode (no
-# Instant Client); pyodbc needs unixodbc + msodbcsql18 from the Dockerfile.
+# code-exec sandbox (sandbox_guard.py). oracledb runs in thin mode by default;
+# ORACLE_THICK_MODE=true switches it to thick mode through the image's Instant
+# Client (needed for a UTF8 national character set — DPY-3012). pyodbc needs
+# unixodbc + msodbcsql18 from the Dockerfile.
 # ClickHouse speaks the NATIVE protocol (port 9000; 9440 with SSL) and needs
 # no system package. clickhouse-sqlalchemy ships sdist-only, so pip builds it —
 # pure Python, no compiler needed. It hard-depends on asynch (compiled, used

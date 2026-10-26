@@ -271,8 +271,71 @@ def _mssql_query_args(cfg: dict) -> dict:
     }
 
 
+# python-oracledb THICK mode — opt-in (settings.ORACLE_THICK_MODE, default
+# off). Thin mode (pure Python) cannot decode NCHAR / NVARCHAR2 / NCLOB of a
+# database whose national character set is UTF8 (id 871): DPY-3012. Thick
+# mode loads Oracle Instant Client (libclntsh) and decodes them, but it is a
+# different driver configuration (connect timeout and TLS ride in the DSN,
+# see _oracle_connect_args), so it stays a deliberate per-install choice.
+# init_oracle_client() may run at most ONCE per process and the mode cannot be
+# switched back, so the verdict is decided once, behind a lock, and cached;
+# None = not decided yet.
+_ORACLE_MODE_LOCK = threading.Lock()
+_ORACLE_THICK: Optional[bool] = None
+
+
+def ensure_oracle_thick_mode() -> bool:
+    """Decide the Oracle driver mode for this process; True = thick active.
+
+    Setting off ⇒ False and the driver is never touched (today's behaviour).
+    Setting on ⇒ `oracledb.init_oracle_client()` once, with no argument (the
+    image registers the library with ldconfig). A failure is logged by
+    exception TYPE only — the driver's message names host library paths —
+    and the process stays thin for good: never raises, never retries."""
+    global _ORACLE_THICK
+    if _ORACLE_THICK is not None:
+        return _ORACLE_THICK
+    with _ORACLE_MODE_LOCK:
+        if _ORACLE_THICK is not None:
+            return _ORACLE_THICK
+        if not settings.ORACLE_THICK_MODE:
+            _ORACLE_THICK = False
+            log_with_sid("db", "info", "ORACLE_DRIVER_MODE mode=thin reason=disabled")
+            return False
+        # Logged values are class names and the client's integer version:
+        # identifiers only, nothing to escape.
+        try:
+            import oracledb
+            oracledb.init_oracle_client()
+        except Exception as e:
+            _ORACLE_THICK = False
+            log_with_sid("db", "error",
+                         f"ORACLE_THICK_MODE_UNAVAILABLE "
+                         f"error={type(e).__name__} "
+                         f"(Oracle connections stay in thin mode)")
+            return False
+        _ORACLE_THICK = True
+        try:
+            version = ".".join(str(int(p)) for p in oracledb.clientversion())
+        except Exception as e:
+            version = "unknown"
+            log_with_sid("db", "warning",
+                         f"ORACLE_CLIENT_VERSION_UNREADABLE error={type(e).__name__}")
+        log_with_sid("db", "info", f"ORACLE_THICK_MODE_ENABLED client_version={version}")
+        return True
+
+
+def _reset_oracle_mode_for_tests() -> None:
+    """Forget the cached verdict. Tests only: in a real process the driver's
+    mode cannot be undone once init_oracle_client() has run."""
+    global _ORACLE_THICK
+    with _ORACLE_MODE_LOCK:
+        _ORACLE_THICK = None
+
+
 def _oracle_query_args(cfg: dict) -> dict:
-    # Thin-mode oracledb: service name (or SID) rides in the URL query.
+    # oracledb (thin and thick): service name (or SID) rides in the URL query;
+    # a thick-mode DSN from _oracle_connect_args replaces it.
     if cfg.get("service_name"):
         return {"service_name": cfg["service_name"]}
     if cfg.get("database"):
@@ -281,9 +344,34 @@ def _oracle_query_args(cfg: dict) -> dict:
 
 
 def _oracle_connect_args(cfg: dict, timeout: int) -> dict:
-    # Thin-mode oracledb: without this the connect falls back to the OS TCP
-    # timeout (~127s on Linux), the one dialect that could outlast a click.
+    # Without a connect bound oracledb falls back to the OS TCP timeout
+    # (~127s on Linux), the one dialect that could outlast a click. Thin mode
+    # honours `tcp_connect_timeout`; thick mode does not (see below).
     args = {"tcp_connect_timeout": float(timeout)}
+    if _ORACLE_THICK:
+        # THICK mode (read at call time from the cached verdict). Measured
+        # with Instant Client 23.26: the `tcp_connect_timeout` keyword is
+        # ignored next to the full descriptor SQLAlchemy builds (an
+        # unreachable host took 20 s for a 5 s bound), while
+        # `transport_connect_timeout` in an Easy Connect DSN is honoured — so
+        # the DSN is always ours here (the keyword stays: harmless). TLS goes
+        # through the client library: `wallet_location=SYSTEM` validates the
+        # server against the OS CA store (without a trust source every TCPS
+        # connect fails, ORA-12543). The thin-only ssl_context /
+        # ssl_server_dn_match keywords are not sent, so the trust box has no
+        # effect in thick mode — an untrusted or self-signed server is refused,
+        # reported by the driver as ORA-12543 "destination host unreachable".
+        port = cfg.get("port") or 1521
+        service = cfg.get("service_name") or cfg.get("database") or ""
+        query = f"transport_connect_timeout={int(timeout)}"
+        scheme = ""
+        if cfg.get("ssl"):
+            scheme = "tcps://"
+            query += "&wallet_location=SYSTEM"
+        # No service: no "/" either, as the thin DSN carries none.
+        path = f"/{service}" if service else ""
+        args["dsn"] = f"{scheme}{cfg.get('host') or ''}:{port}{path}?{query}"
+        return args
     if cfg.get("ssl"):
         # TLS: a `tcps://` DSN replaces the plain-TCP one the dialect builds
         # from the URL (create_engine applies connect_args after the
@@ -1205,6 +1293,12 @@ def get_engine(cfg: dict, password: str, *, connect_timeout: Optional[int] = Non
     timeout = int(connect_timeout or cfg.get("connect_timeout") or settings.DB_CONNECT_TIMEOUT)
     url = build_url(cfg, password)
     kwargs: dict = {"poolclass": NullPool}
+    if d.key == "oracle":
+        # The driver mode must be fixed before the first connection (oracledb
+        # settles on thin mode for good at its first connect) and before the
+        # connect arguments, which differ per mode. Oracle only: no other
+        # dialect may trigger an Oracle client load.
+        ensure_oracle_thick_mode()
     ca = d.connect_args(cfg, timeout)
     if ca:
         kwargs["connect_args"] = ca
