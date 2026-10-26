@@ -43,6 +43,41 @@ RUN if [ "$INSTALL_MSSQL_ODBC" = "1" ] \
          && rm -rf /var/lib/apt/lists/* ; \
        fi
 
+# Oracle Instant Client Basic for python-oracledb THICK mode, used only when
+# an install sets ORACLE_THICK_MODE=true (a runtime switch — never set here);
+# thin mode cannot decode NCHAR columns of a UTF8 national character set
+# (DPY-3012). Basic, not Basic Light: Light carries only a subset of the
+# character sets (and English messages only). Oracle publishes the zip for Linux
+# x64, so the install is guarded: other architectures (and
+# INSTALL_ORACLE_CLIENT=0 builds) skip it and Oracle stays in thin mode. The
+# zip is pinned by version + sha256, checked before anything is unpacked.
+# `unzip`, not Python's zipfile, because zipfile drops the libclntsh.so ->
+# libclntsh.so.23.1 symlinks the loader needs; it leaves in the same layer.
+# Debian trixie names libaio `libaio1t64` and Instant Client loads
+# `libaio.so.1`, hence the link. The Java archives are unused by
+# python-oracledb and removed for size; ldconfig registers the library, so
+# init_oracle_client() is called without a path.
+ARG INSTALL_ORACLE_CLIENT=1
+ARG ORACLE_IC_VERSION=23.26.4.0.0
+ARG ORACLE_IC_SHA256=cab59aa3b411b3b50898e456fa9aabfe48d67e25cbc1bb23303800390ce7de26
+RUN if [ "$INSTALL_ORACLE_CLIENT" = "1" ] \
+       && [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+         IC_DIR=$(echo "$ORACLE_IC_VERSION" | tr -d . | cut -c1-7) \
+         && apt-get update \
+         && apt-get install -y --no-install-recommends libaio1t64 unzip \
+         && curl -fsSL -o /tmp/ic.zip \
+              "https://download.oracle.com/otn_software/linux/instantclient/${IC_DIR}/instantclient-basic-linux.x64-${ORACLE_IC_VERSION}.zip" \
+         && echo "${ORACLE_IC_SHA256}  /tmp/ic.zip" | sha256sum -c - \
+         && unzip -q /tmp/ic.zip -d /opt/oracle \
+         && rm -f /tmp/ic.zip \
+         && ln -sf /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1 \
+         && rm -f /opt/oracle/instantclient_*/*.jar \
+         && ls -d /opt/oracle/instantclient_* > /etc/ld.so.conf.d/oracle-instantclient.conf \
+         && ldconfig \
+         && apt-get purge -y unzip \
+         && rm -rf /var/lib/apt/lists/* ; \
+       fi
+
 COPY requirements.txt .
 # pip is a build-time tool, so its version is fixed HERE rather than in
 # requirements.txt — that file is the application's runtime set. The upgrade

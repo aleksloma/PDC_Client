@@ -289,6 +289,35 @@ client only ever issues SELECT/introspection statements, and that grant is
 your hard guarantee. Set the nightly snapshot-refresh time in the admin UI
 (container-local time — set `TZ` in `client.env` if your server isn't UTC).
 
+**Oracle: thick mode (`ORACLE_THICK_MODE`).** By default the client talks to
+Oracle in the driver's *thin* mode. Thin mode cannot read NCHAR, NVARCHAR2 or
+NCLOB columns of a database whose national character set is not AL16UTF16,
+for example `NLS_NCHAR_CHARACTERSET = UTF8`: "Preview first rows", a snapshot
+or a live query then fails with
+`DPY-3012: national character set id 871 is not supported by python-oracledb in thin mode`.
+Your DBA can check the setting with
+`SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_NCHAR_CHARACTERSET'`.
+If you see DPY-3012, switch the client to *thick* mode, which uses the Oracle
+Instant Client shipped in the standard (amd64) image:
+
+1. Add `ORACLE_THICK_MODE=true` to `client.env`.
+2. Recreate the web container: `docker compose up -d --force-recreate client`.
+   The mode is chosen once at startup; editing the file alone changes nothing.
+3. Check `docker logs pdc-client` for `ORACLE_THICK_MODE_ENABLED client_version=…`.
+   `ORACLE_THICK_MODE_UNAVAILABLE` means the Instant Client could not be loaded
+   (for example an image built for another architecture). The client then keeps
+   working in thin mode.
+
+Thick mode applies to every Oracle connection of the install. Connections that
+do not use SSL behave as before, connect timeout included. **SSL connections
+behave differently in thick mode:** the database server's certificate must be
+issued by a certificate authority the container trusts (a public CA), and the
+"Trust server certificate" box has no effect. A self-signed or internal-CA
+certificate is refused, and the driver reports this as
+`ORA-12543: TNS:destination host unreachable`, although the server is
+reachable. Turning thick mode off again (remove the line and recreate the
+container) restores thin mode exactly, including the trust box.
+
 **What the "SSL / Encrypt" box enforces.** Ticked:
 
 | Database | Ticked | Server identity |
@@ -296,7 +325,7 @@ your hard guarantee. Set the nightly snapshot-refresh time in the admin UI
 | PostgreSQL | `sslmode=require`: a server that does not offer TLS is refused | Not verified. (The PostgreSQL client library upgrades `require` to certificate verification if a `root.crt` exists in the container user's `~/.postgresql`; this image does not ship one.) |
 | MySQL / MariaDB | The connection is refused if the server did not negotiate TLS — the driver would otherwise carry on in plaintext. The check runs after sign-in, so it detects a server without TLS, not an attacker in the network path | Not verified |
 | SQL Server | `Encrypt=yes` | Certificate verified, unless "Trust server certificate" is ticked |
-| Oracle | TCPS (TLS) instead of plain TCP | Server certificate DN is matched, unless "Trust server certificate" is ticked |
+| Oracle | TCPS (TLS) instead of plain TCP | Server certificate DN is matched, unless "Trust server certificate" is ticked. With `ORACLE_THICK_MODE=true`: the certificate must come from a CA the container trusts, and the trust box has no effect (see above) |
 | ClickHouse | Secure native protocol on port 9440 | Certificate verified, unless "Trust server certificate" is ticked |
 
 Unticked, no database requires encryption and the connection normally runs in

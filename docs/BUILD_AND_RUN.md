@@ -451,6 +451,19 @@ Prerequisites (client env, see `client.env.example`):
   `users/ladmin/auth.json` on the volume and restart).
 - The customer's DBA provides a **dedicated SELECT-only database login**
   (ideally on a read replica) — that grant is the real security guarantee.
+- `ORACLE_THICK_MODE` (default `false`): Oracle runs in python-oracledb's thin
+  mode. Set `true` when an Oracle connection fails with `DPY-3012` (national
+  character set not supported in thin mode, e.g. `NLS_NCHAR_CHARACTERSET` UTF8,
+  id 871); the client then loads the Oracle Instant Client **Basic** that the
+  amd64 web image ships (`/opt/oracle/instantclient_*`, checksum-pinned in the
+  Dockerfile; a build for another architecture or with
+  `--build-arg INSTALL_ORACLE_CLIENT=0` has none and stays thin, logging
+  `ORACLE_THICK_MODE_UNAVAILABLE`). Read once at startup: recreate the
+  container after changing it, and confirm `ORACLE_THICK_MODE_ENABLED` in the
+  log. In thick mode an SSL Oracle connection needs a server certificate from a
+  CA the container trusts and the "Trust server certificate" box has no effect;
+  connections without SSL keep their connect timeout. Details for customers:
+  `CUSTOMER_INSTALL.md` ("Oracle: thick mode").
 - `LIVE_MODE_CELL_THRESHOLD`: size in cells (rows x columns) at or above
   which the wizard suggests live mode (default `50000000`).
 - `LIVE_MODE_FORCE_THRESHOLD`: size in cells at or above which a snapshot is

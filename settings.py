@@ -290,6 +290,14 @@ class Settings(BaseModel):
     DB_SNAPSHOT_CHUNK_ROWS: int = Field(default_factory=lambda: int(os.getenv("DB_SNAPSHOT_CHUNK_ROWS", "100000")))
     DB_PREVIEW_ROWS: int = Field(default_factory=lambda: int(os.getenv("DB_PREVIEW_ROWS", "20")))
     DB_MAX_AUTO_CONNECTORS: int = Field(default_factory=lambda: int(os.getenv("DB_MAX_AUTO_CONNECTORS", "25")))
+    # python-oracledb THICK mode (db_connector.ensure_oracle_thick_mode).
+    # OFF by default: thin mode cannot decode NCHAR / NVARCHAR2 / NCLOB of a
+    # database whose national character set is UTF8 (DPY-3012), thick mode
+    # can. It needs the Instant Client the amd64 web image ships; decided once
+    # per process at startup. In thick mode an SSL connection validates the
+    # server against the OS CA store, so it needs a certificate from a CA the
+    # container trusts, and the "Trust server certificate" box does nothing.
+    ORACLE_THICK_MODE: bool = Field(default_factory=lambda: os.getenv("ORACLE_THICK_MODE", "").strip().lower() in ("1", "true", "yes", "on"))
 
     # Live-mode size thresholds, in CELLS (row count x column count). At or
     # above LIVE_MODE_CELL_THRESHOLD the admin UI suggests live mode; at or
