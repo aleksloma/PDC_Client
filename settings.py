@@ -86,7 +86,7 @@ class Settings(BaseModel):
     # Brain connection (injected per-tenant at install time)
     BRAIN_URL: str = Field(default_factory=lambda: os.getenv("BRAIN_URL", "http://localhost:8080"))
     BRAIN_TENANT_TOKEN: str = Field(default_factory=lambda: os.getenv("BRAIN_TENANT_TOKEN", ""))
-    BRAIN_REQUEST_TIMEOUT: float = Field(default_factory=lambda: float(os.getenv("BRAIN_REQUEST_TIMEOUT", "180.0")))
+    BRAIN_REQUEST_TIMEOUT: float = Field(default_factory=lambda: float(os.getenv("BRAIN_REQUEST_TIMEOUT", "300.0")))
     # Tighter cap for brain calls made behind an interactive admin click (the
     # AI description draft during table registration): a stalled brain must
     # surface as a named error, not as a spinner nobody can wait out.

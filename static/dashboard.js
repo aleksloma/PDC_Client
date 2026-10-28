@@ -1845,7 +1845,7 @@ async function _resumeIfGenerating(chatId, convId) {
   _stopReloadGenPoll();
   _reloadGenPollConv = convId;
   const POLL_MS = 2500;
-  const MAX_MS = 240000;   // a few minutes — matches the live SSE abort timeout
+  const MAX_MS = 330000;   // a few minutes — matches the live SSE abort timeout
   const startedAt = Date.now();
   _reloadGenPollTimer = setInterval(async () => {
     // Stop if the user navigated to a different conversation.
@@ -3323,9 +3323,9 @@ async function sendMessage() {
   let narrativeShown = false;
   let tablesStreamed = 0;
 
-  // Abort controller with 240s timeout (Cloud Run has 300s, leave margin)
+  // Abort controller at 330s — past the server's 300s brain-call timeout, so its message arrives first
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 240000);
+  const timeoutId = setTimeout(() => controller.abort(), 330000);
 
   // Shared stream state (also read by the instant-Stop handler below).
   let loadingBubbleVisible = true;
@@ -3420,7 +3420,7 @@ async function sendMessage() {
               loadingBubbleVisible = false;
               clearTimeout(timeoutId);
             }
-            appendMessage('assistant', data.error);
+            appendMessage('assistant', data.error_key ? _t(data.error_key, data.error) : data.error);
             chatMessages.scrollTop = chatMessages.scrollHeight;
             continue;
           }
@@ -3831,7 +3831,7 @@ async function editAndRegenerate(messageDiv, editedQuestion) {
   chatMessages.scrollTop = chatMessages.scrollHeight;
 
   const editController = new AbortController();
-  const editTimeoutId = setTimeout(() => editController.abort(), 240000);
+  const editTimeoutId = setTimeout(() => editController.abort(), 330000);
 
   try {
     const res = await pdcFetch(`/api/chat/${currentChatId}/edit-regenerate`, {
@@ -3859,7 +3859,7 @@ async function editAndRegenerate(messageDiv, editedQuestion) {
     }
 
     if (data.error) {
-      loadingDiv.innerHTML = `<div class="message-content"><p style="color:#ef4444;">${escapeHtml(data.error)}</p></div>`;
+      loadingDiv.innerHTML = `<div class="message-content"><p style="color:#ef4444;">${escapeHtml(data.error_key ? _t(data.error_key, data.error) : data.error)}</p></div>`;
       return;
     }
 
