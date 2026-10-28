@@ -395,6 +395,64 @@ Remove the check's throwaway account and dashboard afterwards.
 
 ## Deploy history
 
+**2026-10-28 — `main` at `2a52247` (PRs #34, #35, #36).** The brain-call
+timeout `BRAIN_REQUEST_TIMEOUT` raised from 180 s to 300 s (the browser's
+stream / edit-regenerate aborts to 330 s), and a brain-call timeout now
+answers "The analysis is taking longer than expected. Please try again."
+(i18n key `lab.brain_timeout`, EN/GEO/RU) instead of the sandbox-queue "busy"
+sentence (PR #34); Authlib 1.8.0 → 1.9.1 (PR #35); the brain's request-budget
+docs mirrored (PR #36, docs only). Deployed after the brain went live with its
+240 s request budget (`pdcbrain-00034-riq`). Neither service sets
+`BRAIN_REQUEST_TIMEOUT`, so the image default (300 s) applies; no spec change
+beyond the images. Built ONCE by Cloud Build
+`daa3244a-e3cb-4563-b543-84dd8714b0c3` from a clean clone of GitHub `main` at
+`2a52247` (both images stamped `2a52247`, `BUILD_TIME=2026-10-28T12:22:29Z`)
+and deployed here first, then to `pdcclient-brb`:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:2a52247` | `sha256:45f0bd18f563292545a4a984287e66dac6895563190aa979ee8c24e203d5e97f` |
+| `pdcexecutor-demo:2a52247` | `sha256:0475fa7fa38932e286b3330d8aba840b39146b9512c5687232756dac8f71dcb4` |
+
+Revision `pdcclient-demo-2a52247`, serving 100 % since 2026-10-28 ~12:33 UTC;
+it resolved exactly the two digests above. It replaced
+`pdcclient-demo-c0474e3`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-demo-c0474e3=100
+```
+
+Backup taken before the deploy:
+`gs://pdc-enterprise-client-demo-data-backups/20261028-122308/`, which matched
+the data bucket in size (442,975,841 bytes) and in its 597 object names.
+
+The spec change was image-only (two `image:` lines and the template name),
+checked by a diff against the export before the Admin API `PUT`. Candidate
+checks (`candidate---…` URL):
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `2a52247`. Revision
+  log: `LADMIN_PRESENT`, `RESET_TOKEN_INDEX_FILLED count=1`,
+  `EXECUTOR_HANDSHAKE_OK version=2a52247`, `DB_SCHEDULER_STARTED`; no error
+  lines, no 5xx, no `BACKEND_REQUEST_REFUSED`.
+- The served `i18n.js` carries `lab.brain_timeout` in all three languages
+  (the exact EN/GEO/RU sentences) and `dashboard.js` the `error_key` render
+  sites and the 330 s abort; `/lab` carried `window.__DIRECT_UPLOAD__ = true`.
+- A self-registered throwaway account (scripted over HTTPS) created a
+  `sample_sales.csv` chat ("Sales Analytics"; the welcome message and three
+  suggested questions were present) and asked "How many rows are there?":
+  answered in 15.3 s with "The dataset contains a total of 6 rows." above a
+  table, no error. The same account repeated the question on
+  `client.powerdatachat.com` after the shift (chat "Sales Metrics", 12.3 s,
+  "The dataset contains 6 rows.").
+- The throwaway account was removed through `POST /api/admin/users/remove`
+  (2 chats deleted); `ladmin` signed in with the password in
+  `CLIENT_DEMO_LADMIN_PASSWORD`.
+- Not run: the browser-only chart/dashboard-pin cycle and the > 32 MiB
+  direct-upload trace (nothing in this release touches them).
+- After the shift, `client.powerdatachat.com` reported the same `/version`
+  and `/health`, and `pdcbrain` gained no revision (`pdcbrain-00034-riq`
+  serving before and after).
+
 **2026-10-25 — `main` at `c0474e3` (PRs #16–#31).** Narrative templates:
 the planner's answer and caption templates are filled locally from the
 sandbox's `VALUES` / `FINDINGS` (`pdc_diag`, `narrative.py`), with the n/a
