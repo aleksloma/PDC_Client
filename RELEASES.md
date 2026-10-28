@@ -10,6 +10,47 @@ against the existing data volume.
 
 ## Unreleased (on `main`, not yet tagged)
 
+### Authlib 1.8.0 → 1.9.1 — 2026-10-28
+
+**Why.** pip-audit (PyPI and OSV) reported six advisories against
+`Authlib==1.8.0`: CVE-2026-96760 (an empty `signatures` array accepted by
+`JsonWebSignature.deserialize_json`), CVE-2026-114615 (PEM / public-key bytes
+usable as an HMAC secret), CVE-2026-114617 (an ID token's
+`nonce_supported=false` claim disabled nonce validation), CVE-2026-114618 (the
+default JWT-bearer grant did not match `aud`) and CVE-2026-114620 (an
+unvalidated JAR `request_uri` fetch), all fixed in 1.9.0, and CVE-2026-114616
+(an empty HMAC key accepted), fixed in 1.9.1. OSV lists a seventh against
+1.8.0, CVE-2026-114619 (the OpenID implicit grant checked the raw scope instead
+of the allowed scope), also fixed in 1.9.0. They made the CI `images` check
+fail for every pull request. Authlib is the Microsoft Entra ID SSO library of
+the web image only.
+
+**Change.**
+- `Authlib==1.9.1` in `requirements.txt` (the sandbox image has no Authlib).
+- The regression floor `FIX_VERSIONS["Authlib"] = "1.9.1"` in
+  `tests/test_dependency_pins.py`.
+- Nothing else changed.
+
+**Release notes reviewed.** The 1.9.0 breaking changes concern
+authorization-server features this client does not use (JAR, `request_uri`,
+JWT bearer, ID-JAG, RFC 7592) or stricter validation the authorization-code
+flow already satisfies (the nonce is always enforced; the client always sends
+an Authlib-generated nonce). The client's surface (`OAuth().register`,
+`authorize_redirect`, `authorize_access_token`, `token["userinfo"]`,
+`OAuthError`) is unchanged; a non-JSON token-endpoint body now raises an HTTP
+error, which the callback's existing handlers turn into the same sign-in-failed
+page. joserfc 1.7.5 and cryptography 50.0.1 already meet 1.9.1's floors
+(`joserfc>=1.6.8`, `cryptography>=45.0.1`).
+
+**Gates (local, before the pull request).**
+
+| Gate | Result |
+|---|---|
+| Web suite, Python 3.11, Windows (`tests/test_export_plotly_png.py` excluded locally — kaleido does not start natively on this machine; CI runs it) | 5641 passed, 87 skipped, 0 failed |
+| Local web image build | Built; the container reports Authlib 1.9.1 and joserfc 1.7.5, `/health` 200 |
+| Microsoft sign-in smoke test (localhost, temporary SSO config) | `/auth/microsoft` 302 to `login.microsoftonline.com/common/oauth2/v2.0/authorize` with the expected client_id, redirect_uri, `response_type=code`, `scope=openid profile email`, state and nonce; `/?local=1` shows the password form; an error callback and a wrong state answer the sign-in-failed page (401); config removed afterwards |
+| CI tests / executor-tests / images | Required on the pull request; merged only when all three pass |
+
 ### pillow 12.3.0 → 13.0.0 — 2026-10-23
 
 **Why.** pip-audit (PyPI and OSV) reported 35 known vulnerabilities against
