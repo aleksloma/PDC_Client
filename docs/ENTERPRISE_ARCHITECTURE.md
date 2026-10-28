@@ -275,6 +275,84 @@ returns `403 {"detail": "Tenant <status>"}` before any LLM call when
    (§10d) the client fills the brain's template locally instead and skips
    both calls, except describe for a visual without a caption.
 
+
+### 8a. Request timing model
+
+A client-facing LLM request (`/v1/plan`, `/v1/retry`, `/v1/describe`,
+`/v1/summarize`, `/v1/greeting`) runs under ONE total wall-clock budget,
+`PLAN_TOTAL_BUDGET_SECONDS` (env, default **240 s**), counted from the start
+of the request (for a plan, including the classifier).
+
+- **Per attempt.** Each model call gets `min(per-model cap, remaining
+  budget)` as its timeout. The per-model caps are unchanged and stay the
+  upper limit of one attempt: `LLM_COMPLEX_TIMEOUT` (150 s) for complex or
+  narrative-tier plans, `use_pro` and narrative-only retries and
+  complex-tier summaries, otherwise 90 s (plan), 120 s (retry), 60 s
+  (summarize), 20 s (describe, greeting). Inside one attempt the 429/5xx
+  HTTP retries of `_call_gemini_rest` also stop at the request deadline: a
+  retry that would leave less than 10 s is not made.
+- **Fallback chain.** `/v1/plan` still falls through its model chain
+  (selected → simple → light → `gemini-2.5-flash`), but no further model is
+  started once less than 10 s (`BUDGET_MIN_ATTEMPT_S`) of the budget is left.
+- **Exhausted budget.** The response stays HTTP 200 in its usual fallback
+  shape (plan: `context_decision.api_failed = true`, no code) and adds
+  `error_code: "llm_budget_exhausted"` plus `models_tried`, so the client can
+  tell a spent budget from other failures (see `PROTOCOL.md`). All models
+  failing inside the budget keeps the old `PLAN_API_FAILED` shape without
+  `error_code`.
+- **One log line per request that reaches a model call** (a plan answered
+  by the greeting short-circuit logs none), `LLM_BUDGET`, with the fields `caller`,
+  `total_elapsed`, `budget`, `exhausted` and `attempts`
+  (`<model>:<seconds>:<outcome>;…`, a correction attempt as
+  `<model>:<seconds>:<outcome>:correction`, or `-` when no model was started),
+  written at the END of the request so it covers every call, e.g.
+  `[sid=…] [caller=plan] [total_elapsed=240.31] [budget=240] [exhausted=True]
+  [attempts=gemini-4-argon:150.00:ReadTimeout;gemini-3.8-flash:90.00:ReadTimeout] LLM_BUDGET`
+  or, with a narrative correction,
+  `[sid=…] [caller=plan] [total_elapsed=102.59] [budget=240] [exhausted=False]
+  [attempts=gemini-2.5-pro:61.08:ok;gemini-2.5-pro:30.11:ok:correction] LLM_BUDGET`.
+  Model names, seconds and the outcome class (`ok`, an exception class name,
+  `skipped_budget`) only, never prompt or reply text (Article II). A spent
+  budget also logs `<CALLER>_BUDGET_EXHAUSTED` (e.g. `PLAN_BUDGET_EXHAUSTED`),
+  or `NARRATIVE_CORRECTION_SKIPPED_BUDGET` when it runs out at the correction step.
+- **The narrative correction call is inside the budget** (§10d): it gets
+  `min(the plan call's timeout, time left)`, its HTTP retries stop at the
+  request deadline, and it is not started with under 10 s left — then the
+  code is returned with the invalid template dropped plus `error_code` /
+  `models_tried`, and the log line shows `skipped_budget:correction`.
+- **Soft under connection contention.** The shared `httpx` client allows 10
+  connections and the httpx timeout applies per phase, so when more than 10
+  Gemini calls run at once on one instance, a call can wait for a free
+  connection on top of its read time. The budget is then exceeded by at most
+  that wait.
+- `models_tried` names only models that were actually called; `attempts`
+  also lists a call the budget skipped, as `skipped_budget`.
+
+**Ordering rule.** brain budget (240 s) < client `BRAIN_REQUEST_TIMEOUT`
+(300 s) < Cloud Run request timeout of `pdcbrain` (recommended 600 s, see
+`DEPLOY.md` §6). The brain therefore answers, even if only with
+`llm_budget_exhausted`, before the client gives up, and the client gives up
+before Cloud Run cuts the connection with a 504.
+
+**Threading and workers.** The `/v1/*` handlers are `async def`, but every
+blocking LLM call (`brain_agent.*`, `_call_gemini_rest`, the auto-analytics
+planner, schema autofill, and on the admin side the model health check and
+the PPTX template analysis) runs through Starlette's `run_in_threadpool`, so a
+slow Gemini call never stalls the event loop: other requests and `/health`
+are served while it runs. The per-request tenant context is a `ContextVar`
+and is copied into the worker thread. Tenant checks, logging and
+`record_request` stay on the event loop. The shared `httpx` client allows 10
+connections, so more than 10 simultaneous Gemini calls on one instance wait
+for a free connection.
+
+The container runs **one uvicorn worker on purpose**. Three pieces of state
+are per process and would diverge with several workers: brain-wide model
+settings saved in the admin panel (applied in memory to the serving process
+only), the per-recipient mail rate limit, and the in-process lock that
+serialises `record_request`'s read-modify-write of `meta.json` /
+`users.jsonl`. Concurrency comes from the thread pool inside the one worker
+and from Cloud Run scaling out instances.
+
 ---
 
 ## 9. Presentation / report download flow
