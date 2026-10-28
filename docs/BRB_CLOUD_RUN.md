@@ -218,6 +218,66 @@ the demo export is kept in `BRB_Database_template/docs/BRB_SERVICE_DIFF.md`.
 
 ## Deploy history
 
+**2026-10-28 — `main` at `2a52247` (PRs #34, #35, #36).** The brain-call
+timeout `BRAIN_REQUEST_TIMEOUT` raised from 180 s to 300 s (the browser's
+stream / edit-regenerate aborts to 330 s), and a brain-call timeout now
+answers "The analysis is taking longer than expected. Please try again."
+(i18n key `lab.brain_timeout`, EN/GEO/RU) instead of the sandbox-queue "busy"
+sentence (PR #34); Authlib 1.8.0 → 1.9.1 (PR #35); the brain's request-budget
+docs mirrored (PR #36, docs only) (see the `pdcclient-demo` entry). Deployed
+after the brain went live with its 240 s request budget
+(`pdcbrain-00034-riq`). Neither service sets `BRAIN_REQUEST_TIMEOUT`, so the
+image default (300 s) applies; no spec change beyond the images. Same images
+as `pdcclient-demo` (Cloud Build `daa3244a-e3cb-4563-b543-84dd8714b0c3` from a
+clean clone of GitHub `main` at `2a52247`, `BUILD_TIME=2026-10-28T12:22:29Z`),
+deployed right after the demo; the revision resolved exactly these digests:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:2a52247` | `sha256:45f0bd18f563292545a4a984287e66dac6895563190aa979ee8c24e203d5e97f` |
+| `pdcexecutor-demo:2a52247` | `sha256:0475fa7fa38932e286b3330d8aba840b39146b9512c5687232756dac8f71dcb4` |
+
+Revision `pdcclient-brb-2a52247`, serving 100 % since 2026-10-28 ~12:38 UTC.
+It replaced `pdcclient-brb-c0474e3`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-brb --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-brb-c0474e3=100
+```
+
+Backups taken before the deploy:
+- Data bucket: `gs://pdc-enterprise-client-brb-data-backups/20261028-123428/`,
+  which matched the data bucket in size (285,467,015 bytes) and in its 346
+  object names.
+- Database (Cloud SQL export of `brb-demo-pg`):
+  `gs://pdc-enterprise-client-brb-data-backups/20261028-123428-sql/brb_demo.sql.gz`
+  (180,645,197 bytes), by `gcloud sql export sql brb-demo-pg <uri>
+  --database=brb_demo`.
+
+The spec change was image-only (two `image:` lines and the template name;
+the `cloudsql-instances` annotation, secrets, buckets and resources carried
+over), checked by a diff against the export before the Admin API `PUT`.
+Candidate checks (`candidate---…` URL), none of them signed in:
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `2a52247`; the landing
+  answered 200, an anonymous `/lab` redirected to sign-in and an anonymous
+  `/auth/active_chats` answered 401. The served `i18n.js` carries the three
+  `lab.brain_timeout` sentences and `dashboard.js` the `error_key` render
+  sites and the 330 s abort. Revision log: `LADMIN_PRESENT`,
+  `RESET_TOKEN_INDEX_FILLED`, `EXECUTOR_HANDSHAKE_OK version=2a52247`,
+  `DB_SCHEDULER_STARTED`; no error lines, no 5xx, no
+  `BACKEND_REQUEST_REFUSED`.
+- `ladmin`: one scripted sign-in with `CLIENT_BRB_LADMIN_PASSWORD` answered
+  401 (the secret still predates the 2026-10-03 password change; one attempt
+  only).
+- **Pending, to be done by hand in the browser:** the signed-in checks (the
+  connection test and 39 tables, a question in a DB-table chat completing
+  normally, invite twice). Not run here; this instance is invitation-only and
+  no account was created; the same two digests answered the question on the
+  `pdcclient-demo` candidate and on `client.powerdatachat.com`.
+- After the shift, `brb.powerdatachat.com` reported the same `/version` and
+  `/health`; `pdcbrain` gained no revision (`pdcbrain-00034-riq`) and
+  `pdcclient-demo` stayed on `pdcclient-demo-2a52247`.
+
 **2026-10-25 — `main` at `c0474e3` (PRs #16–#31).** Narrative templates
 filled locally from the sandbox's `VALUES` / `FINDINGS`, with the n/a gate,
 the narrative-only retry, finding sentences, data-gap and scope-change
