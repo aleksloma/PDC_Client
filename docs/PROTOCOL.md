@@ -267,7 +267,9 @@ summarize text.
                                           // OPTIONAL — narrative_v1 only, next to PYTHON / PLOT_CODE
   "captions": { "1": "Count per month; {{anomaly_period:period}} is highlighted." },
                                           // OPTIONAL — keys are strings "1".."12"
-  "diagnostic": true                      // OPTIONAL — phase-1 plan with two_phase_v1 only; never false
+  "diagnostic": true,                     // OPTIONAL — phase-1 plan with two_phase_v1 only; never false
+  "error_code": "llm_budget_exhausted",   // OPTIONAL — only when the request budget ran out
+  "models_tried": ["gemini-2.5-pro"]      //   (see "Spent request budget" under Errors)
 }
 ```
 
@@ -381,13 +383,16 @@ grammar (DIAGNOSTICS_SPEC A2.1, the same token regex), without rendering:
   that one was valid. A template invalid in both replies is dropped —
   without `narrative` the client describes the result as before. `usage`
   sums both calls.
-- **Time bound.** The call shares the client's request timeout (300 s): it
-  runs only while at least 30 s of a 170 s budget, counted from the start
-  of the request, are left, and its per-attempt timeout is capped at the
-  time left (the REST layer's retries of a retryable HTTP status can still
-  add to it).
-  Skipped for lack of time, it counts as failed: the invalid templates are
-  dropped and the valid ones kept.
+- **Time bound.** The call runs inside the request's own budget
+  (`PLAN_TOTAL_BUDGET_SECONDS`, 240 s from the start of the request, below
+  the client's 300 s request timeout): its timeout is the plan call's
+  timeout capped at the time left, its HTTP retries stop at the same
+  deadline, and it is not started with under 10 s left. Skipped for lack
+  of time, it counts as failed: the invalid templates are dropped, the
+  valid ones and the code are kept, and the response carries
+  `error_code: "llm_budget_exhausted"` plus `models_tried` (see "Spent
+  request budget" under Errors). The `LLM_BUDGET` log line lists the call
+  as a `:correction` attempt.
 - Without `narrative_v1`, or next to a text kind, nothing is checked and no
   call is made.
 
@@ -467,9 +472,9 @@ Template validation logs `NARRATIVE_SECTIONS_REWRITTEN n=` (with
 `NARRATIVE_INVALID templates= nested= unclosed= mismatched= unknown=`,
 `NARRATIVE_CORRECTED`, `NARRATIVE_INVALID_TWICE` (the same counts plus
 `dropped_narrative` / `dropped_captions` and `new_invalid`, a template only
-the second reply has and breaks) and `NARRATIVE_CORRECTION_FAILED
-error=<Type>` (`TimeoutError` when the budget was spent) — classes and
-counts, never a section name.
+the second reply has and breaks), `NARRATIVE_CORRECTION_FAILED
+error=<Type>` and `NARRATIVE_CORRECTION_SKIPPED_BUDGET` (no time left for
+the call) — classes and counts, never a section name.
 Outside the opt-in `LLM_DEBUG_LOG`, no log line carries template text or a
 findings value.
 
@@ -642,7 +647,9 @@ the code that ran, unchanged: the whole answer, its blocks joined by
   "sql": { ... },                         // OPTIONAL — a new SELECT per live df key, same
                                           //   rules as /v1/plan; a key it names is re-fetched
   "narrative": "...",                     // OPTIONAL — narrative_v1 only; same rules as /v1/plan
-  "captions": { "1": "..." }              // OPTIONAL — never "diagnostic" on a retry
+  "captions": { "1": "..." },             // OPTIONAL — never "diagnostic" on a retry
+  "error_code": "llm_budget_exhausted",   // OPTIONAL — only when the request budget ran out
+  "models_tried": ["gemini-2.5-pro"]      //   (see "Spent request budget" under Errors)
 }
 ```
 
@@ -656,7 +663,9 @@ A narrative-only retry (`error_msg` "narrative_invalid: …") answers:
   "usage": { ... },                       // the one model call
   "model_used": "gemini-2.5-pro",
   "narrative": "...",                     // OPTIONAL — absent ⇒ the client describes the result
-  "captions": { "1": "..." }              // OPTIONAL
+  "captions": { "1": "..." },             // OPTIONAL
+  "error_code": "llm_budget_exhausted",   // OPTIONAL — only when the request budget ran out
+  "models_tried": ["gemini-2.5-pro"]      //   (see "Spent request budget" under Errors)
 }
 ```
 
@@ -733,6 +742,7 @@ a visual whose caption is missing.
 
 ```jsonc
 { "text": "[[DATA_NOTE]] Every product has the same value per city here — this is availability, not sold quantities. The table below lists them.", "usage": { ... } }
+// + "error_code": "llm_budget_exhausted", "models_tried": [...] when the request budget ran out (see Errors)
 ```
 
 ---
@@ -752,6 +762,7 @@ LLM can mention the user's uploaded file names in the reply — no data.
 
 ```jsonc
 { "text": "Hello! I'm a data analyst assistant. ...", "usage": { ... } }
+// + "error_code": "llm_budget_exhausted", "models_tried": [...] when the request budget ran out (see Errors)
 ```
 
 ---
@@ -786,6 +797,7 @@ keys plus `"_truncated_keys": <number dropped>`.
 ```jsonc
 { "text": "This is the highest salary across all employees in the dataset.", "usage": { ... } }
 // with "preview": null the reply names no value; the client shows it locally
+// + "error_code": "llm_budget_exhausted", "models_tried": [...] when the request budget ran out (see Errors)
 ```
 
 **Null preview.** When `preview` is `null` or absent (or cannot be
@@ -1342,3 +1354,33 @@ rendered.
 
 The client implements all of these in `brain_client.py` as
 `BrainError` / `TenantRevokedError`.
+
+### Spent request budget (`llm_budget_exhausted`)
+
+`/v1/plan`, `/v1/retry`, `/v1/describe`, `/v1/summarize` and `/v1/greeting`
+run under one total time budget per request (`PLAN_TOTAL_BUDGET_SECONDS`,
+default 240 s, below the client's 300 s request timeout; see
+`ENTERPRISE_ARCHITECTURE.md` §8a). Every model call of the request counts,
+the narrative correction call included. When the budget runs out before a
+model answered, the endpoint still returns **HTTP 200** with its usual
+fallback body (plan / retry: `kind: "NO_CODE"`, empty `code`, plan also
+`context_decision.api_failed: true`; a narrative-only retry: the failed code
+unchanged with its kind and no narrative; describe / summarize: the
+localized fallback text; greeting: its fixed fallback text) plus two
+additive fields:
+
+```jsonc
+{
+  "error_code": "llm_budget_exhausted",       // OPTIONAL — only when the budget ran out
+  "models_tried": ["gemini-4-argon", "gemini-3.8-flash"]  // models actually called, in order (may be [])
+}
+```
+
+When the budget runs out only at the narrative correction step (the main
+attempt already returned code, its template is invalid), the code and kind
+are returned as usual with the invalid template dropped, plus the same two
+fields.
+
+Both fields are absent on every other response, including a plan whose
+models all failed inside the budget (`api_failed: true` without
+`error_code`). Older clients ignore them.
