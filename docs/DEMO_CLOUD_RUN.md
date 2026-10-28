@@ -145,7 +145,7 @@ Never copy this layout into a customer install.
   `MAX_UPLOAD_BYTES`, but its workbooks still pass the xlsx archive check).
   Customer LAN installs have no ingress cap and leave the variable unset.
 - `--timeout=900` — long analyses (60 s exec windows + brain round-trips up to
-  `BRAIN_REQUEST_TIMEOUT=180 s` each).
+  `BRAIN_REQUEST_TIMEOUT=300 s` each).
 - `--min-instances=0` — near-zero idle cost; first hit after idle cold-starts
   (two images now, so allow ~30–45 s). Bump to 1 shortly before an important
   meeting if desired:

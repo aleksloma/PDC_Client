@@ -381,7 +381,7 @@ grammar (DIAGNOSTICS_SPEC A2.1, the same token regex), without rendering:
   that one was valid. A template invalid in both replies is dropped —
   without `narrative` the client describes the result as before. `usage`
   sums both calls.
-- **Time bound.** The call shares the client's request timeout (180 s): it
+- **Time bound.** The call shares the client's request timeout (300 s): it
   runs only while at least 30 s of a 170 s budget, counted from the start
   of the request, are left, and its per-attempt timeout is capped at the
   time left (the REST layer's retries of a retryable HTTP status can still

@@ -73,6 +73,12 @@ _CHART_REF_MAX = 256
 _CHART_REF_MAX_BYTES = 200_000_000
 _CHART_REF_TOTAL = {"bytes": 0}
 _CHART_REF_RE = re.compile(r"[0-9a-f]{32}")
+
+# The brain-call timeout wording (chat stream + edit-regenerate). The
+# sandbox-queue case keeps run_chat_local._INFRA_BUSY_TEXT — a different cause.
+BRAIN_TIMEOUT_TEXT = "The analysis is taking longer than expected. Please try again."
+BRAIN_TIMEOUT_KEY = "lab.brain_timeout"
+
 # One warning per process when a browser still posts chart markup.
 _EXPORT_LEGACY_LOGGED = {"logged": False}
 
@@ -2053,12 +2059,12 @@ async def chat_stream(request: Request, chat_id: str):
                 err_msg = "Service unavailable. Please contact your administrator."
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", err_msg))
             except BrainTimeoutError:
-                # BrainTimeoutError subclasses BrainError — caught FIRST. A
-                # timeout under load (e.g. Auto Analytics occupying the shared
-                # connection pool) is contention, not an outage; the old
-                # "temporarily unavailable" wording was misleading (QA 2.3).
-                err_msg = "The analysis service is busy right now. Please try again in a moment."
-                loop.call_soon_threadsafe(queue.put_nowait, ("error", err_msg))
+                # A brain call outlived BRAIN_REQUEST_TIMEOUT. BrainTimeoutError
+                # subclasses BrainError, so it is caught FIRST. The key lets the
+                # /lab page localize the message; the history row keeps err_msg.
+                err_msg = BRAIN_TIMEOUT_TEXT
+                loop.call_soon_threadsafe(queue.put_nowait, (
+                    "error", {"error": err_msg, "error_key": BRAIN_TIMEOUT_KEY}))
             except BrainError:
                 err_msg = "Analysis service is temporarily unavailable."
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", err_msg))
@@ -2137,7 +2143,8 @@ async def chat_stream(request: Request, chat_id: str):
                 break
             tag, payload = event
             if tag == "error":
-                err_event = {"error": payload, "conv_id": conv_id, "done": True}
+                err_event = dict(payload) if isinstance(payload, dict) else {"error": payload}
+                err_event.update({"conv_id": conv_id, "done": True})
                 yield f"data: {json.dumps(err_event, ensure_ascii=False)}\n\n"
                 continue
             if tag == "event":
@@ -2396,8 +2403,8 @@ async def edit_regenerate(request: Request, chat_id: str):
         store.append_history(conv_id, {"role": "ai", "content": msg, "ts": time.time()})
         return JSONResponse({"error": msg, "conv_id": conv_id}, status_code=503)
     except BrainTimeoutError as e:
-        # subclass of BrainError — caught first; see the chat_stream worker (QA 2.3)
-        msg = "The analysis service is busy right now. Please try again in a moment."
+        # subclass of BrainError — caught first; see the chat_stream worker
+        msg = BRAIN_TIMEOUT_TEXT
         # No field reaches a log as free text, and the escaping obligation is
         # on the writer. The brain is our own service but not the author of
         # everything it returns — it relays model output — so its error text
@@ -2405,7 +2412,8 @@ async def edit_regenerate(request: Request, chat_id: str):
         log_with_sid(chat_id, "warning",
                      f"EDIT_REGENERATE_BRAIN_TIMEOUT: {log_safe_text(str(e), 200)}")
         store.append_history(conv_id, {"role": "ai", "content": msg, "ts": time.time()})
-        return JSONResponse({"error": msg, "conv_id": conv_id}, status_code=503)
+        return JSONResponse({"error": msg, "error_key": BRAIN_TIMEOUT_KEY,
+                             "conv_id": conv_id}, status_code=503)
     except BrainError as e:
         msg = "Analysis service is temporarily unavailable."
         log_with_sid(chat_id, "warning",

@@ -1835,7 +1835,7 @@ def _draft_table_descriptions(cfg: dict, password: str, schema, table: str,
             desc_word_limit=settings.SCHEMA_AUTOFILL_DESC_WORD_LIMIT,
             user_email=email,
             # Behind an interactive click: a stalled brain must fail fast and
-            # by name, not ride the 180s client-wide default.
+            # by name, not ride the 300s client-wide default.
             timeout=settings.BRAIN_DRAFT_TIMEOUT,
         )
     # Before the generic handler — the admin needs to know WHICH dependency

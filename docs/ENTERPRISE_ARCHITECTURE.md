@@ -927,7 +927,7 @@ the same validated replay — one pipeline, no fork.
 **Relations v4.2 — time-bounded Accept + table-type choice.** Accept is one
 interactive click, so every dependency it touches is bounded at its OWN seam
 (root causes in docs/RELATIONS_UX_PLAN.md § v4.2): the AI draft carries
-`BRAIN_DRAFT_TIMEOUT` (60s, env-tunable) instead of riding the 180s
+`BRAIN_DRAFT_TIMEOUT` (60s, env-tunable) instead of riding the 300s
 client-wide default, and timeout-shaped driver errors become one sentence
 naming the database. Deliberately NOT an `asyncio.wait_for` around the whole
 gesture: executor threads cannot be cancelled, so an outer deadline would

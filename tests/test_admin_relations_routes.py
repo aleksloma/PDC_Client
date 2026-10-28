@@ -1262,7 +1262,7 @@ def test_accept_brain_timeout_names_the_dependency_and_rolls_nothing(
 
 def test_accept_passes_the_draft_timeout_to_the_brain_call(
         client, fk_setup, monkeypatch):
-    """Without a per-call cap the draft rides the 180s client-wide default."""
+    """Without a per-call cap the draft rides the 300s client-wide default."""
     _seed_regions_table(fk_setup)
     import routes.admin_data as admin_mod
     seen = {}

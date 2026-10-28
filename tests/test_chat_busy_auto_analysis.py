@@ -2,8 +2,15 @@
 
 A question used to queue behind the job's exec/pool contention and die ~90s
 later as "Analysis service is temporarily unavailable." Now: an immediate,
-honest 409 BEFORE any history append; and a BrainTimeoutError (contention)
-gets busy wording distinct from the generic outage message.
+honest 409 BEFORE any history append.
+
+A BrainTimeoutError (the brain did not answer within BRAIN_REQUEST_TIMEOUT)
+gets its own wording, `routes.chat.BRAIN_TIMEOUT_TEXT` ("The analysis is
+taking longer than expected. Please try again."), plus the i18n key
+`error_key: "lab.brain_timeout"` on the stream's error event and on the
+edit-regenerate 503. It is neither the generic outage message nor the
+sandbox-queue "busy right now" text (`run_chat_local._INFRA_BUSY_TEXT`, which
+stays as it is). Every other error event keeps exactly {error, conv_id, done}.
 
 Brain calls stubbed; no real LLM/network.
 """
@@ -100,17 +107,112 @@ def test_edit_regenerate_blocked_too(client):
     assert resp.json()["busy"] == "auto_analysis"
 
 
-def test_brain_timeout_gets_busy_wording_not_unavailable(client, monkeypatch):
+BRAIN_TIMEOUT_TEXT = "The analysis is taking longer than expected. Please try again."
+CONV = "cv_0123456789abcdef"
+
+
+def _sse_events(body: str) -> list:
+    """Every `data: ` line of an SSE body, parsed as JSON."""
+    return [json.loads(line[len("data: "):])
+            for line in body.splitlines() if line.startswith("data: ")]
+
+
+def _raising(exc):
+    def gen(**kw):
+        raise exc
+        yield  # pragma: no cover — make it a generator
+    return gen
+
+
+def test_brain_timeout_constants():
+    import routes.chat as chat_mod
+    assert chat_mod.BRAIN_TIMEOUT_TEXT == BRAIN_TIMEOUT_TEXT
+    assert chat_mod.BRAIN_TIMEOUT_KEY == "lab.brain_timeout"
+
+
+def test_brain_timeout_gets_slow_wording_with_key(client, monkeypatch):
     _set_auto_state("done")
     import routes.chat as chat_mod
 
-    def raise_timeout(**kw):
-        raise BrainTimeoutError("pool timeout")
-        yield  # pragma: no cover — make it a generator
-
-    monkeypatch.setattr(chat_mod.run_chat_local, "run_chat_multi_plot", raise_timeout)
+    monkeypatch.setattr(chat_mod.run_chat_local, "run_chat_multi_plot",
+                        _raising(BrainTimeoutError("read timeout")))
     resp = client.post(f"/api/chat/{CHAT}/chat/stream", json={"question": "hi?"})
     assert resp.status_code == 200  # SSE stream carries the error event
     body = resp.text
-    assert "busy right now" in body
+    assert "busy right now" not in body
     assert "temporarily unavailable" not in body
+
+    events = _sse_events(body)
+    conv_id = events[0].get("conv_id")
+    assert conv_id
+    errors = [e for e in events if "error" in e]
+    assert errors == [{"error": BRAIN_TIMEOUT_TEXT,
+                       "error_key": "lab.brain_timeout",
+                       "conv_id": conv_id,
+                       "done": True}]
+
+    history = local_store.ChatDataStore(CHAT).get_history(conv_id)
+    ai_rows = [r for r in history if r.get("role") == "ai"]
+    assert ai_rows and ai_rows[-1]["content"] == BRAIN_TIMEOUT_TEXT
+
+
+def test_plain_brain_error_event_has_no_error_key(client, monkeypatch):
+    """Only the timeout carries a translation key; every other error event
+    keeps exactly the keys it had."""
+    _set_auto_state("done")
+    import routes.chat as chat_mod
+    from brain_client import BrainError
+
+    monkeypatch.setattr(chat_mod.run_chat_local, "run_chat_multi_plot",
+                        _raising(BrainError("HTTP 502")))
+    resp = client.post(f"/api/chat/{CHAT}/chat/stream", json={"question": "hi?"})
+    assert resp.status_code == 200
+    events = _sse_events(resp.text)
+    errors = [e for e in events if "error" in e]
+    assert len(errors) == 1
+    assert set(errors[0]) == {"error", "conv_id", "done"}
+    assert errors[0]["error"] == "Analysis service is temporarily unavailable."
+    assert errors[0]["done"] is True
+    assert "lab.brain_timeout" not in resp.text
+
+
+def test_edit_regenerate_brain_timeout_gets_slow_wording_with_key(client, monkeypatch):
+    _set_auto_state("done")
+    import routes.chat as chat_mod
+
+    store = local_store.ChatDataStore(CHAT)
+    store.append_history(CONV, {"role": "human", "content": "first?", "ts": time.time()})
+    store.append_history(CONV, {"role": "ai", "content": "an answer", "ts": time.time()})
+
+    monkeypatch.setattr(chat_mod.run_chat_local, "run_chat_multi_plot",
+                        _raising(BrainTimeoutError("read timeout")))
+    resp = client.post(f"/api/chat/{CHAT}/edit-regenerate",
+                       json={"edited_question": "edited?", "conv_id": CONV})
+    assert resp.status_code == 503
+    assert resp.json() == {"error": BRAIN_TIMEOUT_TEXT,
+                           "error_key": "lab.brain_timeout",
+                           "conv_id": CONV}
+    assert "busy right now" not in resp.text
+
+    history = local_store.ChatDataStore(CHAT).get_history(CONV)
+    assert [r.get("role") for r in history] == ["human", "ai"]
+    assert history[0]["content"] == "edited?"
+    assert history[-1]["content"] == BRAIN_TIMEOUT_TEXT
+
+
+def test_edit_regenerate_plain_brain_error_has_no_error_key(client, monkeypatch):
+    _set_auto_state("done")
+    import routes.chat as chat_mod
+    from brain_client import BrainError
+
+    store = local_store.ChatDataStore(CHAT)
+    store.append_history(CONV, {"role": "human", "content": "first?", "ts": time.time()})
+    store.append_history(CONV, {"role": "ai", "content": "an answer", "ts": time.time()})
+
+    monkeypatch.setattr(chat_mod.run_chat_local, "run_chat_multi_plot",
+                        _raising(BrainError("HTTP 502")))
+    resp = client.post(f"/api/chat/{CHAT}/edit-regenerate",
+                       json={"edited_question": "edited?", "conv_id": CONV})
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "Analysis service is temporarily unavailable.",
+                           "conv_id": CONV}

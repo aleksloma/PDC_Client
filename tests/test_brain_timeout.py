@@ -1,6 +1,6 @@
 """brain_client timeout plumbing (v4.2).
 
-A stalled brain used to ride the client-wide 180s BRAIN_REQUEST_TIMEOUT even
+A stalled brain used to ride the client-wide 300s BRAIN_REQUEST_TIMEOUT even
 behind an interactive click. `_post` now takes a per-call timeout and raises a
 distinct BrainTimeoutError so callers can name the stalled dependency.
 """
@@ -89,3 +89,22 @@ def test_default_keeps_the_client_wide_timeout(monkeypatch, token):
     brain_client.schema_autofill(sid="s", fname="shop.t", cols_to_fill=["a"],
                                  unique_hints={})
     assert c.calls[0]["timeout"] is httpx.USE_CLIENT_DEFAULT
+
+
+# ---------------------------------------------------------------------------
+# The client-wide default. A chat turn runs several brain calls in sequence
+# (plan, retries, describe), and a heavy planner call alone could outlast
+# 180 s, so the default is 300 s; the env var keeps its name and still wins.
+# ---------------------------------------------------------------------------
+def test_brain_request_timeout_default_is_300(monkeypatch):
+    monkeypatch.delenv("BRAIN_REQUEST_TIMEOUT", raising=False)
+    from settings import Settings
+    assert Settings().BRAIN_REQUEST_TIMEOUT == 300.0
+
+
+def test_brain_request_timeout_stays_configurable(monkeypatch):
+    monkeypatch.setenv("BRAIN_REQUEST_TIMEOUT", "42")
+    from settings import Settings
+    value = Settings().BRAIN_REQUEST_TIMEOUT
+    assert value == 42.0
+    assert isinstance(value, float)

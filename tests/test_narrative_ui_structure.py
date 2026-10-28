@@ -281,3 +281,82 @@ def test_render_ai_record_shows_headline_display():
     window = rec[at:at + 400]
     calls = _calls(window, "appendNarrativeMessage")
     assert calls, "msg.headline_display is not shown through appendNarrativeMessage"
+
+
+# ---------------------------------------------------------------------------
+# Brain timeout: the server sends `error_key: "lab.brain_timeout"` next to the
+# English `error`; both error render sites translate it, and the browser's own
+# abort outlasts the server's 300 s brain timeout.
+# ---------------------------------------------------------------------------
+_BRAIN_TIMEOUT_VALUES = {
+    "en": "The analysis is taking longer than expected. Please try again.",
+    "geo": "ანალიზს მოსალოდნელზე მეტი დრო სჭირდება. გთხოვთ, სცადოთ ხელახლა.",
+    "ru": "Анализ занимает больше времени, чем ожидалось. Попробуйте ещё раз.",
+}
+
+_ERROR_KEY_EXPR = re.compile(
+    r"data\.error_key\s*\?\s*_t\(\s*data\.error_key\s*,\s*data\.error\s*\)"
+    r"\s*:\s*data\.error\b")
+
+
+def _block_after(src: str, pattern: str) -> str:
+    """The brace-matched block opened by the first match of `pattern` (which
+    must end at the opening `{`); "" when absent."""
+    m = re.search(pattern, src)
+    if not m:
+        return ""
+    start = m.end() - 1
+    depth = 0
+    for i in range(start, len(src)):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start:i + 1]
+    return src[start:]
+
+
+def test_i18n_brain_timeout_key():
+    found = {}
+    for lang in ("en", "geo", "ru"):
+        block = _lang_block(lang)
+        m = re.search(r"""['"]lab\.brain_timeout['"]\s*:\s*(['"])(.+?)(?<!\\)\1""", block)
+        assert m and m.group(2).strip(), f"lab.brain_timeout missing in {lang}"
+        found[lang] = m.group(2)
+        assert found[lang] == _BRAIN_TIMEOUT_VALUES[lang], (lang, found[lang])
+    assert any("ა" <= ch <= "ჿ" for ch in found["geo"]), found["geo"]
+    assert len(set(found.values())) == 3, found
+
+
+def test_error_render_sites_use_error_key():
+    send = _function_body(DASH, "sendMessage")
+    assert send
+    # The SSE loop's error branch is the FIRST `if (data.error) {` of
+    # sendMessage (the non-SSE JSON fallback comes after the stream loop).
+    sse_branch = _block_after(send, r"if\s*\(\s*data\.error\s*\)\s*\{")
+    assert sse_branch, "SSE error branch not found"
+    assert "appendMessage" in sse_branch, sse_branch
+    assert _ERROR_KEY_EXPR.search(sse_branch), sse_branch
+    assert not re.search(r"appendMessage\(\s*['\"]assistant['\"]\s*,\s*data\.error\s*\)",
+                         sse_branch), sse_branch
+
+    edit = _function_body(DASH, "editAndRegenerate")
+    assert edit
+    edit_branch = _block_after(edit, r"if\s*\(\s*data\.error\s*\)\s*\{")
+    assert edit_branch, "edit-regenerate error branch not found"
+    assert "escapeHtml" in edit_branch, edit_branch
+    assert _ERROR_KEY_EXPR.search(edit_branch), edit_branch
+    assert not re.search(r"escapeHtml\(\s*data\.error\s*\)", edit_branch), edit_branch
+
+
+def test_browser_abort_outlasts_server_timeout():
+    assert "240000" not in DASH
+    send = _function_body(DASH, "sendMessage")
+    assert re.search(r"setTimeout\(\s*\(\)\s*=>\s*controller\.abort\(\)\s*,\s*330_?000\s*\)",
+                     send), "stream abort is not 330000 ms"
+    edit = _function_body(DASH, "editAndRegenerate")
+    assert re.search(r"setTimeout\(\s*\(\)\s*=>\s*editController\.abort\(\)\s*,\s*330_?000\s*\)",
+                     edit), "edit-regenerate abort is not 330000 ms"
+    resume = _function_body(DASH, "_resumeIfGenerating")
+    assert re.search(r"\bMAX_MS\s*=\s*330_?000\b", resume), "reload poll MAX_MS is not 330000"
