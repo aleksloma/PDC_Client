@@ -31,15 +31,15 @@ python-multipart==0.0.32
 # executor/requirements.txt (a structural test forbids it there).
 nh3==0.3.7
 # Microsoft Entra ID SSO (OIDC authorization-code flow, routes/sso.py).
-# Authlib 1.8.x does the OIDC heavy lifting (discovery, JWKS, ID-token
+# Authlib 1.9.x does the OIDC heavy lifting (discovery, JWKS, ID-token
 # validation, state/nonce in the cookie session) and since 1.7 delegates JOSE
 # to joserfc — which is why joserfc is pinned alongside it. Both require
 # cryptography>=45.0.1, which the cryptography pin below satisfies. Authlib
 # emits a deprecation warning steering to "httpx2": that is its own
 # forward-compat shim, not a version bound (its only requirements are
-# cryptography>=45.0.1 and joserfc>=1.6.1), so httpx stays at 0.27.2 until
+# cryptography>=45.0.1 and joserfc>=1.6.8), so httpx stays at 0.27.2 until
 # httpx 1.0 ships.
-Authlib==1.8.0
+Authlib==1.9.1
 joserfc==1.7.5
 
 # Data + execution (mirrors the B2C app except where security pins move
