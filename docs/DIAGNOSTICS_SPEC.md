@@ -1010,9 +1010,9 @@ Stop (user): the worker breaks at the next event boundary (routes/chat.py:1746);
 
 - Single flow: `plan.diagnostic` with `needs_phase2` is ignored and logged as `PHASE2_SKIPPED reason=single_flow`.
 - `t_turn_start` is taken immediately before the phase-1 `brain_client.plan` call (`run_chat_local.py:1578`).
-**Real time limits.** The 240 s stream timeout in the browser (`static/dashboard.js:3178`) is cleared at the first partial or done (`:3290`, `:3318`), so it does not bound a streamed phase 2. Two limits do:
-- the reload/recover poll gives up at `MAX_MS = 240000` (`dashboard.js:1848`);
-- edit-regenerate is ONE non-streaming POST with a 240 s wall (`dashboard.js:3584-3598`).
+**Real time limits.** The 330 s stream timeout in the browser (`static/dashboard.js:3178`) is cleared at the first partial or done (`:3290`, `:3318`), so it does not bound a streamed phase 2. Two limits do:
+- the reload/recover poll gives up at `MAX_MS = 330000` (`dashboard.js:1848`);
+- edit-regenerate is ONE non-streaming POST with a 330 s wall (`dashboard.js:3584-3598`).
 
 What the spec does about them:
 - **Edit-regenerate never runs phase 2.** It logs `PHASE2_SKIPPED reason=non_streaming`; the generator is called with `allow_phase2=False`.

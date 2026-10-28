@@ -461,7 +461,7 @@ thread itself can no longer hang unboundedly, and the existing snapshot
 rollback stays the single abort path.
 
 Timeout budgets: `BRAIN_DRAFT_TIMEOUT` 60s (new, env-tunable) for the draft
-only — upload autofill keeps the 180s default, unchanged. Client-side:
+only — upload autofill keeps the client-wide default (then 180s, 300s since 2026-10-28), unchanged. Client-side:
 15s on the classify probe, a "still working" message at 20s, and a 390s hard
 abort (60s draft + 300s statement + margin). Aborting only ends OUR wait, so
 that toast says the server may still finish and the list is refetched rather

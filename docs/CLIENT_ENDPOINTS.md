@@ -1224,11 +1224,20 @@ event and the chat UI surfaces it to the user.
 `processing` for the chat, `chat/stream` and `edit-regenerate` return an
 immediate `409 {error: "Auto Analytics is currently running for this chat…",
 busy: "auto_analysis"}` BEFORE any history append (fail-open on a corrupt
-meta). The frontend's non-SSE fallback renders the message in the chat. A
-`BrainTimeoutError` mid-generation (pool/connection contention, a subclass of
-`BrainError` caught first) now reads "The analysis service is busy right now.
-Please try again in a moment." — the generic "temporarily unavailable" text is
-reserved for genuine brain unreachability.
+meta). The frontend's non-SSE fallback renders the message in the chat.
+
+**Brain-call timeout:** a brain call that outlives `BRAIN_REQUEST_TIMEOUT`
+(default 300 s; `BrainTimeoutError`, a subclass of `BrainError` caught first)
+answers "The analysis is taking longer than expected. Please try again." — the
+stream's error event is `{error, error_key: "lab.brain_timeout", conv_id,
+done: true}` and the edit-regenerate answer is `503 {error, error_key:
+"lab.brain_timeout", conv_id}`; the `/lab` page shows the `error_key` text
+from its i18n (en/geo/ru) and falls back to `error`. The history row keeps the
+English text. Every other error event is unchanged (`{error, conv_id, done:
+true}`), and the generic "temporarily unavailable" text stays reserved for
+genuine brain unreachability. The page's own abort of the stream and of
+edit-regenerate is at 330 s, past the server's timeout, so the server's
+message arrives first.
 
 **Missing database tables (Prompt 15):** when a chat's dataframes come back
 empty AND its meta references registered DB tables that can no longer be
