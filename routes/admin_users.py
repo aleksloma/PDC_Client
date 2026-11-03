@@ -89,6 +89,8 @@ def _user_row(u: dict, roles_by_id: dict) -> dict:
         "role_name": names[0],
         "created_at": u.get("created_at"),
         "last_login_at": u.get("last_login_at"),
+        # Personal connections switch (absent = on); inert for admins.
+        "self_service": AuthStore().get_self_service(u.get("email") or ""),
     }
 
 
@@ -170,6 +172,11 @@ def _validate_role_fields(body: dict, store: roles_store.RolesStore,
             if norm["connection_id"] not in conns:
                 return JSONResponse({"error": f"Unknown connection in {field}."},
                                     status_code=400)
+    # A personal connection, or a table on one, belongs to its owner alone
+    # and is never granted to a role (either axis, or explicitly).
+    refusal = roles_store.personal_grant_refusal(body, reg)
+    if refusal:
+        return JSONResponse({"error": refusal}, status_code=400)
     return None
 
 
@@ -306,6 +313,46 @@ async def set_user_permission(request: Request):
         "created_at": prof.get("created_at"),
         "last_login_at": prof.get("last_login_at"),
     }, roles_by_id)}
+
+
+@router.post("/users/set_self_service")
+async def set_user_self_service(request: Request):
+    """The Users-window "Own connections" switch: body {email, allowed: bool}.
+    Off blocks the /power page and every self-service data-sources route for
+    the user; their existing chats and personal tables keep working. Refuses
+    the bootstrap ladmin account, a non-address and a non-bool `allowed`
+    (400), an unknown account (404). Admin-permission users may hold the
+    flag but it has no effect (they never pass self_service_allowed).
+    Audited `user.set_self_service` {allowed}."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    from routes.auth import _EMAIL_RE
+    body = await _json_body(request)
+    target = str(body.get("email") or "").strip().lower()
+    if not target:
+        return JSONResponse({"error": "email is required."}, status_code=400)
+    auth = AuthStore()
+    if auth.is_bootstrap_admin(target):
+        return JSONResponse(
+            {"error": "The local admin account has no personal connections."},
+            status_code=400)
+    if not _EMAIL_RE.fullmatch(target):
+        return JSONResponse({"error": "A valid email address is required."},
+                            status_code=400)
+    allowed = body.get("allowed")
+    if not isinstance(allowed, bool):
+        return JSONResponse({"error": "allowed must be true or false."},
+                            status_code=400)
+    if not auth.user_exists(target) or not auth.set_self_service(target, allowed):
+        return JSONResponse({"error": "Unknown user."}, status_code=404)
+    db_sources.audit(email, "user.set_self_service", target=target,
+                     detail={"allowed": allowed},
+                     ip=(request.client.host if request.client else None))
+    log_with_sid(email, "info",
+                 f"ADMIN_USER_SET_SELF_SERVICE user={log_safe_text(target, 254)} "
+                 f"allowed={allowed}")
+    return {"ok": True, "email": target, "self_service": allowed}
 
 
 @router.post("/users/end_sessions")

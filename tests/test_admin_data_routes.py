@@ -97,8 +97,10 @@ def test_all_admin_routes_reject_non_admin(client):
         p = path.replace("{cid}", "aa11bb22cc33dd44").replace("{tid}", "aa11bb22cc33dd44")
         resp = client.request(method, p)
         assert resp.status_code == 401, (p, resp.status_code)
-    # Plain user (not admin, not power user) → 403 everywhere + audit rows —
+    # Plain user (not admin, not power user, personal connections switched
+    # off — self-service is on by default) → 403 everywhere + audit rows —
     # BOTH guards emit one admin.denied per denial, so the count stays 1:1.
+    local_store.AuthStore().set_self_service(USER, False)
     client.post(f"/_login/{USER}")
     for path, method in paths:
         p = path.replace("{cid}", "aa11bb22cc33dd44").replace("{tid}", "aa11bb22cc33dd44")
@@ -107,16 +109,17 @@ def test_all_admin_routes_reject_non_admin(client):
     denied = [r for r in db_sources.read_audit_tail(500)
               if r["action"] == "admin.denied"]
     assert len(denied) == len(paths)
+    # The source-manager guard names why the switched-off user was refused.
+    reasons = {(r.get("detail") or {}).get("reason") for r in denied}
+    assert reasons == {"self_service_disabled", None}
 
 
 # The ladmin-only surface (prompt 19 spec C). Every other admin_data route is
 # behind _require_source_manager and reachable by a power user within scope.
+# Personal connections: the connection lifecycle routes moved behind the
+# source-manager guard (an owner manages their own connections; ladmin's
+# stay ladmin's through the route's own OUT_OF_SCOPE refusal).
 LADMIN_ONLY = {
-    ("POST", "/api/admin/connections"),
-    ("POST", "/api/admin/connections/test"),
-    ("POST", "/api/admin/connections/{cid}"),
-    ("POST", "/api/admin/connections/{cid}/delete"),
-    ("POST", "/api/admin/connections/{cid}/refresh"),
     ("GET", "/api/admin/refresh_settings"),
     ("POST", "/api/admin/refresh_settings"),
     ("GET", "/api/admin/audit"),
@@ -170,7 +173,9 @@ def test_power_user_guard_matrix(client):
             if resp.status_code == 403:
                 # Only scope/ownership rejections may 403 here — never the
                 # guard's "Administrator access required".
-                assert resp.json().get("code") in ("OUT_OF_SCOPE", "NOT_OWNER"), p
+                assert resp.json().get("code") in (
+                    "OUT_OF_SCOPE", "NOT_OWNER", "PERSONAL_OWNER_ONLY",
+                    "SELF_SERVICE_DISABLED"), p
 
 
 def test_admin_blocked_while_must_change_password(client):
