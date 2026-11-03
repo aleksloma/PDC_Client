@@ -66,6 +66,18 @@ _LIVE_KEYS = ("live_reason", "live_set_by", "live_set_at",
               "live_profiled_at", "live_sample_rows")
 
 
+def _log_type(e: BaseException) -> str:
+    """An exception's TYPE name, escaped for a log line (never its text)."""
+    from exec_transport import log_safe_text
+    return log_safe_text(type(e).__name__, 80)
+
+
+def _log_text(value) -> str:
+    """A stored value escaped for a log line."""
+    from exec_transport import log_safe_text
+    return log_safe_text(str(value), 80)
+
+
 def table_mode(doc) -> str:
     """The storage mode of a table doc; absent / null / anything unusable
     reads as "snapshot" (the one reader every caller uses)."""
@@ -340,7 +352,13 @@ class DataSourceStore:
                 return dict(c) if with_secret else _mask_connection(c)
         return None
 
-    def create_connection(self, fields: dict, password: str, actor: str) -> dict:
+    def create_connection(self, fields: dict, password: str, actor: str, *,
+                          owner: Optional[str] = None,
+                          actor_kind: Optional[str] = None) -> dict:
+        """`owner` (lower-cased) makes this a PERSONAL connection: the
+        self-service user who created it. Absent on every connection an
+        administrator creates. actor_kind=None keeps the audit row
+        byte-identical."""
         enc = encrypt_password(password)  # raises EncryptionUnavailable when no key
         now = _now()
         conn = {
@@ -363,18 +381,23 @@ class DataSourceStore:
             "updated_at": now, "updated_by": actor,
             "last_test_at": None, "last_test_ok": None,
         }
+        owner_norm = str(owner or "").strip().lower()
+        if owner_norm:
+            conn["owner"] = owner_norm
         with _LOCK:
             doc = self.read_doc()
             doc["connections"].append(conn)
             self._write_doc(doc)
         audit(actor, "connection.create", target=conn["id"],
               detail={"name": conn["name"], "db_type": conn["db_type"],
-                      "host": conn["host"], "port": conn["port"]})
+                      "host": conn["host"], "port": conn["port"]},
+              actor_kind=actor_kind)
         log_with_sid(actor, "info", f"DB_CONNECTION_CREATED conn={conn['id']} type={conn['db_type']}")
         return _mask_connection(conn)
 
     def update_connection(self, cid: str, fields: dict, password: Optional[str],
-                          actor: str) -> Optional[dict]:
+                          actor: str, *,
+                          actor_kind: Optional[str] = None) -> Optional[dict]:
         """password=None keeps the stored credential; a string re-encrypts."""
         with _LOCK:
             doc = self.read_doc()
@@ -402,7 +425,8 @@ class DataSourceStore:
                     c["updated_by"] = actor
                     self._write_doc(doc)
                     audit(actor, "connection.update", target=cid,
-                          detail={"password_changed": bool(password)})
+                          detail={"password_changed": bool(password)},
+                          actor_kind=actor_kind)
                     return _mask_connection(c)
         return None
 
@@ -419,7 +443,8 @@ class DataSourceStore:
         except Exception as e:
             log_with_sid("db_sources", "warning", f"DB_CONN_MARK_TESTED_FAILED conn={cid}: {e}")
 
-    def delete_connection(self, cid: str, actor: str, *, cascade: bool = False) -> dict:
+    def delete_connection(self, cid: str, actor: str, *, cascade: bool = False,
+                          actor_kind: Optional[str] = None) -> dict:
         """Without cascade, refuses when tables still reference the connection
         (the route maps that to 409). With cascade, deletes those tables and
         their snapshots too."""
@@ -449,8 +474,91 @@ class DataSourceStore:
         for tid in deleted_tables:
             self._drop_snapshot(tid)
         audit(actor, "connection.delete", target=cid, ok=deleted,
-              detail={"cascade": cascade, "deleted_tables": deleted_tables})
+              detail={"cascade": cascade, "deleted_tables": deleted_tables},
+              actor_kind=actor_kind)
         return {"ok": True, "deleted_tables": deleted_tables}
+
+    # ---- personal (self-service) connections --------------------------------
+    def personal_connection_ids(self) -> set:
+        """Ids of every PERSONAL connection (one carrying an `owner`). Never
+        raises: an unreadable registry answers the empty set (Article IV)."""
+        try:
+            return {c.get("id") for c in self.read_doc()["connections"]
+                    if c.get("id") and str(c.get("owner") or "").strip()}
+        except Exception as e:
+            log_with_sid("db_sources", "warning",
+                         f"DB_PERSONAL_IDS_FAILED error={_log_type(e)}")
+            return set()
+
+    def personal_grants_for(self, email: str) -> list:
+        """One whole-connection grant {"connection_id", "schema": None} per
+        connection whose `owner` equals `email` (case-insensitive): the
+        owner's management scope over their own connections. Never raises
+        (returns [])."""
+        me = str(email or "").strip().lower()
+        if not me:
+            return []
+        try:
+            return [{"connection_id": c["id"], "schema": None}
+                    for c in self.read_doc()["connections"]
+                    if c.get("id")
+                    and str(c.get("owner") or "").strip().lower() == me]
+        except Exception as e:
+            log_with_sid("db_sources", "warning",
+                         f"DB_PERSONAL_GRANTS_FAILED error={_log_type(e)}")
+            return []
+
+    def delete_personal_sources(self, email: str, *, actor: str) -> dict:
+        """The user-removal cascade. Every connection the address OWNS goes,
+        each of its tables through the ordinary table delete (snapshot
+        parquet dropped, recommendations reconciled) plus its profile
+        sidecar and its id pruned from every role, then the connection
+        itself (cascade) and its role grants. Returns
+        {"connections": n, "tables": m}; one `personal_sources.deleted`
+        audit row {connections, tables, connection_ids} when n > 0. Never
+        raises (zeros + DB_DELETE_PERSONAL_FAILED, Article IV)."""
+        zero = {"connections": 0, "tables": 0}
+        me = str(email or "").strip().lower()
+        if not me:
+            return zero
+        try:
+            from local_store import db_profile_path
+            import roles_store                     # lazy: roles_store reads this module
+            rstore = roles_store.RolesStore()
+            owned = [c["id"] for c in self.read_doc()["connections"]
+                     if c.get("id")
+                     and str(c.get("owner") or "").strip().lower() == me]
+            n_conn = n_tab = 0
+            for cid in owned:
+                tids = [t.get("id") for t in self.read_doc()["tables"]
+                        if t.get("connection_id") == cid and t.get("id")]
+                for tid in tids:
+                    if self.delete_table(tid, actor, actor_kind="personal"):
+                        n_tab += 1
+                    try:
+                        prof = db_profile_path(tid)
+                        if prof.exists():
+                            prof.unlink()
+                    except Exception as e:
+                        log_with_sid("db_sources", "warning",
+                                     f"DB_PROFILE_DELETE_FAILED table={_log_text(tid)} error={_log_type(e)}")
+                    rstore.remove_table(tid, actor=actor)
+                res = self.delete_connection(cid, actor, cascade=True,
+                                             actor_kind="personal")
+                if res.get("ok"):
+                    n_conn += 1
+                    rstore.remove_connection(cid, [], actor=actor)
+        except Exception as e:
+            log_with_sid("db_sources", "error",
+                         f"DB_DELETE_PERSONAL_FAILED error={_log_type(e)}")
+            return zero
+        if n_conn:
+            audit(actor, "personal_sources.deleted", target=me,
+                  detail={"connections": n_conn, "tables": n_tab,
+                          "connection_ids": owned})
+            log_with_sid("db_sources", "info",
+                         f"DB_PERSONAL_SOURCES_DELETED connections={n_conn} tables={n_tab}")
+        return {"connections": n_conn, "tables": n_tab}
 
     # ---- tables ------------------------------------------------------------
     def list_tables(self, *, include_connector: bool = True,
@@ -1003,7 +1111,12 @@ def expand_with_connectors(table_ids: list[str],
       registration has no parquet to load until the live query path ships.
     """
     store = store or DataSourceStore()
+    # A table on a PERSONAL connection is never walked: it belongs to its
+    # owner alone and is never a connector, even in a hand-edited doc.
+    personal = store.personal_connection_ids()
     tables = {t.get("id"): t for t in store.list_tables() if t.get("id")}
+    personal_tids = {tid for tid, t in tables.items()
+                     if t.get("connection_id") in personal}
     by_name = {}
     for t in tables.values():
         by_name[f"{t.get('schema') or ''}.{t.get('table_name') or ''}".lower()] = t.get("id")
@@ -1032,13 +1145,13 @@ def expand_with_connectors(table_ids: list[str],
 
     seeds = [tid for tid in table_ids if tid in tables]
     result = set(seeds)
-    queue = deque(sorted(seeds))
+    queue = deque(sorted(t for t in seeds if t not in personal_tids))
     cap = max(0, int(settings.DB_MAX_AUTO_CONNECTORS))
     auto_added = 0
     while queue:
         tid = queue.popleft()
         for nid in sorted(neighbors.get(tid, ())):
-            if nid in result:
+            if nid in result or nid in personal_tids:
                 continue
             if not tables[nid].get("is_connector"):
                 continue
