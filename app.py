@@ -949,6 +949,22 @@ def _is_admin_user(email: str | None) -> bool:
         return False
 
 
+def _is_self_service(email: str | None) -> bool:
+    """Whether the user may add their own (personal) database connections —
+    roles_store.self_service_allowed (not admin, not the bootstrap account,
+    the per-user switch on). Gates the dropdown's "DB config" item and the
+    /power page. Fail-closed on any error (Article IV)."""
+    if not email:
+        return False
+    try:
+        import roles_store
+        return roles_store.self_service_allowed(email)
+    except Exception as e:
+        log_with_sid(log_safe_text(email), "warning",
+                     f"SELF_SERVICE_FLAG_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return False
+
+
 def _profile_context(email: str | None) -> dict:
     """Build the profile context the dashboard partial expects.
 
@@ -959,7 +975,8 @@ def _profile_context(email: str | None) -> dict:
         return {"logged_in": False, "display_name": "", "raw_username": "",
                 "subscription_plan": "Enterprise",
                 "avatar_color": _AVATAR_COLORS[0], "initials": "",
-                "is_power_user": False, "is_admin_user": False}
+                "is_power_user": False, "is_admin_user": False,
+                "is_self_service": False}
     display_name = email
     parts = email.split("@")[0].replace(".", " ").replace("_", " ").split()
     if len(parts) >= 2:
@@ -983,6 +1000,7 @@ def _profile_context(email: str | None) -> dict:
         "initials": initials,
         "is_power_user": _is_power_user(email),
         "is_admin_user": _is_admin_user(email),
+        "is_self_service": _is_self_service(email),
     }
 
 
@@ -1166,7 +1184,9 @@ async def power_data_sources_page(request: Request):
     "power" mode (Connections read-only; Tables/Relations/per-table schedule
     only; no Users/Roles/Audit/global schedule). Same redirect-never-error
     guard style: no session → /, forced change → change_password, ladmin →
-    its own page, non-power users → /lab."""
+    its own page, a user who is neither power nor self-service → /lab. A
+    self-service user (personal connections on) also gets the "Add
+    connection" button and manages their own connections here."""
     email = request.session.get("email")
     if not email:
         return RedirectResponse(url="/", status_code=302)
@@ -1174,7 +1194,8 @@ async def power_data_sources_page(request: Request):
         return RedirectResponse(url="/auth/change_password", status_code=302)
     if AuthStore().is_admin(email):
         return RedirectResponse(url="/admin/data_sources", status_code=302)
-    if not _is_power_user(email):
+    self_service = _is_self_service(email)
+    if not _is_power_user(email) and not self_service:
         log_with_sid(email, "warning", "POWER_PAGE_DENIED")
         return RedirectResponse(url="/lab", status_code=302)
     log_with_sid(email, "info", "OPEN_POWER_DATA_SOURCES")
@@ -1185,30 +1206,47 @@ async def power_data_sources_page(request: Request):
         {"request": request, "ts": int(time.time()), "username": email,
          "build_stamp": _build_stamp(), "manager_mode": "power",
          "manage_scope_summary": summary, "read_beyond_manage": read_beyond,
+         "self_service": self_service,
          "subscription_plan": "Enterprise", **_profile_context(email)},
     )
 
 
 def _power_scope_summary(email: str) -> tuple[str, bool]:
     """(summary sentence, read-beyond-manage flag) for the /power header —
-    computed from manage_grants (19f) + connection names. Fail-soft: any
+    computed from roles_store.manager_scope_for (the user's own connections
+    + manage_grants, 19f) + connection names: "Your connections: A, B"
+    first, then the granted ones as "You can manage: …". Fail-soft: any
     error yields an empty summary rather than a broken page (Article IV)."""
     try:
         import roles_store
         from db_sources import DataSourceStore
         store = DataSourceStore()
-        scope = roles_store.management_scope_for(email) or []
-        names = {c.get("id"): c.get("name") or "?"
-                 for c in store.list_connections()}
-        parts = []
+        scope = roles_store.manager_scope_for(email) or []
+        conns = {c.get("id"): c for c in store.list_connections()}
+        me = str(email or "").strip().lower()
+        owned, parts = [], []
         for g in scope:
-            if g.get("connection_id") not in names:
+            c = conns.get(g.get("connection_id"))
+            if c is None:
                 continue          # grant on a deleted connection — nothing to say
-            label = names[g["connection_id"]]
+            label = c.get("name") or "?"
+            if str(c.get("owner") or "").strip().lower() == me:
+                if label not in owned:
+                    owned.append(label)
+                continue
             parts.append(f"{label} — all schemas" if g.get("schema") is None
                          else f"{label} / {g['schema']}")
-        summary = ("You can manage: " + ", ".join(parts) if parts else
-                   "You have no manage grants yet — ask your administrator.")
+        sentences = []
+        if owned:
+            sentences.append("Your connections: " + ", ".join(owned))
+        if parts:
+            sentences.append("You can manage: " + ", ".join(parts))
+        if sentences:
+            summary = ". ".join(sentences)
+        elif _is_self_service(email):
+            summary = "You have no connections yet — add one with ＋ Add connection."
+        else:
+            summary = "You have no manage grants yet — ask your administrator."
         read_beyond = False
         tables = {t.get("id"): t for t in store.list_tables()}
         for tid in roles_store.allowed_table_ids_for(email):

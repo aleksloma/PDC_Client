@@ -512,3 +512,8 @@ body.admin-ds-page {
 .adm-chip.live { background: #fef3c7; color: #92400e; }
 .adm-mode-block { margin: 6px 0 10px; }
 .adm-mode-block .adm-alert { margin: 8px 0 4px; }
+
+/* Personal (self-service) connections: a user's own read-only connection. */
+.adm-chip.personal { background: #e0f2fe; color: #075985; }
+.adm-owner-cell { color: #475569; }
+.adm-conn-readonly-note { margin: -4px 0 0; font-size: 12px; }

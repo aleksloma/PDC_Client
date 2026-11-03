@@ -26,9 +26,10 @@
   {% endif %}
   <div id="profileDropdown" class="profile-dropdown hidden">
     {% if logged_in %}
-    {% if is_power_user | default(false) or is_admin_user | default(false) %}
-    {# 19g: promoted admins get the full admin page; power users keep /power.
-       The target rides a data attribute so dashboard.js stays flag-free. #}
+    {% if is_power_user | default(false) or is_admin_user | default(false) or is_self_service | default(false) %}
+    {# 19g: promoted admins get the full admin page; power users and
+       self-service users (personal connections) keep /power. The target
+       rides a data attribute so dashboard.js stays flag-free. #}
     <button class="dropdown-item" id="btnDbConfig" data-i18n="profile.db_config"
       data-target="{% if is_admin_user | default(false) %}/admin/data_sources{% else %}/power/data_sources{% endif %}">DB config</button>
     <div class="dropdown-divider"></div>

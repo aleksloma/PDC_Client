@@ -53,7 +53,8 @@ def test_power_page_redirects_per_audience(client):
     # Anonymous → landing.
     r = client.get("/power/data_sources", follow_redirects=False)
     assert r.status_code == 302 and r.headers["location"] == "/"
-    # Plain user → /lab.
+    # Plain user with personal connections switched off → /lab.
+    local_store.AuthStore().set_self_service(USER, False)
     _login(client, USER)
     r = client.get("/power/data_sources", follow_redirects=False)
     assert r.status_code == 302 and r.headers["location"] == "/lab"
@@ -67,6 +68,9 @@ def test_power_page_redirects_ladmin_to_admin_page(client):
 
 
 def test_power_page_renders_power_mode_for_power_user(client):
+    # Personal connections switched off: the power-only view (no Add
+    # connection, the manage-grant summary).
+    local_store.AuthStore().set_self_service(POWER, False)
     # Login target stays /lab — a power user is a normal chat user.
     assert _login(client, POWER).headers["location"] == "/lab"
     r = client.get("/power/data_sources")
@@ -136,6 +140,7 @@ def test_lab_dropdown_db_config_only_for_power_users(client):
     assert r.status_code == 200 and 'id="btnDbConfig"' in r.text
     assert 'data-target="/power/data_sources"' in r.text   # 19g: power keeps /power
     client.post("/auth/logout", headers=JSON_HEADERS)
+    local_store.AuthStore().set_self_service(USER, False)
     _login(client, USER)
     r = client.get("/lab")
     assert r.status_code == 200 and 'id="btnDbConfig"' not in r.text
@@ -211,3 +216,98 @@ def test_admin_template_qa_markers(client):
     assert 'id="twAccessRoles"' in html
     assert '<h4>Access ' in html                 # admin heading unchanged
     assert 'Share with your roles' not in html   # power-only heading
+
+
+# ── personal (self-service) connections ────────────────────────────────────
+
+def test_self_service_user_gets_the_power_page_with_add_connection(client):
+    _login(client, USER)
+    r = client.get("/power/data_sources")
+    assert r.status_code == 200
+    assert '__MANAGER_MODE__ = "power"' in r.text
+    assert 'window.__SELF_SERVICE__ = true' in r.text
+    assert 'id="btnAddConnection"' in r.text
+    assert 'id="connModal"' in r.text and 'id="connReadOnly"' in r.text
+    assert "add your own read-only database connections" in r.text
+    assert 'data-section="users"' not in r.text
+    assert "You have no connections yet" in r.text
+    # Switched off → back to /lab, the dropdown item disappears.
+    local_store.AuthStore().set_self_service(USER, False)
+    r = client.get("/power/data_sources", follow_redirects=False)
+    assert r.status_code == 302 and r.headers["location"] == "/lab"
+    assert 'id="btnDbConfig"' not in client.get("/lab").text
+    # Back on → the page again.
+    local_store.AuthStore().set_self_service(USER, True)
+    assert client.get("/power/data_sources").status_code == 200
+
+
+def test_power_user_with_self_service_gets_add_connection(client):
+    _login(client, POWER)
+    r = client.get("/power/data_sources")
+    assert r.status_code == 200 and 'id="btnAddConnection"' in r.text
+    assert 'window.__SELF_SERVICE__ = true' in r.text
+
+
+def test_power_only_user_has_no_add_connection(client):
+    local_store.AuthStore().set_self_service(POWER, False)
+    _login(client, POWER)
+    r = client.get("/power/data_sources")
+    assert r.status_code == 200
+    assert 'id="btnAddConnection"' not in r.text
+    assert 'window.__SELF_SERVICE__ = false' in r.text
+    # The connection modal (with the read-only box) renders in both modes.
+    assert 'id="connReadOnly"' in r.text
+
+
+def test_admin_page_has_read_only_box_and_no_self_service(client):
+    _login(client, ADMIN2)
+    r = client.get("/admin/data_sources")
+    assert r.status_code == 200
+    assert 'id="connReadOnly"' in r.text
+    assert 'window.__SELF_SERVICE__ = false' in r.text
+
+
+def test_lab_dropdown_db_config_for_self_service_user(client):
+    _login(client, USER)
+    r = client.get("/lab")
+    assert r.status_code == 200 and 'id="btnDbConfig"' in r.text
+    assert 'data-target="/power/data_sources"' in r.text
+
+
+def test_profile_carries_is_self_service(client):
+    _login(client, USER)
+    assert client.get("/auth/profile").json()["is_self_service"] is True
+    local_store.AuthStore().set_self_service(USER, False)
+    assert client.get("/auth/profile").json()["is_self_service"] is False
+    client.post("/auth/logout", headers=JSON_HEADERS)
+    _login(client, ADMIN2)
+    # Admins manage data sources from the admin page, never self-service.
+    assert client.get("/auth/profile").json()["is_self_service"] is False
+
+
+def test_profile_context_is_self_service_key():
+    ctx = app_mod._profile_context(None)
+    assert ctx["is_self_service"] is False
+
+
+def test_power_scope_summary_lists_owned_connections_first(client):
+    import db_sources
+    import roles_store
+    store = db_sources.DataSourceStore()
+    own = store.create_connection(
+        {"name": "my db", "db_type": "postgresql", "host": "h", "port": 5432,
+         "database": "d", "user": "u"}, "pw", actor=POWER, owner=POWER)
+    lad = store.create_connection(
+        {"name": "warehouse", "db_type": "postgresql", "host": "h",
+         "port": 5432, "database": "d", "user": "u"}, "pw", actor=ADMIN2)
+    role = roles_store.RolesStore().create_role(
+        {"name": "MG2", "manage_grants": [{"connection_id": lad["id"],
+                                           "schema": None}]}, actor=ADMIN2)
+    local_store.AuthStore().set_data_roles(POWER, [role["id"]])
+    _login(client, POWER)
+    r = client.get("/power/data_sources")
+    text = r.text
+    assert "Your connections: my db" in text
+    assert "You can manage: warehouse — all schemas" in text
+    assert text.index("Your connections: my db") < text.index("You can manage:")
+    assert own["id"]

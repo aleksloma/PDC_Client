@@ -30,6 +30,21 @@
 
   const POWER = window.__MANAGER_MODE__ === 'power';
   const MANAGER_EMAIL = String(window.__MANAGER_EMAIL__ || '').toLowerCase();
+  // Personal (self-service) connections: the caller may add their own.
+  const SELF_SERVICE = window.__SELF_SERVICE__ === true;
+
+  // A personal connection carries an owner (GET /connections `personal`);
+  // it and every table on it belong to that user alone.
+  function _isPersonalConn(cid) {
+    const c = (typeof CONNECTIONS !== 'undefined' ? CONNECTIONS : [])
+      .find((x) => x.id === cid);
+    return !!(c && c.personal);
+  }
+  function _connOwner(cid) {
+    const c = (typeof CONNECTIONS !== 'undefined' ? CONNECTIONS : [])
+      .find((x) => x.id === cid);
+    return (c && c.owner) || '';
+  }
 
   function toast(msg, isErr) {
     const t = document.createElement('div');
@@ -202,8 +217,11 @@
     if (!CONNECTIONS.length) {
       if (hero) hero.classList.remove('hidden');
       box.innerHTML = POWER
-        ? '<div class="adm-card adm-muted">No connections are in your granted scope yet — ' +
-          'ask your administrator.</div>'
+        ? (SELF_SERVICE
+          ? '<div class="adm-card adm-muted">No connections yet — add your own with ' +
+            '“＋ Add connection”.</div>'
+          : '<div class="adm-card adm-muted">No connections are in your granted scope yet — ' +
+            'ask your administrator.</div>')
         : '';
       return;
     }
@@ -211,18 +229,28 @@
     const rows = CONNECTIONS.map((c) => {
       const where = c.db_type === 'sqlite' ? '(local file)' :
         `${esc(c.host)}:${esc(c.port ?? '')} / ${esc(c.database || c.service_name || '')}`;
-      // Power users: connections are READ-ONLY — registering tables from them
-      // is the one action; test/refresh/edit/delete stay ladmin's.
-      const actions = POWER
-        ? '<button class="adm-btn ghost small" data-act="browse">＋ Register table</button>'
-        : `<button class="adm-btn ghost small" data-act="browse">＋ Register table</button>
+      // Power-mode rows: a granted connection is READ-ONLY (registering
+      // tables is the one action); the caller's OWN connection gets the full
+      // set. Admin: every non-personal row gets the full set, a personal row
+      // none — it is its owner's alone (read-only here, owner shown).
+      const full = `<button class="adm-btn ghost small" data-act="browse">＋ Register table</button>
           <button class="adm-icon-btn" data-act="test" title="Test connection">🔌</button>
           <button class="adm-icon-btn" data-act="refresh" title="Refresh all snapshots on this connection">⟳</button>
           <button class="adm-icon-btn" data-act="edit" title="Edit connection">✎</button>
           <button class="adm-icon-btn" data-act="delete" title="Delete connection">🗑</button>`;
+      const actions = POWER
+        ? (c.owned ? full
+          : '<button class="adm-btn ghost small" data-act="browse">＋ Register table</button>')
+        : (c.personal
+          ? '<span class="adm-muted" title="A user\'s own connection — only its owner can change it">Read-only</span>'
+          : full);
+      const chip = c.personal
+        ? ' <span class="adm-chip personal" title="A user\'s own read-only connection">Personal</span>' : '';
+      const ownerLine = (!POWER && c.personal)
+        ? `<div class="adm-cell-sub adm-owner-cell">Owner: ${esc(c.owner || '')}</div>` : '';
       return `
       <tr data-cid="${esc(c.id)}">
-        <td><strong>${esc(c.name)}</strong><div class="adm-cell-sub">${esc(c.user)}</div></td>
+        <td><strong>${esc(c.name)}</strong>${chip}<div class="adm-cell-sub">${esc(c.user)}</div>${ownerLine}</td>
         <td><span class="adm-chip">${esc(c.db_type)}</span></td>
         <td class="adm-cell-mono">${where}</td>
         <td>${c.table_count || 0}</td>
@@ -261,6 +289,7 @@
       try {
         r = await api(`/api/admin/connections/${c.id}/refresh`, { method: 'POST', body: '{}' });
       } finally { _busyDone(); }
+      if (!r.ok) { toast(r.data.error || 'Refresh failed', true); loadAll(); return; }
       const results = r.data.results || [];
       const bad = results.filter((x) => !x.ok);
       toast(bad.length ? `Refreshed with ${bad.length} failure(s)` : `Refreshed ${results.length} table(s)`, !!bad.length);
@@ -472,7 +501,10 @@
     // Power users may delete ONLY tables they registered themselves — the API
     // enforces the same rule (NOT_OWNER); ladmin sees Delete everywhere.
     const canDelete = (t) => !POWER ||
-      String(t.registered_by || '').toLowerCase() === MANAGER_EMAIL;
+      String(t.registered_by || '').toLowerCase() === MANAGER_EMAIL ||
+      (_isPersonalConn(t.connection_id) && _connOwner(t.connection_id) === MANAGER_EMAIL);
+    // Admin view of a personal table: owner shown, no actions (owner only).
+    const adminReadOnly = (t) => !POWER && _isPersonalConn(t.connection_id);
     const isLive = (t) => t.mode === 'live';
     // Title of the LIVE badge: why and who/when (server-stamped values).
     const liveTitle = (t) => {
@@ -488,10 +520,14 @@
         <td><strong>${esc(t.display_name)}</strong>${isLive(t)
           ? ` <span class="adm-chip live" title="${esc(liveTitle(t))}">live</span>` : ''}${t.is_connector
           ? ' <span class="adm-chip conn" title="Hidden from users; auto-included via relations">connector</span>' : ''}${
+          _isPersonalConn(t.connection_id)
+            ? ' <span class="adm-chip personal" title="On a user\'s own connection">Personal</span>' : ''}${
           isLive(t) ? ''
             : t.schedule ? ' <span class="adm-chip conn" title="Refreshes on its own schedule">own schedule</span>'
               : ' <span class="adm-chip" title="Follows the global refresh schedule">inherits global</span>'}</td>
-        <td class="adm-cell-mono">${esc(connName(t.connection_id))} · ${esc([t.schema, t.table_name].filter(Boolean).join('.'))}</td>
+        <td class="adm-cell-mono">${esc(connName(t.connection_id))} · ${esc([t.schema, t.table_name].filter(Boolean).join('.'))}${
+          adminReadOnly(t)
+            ? `<div class="adm-cell-sub adm-owner-cell">Owner: ${esc(_connOwner(t.connection_id))}</div>` : ''}</td>
         <td>${t.row_count != null ? Number(t.row_count).toLocaleString() : '—'}</td>
         <td title="${esc(t.last_refresh_error || '')}">${isLive(t)
           ? 'live · ' + (t.live_profiled_at
@@ -503,7 +539,8 @@
           : (t.last_refresh_error ? '<span class="adm-chip bad">failed</span>' : '—')}${
           t.last_drift && !t.last_drift.dismissed
             ? ` <span class="adm-chip bad" title="${esc(_driftBits(t.last_drift).join(' · '))}">schema drift</span>` : ''}</td>
-        <td class="adm-actions-cell">
+        <td class="adm-actions-cell">${adminReadOnly(t)
+          ? '<span class="adm-muted" title="On a user\'s own connection — only its owner can change it">Read-only</span>' : `
           <button class="adm-icon-btn" data-act="refresh" title="${isLive(t)
             ? 'Re-count and re-profile now (no snapshot)'
             : 'Refresh snapshot now (always a full snapshot)'}">⟳</button>
@@ -512,7 +549,7 @@
           <button class="adm-icon-btn" data-act="edit" title="Edit descriptions / relations">✎</button>
           ${canDelete(t)
             ? '<button class="adm-icon-btn" data-act="delete" title="Delete registered table">🗑</button>'
-            : ''}
+            : ''}`}
         </td>
       </tr>`).join('');
     box.innerHTML = `<div class="adm-card adm-table-scroll"><table class="adm-table">
@@ -610,6 +647,21 @@
       renderSummary();
       loadWizardSuggestions();   // recomputed on every step-3 open
       renderWizardAccess();      // synchronous — ROLES loaded at page load
+      _applyPersonalWizard();
+    }
+  }
+
+  // A table on a personal connection is never shared with roles and never a
+  // connector (the server refuses both): hide the two controls for it.
+  function _applyPersonalWizard() {
+    const personal = _isPersonalConn(wizardConnId);
+    const wrap = $('twAccessWrap');
+    if (wrap) wrap.hidden = personal;
+    const conn = $('twIsConnector');
+    if (conn) {
+      if (personal) conn.checked = false;
+      const label = conn.closest('label');
+      if (label) label.hidden = personal;
     }
   }
 
@@ -1688,6 +1740,10 @@
       + 'are proposed for review right away.';
     // Historical default until the probe answers; never gate the button on it.
     _setRecType('connector');
+    // A personal connection's tables are never connectors: not offered.
+    const personalRec = _isPersonalConn(rec.connection_id);
+    $('recTypeConnector').disabled = personalRec;
+    if (personalRec) _setRecType('normal');
     $('recAcceptReason').textContent = 'Checking column types…';
     $('btnRecAcceptGo').disabled = false;
     $('recAcceptModal').classList.remove('hidden');
@@ -1721,7 +1777,9 @@
       recAcceptCtx.suggested = out.suggested_type;
       rec._typeHint = out.suggested_type;
     }
-    if (!recAcceptCtx.dirty) _setRecType(out.suggested_type);
+    if (!recAcceptCtx.dirty && !_isPersonalConn(rec.connection_id)) {
+      _setRecType(out.suggested_type);
+    }
     $('recAcceptReason').textContent = out.classified
       ? `Suggested: ${out.suggested_type === 'connector'
           ? 'connector' : 'normal table'} — ${out.reason}`
@@ -1732,7 +1790,9 @@
   async function _runAcceptRecommendation() {
     if (!recAcceptCtx) return;
     const { rec, suggested } = recAcceptCtx;
-    const chosen = $('recTypeNormal').checked ? 'normal' : 'connector';
+    // A personal connection's tables are never connectors.
+    const chosen = (_isPersonalConn(rec.connection_id) || $('recTypeNormal').checked)
+      ? 'normal' : 'connector';
     const phys = _recPhysLabel(rec);
     _closeRecAccept();
     _busy(`Registering ${phys}… introspecting, drafting descriptions, snapshotting.`);
@@ -2508,6 +2568,7 @@
     // Manual rows + checked suggestions, deduped by target + pairs (both are
     // child-first, so a direct compare suffices).
     const rels = collectRelations();
+    const personal = _isPersonalConn(wizardConnId);
     const relKey = (r) => r.related_table_id + '|' + JSON.stringify(r.join_keys);
     const seenRels = new Set(rels.map(relKey));
     collectCheckedSuggestions().forEach((s) => {
@@ -2520,14 +2581,15 @@
       display_name: $('twDisplayName').value.trim(),
       description: $('twDescription').value.trim(),
       columns,
-      is_connector: $('twIsConnector').checked,
+      is_connector: personal ? false : $('twIsConnector').checked,
       relations: rels,
       mode: _wizardMode(),
       confirm: $('twConfirm').checked === true,
     };
     // Access panel → role records. Omitted (not []) when roles were
-    // unavailable, so an edit-save can never strip existing grants.
-    if (_wizAccessReady) body.access_role_ids = collectCheckedAccessRoles();
+    // unavailable, so an edit-save can never strip existing grants — and on
+    // a personal connection, whose tables are never shared with roles.
+    if (_wizAccessReady && !personal) body.access_role_ids = collectCheckedAccessRoles();
     $('btnSaveTable').disabled = true;
     $('btnSaveTable').textContent = body.mode === 'live' ? 'Profiling…' : 'Snapshotting…';
     _busy(body.mode === 'live'
@@ -3050,8 +3112,18 @@
         ${PERMS.map(([v, l]) => `<option value="${v}"
           ${(u.permission || 'standard') === v ? 'selected' : ''}>${l}</option>`).join('')}
       </select>`;
+    // Personal connections switch, on by default; inert for administrators
+    // (they manage data sources from this page), so shown disabled there.
+    const selfSvc = (u) => {
+      const isAdmin = (u.permission || 'standard') === 'admin';
+      return `<label class="adm-check adm-user-selfsvc-wrap"${isAdmin
+        ? ' title="Administrators manage data sources from this page"' : ''}>
+        <input type="checkbox" class="adm-user-selfsvc"
+          ${u.self_service !== false ? 'checked' : ''} ${isAdmin ? 'disabled' : ''}>
+        </label>`;
+    };
     box.innerHTML = `<div class="adm-card adm-table-scroll"><table class="adm-table">
-      <thead><tr><th>Email</th><th>Roles</th><th>Permission</th><th>First login</th><th>Last login</th><th></th></tr></thead>
+      <thead><tr><th>Email</th><th>Roles</th><th>Permission</th><th>Own connections</th><th>First login</th><th>Last login</th><th></th></tr></thead>
       <tbody>${rows.map((u) => `
         <tr data-email="${esc(u.email)}">
           <td>${esc(u.email)}</td>
@@ -3061,6 +3133,7 @@
             <div class="adm-user-roles-panel adm-card hidden">${panel(u)}</div>
           </div></td>
           <td>${permSel(u)}</td>
+          <td>${selfSvc(u)}</td>
           <td class="adm-cell-mono">${fmt(u.created_at)}</td>
           <td class="adm-cell-mono">${fmt(u.last_login_at)}</td>
           <td class="adm-actions-cell adm-user-actions">
@@ -3137,6 +3210,24 @@
         } else {
           toast(r.data.error || 'Could not change the permission', true);
           loadUsers();                  // refetch = revert
+        }
+      });
+    });
+    box.querySelectorAll('.adm-user-selfsvc').forEach((cb) => {
+      cb.addEventListener('change', async () => {
+        const email = cb.closest('tr').dataset.email;
+        const u = USERS.find((x) => x.email === email);
+        const allowed = cb.checked;
+        const r = await api('/api/admin/users/set_self_service', {
+          method: 'POST', body: JSON.stringify({ email, allowed }),
+        });
+        if (r.ok && u) {
+          u.self_service = r.data.self_service;
+          toast(allowed ? `Own connections switched on for ${email}`
+                        : `Own connections switched off for ${email}`);
+        } else {
+          toast(r.data.error || 'Could not change the setting', true);
+          cb.checked = !allowed;        // revert
         }
       });
     });
@@ -3288,16 +3379,18 @@
 
   function renderRoleTree() {
     const box = $('roleAccessTree');
-    const tables = TABLES.filter((t) => !t.is_connector);
-    if (!CONNECTIONS.length || !tables.length) {
+    // Personal connections and their tables are never granted to a role.
+    const grantable = CONNECTIONS.filter((c) => !c.personal);
+    const tables = TABLES.filter((t) => !t.is_connector && !_isPersonalConn(t.connection_id));
+    if (!grantable.length || !tables.length) {
       box.innerHTML = '<div class="adm-empty">No registered tables yet — register tables first, '
         + 'or grant a whole connection once one exists.</div>';
-      if (!CONNECTIONS.length) return;
+      if (!grantable.length) return;
     }
     // 19f two-column rows: left = the Chat-access checkbox + name (tri-state
     // as before), right = the Manage checkbox (connection/schema rows only).
     const manageCell = (inner) => `<span class="adm-tree-manage">${inner}</span>`;
-    const html = CONNECTIONS.map((c) => {
+    const html = grantable.map((c) => {
       const connGranted = roleDraft.connGrants.has(c.id);
       const connManaged = roleDraft.manageConn.has(c.id);
       const connTables = tables.filter((t) => t.connection_id === c.id);

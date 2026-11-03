@@ -80,7 +80,9 @@
         <header class="adm-page-head">
           <div>
             <h1>Database connections</h1>
-            <p class="adm-page-sub">{% if manager_mode == 'power' %}The connections your granted scope
+            <p class="adm-page-sub">{% if manager_mode == 'power' and self_service %}You can
+               add your own read-only database connections and register tables from them;
+               connections your administrator granted are read-only here.{% elif manager_mode == 'power' %}The connections your granted scope
                covers — read-only here; your administrator manages them.{% else %}Read-only credentials
                to your databases. Users never see these — they only pick from the tables you
                register.{% endif %}</p>
@@ -92,7 +94,7 @@
             {% endif %}
             {% endif %}
           </div>
-          {% if manager_mode != 'power' %}
+          {% if manager_mode != 'power' or self_service %}
           <button id="btnAddConnection" class="adm-btn primary">＋ Add connection</button>
           {% endif %}
         </header>
@@ -526,6 +528,9 @@
           </label>
           <label class="adm-check"><input type="checkbox" id="connSsl" /> SSL / Encrypt</label>
           <label class="adm-check"><input type="checkbox" id="connTrustCert" /> Trust server certificate</label>
+          <label class="adm-check span2"><input type="checkbox" id="connReadOnly" checked disabled /> Read-only access</label>
+          <p class="adm-muted span2 adm-conn-readonly-note">PowerDataChat only ever reads from a database.
+            Writes are refused by the platform even when the login has write privileges.</p>
         </div>
         <div id="connTlsWarn" class="adm-alert warn hidden conn-tls-warn" role="status"></div>
         <div id="connTestResult" class="adm-test-result hidden"></div>
@@ -845,6 +850,7 @@
     {# tojson: autoescape would entity-escape '/& inside emails and break the
        registered_by === MANAGER_EMAIL ownership compare in the JS #}
     window.__MANAGER_EMAIL__ = {{ username | tojson }};
+    window.__SELF_SERVICE__ = {{ 'true' if self_service | default(false) else 'false' }};
   </script>
   <script src="/static/admin_data_sources.js?v={{ ts }}"></script>
 </body>
