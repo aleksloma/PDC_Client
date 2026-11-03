@@ -409,11 +409,14 @@ def _remove_account(target: str, actor: str) -> tuple[bool, dict]:
     """The account folder first — it holds the sessions' generation and the
     records a live session could otherwise write back into — then every chat
     the account owns, then the address comes off every other owner's share
-    lists and off the tables it registered. The last three are best effort:
+    lists, then its PERSONAL connections go with every table on them
+    (snapshots, profiles and role ids included), then the address comes off
+    the tables it registered elsewhere. The last four are best effort:
     once the folder is gone, a step that raises is logged (the type only)
     and counts 0, so the route still audits the removal and answers with the
     counts achieved. Blocking."""
     counts = {"chats_deleted": 0, "chats_unshared": 0, "dashboards_unshared": 0,
+              "personal_connections_deleted": 0, "personal_tables_deleted": 0,
               "registrations_released": 0}
     if not AuthStore().remove_user(target):
         return False, counts
@@ -434,6 +437,14 @@ def _remove_account(target: str, actor: str) -> tuple[bool, dict]:
     purged = purged if isinstance(purged, dict) else {}
     counts["chats_unshared"] = int(purged.get("chats_unshared") or 0)
     counts["dashboards_unshared"] = int(purged.get("dashboards_unshared") or 0)
+    # Before release_registrations: the owner's personal tables are gone by
+    # then, so there is nothing of theirs left to release.
+    personal = _step("delete_personal_sources",
+                     lambda: db_sources.DataSourceStore().delete_personal_sources(
+                         target, actor=actor))
+    personal = personal if isinstance(personal, dict) else {}
+    counts["personal_connections_deleted"] = int(personal.get("connections") or 0)
+    counts["personal_tables_deleted"] = int(personal.get("tables") or 0)
     counts["registrations_released"] = int(_step(
         "release_registrations",
         lambda: db_sources.DataSourceStore().release_registrations(target, actor=actor))
@@ -449,12 +460,14 @@ async def remove_user(request: Request):
     included; recipients of its chats and dashboards then meet the existing
     owner-vanished paths. Every session of the account ends on its next
     request (`SESSION_GEN_REMOVED`). Then the address is taken off every
-    other owner's chat and dashboard share list and `registered_by` is
-    removed from the tables it registered, so an account created again at
+    other owner's chat and dashboard share list, its PERSONAL connections
+    are deleted with every table on them, and `registered_by` is removed
+    from the tables it registered elsewhere, so an account created again at
     the address inherits nothing; audit rows keep their attribution. 400
     for the bootstrap local admin and for the caller's own account, 404 for
     an unknown address. Answers {ok: true, chats_deleted, chats_unshared,
-    dashboards_unshared, registrations_released} — the counts achieved;
+    dashboards_unshared, personal_connections_deleted,
+    personal_tables_deleted, registrations_released} — the counts achieved;
     audited `user.removed` with the same counts."""
     email, err = _require_admin(request)
     if err:
@@ -495,6 +508,8 @@ async def remove_user(request: Request):
                  f"chats_deleted={counts['chats_deleted']} "
                  f"chats_unshared={counts['chats_unshared']} "
                  f"dashboards_unshared={counts['dashboards_unshared']} "
+                 f"personal_connections_deleted={counts['personal_connections_deleted']} "
+                 f"personal_tables_deleted={counts['personal_tables_deleted']} "
                  f"registrations_released={counts['registrations_released']}")
     return {"ok": True, **counts}
 
