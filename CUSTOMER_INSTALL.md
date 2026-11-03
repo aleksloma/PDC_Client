@@ -24,11 +24,15 @@ charts, tables and reports. It is meant for this, within these limits:
   registered database tables they may use; a file a user uploads is visible
   to that user and to the people they share the chat with.
 - **Permitted data** is data your Data Governance function has classified as
-  permitted for processing by a third-party language model in this form:
-  column names, data types, the values of text columns with at most 20
-  distinct values, aggregate statistics, and short computed results (see
-  "What leaves your network"). The raw rows stay in your network, but those
-  derived facts do not.
+  permitted for its *metadata* to be processed by a third-party language
+  model. No raw data leaves your network: not the rows, not the cell values
+  of number and date columns, not result tables, charts or computed numbers.
+  What the AI service receives is metadata about your data: table, sheet and
+  column names, data types, row counts, per-column counts (filled, empty,
+  distinct), and the category values of text columns with at most 20
+  distinct values (for example city names, branch names or product
+  categories). The exact field-by-field list is in "What leaves your
+  network".
 - **Do not upload or register** data whose classification forbids that
   processing, for example: special-category personal data, card numbers or
   authentication data, national identifiers, account numbers or other
@@ -1112,18 +1116,27 @@ responses, and do not rewrite the header.
 
 ## What leaves your network
 
-No uploaded file, DataFrame, query result set, or rendered chart is ever
-transmitted. What does cross to the brain over HTTPS is listed in the table
-below: the question text, the schema text (names, data types, descriptions
-and the values of text columns with at most 20 distinct values), profile
-counts and flags, and truncated answer text for titles and reports. Computed
-results are not sent: the AI writes the answer as a template with blanks, and
-the web application fills in the numbers on your server. Some of what is sent
-can still carry individual values from your data: a short category list, the
-Excel header text listed below, and the answer text of conversations held
-before this release, which is sent back as history. A column named in
-`SCHEMA_VALUE_DENY_COLUMNS` sends its name, data type and counts only. User
-email is sent for tenant routing.
+**No raw data leaves your network.** No uploaded file, DataFrame, query
+result set, rendered chart or computed number is ever transmitted. What the
+AI service receives is **metadata about your data**, listed field by field in
+the table below: the question text, table/sheet/column names, data types, the
+descriptions your admin confirms, row counts and per-column counts (filled,
+empty, distinct) with true/false flags, and the category values of text
+columns with at most 20 distinct values (for example city names, branch
+names or product categories). With every question, number and date columns
+send no value: no minimum, maximum, mean or most-frequent value. The one
+place a rounded number appears is the one-time hint for the AI column
+descriptions at upload or registration (range and mean at two significant
+figures, year-month range for dates), described in its own row below.
+Computed results are not sent: the AI writes the answer as a template with
+blanks, and the web application fills in the numbers on your server. The template, not the
+filled-in text, is what travels back as history and in titles and reports.
+Besides the category values above, two other items can carry text read from
+your data: the Excel header text listed below, and the answer text of
+conversations held before this release, which is sent back as history as it
+was stored. A column named in `SCHEMA_VALUE_DENY_COLUMNS` sends its name,
+data type and counts only, never a value. User email is sent for tenant
+routing.
 
 Everything in the list below is sent by the web application. Two things are
 worth stating plainly:

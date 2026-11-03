@@ -27,25 +27,38 @@ the chat UI surfaces a single "service unavailable" error.
   one jobs directory, one directory per in-flight question. All raw data +
   result tables + rendered files stay on this server.
 - **Brain** (a separate, hosted service operated by PowerDataChat) —
-  the LLM gateway. Receives column names, schema text, sampled
-  metadata, generated code, error text, and findings — see the table
-  below for the exact list. Never receives uploaded files, DataFrames,
-  query result sets, rendered charts, or the customer's templates.
+  the LLM gateway. Receives metadata only: column names, data types,
+  schema text, row and per-column counts, generated code, scrubbed error
+  text, and findings — see the table below for the exact list. Never
+  receives uploaded files, DataFrames, query result sets, rendered
+  charts, computed numbers, or the customer's templates.
 
 ## Data boundary (the whole point)
 
-No uploaded file, DataFrame, query result set, or rendered chart is ever
-transmitted. What does cross to the brain over HTTPS is listed in the table
-below: the question text, the schema text (names, dtypes, descriptions and the
-values of low-cardinality text columns), profile counts and flags, and
-truncated answer text for titles and reports. Computed results are not sent:
+**No raw data leaves the customer's network.** No uploaded file, DataFrame,
+query result set, rendered chart or computed number is ever transmitted. What
+crosses to the brain over HTTPS is **metadata about the data**, listed field
+by field in the table below: the question text, table/sheet/column names,
+dtypes, the admin-confirmed descriptions, row counts and per-column counts
+(filled, empty, distinct) with true/false flags, and the category values of
+text columns with at most 20 distinct values (for example city names, branch
+names or product categories). With every question, numeric and date columns
+send no value: no min, max, mean or most-frequent value. The one place a
+rounded number appears is the one-time schema-autofill hint at upload or
+registration (range and mean at two significant figures, year-month range
+for dates), described in its own row below. Computed results are not sent:
 the brain writes the answer as a TEMPLATE and this client fills in the values
-locally (`narrative.py`; the brain sees the template, never the filled text).
-Some of what is sent can still carry individual values from your data: the
-categories of a text column with at most 20 distinct values, Excel header
-text, and the answer text of history rows stored before the narrative
-release. A column named in `SCHEMA_VALUE_DENY_COLUMNS` sends its name, dtype
-and counts only, never a value. User email is sent for tenant routing.
+locally (`narrative.py`; the brain sees the template, never the filled text),
+and the template is what travels back as history and in titles and reports.
+Besides the category values above, two other items can carry text read from
+the data: Excel header text, and the answer text of history rows stored
+before the narrative release, sent as stored. A column named in
+`SCHEMA_VALUE_DENY_COLUMNS` sends its name, dtype and counts only, never a
+value. User email is sent for tenant routing.
+
+`CUSTOMER_INSTALL.md` → "Intended use" and "What leaves your network" state
+the same boundary in customer-facing words; the two files must stay in
+agreement.
 
 - `/v1/summarize` always gets `preview: null`. The `_safe_preview` helper in
   [`run_chat_local.py`](run_chat_local.py) still decides what a scalar result
