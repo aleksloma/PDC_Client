@@ -1181,7 +1181,7 @@ async def admin_data_sources_page(request: Request):
 @app.get("/power/data_sources", response_class=HTMLResponse)
 async def power_data_sources_page(request: Request):
     """The POWER-USER variant of the Data-sources page: the same template in
-    "power" mode (Connections read-only; Tables/Relations/per-table schedule
+    "power" mode (granted connections read-only; Tables/Relations/per-table schedule
     only; no Users/Roles/Audit/global schedule). Same redirect-never-error
     guard style: no session → /, forced change → change_password, ladmin →
     its own page, a user who is neither power nor self-service → /lab. A

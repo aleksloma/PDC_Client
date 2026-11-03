@@ -477,6 +477,12 @@ Prerequisites (client env, see `client.env.example`):
   (the answer carries the truncation note).
 - `LIVE_QUERY_TIMEOUT_S`: the live query's statement timeout in seconds
   (default `60`), capped by the connection's own statement timeout.
+- `PERSONAL_TABLES_MAX`: optional, default `15` (minimum 1). The most tables a
+  user may register on their own (personal) connections, connectors counted;
+  a new registration past it is refused (`PERSONAL_TABLE_CAP`), edits never
+  count. Every user who is not an administrator may add their own read-only
+  connections from `/power/data_sources`; the administrator switches that off
+  per user in the Users section ("Own connections").
 - A live table is registered, profiled from a sample and skipped by
   scheduled refreshes; chats query it at question time — one read-only SELECT
   per live table a question uses, run by the web application, capped by rows

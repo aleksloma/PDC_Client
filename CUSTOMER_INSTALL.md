@@ -289,6 +289,18 @@ client only ever issues SELECT/introspection statements, and that grant is
 your hard guarantee. Set the nightly snapshot-refresh time in the admin UI
 (container-local time — set `TZ` in `client.env` if your server isn't UTC).
 
+**Users may add their own connections.** Every user who is not an
+administrator can add their own database connections ("personal
+connections") from **DB config** in their profile menu, and register up to
+`PERSONAL_TABLES_MAX` tables on them (default 15; set it in `client.env` to
+change it). A personal connection and its tables are visible to their owner
+only, are never shared through roles, and are deleted when the user is
+removed. You see them read-only on the admin page, with the owner. The
+feature is on for every account; switch it off per user in **Users → Own
+connections**. PowerDataChat only ever reads from these databases, whatever
+the login's privileges, but recommend that your users connect with
+read-only logins anyway.
+
 **Oracle: thick mode (`ORACLE_THICK_MODE`).** By default the client talks to
 Oracle in the driver's *thin* mode. Thin mode cannot read NCHAR, NVARCHAR2 or
 NCLOB columns of a database whose national character set is not AL16UTF16,

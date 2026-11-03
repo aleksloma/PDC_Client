@@ -8,8 +8,9 @@
  * /power/data_sources): the template removes Users/Roles/Audit/global-
  * schedule sections, the connection-mutation buttons and the wizard Access
  * panel; this file mirrors that by trimming SECTIONS, skipping the ladmin-
- * only fetches (they would 403), rendering connections read-only (browse
- * only) and showing table Delete only on tables the power user registered
+ * only fetches (they would 403), rendering granted connections read-only
+ * (browse only; the caller's OWN personal connections get the full action
+ * set) and showing table Delete only on tables the power user registered
  * themselves (registered_by === window.__MANAGER_EMAIL__ — the API enforces
  * the same rule). Admin mode behavior is unchanged.
  *

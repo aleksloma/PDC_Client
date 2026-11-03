@@ -2,10 +2,13 @@
 registered tables by ladmin, plus scoped self-service by POWER USERS.
 
 Security model:
-  - Connection lifecycle (create/edit/delete/test/refresh-all), the GLOBAL
-    refresh schedule and the audit tail stay behind `_require_admin`
-    (role == "admin" on the local user record; 403 while a forced password
-    change is pending). Denials are audited (`admin.denied`).
+  - The GLOBAL refresh schedule and the audit tail stay behind
+    `_require_admin` (role == "admin" on the local user record; 403 while a
+    forced password change is pending). Denials are audited
+    (`admin.denied`). The connection lifecycle (create/edit/delete/test/
+    refresh-all) is behind `_require_source_manager` since personal
+    connections: an administrator keeps every non-personal connection, a
+    non-admin creates and manages only their OWN (personal) connections.
   - Everything a power user may reach is behind `_require_source_manager`:
     ladmin passes unrestricted (scope None); a user whose PERMISSION is
     "power" (AuthStore profile role, 19e) gets the union of their held
