@@ -1453,10 +1453,14 @@ relate a personal table (`403 PERSONAL_OWNER_ONLY`); a non-admin cannot
 change ladmin's connections (`403 OUT_OF_SCOPE`). The non-admin
 test-connection probe is rate limited (10 per 60 s per user, `429
 TOO_MANY_TESTS`) and audited `{db_type, host, port, ok}`. Writes on personal
-sources are audited `actor_kind: "personal"`. Open point, outside this
-design: the read-only browse routes (`connections/{cid}/schemas` and
-`/tables`, `tables/introspect`, `tables/draft_descriptions`, the relation
-scan) still accept an administrator on a personal connection.
+sources are audited `actor_kind: "personal"`. Reads are owner-only as
+well (decided 2026-11-04): the browse routes (`connections/{cid}/schemas`
+and `/tables`, `tables/introspect`, `tables/draft_descriptions`) answer an
+administrator and any other user `403 PERSONAL_OWNER_ONLY` on a personal
+connection, and the relation scan leaves out other owners' personal tables,
+an administrator's scan included. What ladmin sees of a personal connection
+is the lists: the connection and its registered tables, read-only, with the
+owner.
 
 *Removal cascade.* Removing the user (`POST /api/admin/users/remove`)
 deletes every connection they own with every table on it — registry rows,

@@ -41,6 +41,12 @@
       .find((x) => x.id === cid);
     return !!(c && c.personal);
   }
+  // The connections the caller may browse to register a table: a personal
+  // connection is its owner's alone (the browse routes refuse anyone else).
+  function _browsableConnections() {
+    return (typeof CONNECTIONS !== 'undefined' ? CONNECTIONS : [])
+      .filter((c) => !c.personal || c.owned);
+  }
   function _connOwner(cid) {
     const c = (typeof CONNECTIONS !== 'undefined' ? CONNECTIONS : [])
       .find((x) => x.id === cid);
@@ -621,15 +627,16 @@
   // several → quick pick via prompt-free chooser (first connection preselected
   // in a tiny select is overkill — use a confirm-style chooser list).
   function registerTableEntry() {
-    if (!CONNECTIONS.length) {
+    const conns = _browsableConnections();
+    if (!conns.length) {
       showSection('connections');
       toast(POWER ? 'No connections are in your granted scope — ask your administrator'
                   : 'Add a database connection first', true);
       return;
     }
-    if (CONNECTIONS.length === 1) { openTableWizard(CONNECTIONS[0].id); return; }
+    if (conns.length === 1) { openTableWizard(conns[0].id); return; }
     // lightweight chooser: reuse the wizard's step-1 connection field as a select
-    openTableWizard(CONNECTIONS[0].id, null, true);
+    openTableWizard(conns[0].id, null, true);
   }
 
   // ── Register / edit wizard (3 steps) ───────────────────────────────────
@@ -694,7 +701,7 @@
     if (chooseConn) {
       const sel = document.createElement('select');
       sel.id = 'twConnName';
-      CONNECTIONS.forEach((c) => {
+      _browsableConnections().forEach((c) => {
         const o = document.createElement('option');
         o.value = c.id; o.textContent = c.name;
         sel.appendChild(o);
@@ -1838,6 +1845,12 @@
   }
 
   function registerGhost(g) {
+    // A personal connection is browsed by its owner only (the server answers
+    // PERSONAL_OWNER_ONLY): say so instead of opening an empty wizard.
+    if (!_browsableConnections().some((c) => c.id === g.connection_id)) {
+      toast('Only the owner can register tables on a personal connection.', true);
+      return;
+    }
     // connector: null -> the wizard pre-ticks from the same suggestion
     // instead of assuming every recommended table is a connector.
     openTableWizard(g.connection_id, null, false,

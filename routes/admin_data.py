@@ -9,6 +9,11 @@ Security model:
     refresh-all) is behind `_require_source_manager` since personal
     connections: an administrator keeps every non-personal connection, a
     non-admin creates and manages only their OWN (personal) connections.
+    A personal connection is its owner's alone for reads too: the browse
+    routes (schema / table listing, introspect, draft descriptions) answer
+    403 PERSONAL_OWNER_ONLY to ladmin and to any other user, and the
+    relation scan leaves out other owners' personal tables; the lists
+    (GET /connections, GET /tables) still show them to ladmin read-only.
   - Everything a power user may reach is behind `_require_source_manager`:
     ladmin passes unrestricted (scope None); a user whose PERMISSION is
     "power" (AuthStore profile role, 19e) gets the union of their held
@@ -148,6 +153,7 @@ _PERSONAL_NO_CONNECTOR_TEXT = ("A table on a personal connection cannot be a "
 _PERSONAL_MIXED_TEXT = ("A personal table can be related only to tables on "
                         "your own connections.")
 _ADMIN_CONNECTION_TEXT = "Only the administrator can change this connection."
+_PERSONAL_BROWSE_TEXT = "Only the owner can browse a personal connection."
 
 
 def _owner_of(conn) -> str:
@@ -213,6 +219,21 @@ def _connection_write_refusal(email, scope, conn):
         return None
     if scope is not None:
         return _out_of_scope(_ADMIN_CONNECTION_TEXT)
+    return None
+
+
+def _browse_refusal(email, store, cid):
+    """The read rule of the browse routes: a PERSONAL connection is browsed
+    by its owner only — ladmin and every other user get 403
+    PERSONAL_OWNER_ONLY (checked before the scope rule, so the code names
+    the reason). Not personal, unknown or no id → None (today's path)."""
+    cid = str(cid or "").strip()
+    if not cid:
+        return None
+    conn = store.get_connection(cid)
+    if _is_personal(conn) and not _owns_connection(email, conn):
+        return _refusal_response(("PERSONAL_OWNER_ONLY",
+                                  _PERSONAL_BROWSE_TEXT))
     return None
 
 
@@ -565,9 +586,12 @@ async def connection_schemas(request: Request, cid: str):
     email, scope, err = _require_source_manager(request)
     if err:
         return err
+    store = db_sources.DataSourceStore()
+    refusal = _browse_refusal(email, store, cid)
+    if refusal is not None:
+        return refusal
     if scope is not None and not any(g.get("connection_id") == cid for g in scope):
         return _out_of_scope()
-    store = db_sources.DataSourceStore()
     cfg, password, resp = _conn_cfg_and_password(store, {"connection_id": cid})
     if resp is not None:
         return resp
@@ -591,9 +615,12 @@ async def connection_tables(request: Request, cid: str, schema: str = ""):
     email, scope, err = _require_source_manager(request)
     if err:
         return err
+    store = db_sources.DataSourceStore()
+    refusal = _browse_refusal(email, store, cid)
+    if refusal is not None:
+        return refusal
     if not _in_scope(scope, cid, schema or None):
         return _out_of_scope()
-    store = db_sources.DataSourceStore()
     cfg, password, resp = _conn_cfg_and_password(store, {"connection_id": cid})
     if resp is not None:
         return resp
@@ -864,12 +891,17 @@ async def scan_relations(request: Request):
     the registry); an unreachable connection degrades that source only —
     name/description candidates still come back. Nothing is written. A power
     user's scan runs over their manageable tables only — introspection,
-    candidates, recommendations and the confirmed count all stay in scope."""
+    candidates, recommendations and the confirmed count all stay in scope.
+    Tables on another user's PERSONAL connection are left out for every
+    caller, ladmin included (the owner's own stay in their scan)."""
     email, scope, err = _require_source_manager(request)
     if err:
         return err
     store = db_sources.DataSourceStore()
-    tables = _scoped_tables(scope, store.list_tables())
+    me = str(email or "").strip().lower()
+    owner_of = {c.get("id"): _owner_of(c) for c in store.list_connections()}
+    tables = [t for t in _scoped_tables(scope, store.list_tables())
+              if owner_of.get(t.get("connection_id"), "") in ("", me)]
     degraded: list = []
     fk_map: dict = {}
 
@@ -1834,10 +1866,13 @@ async def introspect_table(request: Request):
     # A power user may introspect only saved connections inside their scope —
     # the unsaved-draft path (no connection_id) is inherently out of scope,
     # since no grant can reference an unsaved connection.
+    store = db_sources.DataSourceStore()
+    refusal = _browse_refusal(email, store, body.get("connection_id"))
+    if refusal is not None:
+        return refusal
     if not _in_scope(scope, (body.get("connection_id") or "").strip(),
                      (body.get("schema") or "").strip() or None):
         return _out_of_scope()
-    store = db_sources.DataSourceStore()
     cfg, password, resp = _conn_cfg_and_password(store, body)
     if resp is not None:
         return resp
@@ -2162,10 +2197,13 @@ async def draft_descriptions(request: Request):
     if err:
         return err
     body = await _json_body(request)
+    store = db_sources.DataSourceStore()
+    refusal = _browse_refusal(email, store, body.get("connection_id"))
+    if refusal is not None:
+        return refusal
     if not _in_scope(scope, (body.get("connection_id") or "").strip(),
                      (body.get("schema") or "").strip() or None):
         return _out_of_scope()
-    store = db_sources.DataSourceStore()
     cfg, password, resp = _conn_cfg_and_password(store, body)
     if resp is not None:
         return resp

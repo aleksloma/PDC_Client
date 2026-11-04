@@ -432,10 +432,10 @@ client must be closed on FastAPI lifespan shutdown.
    follow every rule above unchanged. They are owner-only for every write
    (only the owner edits, deletes, tests or refreshes them and registers or
    changes their tables), only the owner is offered their tables in a chat,
-   an administrator sees them read-only (the read-only browse routes —
-   schema and table listing, introspect, draft descriptions, relation scan —
-   still accept an administrator, an open point recorded in
-   ENTERPRISE_ARCHITECTURE.md §10b), and they are never grantable to a role
+   only the owner browses them (schema and table listing, introspect,
+   draft descriptions; the relation scan leaves out other owners' personal
+   tables), an administrator sees only the connection and its registered
+   tables, read-only, in the lists, and they are never grantable to a role
    and never connector tables. Their
    read-only guarantee does not depend on the privileges of the login the
    user typed: the connector issues SQLAlchemy SELECT constructs only, live

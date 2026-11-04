@@ -441,10 +441,13 @@ Decisions confirmed with Sandro, as built:
   connection form shows a checked, disabled "Read-only access" box.
 - **Out of scope.** No sharing of personal tables through roles or any new
   mechanism; no scheduler change (personal tables refresh on the global
-  schedule); no chat/dashboard sharing change. Open point for a later
-  decision: the read-only browse routes (schema/table listing, introspect,
-  draft descriptions, relation scan) still accept an administrator on a
-  personal connection.
+  schedule); no chat/dashboard sharing change.
+- **Browse (decided 2026-11-04).** Reads are owner-only too: the browse
+  routes (schema/table listing, introspect, draft descriptions) answer
+  ladmin and any other user `403 PERSONAL_OWNER_ONLY` on a personal
+  connection, and the relation scan leaves out other owners' personal
+  tables. Ladmin keeps the read-only lists (the connection and its
+  registered tables, with the owner).
 
 ## Follow-up standalone task (after Phase 1)
 

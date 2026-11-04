@@ -137,3 +137,21 @@ def test_profile_partial_shows_db_config_for_self_service():
     assert m, PARTIAL[:600]
     cond = m.group(1)
     assert "is_power_user" in cond and "is_admin_user" in cond and "is_self_service" in cond
+
+
+def test_register_table_chooser_offers_only_browsable_connections():
+    """2026-11-04: the browse routes refuse a personal connection to anyone
+    but its owner, so the Tables section's "＋ Register table" entry and the
+    wizard's connection chooser draw on `_browsableConnections()` (not
+    personal, or owned) — an administrator is never offered a personal
+    connection it would get a 403 for."""
+    m = re.search(r"function _browsableConnections\(\) \{(.*?)\n  \}", JS, re.S)
+    assert m, "_browsableConnections() missing"
+    assert "!c.personal || c.owned" in m.group(1)
+    entry = re.search(r"function registerTableEntry\(\) \{(.*?)\n  \}", JS, re.S)
+    assert entry and "_browsableConnections()" in entry.group(1)
+    assert "CONNECTIONS.length" not in entry.group(1)
+    assert "_browsableConnections().forEach((c) => {" in JS
+    ghost = re.search(r"function registerGhost\(g\) \{(.*?)\n  \}", JS, re.S)
+    assert ghost and "_browsableConnections()" in ghost.group(1)
+    assert "Only the owner can register tables on a personal connection." in ghost.group(1)

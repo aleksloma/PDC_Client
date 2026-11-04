@@ -628,3 +628,93 @@ def test_switched_off_user_keeps_personal_tables_in_chats_and_schedule(client, c
     res = db_scheduler.run_all_due(table_ids=[t["id"]], force=True)
     assert [r["table_id"] for r in res["results"]] == [t["id"]]
     assert res["results"][0]["ok"] is True, res
+
+
+# ── browse routes: a personal connection is its owner's alone (2026-11-04) ──
+
+def _browse_calls(client, cid):
+    """The four read-only browse routes for one connection, as responses."""
+    return {
+        "schemas": client.get(f"/api/admin/connections/{cid}/schemas"),
+        "tables": client.get(f"/api/admin/connections/{cid}/tables"),
+        "introspect": client.post("/api/admin/tables/introspect",
+                                  json={"connection_id": cid, "schema": "",
+                                        "table": "t"}),
+        "draft": client.post("/api/admin/tables/draft_descriptions",
+                             json={"connection_id": cid, "schema": "",
+                                   "table": "t"}),
+    }
+
+
+def test_browse_routes_owner_only_on_personal_connection(client, conns):
+    """Decision 2026-11-04: on a PERSONAL connection the schema / table
+    listing, introspect and draft-descriptions routes answer 403
+    PERSONAL_OWNER_ONLY to ladmin AND to any other user (checked before the
+    scope rule); the owner browses as before, and ladmin keeps browsing its
+    own connections. An ordinary refusal: no admin.denied row."""
+    _login(client, OWNER)
+    for name, r in _browse_calls(client, conns["mine"]).items():
+        assert r.status_code == 200, (name, r.json())
+        assert r.json().get("ok") is True, (name, r.json())
+    for who in (ADMIN, ADMIN2, OTHER):
+        _login(client, who)
+        for name, r in _browse_calls(client, conns["mine"]).items():
+            assert r.status_code == 403, (who, name, r.json())
+            assert r.json()["code"] == "PERSONAL_OWNER_ONLY", (who, name)
+    _login(client, ADMIN)
+    for name, r in _browse_calls(client, conns["lad"]).items():
+        assert r.status_code == 200 and r.json().get("ok") is True, (name, r.json())
+    assert _audit("admin.denied") == []
+
+
+def test_admin_lists_still_show_personal_sources_read_only(client, conns):
+    """The browse rule does not hide anything from the lists: ladmin still
+    sees the personal connection (with its owner) and its registered
+    tables."""
+    _login(client, OWNER)
+    t = _register(client, conns["mine"], "t")
+    _login(client, ADMIN)
+    rows = {c["id"]: c for c in client.get("/api/admin/connections").json()["connections"]}
+    assert rows[conns["mine"]]["personal"] is True
+    assert rows[conns["mine"]]["owner"] == OWNER
+    tids = {x["id"] for x in client.get("/api/admin/tables").json()["tables"]}
+    assert t["id"] in tids
+
+
+def test_relation_scan_skips_other_owners_personal_tables(client, conns, monkeypatch):
+    """The relation scan introspects and considers only tables the caller
+    may browse: ladmin's scan leaves out every personal table, the owner's
+    scan keeps their own and never another owner's."""
+    import routes.admin_data as admin_mod
+    mine = _store_table(conns["mine"], "t", registered_by=OWNER)
+    theirs = _store_table(conns["theirs"], "t", registered_by=OTHER)
+    lad = _store_table(conns["lad"], "t")
+    seen = []
+    real = admin_mod.db_connector.introspect
+
+    def spy(cfg, password, schema, table, sid=None, **kw):
+        seen.append(cfg.get("url_override"))
+        return real(cfg, password, schema, table, sid=sid, **kw)
+
+    monkeypatch.setattr(admin_mod.db_connector, "introspect", spy)
+    store = db_sources.DataSourceStore()
+
+    def db_of(cid):
+        return store.get_connection(cid, with_secret=True)["url_override"]
+
+    _login(client, ADMIN)
+    r = client.post("/api/admin/relations/scan", json={})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert seen == [db_of(conns["lad"])]
+    assert _audit("relations.scan")[0]["detail"]["tables"] == 1
+    ids = {c.get("table_id") for c in r.json()["candidates"]} | {
+        c.get("related_table_id") for c in r.json()["candidates"]}
+    assert not ids & {mine["id"], theirs["id"]}
+
+    seen.clear()
+    _login(client, OWNER)
+    r = client.post("/api/admin/relations/scan", json={})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert seen == [db_of(conns["mine"])]
+    assert _audit("relations.scan")[0]["detail"]["tables"] == 1
+    assert lad["id"] not in {c.get("table_id") for c in r.json()["candidates"]}
