@@ -3771,7 +3771,7 @@
     ta.remove();
   }
 
-  // ── Account (sidebar footer) ───────────────────────────────────────────
+  // ── Account (admin sidebar footer + the power-mode profile menu) ───────────────────────────────────────────
   async function logout() {
     try { await fetch('/auth/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' } }); } catch (e) { /* ignore */ }
     window.location.href = '/';
@@ -3902,8 +3902,31 @@
     $('btnSsoDisable')?.addEventListener('click', disableSso);
     $('btnSsoCopyUri')?.addEventListener('click', copySsoRedirectUri);
 
-    $('btnAdmLogout').addEventListener('click', logout);
-    $('btnAdmChangePw').addEventListener('click', openPwModal);
+    // ?. binds: the sidebar footer controls are removed in power mode.
+    $('btnAdmLogout')?.addEventListener('click', logout);
+    $('btnAdmChangePw')?.addEventListener('click', openPwModal);
+    // Power mode: the sidebar footer is gone, the shared profile partial in
+    // the top bar carries the same three actions (Back to chat / Change
+    // Password / Logout). Same toggle + outside-click close as dashboard.js.
+    const profBtn = $('btnProfileIcon');
+    const profDrop = $('profileDropdown');
+    if (profBtn && profDrop) {
+      profBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        profDrop.classList.toggle('hidden');
+      });
+      document.addEventListener('click', (e) => {
+        if (!e.target.closest('.profile-dropdown-container')) profDrop.classList.add('hidden');
+      });
+      $('btnBackToChat')?.addEventListener('click', (e) => {
+        window.location.href = e.currentTarget.dataset.target || '/lab';
+      });
+      $('btnChangePassword')?.addEventListener('click', () => {
+        profDrop.classList.add('hidden');
+        openPwModal();
+      });
+      $('btnLogout')?.addEventListener('click', logout);
+    }
     $('closePwModal').addEventListener('click', () => $('pwModal').classList.add('hidden'));
     $('btnCancelPw').addEventListener('click', () => $('pwModal').classList.add('hidden'));
     $('btnSavePw').addEventListener('click', savePassword);

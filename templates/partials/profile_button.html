@@ -1,8 +1,12 @@
 {# Shared profile button + dropdown partial.
-   Used on dashboard.html (the /lab page) and dashboard_view.html.
+   Used on dashboard.html (the /lab page), dashboard_view.html and — in
+   POWER mode only — admin_data_sources.html (the /power/data_sources top bar).
    Requires template context: logged_in, avatar_color, initials, display_name, subscription_plan, raw_username
    Optional: is_power_user (defaulted false — dashboard_view passes it via
-   _profile_context too, but the default keeps any other includer safe).
+   _profile_context too, but the default keeps any other includer safe);
+   profile_menu_back_to_chat (defaulted false — the Data-sources page sets it
+   so the first item is "Back to chat" → /lab instead of "DB config", which
+   would point at the page itself; /lab and dashboard_view render unchanged).
 
    ENTERPRISE: the dropdown carries "Change Password" (opens the small
    change-password modal, wired in dashboard.js) and "Logout"; a POWER USER
@@ -26,6 +30,10 @@
   {% endif %}
   <div id="profileDropdown" class="profile-dropdown hidden">
     {% if logged_in %}
+    {%- if profile_menu_back_to_chat | default(false) %}
+    <button class="dropdown-item" id="btnBackToChat" data-target="/lab">Back to chat</button>
+    <div class="dropdown-divider"></div>
+    {%- else %}
     {% if is_power_user | default(false) or is_admin_user | default(false) or is_self_service | default(false) %}
     {# 19g: promoted admins get the full admin page; power users and
        self-service users (personal connections) keep /power. The target
@@ -34,6 +42,7 @@
       data-target="{% if is_admin_user | default(false) %}/admin/data_sources{% else %}/power/data_sources{% endif %}">DB config</button>
     <div class="dropdown-divider"></div>
     {% endif %}
+    {%- endif %}
     <button class="dropdown-item" id="btnChangePassword" data-i18n="profile.change_pw_btn">Change Password</button>
     <div class="dropdown-divider"></div>
     <button class="dropdown-item" id="btnLogout" data-i18n="profile.logout">Logout</button>

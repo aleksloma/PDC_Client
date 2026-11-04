@@ -55,25 +55,33 @@
         {% endif %}
       </nav>
 
-      <div class="adm-sidebar-footer">
+      {# The account controls live here in ADMIN mode only. In POWER mode
+         the top bar carries the chat page's profile button instead (the
+         shared partial, below), so the control exists once; the footer
+         keeps the build stamp. Every tag of this block sits at a line end so
+         the admin-mode render stays byte-identical
+         (tests/test_power_page_profile_menu.py). #}<div class="adm-sidebar-footer">{% if manager_mode != 'power' %}
         <div class="adm-user">
           <span class="adm-user-avatar">{{ (username or 'A')[0]|upper }}</span>
           <span class="adm-user-name" title="{{ username }}">{{ username }}</span>
         </div>
         {# 19g: promoted admins are full chat users too — the /admin route
            passes back_to_chat for them (bootstrap ladmin gets false). #}
-        {% if manager_mode == 'power' or back_to_chat | default(false) %}
+        {% if back_to_chat | default(false) %}
         <a href="/lab" class="adm-footer-btn adm-back-link">← Back to chat</a>
         {% endif %}
         <button id="btnAdmChangePw" class="adm-footer-btn">Change password</button>
-        <button id="btnAdmLogout" class="adm-footer-btn">Sign out</button>
+        <button id="btnAdmLogout" class="adm-footer-btn">Sign out</button>{% endif %}
         <div class="adm-build-stamp" title="The running build — also served by /version">
           {{ build_stamp }}</div>
       </div>
     </aside>
 
     <!-- ── Main content ─────────────────────────────────────────────────── -->
-    <main class="adm-main">
+    <main class="adm-main">{% if manager_mode == 'power' %}
+      {# POWER mode: the chat page's profile button, top right, with Back to
+         chat / Change Password / Logout (wired in admin_data_sources.js). #}
+      <div class="adm-topbar">{% with profile_menu_back_to_chat = true %}{% include 'partials/profile_button.html' %}{% endwith %}</div>{% endif %}
 
       <!-- Connections -->
       <section id="secConnections" class="adm-section">
