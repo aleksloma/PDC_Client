@@ -10,6 +10,33 @@ against the existing data volume.
 
 ## Unreleased (on `main`, not yet tagged)
 
+### joserfc 1.7.5 → 1.7.6, pyasn1 0.6.4 → 0.6.5 — 2026-11-04
+
+**Why.** pip-audit (PyPI and OSV) on the built web image reported
+CVE-2026-119284 against `joserfc==1.7.5` (fixed in 1.7.6) and
+CVE-2026-119194, CVE-2026-119195, CVE-2026-119196 and CVE-2026-119197 against
+`pyasn1==0.6.4` (fixed in 0.6.5), published after the last green `main` run
+(2026-10-28). They made the CI `images` check fail for every pull request.
+joserfc is Authlib's JOSE library (Microsoft Entra ID SSO); pyasn1 is a
+transitive of `rsa` / `pyasn1_modules` (google-auth, the optional
+direct-to-GCS upload path). Both are web-image only.
+
+**Change.**
+- `joserfc==1.7.6` and `pyasn1==0.6.5` in `requirements.txt`, each with a
+  comment naming the advisories (the sandbox image installs neither).
+- The regression floors `FIX_VERSIONS["joserfc"] = "1.7.6"` and
+  `FIX_VERSIONS["pyasn1"] = "0.6.5"` in `tests/test_dependency_pins.py`.
+- Nothing else changed. The parents' bounds already admit both releases
+  (Authlib 1.9.1 `joserfc>=1.6.8`; pyasn1_modules 0.4.2
+  `pyasn1>=0.6.1,<0.7.0`; rsa 4.9.1 `pyasn1>=0.1.3`).
+
+**Gates (local, before the pull request).**
+
+| Gate | Result |
+|---|---|
+| Web suite, Python 3.11, Windows, with joserfc 1.7.6 and pyasn1 0.6.5 installed (`tests/test_export_plotly_png.py` excluded locally — kaleido does not start natively on this machine; CI runs it) | 5655 passed, 87 skipped, 0 failed |
+| CI tests / executor-tests / images | Required on the pull request; merged only when all three pass |
+
 ### Authlib 1.8.0 → 1.9.1 — 2026-10-28
 
 **Why.** pip-audit (PyPI and OSV) reported six advisories against

@@ -38,9 +38,11 @@ nh3==0.3.7
 # emits a deprecation warning steering to "httpx2": that is its own
 # forward-compat shim, not a version bound (its only requirements are
 # cryptography>=45.0.1 and joserfc>=1.6.8), so httpx stays at 0.27.2 until
-# httpx 1.0 ships.
+# httpx 1.0 ships. joserfc 1.7.6 is the release that fixes CVE-2026-119284
+# (pip-audit, 2026-11-03) against 1.7.5; Authlib's own floor (>=1.6.8) would
+# accept the vulnerable release, so the pin is what keeps it out.
 Authlib==1.9.1
-joserfc==1.7.5
+joserfc==1.7.6
 
 # Data + execution (mirrors the B2C app except where security pins move
 # ahead of it — pyarrow no longer matches, and pillow is pinned here).
@@ -121,7 +123,11 @@ googleapis-common-protos==1.75.2
 proto-plus==1.28.4
 protobuf==7.36.1
 cachetools==5.5.2
-pyasn1==0.6.4
+# Transitive of rsa and pyasn1_modules (google-auth). Neither bounds it below
+# 0.6.5, the release that fixes CVE-2026-119194/119195/119196/119197
+# (pip-audit, 2026-11-03) against 0.6.4; pyasn1_modules 0.4.2 requires
+# pyasn1>=0.6.1,<0.7.0, so 0.6.5 stays inside its range.
+pyasn1==0.6.5
 pyasn1_modules==0.4.2
 rsa==4.9.1
 # Refresh scheduling: preset schedules (daily/weekly/monthly/interval/cron)
