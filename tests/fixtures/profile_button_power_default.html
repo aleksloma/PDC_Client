@@ -1,0 +1,26 @@
+
+<div class="profile-dropdown-container">
+  
+  <button id="btnProfileIcon" class="profile-btn" title="Profile"
+          data-username="power@x.com">
+    <span id="profileAvatar" class="profile-avatar" style="background:#2563eb">PO</span>
+    <span class="profile-btn-info">
+      <span id="profileBtnName" class="profile-btn-name">power@x.com</span>
+      <span id="profileBtnPlan" class="profile-btn-plan">Enterprise</span>
+    </span>
+  </button>
+  
+  <div id="profileDropdown" class="profile-dropdown hidden">
+    
+    
+    
+    <button class="dropdown-item" id="btnDbConfig" data-i18n="profile.db_config"
+      data-target="/power/data_sources">DB config</button>
+    <div class="dropdown-divider"></div>
+    
+    <button class="dropdown-item" id="btnChangePassword" data-i18n="profile.change_pw_btn">Change Password</button>
+    <div class="dropdown-divider"></div>
+    <button class="dropdown-item" id="btnLogout" data-i18n="profile.logout">Logout</button>
+    
+  </div>
+</div>

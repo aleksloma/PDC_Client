@@ -403,6 +403,52 @@ cells instead of the row default above, the mode endpoint, the sampled
 profile, the admin UI). The query path follows. The current design, which
 supersedes the details above where they differ, is `docs/LIVE_TABLES_PLAN.md`.
 
+## Personal connections (self-service) — 2026-11-03
+
+Decisions confirmed with Sandro, as built:
+
+- **Who.** Every user who is not an administrator may add their own read-only
+  database connections, register tables on them and relate those tables,
+  from `/power/data_sources` (the profile menu's "DB config"). On by default;
+  the administrator switches it off per user in the Users window (`POST
+  /api/admin/users/set_self_service`, profile `self_service_sources`, absent
+  = on). Off blocks the page and the routes only; chats and existing personal
+  tables keep working.
+- **Storage.** A connection doc gains an optional `owner` (the creator's
+  email, lower-cased) — absent on every administrator connection and on
+  every doc written before, so nothing is migrated (an old-shape regression
+  test pins it). `settings.PERSONAL_TABLES_MAX` (default 15, floor 1) caps
+  the tables per owner.
+- **Scope.** `roles_store.manager_scope_for` = the power manage grants ∪ one
+  whole-connection grant per owned connection; the one resolver the
+  data-sources guard and the /power page use. `management_scope_for` is
+  unchanged.
+- **Ownership.** A personal connection and every table on it belong to the
+  owner alone: owner-only writes everywhere (ladmin `403
+  PERSONAL_OWNER_ONLY`, other users `403 OUT_OF_SCOPE`), never a role grant,
+  never a connector, never walked by the connector closure, no relation
+  across owners. Ladmin sees them read-only with the owner and keeps its own
+  connections (a non-admin cannot change them).
+- **Limits.** `PERSONAL_TABLE_CAP` on a new registration at the cap; the
+  non-admin test-connection probe is rate limited (10 per 60 s per user,
+  `429 TOO_MANY_TESTS`) and audited without user or password.
+- **Removal.** Removing the user deletes their personal connections and
+  every table on them (registry, snapshots, profiles, role ids) before the
+  remaining registrations are released.
+- **Read-only.** No enforcement code changed: SELECT constructs, the
+  `assert_read_only_query` gate, the sandbox driver denylist and the
+  per-dialect read-only sessions apply whatever the login's privileges. The
+  connection form shows a checked, disabled "Read-only access" box.
+- **Out of scope.** No sharing of personal tables through roles or any new
+  mechanism; no scheduler change (personal tables refresh on the global
+  schedule); no chat/dashboard sharing change.
+- **Browse (decided 2026-11-04).** Reads are owner-only too: the browse
+  routes (schema/table listing, introspect, draft descriptions) answer
+  ladmin and any other user `403 PERSONAL_OWNER_ONLY` on a personal
+  connection, and the relation scan leaves out other owners' personal
+  tables. Ladmin keeps the read-only lists (the connection and its
+  registered tables, with the owner).
+
 ## Follow-up standalone task (after Phase 1)
 
 Client-side user management: admin creates roles with table-view permissions and

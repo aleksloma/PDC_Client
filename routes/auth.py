@@ -322,6 +322,13 @@ def _public_profile(email: str) -> dict:
         is_admin_user = store.is_admin(email) and not store.is_bootstrap_admin(email)
     except Exception as e:
         log_with_sid(email, "warning", f"PROFILE_ADMIN_FLAG_FAILED: {log_safe_text(str(e), 200)}")
+    is_self_service = False
+    try:
+        import roles_store
+        is_self_service = roles_store.self_service_allowed(email)   # personal connections
+    except Exception as e:
+        log_with_sid(email, "warning",
+                     f"PROFILE_SELF_SERVICE_FLAG_FAILED error={log_safe_text(type(e).__name__, 80)}")
     return {
         "username": email,
         "email": email,
@@ -330,6 +337,7 @@ def _public_profile(email: str) -> dict:
         "is_local_admin": AuthStore().is_admin(email),
         "is_power_user": is_power,
         "is_admin_user": is_admin_user,
+        "is_self_service": is_self_service,
     }
 
 

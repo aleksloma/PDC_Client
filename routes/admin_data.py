@@ -2,10 +2,18 @@
 registered tables by ladmin, plus scoped self-service by POWER USERS.
 
 Security model:
-  - Connection lifecycle (create/edit/delete/test/refresh-all), the GLOBAL
-    refresh schedule and the audit tail stay behind `_require_admin`
-    (role == "admin" on the local user record; 403 while a forced password
-    change is pending). Denials are audited (`admin.denied`).
+  - The GLOBAL refresh schedule and the audit tail stay behind
+    `_require_admin` (role == "admin" on the local user record; 403 while a
+    forced password change is pending). Denials are audited
+    (`admin.denied`). The connection lifecycle (create/edit/delete/test/
+    refresh-all) is behind `_require_source_manager` since personal
+    connections: an administrator keeps every non-personal connection, a
+    non-admin creates and manages only their OWN (personal) connections.
+    A personal connection is its owner's alone for reads too: the browse
+    routes (schema / table listing, introspect, draft descriptions) answer
+    403 PERSONAL_OWNER_ONLY to ladmin and to any other user, and the
+    relation scan leaves out other owners' personal tables; the lists
+    (GET /connections, GET /tables) still show them to ladmin read-only.
   - Everything a power user may reach is behind `_require_source_manager`:
     ladmin passes unrestricted (scope None); a user whose PERMISSION is
     "power" (AuthStore profile role, 19e) gets the union of their held
@@ -34,7 +42,10 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import math
+import threading
 import time
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -75,12 +86,16 @@ def _require_admin(request: Request):
 
 
 def _require_source_manager(request: Request):
-    """3-tuple guard for the endpoints POWER USERS may reach: (email, scope,
-    None) on success — scope is None for ladmin (unrestricted) or the power
-    user's management grants (roles_store.management_scope_for, fail-closed) —
-    else (None, None, JSONResponse). 401/403/forced-change semantics and the
-    `admin.denied` audit row match _require_admin exactly (the guard-coverage
-    test counts those rows 1:1), with detail {"reason": "not_power_user"}."""
+    """3-tuple guard for the endpoints POWER USERS and SELF-SERVICE users
+    may reach: (email, scope, None) on success — scope is None for ladmin
+    (unrestricted), else roles_store.manager_scope_for: the power user's
+    management grants plus one whole-connection grant per connection the
+    user owns (fail-closed; [] for a self-service user without a
+    connection yet) — else (None, None, JSONResponse). 401/403/forced-change
+    semantics and the `admin.denied` audit row match _require_admin exactly
+    (the guard-coverage test counts those rows 1:1), with detail
+    {"reason": "self_service_disabled"} when the administrator switched the
+    user's personal connections off, else {"reason": "not_power_user"}."""
     email = request.session.get("email")
     if not email:
         return None, None, JSONResponse({"error": "Not authenticated"}, status_code=401)
@@ -91,10 +106,19 @@ def _require_source_manager(request: Request):
     if AuthStore().is_admin(email):
         return email, None, None
     import roles_store
-    scope = roles_store.management_scope_for(email)
+    scope = roles_store.manager_scope_for(email)
     if scope is None:
+        reason = "not_power_user"
+        try:
+            if (AuthStore().user_exists(email)
+                    and not roles_store.is_power_user(email)
+                    and not AuthStore().get_self_service(email)):
+                reason = "self_service_disabled"
+        except Exception as e:
+            log_with_sid(log_safe_text(email), "warning",
+                         f"ADMIN_DENY_REASON_FAILED error={log_safe_text(type(e).__name__, 80)}")
         db_sources.audit(email, "admin.denied", target=str(request.url.path), ok=False,
-                         detail={"reason": "not_power_user"},
+                         detail={"reason": reason},
                          ip=(request.client.host if request.client else None))
         log_with_sid(email, "warning", f"ADMIN_DENIED path={request.url.path}")
         return None, None, JSONResponse({"error": "Administrator access required"},
@@ -102,10 +126,185 @@ def _require_source_manager(request: Request):
     return email, scope, None
 
 
-def _kind(scope):
-    """Audit actor_kind for this request: ladmin (scope None) keeps rows
-    byte-identical; a power user's writes are labeled."""
+def _kind(scope, personal: bool = False):
+    """Audit actor_kind for this request: a write on a PERSONAL connection
+    or one of its tables is "personal"; otherwise ladmin (scope None) keeps
+    rows byte-identical and a power user's writes are "power_user"."""
+    if personal:
+        return "personal"
     return "power_user" if scope is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Personal (self-service) connections — a connection with an `owner`. It and
+# every table on it belong to the owner alone: ladmin sees them read-only
+# (PERSONAL_OWNER_ONLY on every write), another user never reaches them
+# (outside their scope), and a relation never crosses owners.
+# ---------------------------------------------------------------------------
+
+_PERSONAL_OWNER_ONLY_TEXT = ("Only the owner can change a personal connection "
+                             "or its tables.")
+_SELF_SERVICE_DISABLED_TEXT = ("Personal connections are switched off for "
+                               "your account. Ask your administrator.")
+_PERSONAL_NO_ROLES_TEXT = ("A table on a personal connection cannot be shared "
+                           "with roles.")
+_PERSONAL_NO_CONNECTOR_TEXT = ("A table on a personal connection cannot be a "
+                               "connector table.")
+_PERSONAL_MIXED_TEXT = ("A personal table can be related only to tables on "
+                        "your own connections.")
+_ADMIN_CONNECTION_TEXT = "Only the administrator can change this connection."
+_PERSONAL_BROWSE_TEXT = "Only the owner can browse a personal connection."
+
+
+def _owner_of(conn) -> str:
+    return str((conn or {}).get("owner") or "").strip().lower()
+
+
+def _is_personal(conn) -> bool:
+    """A personal connection carries an `owner`."""
+    return bool(_owner_of(conn))
+
+
+def _owns_connection(email, conn) -> bool:
+    owner = _owner_of(conn)
+    return bool(owner) and owner == str(email or "").strip().lower()
+
+
+def _table_owner(store, doc) -> str:
+    """The owner of the connection a table doc sits on ("" = not personal)."""
+    if not isinstance(doc, dict):
+        return ""
+    return _owner_of(store.get_connection(str(doc.get("connection_id") or "")))
+
+
+def _personal_refusal(email, scope, owners, mixed_msg: str = "") -> tuple | None:
+    """None, or (code, message), for a write touching the connection owners
+    listed ("" = not personal). No personal side → None (the ordinary scope
+    rules decide). A personal side and an administrator → PERSONAL_OWNER_ONLY.
+    Otherwise every side must be personal AND owned by the caller, else
+    OUT_OF_SCOPE (another user's connection, or a mix of owners)."""
+    owners = [str(o or "") for o in owners]
+    if not any(owners):
+        return None
+    if scope is None:
+        return ("PERSONAL_OWNER_ONLY", _PERSONAL_OWNER_ONLY_TEXT)
+    if any(o != email for o in owners):
+        return ("OUT_OF_SCOPE", mixed_msg or "Outside your managed scope.")
+    return None
+
+
+def _refusal_response(refusal: tuple):
+    code, msg = refusal
+    return JSONResponse({"error": msg, "code": code}, status_code=403)
+
+
+def _table_refusal(email, scope, store, doc):
+    """The single-table write rule as a response (or None)."""
+    ref = _personal_refusal(email, scope, [_table_owner(store, doc)])
+    return _refusal_response(ref) if ref else None
+
+
+def _connection_write_refusal(email, scope, conn):
+    """Edit / delete / refresh / saved-test of a connection: a personal one
+    is the owner's alone (ladmin → PERSONAL_OWNER_ONLY, anyone else →
+    OUT_OF_SCOPE); a non-personal one stays the administrator's."""
+    if conn is None:
+        return None
+    if _is_personal(conn):
+        if scope is None:
+            return _refusal_response(("PERSONAL_OWNER_ONLY",
+                                      _PERSONAL_OWNER_ONLY_TEXT))
+        if not _owns_connection(email, conn):
+            return _out_of_scope()
+        return None
+    if scope is not None:
+        return _out_of_scope(_ADMIN_CONNECTION_TEXT)
+    return None
+
+
+def _browse_refusal(email, store, cid):
+    """The read rule of the browse routes: a PERSONAL connection is browsed
+    by its owner only — ladmin and every other user get 403
+    PERSONAL_OWNER_ONLY (checked before the scope rule, so the code names
+    the reason). Not personal, unknown or no id → None (today's path)."""
+    cid = str(cid or "").strip()
+    if not cid:
+        return None
+    conn = store.get_connection(cid)
+    if _is_personal(conn) and not _owns_connection(email, conn):
+        return _refusal_response(("PERSONAL_OWNER_ONLY",
+                                  _PERSONAL_BROWSE_TEXT))
+    return None
+
+
+def _personal_table_count(store, email) -> int:
+    """Tables registered on the caller's own connections (connectors too)."""
+    owned = {g["connection_id"] for g in store.personal_grants_for(email)}
+    return sum(1 for t in store.list_tables() if t.get("connection_id") in owned)
+
+
+def _personal_cap_refusal(store, email):
+    cap = int(settings.PERSONAL_TABLES_MAX)
+    if _personal_table_count(store, email) >= cap:
+        return JSONResponse(
+            {"error": f"You can register at most {cap} tables on your own "
+                      "connections.",
+             "code": "PERSONAL_TABLE_CAP", "max": cap}, status_code=400)
+    return None
+
+
+def _rel_ref_owners(store, ref: str, tables=None) -> list:
+    """Connection owners of a relation's related side: a table id resolves
+    to its table, a legacy name to every registration of that name."""
+    if not ref:
+        return []
+    if db_sources.DataSourceStore.valid_id(ref):
+        parent = store.get_table(ref)
+        return [_table_owner(store, parent)] if parent else []
+    wanted = ref.strip().lower()
+    return [_table_owner(store, t)
+            for t in (tables if tables is not None else store.list_tables())
+            if wanted in {str(t.get("display_name") or "").strip().lower(),
+                          str(t.get("table_name") or "").strip().lower()}]
+
+
+# Non-admin test-connection limiter: per email, at most _TEST_LIMIT attempts
+# in _TEST_WINDOW_S seconds (module attributes the tests patch, read at call
+# time). In memory, per process — correct under the one-worker rule, like
+# auth_limiter. Bounded to _TEST_MAX_KEYS addresses (oldest dropped).
+_TEST_LIMIT = 10
+_TEST_WINDOW_S = 60
+_TEST_MAX_KEYS = 10_000
+_test_clock = time.monotonic
+_TEST_LOCK = threading.Lock()
+_TEST_ATTEMPTS: OrderedDict = OrderedDict()
+_TOO_MANY_TESTS_TEXT = "Too many connection tests. Try again in a minute."
+
+
+def _reset_test_limiter() -> None:
+    with _TEST_LOCK:
+        _TEST_ATTEMPTS.clear()
+
+
+def _test_limit_wait(email: str) -> int:
+    """0 when the attempt is allowed (and recorded), else the whole seconds
+    until the oldest attempt in the window expires."""
+    now = _test_clock()
+    key = str(email or "").strip().lower()
+    with _TEST_LOCK:
+        q = _TEST_ATTEMPTS.get(key)
+        if q is None:
+            q = deque()
+            _TEST_ATTEMPTS[key] = q
+        _TEST_ATTEMPTS.move_to_end(key)
+        while q and now - q[0] >= _TEST_WINDOW_S:
+            q.popleft()
+        if len(q) >= _TEST_LIMIT:
+            return max(1, math.ceil(_TEST_WINDOW_S - (now - q[0])))
+        q.append(now)
+        while len(_TEST_ATTEMPTS) > _TEST_MAX_KEYS:
+            _TEST_ATTEMPTS.popitem(last=False)
+    return 0
 
 
 def _in_scope(scope, connection_id, schema) -> bool:
@@ -211,15 +410,32 @@ async def list_connections(request: Request):
         counts[t.get("connection_id")] = counts.get(t.get("connection_id"), 0) + 1
     for c in conns:
         c["table_count"] = counts.get(c.get("id"), 0)
+        c["personal"] = _is_personal(c)
+        if scope is None:
+            c.setdefault("owner", None)
+        else:
+            # Which rows the page offers Test / Edit / Delete / Refresh on.
+            c["owned"] = _owns_connection(email, c)
     return {"connections": conns, "encryption_ready": db_sources.encryption_ready()}
 
 
 @router.post("/connections")
 async def create_connection(request: Request):
-    email, err = _require_admin(request)
+    """An administrator creates an ordinary connection (no `owner`); any
+    other caller past the guard creates a PERSONAL one (owner = the caller)
+    when self-service is allowed for them, else 403 SELF_SERVICE_DISABLED.
+    `url_override` is never taken from a non-admin body."""
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     body = await _json_body(request)
+    personal = scope is not None
+    if personal:
+        import roles_store
+        if not roles_store.self_service_allowed(email):
+            return JSONResponse({"error": _SELF_SERVICE_DISABLED_TEXT,
+                                 "code": "SELF_SERVICE_DISABLED"}, status_code=403)
+        body.pop("url_override", None)
     if not (body.get("name") or "").strip():
         return JSONResponse({"error": "Name is required."}, status_code=400)
     try:
@@ -235,7 +451,9 @@ async def create_connection(request: Request):
         return JSONResponse({"error": "Password is required."}, status_code=400)
     try:
         conn = db_sources.DataSourceStore().create_connection(
-            body, body.get("password"), actor=email)
+            body, body.get("password"), actor=email,
+            owner=email if personal else None,
+            actor_kind=_kind(scope, personal))
     except db_sources.EncryptionUnavailable as e:
         return JSONResponse({"error": str(e)}, status_code=503)
     return JSONResponse({"connection": conn}, status_code=201)
@@ -245,30 +463,75 @@ async def create_connection(request: Request):
 async def test_connection(request: Request):
     """SELECT-1 probe. Accepts {connection_id} OR a full unsaved draft (with
     password) so Test-before-Save works. Connectivity failure → 200 ok:false.
-    NOTE: registered before /connections/{cid} — literal beats parameter."""
-    email, err = _require_admin(request)
+    NOTE: registered before /connections/{cid} — literal beats parameter.
+    A non-admin caller is rate limited first (_TEST_LIMIT per _TEST_WINDOW_S,
+    429 TOO_MANY_TESTS), may test a saved connection only when they own it,
+    and a draft only with self-service allowed (url_override dropped, hidden
+    dialects refused); each probe they run is audited connection.test with
+    {db_type, host, port, ok} — never the user or the password."""
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     body = await _json_body(request)
     store = db_sources.DataSourceStore()
+    non_admin = scope is not None
+    if non_admin:
+        wait = _test_limit_wait(email)
+        if wait:
+            log_with_sid(log_safe_text(email), "warning",
+                         f"CONNECTION_TEST_LIMITED retry_after={wait}")
+            return JSONResponse({"error": _TOO_MANY_TESTS_TEXT,
+                                 "code": "TOO_MANY_TESTS"}, status_code=429,
+                                headers={"Retry-After": str(wait)})
+    cid = (body.get("connection_id") or "").strip()
+    if cid:
+        conn = store.get_connection(cid)
+        refusal = _connection_write_refusal(email, scope, conn)
+        if refusal is not None:
+            return refusal
+    elif non_admin:
+        import roles_store
+        if not roles_store.self_service_allowed(email):
+            return JSONResponse({"error": _SELF_SERVICE_DISABLED_TEXT,
+                                 "code": "SELF_SERVICE_DISABLED"}, status_code=403)
+        body.pop("url_override", None)
+        try:
+            if db_connector.get_dialect(body.get("db_type")).hidden:
+                raise ValueError(f"Unknown database type: {body.get('db_type')!r}")
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
     cfg, password, resp = _conn_cfg_and_password(store, body)
     if resp is not None:
         return resp
     res = await _run(db_connector.test_connection, cfg, password, sid=f"admin:{email}")
-    cid = (body.get("connection_id") or "").strip()
     if cid:
         store.mark_tested(cid, bool(res.get("ok")))
-    db_sources.audit(email, "connection.test", target=cid or (cfg.get("host") or ""),
-                     ok=bool(res.get("ok")), detail={"error": res.get("error")})
+    if non_admin:
+        db_sources.audit(email, "connection.test", target=cid or (cfg.get("host") or ""),
+                         ok=bool(res.get("ok")),
+                         detail={"db_type": cfg.get("db_type"), "host": cfg.get("host"),
+                                 "port": cfg.get("port"), "ok": bool(res.get("ok"))})
+    else:
+        db_sources.audit(email, "connection.test", target=cid or (cfg.get("host") or ""),
+                         ok=bool(res.get("ok")), detail={"error": res.get("error")})
     return res
 
 
 @router.post("/connections/{cid}")
 async def update_connection(request: Request, cid: str):
-    email, err = _require_admin(request)
+    """A personal connection is edited by its owner only; any other one by
+    an administrator only."""
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
+    store = db_sources.DataSourceStore()
+    existing = store.get_connection(cid)
+    refusal = _connection_write_refusal(email, scope, existing)
+    if refusal is not None:
+        return refusal
     body = await _json_body(request)
+    if scope is not None:
+        body.pop("url_override", None)
     if body.get("db_type"):
         try:
             if db_connector.get_dialect(body["db_type"]).hidden:
@@ -276,8 +539,9 @@ async def update_connection(request: Request, cid: str):
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
     try:
-        conn = db_sources.DataSourceStore().update_connection(
-            cid, body, body.get("password") or None, actor=email)
+        conn = store.update_connection(
+            cid, body, body.get("password") or None, actor=email,
+            actor_kind=_kind(scope, _is_personal(existing)))
     except db_sources.EncryptionUnavailable as e:
         return JSONResponse({"error": str(e)}, status_code=503)
     if conn is None:
@@ -287,12 +551,20 @@ async def update_connection(request: Request, cid: str):
 
 @router.post("/connections/{cid}/delete")
 async def delete_connection(request: Request, cid: str):
-    email, err = _require_admin(request)
+    """A personal connection is deleted by its owner only; any other one by
+    an administrator only."""
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
+    store = db_sources.DataSourceStore()
+    existing = store.get_connection(cid)
+    refusal = _connection_write_refusal(email, scope, existing)
+    if refusal is not None:
+        return refusal
     body = await _json_body(request)
-    res = db_sources.DataSourceStore().delete_connection(
-        cid, actor=email, cascade=bool(body.get("cascade")))
+    res = store.delete_connection(
+        cid, actor=email, cascade=bool(body.get("cascade")),
+        actor_kind=_kind(scope, _is_personal(existing)))
     if not res.get("ok"):
         return JSONResponse(
             {"error": "Registered tables still use this connection.",
@@ -314,9 +586,12 @@ async def connection_schemas(request: Request, cid: str):
     email, scope, err = _require_source_manager(request)
     if err:
         return err
+    store = db_sources.DataSourceStore()
+    refusal = _browse_refusal(email, store, cid)
+    if refusal is not None:
+        return refusal
     if scope is not None and not any(g.get("connection_id") == cid for g in scope):
         return _out_of_scope()
-    store = db_sources.DataSourceStore()
     cfg, password, resp = _conn_cfg_and_password(store, {"connection_id": cid})
     if resp is not None:
         return resp
@@ -340,9 +615,12 @@ async def connection_tables(request: Request, cid: str, schema: str = ""):
     email, scope, err = _require_source_manager(request)
     if err:
         return err
+    store = db_sources.DataSourceStore()
+    refusal = _browse_refusal(email, store, cid)
+    if refusal is not None:
+        return refusal
     if not _in_scope(scope, cid, schema or None):
         return _out_of_scope()
-    store = db_sources.DataSourceStore()
     cfg, password, resp = _conn_cfg_and_password(store, {"connection_id": cid})
     if resp is not None:
         return resp
@@ -364,12 +642,19 @@ async def connection_tables(request: Request, cid: str, schema: str = ""):
 
 @router.post("/connections/{cid}/refresh")
 async def refresh_connection(request: Request, cid: str):
-    """Refresh-now for every table on one connection (sequential)."""
-    email, err = _require_admin(request)
+    """Refresh-now for every table on one connection (sequential). A
+    personal connection is refreshed by its owner only; any other one by an
+    administrator only."""
+    email, scope, err = _require_source_manager(request)
     if err:
         return err
     import db_scheduler
     store = db_sources.DataSourceStore()
+    existing = store.get_connection(cid)
+    refusal = _connection_write_refusal(email, scope, existing)
+    if refusal is not None:
+        return refusal
+    kind = _kind(scope, _is_personal(existing))
     tables = [t for t in store.list_tables() if t.get("connection_id") == cid]
     results = []
     for t in tables:
@@ -381,7 +666,8 @@ async def refresh_connection(request: Request, cid: str):
                             "ok": True, "rows": None, "error": None,
                             "skipped": "live"})
             continue
-        res = await _run(db_scheduler.refresh_one_table, t.get("id"), actor=email)
+        res = await _run(db_scheduler.refresh_one_table, t.get("id"), actor=email,
+                         actor_kind=kind)
         results.append({"table_id": t.get("id"),
                         "display_name": t.get("display_name"),
                         "ok": bool(res.get("ok")),
@@ -605,12 +891,17 @@ async def scan_relations(request: Request):
     the registry); an unreachable connection degrades that source only —
     name/description candidates still come back. Nothing is written. A power
     user's scan runs over their manageable tables only — introspection,
-    candidates, recommendations and the confirmed count all stay in scope."""
+    candidates, recommendations and the confirmed count all stay in scope.
+    Tables on another user's PERSONAL connection are left out for every
+    caller, ladmin included (the owner's own stay in their scan)."""
     email, scope, err = _require_source_manager(request)
     if err:
         return err
     store = db_sources.DataSourceStore()
-    tables = _scoped_tables(scope, store.list_tables())
+    me = str(email or "").strip().lower()
+    owner_of = {c.get("id"): _owner_of(c) for c in store.list_connections()}
+    tables = [t for t in _scoped_tables(scope, store.list_tables())
+              if owner_of.get(t.get("connection_id"), "") in ("", me)]
     degraded: list = []
     fk_map: dict = {}
 
@@ -957,6 +1248,7 @@ async def accept_relations(request: Request):
 
     store = db_sources.DataSourceStore()
     by_child: dict = {}
+    personal_children: set = set()
     for idx, item in enumerate(items):
         if not isinstance(item, dict):
             return _reject(f"relations[{idx}] must be an object.")
@@ -972,6 +1264,15 @@ async def accept_relations(request: Request):
                     f"'{side.get('display_name') or side.get('table_name')}' "
                     "is outside your managed scope.",
                     status=403, code="OUT_OF_SCOPE")
+        # Personal tables: owner only, and never related across owners.
+        child_owner = _table_owner(store, child)
+        refusal = _personal_refusal(
+            email, scope, [child_owner, _table_owner(store, parent)],
+            _PERSONAL_MIXED_TEXT)
+        if refusal is not None:
+            return _reject(refusal[1], status=403, code=refusal[0])
+        if child_owner:
+            personal_children.add(child["id"])
         jk = item.get("join_keys")
         ok_shape = (isinstance(jk, list) and jk and all(
             isinstance(p, (list, tuple)) and len(p) == 2
@@ -1016,6 +1317,11 @@ async def accept_relations(request: Request):
                 return _reject("The relation being replaced relates a table "
                                "outside your managed scope.",
                                status=403, code="OUT_OF_SCOPE")
+            refusal = _personal_refusal(
+                email, scope, [child_owner] + _rel_ref_owners(store, rep_ref),
+                _PERSONAL_MIXED_TEXT)
+            if refusal is not None:
+                return _reject(refusal[1], status=403, code=refusal[0])
             # No truncation: the ref is compared against stored values, never
             # stored itself — a shortened ref could silently stop matching.
             replaces = {"ref": rep_ref,
@@ -1082,13 +1388,13 @@ async def accept_relations(request: Request):
         if changed:
             doc["relations"] = existing
             await _run(store.upsert_table, doc, actor=email,
-                       actor_kind=_kind(scope))
+                       actor_kind=_kind(scope, tid in personal_children))
 
     db_sources.audit(email, "relations.accept",
                      detail={"accepted": accepted, "skipped": skipped,
                              "replaced": replaced,
                              "tables": sorted(by_child.keys())},
-                     actor_kind=_kind(scope))
+                     actor_kind=_kind(scope, bool(personal_children)))
     return {"ok": True, "accepted": accepted, "skipped": skipped,
             "replaced": replaced}
 
@@ -1107,13 +1413,17 @@ async def dismiss_relation(request: Request):
     if not (db_sources.DataSourceStore.valid_id(tid)
             and db_sources.DataSourceStore.valid_id(rid)):
         return JSONResponse({"error": "Unknown table id."}, status_code=400)
+    store = db_sources.DataSourceStore()
     if scope is not None:
-        store = db_sources.DataSourceStore()
         for ref in (tid, rid):
             doc = store.get_table(ref)
             if doc is not None and not _in_scope(scope, doc.get("connection_id"),
                                                  doc.get("schema")):
                 return _out_of_scope()
+    owners = [_table_owner(store, store.get_table(ref)) for ref in (tid, rid)]
+    refusal = _personal_refusal(email, scope, owners, _PERSONAL_MIXED_TEXT)
+    if refusal is not None:
+        return _refusal_response(refusal)
     jk = body.get("join_keys")
     jk = [[str(p[0])[:128], str(p[1])[:128]] for p in jk
           if isinstance(p, (list, tuple)) and len(p) == 2] if isinstance(jk, list) else []
@@ -1122,7 +1432,7 @@ async def dismiss_relation(request: Request):
                      detail={"join_keys": jk,
                              "band": band if band in ("confirmed", "suggested",
                                                       "attention") else None},
-                     actor_kind=_kind(scope))
+                     actor_kind=_kind(scope, any(owners)))
     return {"ok": True}
 
 
@@ -1312,6 +1622,20 @@ async def accept_recommendation(request: Request):
     if not _in_scope(scope, rec.get("connection_id"), rec.get("schema")):
         return _out_of_scope()
     cid = str(rec.get("connection_id") or "")
+    # A recommendation on a personal connection registers a personal table:
+    # owner only, never a connector, within the owner's table cap.
+    rec_owner = _owner_of(store.get_connection(cid))
+    refusal = _personal_refusal(email, scope, [rec_owner])
+    if refusal is not None:
+        return _refusal_response(refusal)
+    if rec_owner:
+        if chosen_type == "connector":
+            return JSONResponse({"error": _PERSONAL_NO_CONNECTOR_TEXT,
+                                 "code": "PERSONAL_NO_CONNECTOR"}, status_code=400)
+        cap = _personal_cap_refusal(store, email)
+        if cap is not None:
+            return cap
+    kind = _kind(scope, bool(rec_owner))
     cfg, password, resp = _conn_cfg_and_password(store, {"connection_id": cid})
     if resp is not None:
         return resp
@@ -1330,7 +1654,7 @@ async def accept_recommendation(request: Request):
                                  "note": "already_registered",
                                  "suggested_type": suggested_type,
                                  "chosen_type": chosen_type},
-                         actor_kind=_kind(scope))
+                         actor_kind=kind)
         return {"ok": True, "status": "registered",
                 "note": "This table is already registered.", "candidates": []}
 
@@ -1381,11 +1705,11 @@ async def accept_recommendation(request: Request):
             relations=[],
             intro=intro, where_filter=None, row_cap=None, email=email)
         _phase("register")
-        saved = store.upsert_table(doc, actor=email, actor_kind=_kind(scope))
+        saved = store.upsert_table(doc, actor=email, actor_kind=kind)
         import db_scheduler
         _phase("snapshot")
         snap = db_scheduler.refresh_one_table(saved["id"], actor=email,
-                                              actor_kind=_kind(scope))
+                                              actor_kind=kind)
         if not snap.get("ok"):
             # Accept is one atomic gesture: unlike the wizard save (which
             # keeps the registration for a manual "Refresh now"), roll the
@@ -1393,7 +1717,7 @@ async def accept_recommendation(request: Request):
             # store's reconcile hook restores the rec to open. A nightly-
             # scheduler race can at worst leave an orphan parquet, the same
             # window a plain table delete has today.
-            store.delete_table(saved["id"], actor=email, actor_kind=_kind(scope))
+            store.delete_table(saved["id"], actor=email, actor_kind=kind)
             return {"ok": False,
                     "error": (snap.get("error") or "Snapshot failed")
                     + " — the table was not registered."}
@@ -1408,7 +1732,7 @@ async def accept_recommendation(request: Request):
                      ok=bool(res.get("ok")),
                      detail={"table": phys, "suggested_type": suggested_type,
                              "chosen_type": chosen_type},
-                     actor_kind=_kind(scope))
+                     actor_kind=kind)
     if not res.get("ok"):
         if res.get("code") == "LIVE_REQUIRED":
             return JSONResponse({"ok": False, "error": res.get("error"),
@@ -1465,6 +1789,12 @@ async def delete_relation(request: Request):
         if parent is not None and not _in_scope(scope, parent.get("connection_id"),
                                                 parent.get("schema")):
             return _out_of_scope()
+    child_owner = _table_owner(store, doc)
+    refusal = _personal_refusal(email, scope,
+                                [child_owner] + _rel_ref_owners(store, ref),
+                                _PERSONAL_MIXED_TEXT)
+    if refusal is not None:
+        return _refusal_response(refusal)
     kept = [r for r in (doc.get("relations") or [])
             if not (isinstance(r, dict) and _rel_matches(r, ref, jk))]
     removed = len(doc.get("relations") or []) - len(kept)
@@ -1472,10 +1802,10 @@ async def delete_relation(request: Request):
         return JSONResponse({"error": "Relation not found on this table."},
                             status_code=404)
     doc["relations"] = kept
-    await _run(store.upsert_table, doc, actor=email, actor_kind=_kind(scope))
+    await _run(store.upsert_table, doc, actor=email, actor_kind=_kind(scope, bool(child_owner)))
     db_sources.audit(email, "relations.delete", target=f"{tid}->{ref}",
                      detail={"join_keys": jk, "removed": removed},
-                     actor_kind=_kind(scope))
+                     actor_kind=_kind(scope, bool(child_owner)))
     return {"ok": True, "removed": removed}
 
 
@@ -1536,10 +1866,13 @@ async def introspect_table(request: Request):
     # A power user may introspect only saved connections inside their scope —
     # the unsaved-draft path (no connection_id) is inherently out of scope,
     # since no grant can reference an unsaved connection.
+    store = db_sources.DataSourceStore()
+    refusal = _browse_refusal(email, store, body.get("connection_id"))
+    if refusal is not None:
+        return refusal
     if not _in_scope(scope, (body.get("connection_id") or "").strip(),
                      (body.get("schema") or "").strip() or None):
         return _out_of_scope()
-    store = db_sources.DataSourceStore()
     cfg, password, resp = _conn_cfg_and_password(store, body)
     if resp is not None:
         return resp
@@ -1864,10 +2197,13 @@ async def draft_descriptions(request: Request):
     if err:
         return err
     body = await _json_body(request)
+    store = db_sources.DataSourceStore()
+    refusal = _browse_refusal(email, store, body.get("connection_id"))
+    if refusal is not None:
+        return refusal
     if not _in_scope(scope, (body.get("connection_id") or "").strip(),
                      (body.get("schema") or "").strip() or None):
         return _out_of_scope()
-    store = db_sources.DataSourceStore()
     cfg, password, resp = _conn_cfg_and_password(store, body)
     if resp is not None:
         return resp
@@ -2021,14 +2357,41 @@ async def save_table(request: Request, tid: str = ""):
     if posted_mode is not None and posted_mode not in db_sources.MODES:
         return JSONResponse({"error": "mode must be 'snapshot' or 'live'.",
                              "code": "BAD_MODE"}, status_code=400)
+    access_role_ids = body.get("access_role_ids")
+
+    # Personal connection: the owner alone registers and edits (ladmin →
+    # PERSONAL_OWNER_ONLY), never with roles, never as a connector, and a
+    # NEW registration counts against the owner's PERSONAL_TABLES_MAX.
+    # Checked before the role rules — a self-service user holds no roles.
+    posted_owner = _owner_of(store.get_connection(
+        (body.get("connection_id") or "").strip()))
+    prior = (store.get_table(tid)
+             if db_sources.DataSourceStore.valid_id(tid) else None)
+    prior_owner = _table_owner(store, prior) if prior else ""
+    refusal = _personal_refusal(email, scope, [posted_owner]
+                                + ([prior_owner] if prior else []))
+    if refusal is not None:
+        return _refusal_response(refusal)
+    personal = bool(posted_owner)
+    kind = _kind(scope, personal)
+    if personal:
+        if isinstance(access_role_ids, list) and any(access_role_ids):
+            return JSONResponse({"error": _PERSONAL_NO_ROLES_TEXT,
+                                 "code": "PERSONAL_NO_ROLES"}, status_code=400)
+        if body.get("is_connector"):
+            return JSONResponse({"error": _PERSONAL_NO_CONNECTOR_TEXT,
+                                 "code": "PERSONAL_NO_CONNECTOR"}, status_code=400)
+        if prior is None:
+            cap = _personal_cap_refusal(store, email)
+            if cap is not None:
+                return cap
 
     # 19f publish+share: a power user may share their registration, but only
     # with roles they HOLD — an outside id is rejected up-front (403, never
     # silently dropped) BEFORE anything is registered or snapshotted. The
     # built-in Base role is EXCLUDED even when held (everyone is a member —
     # publishing to the whole platform stays ladmin's call).
-    access_role_ids = body.get("access_role_ids")
-    if isinstance(access_role_ids, list) and scope is not None:
+    if isinstance(access_role_ids, list) and scope is not None and not personal:
         import roles_store
         held = ({r["id"] for r in roles_store.roles_for_email(email)}
                 - {roles_store.BASE_ROLE_ID})
@@ -2069,6 +2432,26 @@ async def save_table(request: Request, tid: str = ""):
         [r for r in ((own or {}).get("relations") or []) if isinstance(r, dict)])
     if rel_err is not None:
         return rel_err
+    # A NEW or changed relation follows the relation-accept owner rule
+    # (unchanged stored copies pass — the wizard posts them back).
+    stored_rels = [r for r in ((own or {}).get("relations") or [])
+                   if isinstance(r, dict)]
+    all_tables = store.list_tables()
+    for rel in posted_rels:
+        ref = str(rel.get("related_table_id") or rel.get("related_table") or "").strip()
+        try:
+            pairs = [[str(p[0]), str(p[1])] for p in (rel.get("join_keys") or [])]
+        except Exception as e:
+            log_with_sid(log_safe_text(email), "warning",
+                         f"REL_SAVE_MALFORMED_ENTRY error={log_safe_text(type(e).__name__, 80)}")
+            pairs = None
+        if pairs is not None and any(_rel_matches(r, ref, pairs) for r in stored_rels):
+            continue
+        refusal = _personal_refusal(
+            email, scope, [posted_owner] + _rel_ref_owners(store, ref, all_tables),
+            _PERSONAL_MIXED_TEXT)
+        if refusal is not None:
+            return _refusal_response(refusal)
     own_key = relation_discovery.physical_key(own) if own else None
     new_key = relation_discovery.physical_key(
         {"connection_id": body.get("connection_id"),
@@ -2128,7 +2511,7 @@ async def save_table(request: Request, tid: str = ""):
         table=table, display_name=body.get("display_name") or "",
         description=body.get("description") or "",
         columns=body.get("columns") or [],
-        is_connector=bool(body.get("is_connector")),
+        is_connector=bool(body.get("is_connector")) and not personal,
         relations=relations, intro=intro,
         where_filter=where_in, row_cap=cap_in,
         email=email, existing=own)
@@ -2166,13 +2549,13 @@ async def save_table(request: Request, tid: str = ""):
     except Exception as e:
         log_with_sid(email, "warning", f"REL_SAVE_COLCHECK_FAILED: {type(e).__name__}")
 
-    saved = store.upsert_table(doc, actor=email, actor_kind=_kind(scope))
+    saved = store.upsert_table(doc, actor=email, actor_kind=kind)
     if mode != (prev_mode or "snapshot"):
         db_sources.audit(email, "table.mode", target=saved["id"],
                          detail={"from": prev_mode or "snapshot", "to": mode,
                                  "reason": doc.get("live_reason"),
                                  "cell_count": verdict.get("cell_count")},
-                         actor_kind=_kind(scope))
+                         actor_kind=kind)
 
     # Access panel (wizard step 3): canonical storage on the ROLE records,
     # never on the table doc. Absent field ⇒ no role writes (recommendation
@@ -2184,7 +2567,7 @@ async def save_table(request: Request, tid: str = ""):
     # membership — set_table_roles' exact reconcile would otherwise let a PU
     # edit-save silently strip other roles' read access. Best-effort: a role
     # write failure never fails the save (Article IV).
-    if isinstance(access_role_ids, list):
+    if isinstance(access_role_ids, list) and not personal:
         try:
             import roles_store
             wanted = [r for r in access_role_ids if isinstance(r, str)]
@@ -2196,7 +2579,7 @@ async def save_table(request: Request, tid: str = ""):
                            if ro["id"] not in held
                            and saved["id"] in (ro.get("table_ids") or [])]
             roles_store.RolesStore().set_table_roles(
-                saved["id"], wanted, actor=email, actor_kind=_kind(scope))
+                saved["id"], wanted, actor=email, actor_kind=kind)
         except Exception as e:
             log_with_sid(email, "warning", f"TABLE_ACCESS_ROLES_FAILED: {e}")
 
@@ -2207,7 +2590,7 @@ async def save_table(request: Request, tid: str = ""):
         # re-counts and re-samples.
         live_profile = await _run(_profile_live_table, saved["id"], cfg,
                                   password, store.get_table(saved["id"]) or saved,
-                                  count_res, email, _kind(scope))
+                                  count_res, email, kind)
         return JSONResponse({"table": store.get_table(saved["id"]),
                              "snapshot": None, "live_profile": live_profile,
                              "size_verdict": verdict},
@@ -2217,7 +2600,7 @@ async def save_table(request: Request, tid: str = ""):
     # last_refresh_error set — "Refresh now" retries.
     import db_scheduler
     snap = await _run(db_scheduler.refresh_one_table, saved["id"], actor=email,
-                      actor_kind=_kind(scope))
+                      actor_kind=kind)
     return JSONResponse({"table": store.get_table(saved["id"]), "snapshot": snap,
                          "size_verdict": verdict},
                         status_code=status)
@@ -2235,20 +2618,27 @@ async def delete_table(request: Request, tid: str):
         return err
     body = await _json_body(request)
     store = db_sources.DataSourceStore()
+    doc = store.get_table(tid)
+    # A personal table is deleted by the connection's owner only (ladmin →
+    # PERSONAL_OWNER_ONLY); the owner needs no registered_by match.
+    personal = bool(_table_owner(store, doc))
+    refusal = _table_refusal(email, scope, store, doc)
+    if refusal is not None:
+        return refusal
     if scope is not None:
-        doc = store.get_table(tid)
         if doc is None:
             return JSONResponse({"error": "Unknown table."}, status_code=404)
         if not _in_scope(scope, doc.get("connection_id"), doc.get("schema")):
             return _out_of_scope()
         # Case-insensitive like the ownership read and the UI's canDelete.
-        if str(doc.get("registered_by") or "").strip().lower() != email:
+        if not personal and \
+                str(doc.get("registered_by") or "").strip().lower() != email:
             return JSONResponse(
                 {"error": "Only tables you registered yourself can be deleted.",
                  "code": "NOT_OWNER"}, status_code=403)
     ok = store.delete_table(
         tid, actor=email, drop_snapshot=body.get("drop_snapshot", True),
-        actor_kind=_kind(scope))
+        actor_kind=_kind(scope, personal))
     if not ok:
         return JSONResponse({"error": "Unknown table."}, status_code=404)
     # Best-effort prune from every role's table_ids (a stale id grants
@@ -2270,18 +2660,23 @@ async def refresh_table(request: Request, tid: str):
     email, scope, err = _require_source_manager(request)
     if err:
         return err
-    doc = db_sources.DataSourceStore().get_table(tid)
+    store = db_sources.DataSourceStore()
+    doc = store.get_table(tid)
     if scope is not None:
         if doc is None or not _in_scope(scope, doc.get("connection_id"),
                                         doc.get("schema")):
             return _out_of_scope()
+    refusal = _table_refusal(email, scope, store, doc)
+    if refusal is not None:
+        return refusal
+    kind = _kind(scope, bool(_table_owner(store, doc)))
     if doc is not None and db_sources.table_mode(doc) == "live":
-        lp = await _run(_count_and_profile_live, tid, email, _kind(scope))
+        lp = await _run(_count_and_profile_live, tid, email, kind)
         return {"ok": bool(lp.get("ok")), "live_profile": lp,
                 "rows": lp.get("rows"), "error": lp.get("error")}
     import db_scheduler
     return await _run(db_scheduler.refresh_one_table, tid, actor=email,
-                      actor_kind=_kind(scope))
+                      actor_kind=kind)
 
 
 @router.post("/tables/{tid}/dismiss_drift")
@@ -2291,12 +2686,16 @@ async def dismiss_drift(request: Request, tid: str):
     if err:
         return err
     store = db_sources.DataSourceStore()
+    doc = store.get_table(tid)
     if scope is not None:
-        doc = store.get_table(tid)
         if doc is None or not _in_scope(scope, doc.get("connection_id"),
                                         doc.get("schema")):
             return _out_of_scope()
-    if not store.dismiss_drift(tid, actor=email, actor_kind=_kind(scope)):
+    refusal = _table_refusal(email, scope, store, doc)
+    if refusal is not None:
+        return refusal
+    if not store.dismiss_drift(tid, actor=email,
+                               actor_kind=_kind(scope, bool(_table_owner(store, doc)))):
         return JSONResponse({"error": "Unknown table or no drift recorded."},
                             status_code=404)
     return {"ok": True}
@@ -2400,18 +2799,22 @@ async def set_table_schedule(request: Request, tid: str):
     from datetime import datetime
     body = await _json_body(request)
     store = db_sources.DataSourceStore()
+    doc = store.get_table(tid)
     if scope is not None:
-        doc = store.get_table(tid)
         if doc is None or not _in_scope(scope, doc.get("connection_id"),
                                         doc.get("schema")):
             return _out_of_scope()
+    refusal = _table_refusal(email, scope, store, doc)
+    if refusal is not None:
+        return refusal
+    kind = _kind(scope, bool(_table_owner(store, doc)))
     sched_body = body.get("schedule")
     if sched_body is not None and not isinstance(sched_body, dict):
         return JSONResponse({"error": "Unknown schedule mode.",
                              "code": "BAD_SCHEDULE"}, status_code=400)
     try:
         found = store.set_table_schedule(tid, sched_body, actor=email,
-                                         actor_kind=_kind(scope))
+                                         actor_kind=kind)
     except ValueError as e:
         return JSONResponse({"error": str(e), "code": "BAD_SCHEDULE"},
                             status_code=400)
@@ -2458,6 +2861,10 @@ async def set_table_mode(request: Request, tid: str):
             return _out_of_scope()
     if doc is None:
         return JSONResponse({"error": "Unknown table."}, status_code=404)
+    refusal = _table_refusal(email, scope, store, doc)
+    if refusal is not None:
+        return refusal
+    kind = _kind(scope, bool(_table_owner(store, doc)))
     mode = body.get("mode")
     if mode not in db_sources.MODES:
         return JSONResponse({"error": "mode must be 'snapshot' or 'live'.",
@@ -2482,7 +2889,7 @@ async def set_table_mode(request: Request, tid: str):
             return JSONResponse({"error": _LIVE_REQUIRED_TEXT,
                                  "code": "LIVE_REQUIRED"}, status_code=400)
         found = store.set_table_mode(tid, "snapshot", actor=email,
-                                     actor_kind=_kind(scope),
+                                     actor_kind=kind,
                                      cell_count=verdict["cell_count"])
         if not found:
             return JSONResponse({"error": "Unknown table."}, status_code=404)
@@ -2490,7 +2897,7 @@ async def set_table_mode(request: Request, tid: str):
         # period would otherwise be served to chats as current data.
         import db_scheduler
         snap = await _run(db_scheduler.refresh_one_table, tid, actor=email,
-                          actor_kind=_kind(scope))
+                          actor_kind=kind)
         if not (isinstance(snap, dict) and snap.get("ok")):
             # The switch holds only once a snapshot exists: back to live,
             # keeping why it was live before.
@@ -2498,7 +2905,7 @@ async def set_table_mode(request: Request, tid: str):
             if reason not in db_sources.LIVE_REASONS:
                 reason = "manual"
             restored = store.set_table_mode(tid, "live", actor=email,
-                                            actor_kind=_kind(scope), reason=reason,
+                                            actor_kind=kind, reason=reason,
                                             cell_count=verdict["cell_count"])
             if not restored:
                 # The table vanished while the snapshot ran: nothing to
@@ -2519,11 +2926,11 @@ async def set_table_mode(request: Request, tid: str):
         return {"ok": True, "table": store.get_table(tid), "snapshot": snap}
     reason = "threshold" if stored["live_suggested"] else "manual"
     found = store.set_table_mode(tid, "live", actor=email,
-                                 actor_kind=_kind(scope), reason=reason,
+                                 actor_kind=kind, reason=reason,
                                  cell_count=stored["cell_count"])
     if not found:
         return JSONResponse({"error": "Unknown table."}, status_code=404)
-    lp = await _run(_count_and_profile_live, tid, email, _kind(scope))
+    lp = await _run(_count_and_profile_live, tid, email, kind)
     return {"ok": True, "table": store.get_table(tid), "live_profile": lp}
 
 

@@ -168,6 +168,7 @@ To run the stack you need:
 | `SECRET_KEY` | **Required.** Local session-cookie signing secret, at least 32 characters. Generate once with `python -c "import secrets; print(secrets.token_hex(32))"`. The app refuses to start (`SECRET_KEY_UNSET`) without it. |
 | `DATA_ROOT` | Local-disk root for raw data + chats. Mount a volume. |
 | `SCHEMA_VALUE_DENY_COLUMNS` | Optional. Comma-separated column names (case-insensitive) whose values never reach the brain: those columns send name, dtype and counts only. Empty by default. |
+| `PERSONAL_TABLES_MAX` | Optional, default `15`. The most tables one user may register on their own (personal) database connections; a new registration past it is refused. |
 | `SHARE_ALLOWED_DOMAINS` | Optional. Comma-separated recipient domains a chat, conversation or dashboard may be shared with. Empty by default: the domains of the administrator accounts are used, or, when none has an email address, the domains of all accounts with one; with no such account every share is refused. |
 | `SSO_ALLOW_GUESTS` | Optional, default `false`. `true` lets guests (`#EXT#`) of your Entra tenant sign in with Microsoft. See [`docs/SSO_MICROSOFT.md`](docs/SSO_MICROSOFT.md). |
 | `SSO_AUTO_PROVISION` | Optional, default `false`. `true` creates an account at the Microsoft sign-in of an identity that has none; otherwise such a sign-in is refused, except for an address in an approved sign-in domain (set by `ladmin` on the admin panel's **Users** page, not in `client.env`). Requires "Assignment required? = Yes" on the Entra enterprise application. |

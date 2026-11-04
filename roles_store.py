@@ -383,13 +383,25 @@ def _grant_matches(grant: dict, connection_id, schema) -> bool:
     return g_schema is None or str(g_schema).lower() == str(schema or "").lower()
 
 
-def effective_table_ids(role: Optional[dict], tables: list[dict]) -> set:
+def _personal_cids() -> set:
+    """Ids of every personal (owner-carrying) connection; never raises."""
+    from db_sources import DataSourceStore
+    return DataSourceStore().personal_connection_ids()
+
+
+def effective_table_ids(role: Optional[dict], tables: list[dict],
+                        personal_cids: Optional[set] = None) -> set:
     """The set of NON-CONNECTOR registry table ids this role may use: explicit
     table_ids intersected with the live registry, plus every table matched by
     a scope grant (connection match AND schema match, case-insensitive; a
-    None-schema grant covers the whole connection)."""
+    None-schema grant covers the whole connection). A table on a PERSONAL
+    connection is never role-reachable (only its owner reads it, through
+    the ownership read in allowed_table_ids_for); `personal_cids` is
+    resolved from the registry when not given."""
     if not isinstance(role, dict):
         return set()
+    if personal_cids is None:
+        personal_cids = _personal_cids()
     explicit = {t for t in (role.get("table_ids") or []) if isinstance(t, str)}
     grants = [g for g in map(_normalize_grant, role.get("scope_grants") or [])
               if g is not None]
@@ -397,6 +409,8 @@ def effective_table_ids(role: Optional[dict], tables: list[dict]) -> set:
     for t in tables or []:
         tid = t.get("id")
         if not tid or t.get("is_connector"):
+            continue
+        if t.get("connection_id") in personal_cids:
             continue
         if tid in explicit:
             out.add(tid)
@@ -439,10 +453,12 @@ def allowed_table_ids_for(email: str) -> set:
     case-insensitive) so a power user always sees what they registered even
     before sharing it with any role. Connectors stay excluded either way."""
     from db_sources import DataSourceStore
-    tables = DataSourceStore().list_tables()
+    store = DataSourceStore()
+    tables = store.list_tables()
+    personal = store.personal_connection_ids()
     out: set = set()
     for role in roles_for_email(email):
-        out |= effective_table_ids(role, tables)
+        out |= effective_table_ids(role, tables, personal)
     me = str(email or "").strip().lower()
     if me:
         out |= {t["id"] for t in tables
@@ -523,10 +539,96 @@ def manageable_table_ids_for(email: str) -> set:
     scope = management_scope_for(email)
     if scope is None:
         return set()
+    store = DataSourceStore()
+    personal = store.personal_connection_ids()
     out: set = set()
-    for t in DataSourceStore().list_tables():
+    for t in store.list_tables():
         tid = t.get("id")
+        if t.get("connection_id") in personal:
+            continue            # never through a role grant
         if tid and any(_grant_matches(g, t.get("connection_id"), t.get("schema"))
                        for g in scope):
             out.add(tid)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Self-service (personal connections)
+# ---------------------------------------------------------------------------
+
+PERSONAL_GRANT_REFUSED_TEXT = "Personal connections cannot be granted to roles."
+
+
+def self_service_allowed(email: str) -> bool:
+    """True iff the account exists, is NOT admin permission (admins use the
+    admin page), is NOT the bootstrap ladmin, and its stored switch
+    (AuthStore.get_self_service, absent = on) is on. Fails CLOSED on any
+    exception (SELF_SERVICE_CAPABILITY_FAILED, Article IV)."""
+    try:
+        from local_store import AuthStore
+        auth = AuthStore()
+        if not str(email or "").strip() or not auth.user_exists(email):
+            return False
+        if auth.is_admin(email) or auth.is_bootstrap_admin(email):
+            return False
+        return bool(auth.get_self_service(email))
+    except Exception as e:
+        from exec_transport import log_safe_text
+        log_with_sid(email, "error",
+                     f"SELF_SERVICE_CAPABILITY_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return False
+
+
+def manager_scope_for(email: str) -> Optional[list]:
+    """THE scope resolver of the data-sources guard and the /power page:
+    the union (deduped, the management_scope_for idiom) of the power user's
+    manage grants and, when self_service_allowed, one whole-connection grant
+    per connection the user owns. None (denied) when neither applies; a
+    self-service user without a connection gets [], which passes the guard
+    so they can create their first one. Admins never reach this (the guard
+    returns a None scope for them first). Fails closed (None)."""
+    try:
+        power = management_scope_for(email)
+        personal = None
+        if self_service_allowed(email):
+            from db_sources import DataSourceStore
+            personal = DataSourceStore().personal_grants_for(email)
+        if power is None and personal is None:
+            return None
+        out: list = []
+        seen: set = set()
+        for g in map(_normalize_grant, (power or []) + (personal or [])):
+            if g is None:
+                continue
+            key = (g["connection_id"],
+                   None if g["schema"] is None else str(g["schema"]).lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(g)
+        return out
+    except Exception as e:
+        from exec_transport import log_safe_text
+        log_with_sid(email, "error",
+                     f"MANAGER_SCOPE_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return None
+
+
+def personal_grant_refusal(fields: dict, store) -> Optional[str]:
+    """The role create/edit check: a `scope_grants` / `manage_grants` entry
+    naming a personal connection, or a `table_ids` entry naming a table on
+    one, answers PERSONAL_GRANT_REFUSED_TEXT; None otherwise (also for a
+    body without those keys)."""
+    personal = store.personal_connection_ids()
+    if not personal:
+        return None
+    for field in ("scope_grants", "manage_grants"):
+        for g in fields.get(field) or []:
+            if isinstance(g, dict) and g.get("connection_id") in personal:
+                return PERSONAL_GRANT_REFUSED_TEXT
+    wanted = {t for t in (fields.get("table_ids") or []) if isinstance(t, str)}
+    if wanted:
+        for t in store.list_tables():
+            if t.get("id") in wanted and t.get("connection_id") in personal:
+                return PERSONAL_GRANT_REFUSED_TEXT
+    return None

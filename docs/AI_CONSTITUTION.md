@@ -4,8 +4,8 @@
 > enterprise (on-prem) edition. Adapted from the original B2C constitution
 > for the brain/client split.
 
-**Version:** 1.10 (enterprise)
-**Last Updated:** 2026-10-24
+**Version:** 1.11 (enterprise)
+**Last Updated:** 2026-11-03
 
 ---
 
@@ -426,6 +426,23 @@ client must be closed on FastAPI lifespan shutdown.
    SQL text is never logged anywhere on the path. No route accepts free SQL
    from a browser — relation discovery's "Analyze SQL" box PARSES pasted
    SQL, it never executes it.
+
+   **Personal (self-service) connections** — a connection a user who is not
+   an administrator created for themselves (`owner` on the connection doc) —
+   follow every rule above unchanged. They are owner-only for every write
+   (only the owner edits, deletes, tests or refreshes them and registers or
+   changes their tables), only the owner is offered their tables in a chat,
+   only the owner browses them (schema and table listing, introspect,
+   draft descriptions; the relation scan leaves out other owners' personal
+   tables), an administrator sees only the connection and its registered
+   tables, read-only, in the lists, and they are never grantable to a role
+   and never connector tables. Their
+   read-only guarantee does not depend on the privileges of the login the
+   user typed: the connector issues SQLAlchemy SELECT constructs only, live
+   SQL passes `assert_read_only_query`, and the sandbox import denylist keeps
+   every database driver out of generated code — plus the per-dialect
+   read-only sessions. Their credentials are Fernet-encrypted at rest like
+   any connection's (rule 8) and are never sent to the brain.
 10. **Admin-pasted SQL never leaves this client.** The relation-discovery
    "Analyze SQL" box (`relation_discovery.py`) parses pasted SELECT
    statements in memory only: the SQL TEXT is never persisted, logged,

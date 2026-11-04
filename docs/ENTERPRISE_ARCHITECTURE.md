@@ -1397,15 +1397,86 @@ requires ownership — the doc's
 `_build_table_doc`, carried through edit-saves like the schedule override;
 absent = ladmin-registered/legacy, or released when the registrant's
 account was removed) must equal the power user
-(`403 NOT_OWNER`). Connection lifecycle, the global refresh schedule,
-users/roles/permissions and the audit tail stay strictly ladmin-only
-(`_require_admin`). Power-user writes are labeled
+(`403 NOT_OWNER`). The global refresh schedule, users/roles/permissions and
+the audit tail stay strictly ladmin-only (`_require_admin`); the connection
+lifecycle routes sit behind `_require_source_manager` since personal
+connections (below) — an administrator keeps every non-personal connection,
+a non-admin manages only their own. Power-user writes are labeled
 `actor_kind: "power_user"` in their audit detail so ladmin can tell them
 apart in the tail; helpers: `roles_store.is_power_user` (delegates to
 `AuthStore.is_power`) / `management_scope_for` (None unless the permission,
 else the union) / `can_manage_physical` / `manageable_table_ids_for`
 (connectors INCLUDED — management is about the registry, unlike read
 access) / `scope_covers`, all fail-closed.
+
+**Personal (self-service) connections.** Every user who is not an
+administrator may add their OWN read-only database connections, register
+tables on them and relate those tables, from the same `/power/data_sources`
+page (its "DB config" dropdown item shows for them too). The capability is on
+by default for every account: `roles_store.self_service_allowed(email)` is
+true when the account exists, is not admin permission (administrators use
+the admin page), is not the bootstrap account, and its profile switch
+`self_service_sources` is not `false` (absent = on, so no profile is
+migrated; `AuthStore.get_self_service` fails open by design,
+`self_service_allowed` fails closed). The administrator switches it off per
+user from the Users window ("Own connections", `POST
+/api/admin/users/set_self_service`, audited `user.set_self_service`); off
+blocks the page and every self-service route for that user and nothing else
+— their chats keep answering and their existing personal tables keep
+refreshing on the schedule.
+
+*Owner model.* A **personal connection** is a connection doc carrying an
+`owner` (the creator's email, lower-cased; absent on every administrator
+connection and every connection stored before the feature). A **personal
+table** is any table on one. The guard's scope comes from ONE resolver,
+`roles_store.manager_scope_for`: the power user's manage grants
+(`management_scope_for`, unchanged) union one whole-connection grant per
+owned connection (`DataSourceStore.personal_grants_for`); `[]` for a
+self-service user without a connection yet (passes the guard so they can
+create the first one), `None` when neither applies. A personal connection
+and every table on it belong to the owner alone: visible in the owner's
+picker (the existing ownership read on `registered_by`) and nowhere else,
+never grantable to a role (role create/edit refuse a grant or table id
+naming one; `effective_table_ids` and `manageable_table_ids_for` exclude
+them defensively), never a connector (`PERSONAL_NO_CONNECTOR`; the connector
+closure never walks one), and capped at `PERSONAL_TABLES_MAX` (default 15)
+tables per owner (`PERSONAL_TABLE_CAP` on a new registration; edits never
+count). A relation never crosses owners. Chat and dashboard sharing are
+unchanged: a recipient views the stored snapshot, and fresh computation is
+role-gated, so it is refused.
+
+*What ladmin can and cannot do.* The admin page lists personal connections
+and tables read-only with "Owner: <email>" and a "Personal" chip; the roles
+tree leaves them out. Ladmin cannot test, edit, delete or refresh a personal
+connection, nor register, edit, delete, refresh, re-mode, re-schedule or
+relate a personal table (`403 PERSONAL_OWNER_ONLY`); a non-admin cannot
+change ladmin's connections (`403 OUT_OF_SCOPE`). The non-admin
+test-connection probe is rate limited (10 per 60 s per user, `429
+TOO_MANY_TESTS`) and audited `{db_type, host, port, ok}`. Writes on personal
+sources are audited `actor_kind: "personal"`. Reads are owner-only as
+well (decided 2026-11-04): the browse routes (`connections/{cid}/schemas`
+and `/tables`, `tables/introspect`, `tables/draft_descriptions`) answer an
+administrator and any other user `403 PERSONAL_OWNER_ONLY` on a personal
+connection, and the relation scan leaves out other owners' personal tables,
+an administrator's scan included. What ladmin sees of a personal connection
+is the lists: the connection and its registered tables, read-only, with the
+owner.
+
+*Removal cascade.* Removing the user (`POST /api/admin/users/remove`)
+deletes every connection they own with every table on it — registry rows,
+snapshot parquets, profile sidecars, role ids
+(`DataSourceStore.delete_personal_sources`, one `personal_sources.deleted`
+audit row) — right before their remaining registrations are released; the
+response and the `user.removed` row carry `personal_connections_deleted` and
+`personal_tables_deleted`. A chat that still names such a table reports it
+through the existing `missing_db_tables` "unregistered" path.
+
+*Read-only statement.* Nothing in the enforcement changed: a snapshot is a
+SQLAlchemy SELECT construct, live SQL passes `assert_read_only_query`, the
+database drivers are denied in the sandbox, and the per-dialect read-only
+sessions apply — independent of the privileges of the login the user typed.
+The connection modal says so with a checked, disabled "Read-only access"
+box. Installs should still recommend a read-only database login.
 
 ### 10c. Identity — Microsoft Entra ID SSO (optional, client-side only)
 

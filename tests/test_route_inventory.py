@@ -126,6 +126,7 @@ EXPECTED_ROUTES = [
     ('POST', '/api/admin/users/remove'),
     ('POST', '/api/admin/users/set_permission'),
     ('POST', '/api/admin/users/set_role'),
+    ('POST', '/api/admin/users/set_self_service'),
     ('POST', '/api/charts'),
     ('POST', '/api/chat/{chat_id}/auto_analysis/start'),
     ('POST', '/api/chat/{chat_id}/chat/stream'),

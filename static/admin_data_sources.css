@@ -411,6 +411,138 @@ body.admin-ds-page {
   .adm-main { padding: 20px 16px 50px; }
 }
 
+/* ── Power-mode top bar: the chat page's profile button ─────────────────── */
+/* The partial (templates/partials/profile_button.html) is styled by
+   main.css, which this page cannot load (its global body/button/input rules
+   would restyle the panel). The block below is that file's profile section
+   VERBATIM — tests/test_power_page_profile_menu.py pins it equal, so the two
+   cannot drift. .hidden (!important, above) is what toggles the dropdown. */
+.adm-topbar { display: flex; justify-content: flex-end; align-items: center; margin: -10px 0 14px; }
+/* main.css styles every button with font: inherit; this page does not. */
+.adm-topbar .profile-btn, .adm-topbar .dropdown-item { font: inherit; }
+
+/* Profile Dropdown (shared with dashboard) */
+.profile-dropdown-container {
+  position: relative;
+}
+
+.profile-icon-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 1px solid #e5e7eb;
+  background: #ffffff;
+  cursor: pointer;
+  font-size: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.profile-icon-btn:hover {
+  background: #f3f4f6;
+  border-color: #d1d5db;
+}
+
+/* Shared profile button with avatar + name + plan */
+.profile-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 12px 4px 4px;
+  border-radius: 24px;
+  border: 1px solid #e5e7eb;
+  background: #ffffff;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.profile-btn:hover {
+  background: #f3f4f6;
+  border-color: #d1d5db;
+}
+
+.profile-avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: #2563eb;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  letter-spacing: 0.5px;
+}
+
+.profile-btn-info {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  line-height: 1.2;
+  min-width: 0;
+}
+
+.profile-btn-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: #1f2937;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 120px;
+}
+
+.profile-btn-plan {
+  font-size: 11px;
+  color: #6b7280;
+  white-space: nowrap;
+}
+
+.profile-dropdown {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 8px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  min-width: 180px;
+  z-index: 100;
+  overflow: hidden;
+}
+
+.profile-dropdown.hidden {
+  display: none;
+}
+
+.profile-dropdown .dropdown-item {
+  display: block;
+  width: 100%;
+  padding: 12px 16px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  font-size: 14px;
+  color: #374151;
+  transition: background 0.15s;
+}
+
+.profile-dropdown .dropdown-item:hover {
+  background: #f3f4f6;
+}
+
+.profile-dropdown .dropdown-divider {
+  height: 1px;
+  background: #e5e7eb;
+  margin: 4px 0;
+}
+
 /* ── Users & Roles ─────────────────────────────────────────────────────── */
 .adm-btn.danger { background: #dc2626; color: #fff; }
 .adm-btn.danger:hover { background: #b91c1c; }
@@ -512,3 +644,8 @@ body.admin-ds-page {
 .adm-chip.live { background: #fef3c7; color: #92400e; }
 .adm-mode-block { margin: 6px 0 10px; }
 .adm-mode-block .adm-alert { margin: 8px 0 4px; }
+
+/* Personal (self-service) connections: a user's own read-only connection. */
+.adm-chip.personal { background: #e0f2fe; color: #075985; }
+.adm-owner-cell { color: #475569; }
+.adm-conn-readonly-note { margin: -4px 0 0; font-size: 12px; }

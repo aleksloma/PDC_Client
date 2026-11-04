@@ -1630,6 +1630,45 @@ class AuthStore:
     def set_data_role(self, email: str, role_id: str) -> bool:
         return self.set_data_roles(email, [role_id])
 
+    # --- Self-service data sources (personal connections) -------------------
+    #
+    # profile.json `self_service_sources` (bool). ABSENT = True: the
+    # capability is on by default for every account, so a profile written
+    # before the field existed needs no migration. The capability itself
+    # (not admin, not the bootstrap account, flag on) is decided by
+    # roles_store.self_service_allowed; this is only the stored switch.
+
+    def get_self_service(self, email: str) -> bool:
+        """The stored per-user switch; absent → True. Fails OPEN on an
+        exception by design (the default is on): logged
+        SELF_SERVICE_READ_FAILED, never raises (Article IV)."""
+        try:
+            prof = self.get_profile(email) or {}
+            return prof.get("self_service_sources") is not False
+        except Exception as e:
+            log_with_sid(log_safe_value(str(email), 300), "warning",
+                         f"SELF_SERVICE_READ_FAILED error={log_safe_value(type(e).__name__, 80)}")
+            return True
+
+    def set_self_service(self, email: str, allowed: bool) -> bool:
+        """True when the account carries `allowed` afterwards; False, nothing
+        written, for a missing account (`_account_present`, the set_data_roles
+        idiom: locked, atomic)."""
+        email = _safe_email(email)
+        allowed = bool(allowed)
+        with _LOCK:
+            if not self._account_present(email, "set_self_service"):
+                return False
+            prof = self.get_profile(email) or {"email": email, "created_at": _now()}
+            if prof.get("self_service_sources") is allowed:
+                return True
+            prof["self_service_sources"] = allowed
+            p = _data_root() / "users" / email / "profile.json"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            _write_json_atomic(p, prof)
+        log_with_sid(email, "info", f"USER_SELF_SERVICE_SET allowed={log_safe_value(str(allowed), 10)}")
+        return True
+
     def touch_last_login(self, email: str):
         """Stamp last_login_at on the profile. Best-effort — a failed stamp
         must never break a login (Article IV). False, nothing written, for a

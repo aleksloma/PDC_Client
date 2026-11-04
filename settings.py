@@ -318,6 +318,11 @@ class Settings(BaseModel):
     # stops once the frames read so far exceed LIVE_RESULT_MAX_MB megabytes
     # (`memory_usage(deep=True)`), and the result is flagged truncated.
     LIVE_RESULT_MAX_MB: int = Field(default_factory=lambda: _int_env("LIVE_RESULT_MAX_MB", 256, 1))
+    # Personal (self-service) connections: at most PERSONAL_TABLES_MAX tables
+    # registered on a user's OWN connections (connectors counted); a new
+    # registration at or above it is refused (400 PERSONAL_TABLE_CAP). Edits
+    # never count. Read through _int_env (default 15, floor 1).
+    PERSONAL_TABLES_MAX: int = Field(default_factory=lambda: _int_env("PERSONAL_TABLES_MAX", 15, 1))
 
     # Nightly snapshot refresh (container-local time; the admin UI value in
     # data_sources.json wins once set — these are first-boot defaults only).

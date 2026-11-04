@@ -484,8 +484,11 @@ def test_permission_stacked_on_access_roles(client, two_conns):
     # (table_ids) but is outside the MANAGEMENT scope.
     tables = client.get("/api/admin/tables").json()["tables"]
     assert [t["schema"] for t in tables] == ["main"]
-    # Same roles at STANDARD permission → guard 403 everywhere on /power APIs.
+    # Same roles at STANDARD permission → guard 403 everywhere on /power APIs
+    # — once personal connections are switched off for the account too
+    # (self-service is on by default and would let a standard user in).
     auth.set_role(POWER, "user")
+    auth.set_self_service(POWER, False)
     assert client.get("/api/admin/tables").status_code == 403
     assert client.post("/api/admin/tables", json=_table_body(
         cid1, table="u", schema="main")).status_code == 403

@@ -55,32 +55,42 @@
         {% endif %}
       </nav>
 
-      <div class="adm-sidebar-footer">
+      {# The account controls live here in ADMIN mode only. In POWER mode
+         the top bar carries the chat page's profile button instead (the
+         shared partial, below), so the control exists once; the footer
+         keeps the build stamp. Every tag of this block sits at a line end so
+         the admin-mode render stays byte-identical
+         (tests/test_power_page_profile_menu.py). #}<div class="adm-sidebar-footer">{% if manager_mode != 'power' %}
         <div class="adm-user">
           <span class="adm-user-avatar">{{ (username or 'A')[0]|upper }}</span>
           <span class="adm-user-name" title="{{ username }}">{{ username }}</span>
         </div>
         {# 19g: promoted admins are full chat users too — the /admin route
            passes back_to_chat for them (bootstrap ladmin gets false). #}
-        {% if manager_mode == 'power' or back_to_chat | default(false) %}
+        {% if back_to_chat | default(false) %}
         <a href="/lab" class="adm-footer-btn adm-back-link">← Back to chat</a>
         {% endif %}
         <button id="btnAdmChangePw" class="adm-footer-btn">Change password</button>
-        <button id="btnAdmLogout" class="adm-footer-btn">Sign out</button>
+        <button id="btnAdmLogout" class="adm-footer-btn">Sign out</button>{% endif %}
         <div class="adm-build-stamp" title="The running build — also served by /version">
           {{ build_stamp }}</div>
       </div>
     </aside>
 
     <!-- ── Main content ─────────────────────────────────────────────────── -->
-    <main class="adm-main">
+    <main class="adm-main">{% if manager_mode == 'power' %}
+      {# POWER mode: the chat page's profile button, top right, with Back to
+         chat / Change Password / Logout (wired in admin_data_sources.js). #}
+      <div class="adm-topbar">{% with profile_menu_back_to_chat = true %}{% include 'partials/profile_button.html' %}{% endwith %}</div>{% endif %}
 
       <!-- Connections -->
       <section id="secConnections" class="adm-section">
         <header class="adm-page-head">
           <div>
             <h1>Database connections</h1>
-            <p class="adm-page-sub">{% if manager_mode == 'power' %}The connections your granted scope
+            <p class="adm-page-sub">{% if manager_mode == 'power' and self_service %}You can
+               add your own read-only database connections and register tables from them;
+               connections your administrator granted are read-only here.{% elif manager_mode == 'power' %}The connections your granted scope
                covers — read-only here; your administrator manages them.{% else %}Read-only credentials
                to your databases. Users never see these — they only pick from the tables you
                register.{% endif %}</p>
@@ -92,7 +102,7 @@
             {% endif %}
             {% endif %}
           </div>
-          {% if manager_mode != 'power' %}
+          {% if manager_mode != 'power' or self_service %}
           <button id="btnAddConnection" class="adm-btn primary">＋ Add connection</button>
           {% endif %}
         </header>
@@ -526,6 +536,9 @@
           </label>
           <label class="adm-check"><input type="checkbox" id="connSsl" /> SSL / Encrypt</label>
           <label class="adm-check"><input type="checkbox" id="connTrustCert" /> Trust server certificate</label>
+          <label class="adm-check span2"><input type="checkbox" id="connReadOnly" checked disabled /> Read-only access</label>
+          <p class="adm-muted span2 adm-conn-readonly-note">PowerDataChat only ever reads from a database.
+            Writes are refused by the platform even when the login has write privileges.</p>
         </div>
         <div id="connTlsWarn" class="adm-alert warn hidden conn-tls-warn" role="status"></div>
         <div id="connTestResult" class="adm-test-result hidden"></div>
@@ -845,6 +858,7 @@
     {# tojson: autoescape would entity-escape '/& inside emails and break the
        registered_by === MANAGER_EMAIL ownership compare in the JS #}
     window.__MANAGER_EMAIL__ = {{ username | tojson }};
+    window.__SELF_SERVICE__ = {{ 'true' if self_service | default(false) else 'false' }};
   </script>
   <script src="/static/admin_data_sources.js?v={{ ts }}"></script>
 </body>
