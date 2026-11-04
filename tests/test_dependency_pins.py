@@ -80,6 +80,8 @@ FIX_VERSIONS = {
     "urllib3": "2.8.0",
     "pillow": "13.0.0",
     "Authlib": "1.9.1",
+    "joserfc": "1.7.6",
+    "pyasn1": "0.6.5",
 }
 
 # Security-relevant transitives that fastapi / Authlib / matplotlib / the HTTP
