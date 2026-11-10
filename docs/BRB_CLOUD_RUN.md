@@ -218,6 +218,60 @@ the demo export is kept in `BRB_Database_template/docs/BRB_SERVICE_DIFF.md`.
 
 ## Deploy history
 
+**2026-11-10 — `main` at `f841877` (PRs #37, #39, #40).** Personal
+(self-service) database connections for non-administrator accounts, owner-only
+and never grantable to a role, with the per-user "Own connections" switch (on
+by default) and the power page's profile button in the top bar (PR #39);
+`pyasn1` 0.6.5 and `joserfc` 1.7.6 (PR #40); the `2a52247` deploy records
+(PR #37, docs only) (see the `pdcclient-demo` entry). `PERSONAL_TABLES_MAX`
+not set, image default (15). Same images as `pdcclient-demo` (Cloud Build
+`534c0927-fc08-4cc3-b87a-48cc35c4f4cb` from a clean clone of GitHub `main` at
+`f841877`, `BUILD_TIME=2026-11-10T12:57:33Z`), deployed right after the demo;
+the revision resolved exactly these digests:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:f841877` | `sha256:9240497ee4dd59aba08871b58d47b39dae9f7728fb7ac7b17b25e5af7212d0fe` |
+| `pdcexecutor-demo:f841877` | `sha256:ea2fbcb5bdf8be2e3b1fb7e1c4e94174d2f692c9158721c929e6e63d8755e613` |
+
+Revision `pdcclient-brb-f841877`, serving 100 % since 2026-11-10 ~13:13 UTC.
+It replaced `pdcclient-brb-2a52247`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-brb --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-brb-2a52247=100
+```
+
+Backups taken before the deploy:
+- Data bucket: `gs://pdc-enterprise-client-brb-data-backups/20261110-130833/`,
+  which matched the data bucket in size (285,559,063 bytes) and in its 346
+  object names.
+- Database (Cloud SQL export of `brb-demo-pg`, instance `RUNNABLE`):
+  `gs://pdc-enterprise-client-brb-data-backups/20261110-130833-sql/brb_demo.sql.gz`
+  (180,645,199 bytes).
+
+The spec change was image-only (two `image:` lines and the template name; the
+tag-only `candidate` traffic entry dropped; the `cloudsql-instances`
+annotation, secrets, buckets and resources carried over), checked by a diff
+against the export before the Admin API `PUT`. Candidate checks
+(`candidate---…` URL), none of them signed in:
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `f841877`; the landing
+  answered 200, an anonymous `/lab` redirected to sign-in, and an anonymous
+  `/auth/active_chats` and `/api/admin/connections` answered 401. Revision
+  log: `LADMIN_PRESENT`, `RESET_TOKEN_INDEX_FILLED count=9`,
+  `EXECUTOR_HANDSHAKE_OK version=f841877`, `DB_SCHEDULER_STARTED`; no error
+  lines, no 5xx, no `BACKEND_REQUEST_REFUSED`.
+- **Pending, to be done by hand in the browser:** the signed-in checks (the
+  connection test and 39 tables, a question in a DB-table chat, invite twice,
+  the "Own connections" column in Users). No sign-in was attempted: the
+  `CLIENT_BRB_LADMIN_PASSWORD` secret still predates the 2026-10-03 password
+  change, and this instance is invitation-only. The same two digests answered
+  a question on the `pdcclient-demo` candidate.
+- After the shift, `brb.powerdatachat.com` reported the same `/version` and
+  `/health` and served the sign-in page; `pdcbrain` gained no revision
+  (`pdcbrain-00034-riq`) and `pdcclient-demo` stayed on
+  `pdcclient-demo-f841877`.
+
 **2026-10-28 — `main` at `2a52247` (PRs #34, #35, #36).** The brain-call
 timeout `BRAIN_REQUEST_TIMEOUT` raised from 180 s to 300 s (the browser's
 stream / edit-regenerate aborts to 330 s), and a brain-call timeout now
