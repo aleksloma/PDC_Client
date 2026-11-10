@@ -395,6 +395,66 @@ Remove the check's throwaway account and dashboard afterwards.
 
 ## Deploy history
 
+**2026-11-10 — `main` at `f841877` (PRs #37, #39, #40).** Personal
+(self-service) database connections: a non-administrator account may add its
+own read-only connections and register up to `PERSONAL_TABLES_MAX` (default
+15) tables from them, owner-only for every write and every browse, never
+grantable to a role, deleted with the account; an "Own connections" switch per
+user in Users (on by default); the power page's profile button in the top bar
+(PR #39). `pyasn1` 0.6.4 → 0.6.5 and `joserfc` 1.7.5 → 1.7.6 for the pip-audit
+advisories (PR #40). The `2a52247` deploy records (PR #37, docs only).
+`PERSONAL_TABLES_MAX` is not set on the service, so the image default applies;
+no spec change beyond the images. Built ONCE by Cloud Build
+`534c0927-fc08-4cc3-b87a-48cc35c4f4cb` from a clean clone of GitHub `main` at
+`f841877` (both images stamped `f841877`, `BUILD_TIME=2026-11-10T12:57:33Z`)
+and deployed here first, then to `pdcclient-brb`:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:f841877` | `sha256:9240497ee4dd59aba08871b58d47b39dae9f7728fb7ac7b17b25e5af7212d0fe` |
+| `pdcexecutor-demo:f841877` | `sha256:ea2fbcb5bdf8be2e3b1fb7e1c4e94174d2f692c9158721c929e6e63d8755e613` |
+
+Revision `pdcclient-demo-f841877`, serving 100 % since 2026-11-10 ~13:09 UTC;
+it resolved exactly the two digests above. It replaced
+`pdcclient-demo-2a52247`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-demo-2a52247=100
+```
+
+Backup taken before the deploy:
+`gs://pdc-enterprise-client-demo-data-backups/20261110-125805/`, which matched
+the data bucket in size (445,988,408 bytes) and in its 601 object names.
+
+The spec change was image-only (two `image:` lines and the template name; the
+tag-only `candidate` traffic entry dropped), checked by a diff against the
+export before the Admin API `PUT`. Candidate checks (`candidate---…` URL):
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `f841877`; the landing
+  answered 200 and an anonymous `/lab` redirected to sign-in. Revision log:
+  `LADMIN_PRESENT`, `RESET_TOKEN_INDEX_FILLED count=1`,
+  `EXECUTOR_HANDSHAKE_OK version=f841877`, `DB_SCHEDULER_STARTED`; no error
+  lines, no 5xx, no `BACKEND_REQUEST_REFUSED`.
+- A self-registered throwaway account (scripted over HTTPS) saw
+  `window.__DIRECT_UPLOAD__ = true` on `/lab`, created a `sample_sales.csv`
+  chat ("Retail Analytics"; welcome message and three suggested questions
+  present) and asked "How many rows are there?": answered in 13.7 s with "The
+  dataset contains 6 rows." above a table (sandbox job `EXEC_JOB_END
+  status=ok`).
+- **Pending, to be done by hand:** removing that throwaway account,
+  `deploycheck-f841877-06533631@example.com` (one chat). `ladmin`'s scripted
+  sign-in with `CLIENT_DEMO_LADMIN_PASSWORD` answered 401
+  (`USER_LOGIN_BAD_PASSWORD`, one attempt only): the demo's `ladmin` password
+  no longer matches the secret. Remove the account from Users with the current
+  password, and store that password as a new version of
+  `CLIENT_DEMO_LADMIN_PASSWORD` so the next deploy can sign in.
+- Not run: the browser-only chart/dashboard-pin cycle, the > 32 MiB
+  direct-upload trace, and the personal-connection screens (they need a
+  signed-in account and a database the demo instance can reach).
+- After the shift, `client.powerdatachat.com` reported the same `/version`
+  and `/health` and served the sign-in page, and `pdcbrain` gained no revision
+  (`pdcbrain-00034-riq` serving before and after).
+
 **2026-10-28 — `main` at `2a52247` (PRs #34, #35, #36).** The brain-call
 timeout `BRAIN_REQUEST_TIMEOUT` raised from 180 s to 300 s (the browser's
 stream / edit-regenerate aborts to 330 s), and a brain-call timeout now
