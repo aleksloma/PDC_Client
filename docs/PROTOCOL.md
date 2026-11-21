@@ -257,7 +257,8 @@ summarize text.
   "raw_text": "```python\\nresult = df.groupby('department')['salary'].mean()...\\n```",
   "kind": "PYTHON",                       // PYTHON | PLOT_CODE | NO_CODE | CLARIFICATION | ANSWER | MISSING_DATA
   "code": "result = df.groupby('department')['salary'].mean()",
-  "usage": { "input_tokens": 1234, "output_tokens": 56, "total_tokens": 1290 },
+  "usage": { "input_tokens": 1234, "output_tokens": 56, "total_tokens": 1290,
+             "reasoning_tokens": 0, "cached_tokens": 0 },   // see "usage" below
   "context_decision": { "complexity": "simple", "complexity_score": 5, "skills_needed": ["analytics_libraries"], "is_greeting": false, "answer_language": "English", ... },
   "model_used": "gemini-2.5-pro",
   "sql": {                                // OPTIONAL — one read-only SELECT per live df key the
@@ -272,6 +273,19 @@ summarize text.
   "models_tried": ["gemini-2.5-pro"]      //   (see "Spent request budget" under Errors)
 }
 ```
+
+`usage`: token counts of the model calls behind the response, on every
+endpoint that returns `usage`. `input_tokens`, `output_tokens` and
+`total_tokens` are as before. Two additive keys: `reasoning_tokens` (the
+model's thinking tokens, Gemini `thoughtsTokenCount`) and `cached_tokens`
+(input tokens served from the model's cache, `cachedContentTokenCount`),
+each `0` when the model reports none. Both are present when a model
+answered; a fallback body (zeroed or empty `usage`) has
+neither, and a reader treats an absent key as 0. On `/v1/plan` the counts
+include the complexity-classifier call that precedes the plan call (and the
+narrative correction call, when one ran), also when the plan is answered by
+the greeting short-circuit (`kind: "NO_CODE"`), where the classifier is the
+only model call. Older clients ignore the new keys.
 
 `sql` (optional): `{<df key>: "<one read-only SELECT>"}`. The client never
 runs it as sent: the text passes the read-only guard (strict parse, CTEs
@@ -451,7 +465,12 @@ runs on the complex tier — its model, temperature, thinking and timeout
 from the tenant's effective settings — when the classifier's
 `analysis.task_type` is `diagnostic` or `advisory` (reason `narr_diag`), or
 is `aggregation`, `visualization`, `statistical_analysis` or
-`complex_analysis` and a column is period-like (reason `narr_period`): a
+`complex_analysis`, a column is period-like and the classifier's
+`complexity_score` is at least `NARR_PERIOD_MIN_SCORE` (brain env, integer,
+default 5); the reason is `narr_period`. A missing score does not block the
+upgrade. A period question scored below that
+value keeps the classifier's tier; `narr_diag` does not depend on the
+score. A column is period-like when a
 word of its name starts with `date`, `month`, `period` or `year` (any case,
 snake_case or camelCase: `REPORT_DATE`, `fiscal_year`, `reportDate`, not
 `updated_by`) or its dtype is a datetime, read from the `Columns:` /
@@ -652,6 +671,12 @@ the code that ran, unchanged: the whole answer, its blocks joined by
   "models_tried": ["gemini-2.5-pro"]      //   (see "Spent request budget" under Errors)
 }
 ```
+
+**Tier settings.** A code retry (not the narrative-only retry, which always
+uses the complex tier) runs on the complex tier when `use_pro` is true,
+otherwise on the simple tier, and takes the model, the temperature and the
+thinking setting of that tier from the tenant's effective settings (before:
+the tier's model with a fixed temperature of 0.7 and no thinking setting).
 
 A narrative-only retry (`error_msg` "narrative_invalid: …") answers:
 
@@ -1361,7 +1386,8 @@ The client implements all of these in `brain_client.py` as
 run under one total time budget per request (`PLAN_TOTAL_BUDGET_SECONDS`,
 default 240 s, below the client's 300 s request timeout; see
 `ENTERPRISE_ARCHITECTURE.md` §8a). Every model call of the request counts,
-the narrative correction call included. When the budget runs out before a
+the plan's complexity-classifier call and the narrative correction call
+included. When the budget runs out before a
 model answered, the endpoint still returns **HTTP 200** with its usual
 fallback body (plan / retry: `kind: "NO_CODE"`, empty `code`, plan also
 `context_decision.api_failed: true`; a narrative-only retry: the failed code
@@ -1380,6 +1406,10 @@ When the budget runs out only at the narrative correction step (the main
 attempt already returned code, its template is invalid), the code and kind
 are returned as usual with the invalid template dropped, plus the same two
 fields.
+
+`models_tried` lists the models called for the answer itself. The models
+the complexity classifier called are not in it (they appear in the brain's
+`LLM_BUDGET` log line only, marked `:classifier`).
 
 Both fields are absent on every other response, including a plan whose
 models all failed inside the budget (`api_failed: true` without

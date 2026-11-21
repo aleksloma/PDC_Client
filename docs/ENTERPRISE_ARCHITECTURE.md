@@ -283,6 +283,15 @@ A client-facing LLM request (`/v1/plan`, `/v1/retry`, `/v1/describe`,
 `PLAN_TOTAL_BUDGET_SECONDS` (env, default **240 s**), counted from the start
 of the request (for a plan, including the classifier).
 
+- **The classifier is inside the budget.** `/v1/plan` creates the budget
+  before the complexity classifier runs. Each classifier model call gets
+  `min(15 s, remaining budget)` as its timeout, its HTTP retries stop at the
+  request deadline, and it is recorded in the `LLM_BUDGET` line as
+  `<model>:<seconds>:<outcome>:classifier`. With less than 10 s left no
+  classifier model is called (`AGENT_SKIPPED_BUDGET` in the log) and the
+  plan continues with the fallback complexity. The classifier's token counts
+  are added to the plan's `usage`.
+
 - **Per attempt.** Each model call gets `min(per-model cap, remaining
   budget)` as its timeout. The per-model caps are unchanged and stay the
   upper limit of one attempt: `LLM_COMPLEX_TIMEOUT` (150 s) for complex or
@@ -301,9 +310,11 @@ of the request (for a plan, including the classifier).
   failing inside the budget keeps the old `PLAN_API_FAILED` shape without
   `error_code`.
 - **One log line per request that reaches a model call** (a plan answered
-  by the greeting short-circuit logs none), `LLM_BUDGET`, with the fields `caller`,
+  by the greeting short-circuit logs one too, with its classifier attempt),
+  `LLM_BUDGET`, with the fields `caller`,
   `total_elapsed`, `budget`, `exhausted` and `attempts`
-  (`<model>:<seconds>:<outcome>;…`, a correction attempt as
+  (`<model>:<seconds>:<outcome>;…`, a classifier attempt as
+  `<model>:<seconds>:<outcome>:classifier`, a correction attempt as
   `<model>:<seconds>:<outcome>:correction`, or `-` when no model was started),
   written at the END of the request so it covers every call, e.g.
   `[sid=…] [caller=plan] [total_elapsed=240.31] [budget=240] [exhausted=True]
@@ -325,8 +336,11 @@ of the request (for a plan, including the classifier).
   Gemini calls run at once on one instance, a call can wait for a free
   connection on top of its read time. The budget is then exceeded by at most
   that wait.
-- `models_tried` names only models that were actually called; `attempts`
-  also lists a call the budget skipped, as `skipped_budget`.
+- `models_tried` names only models that were actually called for the answer;
+  the classifier's models are not in it. `attempts` also lists the
+  classifier calls, and any call the budget skipped as `skipped_budget` (a
+  classifier call skipped for lack of time is not listed; the log shows
+  `AGENT_SKIPPED_BUDGET`).
 
 **Ordering rule.** brain budget (240 s) < client `BRAIN_REQUEST_TIMEOUT`
 (300 s) < Cloud Run request timeout of `pdcbrain` (recommended 600 s, see
