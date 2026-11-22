@@ -114,7 +114,7 @@ COPY app.py auth_limiter.py auto_analytics.py brain_client.py code_exec.py \
      relation_discovery.py \
      result_backstop.py roles_store.py run_chat_local.py sandbox_guard.py \
      schedule_utils.py schema_builder.py settings.py signin_domains.py \
-     sso_store.py ./
+     sso_store.py text_chart_check.py ./
 COPY routes/ routes/
 COPY templates/ templates/
 COPY static/ static/

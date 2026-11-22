@@ -1143,6 +1143,122 @@ def capture_outputs(env: Any) -> dict:
         return {"values": {}, "values_dropped": 0, "findings": {}, "findings_dropped": 0}
 
 
+# ---------------------------------------------------------------------------
+# chart_stats — what a Plotly chart draws, for the text/chart check (LOG ONLY)
+# ---------------------------------------------------------------------------
+# Built in the sandbox by `plot_utils._chart_stats` next to `chart_data`, read
+# in the web app by `text_chart_check.check_block`. Numbers only: it is never
+# stored in history, never sent to the brain and never logged except as
+# counts. The caps bound both the sandbox's work and the decoder's.
+CHART_STATS_MAX_TRACES = 20
+CHART_STATS_MAX_VALUES = 2000
+CHART_STATS_MAX_GROUPS = 50
+CHART_STATS_TYPES = ("bar", "scatter", "pie", "box", "violin", "histogram", "heatmap",
+                     "treemap", "sunburst", "icicle", "waterfall", "funnel", "other")
+CHART_STATS_GROUP_KEYS = ("n", "mean", "median", "q1", "q3", "min", "max")
+# A list longer than this many times its cap is not read at all (dropped):
+# the decoder's work stays bounded whatever the response holds.
+_CHART_STATS_SCAN_FACTOR = 4
+
+
+def _stats_number(value: Any):
+    """An exact, finite int / float (never a bool) as a float, else None."""
+    kind = type(value)
+    if kind is not int and kind is not float:
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _stats_list(value: Any, cap: int) -> list:
+    """The finite numbers of a list, the first `cap` kept; a non-list or a
+    list above `cap * _CHART_STATS_SCAN_FACTOR` entries -> []."""
+    if type(value) is not list or len(value) > cap * _CHART_STATS_SCAN_FACTOR:
+        return []
+    out = []
+    for item in value:
+        number = _stats_number(item)
+        if number is None:
+            continue
+        out.append(number)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _stats_group(value: Any):
+    if type(value) is not dict:
+        return None
+    group = {}
+    for key in CHART_STATS_GROUP_KEYS:
+        number = _stats_number(dict.get(value, key))
+        if number is None:
+            continue
+        if key == "n":
+            if number < 0 or not number.is_integer():
+                continue
+            group[key] = int(number)
+        else:
+            group[key] = number
+    return group or None
+
+
+def _stats_trace(value: Any):
+    if type(value) is not dict:
+        return None
+    kind = dict.get(value, "type")
+    if type(kind) is not str or kind not in CHART_STATS_TYPES:
+        kind = "other"
+    groups_raw = dict.get(value, "groups")
+    groups = []
+    if (type(groups_raw) is list
+            and len(groups_raw) <= CHART_STATS_MAX_GROUPS * _CHART_STATS_SCAN_FACTOR):
+        for item in groups_raw:
+            group = _stats_group(item)
+            if group is not None:
+                groups.append(group)
+                if len(groups) >= CHART_STATS_MAX_GROUPS:
+                    break
+    return {"type": kind,
+            "values": _stats_list(dict.get(value, "values"), CHART_STATS_MAX_VALUES),
+            "total": _stats_number(dict.get(value, "total")),
+            "groups": groups,
+            "draws_mean": dict.get(value, "draws_mean") is True}
+
+
+def decode_chart_stats(raw: Any):
+    """The main-app side of `chart_stats` (HOSTILE input — the same
+    discipline as `decode_values`): `{"traces": [{type, values, total,
+    groups, draws_mean}, ...]}` or None. Only exact dicts / lists are read,
+    every number must be an exact finite int / float (never a bool or a
+    string), unknown keys are dropped, an unknown `type` reads "other", the
+    caps (20 traces, 2000 values, 50 groups) keep the first entries and a
+    list far above its cap is dropped unread. Not a dict, or no `traces`
+    list -> None. Never raises, never logs a value."""
+    try:
+        if type(raw) is not dict:
+            return None
+        traces_raw = dict.get(raw, "traces")
+        if (type(traces_raw) is not list
+                or len(traces_raw) > CHART_STATS_MAX_TRACES * _CHART_STATS_SCAN_FACTOR):
+            return None
+        traces = []
+        for item in traces_raw:
+            trace = _stats_trace(item)
+            if trace is not None:
+                traces.append(trace)
+                if len(traces) >= CHART_STATS_MAX_TRACES:
+                    break
+        return {"traces": traces}
+    except Exception as e:
+        log_with_sid("exec", "warning",
+                     f"CHART_STATS_DECODE_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return None
+
+
 def _known_dropped(value: Any) -> int:
     """A drop count from the response: a non-negative int up to the cap,
     else 0. A count cannot be negative, so a negative one reads as 0."""
@@ -1158,9 +1274,9 @@ def _known_dropped(value: Any) -> int:
 _PYTHON_KEYS = ("error", "result", "preview", "image_base64",
                 "values", "values_dropped", "findings", "findings_dropped")
 _PLOT_KEYS = ("ok", "error", "trace", "multi_axes", "is_plotly", "image",
-              "plotly_html", "multi_charts", "chart_data", "result",
+              "plotly_html", "multi_charts", "chart_data", "chart_stats", "result",
               "values", "values_dropped", "findings", "findings_dropped")
-_CHART_KEYS = ("image", "is_plotly", "title", "chart_data")
+_CHART_KEYS = ("image", "is_plotly", "title", "chart_data", "chart_stats")
 _MULTI_CHARTS_MAX = 32
 
 
@@ -1256,6 +1372,8 @@ def _reconstruct(payload: dict, job_dir: Path, kind: str) -> dict:
             out[key] = _decode_blob(value, job_dir)
         elif key == "chart_data":
             out[key] = _decode_chart_data(value)
+        elif key == "chart_stats":
+            out[key] = decode_chart_stats(value)
         elif key == "multi_charts":
             out[key] = _decode_multi_charts(value, job_dir)
     # VALUES / FINDINGS never cause a violation: a hostile entry degrades to
@@ -1308,6 +1426,8 @@ def _decode_multi_charts(value: Any, job_dir: Path):
                 entry[key] = _decode_blob(item, job_dir)
             elif key == "chart_data":
                 entry[key] = _decode_chart_data(item)
+            elif key == "chart_stats":
+                entry[key] = decode_chart_stats(item)
             elif key == "is_plotly":
                 if not isinstance(item, bool):
                     raise _Violation("multi_charts is_plotly is not a boolean")

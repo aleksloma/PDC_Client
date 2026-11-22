@@ -47,9 +47,10 @@ import html_sanitize
 import ident_rule
 import narrative
 import result_backstop
+import text_chart_check
 from code_exec import safe_execute
 from plot_utils import render_plot_safe, _is_noninteractive_standard_chart
-from exec_transport import log_safe_text
+from exec_transport import CHART_STATS_MAX_TRACES, log_safe_text
 from logger_utils import log_with_sid
 from schema_builder import schema_text as build_schema_text
 from schema_builder import _detect_language as _detect_answer_language
@@ -1483,6 +1484,82 @@ def _passed_prefixes(code) -> frozenset:
     return frozenset(m.group(2) for m in _PASSED_PREFIX_ARG_RE.finditer(code))
 
 
+# The slot names one TEXT_CHART_CHECK field lists at most.
+_TEXT_CHART_NAMES_LOG_MAX = 10
+
+
+def _chart_stats_of(out, sid: str = "") -> Optional[dict]:
+    """The `chart_stats` of a PLOT exec answer: its own, or — a split grid —
+    every sub-chart's traces in one structure (one check per block), capped
+    at `CHART_STATS_MAX_TRACES`. None when there is none (matplotlib, an old
+    sandbox image, a stats failure). Never raises."""
+    try:
+        if not isinstance(out, dict):
+            return None
+        own = out.get("chart_stats")
+        if isinstance(own, dict):
+            return own
+        traces: list = []
+        found = False
+        for chart in out.get("multi_charts") or []:
+            stats = chart.get("chart_stats") if isinstance(chart, dict) else None
+            if isinstance(stats, dict) and isinstance(stats.get("traces"), list):
+                found = True
+                traces.extend(stats["traces"])
+        if not found:
+            return None
+        return {"traces": traces[:CHART_STATS_MAX_TRACES]}
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid(log_safe_text(sid or "narrative", 200), "warning",
+                     f"CHART_STATS_READ_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return None
+
+
+def _log_text_chart_check(sid, narr, block_index, block_values, plot_out) -> None:
+    """PROMPT 31 Part C — LOG ONLY: when the turn has a narrative template and
+    the block's chart produced Plotly `chart_stats`, classify the block's
+    numeric slots against the chart (`text_chart_check.check_block`) and log
+    ONE `TEXT_CHART_CHECK` line of counts, trace types and slot NAMES — never
+    a value. Nothing is shown, stored, retried or sent to the brain; the
+    stats are read here and nowhere else. A failure logs
+    `TEXT_CHART_CHECK_FAILED error=<Type>` and the turn goes on. Never
+    raises."""
+    try:
+        if narr is None or not narr.template:
+            return
+        chart_stats = _chart_stats_of(plot_out, sid)
+        if chart_stats is None:
+            return
+        values = block_values if isinstance(block_values, dict) else {}
+        result = text_chart_check.check_block(
+            template_slots=narr.chart_check_slots(block_index, values),
+            block_values=values, chart_stats=chart_stats, lang=narr.lang)
+        if "error" in result:
+            log_with_sid(log_safe_text(sid, 200), "warning",
+                         "TEXT_CHART_CHECK_FAILED "
+                         f"error={log_safe_text(result.get('error'), 80)}")
+            return
+
+        def names(key):
+            listed = [n for n in (result.get(key) or []) if isinstance(n, str)]
+            return ",".join(listed[:_TEXT_CHART_NAMES_LOG_MAX])
+
+        chart = ",".join(dict.fromkeys(str(t) for t in (result.get("chart") or [])[:20]))
+
+        log_with_sid(log_safe_text(sid, 200), "info",
+                     f"TEXT_CHART_CHECK block={int(block_index)} "
+                     f"chart={log_safe_text(chart, 200)} "
+                     f"slots={int(result.get('slots') or 0)} match={int(result.get('match') or 0)} "
+                     f"derived={int(result.get('derived') or 0)} other_stat={int(result.get('other_stat') or 0)} "
+                     f"not_found={int(result.get('not_found') or 0)} exempt={int(result.get('exempt') or 0)} "
+                     f"first={log_safe_text(result.get('first') or 'none', 12)} "
+                     f"other_stat_slots={log_safe_text(names('other_stat_slots'), 420)} "
+                     f"not_found_slots={log_safe_text(names('not_found_slots'), 420)}")
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid(log_safe_text(sid, 200), "warning",
+                     f"TEXT_CHART_CHECK_FAILED error={log_safe_text(type(e).__name__, 80)}")
+
+
 @dataclass
 class _NarrState:
     """One phase's narrative state (A5.1): the received templates, the
@@ -1629,6 +1706,54 @@ class _NarrState:
     def block_findings_for(self, block_index: int) -> dict:
         found = self.block_findings.get(block_index)
         return dict(found) if isinstance(found, dict) else {}
+
+    def chart_check_slots(self, block_index: int, block_values: dict) -> list:
+        """The `(name, kind, in_first_sentence)` of the slots the narrative
+        template and caption `block_index` SHOW that the block's VALUES set
+        (`text_chart_check.check_block`'s input), narrative slots first, each
+        name once. Built with `narrative.rendered_slots` — the narrative with
+        the phase's VALUES so far and every absorbed block's FINDINGS (the
+        merge `finish` makes later), the caption with its own block's; only
+        the narrative's first sentence is the answer's headline, so a
+        caption-only slot is never `in_first_sentence`. Never raises."""
+        try:
+            values = block_values if isinstance(block_values, dict) else {}
+            out: list = []
+            index_of: dict = {}
+
+            def add(slots, first_ok):
+                for name, kind, first in slots:
+                    if name not in values:
+                        continue
+                    if name in index_of:
+                        if first and first_ok:
+                            i = index_of[name]
+                            out[i] = (out[i][0], out[i][1], True)
+                        continue
+                    index_of[name] = len(out)
+                    out.append((name, kind, bool(first and first_ok)))
+
+            if self.template:
+                findings = dict(self.findings)
+                for index in sorted(self.block_findings):
+                    found = self.block_findings[index]
+                    if isinstance(found, dict):
+                        findings.update(found)
+                add(narrative.rendered_slots(self.template, self.values, findings,
+                                             locale=self.locale, prefixes=self.prefixes),
+                    True)
+            caption = self.captions.get(block_index)
+            if caption:
+                add(narrative.rendered_slots(caption, values,
+                                             self.block_findings_for(block_index),
+                                             locale=self.locale,
+                                             prefixes=self.block_prefixes.get(block_index)),
+                    False)
+            return out
+        except Exception as e:                               # noqa: BLE001
+            log_with_sid(log_safe_text(self.sid, 200), "warning",
+                         f"TEXT_CHART_SLOTS_FAILED error={log_safe_text(type(e).__name__, 80)}")
+            return []
 
     def caption(self, block_index: int, block_values: dict):
         """(template, rendered) of caption `block_index`, rendered with THAT
@@ -2663,6 +2788,8 @@ def run_chat_multi_plot(
                     log_with_sid(sid, "info", "MULTI_PLOT_DEDUP_SKIP split")
                     continue
                 produced_sigs.append(sig)
+                # LOG ONLY, for the shown group (after the dedup skip)
+                _log_text_chart_check(sid, narr, block_n, block_values, split_out)
                 split_kw = {"chart_data_list": [c.get("chart_data") for c in sub]}
                 # Caption n renders locally and rides sub-chart 0's partial;
                 # without one, the describe text follows the group's partials
@@ -2817,6 +2944,9 @@ def run_chat_multi_plot(
         produced_sigs.append(sig)
         if data_sig is not None:
             produced_data_sigs.append(data_sig)
+        # LOG ONLY, for a chart that is shown (after the degenerate / dedup
+        # skips above): do its text numbers match what it draws?
+        _log_text_chart_check(sid, narr, block_n, block_values, plot_out)
 
         # Determine the renderable chart from either executor's output shape
         # (render_plot_safe → image/plotly_html; safe_execute → image_base64).
@@ -3305,6 +3435,8 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
         }
 
     block_values = narr.absorb(exec_out, code, 1)
+    if kind == "PLOT_CODE":
+        _log_text_chart_check(sid, narr, 1, block_values, exec_out)
     # The implicit `result` slot (A3.2): a scalar RESULT fills it unless the
     # code set its own.
     safe_p = _safe_preview(exec_out.get("preview")) if kind != "PLOT_CODE" else None

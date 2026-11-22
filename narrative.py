@@ -825,6 +825,54 @@ def first_sentence_na_slot(template, values, findings, *, locale=None, prefixes=
         return None
 
 
+def rendered_slots(template, values, findings, *, locale=None, prefixes=None) -> list:
+    """`[(name, kind, in_first_sentence), ...]` of every slot the render of
+    `template` SHOWS (a slot inside a hidden section is not listed), in
+    template order, each name once (its first kind; `in_first_sentence` true
+    when any of its occurrences is in the first sentence). Same grammar,
+    sections, locale and passed prefixes as `render_with_sections`; the
+    first sentence is the `first_sentence_has_na` one: every slot renders a
+    private-use marker in FRONT of its normal text, so the sentence split is
+    the display render's. `name` / `kind` are planner literals of the
+    template grammar, never a value. A template that does not parse, or any
+    failure -> []. Never raises (Article IV)."""
+    try:
+        if not isinstance(template, str):
+            return []
+        nodes = parse(template)
+        vals = values if isinstance(values, dict) else {}
+        finds = findings if isinstance(findings, dict) else {}
+        seen: list = []
+
+        def slot_text(name, kind):
+            seen.append((name, kind))
+            shown = _fmt_value(vals[name], kind, locale, name=name) if name in vals else _NA
+            return f"{_MARK_OPEN}{len(seen) - 1}{_MARK_CLOSE}{shown}"
+
+        text = _walk(nodes, finds, slot_text, prefixes=passed_prefixes(prefixes),
+                     values=vals)
+        text = _post(text, max(len(text), 1))
+        first = _first_sentence(text) or ""
+        in_first = {int(m.group(1)) for m in _MARK_RE.finditer(first)}
+        out: list = []
+        index_of: dict = {}
+        for i, (name, kind) in enumerate(seen):
+            if name in index_of:
+                if i in in_first:
+                    j = index_of[name]
+                    out[j] = (out[j][0], out[j][1], True)
+                continue
+            index_of[name] = len(out)
+            out.append((name, kind, i in in_first))
+        return out
+    except TemplateError:
+        return []
+    except Exception as e:
+        log_with_sid("narrative", "warning",
+                     f"NARRATIVE_SLOT_LIST_FAILED error={log_safe_value(type(e).__name__, 80)}")
+        return []
+
+
 def invalid_error_msg(kind, slot=None) -> str:
     """The narrative-only retry's `error_msg` (PROTOCOL /v1/retry):
     `narrative_invalid: <kind>`, plus ` slot=<name> cause=<cause>` for a
