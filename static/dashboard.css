@@ -50,9 +50,11 @@
   padding: 20px 16px;
 }
 
-/* Top Bar with Profile */
+/* Top Bar with Profile. One row: the bar never wraps its items onto a second
+   row; on desktop the button labels do not wrap either (block below). */
 .top-bar {
   display: flex;
+  flex-wrap: nowrap;
   align-items: center;
   padding: 8px 16px;
   border-bottom: 1px solid #e5e7eb;
@@ -66,6 +68,7 @@
 
 .top-bar-actions {
   display: flex;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 12px;
 }
@@ -77,6 +80,14 @@
 
 .top-action-btn.hidden {
   display: none;
+}
+
+/* Each top-bar button is an icon + a label span (dashboard.html); the space
+   the label text used to start with is this margin. The desktop no-wrap and
+   icon-only rules sit after the desktop sidebar block ("Top bar on
+   desktop"). */
+.top-action-btn > span.top-bar-icon {
+  margin-right: 5px;
 }
 
 .report-download-btn {
@@ -1932,6 +1943,78 @@ button.danger:hover {
   }
 }
 
+/* Top bar on desktop (see the base rules near the top of this file). */
+@media (min-width: 769px) {
+  .top-bar .top-action-btn,
+  .top-bar .data-as-of-badge {
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  /* The left dropdown must not absorb an overflow (it used to squeeze the
+     Dashboards icon to nothing, hiding the overflow from initTopBarFit). */
+  #dashboardsDropdown {
+    flex-shrink: 0;
+  }
+}
+
+/* Icons only, from 769 to 1200 px: the labels are hidden, each button keeps
+   its localized title / aria-label (data-i18n-title / data-i18n-aria-label).
+   The profile button shows its avatar, as on mobile. Mobile (<= 768 px) is
+   not touched. The same rules apply above 1200 px when dashboard.js
+   (initTopBarFit) marks the bar `top-bar-compact` because the labels do not
+   fit (a wide sidebar) — keep the two blocks identical. */
+@media (min-width: 769px) and (max-width: 1200px) {
+  .top-bar .top-bar-label,
+  .top-bar .profile-btn-info {
+    display: none;
+  }
+  .top-bar .top-action-btn {
+    padding: 6px 10px;
+  }
+  .top-bar .top-action-btn > span.top-bar-icon {
+    margin-right: 0;
+  }
+  .top-bar #btnDashboards {
+    padding: 8px 11px;
+    gap: 0;
+  }
+  .top-bar .profile-btn {
+    padding: 3px;
+    border-radius: 50%;
+  }
+  .top-bar .data-as-of-badge {
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}
+
+@media (min-width: 769px) {
+  .top-bar.top-bar-compact .top-bar-label,
+  .top-bar.top-bar-compact .profile-btn-info {
+    display: none;
+  }
+  .top-bar.top-bar-compact .top-action-btn {
+    padding: 6px 10px;
+  }
+  .top-bar.top-bar-compact .top-action-btn > span.top-bar-icon {
+    margin-right: 0;
+  }
+  .top-bar.top-bar-compact #btnDashboards {
+    padding: 8px 11px;
+    gap: 0;
+  }
+  .top-bar.top-bar-compact .profile-btn {
+    padding: 3px;
+    border-radius: 50%;
+  }
+  .top-bar.top-bar-compact .data-as-of-badge {
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}
+
 /* Responsive */
 @media (max-width: 768px) {
   /* Show hamburger button on mobile */
@@ -2300,6 +2383,8 @@ button.danger:hover {
   transition: background 0.15s;
 }
 #btnDashboards:hover { background: #0a2f5c; border-color: #0a2f5c; }
+/* The icon keeps its size when the button is squeezed. */
+#btnDashboards svg { flex-shrink: 0; }
 
 /* The button sits at the LEFT corner of the top bar — anchor its menu left
    (the shared .dropdown-menu default of right:0 would overflow off-screen). */

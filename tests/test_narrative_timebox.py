@@ -153,6 +153,9 @@ def _done(events):
 
 
 def _single(events):
+    # C2 §2: a single TABLE answer yields its table partial (`single_table`)
+    # right after execution, before the single_response.
+    events = [e for e in events if not e.get("single_table")]
     assert len(events) == 1 and events[0].get("single_response"), events
     return events[0]["result"]
 
@@ -335,6 +338,10 @@ def _recorder(order):
     seen = []
 
     def cb(ev):
+        # C2 §1: `on_progress` also carries the keyed stage events
+        # (`lab.stage_*`); these tests pin the narrative-retry line only.
+        if str(ev.get("message_key", "")).startswith("lab.stage_"):
+            return
         seen.append(ev)
         order.append(("progress", dict(ev)))
 

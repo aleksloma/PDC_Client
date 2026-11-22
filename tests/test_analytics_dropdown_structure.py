@@ -229,7 +229,13 @@ def test_the_menu_sits_in_the_dropdown_next_to_the_download_button():
     assert dropdown in list(menu.ancestors())
     assert dropdown in list(button.ancestors())
     assert menu not in list(button.ancestors()), "the toggle is not a menu item"
-    assert button.attrs.get("data-i18n") == "lab.download_report"
+    # C4 (F9): the button holds an icon span and a label span; the label span
+    # carries the key (applyAll replaces the textContent of a data-i18n
+    # element, so the key on the button itself would wipe the icon).
+    assert "data-i18n" not in button.attrs
+    labels = [n for n in button.descendants()
+              if n.tag == "span" and n.attrs.get("data-i18n") == "lab.download_report"]
+    assert len(labels) == 1, [(n.tag, n.attrs) for n in button.descendants()]
 
 
 def test_the_menu_holds_exactly_three_items_in_order():

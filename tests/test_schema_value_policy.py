@@ -232,6 +232,7 @@ def test_a_small_preview_passes_unchanged(captured):
     assert captured[-1][1]["preview"] == {"total": 12.5, "label": "east"}
 
 
+@pytest.mark.real_brain_title
 def test_the_title_call_sends_at_most_300_answer_characters(captured):
     brain_client.title("sid", "q", "a" * 10_000)
     assert len(captured[-1][1]["answer"]) == 300

@@ -423,6 +423,8 @@ def _turn(dfs, question, history):
     events = list(run_chat_local.run_chat_multi_plot(
         sid="t", dfs=dfs, schema_docs={}, question=question,
         history_rows=history, user_email="alice@acme.com"))
+    # C2 §2: a single TABLE answer yields its table partial first
+    events = [e for e in events if not e.get("single_table")]
     assert len(events) == 1 and events[0].get("single_response"), events
     return events[0]["result"]
 
@@ -495,14 +497,17 @@ def test_values_never_in_describe_payload(monkeypatch, flow_env, sentinel_dfs):
             + "RESULT = dfs['d.csv'].groupby('cat')['n'].sum().reset_index()")
     brain = _FakeBrain(monkeypatch, [
         {"kind": "PYTHON", "raw_text": "", "usage": {}, "code": code,
-         "narrative": "Totals by segment, top {{cat:text}} at {{n:count}}."},
+         "narrative": "Totals by segment, top {{cat:text}} at {{n:count}}.",
+         # C2 §4: in a narrated turn only a PLANNED caption that does not
+         # render (here: empty) keeps the describe call this test inspects
+         "captions": {"1": ""}},
     ])
 
     result = _turn(sentinel_dfs, "totals by segment", [])
 
     assert result.get("table") is not None
     describes = brain.paths("/v1/describe")
-    assert len(describes) == 1                      # uncaptioned visual => describe
+    assert len(describes) == 1                      # planned caption not rendered => describe
     caveat = describes[0].get("data_caveat")
     assert isinstance(caveat, dict)                 # the turn carries FINDINGS
     assert set(caveat) <= _CAVEAT_KEYS

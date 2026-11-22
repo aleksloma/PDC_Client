@@ -25,7 +25,10 @@ everything else are plain dict:
 
 A missing column or a non-numeric metric raises `ValueError` with a fixed
 sentence naming the parameter and the column (schema-level information that
-helps a retry). Degenerate data (an empty frame, one period) never raises: it
+helps a retry). So does a `period_col` holding more than `MAX_PERIODS`
+distinct values (a raw timestamp, not a day / week / month column) in
+coverage_check, detect_anomalies, decompose_change and rate_by_period — the
+sentence names the column, the count and the limit. Degenerate data (an empty frame, one period) never raises: it
 returns empty tables and findings such as `too_few_periods`.
 """
 from __future__ import annotations
@@ -106,8 +109,12 @@ _PALETTE = {"base": "#4C78A8", "highlight": "#E45756", "up": "#54A24B", "down": 
 # ---------------------------------------------------------------------------
 # A4 fmt
 # ---------------------------------------------------------------------------
-KINDS = ("count", "float", "pct", "ratio", "amount", "text", "period")
-_NUMERIC_KINDS = ("count", "float", "pct", "ratio", "amount")
+# `pvalue` is appended at the end (the order above stays stable; narrative.KINDS
+# holds the same tuple): a finite value in [0, 1] — below PVALUE_FLOOR "<0.001",
+# else three decimals; a negative value or one above 1 is not a p-value -> n/a.
+KINDS = ("count", "float", "pct", "ratio", "amount", "text", "period", "pvalue")
+_NUMERIC_KINDS = ("count", "float", "pct", "ratio", "amount", "pvalue")
+PVALUE_FLOOR = 0.001
 # uz / ru (decision F20): a NO-BREAK space (U+00A0) groups thousands, a comma
 # is the decimal separator, the magnitude words are the language's own.
 _LOCALES = {"default": {"thousands": ",", "decimal": ".", "mln": "mln", "bln": "bln",
@@ -130,6 +137,21 @@ COLLAPSE_RATIO = 0.01
 # 1 / SCOPE_ROWS_FACTOR x) the rows of the period right before it is a change
 # of reporting SCOPE, not a business change (detect_anomalies "scope_change").
 SCOPE_ROWS_FACTOR = 3.0
+# The most distinct non-null values a `period_col` may hold (`_check_periods`,
+# called by coverage_check / detect_anomalies / decompose_change /
+# rate_by_period before any per-period work; `order=` does not bypass it).
+# Every function splits the frame once per period, so the cost grows with the
+# period count: measured on a 190,000-row frame (2 dims, 1 metric, Python
+# 3.11, the pinned pandas 2.2.3) coverage_check takes 0.13 s at 31 periods,
+# 0.4 s at 366, 0.8 s at 1,000, 1.4 s at 2,000, 2.5 s at 5,000 (peak 54 MiB)
+# and 4.5 s at 10,000 (100 MiB) — linear, about 0.5 ms per period (pandas
+# 3.0: 26 s at 50,000); detect_anomalies is ~10x cheaper. A raw timestamp
+# passed as the period column (189,018 distinct values) took 81 s and ran the
+# 2 GB sandbox out of memory. 5,000 keeps 13 years of daily data (and any
+# weekly / monthly series) working within a few seconds, while a timestamp
+# column of any sizeable frame is refused with a sentence that says how to
+# build a period column. Script: _p29_harness/c1_period_timing.py.
+MAX_PERIODS = 5000
 # `ratio` edges: 0 <= v < RATIO_FLOOR -> "<0.1x", v > RATIO_CEILING -> ">1000x".
 RATIO_FLOOR = 0.05
 RATIO_CEILING = 1000
@@ -138,7 +160,12 @@ _NA = "n/a"
 
 
 def fmt(value, kind: str | None = None, locale: str | None = None) -> str:
-    """Format one slot value for a narrative template. Never raises."""
+    """Format one slot value for a narrative template. Never raises.
+
+    `kind="pvalue"`: a finite value in [0, 1] below 0.001 (0 included) ->
+    "<0.001", otherwise three decimals ("0.042"); a negative value, one
+    above 1 or a non-finite one -> "n/a"; the decimal separator follows the
+    locale like every other kind ("<0,001" for uz / ru)."""
     try:
         return _fmt(value, kind, locale)
     except Exception:
@@ -175,6 +202,8 @@ def _fmt(value, kind, locale) -> str:
         return _NA
     if isinstance(value, float) and not math.isfinite(value):   # rule 7
         return _NA
+    if kind == "pvalue" and not 0 <= value <= 1:                # not a p-value
+        return _NA
     number, unit = _format_number(value, kind)                  # rule 8
     if number.startswith("-") and not any(ch in "123456789" for ch in number):
         number = number[1:]                                     # rule 9
@@ -207,6 +236,12 @@ def _format_number(value, kind):
         if value > RATIO_CEILING:
             return ">1000", "x"
         return format(value, ",.1f"), "x"
+    if kind == "pvalue":
+        # [0, 1] only (the caller turned anything else into n/a); a value
+        # below PVALUE_FLOOR — 0 included — says so instead of "0.000".
+        if value < PVALUE_FLOOR:
+            return "<0.001", ""
+        return format(value, ".3f"), ""
     # amount
     magnitude = abs(value)
     if magnitude >= 1e12:
@@ -252,6 +287,34 @@ def _require_columns(df, columns, param: str) -> None:
     for column in columns:
         if column not in df.columns:
             raise ValueError(f"{param}: column {column!r} not found in the frame")
+
+
+def _distinct_count(series: pd.Series):
+    """The number of distinct non-null values of `series`, or None when it
+    cannot be counted (unhashable cells are counted by their text)."""
+    try:
+        return int(series.nunique(dropna=True))
+    except Exception:
+        pass
+    try:
+        return int(series.dropna().astype(str).nunique())
+    except Exception:
+        return None
+
+
+def _check_periods(df, period_col) -> None:
+    """Refuse a `period_col` with more than `MAX_PERIODS` distinct non-null
+    values — a raw timestamp instead of a day / week / month column. Called
+    after the column checks (the column exists). No quoted literal carries
+    the advice: the client's retry scrub turns every quoted literal the
+    failed code does not contain into '<value>' (see `_check_prefix`); the
+    column name is quoted as in `_require_columns`, and the code holds it."""
+    n = _distinct_count(df[period_col])
+    if n is not None and n > MAX_PERIODS:
+        raise ValueError(f"period_col: column {period_col!r} has {n} distinct values; a period "
+                         f"column holds days, weeks or months (at most {MAX_PERIODS}). Build one "
+                         f"first, for example with .dt.date for days or with "
+                         f".dt.to_period(freq).astype(str) where freq is D, W or M")
 
 
 def _as_list(value, param: str) -> list:
@@ -301,7 +364,9 @@ def _plain(value):
 
 
 def _label_str(value):
-    """A period / member label as text (at most 200 chars), or None."""
+    """A period / member label as text (at most 200 chars), or None. A
+    `pd.Period` is its own text (`str`: "2024-07", "2024-07-01", "2024Q3",
+    a week "2024-07-01/2024-07-07") — the label `.astype(str)` would give."""
     try:
         if value is None:
             return None
@@ -309,6 +374,9 @@ def _label_str(value):
             value = value.item()
         if isinstance(value, float) and not math.isfinite(value):
             return None
+        if isinstance(value, pd.Period):
+            # before the strftime branch: pd.Timestamp(Period) raises
+            return str(value)[:_LABEL_MAX]
         if isinstance(value, (pd.Timestamp, np.datetime64)) or hasattr(value, "strftime"):
             stamp = pd.Timestamp(value)
             if pd.isna(stamp):
@@ -406,6 +474,9 @@ _MONTH_YEAR_RE = re.compile(r"(\d{1,2})[./](\d{4})")
 _QUARTER_A_RE = re.compile(r"(\d{4})\s*[-/ ]?\s*[Qq]([1-4])")
 _QUARTER_B_RE = re.compile(r"[Qq]([1-4])\s*[-/ ]?\s*(\d{4})")
 _TOKEN_RE = re.compile(r"[^\W\d_]+|\d+")
+# A span label "start/end" — what `str(pd.Period(..., "W"))` prints
+# ("2024-07-01/2024-07-07"): ordered by its start day.
+_DAY_SPAN_RE = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})\s*/\s*\d{4}-\d{1,2}-\d{1,2}")
 
 
 def _stamp(year: int, month: int, day: int = 1):
@@ -417,10 +488,16 @@ def _stamp(year: int, month: int, day: int = 1):
 
 def _parse_period_label(label):
     """A period label -> `pd.Timestamp`, or None when it does not parse.
-    Never raises."""
+    A `pd.Period` (a `.dt.to_period(...)` column) -> the START of the period
+    (`to_timestamp()`), and its text form parses to the same stamp — a week's
+    "start/end" span included. Never raises."""
     try:
         if label is None:
             return None
+        if isinstance(label, pd.Period):
+            # checked before the strftime branch: pd.Timestamp(Period) raises
+            stamp = label.to_timestamp(how="start")
+            return None if pd.isna(stamp) else stamp
         if isinstance(label, pd.Timestamp):
             return None if pd.isna(label) else label
         if isinstance(label, (np.datetime64,)) or hasattr(label, "strftime"):
@@ -432,6 +509,9 @@ def _parse_period_label(label):
         match = _ISO_DAY_RE.fullmatch(text)
         if match:
             return _stamp(match.group(1), match.group(2), match.group(3) or 1)
+        match = _DAY_SPAN_RE.fullmatch(text)
+        if match:
+            return _stamp(match.group(1), match.group(2), match.group(3))
         match = _YEAR_SLASH_RE.fullmatch(text)
         if match:
             return _stamp(match.group(1), match.group(2))
@@ -488,14 +568,28 @@ def _first_appearance(series: pd.Series) -> list:
 
 def _order_with_stamps(series: pd.Series, order=None):
     """`(labels, order_known, stamps | None)`; `stamps` holds one Timestamp
-    per label when every label is a date (parsed or datetime64)."""
+    per label when every label is a date (parsed or datetime64). A
+    `pd.Period` label (object or PeriodDtype column) parses to its start
+    (`_parse_period_label`), so a Period column orders chronologically like
+    its text form; an `order=` entry matches a Period label by its text
+    ("2024-07" names Period 2024-07, and a Period names its text label)."""
     present = series.dropna()
     if order is not None:
         present_list = _first_appearance(present)
         present_set = set(present_list)
+        by_text = {}
+        for label in present_list:
+            if isinstance(label, (pd.Period, str)):
+                by_text.setdefault(_label_str(label), label)
         in_order = []
         for label in list(order):
-            if label in present_set and label not in in_order:
+            if label not in present_set:
+                found = by_text.get(_label_str(label))
+                if found is None or not (isinstance(label, pd.Period)
+                                         or isinstance(found, pd.Period)):
+                    continue
+                label = found
+            if label not in in_order:
                 in_order.append(label)
         rest = [label for label in present_list if label not in set(in_order)]
         labels = in_order + rest
@@ -539,6 +633,14 @@ def _period_frames(df: pd.DataFrame, period_col, labels: list) -> list:
             sub = df[df[period_col] == label]
         out.append(sub)
     return out
+
+
+def _table_periods(labels: list) -> list:
+    """The `period` column of a result table: a `pd.Period` label as its
+    text (`str`, what `_label_str` puts in VALUES and what `.astype(str)`
+    gives), every other label unchanged — so the table matches the VALUES,
+    sorts like the string form and crosses the sandbox transport as text."""
+    return [str(label) if isinstance(label, pd.Period) else label for label in labels]
 
 
 def _period_values(df, period_col, metric, labels, agg) -> list:
@@ -634,6 +736,7 @@ def coverage_check(df, period_col: str, dims: list, metrics: list, *, order=None
     _require_columns(df, unit_cols, "unit_cols")
     for metric in metrics:
         _require_numeric(df, metric, "metrics")
+    _check_periods(df, period_col)
     try:
         as_of_stamp = _naive(pd.Timestamp(as_of if as_of is not None else pd.Timestamp.now()))
         if pd.isna(as_of_stamp):
@@ -645,7 +748,7 @@ def coverage_check(df, period_col: str, dims: list, metrics: list, *, order=None
     frames = _period_frames(df, period_col, labels)
     rows = [int(len(sub)) for sub in frames]
 
-    table = pd.DataFrame({"period": labels, "rows": rows})
+    table = pd.DataFrame({"period": _table_periods(labels), "rows": rows})
     member_sets = {}
     for dim in dims:
         sets = [set(_first_appearance(sub[dim].dropna())) for sub in frames]
@@ -963,6 +1066,7 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
         _require_numeric(df, rows_col, "rows_col")
     dims = _as_list(dims, "dims")
     _require_columns(df, dims, "dims")
+    _check_periods(df, period_col)
 
     try:
         thin_ratio = float(thin_ratio)
@@ -997,7 +1101,8 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
     if n < 3:
         findings["too_few_periods"] = True
         table = pd.DataFrame({
-            "period": labels, "value": v, "robust_z": [np.nan] * n, "ratio_prev": [np.nan] * n,
+            "period": _table_periods(labels), "value": v, "robust_z": [np.nan] * n,
+            "ratio_prev": [np.nan] * n,
             "ratio_median": [np.nan] * n, "is_anomaly": [False] * n, "is_primary": [False] * n,
             "rows": rows, "is_data_gap": [False] * n,
         }, columns=columns)
@@ -1013,7 +1118,7 @@ def detect_anomalies(df, period_col, metric, agg: str = "sum", *, order=None,
     core = _anomaly_core(v, z, ratio, skip=gaps)
     flagged, primary = core["flagged"], core["primary"]
     table = pd.DataFrame({
-        "period": labels,
+        "period": _table_periods(labels),
         "value": v,
         "robust_z": [float(x) for x in core["robust_z"]],
         "ratio_prev": [float(x) for x in core["ratio_prev"]],
@@ -1115,6 +1220,7 @@ def decompose_change(df, period_col, metric, from_period=None, to_period=None, d
     _require_columns(df, dims, "dims")
     if agg in _NUMERIC_AGGS:
         _require_numeric(df, metric, "metric")
+    _check_periods(df, period_col)
     try:
         top_k = max(int(top_k), 0)
     except Exception:
@@ -1701,6 +1807,7 @@ def rate_by_period(df, period_col, numerator, denominator, *, order=None,
     _require_columns(df, [denominator], "denominator")
     _require_numeric(df, numerator, "numerator")
     _require_numeric(df, denominator, "denominator")
+    _check_periods(df, period_col)
 
     labels, _known, _stamps = _order_with_stamps(df[period_col], order)
     frames = _period_frames(df, period_col, labels)
@@ -1708,7 +1815,7 @@ def rate_by_period(df, period_col, numerator, denominator, *, order=None,
     dens = [_agg_series(sub[denominator], "sum") for sub in frames]
     rates = [num / den if (math.isfinite(den) and den != 0) else float("nan")
              for num, den in zip(nums, dens)]
-    table = pd.DataFrame({"period": labels, "numerator": nums, "denominator": dens,
+    table = pd.DataFrame({"period": _table_periods(labels), "numerator": nums, "denominator": dens,
                           "rate": rates}, columns=_RATE_COLUMNS)
     table.attrs["pdc_numerator"] = str(numerator)
     table.attrs["pdc_denominator"] = str(denominator)

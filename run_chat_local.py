@@ -944,6 +944,9 @@ def _run_chat_body(*, sid, dfs, schema_docs, question, history_rows, user_email,
 
     # Greeting — call brain for natural reply
     if kind == "NO_CODE":
+        # A plan the brain could not produce (budget spent / every model
+        # failed) is an error turn, not a "Try rephrasing" answer.
+        _raise_if_analysis_failed(sid, plan_out, "plan")
         if context_decision.get("is_greeting"):
             g = brain_client.greeting(sid, question, df_names, user_email=user_email)
             return {"text": g.get("text", ""), "image_base64": None, "table": None, "code": None, "usage": _sum_usage(usage, g.get("usage", {}))}
@@ -982,6 +985,7 @@ def _run_chat_body(*, sid, dfs, schema_docs, question, history_rows, user_email,
             sql=_retry_sql(state), sql_error=_retry_sql_error(state),
             live_tables=live_tables,
         )
+        _raise_if_analysis_failed(sid, retry_out, "retry")
         _merge_retry_sql(state, retry_out)
         new_code = retry_out.get("code") or ""
         new_kind = retry_out.get("kind")
@@ -1257,6 +1261,21 @@ def _visual_backstop_prefix(sid, question, code, *, chart_data=None,
         return ""
 
 
+def _planned_caption_indices(captions, sid) -> set:
+    """The block numbers a reply's raw `captions` names with a valid 1..12
+    key, whatever its template (an empty or over-long one is dropped by
+    `narrative.clean_captions` but was still planned). Never raises."""
+    try:
+        if not isinstance(captions, dict):
+            return set()
+        return {int(k) for k in captions
+                if isinstance(k, str) and narrative._CAPTION_INDEX_RE.match(k)}
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid(log_safe_text(sid, 200), "warning",
+                     f"CAPTION_PLAN_READ_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return set()
+
+
 def _positive_count(value) -> int:
     """A sandbox-reported drop count as a non-negative int (0 otherwise)."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1308,6 +1327,72 @@ def _emit_narrative_progress(sid, on_progress) -> None:
     except Exception as e:                                   # noqa: BLE001
         log_with_sid(sid, "warning",
                      f"NARRATIVE_PROGRESS_FAILED error={log_safe_text(type(e).__name__, 80)}")
+
+
+# Keyed stage events of the live stream (C2 §1): the English text of each
+# key; the page shows `_t(message_key, message)`. `{n}` is the attempt number
+# of `lab.stage_fixing` (the event also carries it as `attempt`).
+STAGE_TEXTS = {
+    "lab.stage_planning": "Planning the analysis…",
+    "lab.stage_running": "Running the analysis…",
+    "lab.stage_fixing": "Fixing an error (attempt {n})…",
+    "lab.stage_describing": "Describing the result…",
+    "lab.stage_summary": "Preparing the summary…",
+}
+
+
+def _emit_stage(sid, on_progress, key: str, attempt: Optional[int] = None) -> None:
+    """Hand the page one keyed stage event `{"progress": True, "message_key":
+    key, "message": <English text>[, "attempt": n]}` through `on_progress`
+    (None -> nothing: edit-regenerate and Auto Analytics stream nothing). A
+    raising callback is logged (type only) and ignored — a status line never
+    breaks the answer (Article IV)."""
+    if on_progress is None:
+        return
+    try:
+        text = STAGE_TEXTS[key]
+        ev = {"progress": True, "message_key": key, "message": text}
+        if attempt is not None:
+            ev["attempt"] = int(attempt)
+            ev["message"] = text.replace("{n}", str(int(attempt)))
+        on_progress(ev)
+    except Exception as e:                                   # noqa: BLE001
+        log_with_sid(sid, "warning",
+                     f"STAGE_PROGRESS_FAILED error={log_safe_text(type(e).__name__, 80)}")
+
+
+# A /v1/plan or /v1/retry answer the brain could not produce (F13 item 8):
+# its request budget ran out, or every model attempt failed. The turn then
+# ends as an error turn with this translated sentence instead of the NO_CODE
+# "Try rephrasing" text — rephrasing does not help there.
+ANALYSIS_FAILED_TEXT = "The analysis could not be completed. Please try again."
+ANALYSIS_FAILED_KEY = "lab.analysis_failed"
+ANALYSIS_FAILED_CODES = frozenset({"llm_budget_exhausted", "llm_unavailable"})
+
+
+class AnalysisFailedError(brain_client.BrainError):
+    """A plan / retry response carried an `error_code` of
+    ANALYSIS_FAILED_CODES. A BrainError, so a caller that knows only that
+    class still degrades; the chat routes catch it FIRST and answer
+    ANALYSIS_FAILED_TEXT with `error_key` ANALYSIS_FAILED_KEY, persisted like
+    a BrainTimeoutError turn."""
+
+    def __init__(self, error_code: str):
+        super().__init__(ANALYSIS_FAILED_TEXT)
+        self.error_code = error_code
+
+
+def _raise_if_analysis_failed(sid, response, where: str) -> None:
+    """Raise AnalysisFailedError when `response` (a plan / retry answer,
+    passed through by brain_client unchanged) carries `error_code`
+    llm_budget_exhausted or llm_unavailable; any other or absent code keeps
+    today's behaviour. Logs the code (one of the two known names) only."""
+    code = response.get("error_code") if isinstance(response, dict) else None
+    if isinstance(code, str) and code in ANALYSIS_FAILED_CODES:
+        log_with_sid(sid, "warning",
+                     f"ANALYSIS_FAILED error_code={log_safe_text(code, 40)} "
+                     f"where={log_safe_text(where, 20)}")
+        raise AnalysisFailedError(code)
 
 
 def _log_narrative_retry_timeout(sid, started: float) -> None:
@@ -1372,6 +1457,11 @@ class _NarrState:
     # the local headline of a DROPPED narrative (`NARRATIVE_INVALID_TWICE`,
     # `narrative.headline_sentence`); display text only (R0)
     headline: Optional[str] = None
+    # the block numbers the brain DELIVERED a caption for (a 1..12 key in the
+    # reply's `captions`), whether or not the template survived cleaning:
+    # a planned caption that does not render keeps its describe call, a
+    # visual of a narrated turn without one gets none (C2 §4)
+    captions_planned: set = field(default_factory=set)
 
     @classmethod
     def from_reply(cls, reply, input_columns, sid, phase: int = 1,
@@ -1385,7 +1475,27 @@ class _NarrState:
             captions=narrative.clean_captions(reply.get("captions"), sid=sid),
             input_columns=frozenset(input_columns or ()),
             sid=sid,
-            lang=lang if isinstance(lang, str) and lang else "en")
+            lang=lang if isinstance(lang, str) and lang else "en",
+            captions_planned=_planned_caption_indices(reply.get("captions"), sid))
+
+    def caption_planned(self, block_index: int) -> bool:
+        """Whether the brain delivered a caption template for block
+        `block_index` (rendered or not)."""
+        return block_index in self.captions_planned
+
+    def describe_now(self, block_index: int) -> bool:
+        """C2 §4 — for a visual of block `block_index` whose caption did NOT
+        render: True when its describe call must run now (a planned caption
+        that did not render, or no narrative template at all, so no
+        narrative can explain it); False when the decision waits for the
+        narrative (no planned caption, a template exists): a rendered
+        narrative then explains the visual (its last sentence) and no
+        describe call is made; a dropped one leaves describe as today. A
+        later visual of a block whose caption RENDERED on its first visual
+        (a regenerated block's other children) counts as uncaptioned."""
+        planned_unrendered = (self.caption_planned(block_index)
+                              and block_index not in self.captions_used)
+        return planned_unrendered or not self.template
 
     @property
     def locale(self) -> Optional[str]:
@@ -1412,6 +1522,8 @@ class _NarrState:
                                              sid=self.sid, what="narrative")
                 if t:
                     self.template = t
+            if 1 in _planned_caption_indices(reply.get("captions"), self.sid):
+                self.captions_planned.add(block_index)
             caps = narrative.clean_captions(reply.get("captions"), sid=self.sid)
             if 1 in caps:
                 self.captions[block_index] = caps[1]
@@ -2139,7 +2251,34 @@ def run_chat_multi_plot(
     `on_progress` (optional, called from this generator's thread): receives
     the narrative-only retry's `{"progress": True, "message_key":
     "lab.narrative_retry", "message"}` right before that retry, in the multi
-    and the single flow. A raising callback is logged and ignored.
+    and the single flow, and the keyed stage events (`_emit_stage`, C2 §1):
+    `lab.stage_planning` before the plan call, `lab.stage_running` before
+    each block's execution, `lab.stage_fixing` (+ `attempt`) before each
+    exec-error `/v1/retry`, `lab.stage_describing` before each describe call
+    and `lab.stage_summary` before the narrative render / summarize call. A
+    raising callback is logged and ignored.
+
+    Earlier visuals (C2 §2): a chart partial is yielded right after
+    execution. A chart whose caption rendered carries it as `answer`; any
+    other chart is yielded with `answer` "" and, once its describe call
+    returns, followed by `{"caption": True, "index": <its chart_n>, "text":
+    <describe text>, "phase": 1, "block_index"}` (for a split group the
+    index of its first sub-chart). Describe runs only where needed (C2 §4,
+    `_NarrState.describe_now`): a visual whose planned caption rendered is
+    never described; one whose PLANNED caption did not render (empty,
+    invalid, too long, all sentences dropped, code-in-text) is, right away;
+    one without a planned caption is described right away when the plan has
+    no narrative template, else only after the narrative render and only
+    when the narrative is not used (`DESCRIBE_SKIPPED n= reason=narrative`
+    otherwise — the narrative's last sentence explains it, and the chart
+    keeps `answer` "" with no caption event). A single TABLE answer
+    yields `{"partial": True, "single_table": True, "phase": 1, "tables",
+    "table", "code", "table_codes", "table_result_keys", "sql"}` right after
+    execution, then its `single_response` (the text follows there).
+
+    A plan or exec-error retry answer carrying `error_code`
+    llm_budget_exhausted / llm_unavailable raises AnalysisFailedError
+    (F13 item 8).
     """
     df_names = list(dfs.keys())
     df_columns = {name: list(df.columns) for name, df in dfs.items()}
@@ -2156,6 +2295,7 @@ def run_chat_multi_plot(
     caps = brain_capabilities()
 
     # 1) Plan once — reuse the raw_text for single-vs-multi detection
+    _emit_stage(sid, on_progress, "lab.stage_planning")
     plan_out = brain_client.plan(
         sid=sid, question=question, schema_text=schema_str,
         df_names=df_names, history_rows=history_rows,
@@ -2199,7 +2339,9 @@ def run_chat_multi_plot(
         if kind == "PLOT_CODE" and code.strip():
             plot_blocks = [code]
         else:
-            result = _run_single_from_plan(
+            # `yield from`: a single table answer's partial streams before its
+            # text; the generator's return value is the single result.
+            result = yield from _iter_single_from_plan(
                 sid=sid, dfs=dfs, schema_docs=schema_docs, schema_str=schema_str,
                 df_columns=df_columns, df_names=df_names,
                 question=question, history_rows=history_rows, user_email=user_email,
@@ -2211,6 +2353,7 @@ def run_chat_multi_plot(
                 plan_captions=plan_out.get("captions"),
                 capabilities=caps, input_columns=input_columns,
                 on_progress=on_progress,
+                plan_error_code=plan_out.get("error_code"),
             )
             yield {"single_response": True, "result": result}
             return
@@ -2262,18 +2405,26 @@ def run_chat_multi_plot(
     # column renames). See _chart_data_signature.
     produced_data_sigs: list = []
 
-    def _visual_text(n, block_values, code_, **inspect_kw):
-        """The text of one visual of block `n`: its rendered caption (with
-        the backstop note, no brain call) when caption n exists, else the
-        per-visual describe with that block's validated FINDINGS. Returns
-        (brain_safe_text, display_text, caption_template_or_None, usage)."""
+    def _visual_caption(n, block_values, code_, **inspect_kw):
+        """Caption n of one visual of block `n`, rendered locally with the
+        backstop note (no brain call): (brain_safe_text, display_text,
+        caption_template), or None when the block has no caption that
+        renders (never planned, already used, dropped by a gate) — whether
+        the visual then gets a describe call is `narr.describe_now` (C2 §4)."""
         cap = narr.caption(n, block_values)
-        if cap is not None:
-            template, rendered = cap
-            prefix = _visual_backstop_prefix(sid, question, code_,
-                                             dataset_profile=dataset_profile,
-                                             **inspect_kw)
-            return prefix + template, prefix + rendered, prefix + template, {}
+        if cap is None:
+            return None
+        template, rendered = cap
+        prefix = _visual_backstop_prefix(sid, question, code_,
+                                         dataset_profile=dataset_profile,
+                                         **inspect_kw)
+        return prefix + template, prefix + rendered, prefix + template
+
+    def _visual_describe(n, code_, **inspect_kw):
+        """The per-visual describe of block `n` with that block's validated
+        FINDINGS, announced by `lab.stage_describing`. Returns
+        (brain_safe_text, display_text, None, usage)."""
+        _emit_stage(sid, on_progress, "lab.stage_describing")
         d = _describe_with_backstop(sid, question, code_, user_email,
                                     dataset_profile=dataset_profile,
                                     findings=narr.block_findings_for(n),
@@ -2289,6 +2440,12 @@ def run_chat_multi_plot(
     from collections import deque
     work = deque((blk, 0, 0, 0, n) for n, blk in plot_blocks)
     produced = 0
+    # Visuals without a planned caption in a turn whose plan has a narrative
+    # template (C2 §4): their describe call waits for the narrative render —
+    # described (and, for a chart, followed by its `caption` event) only when
+    # the narrative is not used. {index (chart_n, None for a table), answer_at
+    # (their slot in combined/display answers), block_n, code, kw}.
+    deferred: list = []
     # The sentence recorded once the analysis sandbox itself proved to be down
     # — it stops the chart worklist below AND the table blocks after it, which
     # dispatch through the same hop and would each wait the same queue for the
@@ -2313,6 +2470,7 @@ def run_chat_multi_plot(
         except Exception:
             pass
 
+        _emit_stage(sid, on_progress, "lab.stage_running")
         plot_out = _render(code)
 
         # Standard execution-error retry (skip when it's the multi-axes signal).
@@ -2333,6 +2491,7 @@ def run_chat_multi_plot(
                          f"MULTI_PLOT_ERROR attempt={retry_count+1}: {log_safe_text(error_msg, 200)}")
             use_pro = retry_count >= 1
             use_search = retry_count >= 1
+            _emit_stage(sid, on_progress, "lab.stage_fixing", attempt=retry_count + 1)
             retry_out = brain_client.retry(
                 sid=sid, question=question, schema_text=schema_str,
                 df_names=df_names, df_columns=df_columns, history_rows=history_rows,
@@ -2343,6 +2502,7 @@ def run_chat_multi_plot(
                 live_tables=live_tables, capabilities=caps,
                 timeout=None,                 # the client-wide BRAIN_REQUEST_TIMEOUT
             )
+            _raise_if_analysis_failed(sid, retry_out, "retry")
             _merge_retry_sql(state, retry_out)
             new_code = retry_out.get("code") or ""
             new_kind = retry_out.get("kind")
@@ -2438,11 +2598,15 @@ def run_chat_multi_plot(
                     log_with_sid(sid, "info", "MULTI_PLOT_DEDUP_SKIP split")
                     continue
                 produced_sigs.append(sig)
-                base_safe, base_shown, base_tmpl, d_usage = _visual_text(
-                    block_n, block_values, code,
-                    chart_data_list=[c.get("chart_data") for c in sub])
-                total_usage = _sum_usage(total_usage, d_usage)
+                split_kw = {"chart_data_list": [c.get("chart_data") for c in sub]}
+                # Caption n renders locally and rides sub-chart 0's partial;
+                # without one, the describe text follows the group's partials
+                # as a `caption` event for sub-chart 0 (C2 §2).
+                cap = _visual_caption(block_n, block_values, code, **split_kw)
+                base_safe, base_shown, base_tmpl = cap if cap is not None else ("", "", None)
                 log_with_sid(sid, "info", f"MULTI_AXES_SPLIT_EMIT charts={len(sub)}")
+                first_n = None
+                group_answers: list = []      # (index into the answer lists) per sub-chart
                 for i, cobj in enumerate(sub):
                     produced += 1
                     # caption n (or the describe text) on sub-chart 0, the
@@ -2452,6 +2616,8 @@ def run_chat_multi_plot(
                     combined_answers.append(base_safe if i == 0 else title)
                     display_answers.append(txt)
                     if i == 0:
+                        first_n = produced
+                        group_answers.append(len(combined_answers) - 1)
                         combined_codes.append(code)
                     sub_data_sig = (None if _has_hidden_color_measure(code)
                                     else _chart_data_signature(cobj.get("chart_data")))
@@ -2470,6 +2636,17 @@ def run_chat_multi_plot(
                     # emit cap within the group too.
                     if produced >= _MAX_MULTI_PLOTS:
                         break
+                if cap is None and first_n is not None and narr.describe_now(block_n):
+                    d_safe, d_shown, _no_tmpl, d_usage = _visual_describe(
+                        block_n, code, **split_kw)
+                    total_usage = _sum_usage(total_usage, d_usage)
+                    combined_answers[group_answers[0]] = d_safe
+                    display_answers[group_answers[0]] = d_shown
+                    yield {"caption": True, "index": first_n, "text": d_shown,
+                           "phase": 1, "block_index": block_n}
+                elif cap is None and first_n is not None:
+                    deferred.append({"index": first_n, "answer_at": group_answers[0],
+                                     "block_n": block_n, "code": code, "kw": split_kw})
             continue
 
         if plot_out.get("error"):
@@ -2584,15 +2761,17 @@ def run_chat_multi_plot(
             img_b64 = plot_out.get("plotly_html")
         else:
             img_b64 = plot_out.get("image")
-        # Caption n (rendered locally) or describe from code (brain — no data
-        # leaves)
-        safe_text, text, caption_tmpl, d_usage = _visual_text(
-            block_n, block_values, code, chart_data=plot_out.get("chart_data"))
-        total_usage = _sum_usage(total_usage, d_usage)
+        # Caption n (rendered locally) rides the partial; without one the
+        # chart is sent first and its describe text (brain — no data leaves)
+        # follows as a `caption` event (C2 §2 / §4).
+        cap = _visual_caption(block_n, block_values, code,
+                              chart_data=plot_out.get("chart_data"))
+        safe_text, text, caption_tmpl = cap if cap is not None else ("", "", None)
 
         produced += 1
         combined_answers.append(safe_text)
         display_answers.append(text)
+        answer_at = len(combined_answers) - 1
         combined_codes.append(code)
         log_with_sid(sid, "info", f"PLOT_RENDERED chart={produced} plotly={plot_out.get('is_plotly')}")
 
@@ -2604,6 +2783,20 @@ def run_chat_multi_plot(
             "sql": dict(state["sql_used"]),
             "caption_template": caption_tmpl, "phase": 1, "block_index": block_n,
         }
+        if cap is None and narr.describe_now(block_n):
+            d_safe, d_shown, _no_tmpl, d_usage = _visual_describe(
+                block_n, code, chart_data=plot_out.get("chart_data"))
+            total_usage = _sum_usage(total_usage, d_usage)
+            combined_answers[answer_at] = d_safe
+            display_answers[answer_at] = d_shown
+            yield {"caption": True, "index": produced, "text": d_shown,
+                   "phase": 1, "block_index": block_n}
+        elif cap is None:
+            # No planned caption, a narrative template: decided after the
+            # narrative render (C2 §4).
+            deferred.append({"index": produced, "answer_at": answer_at,
+                             "block_n": block_n, "code": code,
+                             "kw": {"chart_data": plot_out.get("chart_data")}})
 
     # Execute the extracted TABLE blocks (mixed dashboard answers). Each block
     # yields one table (or several, when its RESULT was a dict of DataFrames);
@@ -2629,6 +2822,7 @@ def run_chat_multi_plot(
             log_with_sid(sid, "warning", "MIXED_TABLE_BLOCKS_SKIPPED service_down")
             break
         try:
+            _emit_stage(sid, on_progress, "lab.stage_running")
             exec_out = _execute(tb)
             if exec_out.get("error"):
                 if exec_out.get("live_role_denied"):
@@ -2666,9 +2860,23 @@ def run_chat_multi_plot(
             emitted = ([t] if t else []) + (ts or [])
             if not emitted:
                 continue
-            safe_text, text, caption_tmpl, d_usage = _visual_text(
-                block_n, block_values, tb, result_obj=result_obj)
-            total_usage = _sum_usage(total_usage, d_usage)
+            cap = _visual_caption(block_n, block_values, tb, result_obj=result_obj)
+            if cap is not None:
+                safe_text, text, caption_tmpl = cap
+            elif narr.describe_now(block_n):
+                safe_text, text, caption_tmpl, d_usage = _visual_describe(
+                    block_n, tb, result_obj=result_obj)
+                total_usage = _sum_usage(total_usage, d_usage)
+            else:
+                # No planned caption, a narrative template: the describe
+                # call waits for the narrative render (C2 §4); its text, if
+                # any, fills this slot.
+                safe_text, text, caption_tmpl = "", "", None
+                combined_answers.append("")
+                display_answers.append("")
+                deferred.append({"index": None, "answer_at": len(combined_answers) - 1,
+                                 "block_n": block_n, "code": tb,
+                                 "kw": {"result_obj": result_obj}})
             if caption_tmpl is None and text:
                 # the per-block describe text, as today
                 combined_answers.append(safe_text)
@@ -2731,8 +2939,27 @@ def run_chat_multi_plot(
             return None
 
     # The phase's narrative, rendered once every block has run (A5.1).
+    if narr.template:
+        _emit_stage(sid, on_progress, "lab.stage_summary")
     rendered = narr.finish(retry_narrative=_retry_narrative)
     narrative_used = rendered is not None
+
+    # The deferred visuals (C2 §4): a rendered narrative explains them (its
+    # last sentence), so no describe call; otherwise each is described now,
+    # as it would have been before, and a chart's text follows as its
+    # `caption` event.
+    if deferred and narrative_used:
+        log_with_sid(sid, "info", f"DESCRIBE_SKIPPED n={len(deferred)} reason=narrative")
+    elif deferred:
+        for item in deferred:
+            d_safe, d_shown, _no_tmpl, d_usage = _visual_describe(
+                item["block_n"], item["code"], **item["kw"])
+            total_usage = _sum_usage(total_usage, d_usage)
+            combined_answers[item["answer_at"]] = d_safe
+            display_answers[item["answer_at"]] = d_shown
+            if item["index"] is not None:
+                yield {"caption": True, "index": item["index"], "text": d_shown,
+                       "phase": 1, "block_index": item["block_n"]}
 
     # If every block failed all its retries we rendered ZERO charts — surface a
     # clear failure rather than the misleading bare "Analysis complete." (a run
@@ -2798,7 +3025,18 @@ def run_chat_multi_plot(
     yield done_event
 
 
-def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
+def _run_single_from_plan(**kwargs) -> dict:
+    """`_iter_single_from_plan` run to its end, its partial events dropped:
+    the result dict only (same keyword arguments)."""
+    gen = _iter_single_from_plan(**kwargs)
+    while True:
+        try:
+            next(gen)
+        except StopIteration as stop:
+            return stop.value
+
+
+def _iter_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
                            question, history_rows, user_email,
                            kind, code, usage, context_decision,
                            dataset_profile: dict | None = None,
@@ -2807,7 +3045,7 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
                            plan_narrative=None, plan_captions=None,
                            capabilities: list | None = None,
                            input_columns: frozenset | None = None,
-                           on_progress=None) -> dict:
+                           on_progress=None, plan_error_code=None):
     """Execute one already-planned response (kind/code from a prior /v1/plan)
     locally, reusing the same retry + describe/summarize flow as run_chat.
 
@@ -2826,11 +3064,19 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
     `caption_template`, `caption_rendered`, `caption_described`,
     `value_display`, and `headline_display` for a dropped narrative without
     a value line) — each only when present; `text` stays brain-safe.
-    `on_progress` gets the narrative-only retry's progress event.
+    `on_progress` gets the narrative-only retry's progress event and the
+    keyed stage events. `plan_error_code` is the plan response's
+    `error_code` (a NO_CODE plan carrying llm_budget_exhausted /
+    llm_unavailable raises AnalysisFailedError).
+
+    A GENERATOR whose return value is the result dict (`result = yield from
+    _iter_single_from_plan(...)`): it yields the single TABLE answer's
+    partial (`single_table`, C2 §2) right after execution, before the
+    table's text is written. `_run_single_from_plan` drains it.
     """
     if state is None:
         state = _new_live_state()
-    out = _run_single_body(sid=sid, dfs=dfs, schema_docs=schema_docs,
+    out = yield from _run_single_body(sid=sid, dfs=dfs, schema_docs=schema_docs,
                            schema_str=schema_str, df_columns=df_columns,
                            df_names=df_names, question=question,
                            history_rows=history_rows, user_email=user_email,
@@ -2841,7 +3087,8 @@ def _run_single_from_plan(*, sid, dfs, schema_docs, schema_str, df_columns, df_n
                            plan_narrative=plan_narrative, plan_captions=plan_captions,
                            capabilities=capabilities,
                            input_columns=input_columns,
-                           on_progress=on_progress)
+                           on_progress=on_progress,
+                           plan_error_code=plan_error_code)
     return _finish_live_result(out, state, question, sid)
 
 
@@ -2851,7 +3098,11 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
                      dataset_profile, state, live_tables,
                      plan_narrative=None, plan_captions=None,
                      capabilities=None, input_columns=None,
-                     on_progress=None) -> dict:
+                     on_progress=None, plan_error_code=None):
+    """The single flow's body — a GENERATOR whose return value is the result
+    dict. Its only yield is the single TABLE answer's partial, right after
+    execution (C2 §2). A plan / retry answer carrying `error_code`
+    llm_budget_exhausted / llm_unavailable raises AnalysisFailedError."""
     def _exec(code_, kind_):
         if not _ensure_live(sid, dfs, schema_docs, code_, state, user_email):
             return _live_failure_out(state)
@@ -2868,6 +3119,9 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
         log_with_sid(sid, "warning", "NARRATIVE_CODE_IN_TEXT what=answer")
 
     if kind == "NO_CODE":
+        # The plan's own response is not in scope here: the caller passed its
+        # error_code on (the only plan field this check reads).
+        _raise_if_analysis_failed(sid, {"error_code": plan_error_code}, "plan")
         if context_decision.get("is_greeting"):
             g = brain_client.greeting(sid, question, df_names, user_email=user_email)
             return {"text": g.get("text", ""), "image_base64": None, "table": None,
@@ -2917,6 +3171,7 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
                          f"NARRATIVE_RETRY_FAILED error={log_safe_text(type(e).__name__, 80)}")
             return None
 
+    _emit_stage(sid, on_progress, "lab.stage_running")
     exec_out = _exec(code, kind)
 
     retry_count = 0
@@ -2937,6 +3192,7 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
                      f"EXEC_ERROR attempt {retry_count+1}: {log_safe_text(error_msg, 200)}")
         use_pro = retry_count >= 1
         use_search = retry_count >= 1
+        _emit_stage(sid, on_progress, "lab.stage_fixing", attempt=retry_count + 1)
         retry_out = brain_client.retry(
             sid=sid, question=question, schema_text=schema_str,
             df_names=df_names, df_columns=df_columns,
@@ -2949,6 +3205,7 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
             live_tables=live_tables, capabilities=capabilities,
             timeout=None,                     # the client-wide BRAIN_REQUEST_TIMEOUT
         )
+        _raise_if_analysis_failed(sid, retry_out, "retry")
         _merge_retry_sql(state, retry_out)
         new_code = retry_out.get("code") or ""
         new_kind = retry_out.get("kind")
@@ -2987,11 +3244,25 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
         narr.values.setdefault("result", safe_p)
         block_values.setdefault("result", safe_p)
 
+    def _describe(**inspect_kw) -> tuple[dict, dict]:
+        """The describe call of the visual (announced by
+        `lab.stage_describing`), with the validated FINDINGS: ({"described":
+        text}, usage)."""
+        _emit_stage(sid, on_progress, "lab.stage_describing")
+        d = _describe_with_backstop(sid, question, code, user_email,
+                                    dataset_profile=dataset_profile,
+                                    findings=narr.block_findings_for(1),
+                                    **inspect_kw)
+        narr.described += 1
+        return {"described": d.get("text", "")}, d.get("usage") or {}
+
     def _visual(**inspect_kw) -> tuple[dict, dict]:
         """Caption 1 (rendered locally, with the backstop note, no brain call)
         or the describe text with the validated FINDINGS. Returns (fields,
-        usage) where fields holds `caption_template` / `caption_rendered`, or
-        `described`."""
+        usage) where fields holds `caption_template` / `caption_rendered`,
+        `described`, or — no planned caption and a narrative template (C2
+        §4) — `deferred_describe` (the inspection kwargs): `_compose`
+        describes the visual only when the narrative is not used."""
         cap = narr.caption(1, block_values)
         if cap is not None:
             template, rendered_cap = cap
@@ -3000,19 +3271,28 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
                                              **inspect_kw)
             return ({"caption_template": prefix + template,
                      "caption_rendered": prefix + rendered_cap}, {})
-        d = _describe_with_backstop(sid, question, code, user_email,
-                                    dataset_profile=dataset_profile,
-                                    findings=narr.block_findings_for(1),
-                                    **inspect_kw)
-        narr.described += 1
-        return {"described": d.get("text", "")}, d.get("usage") or {}
+        if not narr.describe_now(1):
+            return {"deferred_describe": dict(inspect_kw)}, {}
+        return _describe(**inspect_kw)
 
     def _compose(visual: dict | None) -> dict:
         """The A5.3 keys and the brain-safe `text`, from the visual's fields
-        and the rendered narrative."""
+        and the rendered narrative. A deferred describe (C2 §4) runs here,
+        after the render, only when the narrative is not used (its usage
+        joins `narr_usage`); a rendered narrative leaves the visual without
+        text of its own (`DESCRIBE_SKIPPED`)."""
+        if narr.template:
+            _emit_stage(sid, on_progress, "lab.stage_summary")
         rendered = narr.finish(retry_narrative=_retry_narrative)
         fields: dict = {}
         visual = visual or {}
+        if "deferred_describe" in visual:
+            if rendered is not None:
+                log_with_sid(sid, "info", "DESCRIBE_SKIPPED n=1 reason=narrative")
+                visual = {}
+            else:
+                visual, d_usage = _describe(**visual["deferred_describe"])
+                narr_usage.update(_sum_usage(narr_usage, d_usage))
         if rendered is not None:
             fields["narrative_template"] = narr.template
             fields["narrative_rendered"] = rendered
@@ -3063,6 +3343,18 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
                 "tables": tables, "code": code,
                 "usage": _sum_usage(_sum_usage(usage, d_usage), narr_usage), **fields}
     if table or tables:
+        # Earlier visuals (C2 §2): the table goes to the page right after
+        # execution, through the stream's tables-partial branch; its text
+        # (caption / describe / narrative) follows on the single_response.
+        # The stream worker persists the table from this partial and reuses
+        # its durable keys for the single answer.
+        shown_tables = [table] if table else list(tables)
+        yield {"partial": True, "single_table": True, "phase": 1,
+               "tables": shown_tables, "table": table, "code": code,
+               "table_codes": [code] * len(shown_tables),
+               "table_result_keys": ([None] if table
+                                     else [t.get("title") for t in shown_tables]),
+               "sql": dict(state.get("sql_used") or {})}
         visual, d_usage = _visual(result_obj=result_obj)
         fields = _compose(visual)
         return {"image_base64": None, "table": table,
@@ -3078,6 +3370,8 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
         if "text" in fields:
             return {"image_base64": None, "table": None, "code": code,
                     "usage": _sum_usage(usage, narr_usage), **fields}
+    else:
+        _emit_stage(sid, on_progress, "lab.stage_summary")
     s = brain_client.summarize(
         sid=sid, question=question, schema_text=schema_str,
         history_rows=history_rows, preview=None,

@@ -33,6 +33,7 @@ import local_store
 import narrative
 import run_chat_local
 import brain_client
+import settings as settings_mod
 from brain_client import TenantRevokedError, BrainError, BrainTimeoutError
 from exec_transport import log_safe_text
 from logger_utils import log_with_sid
@@ -78,6 +79,15 @@ _CHART_REF_RE = re.compile(r"[0-9a-f]{32}")
 # sandbox-queue case keeps run_chat_local._INFRA_BUSY_TEXT — a different cause.
 BRAIN_TIMEOUT_TEXT = "The analysis is taking longer than expected. Please try again."
 BRAIN_TIMEOUT_KEY = "lab.brain_timeout"
+# A plan / retry answer whose error_code says the brain could not produce it
+# (F13 item 8): answered and persisted like a brain timeout.
+ANALYSIS_FAILED_TEXT = run_chat_local.ANALYSIS_FAILED_TEXT
+ANALYSIS_FAILED_KEY = run_chat_local.ANALYSIS_FAILED_KEY
+# The stream's opening event and its one-time slow-answer notice (C2 §1 / §3).
+STAGE_WORKING_KEY = "lab.stage_working"
+STAGE_WORKING_TEXT = "Working..."
+TAKING_LONGER_KEY = "lab.taking_longer"
+TAKING_LONGER_TEXT = "This is taking longer than usual. The analysis is still running."
 
 # One warning per process when a browser still posts chart markup.
 _EXPORT_LEGACY_LOGGED = {"logged": False}
@@ -1386,6 +1396,31 @@ def _live_no_query(store, key: str) -> dict:
                      f"re-run it."}
 
 
+def _slow_notice_seconds(sid) -> float:
+    """SLOW_ANSWER_NOTICE_SECONDS read at call time; <= 0 (or unreadable,
+    logged) sends no notice. Never raises (Article IV)."""
+    try:
+        value = float(settings_mod.settings.SLOW_ANSWER_NOTICE_SECONDS)
+        return value if value == value else 0.0
+    except Exception as e:
+        log_with_sid(sid, "warning",
+                     f"SLOW_ANSWER_NOTICE_SETTING_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return 0.0
+
+
+def _is_answer_event(tag, payload) -> bool:
+    """Whether a queued stream item is an ANSWER for the slow notice (C2 §3):
+    an error, or an event that is a partial, a caption, a narrative or a
+    done / single answer. Progress events are not."""
+    if tag == "error":
+        return True
+    if tag != "event" or not isinstance(payload, dict):
+        return False
+    return bool(payload.get("partial") or payload.get("caption")
+                or payload.get("narrative") or payload.get("done")
+                or payload.get("single_response"))
+
+
 def _event_codes(event) -> list:
     """The codes a generator event shows the browser: a streamed chart's
     `code`, a multi-chart done's `combined_codes`, a single answer's code."""
@@ -1859,6 +1894,9 @@ async def chat_stream(request: Request, chat_id: str):
             store.append_history(conv_id, {"role": "ai", "content": welcome, "ts": time.time()})
 
     history_rows = store.get_history(conv_id)
+    # The rows before this turn, as the worker decides the title from them
+    # (a copy: `history_rows` is handed to the planner).
+    title_prior_rows = list(history_rows)
     store.append_history(conv_id, {"role": "human", "content": question, "ts": time.time()})
 
     # `q` is the user's own free text and `log_with_sid` renders every context
@@ -1893,6 +1931,7 @@ async def chat_stream(request: Request, chat_id: str):
             w_table_fields = {"table_captions": [], "table_caption_templates": [],
                               "table_phases": []}
             w_table_captioned = False       # any table event carried captions
+            w_chart_by_n: dict = {}         # chart_n -> its w_charts entry (caption events)
             err_msg = None
             cancelled = False               # STOP requested mid-generation
             w_inflight: list = []           # codes registered for refresh/pin
@@ -1907,9 +1946,10 @@ async def chat_stream(request: Request, chat_id: str):
                 # the planner emitted ###NEXT_PLOT### blocks, and a single
                 # {single_response, result} for normal one-shot answers.
                 # `on_progress`: a status event the flow pushes from inside a
-                # block (the narrative-only retry's "Writing the summary…")
-                # goes straight to the consumer, whose progress branch
-                # forwards it (live UX only — the accumulation never sees it).
+                # block (the keyed stage events, the narrative-only retry's
+                # "Writing the summary…") goes straight to the consumer, whose
+                # progress branch forwards it (live UX only — the
+                # accumulation never sees it).
                 def _on_progress(ev):
                     loop.call_soon_threadsafe(queue.put_nowait, ("event", ev))
 
@@ -1929,11 +1969,19 @@ async def chat_stream(request: Request, chat_id: str):
                     # result (and survives a container restart / reload).
                     if isinstance(event, dict) and event.get("single_response"):
                         _res = event.get("result") or {}
+                        # A single table answer whose table already went out
+                        # as a partial (C2 §2) was persisted there: its keys
+                        # are reused, so the table is stored once. (Only the
+                        # single flow streams tables before a single answer.)
+                        _streamed = list(w_table_keys) if w_tables else None
                         _tbl = _res.get("table")
                         if isinstance(_tbl, dict) and _tbl.get("rows"):
-                            _k = _persist_full_table(store, _tbl, _res.get("code"),
-                                                     sql=_res.get("sql"),
-                                                     first_key=next(iter(dfs), None))
+                            if _streamed:
+                                _k = _streamed[0]
+                            else:
+                                _k = _persist_full_table(store, _tbl, _res.get("code"),
+                                                         sql=_res.get("sql"),
+                                                         first_key=next(iter(dfs), None))
                             if _k:
                                 event["full_table_key"] = _k
                                 w_full_table_key = _k
@@ -1942,14 +1990,17 @@ async def chat_stream(request: Request, chat_id: str):
                         # entry (`result_key`) it re-executes to.
                         _tbls = _res.get("tables")
                         if isinstance(_tbls, list) and _tbls:
-                            _keys = []
-                            for _t in _tbls:
-                                _k = _persist_full_table(
-                                    store, _t, _res.get("code"),
-                                    result_key=_t.get("title"),
-                                    sql=_res.get("sql"),
-                                    first_key=next(iter(dfs), None))
-                                _keys.append(_k)
+                            if _streamed is not None and len(_streamed) == len(_tbls):
+                                _keys = list(_streamed)
+                            else:
+                                _keys = []
+                                for _t in _tbls:
+                                    _k = _persist_full_table(
+                                        store, _t, _res.get("code"),
+                                        result_key=_t.get("title"),
+                                        sql=_res.get("sql"),
+                                        first_key=next(iter(dfs), None))
+                                    _keys.append(_k)
                             event["full_table_keys"] = _keys
                             w_full_table_keys = _keys
                     # Mixed dashboard tables (charts + KPI/table blocks) — on
@@ -2001,17 +2052,26 @@ async def chat_stream(request: Request, chat_id: str):
                                 w_narr[event.get("phase") or 1] = event
                             elif event.get("progress"):
                                 pass
+                            elif event.get("caption"):
+                                # A chart's describe text, after its partial
+                                # (C2 §2): stored as that chart's `answer`,
+                                # exactly as when it rode the partial.
+                                _entry = w_chart_by_n.get(event.get("index"))
+                                if _entry is not None:
+                                    _entry["answer"] = event.get("text") or ""
                             elif event.get("partial"):
                                 w_usage = event.get("usage") or w_usage
                                 if event.get("image_base64"):
-                                    w_charts.append({
+                                    _entry = {
                                         "image_base64": event.get("image_base64"),
                                         "answer": event.get("answer", ""),
                                         "code": event.get("code"),
                                         "chart_data": event.get("chart_data"),
                                         "caption_template": event.get("caption_template"),
                                         "phase": event.get("phase"),
-                                    })
+                                    }
+                                    w_charts.append(_entry)
+                                    w_chart_by_n[event.get("chart_n")] = _entry
                             elif event.get("done") and not event.get("single_response"):
                                 w_combined_answer = event.get("combined_answer", "")
                                 w_combined_codes = event.get("combined_codes") or []
@@ -2058,6 +2118,13 @@ async def chat_stream(request: Request, chat_id: str):
             except TenantRevokedError:
                 err_msg = "Service unavailable. Please contact your administrator."
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", err_msg))
+            except run_chat_local.AnalysisFailedError:
+                # The plan / retry answer carried error_code
+                # llm_budget_exhausted / llm_unavailable (a BrainError
+                # subclass, caught FIRST): an error turn like a timeout.
+                err_msg = ANALYSIS_FAILED_TEXT
+                loop.call_soon_threadsafe(queue.put_nowait, (
+                    "error", {"error": err_msg, "error_key": ANALYSIS_FAILED_KEY}))
             except BrainTimeoutError:
                 # A brain call outlived BRAIN_REQUEST_TIMEOUT. BrainTimeoutError
                 # subclasses BrainError, so it is caught FIRST. The key lets the
@@ -2103,17 +2170,19 @@ async def chat_stream(request: Request, chat_id: str):
                 if record is not None:
                     store.append_history(conv_id, record)
                     if not err_msg and not cancelled:
-                        answer_for_title = _answer_for_title(
-                            w_single, w_view, w_combined_answer)
+                        # Title from the conversation's FIRST answered turn
+                        # (an earlier failed or stopped turn does not count),
+                        # judged on the rows this turn started from — not a
+                        # re-read, which a concurrent turn could change.
                         try:
-                            human_count = sum(
-                                1 for m in store.get_history(conv_id)
-                                if m.get("role") == "human")
-                            if human_count == 2:
+                            if _title_due([*title_prior_rows, record]):
                                 _start_title_generation(
-                                    email, chat_id, conv_id, question, answer_for_title)
-                        except Exception:
-                            pass
+                                    email, chat_id, conv_id, question,
+                                    _answer_for_title(w_single, w_view, w_combined_answer))
+                        except Exception as e:
+                            log_with_sid(sid, "warning",
+                                         f"TITLE_TRIGGER_FAILED "
+                                         f"error={log_safe_text(type(e).__name__, 80)}")
             except Exception as e:
                 # Raised while persisting the answer record — its tables and
                 # their labels are what the message can quote.
@@ -2132,16 +2201,45 @@ async def chat_stream(request: Request, chat_id: str):
 
         threading.Thread(target=_worker, daemon=True).start()
 
-        # First event — empty progress + conv_id so the frontend can capture the conv_id
-        yield f'data: {json.dumps({"progress": True, "message": "Working...", "conv_id": conv_id})}\n\n'
+        # First event — a keyed progress + conv_id so the frontend can capture
+        # the conv_id (C2 §1: `lab.stage_working`, the text it always showed).
+        yield f'data: {json.dumps({"progress": True, "message_key": STAGE_WORKING_KEY, "message": STAGE_WORKING_TEXT, "conv_id": conv_id})}\n\n'
+
+        # The one-time slow-answer notice (C2 §3): sent once, when no answer
+        # event (a partial, a caption, a narrative, the done or an error) has
+        # arrived SLOW_ANSWER_NOTICE_SECONDS after the stream started.
+        notice_after = _slow_notice_seconds(sid)
+        started = loop.time()
+        answered = False
+        notice_sent = False
 
         # The consumer streams events to the browser and caches live chart_data;
         # it persists NOTHING (the worker owns persistence — exactly-once).
         while True:
-            event = await queue.get()
+            if answered or notice_sent or notice_after <= 0 or not queue.empty():
+                event = await queue.get()
+            else:
+                remaining = notice_after - (loop.time() - started)
+                event = None
+                timed_out = remaining <= 0
+                if not timed_out:
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        timed_out = True
+                if timed_out:
+                    notice_sent = True
+                    log_with_sid(sid, "info",
+                                 f"SLOW_ANSWER_NOTICE after_s={float(notice_after)}")
+                    notice = {"progress": True, "message_key": TAKING_LONGER_KEY,
+                              "message": TAKING_LONGER_TEXT, "conv_id": conv_id}
+                    yield f"data: {json.dumps(notice, ensure_ascii=False)}\n\n"
+                    continue
             if event is None:
                 break
             tag, payload = event
+            if not answered and _is_answer_event(tag, payload):
+                answered = True
             if tag == "error":
                 err_event = dict(payload) if isinstance(payload, dict) else {"error": payload}
                 err_event.update({"conv_id": conv_id, "done": True})
@@ -2156,12 +2254,21 @@ async def chat_stream(request: Request, chat_id: str):
                                 "text": ev.get("text") or "", "conv_id": conv_id}
                     yield f"data: {json.dumps(_json_safe(narr_out), ensure_ascii=False)}\n\n"
                     continue
-                # ── Progress (phase 2 status line) ──
+                # ── Progress: the keyed stage events (C2 §1), the narrative
+                # retry's status line and phase 2's ──
                 if ev.get("progress"):
-                    prog_out = {k: ev[k] for k in ("progress", "phase", "message_key", "message")
+                    prog_out = {k: ev[k] for k in ("progress", "phase", "message_key",
+                                                   "message", "attempt")
                                 if k in ev}
                     prog_out["conv_id"] = conv_id
                     yield f"data: {json.dumps(_json_safe(prog_out), ensure_ascii=False)}\n\n"
+                    continue
+                # ── Caption: a streamed chart's describe text (C2 §2) — the
+                # page fills it into that chart's caption slot ──
+                if ev.get("caption"):
+                    cap_out = {"caption": True, "index": ev.get("index"),
+                               "text": ev.get("text") or "", "conv_id": conv_id}
+                    yield f"data: {json.dumps(_json_safe(cap_out), ensure_ascii=False)}\n\n"
                     continue
                 # ── Tables partial: tables without a chart (never a chart) ──
                 if ev.get("partial") and not ev.get("image_base64") and ev.get("tables"):
@@ -2173,6 +2280,16 @@ async def chat_stream(request: Request, chat_id: str):
                             ev, len(ev.get("tables") or []))[0],
                         "conv_id": conv_id,
                     }
+                    if ev.get("single_table"):
+                        # A single table answer (C2 §2): its text follows on
+                        # the done event; `table` / `full_table_key` let the
+                        # page draw a one-table answer as the done would.
+                        _keys = ev.get("full_table_keys") or []
+                        tbl_out["single_table"] = True
+                        tbl_out["code"] = ev.get("code")
+                        if isinstance(ev.get("table"), dict):
+                            tbl_out["table"] = ev.get("table")
+                            tbl_out["full_table_key"] = _keys[0] if _keys else None
                     yield f"data: {json.dumps(_json_safe(tbl_out), ensure_ascii=False)}\n\n"
                     continue
                 # ── Multi-plot: per-chart partial event (live UX only) ──
@@ -2308,6 +2425,11 @@ async def edit_regenerate(request: Request, chat_id: str):
     plus `record_view` (the persisted record, as the history route serves it)
     and `ai_index` (its row index). `answer` is the DISPLAY text — never the
     brain-safe `combined_answer` / `result.text` (DIAGNOSTICS_SPEC A5.5).
+    A chart's `caption` event (its describe text, C2 §2) is folded into that
+    chart's `answer`; a single table answer's early partial persists the
+    table and the single answer reuses its keys. A plan / retry answer carrying
+    error_code llm_budget_exhausted / llm_unavailable answers 503 with
+    `error_key` `lab.analysis_failed`, persisted like a brain timeout.
 
     Mirrors global's truncate-then-rerun behavior:
       1. Truncate the conv history to drop the last human turn (and everything
@@ -2359,6 +2481,9 @@ async def edit_regenerate(request: Request, chat_id: str):
     if last_human_idx is None:
         return JSONResponse({"error": "No user message found to edit."}, status_code=400)
 
+    # Read BEFORE the truncation: an answer the edit removes still means the
+    # conversation was titled, so the regenerated answer must not re-title it.
+    had_answer = any(_is_answered_row(r) for r in history)
     store.truncate_conv_history(conv_id, last_human_idx)
     log_with_sid(chat_id, "info",
                  f"EDIT_REGENERATE user={email} "
@@ -2402,6 +2527,17 @@ async def edit_regenerate(request: Request, chat_id: str):
         msg = "Service unavailable. Please contact your administrator."
         store.append_history(conv_id, {"role": "ai", "content": msg, "ts": time.time()})
         return JSONResponse({"error": msg, "conv_id": conv_id}, status_code=503)
+    except run_chat_local.AnalysisFailedError as e:
+        # error_code llm_budget_exhausted / llm_unavailable on a plan or retry
+        # answer (a BrainError subclass, caught first): answered and persisted
+        # like a brain timeout. The code is one of two known names.
+        msg = ANALYSIS_FAILED_TEXT
+        log_with_sid(chat_id, "warning",
+                     f"EDIT_REGENERATE_ANALYSIS_FAILED error_code="
+                     f"{log_safe_text(str(e.error_code), 40)}")
+        store.append_history(conv_id, {"role": "ai", "content": msg, "ts": time.time()})
+        return JSONResponse({"error": msg, "error_key": ANALYSIS_FAILED_KEY,
+                             "conv_id": conv_id}, status_code=503)
     except BrainTimeoutError as e:
         # subclass of BrainError — caught first; see the chat_stream worker
         msg = BRAIN_TIMEOUT_TEXT
@@ -2461,9 +2597,22 @@ async def edit_regenerate(request: Request, chat_id: str):
         acc_fields["table_phases"].extend(phases)
         acc_captioned = acc_captioned or has
 
-    def _append_and_index(record: dict) -> int:
+    def _append_and_index(record: dict, title_src: tuple) -> int:
+        """Persist the answer, title the conversation when this is its first
+        answer ever (`had_answer` false — a failed first turn edited into an
+        answer), and return the row index. `title_src` is the
+        `_answer_for_title(single, view, combined)` triple."""
         store.append_history(conv_id, record)
-        return len(store.get_history(conv_id)) - 1
+        rows = store.get_history(conv_id)
+        try:
+            if not had_answer and _title_due(rows):
+                _start_title_generation(email, chat_id, conv_id, edited_question,
+                                        _answer_for_title(*title_src))
+        except Exception as e:
+            log_with_sid(chat_id, "warning",
+                         f"TITLE_TRIGGER_FAILED "
+                         f"error={log_safe_text(type(e).__name__, 80)}")
+        return len(rows) - 1
 
     # The answer is persisted inside this loop; its codes count as stored
     # until then (same registry the streaming worker uses).
@@ -2471,23 +2620,32 @@ async def edit_regenerate(request: Request, chat_id: str):
     for ev in events:
         for c in _event_codes(ev):
             _inflight_add(chat_id, c, sql=_event_sql(ev))
+    chart_by_n: dict = {}           # chart_n -> its all_charts entry (caption events)
     try:
         for ev in events:
             if ev.get("narrative") or ev.get("progress"):
+                continue
+            if ev.get("caption"):
+                # A chart's describe text, sent after its partial (C2 §2).
+                entry = chart_by_n.get(ev.get("index"))
+                if entry is not None:
+                    entry["answer"] = ev.get("text") or ""
                 continue
             if ev.get("partial") and not ev.get("image_base64") and ev.get("tables"):
                 _persist_event_tables(ev)
                 continue
             if ev.get("partial"):
                 if ev.get("image_base64"):
-                    all_charts.append({
+                    entry = {
                         "image_base64": ev.get("image_base64"),
                         "answer": ev.get("answer", ""),
                         "code": ev.get("code"),
                         "chart_data": ev.get("chart_data"),
                         "caption_template": ev.get("caption_template"),
                         "phase": ev.get("phase"),
-                    })
+                    }
+                    all_charts.append(entry)
+                    chart_by_n[ev.get("chart_n")] = entry
                 continue
             if ev.get("done") and not ev.get("single_response"):
                 combined_codes = ev.get("combined_codes") or []
@@ -2502,7 +2660,9 @@ async def edit_regenerate(request: Request, chat_id: str):
                     full_table_keys=acc_keys or None,
                     combined_tables=acc_tables or None,
                     live_fields=ev, narrative_src=narr_src)
-                ai_index = _append_and_index(history_obj)
+                ai_index = _append_and_index(
+                    history_obj,
+                    (None, ev.get("narrative_view"), ev.get("combined_answer", "")))
                 # The page gets the DISPLAY text, never the brain-safe
                 # combined answer (the marker + template).
                 answer = (ev.get("display_answer") if "display_answer" in ev
@@ -2532,16 +2692,22 @@ async def edit_regenerate(request: Request, chat_id: str):
                 # record, so the key can be embedded → a reloaded conversation
                 # re-executes for the FULL Download Excel / Show full table.
                 full_table_key = None
+                # A single table answer's early partial (C2 §2) persisted the
+                # table already: reuse its keys, so it is stored once.
+                streamed = list(acc_keys) if acc_tables else None
                 tbl = single_result.get("table")
                 if isinstance(tbl, dict) and tbl.get("rows"):
-                    full_table_key = _persist_full_table(
+                    full_table_key = streamed[0] if streamed else _persist_full_table(
                         store, tbl, single_result.get("code"),
                         sql=single_result.get("sql"),
                         first_key=next(iter(dfs), None))
                 # Multi-table answer: one durable key per table (see chat_stream).
                 full_table_keys = None
                 tbls = single_result.get("tables")
-                if isinstance(tbls, list) and tbls:
+                if isinstance(tbls, list) and tbls and streamed is not None \
+                        and len(streamed) == len(tbls):
+                    full_table_keys = streamed
+                elif isinstance(tbls, list) and tbls:
                     full_table_keys = [
                         _persist_full_table(store, t, single_result.get("code"),
                                             result_key=t.get("title"),
@@ -2552,7 +2718,7 @@ async def edit_regenerate(request: Request, chat_id: str):
                 ai_record = _build_ai_history_record(
                     None, single_result, None, [], {}, [],
                     full_table_key=full_table_key, full_table_keys=full_table_keys)
-                ai_index = _append_and_index(ai_record)
+                ai_index = _append_and_index(ai_record, (single_result, None, None))
                 chart_data_key = None
                 cd = single_result.get("chart_data")
                 if isinstance(cd, dict) and (cd.get("rows") or cd.get("tables")):
@@ -2609,11 +2775,43 @@ async def generate_filename(request: Request, chat_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Title generation — background, fired after 2nd human message
+# Title generation — background, fired after the FIRST answered turn
 # ---------------------------------------------------------------------------
+# Keys only the answer builders write (`_build_ai_history_record`,
+# `_build_stopped_record`): the welcome row and an error turn are
+# `{role, content, ts}` and carry none of them.
+_ANSWER_ROW_KEYS = ("code", "image_base64", "images", "table", "tables")
+
+
+def _is_answered_row(row) -> bool:
+    """An AI history row that holds an ANSWER: written by an answer builder
+    and not a stopped turn. The welcome message, an error turn (`{role,
+    content, ts}`) and a turn the user stopped do not count."""
+    return (isinstance(row, dict) and row.get("role") == "ai"
+            and not row.get("stopped")
+            and any(k in row for k in _ANSWER_ROW_KEYS))
+
+
+def _title_due(history) -> bool:
+    """Whether the row just appended (the LAST of `history`) is the
+    conversation's FIRST answered turn — the one the title is generated from.
+
+    There is no stored "titled" flag: the conversation is titled exactly when
+    its first answer is persisted, so an earlier answered row means it already
+    was (never re-titled), and a run of failed or stopped turns before the
+    first answer leaves the title to that answer."""
+    rows = list(history or [])
+    if not rows or not _is_answered_row(rows[-1]):
+        return False
+    return not any(_is_answered_row(r) for r in rows[:-1])
+
+
 def _start_title_generation(email: str, chat_id: str, conv_id: str,
                              question: str, answer: str) -> None:
-    """Spin a daemon thread to call brain /v1/title and rename the conversation."""
+    """Spin a daemon thread to call brain /v1/title and rename the conversation
+    (the stream worker and edit-regenerate call it once per conversation,
+    see `_title_due`; edit-regenerate also skips it when the edit removed an
+    earlier answer)."""
     def _worker():
         try:
             lang_code = _detect_lang_for_title((question + " " + answer)[:300])

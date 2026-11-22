@@ -30,7 +30,8 @@ import textwrap
 import pdc_diag
 from logger_utils import log_safe_value, log_with_sid
 
-KINDS = ("count", "float", "pct", "ratio", "amount", "text", "period")
+# The same tuple as pdc_diag.KINDS (`pvalue` appended at the end).
+KINDS = ("count", "float", "pct", "ratio", "amount", "text", "period", "pvalue")
 TEMPLATE_MAX = 4000
 CAPTION_MAX = 600
 RENDERED_MAX = 8000

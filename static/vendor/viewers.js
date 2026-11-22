@@ -9,7 +9,7 @@
  *
  * Public API (window.PDCViewers):
  *   fixPlotlyOffline(html)    — rewrite a chart doc's cdn.plot.ly script tag to the local plotly.js asset.
- *   fitChartTitle(html)       — add the script that keeps a chart's title clear of the Plotly toolbar.
+ *   fitChartTitle(html)       — add the script that keeps a chart's title clear of the Plotly toolbar (and a top legend under the title).
  *   setChartFrame(iframe, html) — THE one way a chart document is put into a frame (sandbox, registered with /api/charts, loaded from /charts/{token}).
  *   openCode(code)            — open a tab and render highlighted Python.
  *   openData(table)           — open a tab and render a {columns, rows} table.
@@ -283,7 +283,9 @@
   // toolbar (modebar) also sits, so a long title runs under the buttons.
   // `fitChartTitle(doc)` puts ONE inline script into the chart document;
   // once the chart is drawn, and again on resize, it moves the title below
-  // the toolbar and word-wraps it to the frame width. The stored HTML and the
+  // the toolbar and word-wraps it to the frame width; a horizontal legend
+  // placed above the plot (y ≥ 1) is moved under the title, its height added
+  // to the reserved top margin, in the same single relayout. The stored HTML and the
   // PNG/PDF exports never see it. `chartTitleFitScript` is NEVER run on this
   // page: its source is serialized into the chart document, where the
   // /charts/ route's policy allows inline script inside the sandboxed frame.
@@ -310,7 +312,7 @@
     hide.textContent = ".plotly-graph-div{visibility:hidden}";
     (document.head || document.documentElement).appendChild(hide);
     var gd = null, original = null, baseMarginT = null, singleH = null, busy = false,
-      last = null, canvas = null, timer = 0;
+      last = null, canvas = null, timer = 0, legendH = null;
 
     function reveal() { if (hide.parentNode) hide.parentNode.removeChild(hide); }
     function finish() { state.done = true; reveal(); }
@@ -369,6 +371,51 @@
       if (!mb) return 0;
       return Math.max(0, mb.getBoundingClientRect().bottom - gd.getBoundingClientRect().top);
     }
+    // A legend drawn ABOVE the plot (the `orientation:'h', yanchor:'bottom',
+    // y:1.02` the analytics prompt asks for) sits in the same top margin as
+    // the title, so it would overlap the fitted title. Returns
+    // {h: drawn height in px} for such a legend, else null: the main legend,
+    // shown, in paper coordinates, horizontal, at y ≥ 1 (with yanchor
+    // 'bottom' that is plotly.js's own "above the plot area"; any other
+    // anchor at y ≥ 1 reaches into the margin too). The height is measured
+    // once per frame width (a horizontal legend re-wraps only when the width
+    // changes; plotly.js caps an above-plot legend at half the frame height,
+    // whatever the margins), so a re-measure after the relayout cannot move
+    // the margin by a pixel and trigger another one.
+    function topLegend() {
+      var fl = gd._fullLayout, L = fl && fl.legend;
+      if (!L || !fl.showlegend || L.orientation !== "h") return null;
+      if (L.yref && L.yref !== "paper") return null;
+      if (typeof L.y !== "number" || !(L.y >= 1)) return null;
+      var el = gd.querySelector("g.legend");
+      if (!el) return null;
+      var w = gd.clientWidth || gd.getBoundingClientRect().width;
+      if (!legendH || legendH.w !== w) {
+        var h = typeof L._effHeight === "number" ? L._effHeight : 0;
+        if (!(h > 0)) {
+          var bg = el.querySelector(".bg");
+          h = bg ? parseFloat(bg.getAttribute("height")) + (L.borderwidth || 0) : 0;
+        }
+        if (!(h > 0)) h = el.getBoundingClientRect().height;
+        legendH = { w: w, h: h > 0 ? Math.ceil(h) : 0 };
+      }
+      return legendH.h > 0 ? { h: legendH.h } : null;
+    }
+    // Paper y (anchored 'top') that puts the legend's top edge `topPx` below
+    // the top of the frame once the top margin is `marginT`; null when it
+    // cannot be placed (no plot height, or outside plotly's legend.y range).
+    function legendPaperY(topPx, marginT) {
+      var fl = gd._fullLayout, size = fl._size || {};
+      var H = fl.height || gd.clientHeight || 0;
+      var b = typeof size.b === "number" ? size.b : ((fl.margin || {}).b || 0);
+      var plotH = H - marginT - b;
+      if (!(plotH > 20)) return null;
+      var y = 1 + (marginT - topPx) / plotH;
+      return (y >= 1 && y <= 3) ? { y: y, plotH: plotH } : null;
+    }
+    function sameY(a, b, plotH) {
+      return typeof a === "number" && typeof b === "number" && Math.abs(a - b) * plotH < 1;
+    }
     function lineCount(s) { return String(s || "").split(/<br\s*\/?>/i).length; }
     // Height the title will take with `lines` lines: one line's box (measured
     // ONCE on the title as first drawn, so a re-measure cannot move the
@@ -410,24 +457,41 @@
         // The top margin is reserved here, so title.automargin never has to
         // push it: when it pushes, plotly.js 2.35 also moves a multi-line
         // title UP by its extra lines — back under the toolbar.
-        var marginT = Math.max(baseMarginT,
-          Math.ceil(padT + titleHeight(t, lines, size) + GAP));
+        var titleBottom = padT + titleHeight(t, lines, size);
+        var marginT = Math.max(baseMarginT, Math.ceil(titleBottom + GAP));
+        // A legend above the plot goes right under the title (top-anchored,
+        // GAP below it) and its height joins the reserved margin. Moved in
+        // the SAME relayout; left alone when it cannot be placed.
+        var leg = topLegend(), legY = null;
+        if (leg) {
+          var legTop = Math.ceil(titleBottom + GAP);
+          var legMarginT = Math.max(baseMarginT, legTop + leg.h + GAP);
+          legY = legendPaperY(legTop, legMarginT);
+          if (legY) marginT = legMarginT;
+        }
         var pad = t.pad || {};
+        var lay = gd.layout.legend || {};
         var current = t.text === text && pad.t === padT && t.yref === "container" &&
           t.y === 1 && t.yanchor === "top" && t.automargin === true &&
-          (gd.layout.margin || {}).t === marginT;
+          (gd.layout.margin || {}).t === marginT &&
+          (!legY || (lay.yanchor === "top" && sameY(lay.y, legY.y, legY.plotH)));
         // `last` also stops a loop should Plotly normalize what it stores.
         if (current || (last && last.text === text && last.padT === padT &&
-            last.marginT === marginT)) { finish(); return; }
+            last.marginT === marginT &&
+            (legY ? sameY(last.legendY, legY.y, legY.plotH) : last.legendY === null))) {
+          finish(); return;
+        }
         busy = true;
-        last = { text: text, padT: padT, marginT: marginT };
+        last = { text: text, padT: padT, marginT: marginT, legendY: legY ? legY.y : null };
         state.relayouts += 1;
         var settle = function () { busy = false; finish(); };
-        Promise.resolve(window.Plotly.relayout(gd, {
+        var update = {
           "title.text": text, "title.yref": "container", "title.y": 1,
           "title.yanchor": "top", "title.pad.t": padT, "title.automargin": true,
           "margin.t": marginT
-        })).then(settle, settle);
+        };
+        if (legY) { update["legend.y"] = legY.y; update["legend.yanchor"] = "top"; }
+        Promise.resolve(window.Plotly.relayout(gd, update)).then(settle, settle);
       } catch (e) { busy = false; finish(); }
     }
     function start() {

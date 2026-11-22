@@ -866,8 +866,10 @@ def _plotly_to_html(fig) -> str:
         _format_plotly_numeric(fig)
 
         # Conditionally switch a value axis to log when its positive range spans
-        # many orders of magnitude (a few extremes compress the bulk). Guarded
-        # internally; only fires for genuinely extreme, all-positive ranges.
+        # many orders of magnitude (a few extremes compress the bulk). Decided
+        # per real axis (y, y2, x2, …), never on an explicitly typed axis; a
+        # switched axis gets a "log scale" title note. Guarded internally;
+        # only fires for genuinely extreme, all-positive ranges.
         _maybe_log_plotly_axes(fig)
 
         # Widen the discrete color palette for high-cardinality categorical
@@ -972,7 +974,15 @@ def _plotly_layout_axis(fig, ref):
 
 
 def _plotly_axis_title(axis):
+    """The axis title for "Show data" headers. An axis the automatic log step
+    switched answers the title it had BEFORE the log-scale note was added
+    (`_LOG_TITLE_ORIG_ATTR`), so the table names the measure, not the scale."""
     try:
+        if axis is not None:
+            try:
+                return getattr(axis, _LOG_TITLE_ORIG_ATTR) or None
+            except AttributeError:
+                pass
         t = getattr(axis, "title", None)
         return (getattr(t, "text", None) if t is not None else None) or None
     except Exception:
@@ -1703,18 +1713,71 @@ _LOG_RANGE_RATIO = 1000.0   # max/median (or p95/p5) must exceed this to switch
 _LOG_MIN_POINTS = 4         # need enough numeric points to judge a range
 # Only simple bar/line/scatter charts are eligible; any other trace type aborts.
 _LOG_ALLOWED_TYPES = {"bar", "scatter", "scattergl"}
+# The note a switched axis carries in its title: appended as " (log scale)"
+# to an existing title, or the whole title when the axis had none.
+_LOG_SCALE_NOTE = "log scale"
+# Set on a layout axis object when the switch rewrote its title: the title
+# as it was before (None when there was none). `_plotly_axis_title` reads it,
+# so "Show data" keeps the measure's name and never shows the note.
+_LOG_TITLE_ORIG_ATTR = "_pdc_title_before_log"
+# A trace's axis reference: "x", "y", "x2", "y13", …
+_AXIS_REF_RE = re.compile(r"^([xy])([1-9][0-9]*)?$")
+
+
+def _log_axis_event(level, message, **context):
+    """One plot_utils log line for the log-axis step (Article IV). The logger
+    is imported here, not at module level, so the module's imports (shared by
+    the sandbox image) stay as they are; a failing logger falls back to the
+    stdlib logger and never raises. Axis names and exception TYPES only —
+    never a value or a title."""
+    try:
+        from logger_utils import log_with_sid
+        log_with_sid("plot", level, message, **context)
+    except Exception:
+        try:
+            import logging
+            extra = "".join(f" [{k}={v}]" for k, v in context.items())
+            logging.getLogger(__name__).warning(f"{message}{extra}")
+        except Exception:
+            pass
+
+
+def _layout_axis_name(ref):
+    """'y' → 'yaxis', 'y2' → 'yaxis2', 'x1' → 'xaxis'; None for anything that
+    is not an axis reference."""
+    if not isinstance(ref, str):
+        return None
+    m = _AXIS_REF_RE.match(ref.strip())
+    if not m:
+        return None
+    num = m.group(2)
+    return m.group(1) + "axis" + (num if num and num != "1" else "")
 
 
 def _maybe_log_plotly_axes(fig):
     """Switch a NUMERIC value axis to a log scale when its plotted values span
     many orders of magnitude, so a few extreme values don't compress the rest
     into an unreadable sliver. Generic + statistical: decided from the values
-    themselves (max/median and p95/p5 ratios), never column names. Applies ONLY
-    when ALL hold: every value on that axis is strictly > 0, the range ratio
-    exceeds _LOG_RANGE_RATIO, the axis is linear (not date/category/already-log),
-    and the figure is a plain bar/line/scatter. Otherwise the axis is left
-    exactly as-is. Never raises (Article IV) — on any issue the chart is
-    unchanged (linear)."""
+    themselves (max/median and p95/p5 ratios), never column names.
+
+    Decided PER REAL AXIS (P29 F8): every trace is grouped by the axis it is
+    drawn on (`tr.xaxis` / `tr.yaxis`: "x", "y", "y2", … → layout `xaxis`,
+    `yaxis`, `yaxis2`, …), so a secondary-axis line never decides — or blocks —
+    the primary axis, and a secondary axis that needs log gets it. Axes tied
+    by `matches` (facet charts) are judged together and switched together, as
+    plotly.js requires one type for matched axes.
+
+    An axis switches ONLY when ALL hold: at least `_LOG_MIN_POINTS` numeric
+    values on it, every one strictly > 0, the range ratio reaches
+    `_LOG_RANGE_RATIO`, the figure set no `type` on it (nor on an axis it is
+    matched with — an explicit `linear` / `log` / `date` / `category` is never
+    touched), and the figure is a plain bar/line/scatter. A switched axis
+    carries a note: " (log scale)" appended to its existing title, or the
+    title "log scale" when it had none (in a matched group without any title,
+    the first axis only); the original title is kept on the axis object for
+    "Show data" (`_LOG_TITLE_ORIG_ATTR`). Every other axis is left exactly
+    as-is. Never raises (Article IV) — on any issue the failing axis is left
+    unchanged (linear) and the failure is logged with its exception type."""
     try:
         import numbers as _numbers
         traces = list(getattr(fig, "data", None) or [])
@@ -1728,16 +1791,60 @@ def _maybe_log_plotly_axes(fig):
 
         layout = getattr(fig, "layout", None)
 
-        def _nums_on(letter):
-            out = []
-            for tr in traces:
+        def _axis_obj(name):
+            try:
+                return getattr(layout, name, None)
+            except Exception:
+                return None   # a trace on an axis the layout never defined
+
+        def _explicit_type(name):
+            ax = _axis_obj(name)
+            atype = getattr(ax, "type", None) if ax is not None else None
+            return atype not in (None, "", "-")   # "-" is plotly's "auto"
+
+        # Values per layout axis, from the traces drawn on it.
+        values = {}   # "yaxis2" -> [float, …]
+        order = []    # axis names in first-seen order (stable decisions/logs)
+        for tr in traces:
+            for letter in ("x", "y"):
+                name = _layout_axis_name(getattr(tr, letter + "axis", None) or letter)
+                if name is None:
+                    continue
+                if name not in values:
+                    values[name] = []
+                    order.append(name)
                 arr = getattr(tr, letter, None)
                 if arr is None:
                     continue
                 for v in arr:
                     if isinstance(v, _numbers.Number) and not isinstance(v, bool):
-                        out.append(float(v))
-            return out
+                        values[name].append(float(v))
+
+        # Axes tied by `matches` form one group (union-find over axis names).
+        parent = {n: n for n in order}
+
+        def _root(n):
+            while parent.get(n, n) != n:
+                n = parent[n]
+            return n
+
+        for name in order:
+            try:
+                ax = _axis_obj(name)
+                target = _layout_axis_name(getattr(ax, "matches", None)) if ax is not None else None
+                if target and target[0] == name[0]:
+                    parent.setdefault(target, target)
+                    ra, rb = _root(name), _root(target)
+                    if ra != rb:
+                        parent[ra] = rb
+            except Exception as e:
+                _log_axis_event("warning", "PLOTLY_LOG_AXIS_FAILED", axis=name,
+                                step="matches", error=type(e).__name__)
+        # Every axis of a group is switched together — a matched axis that
+        # carries no trace of its own included (plotly.js needs one type).
+        groups = {}
+        for name in list(parent):
+            groups.setdefault(_root(name), []).append(name)
 
         def _pct(svals, p):
             if not svals:
@@ -1748,33 +1855,75 @@ def _maybe_log_plotly_axes(fig):
                 return svals[-1]
             return svals[f] + (svals[f + 1] - svals[f]) * (k - f)
 
-        for letter, axis_name in (("x", "xaxis"), ("y", "yaxis")):
+        def _needs_log(vals):
+            if len(vals) < _LOG_MIN_POINTS:
+                return False
+            # (a) strictly positive — log is undefined for <= 0
+            if any(v <= 0 for v in vals):
+                return False
+            # (b) genuinely huge dynamic range by a statistical ratio
+            svals = sorted(vals)
+            med = svals[len(svals) // 2] if len(svals) % 2 else \
+                0.5 * (svals[len(svals) // 2 - 1] + svals[len(svals) // 2])
+            p5, p95 = _pct(svals, 0.05), _pct(svals, 0.95)
+            ratio_med = (svals[-1] / med) if med > 0 else float("inf")
+            ratio_pct = (p95 / p5) if (p5 and p5 > 0) else float("inf")
+            return ratio_med >= _LOG_RANGE_RATIO or ratio_pct >= _LOG_RANGE_RATIO
+
+        for members in groups.values():
             try:
-                vals = _nums_on(letter)
-                if len(vals) < _LOG_MIN_POINTS:
+                # (c) never an axis whose type the figure set explicitly
+                if any(_explicit_type(n) for n in members):
                     continue
-                # (a) strictly positive — log is undefined for <= 0
-                if any(v <= 0 for v in vals):
+                vals = [v for n in members for v in values.get(n, ())]
+                if not _needs_log(vals):
                     continue
-                axis = getattr(layout, axis_name, None)
-                atype = getattr(axis, "type", None) if axis is not None else None
-                # (c) only an ordinary linear numeric axis (skip date/category/log)
-                if atype in ("date", "category", "multicategory", "log"):
-                    continue
-                # (b) genuinely huge dynamic range by a statistical ratio
-                svals = sorted(vals)
-                med = svals[len(svals) // 2] if len(svals) % 2 else \
-                    0.5 * (svals[len(svals) // 2 - 1] + svals[len(svals) // 2])
-                p5, p95 = _pct(svals, 0.05), _pct(svals, 0.95)
-                ratio_med = (svals[-1] / med) if med > 0 else float("inf")
-                ratio_pct = (p95 / p5) if (p5 and p5 > 0) else float("inf")
-                if ratio_med >= _LOG_RANGE_RATIO or ratio_pct >= _LOG_RANGE_RATIO:
-                    # merge (don't overwrite) so tickformat etc. set earlier stays
-                    fig.update_layout(**{axis_name: dict(type="log")})
-            except Exception:
-                continue
+                titled = [n for n in members if _axis_title_text(_axis_obj(n))]
+                noted = set(titled) if titled else {members[0]}
+                for name in members:
+                    _switch_axis_to_log(fig, name, _axis_obj(name), name in noted)
+            except Exception as e:
+                _log_axis_event("warning", "PLOTLY_LOG_AXIS_FAILED",
+                                axis=",".join(members), error=type(e).__name__)
+    except Exception as e:
+        _log_axis_event("warning", "PLOTLY_LOG_AXIS_FAILED", error=type(e).__name__)
+
+
+def _axis_title_text(axis):
+    """The axis title text as written, "" when none. Never raises."""
+    try:
+        t = getattr(axis, "title", None) if axis is not None else None
+        txt = getattr(t, "text", None) if t is not None else None
+        return txt if isinstance(txt, str) else ""
     except Exception:
-        pass
+        return ""
+
+
+def _switch_axis_to_log(fig, name, axis, add_note):
+    """Set one layout axis to log (merged, so tickformat / title font etc.
+    set earlier stay) and, when `add_note`, put the log-scale note into its
+    title. The note is added once: a title that already says "log scale"
+    keeps its text."""
+    update = {"type": "log"}
+    original = _axis_title_text(axis)
+    noted = None
+    if add_note:
+        if not original.strip():
+            noted = _LOG_SCALE_NOTE
+        elif _LOG_SCALE_NOTE not in original.lower():
+            noted = original.rstrip() + " (" + _LOG_SCALE_NOTE + ")"
+        if noted is not None:
+            update["title"] = {"text": noted}
+    fig.update_layout(**{name: update})
+    if noted is not None:
+        try:
+            setattr(getattr(fig.layout, name), _LOG_TITLE_ORIG_ATTR,
+                    original if original.strip() else None)
+        except Exception as e:
+            _log_axis_event("warning", "PLOTLY_LOG_AXIS_FAILED", axis=name,
+                            step="title_marker", error=type(e).__name__)
+    _log_axis_event("info", "PLOTLY_LOG_AXIS_SWITCHED", axis=name,
+                    note=bool(noted is not None))
 
 
 def _format_matplotlib_numeric(fig):

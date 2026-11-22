@@ -5,7 +5,9 @@ These encode EXACTLY the algorithm the brain's planner prompt used to spell
 out inline (QA 2.6): the union of three robust, scale-free tests —
 median/MAD distance, 1st-99th percentile, and 3x-IQR — followed by a GAP
 GUARD so benign edge-of-bulk tails are never trimmed, only values sitting far
-beyond the bulk of the data. The planner prompt now just tells generated code
+beyond the bulk of the data — and only on the SIDE (high or low tail) whose
+gap fired, so one far-off tail never takes the other, benign tail with it.
+The planner prompt now just tells generated code
 to call `drop_extreme_outliers(df, "col")` instead of re-implementing this,
 so the behavior is deterministic instead of prompt-adherence-dependent.
 
@@ -16,6 +18,7 @@ ValueError so generated code fails visibly instead of silently mis-filtering.
 """
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 
@@ -73,8 +76,18 @@ def drop_extreme_outliers(df: pd.DataFrame, col: str) -> tuple[pd.DataFrame, int
     of the bulk (gap ~ 0) → nothing is dropped and the ORIGINAL df is returned
     with n_dropped=0. No silent trimming on benign data.
 
+    ONE-SIDED: the gaps are measured per side against the rows not flagged at
+    all (`hi_gap` = highest flagged value - highest kept value, `lo_gap` =
+    lowest kept value - lowest flagged value; `span` = the kept values'
+    range). `hi_gap > 3*span` drops the flagged rows ABOVE the median of the
+    column's non-null values, `lo_gap > 3*span` the flagged rows BELOW it;
+    both gaps -> both sides. A flagged row on the side whose gap did not fire
+    (or exactly at the median) is kept. `n_dropped` = the rows actually
+    dropped; a drop returns a copy.
+
     Missing column / non-numeric column → ValueError. Empty df, all-NaN,
-    nothing flagged → (df, 0) (same object, no copy).
+    nothing flagged, fewer than 5 rows left unflagged, no gap over 3x the
+    span → (df, 0) (same object, no copy).
     """
     if not isinstance(df, pd.DataFrame):
         raise ValueError("drop_extreme_outliers requires a DataFrame as its first argument")
@@ -94,7 +107,21 @@ def drop_extreme_outliers(df: pd.DataFrame, col: str) -> tuple[pd.DataFrame, int
     drp = df.loc[mask, col].astype(float).dropna()
     hi_gap = (float(drp.max()) - float(kept_vals.max())) if len(drp) else 0.0
     lo_gap = (float(kept_vals.min()) - float(drp.min())) if len(drp) else 0.0
-    act = (hi_gap > 3 * span) or (lo_gap > 3 * span)
-    if act:
-        return kept.copy(), n_excluded
-    return df, 0
+    drop_hi = hi_gap > 3 * span
+    drop_lo = lo_gap > 3 * span
+    if not (drop_hi or drop_lo):
+        return df, 0
+    # One-sided: only the side whose gap fired loses its flagged rows. A side
+    # is decided against the median of the column's non-null values.
+    values = df[col].astype(float).to_numpy()
+    flagged = mask.to_numpy(dtype=bool)
+    median = float(pd.Series(values).dropna().median())
+    drop = np.zeros(len(values), dtype=bool)
+    if drop_hi:
+        drop |= flagged & (values > median)
+    if drop_lo:
+        drop |= flagged & (values < median)
+    n_dropped = int(drop.sum())
+    if n_dropped == 0:
+        return df, 0
+    return df[~drop].copy(), n_dropped

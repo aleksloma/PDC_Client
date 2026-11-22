@@ -22,11 +22,13 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.datastructures import MutableHeaders
 
@@ -75,15 +77,40 @@ def _session_now() -> int:
 def _build_stamp() -> str:
     """One line identifying the RUNNING build, for the admin sidebar.
 
-    Deliberately not the `?v=` static cache-buster: that is the page-render
-    clock, recomputed per request, and reading it as a build marker has twice
-    sent verification down the wrong path. An unstamped image (no build args)
-    honestly reports when this process started instead of faking an identity.
+    Not the `?v=` static cache-buster (`_static_version`): on an unstamped
+    image that is the process start time as a bare number, which says nothing
+    about which code is running. An unstamped image (no build args) honestly
+    reports when this process started instead of faking an identity.
     """
     if settings.BUILD_COMMIT:
         return f"build {settings.BUILD_COMMIT}" + (
             f" · {settings.BUILD_TIME}" if settings.BUILD_TIME else "")
     return f"started {_STARTED_AT:%Y-%m-%d %H:%M} UTC"
+
+
+# The `?v=` of an unstamped process: its start time, fixed for the life of
+# the process, so every page it renders names the same static URLs.
+_PROCESS_STATIC_VERSION = str(int(_STARTED_AT.timestamp()))
+_STATIC_VERSION_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _static_version() -> str:
+    """The `?v=` the page routes put on every `/static/...` URL.
+
+    `BUILD_COMMIT` when the image is stamped (read per call; only URL-safe
+    characters kept, at most 64), else the process start time — ONE value per
+    process. A new build or a restart changes every URL, so a browser fetches
+    the new files on its next page load, and between the two it may keep them
+    for a year (`StaticAssets` marks a request carrying this exact value
+    immutable). Never raises: any failure answers the process value.
+    """
+    try:
+        commit = _STATIC_VERSION_UNSAFE_RE.sub("", str(settings.BUILD_COMMIT or ""))[:64]
+        return commit or _PROCESS_STATIC_VERSION
+    except Exception as e:
+        log_with_sid("static", "warning",
+                     f"STATIC_VERSION_FAILED {log_safe_text(type(e).__name__, 80)}")
+        return _PROCESS_STATIC_VERSION
 
 
 def _refuse_on_weak_secret_key() -> None:
@@ -831,6 +858,99 @@ class JsonContentTypeGate:
         await send({"type": "http.response.body", "body": body})
 
 
+# The static text assets worth compressing, and the smallest body that is.
+_STATIC_GZIP_SUFFIXES = (".js", ".css", ".html", ".svg", ".json", ".map")
+_STATIC_GZIP_MIN_BYTES = 1024
+# Served uncompressed: the plotly bundle every chart frame loads (no `?v=`).
+_STATIC_GZIP_SKIP_PREFIX = "/static/vendor/plotly/"
+_STATIC_IMMUTABLE = "public, max-age=31536000, immutable"
+
+
+class StaticAssets:
+    """Pure ASGI wrapper around the `/static` mount — and ONLY that mount, so
+    no other response (a page, the API, the chat's event stream,
+    `/charts/{token}`) can be compressed or cached by it.
+
+    - A request whose `v` query parameter is exactly `_static_version()` (the
+      value the page routes write) gets `Cache-Control: public,
+      max-age=31536000, immutable` on a 200 or 304. Any other request — no
+      `v`, or a stale one from a page an older build rendered — keeps what
+      StaticFiles sends today (no Cache-Control; the browser revalidates with
+      the ETag / Last-Modified).
+    - A text asset (`_STATIC_GZIP_SUFFIXES`) goes through Starlette's
+      GZipMiddleware: compressed when the request accepts gzip and the body
+      is at least `_STATIC_GZIP_MIN_BYTES` (it adds `Vary: Accept-Encoding`
+      and leaves a 206 alone); a request carrying `Range` is passed through
+      uncompressed. Images, fonts and every other type are never touched, and
+      neither is the plotly bundle (`_STATIC_GZIP_SKIP_PREFIX`): 4.5 MB
+      compressed afresh for every chart frame would cost the single worker's
+      event loop ~0.1 s each time.
+    - A compressed response's ETag is made weak (`W/…`), so the file's strong
+      validator is never shared between the gzip and identity bodies; a 304
+      to a gzip-accepting request for a compressible asset carries the same
+      weak ETag and `Vary: Accept-Encoding`. StaticFiles compares
+      If-None-Match with the `W/` removed, so revalidation still matches.
+
+    It wraps the mounted app, not the middleware stack, so it sits INSIDE
+    every middleware: the guard, nosniff, the page policy (which adds nothing
+    to a non-HTML response) and the gates see the response as before. A
+    failure reading the request is logged and answers the bare StaticFiles
+    response (Article IV).
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+        self.gzip = GZipMiddleware(app, minimum_size=_STATIC_GZIP_MIN_BYTES,
+                                   compresslevel=6)
+
+    @staticmethod
+    def _plan(scope) -> tuple[bool, bool, bool]:
+        """(immutable, compress, accepts_gzip) for one request. Never raises."""
+        try:
+            query = parse_qs((scope.get("query_string") or b"").decode("latin-1"))
+            immutable = query.get("v") == [_static_version()]
+            path = str(scope.get("path") or "").lower()
+            headers = scope.get("headers") or []
+            ranged = any(name == b"range" for name, _ in headers)
+            accepts_gzip = any(name == b"accept-encoding" and b"gzip" in value.lower()
+                               for name, value in headers)
+            compress = (path.endswith(_STATIC_GZIP_SUFFIXES) and not ranged
+                        and _STATIC_GZIP_SKIP_PREFIX not in path)
+            return immutable, compress, accepts_gzip
+        except Exception as e:
+            log_with_sid("static", "warning",
+                         f"STATIC_PLAN_FAILED {log_safe_text(type(e).__name__, 80)}")
+            return False, False, False
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        immutable, compress, accepts_gzip = self._plan(scope)
+        target = self.gzip if compress else self.app
+        if not (immutable or compress):
+            await target(scope, receive, send)
+            return
+
+        async def send_with_headers(message) -> None:
+            if message.get("type") == "http.response.start":
+                status = message.get("status")
+                headers = MutableHeaders(scope=message)
+                if immutable and status in (200, 304):
+                    headers["Cache-Control"] = _STATIC_IMMUTABLE
+                gzipped = headers.get("content-encoding", "").lower() == "gzip"
+                revalidated = compress and accepts_gzip and status == 304
+                if gzipped or revalidated:
+                    etag = headers.get("etag")
+                    if etag and not etag.startswith("W/"):
+                        headers["ETag"] = "W/" + etag
+                if revalidated:
+                    headers.add_vary_header("Accept-Encoding")
+            await send(message)
+
+        await target(scope, receive, send_with_headers)
+
+
 # The absolute session lifetime (seconds): RememberMeSessionMiddleware's cap.
 _REMEMBER_ME_MAX_AGE = settings.REMEMBER_ME_MAX_DAYS * 86400
 
@@ -866,8 +986,11 @@ app.add_middleware(SecurityHeaders)
 # from the sandbox's range must be refused before a session is even unsigned.
 app.add_middleware(BackendNetworkGuard)
 
-# Static assets (copied byte-for-byte from the B2C app)
-app.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static")
+# Static assets (copied byte-for-byte from the B2C app). `StaticAssets` adds
+# the immutable cache header to versioned requests and gzip for text assets —
+# on this mount only, never on a page, the API or the event stream.
+app.mount("/static", StaticAssets(StaticFiles(directory=str(_HERE / "static"))),
+          name="static")
 
 app.include_router(auth_router)
 app.include_router(upload_router)
@@ -1018,7 +1141,7 @@ async def lab(request: Request):
         # admin (19g) renders /lab like any user.
         return RedirectResponse(url="/admin/data_sources", status_code=302)
     log_with_sid(email, "info", "OPEN_LAB_UI")
-    ts = int(time.time())
+    ts = _static_version()
     prof = _profile_context(email)
     return templates.TemplateResponse(
         request,
@@ -1082,7 +1205,7 @@ async def open_conversation_deeplink(request: Request, conv_id: str):
         return RedirectResponse(url="/lab", status_code=302)
     log_with_sid(email, "info", "OPEN_CONV_DEEPLINK",
                  conv_id=log_safe_text(str(conv_id), 80), chat_id=chat_id)
-    ts = int(time.time())
+    ts = _static_version()
     prof = _profile_context(email)
     return templates.TemplateResponse(
         request,
@@ -1134,7 +1257,7 @@ async def dashboard_view_page(request: Request, dash_id: str):
         return RedirectResponse(url="/lab", status_code=302)
     log_with_sid(email, "info", "OPEN_DASHBOARD_UI",
                  dash_id=log_safe_text(str(dash_id), 80))
-    ts = int(time.time())
+    ts = _static_version()
     prof = _profile_context(email)
     return templates.TemplateResponse(
         request,
@@ -1168,7 +1291,7 @@ async def admin_data_sources_page(request: Request):
     return templates.TemplateResponse(
         request,
         "admin_data_sources.html",
-        {"request": request, "ts": int(time.time()), "username": email,
+        {"request": request, "ts": _static_version(), "username": email,
          "build_stamp": _build_stamp(), "manager_mode": "admin",
          # 19g: a PROMOTED admin is a full chat user — the sidebar footer
          # renders "← Back to chat" for them; the bootstrap account has no
@@ -1203,7 +1326,7 @@ async def power_data_sources_page(request: Request):
     return templates.TemplateResponse(
         request,
         "admin_data_sources.html",
-        {"request": request, "ts": int(time.time()), "username": email,
+        {"request": request, "ts": _static_version(), "username": email,
          "build_stamp": _build_stamp(), "manager_mode": "power",
          "manage_scope_summary": summary, "read_beyond_manage": read_beyond,
          "self_service": self_service,
@@ -1292,9 +1415,10 @@ async def health():
 
 @app.get("/version")
 async def version():
-    """Which build is running — checkable without shell access (the point:
-    the static `?v=` parameter is a per-request clock, not a build marker).
-    Unauthenticated like /health, and carries no secrets."""
+    """Which build is running — checkable without shell access (the static
+    `?v=` parameter is the commit only on a stamped image; unstamped, it is a
+    bare process-start number). Unauthenticated like /health, and carries no
+    secrets."""
     return {
         "commit": settings.BUILD_COMMIT or None,
         "build_time": settings.BUILD_TIME or None,

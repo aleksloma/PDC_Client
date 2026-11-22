@@ -80,6 +80,8 @@ class Settings(BaseModel):
 
     # Build identity — baked in as Docker build args (see the Dockerfile).
     # Empty on an unstamped build; the app then reports its start time.
+    # BUILD_COMMIT is also the static `?v=` (app._static_version; the process
+    # start time when empty), and requests carrying it are cached immutable.
     BUILD_COMMIT: str = Field(default_factory=lambda: os.getenv("BUILD_COMMIT", ""))
     BUILD_TIME: str = Field(default_factory=lambda: os.getenv("BUILD_TIME", ""))
 
@@ -91,6 +93,12 @@ class Settings(BaseModel):
     # AI description draft during table registration): a stalled brain must
     # surface as a named error, not as a spinner nobody can wait out.
     BRAIN_DRAFT_TIMEOUT: float = Field(default_factory=lambda: float(os.getenv("BRAIN_DRAFT_TIMEOUT", "60.0")))
+    # Seconds a chat stream waits for its first answer event (a partial, a
+    # caption, a narrative, the done / single answer or an error — see
+    # routes/chat.py `_is_answer_event`) before it sends ONE keyed progress event
+    # `lab.taking_longer` ("This is taking longer than usual…"). Read by
+    # routes/chat.py at call time; 0 sends no notice.
+    SLOW_ANSWER_NOTICE_SECONDS: float = Field(default_factory=lambda: _float_env("SLOW_ANSWER_NOTICE_SECONDS", 90.0, 0.0))
 
     # Verbose brain-call debug logging. OFF by default. When ON, every brain
     # request/response is logged to the LOCAL client log (BRAIN_REQUEST /

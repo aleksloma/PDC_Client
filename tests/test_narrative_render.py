@@ -44,7 +44,10 @@ def _lines(caplog, needle):
 # --------------------------------------------------------------------- constants
 
 def test_public_constants():
-    assert KINDS == ("count", "float", "pct", "ratio", "amount", "text", "period")
+    # DELIBERATE CHANGE (C1 / F4): `pvalue` is appended at the end of the
+    # tuple; narrative.KINDS and pdc_diag.KINDS stay equal.
+    assert KINDS == ("count", "float", "pct", "ratio", "amount", "text", "period", "pvalue")
+    assert KINDS == pdc_diag.KINDS
     assert TEMPLATE_MAX == 4000 and CAPTION_MAX == 600
     assert RENDERED_MAX == 8000 and CAPTION_RENDERED_MAX == 1200
     assert FINDINGS_MAX_KEYS == 24 and FINDINGS_STR_MAX == 64 and MARKER_MAX == 400
@@ -105,6 +108,26 @@ def test_fmt_delegated_to_pdc_diag():
     # the slot renderer IS pdc_diag.fmt — the two can never disagree
     assert _r("{{v:amount}}", {"v": 2345678901}) == pdc_diag.fmt(2345678901, "amount")
     assert _r("{{v:count}}", {"v": float("nan")}) == "n/a"
+
+
+def test_pvalue_slot_renders():
+    # C1 / F4: a `{{p:pvalue}}` slot goes through pdc_diag.fmt's pvalue kind
+    assert _r("p = {{p:pvalue}}", {"p": 0.0004}) == "p = <0.001"
+    assert _r("p = {{p:pvalue}}", {"p": 0.0}) == "p = <0.001"
+    assert _r("p = {{p:pvalue}}", {"p": 0.04213}) == "p = 0.042"
+    assert _r("p = {{p:pvalue}}", {"p": 0.5}) == "p = 0.500"
+    assert _r("p = {{p:pvalue}}", {"p": 1.0}) == "p = 1.000"
+    assert _r("p = {{p:pvalue}}", {"p": 1.5}) == "p = n/a"
+    assert _r("p = {{p:pvalue}}", {"p": -0.1}) == "p = n/a"
+    assert _r("{{p:pvalue}}", {"p": 0.04213}) == pdc_diag.fmt(0.04213, "pvalue")
+    # pvalue is a known kind: NOT the type default (a float would be "0.04")
+    assert _r("{{p:pvalue}}", {"p": 0.04213}) != _r("{{p}}", {"p": 0.04213})
+
+
+def test_pvalue_slot_renders_in_locale():
+    assert render("p = {{p:pvalue}}", {"p": 0.04213}, {}, sid=SID, locale="ru") == "p = 0,042"
+    assert render("p = {{p:pvalue}}", {"p": 0.0004}, {}, sid=SID, locale="uz") == "p = <0,001"
+    assert render("p = {{p:pvalue}}", {"p": 0.0004}, {}, sid=SID, locale=None) == "p = <0.001"
 
 
 # ---------------------------------------------------------------------- sections

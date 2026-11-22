@@ -199,7 +199,7 @@ section   := ( "{{#" name "}}" | "{{^" name "}}" ) body "{{/" name "}}"    -- cl
 body      := { text | slot }                                                -- no section inside a section
 slot      := "{{" name [ ":" kind ] "}}"                                     -- no whitespace inside braces
 name      := [A-Za-z_][A-Za-z0-9_]{0,39}
-kind      := [a-z]{1,10}       -- recognised: count|float|pct|ratio|amount|text|period; other ⇒ default kind
+kind      := [a-z]{1,10}       -- recognised: count|float|pct|ratio|amount|text|period|pvalue; other ⇒ default kind
 text      := any characters; any "{{…}}" that does not match the token regex below is literal text
 ```
 
@@ -263,7 +263,7 @@ _TOKEN_RE = re.compile(
 #### A2.4 API (`narrative.py`, main app only; imports stdlib, `pdc_diag`, `logger_utils`)
 
 ```python
-KINDS = ("count", "float", "pct", "ratio", "amount", "text", "period")
+KINDS = ("count", "float", "pct", "ratio", "amount", "text", "period", "pvalue")   # = pdc_diag.KINDS (pvalue: P29 C1)
 TEMPLATE_MAX = 4000; CAPTION_MAX = 600; RENDERED_MAX = 8000; CAPTION_RENDERED_MAX = 1200
 FINDINGS_MAX_KEYS = 24; FINDINGS_STR_MAX = 64; MARKER_MAX = 400
 class TemplateError(ValueError): ...
@@ -378,12 +378,14 @@ Rules, applied in order:
    - an `int`/`float` ⇒ formatted with its type's default kind.
 6. A numeric kind with a non-numeric value ⇒ the text rule.
 7. NaN / ±inf ⇒ `"n/a"`.
+7a. Kind `pvalue` with a value below 0 or above 1 ⇒ `"n/a"` (not a p-value).
 8. Formatting always uses `format(v, ",.Nf")` (never scientific; Python rounds half-to-even on the binary value):
    - `count`: an `int` → `format(v, ",")` (exact, with no float conversion); a `float` → `",.0f"`;
    - `float`: `",.2f"`;
    - `pct`: `format(v * 100, ",.1f") + "%"` — the input is a fraction;
    - `ratio`: `0 ≤ v < 0.05` ⇒ `"<0.1x"`; `v > 1000` ⇒ `">1000x"`; otherwise `",.1f"` + `"x"` (a negative ratio keeps the fixed-point rule). A collapse such as 6.6e-6 therefore never reads as `"0.0x"`;
-   - `amount`: `|v| ≥ 1e12` ⇒ `format(v / 1e12, ",.2f") + " " + trln` (decision F12); `|v| ≥ 1e9` ⇒ `format(v / 1e9, ",.2f") + " " + bln`; `|v| ≥ 1e6` ⇒ the same with `/1e6` and `mln`; otherwise the count rule.
+   - `amount`: `|v| ≥ 1e12` ⇒ `format(v / 1e12, ",.2f") + " " + trln` (decision F12); `|v| ≥ 1e9` ⇒ `format(v / 1e9, ",.2f") + " " + bln`; `|v| ≥ 1e6` ⇒ the same with `/1e6` and `mln`; otherwise the count rule;
+   - `pvalue` (P29 C1, 22 Nov 2026; a value in [0, 1] after rule 7a): `v < PVALUE_FLOOR` (0.001, zero included) ⇒ `"<0.001"`; otherwise `format(v, ".3f")` (`0.04213` → `0.042`, `1` → `1.000`). The kind is appended LAST to `KINDS` (`pdc_diag.KINDS` and `narrative.KINDS` hold the same tuple) and is one of the numeric kinds, so a bool follows rule 3 and a string rule 6. The brain tells the planner to write every p-value slot `{{name:pvalue}}`, never `:float` (which shows two decimals, so p = 0.0004 read `0.00`).
 9. Negative zero: if the result starts with `"-"` and contains no digit 1–9, drop the `"-"`.
 10. Locale: when `locale` names an entry other than `default`, swap the separators through a placeholder (`,` → `\0`, `.` → decimal, `\0` → thousands) and swap the `mln`/`bln`/`trln` words. An unknown locale ⇒ default. Two locales exist besides `default` (decision F20, 2026-10-25): `uz` = thousands U+00A0 (no-break space), decimal `,`, words `mln` / `mlrd` / `trln`; `ru` = the same separators, words `млн` / `млрд` / `трлн`. `narrative` picks the locale from the answer language (`locale_for(lang)`: uz → `uz`, ru → `ru`, everything else default) for every slot, caption, `value_display` line and finding sentence. Period labels are shown in the file's own form (month names are not translated).
 11. A result longer than `FMT_MAX_LEN` (32) ⇒ `"n/a"`.
@@ -443,6 +445,8 @@ Rules, applied in order:
 | `42` | `"bogus"` | `42` |
 | `0.5` | None | `0.50` |
 
+`pvalue` examples (pinned by `tests/test_pdc_diag_fmt.py::test_pvalue_*`): `0.0004` → `<0.001`; `0` → `<0.001`; `0.001` → `0.001`; `0.04213` → `0.042`; `0.9996` → `1.000`; `1` → `1.000`; `-0.0001`, `1.5`, NaN → `n/a`; `0.0004` with `uz` / `ru` → `<0,001`; `0.04213` with `uz` / `ru` → `0,042`; `True` → `true`; `"0.04"` → `0.04`.
+
 ### A5. Rendering, storage and display (D7)
 
 #### A5.1 Where rendering happens (`run_chat_local.py`)
@@ -468,8 +472,8 @@ class _NarrState:                 # one per phase
   - A table block whose RESULT is a dict yields several tables: caption n goes on the first table and the others get `""`.
   - With the split-axes fallback (`run_chat_local.py:1812-1828`), caption n goes on sub-chart 0 and the others keep `cobj.title`.
   - if `result_backstop.inspect_outputs` fires for that visual, prepend `result_backstop.fallback_sentence(lang, …)` + `"\n\n"` to both the template and the rendered caption (a value-free sentence; no brain call);
-  - if caption `n` is missing, today's per-chart `_describe_with_backstop` runs for that visual only (A6).
-  - the rendered caption passes the quality gate below (`what=caption`); a caption the gate empties counts as missing, so describe runs for that visual.
+  - if caption `n` does not render, whether the per-chart `_describe_with_backstop` runs for that visual is decided by `_NarrState.describe_now(n)` (describe only where needed, P29 C2, 22 Nov 2026): a caption the brain PLANNED (a 1..12 key in the reply's `captions`, `captions_planned`, whatever its template) that did not render (empty, invalid, too long, all sentences dropped, code in text) ⇒ described at once; no planned caption and no narrative template ⇒ described at once (A6); no planned caption and a narrative template ⇒ DEFERRED until the narrative render: a rendered narrative explains the visual in its last sentence and no describe call is made (`DESCRIBE_SKIPPED n=<count> reason=narrative`), a narrative that is not used leaves describe as before. A later visual of a block whose caption rendered on its first visual counts as uncaptioned.
+  - the rendered caption passes the quality gate below (`what=caption`); a caption the gate empties counts as not rendered (planned), so describe runs for that visual.
 - **Narrative.** After all blocks of the phase finish, and only if `ok_blocks ≥ 1`: `render(template, values, findings, sid=sid)`, then the quality gate (`what=narrative`), then `_append_live_notes` (`run_chat_local.py:478`) on the RENDERED text only. If `ok_blocks == 0`, the narrative is not used (`NARRATIVE_SKIPPED reason=no_successful_block`) and today's failure texts apply. If the gate empties the text, the narrative is not used either (`NARRATIVE_SKIPPED reason=all_sentences_dropped`) and the answer takes today's no-narrative path: the per-visual describe / caption texts, or summarize plus `value_display` for a scalar.
 - **Quality gate** — `narrative.drop_na_sentences(text, *, sid, what) -> str`, applied to every rendered text before display. The text is split on newlines and after `.` / `!` / `?` followed by whitespace or the end (so `7.9x` or `1,234.57` is not a sentence end). Every piece holding the token `n/a` (case-insensitive, not inside a word) is removed, then the A2.2 space/newline post-processing runs again. A missing slot, a slot whose value is None and a non-finite value all render `n/a`, so a sentence about a value the code did not produce never reaches the user. One line `NARRATIVE_SENTENCE_DROPPED reason=missing_slot n=<pieces> what=<narrative|caption>` per text, never the text. The stored template and VALUES are unchanged; a text without `n/a` is returned as it is. Never raises. Known limits: a value or template text that legitimately reads `N/A` (a category named so) drops its sentence too, and is still logged as `missing_slot`; an abbreviation such as `e.g. ` counts as a sentence end.
 - **Invalid template.** Before the gate, `finish` checks the template: a parse error (`NARRATIVE_PARSE_FAILED kind=nested|unclosed|mismatched`) or a FIRST rendered sentence holding `n/a` (`NARRATIVE_INVALID reason=first_sentence`) makes it invalid; the headline is never dropped silently and `fallback_text` is no longer shown as a narrative. An invalid template gets ONE narrative-only retry through `/v1/retry`: the flow's exec-error retry keywords with `error_msg = "narrative_invalid: <kind>"` (kind `nested`, `unclosed`, `mismatched` or `first_sentence`; when a SLOT made the first sentence show `n/a`, `"narrative_invalid: first_sentence slot=<name> cause=<missing|none|nan>"` — `narrative.first_sentence_na_slot` finds the first slot of the first sentence whose key is absent, whose value is None or whose value is non-finite, through a marking pass of `render_with_sections`; `narrative.invalid_error_msg` builds the string, and the same detail is logged `NARRATIVE_INVALID reason=first_sentence slot=<name> cause=<cause>`. The slot name is a template identifier, never a value; any other `n/a` — a literal one, a fmt overflow, an unsupported type — sends the plain kind), `failed_code` = the code that already ran (single: the block's code; multi: the emitted chart codes then the table codes, joined with `\n###NEXT_PLOT###\n`), `use_pro = true`, `sql` = what ran, `sql_error = null`. Only the reply's `narrative` is read (through `clean_template`); its code and captions are ignored and nothing re-runs (the SQL map is not merged). Its usage is added to the turn. The reply's template is checked the same way: valid ⇒ it replaces the plan's template (also in `content` = `history_content`), invalid or absent ⇒ `NARRATIVE_INVALID_TWICE` and the turn takes the no-narrative path (A6). A raise in the retry logs `NARRATIVE_RETRY_FAILED error=<Type>` and counts as no reply.
@@ -500,7 +504,10 @@ Existing keys stay. These keys are added, only when present:
 
 | Event | Keys added (internal) | Forwarded to the browser by the `routes/chat.py` consumer |
 |---|---|---|
-| chart partial (existing, `run_chat_local.py:1822-1828`, `:1948-1954`) | `answer` = rendered caption or describe text, `caption_template` (or None), `phase`, `block_index` | existing payload (`routes/chat.py:1866-1879`) + `phase` |
+| chart partial (existing) | yielded right after execution (P29 C2): `answer` = the rendered caption, else `""`; `caption_template` (or None), `phase`, `block_index` | existing payload + `phase` |
+| caption (NEW, P29 C2) | `{"caption": True, "index": <chart_n of the chart, for a split group its first sub-chart>, "text": <describe display text>, "phase": 1, "block_index"}` — after the chart partial, once its describe call returns (or after the narrative render for a deferred visual whose narrative is not used, A5.1); never for a chart whose caption rendered or a deferred visual explained by the narrative | `{caption: true, index, text, conv_id}`; the worker stores `text` as that chart's `answer` |
+| single table partial (NEW, P29 C2; single flow, `_iter_single_from_plan` → `_run_single_body`) | `{"partial": True, "single_table": True, "phase": 1, "tables", "table", "code", "table_codes", "table_result_keys", "sql"}` right after execution, before the table's text is written; the `single_response` follows with the text | the tables-partial payload + `single_table: true`, `code`, and for a one-table answer `table` + `full_table_key`; the worker persists the table here and the single answer reuses its keys |
+| progress (NEW, P29 C2 stage events) | through `on_progress` (single and multi flow, not yielded; `_emit_stage`): `{"progress": True, "message_key": "lab.stage_planning" \| "lab.stage_running" \| "lab.stage_fixing" \| "lab.stage_describing" \| "lab.stage_summary", "message": <English text>}`, `lab.stage_fixing` also `attempt` (and the number in `message`) | the same + `conv_id` (`progress, phase, message_key, message, attempt` when present) |
 | tables partial (NEW; phase 1, before phase 2 only) | `{"partial": True, "phase": 1, "tables", "table_codes", "table_result_keys", "table_captions", "table_caption_templates"}` | `{partial, phase, tables, full_table_keys, table_captions, conv_id}` |
 | narrative (NEW) | `{"narrative": True, "phase": p, "text": rendered, "template", "values", "findings"}` | `{narrative: true, phase, text, conv_id}` |
 | progress (NEW, phase 2) | `{"progress": True, "phase": 2, "message_key": "lab.phase2_progress", "message": "Checking what drives this…"}` | the same + `conv_id` |
@@ -602,25 +609,26 @@ def _apply_narrative_fields(rec: dict, src: dict | None) -> dict
 - On `data.narrative`: fill `slot[data.phase]` via `renderMarkdown` and unhide it.
 - On `data.progress && data.phase === 2`: remove `streamLoadingDiv`, append `slot2` (hidden), then append a status bubble with the text `_t(data.message_key, data.message)`.
 - On `data.partial && !data.image_base64 && data.tables`: append the tables message with captions. Do not increment `chartCount`.
-- Single done (`chartCount === 0`): if `data.narrative`, call `appendNarrativeMessage(data.narrative, 1)` and then `appendMessage(data.caption || '', image, table, …)`; otherwise behave as today.
+- Single done (`chartCount === 0`): if `data.narrative`, call `appendNarrativeMessage(data.narrative, 1)` and then `appendMessage(data.caption || '', image, table, …)`; otherwise behave as today. A single table answer already drawn by its `single_table` partial (P29 C2) gets only its text from the done event: the narrative into slot 1 above the table and the visual's own text into the table message (`_fillCaptionSlot`).
+- On `data.caption === true` (P29 C2): `_fillCaptionSlot(chartMsgs[data.index], data.text)` — the describe text goes first into that chart's `.message-content` (`.pdc-stream-caption`, through `renderMarkdown`) and is kept as `_pdcCaption` for the pin.
 - At done or stop: remove any slots that are still hidden.
 
 **CSS and i18n:**
 - `static/dashboard.css`: `.pdc-narrative .message-content` and `.pdc-caption` (margin only; no new colours).
-- `static/i18n.js` (en/geo/ru): `lab.phase2_progress`, `lab.narrative_retry` ("Writing the summary…"). The generic progress branch of the live stream shows `_t(message_key, message)` for any keyed progress event: in the loading bubble while it is visible, else in a status bubble that `done` removes.
+- `static/i18n.js` (en/geo/ru): `lab.phase2_progress`, `lab.narrative_retry` ("Writing the summary…"), and since P29 C2 the stage keys `lab.stage_working`, `lab.stage_planning`, `lab.stage_running`, `lab.stage_fixing` (`{n}` = the event's `attempt`), `lab.stage_describing`, `lab.stage_summary`, plus `lab.taking_longer` and `lab.analysis_failed`. The generic progress branch of the live stream shows `_t(message_key, message)` for any keyed progress event: in the loading bubble while it is visible, else in a status bubble that `done` removes.
 
 ### A6. Fallbacks
 
 | Situation | Behaviour |
 |---|---|
 | No narrative (old brain, model omitted it, dropped by caps or kind) | today's describe per visual (with `data_caveat.findings` when FINDINGS exist, B7.4); summarize for a scalar with `preview=None` + local `value_display` |
-| Narrative present, a visual has no caption | user item A.5: today's per-chart describe for THAT visual only (unchanged prompt; `data_caveat.findings` added when FINDINGS exist; backstop caveat as today). The answer-level text stays the narrative; summarize is never called. See F27 |
+| Narrative present, a visual has no caption | since P29 C2 (describe only where needed, A5.1): a visual planned WITHOUT a caption gets no describe call when the narrative is used — the narrative's last sentence explains it (`DESCRIBE_SKIPPED`); when the narrative is not used it is described as before. A visual whose PLANNED caption did not render gets the per-chart describe for THAT visual only (unchanged prompt; `data_caveat.findings` added when FINDINGS exist; backstop caveat as today). The answer-level text stays the narrative; summarize is never called. See F27 |
 | No narrative, some captions present | captioned visuals use the rendered caption (no describe); uncaptioned visuals → describe with an unchanged prompt (+ findings caveat) |
 | Render error (caption) | `fallback_text` (sections removed, slots `"n/a"`), `NARRATIVE_RENDER_FAILED error=<Type>`; the quality gate then drops every sentence that held a slot |
 | Narrative template invalid (parse error, or a first sentence holding `n/a`) | ONE narrative-only retry (`narrative_invalid: <kind>`, with `slot=<name> cause=<missing\|none\|nan>` for a slot, A5.1), time-boxed at 45 s; its valid narrative is rendered, else `NARRATIVE_INVALID_TWICE` and the "No narrative" row, preceded by the headline fallback sentence when VALUES holds `result` / `total` / `*_total` |
 | Narrative-only retry exceeds 45 s | `NARRATIVE_RETRY_TIMEOUT`; counts as no reply (the row above) |
 | A finding no shown section states | one fixed sentence per finding, in the answer language (A5.1) |
-| A rendered sentence holds `n/a` (missing slot, None or non-finite value) | that sentence is dropped (A5.1 quality gate); a caption left empty ⇒ describe for that visual; a narrative left empty ⇒ the "No narrative" row |
+| A rendered sentence holds `n/a` (missing slot, None or non-finite value) | that sentence is dropped (A5.1 quality gate); a (planned) caption left empty ⇒ describe for that visual; a narrative left empty ⇒ the "No narrative" row |
 | A rendered narrative or caption holds code (A5.1 code gate) | the caption counts as missing (describe for that visual); the narrative is not used (the "No narrative" row) |
 | A prose-kind reply (CLARIFICATION / ANSWER / MISSING_DATA) holds runnable Python (a python / py / bare fence, or a fence-free text that parses as code) | its code is extracted and run on the normal path; describe / summarize write the text (A5.1) |
 | Every block of the phase failed | narrative not used; today's failure texts |
@@ -766,6 +774,7 @@ A refused block is an ordinary execution error with the fixed text `pdc_diag can
 **Error behaviour.**
 - The functions never print or log (they run in the sandbox).
 - A missing column or a non-numeric metric raises `ValueError` with a fixed message naming the parameter and the column. That is schema-level information, so it helps retries.
+- **Period guard (P29 C1, 22 Nov 2026).** `coverage_check`, `detect_anomalies`, `decompose_change` and `rate_by_period` call `_check_periods(df, period_col)` after the column checks and before any per-period work (`order=` does not bypass it). A `period_col` with more than `MAX_PERIODS` (5000) distinct non-null values (`_distinct_count`: `nunique(dropna=True)`, unhashable cells counted by their text; an uncountable column passes) — a raw timestamp, not a day / week / month column — raises `ValueError: period_col: column '<name>' has <n> distinct values; a period column holds days, weeks or months (at most 5000). Build one first, for example with .dt.date for days or with .dt.to_period(freq).astype(str) where freq is D, W or M`. The advice carries no quoted literal (the retry scrub, B7.7, would turn one the failed code does not contain into `'<value>'`); the column name is quoted as in the missing-column message. Why: every function splits the frame once per period; a raw timestamp passed as the period column (189,018 distinct values, lab Q7) took 81 s and ran the 2 GB sandbox out of memory, while 5000 periods take about 2.5 s / 54 MiB on 190,000 rows (`coverage_check`; 13 years of daily data stay possible). The brain's planner and retry prompts state the same rule (B10.3 HELPER LIBRARY, B10.4 `retry_narrative_system`).
 - A missing key of a result, of its `values` or of its `findings` raises a plain `KeyError` whose single argument names the function, the part and the key names pdc_diag set when it built the dict (`_names`, recorded at construction), e.g. `KeyError: "'from_period' is not a key of coverage_check values; available keys: as_of_period, coverage_dim_label, …"` — the key names sorted, VALUES keys with the `prefix=` applied, `none` when there is no key, the missing key's repr capped at 80 characters; key names only, never a value. A key the generated code adds later is never listed: it may be data-derived (`r["values"]["total_" + currency]` would put a category value into the unquoted list, which the retry scrub keeps); a key it deletes later is still listed (it is one of pdc_diag's fixed names). `.get` and `in` are unchanged. Why: BRB run 3 read `from_period`, then `last_period`, then `start_period` from a `coverage_check` result — three guesses, because a bare `KeyError: 'from_period'` names no existing key. The sandbox passes the text through `f"{type(e).__name__}: {e}"` unchanged at both exec sites, and the retry scrub (B7.7) keeps it: the missing key is a string literal of the failed code (a key built at run time becomes `'<value>'`), the outer double-quoted literal holds a single-quoted one, so it is kept whole, and the key list is unquoted.
 - Degenerate data (an empty frame, one period) returns empty tables and findings such as `too_few_periods`.
 
@@ -775,6 +784,8 @@ A refused block is an ordinary execution error with the fixed text `pdc_diag can
 PDC_DIAG_VERSION = 1
 THIN_PERIOD_RATIO = 0.5                            # a period with rows < 0.5 × median rows is thin (B8.3, B8.4)
 SCOPE_ROWS_FACTOR = 3.0                            # an anomaly with > 3× / < 1/3× the previous period's rows is a scope change (B8.4)
+MAX_PERIODS = 5000                                 # the most distinct period labels a period_col may hold (Error behaviour, P29 C1)
+PVALUE_FLOOR = 0.001                               # fmt kind "pvalue": a smaller value reads "<0.001" (A4)
 FINDINGS_ENUM = (...)                              # B7.1
 PDC_DIAG_FINDING_KEYS = frozenset({
   "coverage", "coverage_dim", "thin_period", "period_status", "unknown_dominated", "unknown_dim",
@@ -812,6 +823,8 @@ The bool means "order known". Rules, in order:
    - `pd.to_datetime(label, errors="coerce")` last.
 
    If all labels parse, sort by the parsed timestamp (known). Otherwise use first-appearance order (not known), which sets the finding `period_order_unknown: True`.
+
+**`pd.Period` labels (P29 C1, 22 Nov 2026).** A `.dt.to_period(...)` column (PeriodDtype, or Period objects in an object column) goes through rule 4: `_parse_period_label` maps a `pd.Period` to its START (`to_timestamp(how="start")`), so the labels sort chronologically and the order is known. Its text form parses to the same stamp — a week's `"YYYY-MM-DD/YYYY-MM-DD"` span (`str(pd.Period(..., "W"))`, `_DAY_SPAN_RE`) by its start day. An `order=` entry matches a Period label by its text (`"2024-07"` names Period 2024-07, and a Period names its text label). Every period label a function reports — the period VALUES (through `_label_str`, where a Period is `str(period)`) and the `period` column of the `coverage_check`, `detect_anomalies` and `rate_by_period` tables (`_table_periods`) — is the Period's text, so the table matches the VALUES and crosses the sandbox transport as text. Before, a Period column was ordered by first appearance and every period VALUE was None.
 
 #### B8.3 `coverage_check`
 
@@ -1158,11 +1171,11 @@ It is never sent as `false`, and never on `/v1/retry`.
 
 #### B10.2 Classifier section (diagnostics_v1 only)
 
-Changes inside the prompt at `brain_agent.py:1082-1167`. Without `diagnostics_v1`, every byte is unchanged.
-1. The task_type enum in the JSON template line (`:1112`) becomes `<greeting|data_retrieval|aggregation|visualization|statistical_analysis|complex_analysis|explanation|diagnostic|advisory>`.
-2. `AVAILABLE SKILL MODULES` (`:1106-1109`) gets a new line `  diagnostics` after `analytics_output, analytics_dashboard`.
-3. The libraries list (`:1094-1099`) gets a new line: `- pdc_diag — deterministic diagnostic helpers (coverage, anomalies, change decomposition, attribution)`.
-4. The following text is inserted after the explanation definition paragraph (`:1116-1120`) and before `Scoring guide:`:
+Changes inside the classifier prompt of `brain_agent._detect_query_complexity` (the f-string at `brain_agent.py:2392-2430`; the inserts are the constants at `:2295-2326`). Without `diagnostics_v1`, every byte is unchanged.
+1. The task_type enum in the JSON template line gains `|diagnostic|advisory` (`_DIAG_ENUM`): `<greeting|data_retrieval|aggregation|visualization|statistical_analysis|complex_analysis|explanation|diagnostic|advisory>`.
+2. `AVAILABLE SKILL MODULES` gets a new line `  diagnostics` after `analytics_output, analytics_dashboard` (`_DIAG_SKILL_LINE`).
+3. The libraries list gets a new line: `- pdc_diag — deterministic diagnostic helpers (coverage, anomalies, change decomposition, attribution)` (`_DIAG_LIB_LINE`).
+4. The following text (`_DIAGNOSTIC_CLASSIFIER_SECTION`, verbatim) is inserted after the explanation definition paragraph and before `Scoring guide:`:
 
 ```
 task_type "diagnostic": the user asks WHY something changed or looks the way it does, WHAT DRIVES or
@@ -1182,17 +1195,22 @@ Precedence: a why / what-drives / what-problems question is "diagnostic" even wh
 dashboard, an overview or several charts (diagnostic wins over complex_analysis); a what-to-do question is
 "advisory"; a dashboard or overview request with neither stays "complex_analysis". A question about a
 PREVIOUS result answerable from the conversation without new computation stays "explanation".
-For diagnostic and advisory: complexity_score AT LEAST 8, skills_needed includes "diagnostics" and
-"analytics_viz", and suggested_approach MUST be: "Follow the diagnostic playbook: coverage check, confirm
-the anomaly, then decompose the change or attribute the level; ###NEXT_PLOT### blocks with VALUES and
-FINDINGS; one narrative template."
+For diagnostic and advisory: complexity_score AT LEAST 8, and skills_needed includes "diagnostics" and
+"analytics_viz". For an advisory question that asks which group (segment, region, product, client group) to
+focus on or prioritise, with no change over time asked, suggested_approach MUST be: "Where to focus: per
+group compute the total, its share, the member count and the value per member; choose the group by the rule
+the question implies and report the chosen group's total, share, member count and value per member, and both
+the largest-total and the highest-per-member group; ###NEXT_PLOT### blocks with VALUES and FINDINGS; one
+narrative template." For "diagnostic" and every other advisory question, suggested_approach MUST be: "Follow
+the diagnostic playbook: coverage check, confirm the anomaly, then decompose the change or attribute the
+level; ###NEXT_PLOT### blocks with VALUES and FINDINGS; one narrative template."
 ```
 
-The Georgian, Russian and Uzbek examples need a native-speaker check before shipping.
+The Georgian, Russian and Uzbek examples need a native-speaker check before shipping. P29 B4 (22 Nov 2026) split the advisory approach: a which-group-to-focus question gets the "Where to focus" suggested_approach (the `where_to_focus` key of `diagnostics.yaml`, B10.5); diagnostic and every other advisory question keep the playbook one.
 
 #### B10.3 `prompts.json["planner_narrative_system"]` (exact text)
 
-The following text is the prompt verbatim.
+The following text is the prompt verbatim (the brain's `prompts.json` as of P29, 22 Nov 2026).
 
 ````text
 NARRATIVE ANSWER TEXT — the client writes the numbers, you write the words.
@@ -1203,10 +1221,11 @@ You never see result values. For every data answer (a ```python``` or ```plot_co
 
 TEMPLATE LANGUAGE
 - Write the template in the answer language defined at the top of the prompt. Plain markdown only: **bold**, lines starting with "- ", blank lines. No HTML, no headings, no code, no three backticks inside the template. At most 4000 characters.
-- A value slot is {{name}} or {{name:kind}}. name: letters, digits and underscores, starting with a letter or underscore, at most 40 characters, no spaces inside the braces. kind is one of: count (whole number), float (two decimals), pct (the stored value is a FRACTION: 0.125 is shown as 12.5%), ratio (shown as 3.4x), amount (large money or volume, shown as 1.25 bln / 7.25 mln), text (a label such as a category name), period (a period label).
+- A value slot is {{name}} or {{name:kind}}. name: letters, digits and underscores, starting with a letter or underscore, at most 40 characters, no spaces inside the braces. kind is one of: count (whole number), float (two decimals), pct (the stored value is a FRACTION: 0.125 is shown as 12.5%), ratio (shown as 3.4x), amount (large money or volume, shown as 1.25 bln / 7.25 mln), text (a label such as a category name), period (a period label), pvalue (a p-value: below 0.001 shown as <0.001, otherwise three decimals). A p-value slot always uses :pvalue, never :float.
 - Conditional text: {{#flag}}text{{/flag}} is shown only when FINDINGS[flag] is True, or FINDINGS holds a column name or code under flag, or flag is a finding code (for example spread_evenly) that some FINDINGS value equals. {{^flag}}text{{/flag}} is shown only when that is not the case. One level only: never put a section inside a section. Slots may be used inside sections. Put a whole bullet line inside its section ({{#x}}- …{{/x}}) so a hidden bullet leaves no empty line.
 - NEVER write a number, total, percentage, date, name or category value yourself — not as an estimate, not as an example. Every value comes from a slot. Only numbers that are part of the question itself may be repeated.
-- The FIRST sentence directly answers the question and contains its slot(s). The LAST sentence says how to read the chart or table (what the axes show, which bar is highlighted). Two to six sentences unless the user asked for a list.
+- No uncomputed claims: a sentence that reports the outcome of a test, a check or a comparison (normality, equal variances, missing values, a difference, a trend) sits inside a section on a FINDINGS flag that the block running that test or check sets, with both wordings: {{#flag}}…{{/flag}}{{^flag}}…{{/flag}} (except the direction flags anomaly_up, change_up, rate_up and rate_down, whose other wording is never a {{^…}} section, and the CHECKS Note sentences, which stay as written; a direction the code compares itself — which group is higher, the sign of a correlation — gets its own bool flag, for example FINDINGS["a_higher"]). Name a test or check only if the code calls it. Fixed text never states a fact about the data (for example "Neither table contains missing values" with no code that checks it).
+- The FIRST sentence directly answers the question and contains its slot(s). The LAST sentence says how to read a chart or table that has no caption (what the axes show, which bar is highlighted); when every visual has a caption, leave it out. Two to six sentences unless the user asked for a list.
 
 VALUES — the source of every slot
 - In the code assign the numbers and labels the template uses to the dict VALUES, for example VALUES["total_loans"] = int(total); VALUES["latest_period"] = str(latest). VALUES and FINDINGS already exist as empty dicts in every block; use VALUES["key"] = … or VALUES.update(...). Never print them.
@@ -1215,17 +1234,23 @@ VALUES — the source of every slot
 - Keep RESULT and fig exactly as before; VALUES is additional, never a replacement. Every block must still produce a figure (fig) or a RESULT table — a block that only computes VALUES is not allowed.
 
 FINDINGS — codes, never values
-- FINDINGS records checks your code computed, for example FINDINGS["has_gaps"] = bool(gaps). Allowed values: True or False; an exact column name of the loaded data; or one of these codes: coverage_change, coverage_stable, partial_period, metric_definition_overlap, mixed_units, concentrated_in_one_dim, spread_evenly, weak_signal, dominant_feature, anomaly_confirmed, no_anomaly, data_gap, outlier_driven, seasonal_pattern. Anything else is dropped.
+- FINDINGS records checks your code computed, for example FINDINGS["has_gaps"] = bool(gaps). Allowed values: True or False; an exact column name of the loaded data; or one of these codes: coverage_change, coverage_stable, partial_period, metric_definition_overlap, mixed_units, concentrated_in_one_dim, spread_evenly, weak_signal, dominant_feature, anomaly_confirmed, no_anomaly, data_gap, outlier_driven, seasonal_pattern, scope_change, label_disappeared. Anything else is dropped.
 - Keys: lowercase letters, digits and underscores, at most 40 characters, written in the code as a quoted string literal — never built from data (no f-strings or concatenation for keys). At most 24 keys per pass, pdc_diag's included.
 - FINDINGS select the template's conditional text and are the ONLY result information you will see in later turns.
 
 CAPTIONS (optional)
-- After the ```narrative block you may add one ```caption:<n> block per visual: n is the position of the code block in THIS reply, counting every ```python``` and ```plot_code``` block from 1 as split by ###NEXT_PLOT###; 1 ≤ n ≤ 12. Same template language, at most 600 characters, one or two sentences, using only VALUES set by block n itself. A visual without a caption gets a short generic description instead.
+- After the ```narrative block you may add one ```caption:<n> block per visual: n is the position of the code block in THIS reply, counting every ```python``` and ```plot_code``` block from 1 as split by ###NEXT_PLOT###; 1 ≤ n ≤ 12. Same template language, at most 600 characters, one short sentence on what the visual shows (its axes, its grouping, the highlighted bar), using only VALUES set by block n itself. The narrative states the result; a caption never repeats the result or its numbers. A visual without a caption is explained by the narrative's last sentence.
 
 HELPER LIBRARY pdc_diag (pre-imported in every block; do not import it)
-- pdc_diag.coverage_check(df, period_col, dims, metrics, unit_cols=[...]), pdc_diag.detect_anomalies(df, period_col, metric, agg="sum"), pdc_diag.decompose_change(df, period_col, metric, from_period=None, to_period=None, dims=[...]), pdc_diag.attribute_level(df, target, dims, numeric_cols), pdc_diag.check_metric_overlap(df, metric_a, metric_b); charts: fig = pdc_diag.plot_highlighted_series(r["table"]), fig = pdc_diag.plot_waterfall(r["table"]), fig = pdc_diag.plot_importance(r["table"]).
+- pdc_diag.coverage_check(df, period_col, dims, metrics, unit_cols=[...]), pdc_diag.detect_anomalies(df, period_col, metric, agg="sum"), pdc_diag.decompose_change(df, period_col, metric, from_period=None, to_period=None, dims=[...]), pdc_diag.attribute_level(df, target, dims, numeric_cols), pdc_diag.check_metric_overlap(df, metric_a, metric_b), pdc_diag.rate_by_period(df, period_col, numerator, denominator); charts: fig = pdc_diag.plot_highlighted_series(r["table"]), fig = pdc_diag.plot_waterfall(r["table"]), fig = pdc_diag.plot_importance(r["table"]).
+- period_col of coverage_check, detect_anomalies, decompose_change and rate_by_period is a period column — day, week or month labels — never a raw timestamp or a datetime column with times of day. When the data has only a timestamp, the block first builds a period column at the grain the question asks for (month when the question is about months), for example df["day"] = df["datetime"].dt.date or df["month"] = df["datetime"].dt.to_period("M").astype(str), and passes that; a period column with more than 5000 distinct values is refused.
 - A block that calls pdc_diag.plot_* (or otherwise builds fig) MUST be a ```plot_code block, never ```python.
 - Each analysis function returns {"table": DataFrame, "values": dict, "findings": dict}: use VALUES.update(r["values"]) and FINDINGS.update(r["findings"]). Their finding keys are fixed and allowed without being written in your code; pass prefix="xyz_" to keep VALUES keys of two calls apart. Periods are ordered chronologically, month names in English, Russian, Uzbek and Georgian included; pass order=[...] when labels are not dates.
+
+STATISTICAL TESTS AND GUARDED MEANS (every data answer)
+- Guarded means: when a block reports a mean or median from the frame drop_extreme_outliers returned and n_dropped > 0, the narrative says how many extreme rows it leaves out and also gives the all-row mean (computed on the frame before the guard) or the median, through slots the code sets — VALUES["n_excluded"] = int(n_dropped), VALUES["mean_all_rows"] = float(<all-row mean>), one all-row slot per reported mean when there are several (mean_all_rows_a, mean_all_rows_b, …; never one pooled mean for several groups) — inside a section on a flag the code sets, FINDINGS["outliers_excluded"] = bool(n_dropped > 0): {{#outliers_excluded}}…{{n_excluded:count}}…{{mean_all_rows:amount}}…{{/outliers_excluded}}. Each all-row slot takes the kind of its guarded mean (amount for money, float otherwise), and every one the code sets is used in that section. When the block ran a test, that section also says the test used all rows.
+- Effect size next to the main test (the test that answers the question): the code computes the measure that matches the test — Cohen's d for a t-test or Welch, the rank-biserial correlation for Mann-Whitney, eta squared for ANOVA, epsilon squared for Kruskal-Wallis, Cramér's V for chi-square, r for a correlation — and sets VALUES["p_value"], VALUES["effect_size"], FINDINGS["is_significant"] = bool(p < 0.05) and the four size flags FINDINGS["effect_negligible"], FINDINGS["effect_small"], FINDINGS["effect_medium"], FINDINGS["effect_large"], each a bool with its quoted key, exactly one True, and VALUES["effect_measure"], set in the same branch as the test to the name of the measure that branch computes ("Cohen's d", "rank-biserial correlation", …). Size by |value| (small / medium / large); below small is negligible: d 0.2 / 0.5 / 0.8; r and rank-biserial 0.1 / 0.3 / 0.5; eta squared and epsilon squared 0.01 / 0.06 / 0.14; Cramér's V 0.1 / 0.3 / 0.5 for one degree of freedom (divide each by sqrt(min(rows, cols) - 1) for a larger table). It also sets FINDINGS["significant_small_effect"] = bool(p < 0.05 and the class is negligible or small). An assumption check (Shapiro-Wilk, Levene) never sets p_value, effect_size, is_significant or a size flag; it sets its own flag, for example FINDINGS["equal_variances"] = bool(p_levene >= 0.05) or FINDINGS["normal_distribution"] = bool(p_shapiro >= 0.05). A normality check on more than 5000 rows uses scipy.stats.normaltest on all rows (Shapiro-Wilk only up to 5000 rows), never a sample of the rows. A reply reports one main test.
+- Wording: the template names the measure only through {{effect_measure:text}}, never as fixed text, and its size class in the size sections ({{#effect_small}}…{{/effect_small}} and the other three), each using only its own class word (negligible, small, medium, large); no other magnitude word about the effect ("moderate", "substantial", "considerable", …) appears anywhere. It writes the p-value as "p-value {{p_value:pvalue}}", never "p = …". The word "significant" or "significantly" (or its translation) appears only inside {{#is_significant}}…{{/is_significant}}, in any sense, also not in a normality or variance sentence ("does not follow a normal distribution", never "deviates significantly"); {{^is_significant}} says the data shows no statistically detectable difference (or association / correlation), never "not significantly different". Sections never nest, so a significant but negligible or small effect is written in its own section, {{#significant_small_effect}}…{{/significant_small_effect}}, which says the difference is statistically detectable but small in practice, without the word "significant" — common with more than 1000 rows.
 
 SANITY HOOKS (every data answer)
 - A total over several periods: when a column looks like a unit or currency, call pdc_diag.coverage_check with unit_cols=[that column] and branch the template on {{#mixed_units}}…{{/mixed_units}} and {{#coverage_change}}…{{/coverage_change}}.
@@ -1234,9 +1259,9 @@ SANITY HOOKS (every data answer)
 - "This month", "current period", "now": compute the latest period in the data; coverage_check sets latest_is_past_period when the data ends before the current month; then the template says, inside {{#latest_is_past_period}}…{{/latest_is_past_period}}, that the latest period in the data is {{latest_period:period}}.
 
 CHECKS, FINDINGS AND SLOTS (every data answer)
-- Checks before the answer: a "how many" or "what amount" answer that aggregates over a period column calls, in its FIRST block and BEFORE the answer is computed, pdc_diag.coverage_check(df, <period col>, dims=[<categorical columns>], metrics=[<the metric>], unit_cols=[<currency / unit columns>]) and, when the data has a second column of the same kind that the metric may duplicate (a granted / issued column against an active / portfolio / total column), pdc_diag.check_metric_overlap(df, <the metric>, <that column>); both results are merged with VALUES.update(r["values"]) and FINDINGS.update(r["findings"]). The same block then computes the answer from those results: per currency or unit label when r["findings"] reports mixed_units, and for the latest complete period when it reports metric_definition_overlap (unless the user explicitly asks for a total over time, see PERIOD SCOPE AND STOCK METRICS). A block never sees another block's results, so a later block that needs them calls them itself. After the first sentence, the narrative carries the sentence of every check that ran, each in its own section, in the answer language and otherwise unchanged: {{#coverage_change}}Note: the set of {{coverage_dim_label:text}} values changes between periods, so totals are not comparable.{{/coverage_change}} {{#mixed_units}}Note: the amounts carry more than one currency or unit label, so they are reported per label and never added together.{{/mixed_units}} {{#metric_definition_overlap}}Note: in {{overlap_equal_share:pct}} of rows the two metrics are equal, so the one asked about counts a stock (items still active), not new items, and adding periods together counts the same items more than once.{{/metric_definition_overlap}}
-- No home-made flags: where a pdc_diag function provides a finding or value — coverage (coverage_check), units (coverage_check with unit_cols), overlap (check_metric_overlap), anomaly (detect_anomalies), change decomposition (decompose_change), attribution (attribute_level) — the code uses that result and never computes its own version of it: no own currency or unit flag (for example FINDINGS["has_other_currencies"] = len(by_currency) > 1), no own threshold, mean-plus-k-sigma or outlier rule, no own change ratio or top member, no own unknown share. Code computes additional VALUES and FINDINGS only for things pdc_diag does not provide (the answer figure, its period scope, a share or rank the question asks for).
-- Slot safety: a slot whose value comes from a finding is used only inside a section of that finding, never in an unconditional sentence or conclusion, so a finding that did not fire never renders "n/a": {{coverage_dim_label:text}} inside {{#coverage_change}}; {{unknown_dim_label:text}} inside {{#unknown_dominated}}; {{thin_period_label:period}} inside {{#thin_period}}; {{change_dim_label:text}} and {{change_top_member:text}} inside {{#concentrated_in_one_dim}}; {{anomaly_period:period}} inside {{#anomaly_confirmed}}, {{#anomaly_up}} or {{#multiple_anomalies}} (each of them implies a confirmed anomaly). A sentence inside another section names the period through that function's own slot, for example {{change_to_period:period}} inside {{#concentrated_in_one_dim}}. A ratio slot is used only inside {{#anomaly_confirmed}} or {{#change_large}}: {{anomaly_ratio_median:ratio}} with the anomaly, {{change_ratio:ratio}} with change_large; never {{anomaly_ratio_prev}}, which is unset when the anomaly is the first period. A change that is a collapse (a drop to near zero) is described through {{change_pct:pct}}, never through a ratio. Direction words ("increase", "rise", "jump", "times more") appear only inside {{#anomaly_up}} or {{#change_up}}; every other sentence about an anomaly or a change is worded neutrally ("stands out", "changed by {{change_pct:pct}}") and never sits in a {{^anomaly_up}} or {{^change_up}} section, because such a section also shows when there is no anomaly or no change at all. prefix= renames VALUES keys only and is one to ten lowercase letters or digits, starting with a letter, then one underscore (prefix="ovl_", never prefix="loan_amount_"): a slot then carries the prefix ({{ovl_overlap_equal_share:pct}}), a section flag never does, because FINDINGS keys and codes are fixed ({{#concentrated_in_one_dim}}, never {{#change_concentrated_in_one_dim}}); pass prefix= only when two calls in one reply would set the same VALUES key.
+- Checks before the answer: a "how many" or "what amount" answer that aggregates over a period column calls, in its FIRST block and BEFORE the answer is computed, pdc_diag.coverage_check(df, <period col>, dims=[<categorical columns>], metrics=[<the metric>], unit_cols=[<currency / unit columns>]) and, when the data has a second column of the same kind that the metric may duplicate (a granted / issued column against an active / portfolio / total column), pdc_diag.check_metric_overlap(df, <the metric>, <that column>); both results are merged with VALUES.update(r["values"]) and FINDINGS.update(r["findings"]). The same block then computes the answer from those results: per currency or unit label when r["findings"] reports mixed_units, and for the latest complete period when it reports metric_definition_overlap (unless the user explicitly asks for a total over time, see PERIOD SCOPE AND STOCK METRICS). A block never sees another block's results, so a later block that needs them calls them itself. After the first sentence (and after the flow figure of PERIOD SCOPE AND STOCK METRICS, when there is one), the narrative carries the sentence of every check that ran, each in its own section, in the answer language and otherwise unchanged: {{#coverage_change}}Note: the set of {{coverage_dim_label:text}} values changes between periods, so totals are not comparable.{{/coverage_change}} {{#mixed_units}}Note: the amounts carry more than one currency or unit label, so they are reported per label and never added together.{{/mixed_units}} {{#metric_definition_overlap}}Note: in {{overlap_equal_share:pct}} of rows the two metrics are equal, so the one asked about counts a stock (items still active), not new items, and adding periods together counts the same items more than once.{{/metric_definition_overlap}}
+- No home-made flags: where a pdc_diag function provides a finding or value — coverage (coverage_check), units (coverage_check with unit_cols), overlap (check_metric_overlap), anomaly (detect_anomalies), change decomposition (decompose_change), attribution (attribute_level) — the code uses that result and never computes its own version of it: no own currency or unit flag (for example FINDINGS["has_other_currencies"] = len(by_currency) > 1), no own threshold, mean-plus-k-sigma or outlier rule, no own change ratio or top member, no own unknown share. Code computes additional VALUES and FINDINGS only for things pdc_diag does not provide (the answer figure, its period scope, a share or rank the question asks for, a statistical test, its effect size and an outlier-exclusion flag).
+- Slot safety: a slot whose value comes from a finding is used only inside a section of that finding, never in an unconditional sentence or conclusion, so a finding that did not fire never renders "n/a": {{coverage_dim_label:text}} inside {{#coverage_change}}; {{unknown_dim_label:text}} inside {{#unknown_dominated}}; {{thin_period_label:period}} inside {{#thin_period}}; {{change_dim_label:text}} and {{change_top_member:text}} inside {{#concentrated_in_one_dim}}; {{anomaly_period:period}} inside {{#anomaly_confirmed}}, {{#anomaly_up}} or {{#multiple_anomalies}} (each of them implies a primary anomaly period; with multiple_anomalies it may be a change of reporting scope, so that sentence says that several periods stand out, never that they are business anomalies), or inside {{#scope_change}} (the period whose total reflects a change of reporting scope). A sentence inside another section names the period through that function's own slot, for example {{change_to_period:period}} inside {{#concentrated_in_one_dim}}. A ratio slot is used only inside {{#anomaly_confirmed}} or {{#change_large}}: {{anomaly_ratio_median:ratio}} with the anomaly, {{change_ratio:ratio}} with change_large; never {{anomaly_ratio_prev}}, which is unset when the anomaly is the first period. The rate_by_period slots {{rate_first:pct}}, {{rate_last:pct}}, {{rate_first_period:period}} and {{rate_last_period:period}} are used only inside {{#rate_up}} or {{#rate_down}}. A change that is a collapse (a drop to near zero) is described through {{change_pct:pct}}, never through a ratio. Direction words ("increase", "rise", "jump", "times more") appear only inside {{#anomaly_up}} or {{#change_up}}, and about a rate only inside {{#rate_up}} (a falling rate only inside {{#rate_down}}); every other sentence about an anomaly or a change is worded neutrally ("stands out", "changed by {{change_pct:pct}}") and never sits in a {{^anomaly_up}} or {{^change_up}} section, because such a section also shows when there is no anomaly or no change at all. prefix= renames VALUES keys only and is one to ten lowercase letters or digits, starting with a letter, then one underscore (prefix="ovl_", never prefix="loan_amount_"): a slot then carries the prefix ({{ovl_overlap_equal_share:pct}}), a section flag never does, because FINDINGS keys and codes are fixed ({{#concentrated_in_one_dim}}, never {{#change_concentrated_in_one_dim}}); pass prefix= only when two calls in one reply would set the same VALUES key.
 
 PITFALLS (every data answer)
 - A stock (active, outstanding, portfolio) summed over months double counts — use the latest period.
@@ -1249,9 +1274,18 @@ PITFALLS (every data answer)
 PERIOD SCOPE AND STOCK METRICS (every data answer)
 - Period scope: when a number in the narrative is an aggregate over a period column (a sum, count or mean across DATE / month / period rows), the first sentence says which periods it covers, through slots the code sets itself: for a span, {{period_from:period}} to {{period_to:period}} with {{n_periods:count}}; for a single period, {{period:period}} (or {{latest_period:period}}). The code assigns VALUES["period_from"], VALUES["period_to"] and VALUES["n_periods"] after any VALUES.update(...) from pdc_diag, so a pdc_diag n_periods for the whole data never replaces the scope of the answer. Never a bare total without its period scope.
 - Stock-like metrics: when the dataset profile's warnings say a metric equals another metric in most rows, or name it as stock-like (active, outstanding, portfolio), a "how many" or "what amount" question on that metric is answered for the latest period only (the latest complete period when coverage_check reports partial_period): the first sentence says so, and the code sets VALUES for that period (including {{period:period}}). Produce a sum across periods only when the user explicitly asks for a total over time, and then the narrative says that the sum counts the same items once per period.
+- Flow figure next to a stock: when the answer runs check_metric_overlap on the metric asked about and the data also has a flow column for the same items (a column whose name contains new, issued, disbursed, granted_new or similar, or one the dataset profile marks as a flow), the same block also computes that flow column for the period the answer reports, through the same period slot the first sentence uses, with its own slot set unconditionally — VALUES["new_count"] = int(v) if pd.notna(v) else 0 (the float form for an amount) — and the narrative's SECOND sentence reports it inside {{#metric_definition_overlap}}, in the answer language, for example {{#metric_definition_overlap}}New loans in {{latest_period:period}}: {{new_count:count}}.{{/metric_definition_overlap}}; the check sentences, the stock note included, come after it, so the narrative reads: the first sentence, then that flow section, then {{#metric_definition_overlap}}Note: …{{/metric_definition_overlap}} and the other check sections.
 
 CONVERSATION HISTORY
 - Earlier answers appear as templates: {{name}} slots stand for values the user saw and you never see, and a first line "[Findings: key=value; …]" lists that answer's checks. Never guess, restate or compute from a slot's value; refer to it in words ("the total shown above").
+
+TOTALS, FIRST SENTENCE, SECTION NAMES AND HELPER SIGNATURES (every data answer)
+- Totals keep every row: a total, count or sum that answers "how many" or "what amount" is computed over every row — no drop_extreme_outliers, no outlier_mask filter, no quantile, clip or other extreme-value filter on the rows before that aggregate. The OUTLIER HANDLING rule for means, medians and charts does not apply to a total, a count or a sum.
+- First sentence: it uses only slots the code sets unconditionally in the same block — assigned at the top level of that block, never a slot that exists only in a branch (inside an if / elif / else, a try / except or a loop body that may not run).
+- Headline slots are never None: a value computed from a subset that may be empty (one currency, one period, one segment) is never a first-sentence slot; the first sentence uses the whole-data aggregate or, with mixed_units, one slot per label computed from a groupby that includes every label present in the data, each with a defined default of 0 when the latest period lacks it; VALUES assignments for headline slots are written as VALUES["x"] = int(v) if pd.notna(v) else 0 (or the float equivalent, VALUES["x"] = float(v) if pd.notna(v) else 0.0), never a bare value that can be None or NaN.
+- Section names: every {{#name}}, {{^name}} and {{/name}} uses an exact finding code or FINDINGS key with no prefix — {{#metric_definition_overlap}}…{{/metric_definition_overlap}}, never {{#ovl_metric_definition_overlap}}; prefix= applies to VALUES keys only ({{ovl_overlap_equal_share:pct}}). A section closes with exactly the name it opened, and no section contains another section.
+- Direction words: "spike", "jump", "increase", "rise" and their equivalents ("surge", "grew", "times more", and the same words in the answer language) appear only inside {{#anomaly_up}}…{{/anomaly_up}} or {{#change_up}}…{{/change_up}}, and about a rate (rate_by_period) only inside {{#rate_up}}…{{/rate_up}}; a falling rate is written only inside {{#rate_down}}…{{/rate_down}}. A ratio below 1 is a decline, never a spike: a decline is written through {{change_pct:pct}} ("changed by {{change_pct:pct}}"), never through a ratio slot.
+- Helper signatures: pdc_diag.coverage_check(df, period_col, dims=[...], metrics=[...], unit_cols=[...]) — dims= and metrics= are required, pass both on every call; period_col is a day, week or month column, never a raw timestamp (HELPER LIBRARY); the plot helpers take y_title=, never yaxis_title=: fig = pdc_diag.plot_highlighted_series(r["table"], y_title="…"), fig = pdc_diag.plot_waterfall(r["table"], y_title="…").
 ````
 
 #### B10.4 `prompts.json["planner_narrative_suffix"]` and `["retry_narrative_system"]` (exact text)
@@ -1267,21 +1301,26 @@ NARRATIVE OUTPUT FORMAT (extends the format above): a ```python``` or ```plot_co
 ````text
 NARRATIVE: the failed code may set VALUES and FINDINGS for an answer template the client already holds. Keep every VALUES key and every FINDINGS key the failed code sets, with the same meaning and the same kind of value. If your corrected code changes what those values mean, end the reply with a new ```narrative block after the last code block (same template language as the plan: slots {{name:kind}}, sections {{#flag}}…{{/flag}}), optionally followed by ```caption:<n> blocks numbered within THIS reply. Never write a number, name or category value yourself in a narrative or caption.
 
-PDC_DIAG ON RETRY: pdc_diag is pre-imported in every block. Do not import it (a plain "import pdc_diag" only binds the same module again; any other import that binds the name pdc_diag is refused, see below), and never redefine, stub, mock, wrap or replace it; write no fallback branch for it (no try/except around a pdc_diag call, no "if pdc_diag is None", no check of globals(), no replica of its logic). A failed pdc_diag call is fixed by correcting only the argument the error message names (it names the parameter and the column); every other argument stays as written, including to_period="primary_anomaly", a literal string the function resolves itself. For example "dims: column 'X' not found in the frame" ⇒ pass an existing column name under dims; "got an unexpected keyword argument 'dimension'" ⇒ use the parameter name from the signatures below. Signatures (parameters after * are keyword-only): coverage_check(df, period_col, dims, metrics, *, unit_cols=None, order=None, prefix=""); detect_anomalies(df, period_col, metric, agg="sum", *, order=None, prefix=""); decompose_change(df, period_col, metric, from_period=None, to_period=None, dims=(), *, agg="sum", order=None, prefix=""); attribute_level(df, target, dims, numeric_cols, *, prefix=""); check_metric_overlap(df, metric_a, metric_b, *, prefix=""); plot_highlighted_series(table, period_col="period", value_col="value", *, title=None, y_title=None); plot_waterfall(table, *, dim=None, title=None, y_title=None); plot_importance(table, *, title=None, x_title="Share of variation explained"). The client sandbox refuses a block before it runs, with the error "pdc_diag cannot be redefined", when it binds the name pdc_diag in any way other than a plain "import pdc_diag" (import … as pdc_diag, from … import pdc_diag, an assignment, del, a for / with / except target, an attribute write such as pdc_diag.fmt = …), or defines a function or class named pdc_diag or a function named after a pdc_diag function (fmt, coverage_check, detect_anomalies, decompose_change, attribute_level, check_metric_overlap, plot_highlighted_series, plot_waterfall, plot_importance); a stub, mock or wrapper under another name (for example with a suffix such as _mock) and a fallback branch are not refused, but they replace the real findings and are just as invalid. A KeyError from a pdc_diag result lists the available keys; use exactly one of them, do not guess another name.
+PDC_DIAG ON RETRY: pdc_diag is pre-imported in every block. Do not import it (a plain "import pdc_diag" only binds the same module again; any other import that binds the name pdc_diag is refused, see below), and never redefine, stub, mock, wrap or replace it; write no fallback branch for it (no try/except around a pdc_diag call, no "if pdc_diag is None", no check of globals(), no replica of its logic). A failed pdc_diag call is fixed by correcting only the argument the error message names (it names the parameter and the column); every other argument stays as written, including to_period="primary_anomaly", a literal string the function resolves itself. For example "dims: column 'X' not found in the frame" ⇒ pass an existing column name under dims; "got an unexpected keyword argument 'dimension'" ⇒ use the parameter name from the signatures below. Signatures (parameters after * are keyword-only): coverage_check(df, period_col, dims, metrics, *, unit_cols=None, order=None, prefix=""); detect_anomalies(df, period_col, metric, agg="sum", *, order=None, rows_col=None, dims=None, prefix=""); decompose_change(df, period_col, metric, from_period=None, to_period=None, dims=(), *, agg="sum", order=None, rows_col=None, prefix=""); attribute_level(df, target, dims, numeric_cols, *, prefix=""); check_metric_overlap(df, metric_a, metric_b, *, prefix=""); rate_by_period(df, period_col, numerator, denominator, *, order=None, prefix=""); plot_highlighted_series(table, period_col="period", value_col="value", *, title=None, y_title=None); plot_waterfall(table, *, dim=None, title=None, y_title=None); plot_importance(table, *, title=None, x_title="Share of variation explained"). The client sandbox refuses a block before it runs, with the error "pdc_diag cannot be redefined", when it binds the name pdc_diag in any way other than a plain "import pdc_diag" (import … as pdc_diag, from … import pdc_diag, an assignment, del, a for / with / except target, an attribute write such as pdc_diag.fmt = …), or defines a function or class named pdc_diag or a function named after a pdc_diag function (fmt, coverage_check, detect_anomalies, decompose_change, rate_by_period, attribute_level, check_metric_overlap, plot_highlighted_series, plot_waterfall, plot_importance); a stub, mock or wrapper under another name (for example with a suffix such as _mock) and a fallback branch are not refused, but they replace the real findings and are just as invalid. A ValueError "period_col: … distinct values …" usually means a raw timestamp or a too-fine column: build a day, week or month column at the grain the question asks for (for example df["month"] = df["datetime"].dt.to_period("M").astype(str), or .dt.date for days) and pass it, never the timestamp. A KeyError from a pdc_diag result lists the available keys; use exactly one of them, do not guess another name.
 ````
 
-#### B10.5 `skills/core/diagnostics.yaml` (outline; content keys rendered verbatim)
+#### B10.5 `skills/core/diagnostics.yaml` (the file verbatim)
+
+The brain renders exactly ONE of `single_pass_rule` / `phase2_rule`: `phase2_rule` when the request carries two_phase_v1, otherwise `single_pass_rule` (the other key is deleted from the dict before rendering; test `test_diagnostics_yaml_single_pass_without_two_phase`).
 
 ```yaml
 id: diagnostics
 type: core
-token_budget: 900
+# token_budget is metadata only: skill_loader drops it (_SKIP_KEYS) and never truncates the block. It
+# records the rendered size: about 19 300 characters (the phase2_rule rendering is the longer one), i.e.
+# rendered characters / 4 rounded up to the next 100 (P29 B4).
+token_budget: 4900
 purpose: >
   Answer why / what-drives / what-problems / what-should-we-do questions with a fixed, deterministic
   playbook run through pdc_diag, and one narrative template whose conclusions are conditionals over FINDINGS.
 routing:
   - "Diagnostic and advisory plans ALWAYS use the ###NEXT_PLOT### multi-block form, at most 4 blocks in a pass."
-  - "Every block produces a figure (fig) or a RESULT table, and sets VALUES/FINDINGS with pdc_diag results."
+  - "Every block produces a figure (fig) or a RESULT table, and sets VALUES/FINDINGS with pdc_diag results (a where_to_focus block sets its own keys)."
   - "Each ###NEXT_PLOT### block runs with its own empty VALUES and FINDINGS and cannot read another block's variables or results, so its code never reads a VALUES or FINDINGS key that another block sets (never branch in code on one). The narrative template may use every block's VALUES and FINDINGS."
   - 'A block that needs the anomaly period obtains it itself: pdc_diag.decompose_change(..., to_period="primary_anomaly") — leave from_period unset and use the same agg as the anomaly check (or run detect_anomalies again inside the block).'
 playbook:
@@ -1293,6 +1332,20 @@ playbook:
   step_2_confirm_anomaly: >
     pdc_diag.detect_anomalies on the metric the question is about; fig = pdc_diag.plot_highlighted_series(r["table"]).
     If {{#no_anomaly}}, the conclusion says plainly that the data shows no unusual period.
+  step_2b_scope_change_rate: >
+    Scope change first. The block after detect_anomalies calls pdc_diag.rate_by_period(df, <period col>,
+    <numerator>, <denominator>) whenever the data holds the metric together with its natural base (NPL over
+    LOAN_AMOUNT, new loans over active loans, defaults over granted): the anomaly metric over its base or,
+    when the anomaly metric is itself a base (a portfolio total such as LOAN_AMOUNT), the metric it is the
+    base of over it. It shows r["table"] (RESULT = r["table"]) and calls it without
+    waiting for scope_change, because a block never sees another block's FINDINGS. When FINDINGS anomaly is
+    scope_change, the conclusion says inside {{#scope_change}} that the period reflects a change in reporting
+    scope, not a business change; decompose_change member attribution is not reported for it, and the change
+    is read through the rate. decompose_change(to_period="primary_anomaly") attributes no member for a row-count
+    scope change only when it sees the same rows as detect_anomalies, so pass both the same rows_col= (or
+    neither) and leave dims= off detect_anomalies in a reply that also calls decompose_change. The rate
+    sentences: {{#rate_up}} / {{#rate_down}} with
+    {{rate_first:pct}} and {{rate_last:pct}} (template_patterns).
   step_3_decompose_or_attribute: >
     A change over time -> pdc_diag.decompose_change (from the period before the anomaly to the anomaly period),
     fig = pdc_diag.plot_waterfall. A level (what drives a rate) -> pdc_diag.attribute_level,
@@ -1302,11 +1355,16 @@ playbook:
     across every dimension usually means a change of scope, definition or reporting, not a business event),
     {{#concentrated_in_one_dim}} (name the dimension with the {{change_dim_label:text}} slot),
     {{#dominant_feature}} / {{#weak_signal}}. First sentence = the direct answer with its slot;
-    last sentence = how to read the visual.
+    last sentence = how to read the visual. A conclusion never names a period as the main problem when that
+    period is a data gap ({{#data_gap}}, {{#thin_period}}, {{#partial_period}}) or a change of reporting scope
+    ({{#scope_change}}); the main problem is then stated from the rate or from a comparable period.
   keys:
     coverage_check: >
       Call coverage_check(df, period_col, dims=[...], metrics=[...], unit_cols=[...]): dims= and metrics=
-      are required, pass both on every call. VALUES n_periods, first_period, latest_period, period_from,
+      are required, pass both on every call. period_col is a day, week or month column, never a raw
+      timestamp or a datetime with times of day: when the data has only a timestamp, build one first at
+      the grain the question asks for (df["month"] = df["datetime"].dt.to_period("M").astype(str), or
+      .dt.date for days); more than 5000 distinct values is refused with a ValueError. VALUES n_periods, first_period, latest_period, period_from,
       period_to (the same values as first_period and latest_period), latest_rows, median_rows,
       thin_period_label, coverage_jaccard, unknown_share_max, as_of_period, coverage_dim_label,
       unknown_dim_label, disappeared_label, disappeared_after_period (unknown_dim_label and
@@ -1317,6 +1375,7 @@ playbook:
       disappeared_label in a later period means no rows, so never print that 0 outside
       {{#label_disappeared}})
     detect_anomalies: >
+      period_col as in coverage_check (a day, week or month column, never a raw timestamp).
       Optional rows_col= (the row-count column of pre-aggregated input) and dims= (coverage dims).
       VALUES anomaly_period, anomaly_value, baseline_value, anomaly_ratio_median, anomaly_prev_period,
       anomaly_prev_value, anomaly_ratio_prev, rows_ratio (the anomaly period's rows over the previous
@@ -1332,7 +1391,8 @@ playbook:
       n_anomalies never count it; a ratio slot shows <0.1x below 0.05 and >1000x above 1000. Chart:
       fig = pdc_diag.plot_highlighted_series(r["table"], y_title="…") — y_title=, never yaxis_title=
     decompose_change: >
-      VALUES change_from_period, change_to_period, change_from_value, change_to_value, change_abs,
+      period_col as in coverage_check (a day, week or month column, never a raw timestamp).
+      Optional rows_col= as in detect_anomalies. VALUES change_from_period, change_to_period, change_from_value, change_to_value, change_abs,
       change_ratio, change_pct, change_top_member, change_top_member_share, change_top_member_delta,
       change_dim_label (change_ratio and change_pct are None when the from value is 0, so a change_pct slot
       outside {{#change_large}} can be n/a when the change starts from 0; change_dim_label is set exactly
@@ -1342,8 +1402,8 @@ playbook:
       (only when the from value is above 0), unknown_dominated, unknown_dim (the first dim dominated by
       unknown members, left out of the decomposition; it sets no unknown_dim_label, that slot comes from
       coverage_check), too_few_periods, anomaly (no_anomaly when
-      to_period="primary_anomaly" finds none, scope_change when it lands on one); optional
-      rows_col= as in detect_anomalies
+      to_period="primary_anomaly" finds none, scope_change when it lands on one). Chart:
+      fig = pdc_diag.plot_waterfall(r["table"], y_title="…") — y_title=, never yaxis_title=
     attribute_level: >
       VALUES top_feature_label, second_feature_label, top_feature_share, second_feature_share, n_rows_used,
       top_member, top_member_target, overall_target; FINDINGS attribution, top_feature, second_feature,
@@ -1353,7 +1413,8 @@ playbook:
     rate_by_period: >
       Call rate_by_period(df, period_col, numerator, denominator) for a ratio of two summed metrics
       per period (for example a share of a portfolio); use it when the totals move with the row
-      count ({{#scope_change}}). VALUES rate_first, rate_last (fractions: the :pct kind),
+      count ({{#scope_change}}); period_col as in coverage_check (a day, week or month column, never a
+      raw timestamp). VALUES rate_first, rate_last (fractions: the :pct kind),
       rate_change_pp (percentage points: the :float kind), rate_first_period, rate_last_period,
       period_from, period_to, n_periods; FINDINGS rate_up, rate_down (a move of more than 0.5
       percentage points), too_few_periods; TABLE period, numerator, denominator, rate
@@ -1361,23 +1422,88 @@ playbook:
       A narrative slot must be one of these VALUES keys (with the prefix= you passed) or a key the code sets
       itself with VALUES["..."] = …; never an invented name.
 single_pass_rule: >
-  Do all four steps in THIS pass (at most 4 blocks): coverage, anomaly, then decompose_change with
+  Do all four steps in THIS pass (at most 4 blocks): coverage, anomaly, the rate view of step_2b
+  (rate_by_period) when the data holds a metric with its natural base, then decompose_change with
   to_period="primary_anomaly" (or attribute_level), then the conditional conclusion. Never set FINDINGS["needs_phase2"].
 phase2_rule: >
   If step 3 is needed and was NOT done in this pass (for example the anomaly is not yet confirmed when you
-  write the code), set FINDINGS["needs_phase2"] = bool(<anomaly confirmed>) and do steps 1-2 only; the client
+  write the code), set FINDINGS["needs_phase2"] = bool(<anomaly confirmed>) and do steps 1-2 only (step_2b
+  included); the client
   then asks you once more with the FINDINGS. If you can do step 3 in this pass, do it and never set needs_phase2.
 # The brain renders exactly ONE of the two keys above: `phase2_rule` when the request carries two_phase_v1,
 # otherwise `single_pass_rule` (the other key is deleted from the dict before rendering). Test:
 # test_diagnostics_yaml_single_pass_without_two_phase.
 advisory: >
-  Same steps; the conclusion is framed as recommendation conditionals ("{{#concentrated_in_one_dim}}Focus on
+  A question asking which group to focus on or prioritise (segment, region, product, client group; no change
+  over time asked) follows where_to_focus. Every other advisory question follows the playbook steps, and the
+  conclusion is framed as recommendation conditionals ("{{#concentrated_in_one_dim}}Focus on
   … {{/concentrated_in_one_dim}}"). Never invent targets, thresholds, benchmarks or amounts; every number is a slot.
+where_to_focus:
+  scope: >
+    For a question asking which group to focus on or prioritise. This replaces the playbook steps 2-4
+    (single_pass_rule / phase2_rule) for such a question: no anomaly, rate or decomposition step, and never FINDINGS["needs_phase2"]. A date that
+    describes the member (birth date, client since, opening date) is not a period column. Only when the metric's
+    own rows carry a reporting date (transactions) does the focus block itself call coverage_check first, with
+    unit_cols= the currency or unit column, and set period_from / period_to / n_periods for the first sentence
+    (PERIOD SCOPE). On mixed_units it keeps the rows of one label (VALUES["unit_label"], named inside
+    {{#mixed_units}}) or uses a single-unit column such as *_gel when the data has one; it never totals across
+    labels.
+  compute: >
+    Group by the dimension the question names (else the most relevant categorical column), never by the member
+    id itself ("which clients" means which group of clients), and compute per group: total (sum of the metric),
+    share (total over the overall total), members (distinct members, such as clients, when the data has a member
+    id column, else rows) and per_member (total over members). When there is a member table, count members from
+    it (all members of the group) and say so in the text. Before summing an amount, drop declined rows and keep
+    the direction the question means (status / direction columns). Without a member id, members are rows and the
+    text says "per row" or "per transaction", never "per client". RESULT is the full table sorted by the choice
+    rule, ties by total (fig may chart it).
+  choice_rule: >
+    State the rule in a code comment and in the text. A question about volume or reach ("largest", "most",
+    "biggest market") ranks by total. A question about value, potential or profitability per customer ("most
+    valuable", "best", "highest potential", where to focus advisory or premium offers) ranks by per_member among
+    the groups holding at least min_member_share of all members (VALUES["min_member_share"] = 0.05, the
+    playbook's fixed minimum, not an invented threshold; said in the text as {{min_member_share:pct}} only inside
+    {{#min_share_applied}} or {{#small_group_excluded}}), so a tiny group cannot win on one large customer; when
+    no group reaches it, every group counts. A question that implies neither ranks by per_member with that minimum
+    and the text says so.
+  keys: >
+    VALUES, set unconditionally at the top level of the block: focus_group and its own figures focus_total,
+    focus_share (a fraction), focus_members, focus_per_member; top_total_group, top_total_value, top_total_share
+    (a fraction: the :pct kind), top_total_members; top_per_member_group, top_per_member_value (both among the
+    groups with at least min_member_share); top_small_group, top_small_per_member, top_small_member_share (the
+    highest per_member group of all and its share of members); min_member_share. FINDINGS (five) focus_by_total
+    and focus_by_per_member (bools, exactly one True), focus_groups_differ = bool(top_total_group !=
+    top_per_member_group), min_share_applied = bool(some group reaches min_member_share), small_group_excluded =
+    bool(min_share_applied and the highest per_member group of all is below min_member_share).
+  template: >
+    The first sentence names {{focus_group:text}} and the rule the code applied. The second sentence gives its
+    figures: {{focus_members:count}} members, {{focus_total:amount}} in total ({{focus_share:pct}} of the overall
+    total) and {{focus_per_member:amount}} per member. Then {{#focus_groups_differ}}…{{/focus_groups_differ}}
+    names the other group with its figures (top_total_group with top_total_value, top_total_share and
+    top_total_members, or top_per_member_group with top_per_member_value) and says why it was not chosen, and
+    {{^focus_groups_differ}}…{{/focus_groups_differ}} says the same group also leads on the other measure.
+    {{#small_group_excluded}}…{{/small_group_excluded}} names {{top_small_group:text}} with
+    {{top_small_per_member:amount}} per member and says it holds only {{top_small_member_share:pct}} of members,
+    below the {{min_member_share:pct}} minimum. The user's goal may be restated ("to grow revenue"); that is not a
+    direction claim about the data. The text names the metric as what its column measures (for example "clients'
+    spend"), never as the bank's revenue, income, margin or yield, and uses no magnitude word ("substantially",
+    "far") that no slot computes. Then the sentence on how to read the visual (unless a caption covers the
+    visual). No recommendation number that no slot carries.
+  clarification: >
+    A goal the question names (revenue, income, sales, profit, spend, growth) implies a metric even when no
+    column has that name: use the amount column closest to it (spend or transaction amount, never the clients'
+    own income), name that column in the text, and answer. Ask ONE CLARIFICATION only when the question names
+    neither a goal nor a metric (for example 'which segment should we focus on?') and the data has more than one
+    candidate metric for "value" (for example an amount and a count of transactions). Asking for a recommendation
+    is never a reason to ask.
 template_patterns:
   - "{{#coverage_change}}Note: the set of {{coverage_dim_label:text}} values changes between periods, so totals are not comparable.{{/coverage_change}}"
   - "{{#mixed_units}}Note: the amounts carry more than one currency or unit label, so they are reported per label and never added together.{{/mixed_units}}"
   - "{{#metric_definition_overlap}}Note: in {{overlap_equal_share:pct}} of rows the two metrics are equal, so the one asked about counts a stock (items still active), not new items, and adding periods together counts the same items more than once.{{/metric_definition_overlap}}"
   - "{{#anomaly_confirmed}}{{anomaly_period:period}} stands out at {{anomaly_ratio_median:ratio}} the typical level.{{/anomaly_confirmed}}"
+  - "{{#scope_change}}{{anomaly_period:period}} reflects a change in reporting scope (far more or fewer rows, or a changed set of reported categories, than the period before), not a business change, so its total is not compared with other periods.{{/scope_change}}"
+  - "{{#rate_up}}Relative to its base, the rate rose from {{rate_first:pct}} in {{rate_first_period:period}} to {{rate_last:pct}} in {{rate_last_period:period}}.{{/rate_up}}"
+  - "{{#rate_down}}Relative to its base, the rate fell from {{rate_first:pct}} in {{rate_first_period:period}} to {{rate_last:pct}} in {{rate_last_period:period}}.{{/rate_down}}"
 pitfalls:
   - "A stock (active, outstanding, portfolio) summed over months double counts — use the latest period."
   - "A 'granted' column equal to an 'active' column in most rows is a stock, not new grants — check_metric_overlap."

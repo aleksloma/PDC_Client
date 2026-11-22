@@ -347,6 +347,8 @@ def test_single_narrative_retry_names_slot_cause(monkeypatch, dfs, values, cause
 
     events = _run(dfs)
 
+    # C2 §2: a single TABLE answer yields its table partial first
+    events = [e for e in events if not e.get("single_table")]
     assert len(events) == 1 and events[0].get("single_response")
     narr = brain.narr_retries()
     assert len(narr) == 1, [kw.get("error_msg") for kw in brain.calls["retry"]]
