@@ -96,8 +96,18 @@ name the exact commit running, and the sandbox reports its own build through
 `GET /healthz`, which is how the web application detects a mismatched pair.
 They are optional — an unstamped image reports its start time instead.
 (`.git` is dockerignored, so the commit cannot be read from inside the build.)
-Never read the static `?v=` query parameter as a build marker: it is
-`int(time.time())` at page render, per request.
+Never read the static `?v=` query parameter as a build marker: since P29
+(22 Nov 2026) it is `BUILD_COMMIT` when the image is stamped and otherwise
+the process start time as a bare number (`app._static_version`, one value
+per process; it used to be `int(time.time())` per request). `/static`
+requests carrying the current value are served `Cache-Control: public,
+max-age=31536000, immutable`, and text assets of at least 1 KiB are
+gzip-compressed (`StaticAssets` in `app.py`; `docs/CLIENT_ENDPOINTS.md`,
+"Static files"). So `BUILD_COMMIT` is also the browsers' cache key: an image
+rebuilt from a DIRTY tree at the same commit keeps the same `?v=`, and a
+browser that already holds the files keeps serving its cached, immutable
+copies. For a local stack, leave `BUILD_COMMIT` unset (each container start
+then gets a new `?v=`) or hard-reload the page after a rebuild.
 
 The client image is heavier because it ships pandas, matplotlib, plotly,
 kaleido, scikit-learn, python-pptx — every library the user's generated
@@ -215,6 +225,12 @@ parse falls back to the default instead of stopping the boot):
 | `SSO_AUTO_PROVISION` | Microsoft SSO: `true` creates and binds an account for an Entra identity that has none (`SSO_ACCOUNT_PROVISIONED`); default `false` ⇒ refused, nothing created (`SSO_UNKNOWN_ACCOUNT`). Set it only with "Assignment required? = Yes" on the Entra enterprise application. |
 | `SHARE_ALLOWED_DOMAINS` | Recipient domains a chat, conversation or dashboard share may reach (comma-separated, case-insensitive, a leading `@` tolerated; default empty). Empty ⇒ the domains of the administrator accounts, or, when none has an email address, of every account with one, derived at call time (`routes.auth.share_allowed_domains`); none at all ⇒ every share is refused (`SHARE_DOMAINS_UNCONFIGURED`, logged once). An out-of-domain recipient refuses the whole share with `400 RECIPIENT_DOMAIN_NOT_ALLOWED` and creates no account. |
 
+
+Slow-answer note (see `client.env.example`):
+
+| Var | Purpose |
+|---|---|
+| `SLOW_ANSWER_NOTICE_SECONDS` | Seconds a chat stream waits for its first answer event (a chart or table, a caption, the narrative, the final answer or an error) before it sends ONE keyed progress event `lab.taking_longer` ("This is taking longer than usual. The analysis is still running.", translated on the page; log `SLOW_ANSWER_NOTICE after_s=`). Default `90`, minimum `0`; `0` sends no note. Read at call time by `routes/chat.py` (P29 C2). |
 
 Answer-template setting (see `client.env.example`):
 
@@ -562,13 +578,13 @@ settings object — no restart required.
 
 ## 6a. Live Gemini model discovery + health check
 
-In the **Gemini model discovery** card on the admin panel:
-- **Reload** — fetch the list of available Gemini models for this API key.
-  Cached for 10 minutes; falls back to a hardcoded list if the API is
-  unreachable.
-- **Force refresh** — clear the cache and re-fetch.
-- **Health check** — ping each model with a minimal `generateContent` call
-  and show status (`ok` / `unavailable` / `slow` / `dead`) + latency.
+This is brain admin-panel tooling; the brain repository's
+`docs/BUILD_AND_RUN.md` §6a is the reference. In short (P29 B5): the
+General settings and per-tenant pages carry **Refresh models** (re-fetch the
+cached model list) and **Health check**, which probes every listed model
+plus every configured tier model and labels each one `ok`, `rejected`
+(HTTP 400), `dead` (404), `rate_limited` (429), `unavailable` (503),
+`error_<code>`, `slow` (no answer within the probe timeout) or `error`.
 
 Use this after rotating `GOOGLE_API_KEY` or to debug failing model tiers.
 

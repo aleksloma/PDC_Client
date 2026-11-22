@@ -269,8 +269,8 @@ summarize text.
   "captions": { "1": "Count per month; {{anomaly_period:period}} is highlighted." },
                                           // OPTIONAL — keys are strings "1".."12"
   "diagnostic": true,                     // OPTIONAL — phase-1 plan with two_phase_v1 only; never false
-  "error_code": "llm_budget_exhausted",   // OPTIONAL — only when the request budget ran out
-  "models_tried": ["gemini-2.5-pro"]      //   (see "Spent request budget" under Errors)
+  "error_code": "llm_budget_exhausted",   // OPTIONAL — "llm_budget_exhausted" when the budget ran out (with code too when only the narrative correction was skipped),
+  "models_tried": ["gemini-2.5-pro"]      //   or "llm_unavailable" (/v1/plan: no attempt answered, time left); see Errors
 }
 ```
 
@@ -285,7 +285,15 @@ neither, and a reader treats an absent key as 0. On `/v1/plan` the counts
 include the complexity-classifier call that precedes the plan call (and the
 narrative correction call, when one ran), also when the plan is answered by
 the greeting short-circuit (`kind: "NO_CODE"`), where the classifier is the
-only model call. Older clients ignore the new keys.
+only model call. They also include the plan attempts that did not give the
+answer but reported tokens: a reserve attempt whose answer was not used
+(cancelled or finished; one still running when the response is built is
+not counted), and a streamed attempt that was stopped (stalled, cut at the
+thinking-token cap, cancelled or cut at its time bound) or failed after
+its stream had reported token counts, with the counts of the last
+`usageMetadata` it streamed. A plan that no model answered still carries
+these counts. `finish_reason` stays that of the answering call. Older
+clients ignore the new keys.
 
 `sql` (optional): `{<df key>: "<one read-only SELECT>"}`. The client never
 runs it as sent: the text passes the read-only guard (strict parse, CTEs
@@ -401,7 +409,11 @@ grammar (DIAGNOSTICS_SPEC A2.1, the same token regex), without rendering:
   (`PLAN_TOTAL_BUDGET_SECONDS`, 240 s from the start of the request, below
   the client's 300 s request timeout): its timeout is the plan call's
   timeout capped at the time left, its HTTP retries stop at the same
-  deadline, and it is not started with under 10 s left. Skipped for lack
+  deadline, and it is not started with under 10 s left. It repeats the
+  answering call's settings, so when that call was streamed (a tier with
+  thinking on) the correction is streamed with the same liveness rules
+  (`ENTERPRISE_ARCHITECTURE.md` §8a): for a model already seen sending
+  thought parts it may run to the end of the budget. Skipped for lack
   of time, it counts as failed: the invalid templates are dropped, the
   valid ones and the code are kept, and the response carries
   `error_code: "llm_budget_exhausted"` plus `models_tried` (see "Spent
@@ -416,7 +428,11 @@ in the answer language:
 - a slot is `{{name}}` or `{{name:kind}}`: `name` = letters, digits and
   underscores, at most 40 characters; `kind` is `count`, `float`, `pct`
   (the value is a fraction: 0.125 is shown as 12.5%), `ratio`, `amount`,
-  `text` or `period`. A slot no block sets, or whose value is null,
+  `text`, `period` or `pvalue` (a p-value: below 0.001 shown as `<0.001`,
+  otherwise three decimals; a value outside 0–1 renders `n/a`; the planner
+  is told to write every p-value slot with `:pvalue`, never `:float`; a client
+  that does not know the kind shows the value with two decimals). A slot
+  no block sets, or whose value is null,
   renders `n/a`, and the client removes every sentence holding one
   before display (a caption emptied that way is described instead; a
   narrative emptied that way is not used). So a sentence should depend
@@ -1084,8 +1100,13 @@ fall back to the brain-wide default (then to a hardcoded fallback).
 
 ## `POST /v1/title`
 
-Background conversation-title generation. The client fires this after the 2nd
-human message in a conversation (matches global's UX). Uses the Light model.
+Background conversation-title generation. The client fires this once per
+conversation, after its first answered question, from that question and its
+answer (until P29 it fired after the 2nd human message). An error turn or a
+stopped turn does not count, so the next answered turn titles the
+conversation; a conversation is never titled twice. An answer from
+edit-regenerate titles only a conversation that had no answer before the
+edit. Uses the Light model.
 
 ```jsonc
 { "sid": "...", "question": "...", "answer": "...", "lang": "English", "user_email": "..." }
@@ -1407,10 +1428,40 @@ attempt already returned code, its template is invalid), the code and kind
 are returned as usual with the invalid template dropped, plus the same two
 fields.
 
-`models_tried` lists the models called for the answer itself. The models
-the complexity classifier called are not in it (they appear in the brain's
-`LLM_BUDGET` log line only, marked `:classifier`).
+On `/v1/plan` the budget also counts as spent when no attempt answered and
+less than 10 s of it is left when the attempts end, although no model was
+skipped.
 
-Both fields are absent on every other response, including a plan whose
-models all failed inside the budget (`api_failed: true` without
-`error_code`). Older clients ignore them.
+`models_tried` lists the models called for the answer itself, in the order
+their attempts were recorded (on a plan: the main attempt, the reserve
+attempt when it made a call, then the further models of the chain). The
+models the complexity classifier called are not in it (they appear in the
+brain's `LLM_BUDGET` log line only, marked `:classifier`).
+
+### No model answered with time left (`llm_unavailable`, `/v1/plan` only)
+
+When no plan attempt answered (every model called failed: an HTTP error, a
+timeout, a stalled stream, the thinking-token cap) and at least 10 s of the
+budget is still left when the attempts end, `/v1/plan` returns **HTTP 200**
+with the same fallback body (`kind: "NO_CODE"`, empty `code`,
+`context_decision.api_failed: true`) plus:
+
+```jsonc
+{
+  "error_code": "llm_unavailable",                         // OPTIONAL — /v1/plan only
+  "models_tried": ["gemini-4-argon", "gemini-3.8-flash"]   // models actually called, in order (may be [])
+}
+```
+
+`models_tried` follows the rules above (`[]` when no model was called, for
+example an empty model chain). A plan carries at most one `error_code`:
+`llm_budget_exhausted` when the budget is spent, otherwise
+`llm_unavailable`. `usage` still sums the token counts the failed attempts
+reported (see `usage` under `/v1/plan`).
+
+Both fields are absent on every other response. `/v1/retry`,
+`/v1/describe`, `/v1/summarize` and `/v1/greeting` never send
+`llm_unavailable`: when their model fails inside the budget they return
+their fallback body without `error_code`, as before. Older clients ignore
+both fields; for them a plan with `llm_unavailable` is the same
+`api_failed: true` fallback as before.

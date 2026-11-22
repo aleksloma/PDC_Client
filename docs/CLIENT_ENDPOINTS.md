@@ -93,6 +93,28 @@ file documents the enterprise client's implementation of each one.
   `*`). A plain-HTTP request never gets HSTS. Source: `SecurityHeaders` in
   `app.py`, which sits right outside `ContentSecurityPolicy`, inside
   `BackendNetworkGuard`.
+- **Static files (`/static/…`, P29 C5).** The page routes write every local
+  static URL as `/static/<file>?v=<value>`, where the value is
+  `BUILD_COMMIT` on a stamped image (URL-safe characters only, at most 64)
+  and otherwise the process start time — one value for the life of the
+  process (`app._static_version`; it used to be the clock of every page
+  request, so every load refetched every file). A `/static` request whose
+  `v` equals the current value gets `Cache-Control: public,
+  max-age=31536000, immutable` on a `200` / `304`; any other request (no
+  `v`, or a `v` from a page an older build or process rendered) gets no
+  `Cache-Control` and is revalidated by `ETag` / `Last-Modified` as before.
+  Text assets (`.js`, `.css`, `.html`, `.svg`, `.json`, `.map`) of at
+  least 1 KiB are gzip-compressed when the request accepts gzip (with
+  `Vary: Accept-Encoding` and a weak `ETag` `W/"…"`; a `304` for such an
+  asset to a gzip-accepting request carries the same weak `ETag` and
+  `Vary`); a request with a `Range` header, images, fonts and
+  `/static/vendor/plotly/plotly.min.js` (the 4.5 MB bundle every chart frame
+  loads, requested without `?v=`) are never compressed. Both behaviours
+  live in a wrapper on the `/static` mount only (`StaticAssets` in
+  `app.py`): pages, every API response, the chat event stream and
+  `/charts/{token}` are never compressed or cached by it, and every
+  middleware above (guard, `nosniff`, policy, gates) sees the response as
+  before.
 - **No API documentation routes.** `/docs`, `/redoc` and `/openapi.json` do
   not exist (`404`): the FastAPI app is built with `docs_url`, `redoc_url`
   and `openapi_url` set to `None`.
@@ -109,7 +131,19 @@ file documents the enterprise client's implementation of each one.
   moved the title below the Plotly toolbar and word-wrapped it to the frame
   width with one `Plotly.relayout` (again on resize only when the wrap
   changes), so a long title never runs under the toolbar buttons; untitled
-  charts are shown at once (see "Chart HTML is offline-safe"). `styled_html` (a pandas Styler's table) is sanitised
+  charts are shown at once (see "Chart HTML is offline-safe"). A
+  horizontal legend placed above the plot (`orientation: 'h'`, paper
+  `y ≥ 1`) is moved right under the title and its height is added to the
+  reserved top margin in the same relayout (P29 C3), so title, legend and
+  plot no longer overlap; this is render-time only, so stored charts
+  benefit at once. When a bar / line / scatter Plotly chart is built, a
+  value axis with at least 4 values, all positive, whose max/median or
+  p95/p5 ratio is at least 1000 is switched to a log scale PER AXIS (each trace counts for the axis it is drawn on, so a
+  secondary-axis line neither decides nor blocks the primary axis; facet
+  axes tied by `matches` switch together; an axis whose `type` the figure
+  set is never changed), and the switched axis title gains " (log scale)"
+  (or reads "log scale" when it had none); "Show data" keeps the measure's
+  name (`plot_utils._maybe_log_plotly_axes`, P29 C3). `styled_html` (a pandas Styler's table) is sanitised
   on the server to an allowlist of table elements, `T_`-prefixed ids, the
   class names pandas Styler generates (`T_<hex>`, `col<n>`, `row<n>`,
   `level<n>`, `data`, `index_name`, `blank`, `col_heading`, `row_heading`),
@@ -122,7 +156,12 @@ file documents the enterprise client's implementation of each one.
   produced, when a table tile is pinned or refreshed, and whenever a stored
   history row or dashboard tile is served; when nothing survives, the field
   is omitted and the page shows the plain `{columns, rows}` table. Stored
-  files are never rewritten. Matplotlib charts stay base64 PNGs shown as
+  files are never rewritten. A styled table whose row index carries no
+  information (a RangeIndex or an unnamed integer index, not a MultiIndex)
+  is rendered with the index hidden, the rule plain tables already follow,
+  so no 0..n column appears; a meaningful index (dates, labels, a named
+  index) stays (`exec_transport._styled_html`, on a copy of the Styler,
+  P29 C1). Matplotlib charts stay base64 PNGs shown as
   `data:image/png` images.
 
 ---
@@ -146,9 +185,30 @@ file documents the enterprise client's implementation of each one.
 | `GET` | `/auth/change_password` | forced set-a-new-password page shown after a temp-password login (no session → `/`; no pending flag → `/lab`) |
 | `GET` | `/dashboards/{dash_id}` | the dashboard page (grid of pinned tiles, `dashboard_view.html` + `dashboard_view.js`). Resolves the dashboard via own-doc-or-shared-pointer; no session → `/`; forced change pending → `/auth/change_password`; unknown/unshared → `/lab` (never 404). |
 | `GET` | `/health` | liveness + `{brain_reachable, tenant_token_configured}`; v4.2 adds `build_commit` (additive). Additive again: `executor_reachable` + `executor_checked_at` for the analysis sandbox. `executor_reachable` is `null` until the web service has contacted the sandbox once (nobody has checked yet, which is NOT "down"), then `true`/`false`; `executor_checked_at` is the epoch seconds of that observation, `null` while it is `null`. Both come from a CACHED verdict refreshed in the background (the startup handshake, every dispatch, a short refresh thread) and never from a live probe inside the handler — an unresolvable sandbox name costs ~8 s in `getaddrinfo`, which would stall this async handler past the container's own 5 s healthcheck. **The endpoint stays 200 either way, deliberately**: a stack whose sandbox is down must still serve the page that says so, so a caller has to read the body and never the status alone |
-| `GET` | `/version` | which build is running: `{commit, build_time, started_at}` — nulls on an unstamped image, never a fabricated identity. Unauthenticated like `/health`, carries no secrets. Exists because the static `?v=` parameter is `int(time.time())` at page render (per request) and therefore **cannot** identify a build — reading it as one misled release verification twice. Fed by the `BUILD_COMMIT`/`BUILD_TIME` Docker build args; the admin sidebar shows the same string |
+| `GET` | `/version` | which build is running: `{commit, build_time, started_at}` — nulls on an unstamped image, never a fabricated identity. Unauthenticated like `/health`, carries no secrets. Exists because the static `?v=` parameter cannot identify a build on its own: it is `BUILD_COMMIT` only on a stamped image and otherwise the process start time as a bare number (`app._static_version`, since P29; it used to be `int(time.time())` per request) — reading it as a build marker misled release verification twice. Fed by the `BUILD_COMMIT`/`BUILD_TIME` Docker build args; the admin sidebar shows the same string |
 | `GET` | `/admin/data_sources` | the ladmin **Data sources** admin panel (`admin_data_sources.html` + `admin_data_sources.js`, standalone stylesheet — no dashboard.css): sidebar-navigated sections (DB connections, registered tables, relations — a confirmed-relations overview with per-row Edit/Delete above the discovery tools — users, roles, single sign-on (Microsoft Entra ID config — see the SSO admin-routes section + `docs/SSO_MICROSOFT.md`), refresh schedule, audit log), a 3-step register-table wizard (whose relations step auto-suggests relations from the table's own FKs + name/description similarity, FK rows pre-checked) (Source → Describe → Confirm & snapshot), onboarding hero when no connections exist, and sidebar account controls in ADMIN mode (email, change password via `POST /auth/password`, sign out — the power-mode page moves them into a top-bar profile button, see the next row). This is the BOOTSTRAP ladmin's landing page — its login and forced-change redirect here (a PROMOTED admin lands on /lab and reaches this page via the dropdown's "DB config", 19g). Redirect philosophy: no session → `/`; forced change → `/auth/change_password`; non-admin → `/lab` (never an error page). Renders with `manager_mode: "admin"` (→ `window.__MANAGER_MODE__`); 19g adds `back_to_chat` to the context — true for promoted admins, so the sidebar footer carries the "← Back to chat" link (absent for the bootstrap account, which has no chat). |
 | `GET` | `/power/data_sources` | the POWER-USER variant of the same page (prompt 19): the SAME `admin_data_sources.html` rendered with `manager_mode: "power"`. Sidebar shows only Connections (GRANTED connections are a READ-ONLY list — no Add/Edit/Delete/Test/Refresh; "＋ Register table" is the one action; a self-service user's OWN connections are the exception, see "Personal connections" at the end of this row), Registered tables (Delete only on tables the power user registered themselves — `registered_by`), and Relations; the per-table ⏱ schedule modal stays, Users/Roles/Audit/global-schedule are not rendered; the wizard step-3 panel renders as "Share with your roles" (the caller's HELD roles from GET /api/admin/my_roles, all unchecked by default — 19f publish+share) and the page header carries the server-computed manage-scope summary ("You can manage: …", app._power_scope_summary) plus a muted read-beyond-manage hint; the sidebar footer block (email, Back to chat, Change password, Sign out) is NOT rendered — the footer keeps only the build stamp — and the page instead renders the chat page's profile button partial (`partials/profile_button.html`, context flag `profile_menu_back_to_chat`) in a top bar (`.adm-topbar`, top right of the main area) whose dropdown is "Back to chat" → `/lab`, "Change Password" (the page's own `#pwModal` → `POST /auth/password`) and "Logout" (`POST /auth/logout`), so the account control exists once (2026-11-04); the admin-mode render is byte-identical to before (golden-fixture test). Redirects: no session → `/`; forced change → `/auth/change_password`; ladmin → `/admin/data_sources`; a user who is neither power nor self-service → `/lab` (`POWER_PAGE_DENIED` log). Power users reach it via the "DB config" item in the /lab profile dropdown (rendered when `is_power_user` — a promoted admin's "DB config" targets the full `/admin/data_sources` page instead, 19g). **Personal connections (self-service):** the page also opens for a user who is NOT a power user when `roles_store.self_service_allowed` (not admin, not the bootstrap account, the per-user switch on — the default); otherwise such a user is redirected to `/lab` (`POWER_PAGE_DENIED`). The template gets `self_service` (`window.__SELF_SERVICE__`): when true it renders "＋ Add connection", a subtitle saying the user can add their own read-only connections, and the user's own connections with Test / Refresh / Edit / Delete and a "Personal" chip (granted connections stay read-only); the register wizard hides role sharing and the connector choice on a personal connection. The header summary lists "Your connections: …" before the granted "You can manage: …"; with neither it says "You have no connections yet — add one with ＋ Add connection." for a self-service user. The /lab profile dropdown's "DB config" item (`#btnDbConfig`) shows for `is_self_service` too (`_profile_context`, `/auth/profile`), target `/power/data_sources`. |
+
+**`/lab` page behaviour (P29 C4, browser only — no route changes).** The
+Descriptions dialog shows each column's type as Text / Number / Date /
+Yes-No (en / geo / ru), derived in the browser from the stored technical
+description (a text column reads Date when its listed values all look like
+dates, or, with no listed values, when its name says date); the raw pandas
+dtype is the label's tooltip. It is display only: nothing saved, sent to the
+brain or seen by the analysis changes. Escape and an outside click are
+handled in one place (`initLayerDismiss` in `dashboard.js`): an outside
+click closes every open menu (profile, Download Analytics, Dashboards, the
+DB-table picker, the sidebar "⋯" menu, the add-to-dashboard picker) and
+opening one menu closes the others; a click on the backdrop of the topmost
+dialog closes it through that dialog's own close function (Rename, Share,
+Delete, New dashboard, the file-collision dialog — which then answers like
+✕ — and the page's fixed dialogs); Escape closes the open menus, else the
+topmost dialog, one layer per key press. Escape in a description being
+edited cancels the edit first (and does nothing while its save is in
+flight); the full-screen chart viewers and a busy overlay keep their own
+behaviour. From 769 to 1200 px wide — or whenever the labels do not fit —
+the top-bar buttons show icons only, keeping their localized title and
+aria-label; the mobile layout (≤ 768 px) is unchanged.
 
 ---
 
@@ -1105,7 +1165,7 @@ The endpoint is implemented as a real SSE stream (`text/event-stream`), same
 content-type and event shape as the B2C `chat_stream_api`:
 
 ```
-data: {"progress": true, "message": "Working...", "conv_id": "cv_..."}\n\n
+data: {"progress": true, "message_key": "lab.stage_working", "message": "Working...", "conv_id": "cv_..."}\n\n
 data: {"done": true, "partial": false, "conv_id": "cv_...",
        "answer": "...", "image_base64": "...", "table": {...},
        "tokens": {...}}\n\n
@@ -1115,6 +1175,50 @@ data: {"done": true, "partial": false, "conv_id": "cv_...",
 per chart by a multi-chart turn (see "Multi-chart streaming" below); a
 single-chart, table or text answer ends with one `done` event. The frontend
 handles both paths.
+
+**Stages, early visuals and the slow-answer notice (P29 C2, 22 Nov
+2026).** Every event the stream can carry before its end, in addition to the
+narrative events below:
+
+| Event | Shape on the stream | When |
+|---|---|---|
+| opening progress | `{"progress": true, "message_key": "lab.stage_working", "message": "Working...", "conv_id"}` | first event of every stream (carries the `conv_id` the page captures) |
+| stage progress | `{"progress": true, "message_key": <key>, "message": <English text>, "conv_id"}`; `lab.stage_fixing` also `"attempt": n` (and `n` inside `message`) | `lab.stage_planning` "Planning the analysis…" before the plan call; `lab.stage_running` "Running the analysis…" before each block runs (chart blocks, table blocks, the single answer); `lab.stage_fixing` "Fixing an error (attempt {n})…" before each `/v1/retry` after an execution error (`attempt` = 1, 2, 3); `lab.stage_describing` "Describing the result…" before each `/v1/describe` call; `lab.stage_summary` "Preparing the summary…" before the narrative is rendered (when the plan carried one) and before a single answer's `/v1/summarize` call. Edit-regenerate and Auto Analytics emit none |
+| slow-answer notice | `{"progress": true, "message_key": "lab.taking_longer", "message": "This is taking longer than usual. The analysis is still running.", "conv_id"}` | at most once, when no answer event has arrived `SLOW_ANSWER_NOTICE_SECONDS` (default 90; 0 = off) after the stream started. An answer event is an error or any event carrying `partial`, `caption`, `narrative`, `done` or `single_response`; progress events do not count. Logged `SLOW_ANSWER_NOTICE after_s=` |
+| chart partial | `{partial: true, answer, image_base64, chart_n, chart_total, code, chart_data_key, chart_ref, phase, conv_id, …}` | right after the chart's block ran. `answer` is the chart's rendered caption when it has one, else `""` — the describe text no longer rides the partial |
+| caption | `{"caption": true, "index": <chart_n>, "text": <describe text>, "conv_id"}` | after a chart partial sent without text, once its describe call returns (for a split multi-axes group: the group's first chart). The page puts the text above that chart (`_fillCaptionSlot`); the stored record keeps it as that chart's `answer`, the shape records always had. A chart whose caption rendered, or a chart the rendered narrative explains (below), gets no caption event |
+| single table partial | `{"partial": true, "phase": 1, "tables", "full_table_keys", "table_captions", "single_table": true, "code", "conv_id"}` + `table` and `full_table_key` for a one-table answer — no `image_base64` | a single (non-multi-chart) answer whose result is a table, right after execution; its text (narrative, caption, describe or summarize text) follows on the single-shot `done`. The server persists the table here and the `done` / record reuse its durable keys, so it is stored once |
+| error | `{"error", "conv_id", "done": true}`, plus `error_key` for a brain timeout (`lab.brain_timeout`) or a failed analysis (`lab.analysis_failed`, below) | ends the stream |
+
+The page shows `_t(message_key, message)` (en / geo / ru) for every keyed
+progress event, `{n}` replaced by `attempt`: in the loading bubble while it is
+visible, otherwise in a status bubble that the next keyed event replaces and
+`done` removes, so the stage is visible after the last chart too. Stop keeps
+what has already arrived (charts with or without their caption text).
+
+**Describe only where needed (P29 C2).** In a turn whose plan carries a
+narrative template, a visual is described (`/v1/describe`) only when its
+caption was PLANNED (the reply's `captions` names its block) but did not
+render (empty, invalid, too long, every sentence dropped, code in the text).
+A visual planned without a caption waits for the narrative: when the
+rendered narrative is used it explains the visual in its last sentence, no
+describe call is made (`DESCRIBE_SKIPPED n=<count> reason=narrative`) and
+the chart keeps `answer` `""`; when the narrative is not used, it is
+described then (a chart's text follows as its `caption` event). A turn
+without a narrative template describes every uncaptioned visual as before.
+
+**Analysis failed (P29 C2).** A `/v1/plan` answer of kind `NO_CODE`, or any
+`/v1/retry` answer after an execution error, that carries `error_code`
+`llm_budget_exhausted` or `llm_unavailable` (`PROTOCOL.md`, Errors) ends the
+turn as an error turn instead of the "Try rephrasing" text: the stream's
+error event is `{error: "The analysis could not be completed. Please try
+again.", error_key: "lab.analysis_failed", conv_id, done: true}`,
+edit-regenerate answers `503 {error, error_key: "lab.analysis_failed",
+conv_id}`, and the English text is persisted as the AI row, exactly like a
+brain timeout. A multi-chart turn whose block retry carries the code becomes
+an error turn; charts it already showed are not kept in the record. Log
+`ANALYSIS_FAILED error_code=<code> where=plan|retry` (edit-regenerate also
+`EDIT_REGENERATE_ANALYSIS_FAILED error_code=`).
 
 Each `partial` event and the single-shot `done` event also carry `chart_ref`:
 the server's reference to that chart for the PNG export (`null` for a
@@ -1192,8 +1296,8 @@ PDF/PPTX, never `content` and never a brain call. What changes on the stream:
 | progress, narrative retry | `{"progress": true, "message_key": "lab.narrative_retry", "message": "Writing the summary…", "conv_id"}` | Emitted once, right before the narrative-only retry (single and multi-chart turns). The page shows `_t(message_key, message)` (en / geo / ru) in the loading bubble, or — after the charts — in a status bubble that `done` removes. Any progress event with a `message_key` is translated the same way |
 | narrative, headline fallback | `{"narrative": true, "phase": 1, "text": "<headline sentence>", "conv_id"}` | Multi-chart turn whose template was dropped after the narrative-only retry and whose VALUES hold `result` / `total` / `*_total`: fills the phase-1 slot above the charts. The single-shot `done` carries it as `narrative` instead (below) |
 | progress, phase 2 (reserved) | `{"progress": true, "phase": 2, "message_key": "lab.phase2_progress", "message", "conv_id"}` | Not emitted in this release (two-phase ships later). The consumer forwards it and the page shows it as a status bubble; the ordinary `{"progress": true, "message"}` event is unchanged |
-| tables partial | `{"partial": true, "phase", "tables", "full_table_keys", "table_captions", "conv_id"}` — no `image_base64` | Tables without a chart, never counted as a chart. In this release the generator still puts a turn's tables on its `done` event; the consumer, the persistence worker and the page already accept the partial form (reserved for phase 2) |
-| chart partial | existing keys + `phase` (`1`) | `answer` is the chart's RENDERED caption (with the result-backstop sentence in front when that check fired for the chart; no describe call) or, without a caption, the describe text as before. The caption template is not sent |
+| tables partial | `{"partial": true, "phase", "tables", "full_table_keys", "table_captions", "conv_id"}` — no `image_base64` | Tables without a chart, never counted as a chart. A multi-chart turn still puts its tables on its `done` event; since P29 C2 a single table answer is streamed in this form with `single_table: true` (see "Stages, early visuals and the slow-answer notice" above) |
+| chart partial | existing keys + `phase` (`1`) | `answer` is the chart's RENDERED caption (with the result-backstop sentence in front when that check fired for the chart; no describe call) or, without a caption, `""`: since P29 C2 the describe text, when one is made, follows as a `caption` event. The caption template is not sent |
 | multi `done` | existing keys; `answer` = the display text; + `record_view` = `{narrative_rendered?, phase2?: {narrative_rendered}, phase2_status?}`; + `table_captions` (aligned with `tables`, `""` where a table has none) when the turn has tables | `answer` is the rendered narrative when it was used, else the rendered captions / describe texts joined. The brain-safe `combined_answer` the record keeps is never sent |
 | single-shot `done` | existing keys; `answer` = the display text; + `narrative` and `caption` only when a narrative was rendered or the headline fallback applies | `answer` = the rendered narrative + a blank line + the visual's caption (rendered, or its describe text) when a narrative exists; else the rendered caption; else the brain text + a blank line + the local value line (`value_display`, below); else the brain text. With a headline fallback (`headline_display`, no narrative template): `narrative` = the headline, `caption` = that answer, `answer` = headline + a blank line + it |
 
@@ -1202,9 +1306,11 @@ Any other event the generator yields is dropped by the consumer and logged
 `done` the server synthesizes for a cancelled turn carries the RENDERED chart
 answers (or the narrative text) as `answer`, never templates.
 
-Brain calls of a narrative turn: describe runs only for a visual without a
-caption (with that block's validated FINDINGS as `data_caveat.findings` when
-there are any); summarize never runs when a narrative exists. When it does
+Brain calls of a narrative turn: describe runs only where needed (see
+"Describe only where needed" above — a visual whose planned caption did not
+render, or an uncaptioned visual when the narrative is not used; with that
+block's validated FINDINGS as `data_caveat.findings` when there are any);
+summarize never runs when a narrative exists. When it does
 run (a scalar or flat-dict result without a narrative) it gets
 `preview: null` — always, from this release, also for Auto Analytics — and the
 chat answer shows the value through a local line: `**Result:** <value>` for a
@@ -1228,10 +1334,10 @@ and render unchanged):
 | `narrative_template` / `narrative_rendered` | the plan's narrative and its rendered text (live-table truncation notes are appended to the rendered text only) |
 | `values` / `findings` | the merged VALUES (later block wins) and the merged validated FINDINGS (block order, at most 24 keys) — local only; the brain sees FINDINGS only through the marker |
 | `caption_template` / `caption_rendered` | a single-visual record with a caption — also a multi-chart turn that produced exactly one chart, which is stored as a single-visual record |
-| `caption_described` | a single-visual record of a narrative turn whose visual had no caption: its describe text |
+| `caption_described` | a single-visual record of a narrative turn whose visual had no caption: its describe text, when one was made (since P29 C2 a visual the used narrative explains gets none) |
 | `value_display` | the local value line of the summarize fallback |
 | `headline_display` | the headline fallback sentence (`Result: <figure>.` in the answer language) when the template was dropped after the narrative-only retry; reload shows it first, above the answer. Display only — not read by the report (its PDF/PPTX keeps the describe text) |
-| `images[i].answer` | the rendered caption when the entry has `caption_template`, else the describe text |
+| `images[i].answer` | the rendered caption when the entry has `caption_template`, else the describe text (streamed as the chart's `caption` event), or `""` when the used narrative explains the chart (P29 C2) |
 | `images[i].caption_template` / `images[i].phase` | the chart's caption template; its phase (`1` in this release) |
 | `table_captions` / `table_caption_templates` / `table_phases` | arrays aligned with `tables` (`""` for a table without a caption; a dict RESULT puts its caption on its first table) |
 | `phase2` / `phase2_status` | reserved for two-phase answers; not written in this release |
@@ -1287,7 +1393,13 @@ toolbar (`title.yref:'container'`, `y:1`, `yanchor:'top'`, `pad.t` = toolbar
 bottom + 8 px, the top margin reserved to fit it), x/xanchor kept, in ONE
 `Plotly.relayout`; a chart whose toolbar has no buttons (pie, sunburst,
 treemap) is fitted the same way with no toolbar offset; untitled charts are
-never relayouted. The frame exposes `window.__pdcTitleFit = {relayouts, done}`.
+never relayouted. A horizontal legend drawn above the plot (`orientation:
+'h'`, paper `y ≥ 1` — the `yanchor: 'bottom', y: 1.02` the analytics prompt
+asks for) is moved in the same relayout to 8 px under the title
+(`legend.yanchor: 'top'`, `legend.y` in paper coordinates) and its drawn
+height is added to the reserved top margin (P29 C3); a legend that cannot be
+placed is left alone, and a chart without a top legend is fitted exactly as
+before. The frame exposes `window.__pdcTitleFit = {relayouts, done}`.
 
 **Hierarchy repair.** A sunburst/treemap/icicle whose nodes name a parent id
 that is not among the ids (what `px.sunburst(path=[…, pd.cut(…)])` produces
@@ -1320,8 +1432,9 @@ stream's error event is `{error, error_key: "lab.brain_timeout", conv_id,
 done: true}` and the edit-regenerate answer is `503 {error, error_key:
 "lab.brain_timeout", conv_id}`; the `/lab` page shows the `error_key` text
 from its i18n (en/geo/ru) and falls back to `error`. The history row keeps the
-English text. Every other error event is unchanged (`{error, conv_id, done:
-true}`), and the generic "temporarily unavailable" text stays reserved for
+English text. A failed analysis (`lab.analysis_failed`, "Analysis failed"
+above) is answered the same way. Every other error event is unchanged
+(`{error, conv_id, done: true}`), and the generic "temporarily unavailable" text stays reserved for
 genuine brain unreachability. The page's own abort of the stream and of
 edit-regenerate is at 330 s, past the server's timeout, so the server's
 message arrives first.
@@ -1413,8 +1526,9 @@ The full enterprise split inside one turn:
 5. POST → `/v1/describe` (or `/v1/summarize` for scalar results) → brain
    returns the natural-language intro. No row values cross the boundary.
    With a narrative template (`narrative_v1`) the client fills the brain's
-   template locally instead and calls neither, except describe for a visual
-   that has no caption; summarize, when it runs, gets `preview: null`.
+   template locally instead and calls neither, except describe where needed
+   (a planned caption that did not render, or an uncaptioned visual when the
+   narrative is not used); summarize, when it runs, gets `preview: null`.
 6. A plan of kind `CLARIFICATION` or `ANSWER` skips execution entirely — the
    text is returned to the user as-is (`ANSWER` = a context-based explanation,
    e.g. "how did you compute this?").
@@ -1802,7 +1916,7 @@ values leave the client.
 | `GET  /api/chat/{id}/conversation/{conv_id}/share` | owner only (`_require_chat_owner`: no session → `401`, anyone but the chat's owner → `403 {"error": "Access denied"}`); `{conv_id}` must be a conversation of this chat in the owner's OWN conversation list, else `404 {"error": "Conversation not found"}` (a recipient's copy id included). Returns `{shared_with: [...]}` — the addresses THIS conversation is recorded as shared with (`ChatDataStore.conv_share_recipients`), sorted, each once however often it was shared; `[]` for a conversation without a record (never shared, or shared before the record existed). The `/lab` Share Conversation dialog lists these, each with a Remove button |
 | `DELETE /api/chat/{id}/conversation/{conv_id}/share/{recipient}` | owner only, same `401` / `403` / `404` as the `GET`; `{recipient}` must match `routes.auth._EMAIL_RE` after strip + lower-case, else `400 {"error": "Provide a valid email address."}`. `ChatDataStore.remove_conv_share`: takes the address off this conversation's record and deletes every copy that record holds for it (the row in the recipient's conversation list and the copy's file; a per-copy failure is logged `CONV_SHARE_COPY_DELETE_FAILED`), then ends the recipient's chat access — exactly what `DELETE /api/chat/{id}/share/{recipient}` does — only when a conversation share created it and nothing else needs it (see Sharing rules, "Conversations"). Answers `200 {ok: true, shared_with: [...], chat_access_removed: bool}` (`shared_with` = this conversation's remaining addresses). Idempotent: an address not recorded for the conversation changes nothing and answers `chat_access_removed: false`. A store failure → `500 {"error": "Could not remove access."}` (logged `CONV_UNSHARE_FAILED` with the exception type). Must send `Content-Type: application/json` (else `415`). Logged `CONV_UNSHARED` (route) and `CONV_SHARE_REMOVED` (store: copy count and the verdict). Nothing is mailed |
 | `GET  /api/chat/{id}/full_table/{key}` | returns the full result table for `key`. The chat stream sets `full_table_key` on responses that contain a tabular result; the key names a durable record (`conversations/full/{key}.json`: preview rows, `code`, optional `result_key` and `sql`). The route re-executes the stored code (a live table re-fetched with the stored SQL) and answers `{columns, rows, total_rows}`; when that yields nothing it answers the stored record. **Live-table gate:** before any re-execution, an item whose stored code references a LIVE table the requester's role does not cover (by the pre-fetch's own rule: a quoted df key, a generic `dfs` walk, or the `df` alias of the first frame) → `403 {"ok": false, "code": "ROLE_DENIED", "blocked_tables": [<display names>], "error": "Your role does not include this table's data — refresh is unavailable."}`, logged `FULL_TABLE_ROLE_DENIED` / `DOWNLOAD_EXCEL_ROLE_DENIED`; no database query is issued. The gate is consulted only where a live fetch can happen: a record without stored code, or a chat that holds no live table, is served without it, and a table the role does not cover that is a SNAPSHOT is served too (viewing existing data is never blocked retroactively). On a chat holding a live table — or when that cannot be determined — the gate FAILS CLOSED: any error inside it (including a failing role read) answers the same 403 with `blocked_tables: []`, logged `LIVE_REEXEC_GATE_FAILED error=<type>`. 403 rather than the refresh path's 200 because the success answer of `download_excel` is a byte stream. |
-| Conversation title generation | After the 2nd human message, the chat stream fires a background `brain_client.title()` call and renames the conversation via `AuthStore.rename_conversation`. The `answer` it sends is never rendered text: for a narrative turn `narrative.brain_view` of the narrative template (single flow: else of the caption template), slots as `[slot name]`; otherwise the record's brain-safe `content` (caption templates in it bracketed the same way) |
+| Conversation title generation | After the conversation's FIRST answered question (P29 C5; until then the 2nd human message), the chat stream fires a background `brain_client.title()` call from that question and answer and renames the conversation via `AuthStore.rename_conversation`. An error turn or a stopped turn does not count (the next answered turn titles); a conversation is never titled twice — there is no stored flag, an earlier answered history row (`routes/chat._is_answered_row`: an AI row with `code` / `image_base64` / `images` / `table` / `tables`, not `stopped`) means it already was (`_title_due`). Edit-regenerate titles from its answer only when the conversation had no answered row before the edit. A conversation that had exactly one answered turn before this release keeps its question as its title. The `answer` it sends is never rendered text: for a narrative turn `narrative.brain_view` of the narrative template (single flow: else of the caption template), slots as `[slot name]`; otherwise the record's brain-safe `content` (caption templates in it bracketed the same way) |
 | Activity logging | `auth.py` (login), `upload.py` (file_uploaded), `chat.py` (plot_generated, per chart), `report.py` (report_exported), `auto_analytics.py` (auto_analytics_completed) all call `brain_client.post_activity` → brain `/v1/activity`. Fire-and-forget: the post runs on a single background worker thread (ordered), so a slow brain can never block a request or the event loop — telemetry lags instead. |
 | **Auto Analytics** | `POST /api/chat/{id}/auto_analysis/start` kicks a background job → brain `/v1/auto_analytics_plan` (planner returns 3-15 natural-language analytical instructions) → client executes each via `run_chat_local.run_chat` against the local dataframes (bounded 4-worker pool; loaded WITHOUT live tables — `include_live` off — so a live table is never queried by the job and its findings cover the snapshot and file tables only) → brain `/v1/report` for narrative → client renders PPTX via `routes/report._render_pptx` → persists to `chatdata/{id}/auto_analysis.pptx`. `GET /auto_analysis/status` reports `{status: idle|processing|done, progress, error, pptx_path}`. `GET /auto_analysis/download` streams the deck. Raw row data never leaves the client |
 | **Multi-chart streaming** | The chat SSE stream uses `run_chat_multi_plot` (a generator port of global's). The brain Agent classifier sets `suggested_approach` to "Decompose into multiple PLOT_CODE blocks ... separated by ###NEXT_PLOT###" for dashboard/overview-style queries; the planner emits the multi-block raw_text; the client splits it via `_extract_multi_plot_blocks` and executes each block locally with retry, yielding a `{partial: true, chart_n, chart_total, image_base64, answer}` SSE event per chart and a final `{done: true}` combined event; with a narrative template a `{narrative: true, phase, text}` event comes before the `done` (see "Narrative-template answers" under Chat). Capped at 6 charts per response. Single-chart queries fall through to the existing one-shot path |

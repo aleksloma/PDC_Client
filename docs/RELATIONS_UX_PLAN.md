@@ -514,8 +514,9 @@ suggestion is distinguishable from a deliberate admin choice.
 
 ## Build stamp
 
-The static `?v=` parameter is `int(time.time())` computed per request at page
-render. It looks like a build marker and is not one — it sent build
+The static `?v=` parameter was then `int(time.time())` computed per request at
+page render (since P29 it is `BUILD_COMMIT` on a stamped image, else the
+process start time). It looks like a build marker and is not one — it sent build
 verification down the wrong path twice. `GET /version` +
 `{{ build_stamp }}` in the admin sidebar now report the real thing, fed by
 `BUILD_COMMIT`/`BUILD_TIME` Docker build args (`.git` is dockerignored, so

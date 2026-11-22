@@ -273,7 +273,10 @@ returns `403 {"detail": "Tenant <status>"}` before any LLM call when
    `_safe_preview` verdict (`str | int | float | bool` or a flat dict of
    them) is shown locally as a value line. With a narrative template
    (§10d) the client fills the brain's template locally instead and skips
-   both calls, except describe for a visual without a caption.
+   both calls. Since P29 describe runs only where needed: for a visual
+   whose planned caption did not render, and for a visual planned without
+   a caption only when the turn's narrative is not used (a rendered
+   narrative explains it in its last sentence; `DESCRIBE_SKIPPED`).
 
 
 ### 8a. Request timing model
@@ -293,37 +296,110 @@ of the request (for a plan, including the classifier).
   are added to the plan's `usage`.
 
 - **Per attempt.** Each model call gets `min(per-model cap, remaining
-  budget)` as its timeout. The per-model caps are unchanged and stay the
-  upper limit of one attempt: `LLM_COMPLEX_TIMEOUT` (150 s) for complex or
-  narrative-tier plans, `use_pro` and narrative-only retries and
-  complex-tier summaries, otherwise 90 s (plan), 120 s (retry), 60 s
-  (summarize), 20 s (describe, greeting). Inside one attempt the 429/5xx
-  HTTP retries of `_call_gemini_rest` also stop at the request deadline: a
-  retry that would leave less than 10 s is not made.
-- **Fallback chain.** `/v1/plan` still falls through its model chain
-  (selected → simple → light → `gemini-2.5-flash`), but no further model is
-  started once less than 10 s (`BUDGET_MIN_ATTEMPT_S`) of the budget is left.
+  budget)` as its timeout. The per-model caps are unchanged:
+  `LLM_COMPLEX_TIMEOUT` (150 s) for complex or narrative-tier plans,
+  `use_pro` and narrative-only retries and complex-tier summaries,
+  otherwise 90 s (plan), 120 s (retry), 60 s (summarize), 20 s (describe,
+  greeting). The cap is the upper limit of one attempt for every blocking
+  call and for a streamed call without a known liveness signal; a streamed
+  call on a model known to send thought parts is bounded by the request
+  deadline instead (next bullet). Inside one attempt the 429/5xx HTTP
+  retries of `_call_gemini_rest` also stop at the request deadline: a retry
+  that would leave less than 10 s is not made.
+- **Streamed thinking calls (liveness).** On a tier with thinking on, the
+  plan's main and chain attempts, the code retry, the narrative-only retry
+  and the narrative correction call are streamed
+  (`:streamGenerateContent?alt=sse`) and ask for thought summaries
+  (`includeThoughts: true`). The plan's reserve attempt is always streamed
+  (next bullet), and asks for thought summaries only when its tier thinks. A thought part is only a liveness signal and a
+  token count: its text is dropped as it arrives and is never logged,
+  returned or kept. Every other model call (the classifier, describe,
+  summarize, greeting, …) stays blocking. Limits of a streamed attempt:
+  - *first chunk:* for a model already seen sending thought parts, no chunk
+    within `LLM_STREAM_FIRST_CHUNK_SECONDS` (default 20 s, counted from the
+    start of the HTTP try, the wait for the status included) ends the
+    attempt as `stalled`;
+  - *stall:* after the first chunk, `LLM_STREAM_STALL_SECONDS` (default
+    20 s) without a new line ends it as `stalled` — for a known model, or
+    once this call has sent a thought part;
+  - *outer bound:* a known model has no per-attempt cap while chunks
+    arrive: it may run to the request deadline. Every other streamed call
+    keeps `min(cap, time left)`. Reaching the bound is a timeout
+    (`LLM_TIMEOUT`);
+  - *thinking tokens:* with `LLM_THINKING_TOKEN_CAP` above 0 (default 0,
+    off) a streamed thinking call ends as `thinking_cap` once its streamed
+    `thoughtsTokenCount` passes the cap.
+
+  What a model does is learned per process from its replies, never from a
+  model name in code. A model that sends a thought part becomes known. A
+  model that thinks (thinking tokens above 0) without sending a thought
+  part, or answers HTTP 400 to `includeThoughts` and 200 to one immediate
+  repeat without it (not one of the 429/5xx retries, not made with under
+  10 s left), is no longer asked for thought summaries and keeps the
+  per-attempt cap, with no stall rule. Both sets are empty after a restart,
+  so the first streamed call to a model on a new instance keeps the cap. A
+  stopped streamed attempt keeps the token counts it streamed (partial
+  usage); on a plan they are added to `usage`.
+- **Reserve attempt (`/v1/plan`).** When the main attempt has run for
+  `PLAN_RESERVE_START_SECONDS` (default 90 s), a reserve attempt on the
+  tier `PLAN_RESERVE_TIER` (default `light`; `simple` or `complex` also
+  allowed, anything else means no reserve) starts in parallel, in its own
+  pool of `PLAN_RESERVE_WORKERS` threads (default 8) with the request's
+  tenant context copied. It is always streamed, whatever its tier; the
+  liveness rules above (thought summaries, first chunk, stall, the
+  deadline bound) apply only when its tier thinks. Its timeout is
+  `min(150 s when its tier thinks, else 90 s; time left)` and its deadline
+  the request's. When the main attempt fails or stalls before that, the
+  reserve runs at once in the request thread; when the reserve is already
+  running, the request waits for it (at most the time left plus
+  `LLM_STREAM_STALL_SECONDS`). Result choice: the main answer wins whenever
+  it arrives — a reserve is then cancelled, waited for at most
+  `LLM_STREAM_STALL_SECONDS`, and its token counts (full or partial) are
+  added to `usage`; the reserve answer is used only when the main attempt
+  failed, stalled or reached its bound. There is no reserve when the
+  reserve tier's model and thinking setting equal the main attempt's, and
+  none is started with under 10 s left. Main attempt, reserve and chain all
+  run inside the one request budget (240 s, unchanged).
+- **Fallback chain.** After the main attempt and the reserve, `/v1/plan`
+  tries the rest of its chain one model after another: the simple and the
+  light tier model (tenant overrides honoured), then `LLM_FALLBACK_MODELS`
+  (env, comma-separated, default empty), skipping a model already tried.
+  No model name is written in code (the chain used to end in
+  `gemini-2.5-flash`). No further model is started once less than 10 s
+  (`BUDGET_MIN_ATTEMPT_S`) of the budget is left. The classifier tries the
+  agent tier, the light tier, then `LLM_FALLBACK_MODELS`.
 - **Exhausted budget.** The response stays HTTP 200 in its usual fallback
   shape (plan: `context_decision.api_failed = true`, no code) and adds
   `error_code: "llm_budget_exhausted"` plus `models_tried`, so the client can
-  tell a spent budget from other failures (see `PROTOCOL.md`). All models
-  failing inside the budget keeps the old `PLAN_API_FAILED` shape without
-  `error_code`.
+  tell a spent budget from other failures (see `PROTOCOL.md`). A plan with
+  no answer and under 10 s left at the end counts as a spent budget.
+- **No answer with time left.** When every plan attempt failed and at least
+  10 s of the budget is left, the plan adds `error_code: "llm_unavailable"`
+  plus `models_tried` (log `PLAN_API_FAILED`). The other endpoints keep
+  their fallback body without `error_code` when their model fails inside
+  the budget.
 - **One log line per request that reaches a model call** (a plan answered
   by the greeting short-circuit logs one too, with its classifier attempt),
   `LLM_BUDGET`, with the fields `caller`,
   `total_elapsed`, `budget`, `exhausted` and `attempts`
   (`<model>:<seconds>:<outcome>;…`, a classifier attempt as
   `<model>:<seconds>:<outcome>:classifier`, a correction attempt as
-  `<model>:<seconds>:<outcome>:correction`, or `-` when no model was started),
+  `<model>:<seconds>:<outcome>:correction`, a plan's reserve attempt as
+  `<model>:<seconds>:<outcome>:reserve` after a failed main attempt, or
+  `<model>:<seconds>:<outcome>:reserve:discarded` when the main answer won,
+  or `-` when no model was started),
   written at the END of the request so it covers every call, e.g.
   `[sid=…] [caller=plan] [total_elapsed=240.31] [budget=240] [exhausted=True]
   [attempts=gemini-4-argon:150.00:ReadTimeout;gemini-3.8-flash:90.00:ReadTimeout] LLM_BUDGET`
   or, with a narrative correction,
   `[sid=…] [caller=plan] [total_elapsed=102.59] [budget=240] [exhausted=False]
-  [attempts=gemini-2.5-pro:61.08:ok;gemini-2.5-pro:30.11:ok:correction] LLM_BUDGET`.
-  Model names, seconds and the outcome class (`ok`, an exception class name,
-  `skipped_budget`) only, never prompt or reply text (Article II). A spent
+  [attempts=gemini-2.5-pro:61.08:ok;gemini-2.5-pro:30.11:ok:correction] LLM_BUDGET`
+  or, with a reserve the main answer made unnecessary,
+  `[attempts=gemini-3.8-flash:4.10:ok:classifier;gemini-4-argon:131.40:ok;gemini-3.8-flash:41.38:cancelled:reserve:discarded]`.
+  Model names, seconds and the outcome (`ok`, `skipped_budget`, `stalled`,
+  `thinking_cap`, `cancelled`, `running` — a reserve still running when it
+  was given up — or an exception class name) only, never prompt or reply
+  text (Article II). A spent
   budget also logs `<CALLER>_BUDGET_EXHAUSTED` (e.g. `PLAN_BUDGET_EXHAUSTED`),
   or `NARRATIVE_CORRECTION_SKIPPED_BUDGET` when it runs out at the correction step.
 - **The narrative correction call is inside the budget** (§10d): it gets
@@ -331,11 +407,12 @@ of the request (for a plan, including the classifier).
   request deadline, and it is not started with under 10 s left — then the
   code is returned with the invalid template dropped plus `error_code` /
   `models_tried`, and the log line shows `skipped_budget:correction`.
-- **Soft under connection contention.** The shared `httpx` client allows 10
-  connections and the httpx timeout applies per phase, so when more than 10
-  Gemini calls run at once on one instance, a call can wait for a free
-  connection on top of its read time. The budget is then exceeded by at most
-  that wait.
+- **Soft under connection contention.** The shared `httpx` client allows
+  `LLM_HTTP_MAX_CONNECTIONS` connections (default 40; it was a fixed 10),
+  and a streamed call or a running reserve holds its connection for its
+  whole run. The httpx timeout applies per phase, so when more calls than
+  that run at once on one instance, a call can wait for a free connection on
+  top of its read time. The budget is then exceeded by at most that wait.
 - `models_tried` names only models that were actually called for the answer;
   the classifier's models are not in it. `attempts` also lists the
   classifier calls, and any call the budget skipped as `skipped_budget` (a
@@ -355,9 +432,14 @@ the PPTX template analysis) runs through Starlette's `run_in_threadpool`, so a
 slow Gemini call never stalls the event loop: other requests and `/health`
 are served while it runs. The per-request tenant context is a `ContextVar`
 and is copied into the worker thread. Tenant checks, logging and
-`record_request` stay on the event loop. The shared `httpx` client allows 10
-connections, so more than 10 simultaneous Gemini calls on one instance wait
-for a free connection.
+`record_request` stay on the event loop. The shared `httpx` client allows
+`LLM_HTTP_MAX_CONNECTIONS` connections (default 40), so more simultaneous
+Gemini calls than that on one instance wait for a free connection. A plan's
+reserve attempt runs in its own pool (`PLAN_RESERVE_WORKERS`, default 8
+threads), not in Starlette's; a reserve that finds the pool full waits in
+its queue, and runs in the request thread when the main attempt fails
+first. Each streamed call adds one reader thread for its duration. Reserves
+still running at shutdown are cancelled.
 
 The container runs **one uvicorn worker on purpose**. Three pieces of state
 are per process and would diverge with several workers: brain-wide model
@@ -666,9 +748,16 @@ dispatch routes to the clone with no fallback.
   `BUILD_COMMIT`/`BUILD_TIME` **Docker build args** — `.git` is dockerignored,
   so the commit can only arrive from the builder; an unstamped image reports
   its process start time instead of faking an identity. **Never read the
-  static `?v=` query parameter as a build marker**: it is `int(time.time())`
-  computed per request at page render, and mistaking it for one has sent
-  release verification down the wrong path twice.
+  static `?v=` query parameter as a build marker**: since P29 (22 Nov 2026)
+  it is `BUILD_COMMIT` only on a stamped image and otherwise the process
+  start time as a bare number (`app._static_version`, one value per
+  process; until P29 it was `int(time.time())` computed per request, and
+  mistaking it for a build marker sent release verification down the wrong
+  path twice). Use `/version`. A `/static` request carrying the current
+  `?v=` is served `Cache-Control: public, max-age=31536000, immutable`, so
+  a new build must change the value for browsers to fetch the new files:
+  a new `BUILD_COMMIT` on a stamped image, or — only on an unstamped image
+  (`BUILD_COMMIT` empty) — a restart.
 - **A `replace:*` label can target a shape OFF-CANVAS, OVER A LOGO, or a
   blank full-bleed rectangle on a logo-only cover** (the analyzer backstop
   — or the LLM — mislabeling decorative geometry; the real Time template
@@ -1625,7 +1714,10 @@ capabilities, which restores the earlier prompts and responses.
   after each successful block, captions render with their own block's
   VALUES, the narrative renders once after the last block. A captioned
   visual needs no describe call; summarize gets `preview: null` and the
-  value is shown through a local value line.
+  value is shown through a local value line. Since P29 an uncaptioned
+  visual of a turn with a narrative template is described only when the
+  narrative is not used (`_NarrState.describe_now`); a planned caption that
+  did not render is described at once.
 - **Records and stream.** `routes/chat.py` stores the template, the rendered
   text, VALUES, FINDINGS and per-chart / per-table captions additively; the
   record's `content` is the marker + the unfilled template. The stream adds a

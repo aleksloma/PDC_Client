@@ -119,6 +119,37 @@ Read these before you upgrade an existing install to this release.
   start a container whose `cpus` value is above the host's CPU count, so the
   host needs at least 2 vCPUs; on a smaller host lower the value in both
   services of `docker-compose.yml`.
+- Static files (scripts, stylesheets) are now cached by browsers for up to a
+  year under a version taken from the image's build commit, and text files
+  are gzip-compressed by the application. A reverse proxy must pass
+  `Cache-Control`, `Vary` and `ETag` on `/static` through unchanged and must
+  not compress them again (see "Serve it over HTTPS" in §3). An upgrade
+  changes the version, so browsers fetch the new files on their next page
+  load.
+- A chat answer now shows its stages while it runs ("Planning the
+  analysis…", "Running the analysis…", …), shows each chart as soon as it is
+  drawn with its description following, and shows a one-time note when it
+  takes longer than `SLOW_ANSWER_NOTICE_SECONDS` (90 s by default; see §2).
+  When the AI service cannot produce an answer at all, the chat says "The
+  analysis could not be completed. Please try again." instead of asking the
+  user to rephrase.
+- A new conversation is now named after its first answered question (it
+  was the second). A conversation that had exactly one answered question
+  before the upgrade keeps its question as its name.
+- Answers and charts read better: p-values show as `<0.001` or with three
+  decimals (they used to read `0.00`); a chart axis whose values span a
+  very wide range switches to a log scale on its own, per axis, and its
+  title says "(log scale)"; a legend placed above a chart sits under the
+  title instead of over it; styled tables no longer show a meaningless
+  0, 1, 2, … index column. These run inside the analysis sandbox, so the
+  executor image must be upgraded together with the client image (as for
+  every release: both images, the same tag).
+- The `/lab` page: the "View / Edit Descriptions" dialog shows column types
+  as Text, Number, Date or Yes/No (display only — the analysis is
+  unchanged); from 769 to 1200 px wide (or whenever the labels do not fit)
+  the top-bar buttons show icons only, with their name as a tooltip; Escape
+  or a click outside closes the open menu or dialog, and Escape while
+  editing a description cancels that edit first.
 
 ## 1. Get the images
 
@@ -244,6 +275,11 @@ A few more settings are worth knowing about, all optional:
   blocking them, which is useful for a short diagnosis of a page that renders
   wrongly behind your proxy, and nothing else. The container logs
   `CSP_REPORT_ONLY_ENABLED` at startup while it is on.
+- **`SLOW_ANSWER_NOTICE_SECONDS`** — seconds a chat answer may take before
+  the page shows one note, "This is taking longer than usual. The analysis is
+  still running." (translated); `90` by default, `0` turns the note off. It
+  appears at most once per question and only while nothing of the answer has
+  arrived yet; the analysis keeps running either way.
 
 Leave the `EXECUTOR_*` variables out of `client.env`. The ones that wire the
 two containers together (`EXECUTOR_URL`, `EXECUTOR_SHARED_DIR`,
@@ -1059,6 +1095,25 @@ carries a `Content-Security-Policy` header with a value that changes on each
 response. A proxy that strips it, caches pages, or adds a second policy of its
 own can leave charts blank or the page unprotected. Do not cache HTML
 responses, and do not rewrite the header.
+
+**Leave the static files' caching and compression to the application.** The
+pages load their scripts and stylesheets as `/static/<file>?v=<version>`,
+where the version is the image's build commit (`BUILD_COMMIT`, set when the
+image is built; `GET /version` shows it) or, on an image without one, the
+time the container started. A `/static` response for the current version carries
+`Cache-Control: public, max-age=31536000, immutable`, so browsers keep the
+file and do not ask again until an upgrade (or a restart of an unstamped
+image) changes the version in the page. Text files (`.js`, `.css`, `.html`,
+`.svg`, `.json`, `.map`) of 1 KB or more are already gzip-compressed for
+browsers that accept it, with `Vary: Accept-Encoding` and a weak `ETag`.
+Do not strip or rewrite `Cache-Control`, `Vary` or `ETag` on `/static`, and
+do not compress these responses a second time in the proxy (for nginx: no
+`gzip on;` for the application's location, or at least not for responses that
+already carry `Content-Encoding`). Pages, the API, the chat's live answer
+stream and the chart documents are never compressed or cached by the
+application; do not compress the answer stream in the proxy either (it is
+sent with `X-Accel-Buffering: no`, so nginx passes each progress line on at
+once).
 
 ## 4. Verify
 
