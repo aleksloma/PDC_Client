@@ -28,6 +28,11 @@ has returned. Login, upload, chat and report routes all call it, so without
 the stub the suite resolves the brain's hostname on every run. The one module
 that tests the worker itself carries `@pytest.mark.real_activity_worker`.
 
+A fourth autouse fixture stubs `brain_client.title` the same way: a
+conversation's first answered turn starts a daemon thread that calls it, and
+that thread would outlive the test. The one test of the real function carries
+`@pytest.mark.real_brain_title`.
+
 `seed_history(chat_id, code)` writes a REAL AI history row through the app's
 own store, under whatever `settings.DATA_ROOT` the test has monkeypatched.
 The re-run routes (`refresh_item`, the dashboard pin) accept only code the
@@ -75,6 +80,7 @@ INTEGRATION_MARKER = "integration"
 NEEDS_BRAIN_MARKER = "needs_brain"
 EXECUTOR_PROBE_MARKER = "executor_probe"
 REAL_ACTIVITY_MARKER = "real_activity_worker"
+REAL_TITLE_MARKER = "real_brain_title"
 
 
 def pytest_configure(config):
@@ -108,6 +114,11 @@ def pytest_configure(config):
         "markers",
         f"{REAL_ACTIVITY_MARKER}: keep the real brain_client.post_activity "
         "(the test supplies its own `_post` stub and exercises the worker)",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"{REAL_TITLE_MARKER}: keep the real brain_client.title "
+        "(the test supplies its own `_post` stub and checks the payload)",
     )
 
 
@@ -185,6 +196,27 @@ def no_brain_activity_worker(request, monkeypatch):
 
     monkeypatch.setattr(brain_client, "post_activity",
                         lambda *args, **kwargs: {"ok": True, "queued": True})
+
+
+@pytest.fixture(autouse=True)
+def no_brain_title_call(request, monkeypatch):
+    """Replace `brain_client.title` with a stub for every test.
+
+    A conversation's first answered turn (stream or edit-regenerate) starts a
+    daemon thread that calls `brain_client.title` and renames the
+    conversation. Unstubbed, that thread outlives the test that started it and
+    either logs `TITLE_GEN_FAILED` into a later test or, with a tenant token in
+    the environment, POSTs to `BRAIN_URL`. The stub answers an empty title,
+    so nothing is renamed. A test that installs its own stub still wins (the
+    shared `monkeypatch` is undone in reverse); the one test that exercises
+    the real function carries `@pytest.mark.real_brain_title`.
+    """
+    if request.node.get_closest_marker(REAL_TITLE_MARKER):
+        return
+    import brain_client
+
+    monkeypatch.setattr(brain_client, "title",
+                        lambda *args, **kwargs: {"title": ""})
 
 
 @pytest.fixture(autouse=True)

@@ -80,6 +80,8 @@ class Settings(BaseModel):
 
     # Build identity — baked in as Docker build args (see the Dockerfile).
     # Empty on an unstamped build; the app then reports its start time.
+    # BUILD_COMMIT is also the static `?v=` (app._static_version; the process
+    # start time when empty), and requests carrying it are cached immutable.
     BUILD_COMMIT: str = Field(default_factory=lambda: os.getenv("BUILD_COMMIT", ""))
     BUILD_TIME: str = Field(default_factory=lambda: os.getenv("BUILD_TIME", ""))
 

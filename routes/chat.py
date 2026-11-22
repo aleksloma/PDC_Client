@@ -1894,6 +1894,9 @@ async def chat_stream(request: Request, chat_id: str):
             store.append_history(conv_id, {"role": "ai", "content": welcome, "ts": time.time()})
 
     history_rows = store.get_history(conv_id)
+    # The rows before this turn, as the worker decides the title from them
+    # (a copy: `history_rows` is handed to the planner).
+    title_prior_rows = list(history_rows)
     store.append_history(conv_id, {"role": "human", "content": question, "ts": time.time()})
 
     # `q` is the user's own free text and `log_with_sid` renders every context
@@ -2167,17 +2170,19 @@ async def chat_stream(request: Request, chat_id: str):
                 if record is not None:
                     store.append_history(conv_id, record)
                     if not err_msg and not cancelled:
-                        answer_for_title = _answer_for_title(
-                            w_single, w_view, w_combined_answer)
+                        # Title from the conversation's FIRST answered turn
+                        # (an earlier failed or stopped turn does not count),
+                        # judged on the rows this turn started from — not a
+                        # re-read, which a concurrent turn could change.
                         try:
-                            human_count = sum(
-                                1 for m in store.get_history(conv_id)
-                                if m.get("role") == "human")
-                            if human_count == 2:
+                            if _title_due([*title_prior_rows, record]):
                                 _start_title_generation(
-                                    email, chat_id, conv_id, question, answer_for_title)
-                        except Exception:
-                            pass
+                                    email, chat_id, conv_id, question,
+                                    _answer_for_title(w_single, w_view, w_combined_answer))
+                        except Exception as e:
+                            log_with_sid(sid, "warning",
+                                         f"TITLE_TRIGGER_FAILED "
+                                         f"error={log_safe_text(type(e).__name__, 80)}")
             except Exception as e:
                 # Raised while persisting the answer record — its tables and
                 # their labels are what the message can quote.
@@ -2476,6 +2481,9 @@ async def edit_regenerate(request: Request, chat_id: str):
     if last_human_idx is None:
         return JSONResponse({"error": "No user message found to edit."}, status_code=400)
 
+    # Read BEFORE the truncation: an answer the edit removes still means the
+    # conversation was titled, so the regenerated answer must not re-title it.
+    had_answer = any(_is_answered_row(r) for r in history)
     store.truncate_conv_history(conv_id, last_human_idx)
     log_with_sid(chat_id, "info",
                  f"EDIT_REGENERATE user={email} "
@@ -2589,9 +2597,22 @@ async def edit_regenerate(request: Request, chat_id: str):
         acc_fields["table_phases"].extend(phases)
         acc_captioned = acc_captioned or has
 
-    def _append_and_index(record: dict) -> int:
+    def _append_and_index(record: dict, title_src: tuple) -> int:
+        """Persist the answer, title the conversation when this is its first
+        answer ever (`had_answer` false — a failed first turn edited into an
+        answer), and return the row index. `title_src` is the
+        `_answer_for_title(single, view, combined)` triple."""
         store.append_history(conv_id, record)
-        return len(store.get_history(conv_id)) - 1
+        rows = store.get_history(conv_id)
+        try:
+            if not had_answer and _title_due(rows):
+                _start_title_generation(email, chat_id, conv_id, edited_question,
+                                        _answer_for_title(*title_src))
+        except Exception as e:
+            log_with_sid(chat_id, "warning",
+                         f"TITLE_TRIGGER_FAILED "
+                         f"error={log_safe_text(type(e).__name__, 80)}")
+        return len(rows) - 1
 
     # The answer is persisted inside this loop; its codes count as stored
     # until then (same registry the streaming worker uses).
@@ -2639,7 +2660,9 @@ async def edit_regenerate(request: Request, chat_id: str):
                     full_table_keys=acc_keys or None,
                     combined_tables=acc_tables or None,
                     live_fields=ev, narrative_src=narr_src)
-                ai_index = _append_and_index(history_obj)
+                ai_index = _append_and_index(
+                    history_obj,
+                    (None, ev.get("narrative_view"), ev.get("combined_answer", "")))
                 # The page gets the DISPLAY text, never the brain-safe
                 # combined answer (the marker + template).
                 answer = (ev.get("display_answer") if "display_answer" in ev
@@ -2695,7 +2718,7 @@ async def edit_regenerate(request: Request, chat_id: str):
                 ai_record = _build_ai_history_record(
                     None, single_result, None, [], {}, [],
                     full_table_key=full_table_key, full_table_keys=full_table_keys)
-                ai_index = _append_and_index(ai_record)
+                ai_index = _append_and_index(ai_record, (single_result, None, None))
                 chart_data_key = None
                 cd = single_result.get("chart_data")
                 if isinstance(cd, dict) and (cd.get("rows") or cd.get("tables")):
@@ -2752,11 +2775,43 @@ async def generate_filename(request: Request, chat_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Title generation — background, fired after 2nd human message
+# Title generation — background, fired after the FIRST answered turn
 # ---------------------------------------------------------------------------
+# Keys only the answer builders write (`_build_ai_history_record`,
+# `_build_stopped_record`): the welcome row and an error turn are
+# `{role, content, ts}` and carry none of them.
+_ANSWER_ROW_KEYS = ("code", "image_base64", "images", "table", "tables")
+
+
+def _is_answered_row(row) -> bool:
+    """An AI history row that holds an ANSWER: written by an answer builder
+    and not a stopped turn. The welcome message, an error turn (`{role,
+    content, ts}`) and a turn the user stopped do not count."""
+    return (isinstance(row, dict) and row.get("role") == "ai"
+            and not row.get("stopped")
+            and any(k in row for k in _ANSWER_ROW_KEYS))
+
+
+def _title_due(history) -> bool:
+    """Whether the row just appended (the LAST of `history`) is the
+    conversation's FIRST answered turn — the one the title is generated from.
+
+    There is no stored "titled" flag: the conversation is titled exactly when
+    its first answer is persisted, so an earlier answered row means it already
+    was (never re-titled), and a run of failed or stopped turns before the
+    first answer leaves the title to that answer."""
+    rows = list(history or [])
+    if not rows or not _is_answered_row(rows[-1]):
+        return False
+    return not any(_is_answered_row(r) for r in rows[:-1])
+
+
 def _start_title_generation(email: str, chat_id: str, conv_id: str,
                              question: str, answer: str) -> None:
-    """Spin a daemon thread to call brain /v1/title and rename the conversation."""
+    """Spin a daemon thread to call brain /v1/title and rename the conversation
+    (the stream worker and edit-regenerate call it once per conversation,
+    see `_title_due`; edit-regenerate also skips it when the edit removed an
+    earlier answer)."""
     def _worker():
         try:
             lang_code = _detect_lang_for_title((question + " " + answer)[:300])
