@@ -13,8 +13,8 @@ marker), so `validate_findings` is the Article II guard for them: a key must
 be a planner literal or a `pdc_diag` registry key, a value a bool, an INPUT
 column name or a `FINDINGS_ENUM` code — never a number or a category value.
 
-Main app only. Imports: stdlib, `pdc_diag`, `logger_utils` (and, lazily inside
-`answer_lang_code`, `schema_builder._detect_language`). Every log line carries
+Main app only. Imports: stdlib, `pdc_diag`, `ident_rule`, `logger_utils` (and,
+lazily inside `answer_lang_code`, `schema_builder._detect_language`). Every log line carries
 constants, counts or `log_safe_value(...)` — never a template, a value or a
 findings value. `render`, `fallback_text`, `brain_view` and `value_display`
 never raise (Article IV).
@@ -27,6 +27,7 @@ import numbers
 import re
 import textwrap
 
+import ident_rule
 import pdc_diag
 from logger_utils import log_safe_value, log_with_sid
 
@@ -238,10 +239,36 @@ def _md_escape(text: str) -> str:
     return _LEADING_DASH_RE.sub(lambda m: m.group(1) + "\\-", text, count=1)
 
 
-def _fmt_value(value, kind, locale=None) -> str:
+def _identifier_digits(value, name) -> str | None:
+    """The plain digits of an integral number held by a slot / key whose NAME
+    is an identifier (`ident_rule.is_identifier_name`: "client_id",
+    "personal_number"), else None — never grouped, never ".0". Never raises."""
+    try:
+        if name is None or isinstance(value, bool) or not ident_rule.is_identifier_name(name):
+            return None
+        if isinstance(value, numbers.Integral):
+            return str(int(value))
+        if isinstance(value, numbers.Real):
+            f = float(value)
+            if math.isfinite(f) and f.is_integer():
+                return str(int(f))
+        return None
+    except Exception:
+        return None
+
+
+def _fmt_value(value, kind, locale=None, name=None) -> str:
     """One value as display text: `pdc_diag.fmt` (unknown kind -> the type's
     default kind) in `locale`, a string value markdown-escaped; numbers never
-    escaped."""
+    escaped. A slot / key `name` that is an identifier holding an integral
+    number renders its plain digits (`_identifier_digits`) — only when the
+    kind is none (or unknown), `count` or `text`; an explicit amount / float
+    / pct / ratio / pvalue / period kind keeps its format. A `text` slot
+    holding an integral number is plain digits anyway (pdc_diag rule 5)."""
+    if kind not in KINDS or kind in (None, "count", "text"):
+        digits = _identifier_digits(value, name)
+        if digits is not None:
+            return digits
     text = pdc_diag.fmt(value, kind if kind in KINDS else None,
                         locale if isinstance(locale, str) else None)
     if isinstance(value, str) and not isinstance(value, bool):
@@ -394,7 +421,7 @@ def render_with_sections(template: str, values: dict, findings: dict, *, sid: st
                     _marks.append((name, cause))
                     return f"{_MARK_OPEN}{len(_marks) - 1}{_MARK_CLOSE}"
             if name in vals:
-                return _fmt_value(vals[name], kind, locale)
+                return _fmt_value(vals[name], kind, locale, name=name)
             if name not in missing:
                 missing.append(name)
             return _NA
@@ -1199,7 +1226,7 @@ def value_display(safe_preview, lang: str) -> str | None:
             return _post(text, RENDERED_MAX)
         if isinstance(safe_preview, dict) and safe_preview:
             items = list(safe_preview.items())
-            lines = [f"- {_md_escape(str(k)[:_VALUE_DISPLAY_KEY_MAX])}: {_fmt_value(v, None, locale)}"
+            lines = [f"- {_md_escape(str(k)[:_VALUE_DISPLAY_KEY_MAX])}: {_fmt_value(v, None, locale, name=k)}"
                      for k, v in items[:_VALUE_DISPLAY_MAX_LINES]]
             if len(items) > _VALUE_DISPLAY_MAX_LINES:
                 lines.append("- " + _ELLIPSIS)

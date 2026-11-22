@@ -22,6 +22,9 @@ from outlier_utils import outlier_mask, drop_extreme_outliers
 # The sandbox diagnostics library (DIAGNOSTICS_SPEC B8) — a leaf module too
 # (stdlib + numpy + pandas at import time).
 import pdc_diag
+# The one identifier rule (leaf: stdlib + numpy + pandas) — axis titles and
+# the job's source identifiers decide which axes are never grouped.
+import ident_rule
 
 # Import visualization libraries
 try:
@@ -1201,28 +1204,34 @@ def _split_plotly_grid(fig):
 
 
 # Label HEAD words that mark an axis/column as a year/identifier DIMENSION whose
-# numeric values must NOT be comma-grouped (EN + Georgian). We match the HEAD
-# (last) word only — not any substring — so a MEASURE label that merely mentions
-# one of these words still groups: "Order Value" / "Number of Orders" /
-# "Reference Price" / "ID Count" group; "Order ID" / "Customer Code" / "Year"
-# stay raw. Mirrors the frontend `_isIdentifierLabel`.
-_IDENTIFIER_HEAD_WORDS = frozenset({
-    "year", "yr", "წელი", "id", "ids", "code", "codes", "კოდი", "იდ",
-    "zip", "postal", "phone", "account", "iban", "invoice", "order", "ref",
-})
+# numeric values must NOT be comma-grouped. The ONE list and rule live in
+# `ident_rule` (also mirrored by the frontend `_isIdentifierLabel`): the LAST
+# word (camelCase split too) decides, so "Order Value" / "Number of Orders" /
+# "ID Count" group while "Order ID" / "Customer Code" / "Year" stay raw.
+_IDENTIFIER_HEAD_WORDS = ident_rule.IDENT_WORDS
 
 
 def _is_identifier_label(label) -> bool:
     """True when the label's HEAD (last) word names a year/identifier dimension,
-    so its numeric values should stay un-grouped. Never raises."""
+    so its numeric values should stay un-grouped. Delegates to
+    `ident_rule.is_identifier_name` (the name is kept for callers). Never
+    raises."""
     try:
         if not label:
             return False
-        # Unicode letter tokens (drops digits/punctuation/units like "(USD)").
-        toks = re.findall(r"[^\W\d_]+", str(label))
-        if not toks:
+        return ident_rule.is_identifier_name(label)
+    except Exception:
+        return False
+
+
+def _is_identifier_axis_title(title) -> bool:
+    """True when an axis TITLE names an identifier: the name rule, or (in the
+    sandbox) a source input column the job's value rule marked
+    (`ident_rule.job_identifiers`). Never raises."""
+    try:
+        if not title:
             return False
-        return toks[-1].lower() in _IDENTIFIER_HEAD_WORDS
+        return bool(ident_rule.identifier_columns([title], ident_rule.job_identifiers()))
     except Exception:
         return False
 
@@ -1581,22 +1590,104 @@ def _format_plotly_numeric(fig):
                     break
             return bool(vals) and all(_is_num(v) for v in vals)
 
+        def _axis_sample(letter):
+            vals = []
+            for tr in traces:
+                arr = getattr(tr, letter, None)
+                if arr is None:
+                    continue
+                for v in list(arr)[:200]:
+                    if v is not None:
+                        vals.append(v)
+                if len(vals) >= 200:
+                    break
+            return vals
+
+        def _axis_title_text(axis):
+            t = getattr(axis, "title", None) if axis is not None else None
+            return (getattr(t, "text", None) or "") if t is not None else ""
+
+        def _trace_value_letter(tr):
+            """The axis letter that carries a trace's VALUES (the same rule
+            as `_value_var` below): "x" for a horizontal bar, None for a
+            pie / funnelarea / hierarchy trace, else "y"."""
+            ttype = getattr(tr, "type", None)
+            if ttype in ("pie", "funnelarea") or ttype in _HIERARCHY_TYPES:
+                return None
+            if ttype == "bar" and getattr(tr, "orientation", None) == "h":
+                return "x"
+            return "y"
+
+        def _is_value_axis(letter):
+            """True when some trace draws its VALUES on the primary `letter`
+            axis (a trace on a secondary axis — `y2` … — does not count)."""
+            for tr in traces:
+                try:
+                    if _trace_value_letter(tr) != letter:
+                        continue
+                    ref = getattr(tr, letter + "axis", None)
+                    if not ref or ref == letter:
+                        return True
+                except Exception:
+                    return True
+            return False
+
         layout = getattr(fig, "layout", None)
+        # Primary axes whose title names an identifier (the name rule, or a
+        # source column the job's value rule marked): never grouped, and
+        # their value labels are not grouped either (below).
+        ident_letters = set()
         for letter, axis_name in (("x", "xaxis"), ("y", "yaxis")):
             try:
                 axis = getattr(layout, axis_name, None)
                 atype = getattr(axis, "type", None) if axis is not None else None
-                if atype in ("date", "category", "multicategory", "log"):
+                if _is_identifier_axis_title(_axis_title_text(axis)):
+                    ident_letters.add(letter)
+                    numeric = _axis_numeric(letter)
+                    sample = [v for v in _axis_sample(letter) if _is_num(v)] if numeric else []
+                    integral = bool(sample) and all(float(v).is_integer() for v in sample)
+                    # A YEAR axis (every value a whole number in 1900–2100)
+                    # is left exactly as before: never grouped, no type or
+                    # format set here.
+                    if integral and all(1900 <= float(v) <= 2100 for v in sample):
+                        continue
+                    # A linear axis would print 52906123456 as "52.9B" and
+                    # place ticks between real ids. A pure DIMENSION axis
+                    # (no trace draws its values there, no explicit range,
+                    # no type set by the figure) shows its values as
+                    # categories. Any other identifier axis keeps its type;
+                    # it prints full digits (`tickformat="d"`: no grouping,
+                    # no SI suffix) only when its values are whole numbers
+                    # reaching 10 000 — where plotly would switch to "k" /
+                    # "B". Anything else is left as before (never grouped).
+                    no_range = getattr(axis, "range", None) is None if axis is not None else True
+                    if (atype in (None, "-") and numeric and no_range
+                            and not _is_value_axis(letter)):
+                        fig.update_layout(**{axis_name: dict(type="category")})
+                        continue
+                    if (integral and max(abs(float(v)) for v in sample) >= 10000
+                            and (atype in ("linear", "log") or (atype in (None, "-") and numeric))):
+                        fig.update_layout(**{axis_name: dict(tickformat="d")})
                     continue
-                # skip only genuine year/id-style axes (head-word match)
-                t = getattr(axis, "title", None) if axis is not None else None
-                ttxt = (getattr(t, "text", None) or "") if t is not None else ""
-                if _is_identifier_label(ttxt):
+                if atype in ("date", "category", "multicategory", "log"):
                     continue
                 if atype == "linear" or (atype in (None, "-") and _axis_numeric(letter)):
                     fig.update_layout(**{axis_name: dict(tickformat=",")})
             except Exception:
                 continue
+
+        def _value_axis_is_ident(tr, var):
+            """True when the trace's value axis (`var` x / y) is an
+            identifier axis: the primary one by `ident_letters`, a secondary
+            one (`y2` …) by its own title."""
+            if var not in ("x", "y"):
+                return False
+            ref = getattr(tr, var + "axis", None)
+            if not ref or ref == var:
+                return var in ident_letters
+            name = _layout_axis_name(ref)
+            axis = getattr(layout, name, None) if name else None
+            return _is_identifier_axis_title(_axis_title_text(axis))
 
         # ── Numeric value labels → thousands-grouped ──────────────────────
         # A trace can show numeric value labels three ways, all handled here:
@@ -1668,6 +1759,10 @@ def _format_plotly_numeric(fig):
         for tr in traces:
             try:
                 var = _value_var(tr)
+                # Value labels of a trace whose value axis is an identifier
+                # axis are left exactly as the code built them (no grouping).
+                if _value_axis_is_ident(tr, var):
+                    continue
                 # (C) sunburst/treemap/icicle without a texttemplate: a
                 # `textinfo` that shows the value gets an equivalent template
                 # whose value part is formatted (see _hierarchy_texttemplate);
@@ -1991,12 +2086,25 @@ def _format_matplotlib_numeric(fig):
         except Exception:
             pass
 
+        def _value_axis_letter(ax):
+            """The axis that carries the subplot's VALUES: "x" when it holds
+            a horizontal bar container (`barh`), else "y". Never raises."""
+            try:
+                for cont in list(getattr(ax, "containers", []) or []):
+                    if getattr(cont, "orientation", None) == "horizontal":
+                        return "x"
+            except Exception:
+                pass
+            return "y"
+
         for ax in fig.get_axes():
             for axis, label in ((ax.xaxis, ax.get_xlabel()), (ax.yaxis, ax.get_ylabel())):
                 try:
                     if _skip_axis(axis):
                         continue
-                    if _is_identifier_label(label):
+                    # An identifier axis (by label: the name rule or a source
+                    # column the job's value rule marked) is never grouped.
+                    if _is_identifier_axis_title(label):
                         continue
                     # Only group an axis whose CURRENT tick labels are all
                     # numeric. Skipping a string/category axis preserves names
@@ -2006,6 +2114,14 @@ def _format_matplotlib_numeric(fig):
                     axis.set_major_formatter(_mtick.FuncFormatter(_fmt))
                 except Exception:
                     continue
+            # Data labels show the VALUES: when the value axis is an
+            # identifier axis they are identifier values, left as drawn.
+            try:
+                value_label = ax.get_xlabel() if _value_axis_letter(ax) == "x" else ax.get_ylabel()
+                if _is_identifier_axis_title(value_label):
+                    continue
+            except Exception:
+                pass
             # Numeric data labels (bar labels / annotations). Plain numbers only;
             # a 4-digit year is left alone, 'k'/'M'-suffixed or text labels skip.
             for t in list(getattr(ax, "texts", []) or []):
@@ -2101,6 +2217,14 @@ def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: b
     # per-exec-site install pattern as SANDBOX_BUILTINS below).
     from exec_sanitizer import sanitize_for_execution
     dfs = sanitize_for_execution(dfs, sid_or_id)
+    # The job's source identifier columns, from its OWN input frames (the
+    # sandbox side decides; nothing new rides on the executor request). Kept
+    # as per-job state for the chart formatters; reset every job and
+    # computed lazily, the first time a figure is formatted.
+    try:
+        ident_rule.begin_job(dfs)
+    except Exception as _e:
+        logging.warning(f"[PLOT_RENDER] IDENT_COLUMNS_FAILED error={type(_e).__name__}")
     env["dfs"] = dfs
     # Same guarded builtins as `code_exec._execute_in_process` — chart code
     # must not import DB drivers / credential modules either (Article VII).

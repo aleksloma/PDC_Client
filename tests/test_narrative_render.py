@@ -318,7 +318,9 @@ def test_text_value_markdown_escaped():
     # a dash that is not leading is untouched
     assert _r("{{v}}", {"v": "a - b"}) == "a - b"
     # numbers are never escaped, whatever the kind
-    assert _r("{{n:text}}", {"n": -1234}) == "-1,234"
+    # (P31 Part D, deliberate update: an integral number under `text` is
+    # plain digits — still never escaped)
+    assert _r("{{n:text}}", {"n": -1234}) == "-1234"
     assert _r("{{n}}", {"n": -1234}) == "-1,234"
     assert _r("{{n:float}}", {"n": -0.5}) == "-0.50"
     # the template's own markdown is left alone

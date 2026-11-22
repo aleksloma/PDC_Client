@@ -44,6 +44,7 @@ import pandas as pd
 import brain_client
 import executor_client
 import html_sanitize
+import ident_rule
 import narrative
 import result_backstop
 from code_exec import safe_execute
@@ -679,13 +680,58 @@ def _normalize_df_for_table(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
 
-def _build_table_from_result(result_obj) -> Optional[dict]:
+def source_identifiers(sid, dfs, cache: dict | None = None) -> frozenset:
+    """The turn's source identifier columns (`ident_rule.
+    source_identifier_columns` over the input frames `dfs`), computed once
+    per turn: `cache` (a dict the caller keeps for the turn) holds the answer
+    keyed by the frames' identities together with STRONG references to those
+    frames, so an id can never be reused by another frame while cached and a
+    live frame fetched since is examined anew. Logs the COUNT only
+    (`IDENT_COLUMNS n=`), once per computation. Never raises (empty on
+    failure, Article IV)."""
+    try:
+        frames = dfs if isinstance(dfs, dict) else {}
+        key = tuple((str(k), id(v)) for k, v in frames.items())
+        if isinstance(cache, dict) and cache.get("key") == key and "idents" in cache:
+            return cache["idents"]
+        idents = ident_rule.source_identifier_columns(frames)
+        if isinstance(cache, dict):
+            cache["key"] = key
+            cache["frames"] = tuple(frames.values())
+            cache["idents"] = idents
+        log_with_sid(sid, "info", f"IDENT_COLUMNS n={len(idents)}")
+        return idents
+    except Exception as e:
+        log_with_sid(sid, "warning",
+                     f"IDENT_COLUMNS_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return frozenset()
+
+
+def _add_identifier_columns(table: dict, source_idents) -> dict:
+    """Adds the ADDITIVE `identifier_columns` key (the table's columns that
+    `ident_rule.identifier_columns` decides are identifiers — the name rule,
+    or a source column the value rule marked) only when non-empty. Never
+    raises; a table without the key renders by the browser's name rule."""
+    try:
+        cols = ident_rule.identifier_columns(table.get("columns") or [], source_idents or ())
+        if cols:
+            table["identifier_columns"] = cols
+    except Exception as e:
+        log_with_sid("table", "warning",
+                     f"IDENT_TABLE_FAILED error={log_safe_text(type(e).__name__, 80)}")
+    return table
+
+
+def _build_table_from_result(result_obj, source_idents=None) -> Optional[dict]:
     """Tiny port of the B2C `_build_table_from_result` for DataFrame / Series.
 
-    Returns {columns, rows, total_rows[, styled_html]} or None. When the result
-    is a pandas Styler, also carries `styled_html` so the frontend can render
-    the conditional formatting (B2C parity) while keeping the raw rows/columns
-    for "Show full table" and "Download Excel".
+    Returns {columns, rows, total_rows[, styled_html][, identifier_columns]}
+    or None. When the result is a pandas Styler, also carries `styled_html`
+    so the frontend can render the conditional formatting (B2C parity) while
+    keeping the raw rows/columns for "Show full table" and "Download Excel".
+    `identifier_columns` (additive, only when non-empty) names the columns
+    shown as plain digits — `source_idents` is the turn's
+    `source_identifiers`; None applies the name rule alone.
     """
     if result_obj is None:
         return None
@@ -708,12 +754,12 @@ def _build_table_from_result(result_obj) -> Optional[dict]:
         styled = _styler_to_html(result_obj)
         if styled:
             table["styled_html"] = styled
-        return table
+        return _add_identifier_columns(table, source_idents)
     except Exception:
         return None
 
 
-def _build_tables_from_result(result_obj) -> Optional[list]:
+def _build_tables_from_result(result_obj, source_idents=None) -> Optional[list]:
     """Handle a DICT of DataFrames/Series/Stylers as the executed RESULT
     (e.g. RESULT = {'Sales first 10': df1, 'Stock first 10': df2} — a shape
     models produce for "show each table" questions even though the planner
@@ -729,7 +775,7 @@ def _build_tables_from_result(result_obj) -> Optional[list]:
     tables: list = []
     for key, val in result_obj.items():
         try:
-            t = _build_table_from_result(val)
+            t = _build_table_from_result(val, source_idents)
             if t and int(t.get("total_rows", 0)) > 0 and (t.get("rows") or []):
                 t["title"] = str(key)
                 tables.append(t)
@@ -744,14 +790,14 @@ def _build_tables_from_result(result_obj) -> Optional[list]:
     return tables or None
 
 
-def _tables_from_python_result(result_obj, table):
+def _tables_from_python_result(result_obj, table, source_idents=None):
     """Shared post-processing for the PYTHON branches: when the single-table
     builder found nothing and the result is a dict of DF-likes, build the
     tables list; a single-entry dict unwraps back into the plain single-table
     path (no UI change needed for that common shape). Returns (table, tables)."""
     tables = None
     if table is None:
-        tables = _build_tables_from_result(result_obj)
+        tables = _build_tables_from_result(result_obj, source_idents)
         if tables and len(tables) == 1:
             table = dict(tables[0])
             table.pop("title", None)
@@ -950,6 +996,8 @@ def _run_chat_body(*, sid, dfs, schema_docs, question, history_rows, user_email,
         if context_decision.get("is_greeting"):
             g = brain_client.greeting(sid, question, df_names, user_email=user_email)
             return {"text": g.get("text", ""), "image_base64": None, "table": None, "code": None, "usage": _sum_usage(usage, g.get("usage", {}))}
+        # A plan cut at the token limit is an error turn, not "Try rephrasing".
+        _raise_if_plan_cut(sid, usage)
         # Else: try to summarize from scalar preview (we have no result yet, so just return generic)
         return {"text": "I couldn't generate analysis code for this question. Try rephrasing.", "image_base64": None, "table": None, "code": None, "usage": usage}
 
@@ -1076,10 +1124,11 @@ def _run_chat_body(*, sid, dfs, schema_docs, question, history_rows, user_email,
 
     # PYTHON branch
     result_obj = exec_out.get("result")
-    table = _build_table_from_result(result_obj)
+    idents = source_identifiers(sid, dfs)
+    table = _build_table_from_result(result_obj, idents)
     if table and (int(table.get("total_rows", 0)) <= 0 or not (table.get("rows") or [])):
         table = None
-    table, tables = _tables_from_python_result(result_obj, table)
+    table, tables = _tables_from_python_result(result_obj, table, idents)
     img_b64 = exec_out.get("image_base64")
 
     if img_b64:
@@ -1393,6 +1442,19 @@ def _raise_if_analysis_failed(sid, response, where: str) -> None:
                      f"ANALYSIS_FAILED error_code={log_safe_text(code, 40)} "
                      f"where={log_safe_text(where, 20)}")
         raise AnalysisFailedError(code)
+
+
+def _raise_if_plan_cut(sid, usage) -> None:
+    """A NO_CODE plan whose generation was CUT (`usage.finish_reason ==
+    "MAX_TOKENS"`) is an error turn, not "Try rephrasing": raises
+    AnalysisFailedError("llm_unavailable") so /lab shows the translated
+    `lab.analysis_failed` text even against a brain that does not send an
+    `error_code` for it. A complete NO_CODE reply keeps today's sentence."""
+    reason = usage.get("finish_reason") if isinstance(usage, dict) else None
+    if reason == "MAX_TOKENS":
+        log_with_sid(sid, "warning",
+                     "ANALYSIS_FAILED error_code=llm_unavailable where=plan_cut")
+        raise AnalysisFailedError("llm_unavailable")
 
 
 def _log_narrative_retry_timeout(sid, started: float) -> None:
@@ -2308,6 +2370,9 @@ def run_chat_multi_plot(
     # The live state is shared across the whole worklist: a table is fetched
     # once per turn and every block sees the same frame.
     state = _new_live_state(plan_out)
+    # The turn's source identifier columns, computed once (`source_identifiers`)
+    # the first time a table block needs them.
+    ident_cache: dict = {}
 
     def _render(code_, **kw):
         if not _ensure_live(sid, dfs, schema_docs, code_, state, user_email):
@@ -2851,12 +2916,13 @@ def run_chat_multi_plot(
             # out of it (A3.2).
             block_values = narr.absorb(exec_out, tb, block_n)
             result_obj = exec_out.get("result")
-            t = _build_table_from_result(result_obj)
+            idents = source_identifiers(sid, dfs, ident_cache)
+            t = _build_table_from_result(result_obj, idents)
             if t and (int(t.get("total_rows", 0)) <= 0 or not (t.get("rows") or [])):
                 t = None
             ts = None
             if t is None:
-                ts = _build_tables_from_result(result_obj)
+                ts = _build_tables_from_result(result_obj, idents)
             emitted = ([t] if t else []) + (ts or [])
             if not emitted:
                 continue
@@ -3126,6 +3192,8 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
             g = brain_client.greeting(sid, question, df_names, user_email=user_email)
             return {"text": g.get("text", ""), "image_base64": None, "table": None,
                     "code": None, "usage": _sum_usage(usage, g.get("usage", {}))}
+        # A plan cut at the token limit is an error turn, not "Try rephrasing".
+        _raise_if_plan_cut(sid, usage)
         return {"text": "I couldn't generate analysis code for this question. Try rephrasing.",
                 "image_base64": None, "table": None, "code": None, "usage": usage}
 
@@ -3330,10 +3398,11 @@ def _run_single_body(*, sid, dfs, schema_docs, schema_str, df_columns, df_names,
 
     # PYTHON
     result_obj = exec_out.get("result")
-    table = _build_table_from_result(result_obj)
+    idents = source_identifiers(sid, dfs)
+    table = _build_table_from_result(result_obj, idents)
     if table and (int(table.get("total_rows", 0)) <= 0 or not (table.get("rows") or [])):
         table = None
-    table, tables = _tables_from_python_result(result_obj, table)
+    table, tables = _tables_from_python_result(result_obj, table, idents)
     img_b64 = exec_out.get("image_base64")
 
     if img_b64:

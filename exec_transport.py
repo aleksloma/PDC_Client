@@ -63,6 +63,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from exec_sanitizer import sanitize_for_execution
+import ident_rule
 import logger_utils as _logger_utils
 from logger_utils import log_with_sid
 
@@ -810,16 +811,52 @@ def _without_default_index(styler):
         return styler
 
 
+def _ident_cell_text(value) -> str:
+    """One identifier cell of a styled table: '' for a missing value, the
+    plain digits of an integral number (no grouping, no ".0"), else str(v)."""
+    text = ident_rule.plain_text(value)
+    return "" if text is None else text
+
+
+def _with_plain_identifiers(styler):
+    """A COPY of `styler` whose identifier columns (decided by
+    `ident_rule.identifier_columns` over `styler.data`'s columns and the
+    job's source identifiers — `ident_rule.job_identifiers()`, the per-job
+    state `code_exec._execute_in_process` set from the job's own input
+    frames) are formatted as plain digit strings, overriding a generated
+    `.format(thousands=',')` for those columns only. No identifier column ->
+    the styler itself. Never raises: a failure logs the exception TYPE only
+    (a library message can quote a cell) and keeps the styler as it was."""
+    try:
+        frame = styler.data
+        cols = ident_rule.identifier_columns(frame.columns, ident_rule.job_identifiers())
+        if not cols:
+            return styler
+        wanted = set(cols)
+        subset = [c for c in frame.columns if str(c) in wanted]
+        if not subset or len(set(subset)) != len(subset) or not frame.columns.is_unique:
+            return styler
+        out = copy.deepcopy(styler)
+        formatted = out.format(_ident_cell_text, subset=subset, escape="html")
+        return formatted if formatted is not None and hasattr(formatted, "to_html") else styler
+    except Exception as e:
+        log_with_sid("exec", "warning",
+                     f"EXEC_STYLER_IDENT_FORMAT_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return styler
+
+
 def _styled_html(styler) -> Optional[str]:
     """`styler.to_html()` within the Styler caps, else None. An index that
     carries no information (RangeIndex / unnamed integer index, not a
     MultiIndex) is hidden first, on a copy (`_without_default_index`), so the
-    styled table shows no 0..n column — a meaningful index stays visible."""
+    styled table shows no 0..n column — a meaningful index stays visible.
+    Identifier columns are shown as plain digits first, on a copy
+    (`_with_plain_identifiers`)."""
     try:
         frame = styler.data
         if frame.shape[0] > STYLED_MAX_ROWS or frame.shape[1] > STYLED_MAX_COLS:
             return None
-        html = _without_default_index(styler).to_html()
+        html = _without_default_index(_with_plain_identifiers(styler)).to_html()
         if not isinstance(html, str) or not html.strip() or len(html) > STYLED_MAX_CHARS:
             return None
         return html

@@ -2129,24 +2129,97 @@ async function openConversation(chatId, convId) {
 }
 
 // Append message to chat
-// columns whose values must NOT be comma-grouped (years / identifiers).
-// Real date/datetime columns already arrive as strings, so the typeof===number
-// guard skips them; this only excludes numeric year/id-style columns by name.
-// We match the HEAD (last) word only — not any substring — so a MEASURE column
-// that merely mentions one of these words still groups ("Order Value",
-// "ID Count"), while "Order ID" / "Customer Code" / "Year" stay raw.
-// Mirrors plot_utils._is_identifier_label.
-const _IDENT_HEAD_WORDS = new Set(['year','yr','წელი','id','ids','code','codes','კოდი','იდ','zip','postal','phone','account','iban','invoice','order','ref']);
+// IDENTIFIER columns (personal numbers, ids, codes, accounts, years) are shown
+// as a plain digit string — never comma-grouped, never with decimals. The
+// server decides per table: `table.identifier_columns` (ident_rule.
+// identifier_columns — the name rule plus the input columns the value rule
+// found). A table without that key (a history row stored before it existed)
+// falls back to the NAME rule below, which mirrors ident_rule.
+// is_identifier_name: the LAST word — letter runs split on non-letters AND
+// camelCase ("personalNumber", "clientID") — is in the list, or the label
+// ends with "#". So a MEASURE that merely mentions a word still groups
+// ("Order Value", "ID Count", "number of orders").
+const _IDENT_HEAD_WORDS = new Set(['year','yr','წელი','id','ids','code','codes','კოდი','იდ','zip','postal','phone','account','iban','invoice','order','ref',
+  'number','num','no','nr','nbr','key','uid','guid','uuid',
+  'pin','pinfl','ssn','tin','inn','iin','passport','card','msisdn','imei',
+  'ნომერი','номер','код','счет','счёт','ид']);
+// MEASURE words: a label holding ANY of them is never an identifier by
+// name (mirrors ident_rule.MEASURE_WORDS).
+const _IDENT_MEASURE_WORDS = new Set(['amount','amt','sum','total','price','cost','revenue','sales','salary','income','balance','fee','value','qty','quantity','count','avg','mean','median','per','spend','profit','margin','rate','score','сумма','цена','стоимость','выручка','доход','баланс','количество','итого','თანხა','ფასი','ჯამი','შემოსავალი','ბალანსი','რაოდენობა']);
+// The ORIGINAL identifier words: a label ending in one of them is an
+// identifier even when it holds a measure word (ident_rule.ORIGINAL_IDENT_WORDS).
+const _IDENT_ORIGINAL_WORDS = new Set(['year','yr','წელი','id','ids','code','codes','კოდი','იდ','zip','postal','phone','account','iban','invoice','order','ref']);
 
-function _isIdentifierLabel(name) {
-  if (name == null) return false;
-  const toks = String(name).match(/\p{L}+/gu);
-  if (!toks || !toks.length) return false;
-  return _IDENT_HEAD_WORDS.has(toks[toks.length - 1].toLowerCase());
+// ident_rule.name_tokens: lower-cased letter runs, split on non-letters and
+// camelCase (an acronym splits before a following word of ≥ 2 lower-case
+// letters, so "HTTPServer" → http, server while "IDs" stays one word).
+function _identNameTokens(name) {
+  const chars = Array.from(String(name));
+  const isL = (c) => /\p{L}/u.test(c);
+  const isLo = (c) => /\p{Ll}/u.test(c);
+  const isUp = (c) => /\p{Lu}/u.test(c);
+  const toks = [];
+  let cur = '';
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    if (!isL(ch)) {
+      if (cur) { toks.push(cur.toLowerCase()); cur = ''; }
+      continue;
+    }
+    if (cur) {
+      const prev = chars[i - 1];
+      let split = isLo(prev) && isUp(ch);
+      if (!split && isUp(prev) && isUp(ch)) {
+        let j = i + 1;
+        while (j < chars.length && isL(chars[j]) && isLo(chars[j])) j++;
+        split = (j - (i + 1)) >= 2;
+      }
+      if (split) { toks.push(cur.toLowerCase()); cur = ''; }
+    }
+    cur += ch;
+  }
+  if (cur) toks.push(cur.toLowerCase());
+  return toks;
 }
 
-function _fmtCellValue(colName, v) {
-  if (typeof v === 'number' && isFinite(v) && !_isIdentifierLabel(colName)) {
+// `identCols`: the table's `identifier_columns` as a Set (or null).
+function _isIdentifierLabel(name, identCols) {
+  if (name == null) return false;
+  const label = String(name);
+  if (identCols && identCols.has(label)) return true;
+  const t = label.trim();
+  if (!t) return false;
+  const toks = _identNameTokens(t);
+  if (toks.some((w) => _IDENT_MEASURE_WORDS.has(w))
+    && !(toks.length && _IDENT_ORIGINAL_WORDS.has(toks[toks.length - 1]))) return false;
+  // "no" and a trailing "#" count only after another word that is not "yes"
+  const after = (prev) => prev.length >= 1 && prev[prev.length - 1] !== 'yes';
+  if (t.endsWith('#')) return after(toks);
+  if (!toks.length) return false;
+  const last = toks[toks.length - 1];
+  if (last === 'no') return after(toks.slice(0, -1));
+  return _IDENT_HEAD_WORDS.has(last);
+}
+
+// A table payload's `identifier_columns` (additive key) as a Set, else null.
+function _identColumnSet(table) {
+  const list = table && Array.isArray(table.identifier_columns) ? table.identifier_columns : null;
+  return list ? new Set(list.map((c) => String(c))) : null;
+}
+
+// An identifier cell: an integer as its plain digits (no grouping, no ".0"),
+// anything else as String(v); null/undefined → ''.
+function _fmtIdentValue(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'number' && isFinite(v) && Number.isInteger(v)) {
+    return v.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 0 });
+  }
+  return String(v);
+}
+
+function _fmtCellValue(colName, v, identCols) {
+  if (_isIdentifierLabel(colName, identCols)) return _fmtIdentValue(v);
+  if (typeof v === 'number' && isFinite(v)) {
     // Value-driven rounding: integers → 0 dp; non-integers → ≤2 dp (avoids raw
     // floats like "15,018.369999999999"). No column-name literals.
     return Number.isInteger(v)
@@ -3189,6 +3262,7 @@ function appendTableTo(div, table, fullKey, messageContext = '') {
 
   const previewCols = table.columns || [];
   const previewRows = Array.isArray(table.rows) ? table.rows.slice() : [];
+  const identCols = _identColumnSet(table);
   let tbody = null;
   let thead = null;
   let tableContainer = null;
@@ -3253,7 +3327,7 @@ function appendTableTo(div, table, fullKey, messageContext = '') {
         const td = document.createElement('td');
         let v = row && Object.prototype.hasOwnProperty.call(row, c) ? row[c] : '';
         if (v === null || v === undefined) v = '';
-        td.textContent = _fmtCellValue(c, v);
+        td.textContent = _fmtCellValue(c, v, identCols);
         td.style.cssText = 'border: 1px solid #e5e7eb; padding: 8px;';
         tr.appendChild(td);
       });
@@ -3320,6 +3394,7 @@ function appendTableTo(div, table, fullKey, messageContext = '') {
           body: JSON.stringify({
             columns: table.columns || [],
             rows: table.rows || [],
+            identifier_columns: Array.isArray(table.identifier_columns) ? table.identifier_columns : [],
             filename: filename
           })
         });
