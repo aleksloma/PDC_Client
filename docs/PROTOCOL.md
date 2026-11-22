@@ -270,7 +270,7 @@ summarize text.
                                           // OPTIONAL — keys are strings "1".."12"
   "diagnostic": true,                     // OPTIONAL — phase-1 plan with two_phase_v1 only; never false
   "error_code": "llm_budget_exhausted",   // OPTIONAL — "llm_budget_exhausted" when the budget ran out (with code too when only the narrative correction was skipped),
-  "models_tried": ["gemini-2.5-pro"]      //   or "llm_unavailable" (/v1/plan: no attempt answered, time left); see Errors
+  "models_tried": ["gemini-2.5-pro"]      //   or "llm_unavailable" (/v1/plan: no attempt answered or no reply was usable and none salvaged, time left); see Errors
 }
 ```
 
@@ -291,9 +291,11 @@ answer but reported tokens: a reserve attempt whose answer was not used
 not counted), and a streamed attempt that was stopped (stalled, cut at the
 thinking-token cap, cancelled or cut at its time bound) or failed after
 its stream had reported token counts, with the counts of the last
-`usageMetadata` it streamed. A plan that no model answered still carries
-these counts. `finish_reason` stays that of the answering call. Older
-clients ignore the new keys.
+`usageMetadata` it streamed, and every reply that answered but was not
+used (cut at the output limit, or prose without code; see `kind`
+semantics below). A plan that no model answered still carries these
+counts. `finish_reason` stays that of the answering call (`MAX_TOKENS` for
+a salvaged cut reply). Older clients ignore the new keys.
 
 `sql` (optional): `{<df key>: "<one read-only SELECT>"}`. The client never
 runs it as sent: the text passes the read-only guard (strict parse, CTEs
@@ -320,6 +322,18 @@ from domain context. The client returns `CLARIFICATION`, `ANSWER`, and
 `MISSING_DATA` text to the user directly without executing anything; a flow
 that requires code treats `ANSWER` and `MISSING_DATA` exactly like `NO_CODE`
 (retry loops count them as failed prose attempts).
+
+On `/v1/plan` each model reply is judged before it is returned. A reply that
+ended at the model's output limit (`MAX_TOKENS`), and prose without an
+outcome keyword or an empty reply, is not returned: the reserve or the next
+model of the chain answers instead. An exact `NO_CODE`, `CLARIFICATION`,
+`ANSWER`, `MISSING_DATA` and a safety block are returned as before. When no
+reply is usable, a cut reply that still holds a complete code block (its
+unfinished block dropped) is returned as `PYTHON` / `PLOT_CODE`; otherwise
+the plan is the fallback with `error_code: "llm_unavailable"` (or
+`llm_budget_exhausted` when the budget is spent; see Errors).
+`/v1/retry` still returns such prose as `NO_CODE`, and keeps the complete
+code blocks of a reply cut at the limit.
 
 How the brain reads the model reply into `kind`: `ANSWER`, `MISSING_DATA` and
 `CLARIFICATION` (also written `CLARIFY` / `NEED_CLARIFICATION`) count only as
@@ -1428,8 +1442,8 @@ attempt already returned code, its template is invalid), the code and kind
 are returned as usual with the invalid template dropped, plus the same two
 fields.
 
-On `/v1/plan` the budget also counts as spent when no attempt answered and
-less than 10 s of it is left when the attempts end, although no model was
+On `/v1/plan` the budget also counts as spent when no usable answer came
+back and less than 10 s of it is left when the attempts end, although no model was
 skipped.
 
 `models_tried` lists the models called for the answer itself, in the order
@@ -1438,10 +1452,13 @@ attempt when it made a call, then the further models of the chain). The
 models the complexity classifier called are not in it (they appear in the
 brain's `LLM_BUDGET` log line only, marked `:classifier`).
 
-### No model answered with time left (`llm_unavailable`, `/v1/plan` only)
+### No usable answer with time left (`llm_unavailable`, `/v1/plan` only)
 
 When no plan attempt answered (every model called failed: an HTTP error, a
-timeout, a stalled stream, the thinking-token cap) and at least 10 s of the
+timeout, a stalled stream, the thinking-token cap) OR no reply was usable
+(every reply that came back was cut at the output limit or was prose without
+code, and no cut reply still held a complete code block; see `kind`
+semantics under `/v1/plan`), and at least 10 s of the
 budget is still left when the attempts end, `/v1/plan` returns **HTTP 200**
 with the same fallback body (`kind: "NO_CODE"`, empty `code`,
 `context_decision.api_failed: true`) plus:
