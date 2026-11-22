@@ -25,6 +25,7 @@ import base64
 import json
 import math
 import os
+import re
 import stat
 import threading
 import warnings
@@ -498,7 +499,11 @@ def test_result_styler_html_is_byte_identical_to_that_object(job_dir):
     """ONE Styler object: every `.style` access carries a fresh uuid, so the
     comparison must be against the same object's own `to_html()`."""
     df = pd.DataFrame({"a": [1.0, 2.0, 3.0], "b": [3.0, 2.0, 1.0]})
-    sty = df.style.background_gradient(cmap="Blues").format("{:.2f}")
+    # C1 / F7 (deliberate update): `_styled_html` now hides a RangeIndex, so
+    # the Styler is built with the index already hidden — hiding is
+    # idempotent, and the byte-identity this test pins still holds whether
+    # the transport hides on the object itself or on a copy.
+    sty = df.style.background_gradient(cmap="Blues").format("{:.2f}").hide(axis="index")
     expected_html = sty.to_html()
     decoded = _roundtrip(_python_return(sty), job_dir)
     result = decoded["result"]
@@ -539,10 +544,144 @@ def test_styled_frame_to_html_returns_empty_string_when_html_is_none():
     assert sf2.to_html() == "<table></table>"
 
 
+# ---------------------------------------------------------------------------
+# C1 / F7: `_styled_html` hides an index that carries no information — the
+# `_normalize_df_for_table` rule: NOT a MultiIndex, no named level, and a
+# RangeIndex or an integer-dtype index. A meaningful index stays visible.
+# ---------------------------------------------------------------------------
+_TD_RE = re.compile(r"<td\b[^>]*\bclass=\"([^\"]*)\"[^>]*>(.*?)</td>", re.S)
+_COL_HEAD_RE = re.compile(r"<th\b[^>]*\bclass=\"(col_heading[^\"]*)\"[^>]*>(.*?)</th>", re.S)
+
+
+def _cells(html: str) -> list:
+    """(class, text) of every data cell and column heading — ids dropped,
+    since they carry the Styler's uuid."""
+    return _COL_HEAD_RE.findall(html) + _TD_RE.findall(html)
+
+
+def _styler(df: pd.DataFrame, uuid: str = "pdcc1"):
+    """A styler with a FIXED uuid, so two builds of it render byte-identically."""
+    return df.style.set_uuid(uuid).background_gradient(cmap="Blues").format("{:.1f}")
+
+
+def _metric_frame(index=None) -> pd.DataFrame:
+    return pd.DataFrame({"revenue": [100.0, 80.0, 120.0], "units": [10.0, 8.0, 12.0]},
+                        index=index)
+
+
+def _assert_index_hidden(html, df):
+    assert isinstance(html, str) and "<table" in html, html
+    assert "row_heading" not in html, html
+    assert 'class="blank' not in html, html
+    assert "index_name" not in html, html
+    # the column cells are exactly those of the same styler rendered with the
+    # index hidden by hand (same uuid -> byte-identical markup)
+    expected = _styler(df).hide(axis="index").to_html()
+    assert html == expected
+    assert _cells(html) == _cells(_styler(df).to_html())
+
+
+def test_styled_html_hides_a_range_index():
+    df = _metric_frame()
+    assert isinstance(df.index, pd.RangeIndex)
+    html = exec_transport._styled_html(_styler(df))
+    _assert_index_hidden(html, df)
+
+
+def test_styled_html_hides_a_filtered_unnamed_integer_index():
+    base = pd.DataFrame({"revenue": [100.0, 80.0, 120.0, 90.0, 130.0],
+                         "units": [10.0, 8.0, 12.0, 9.0, 13.0]})
+    df = base[base["revenue"] > 85.0]          # index 0, 2, 3, 4 — gaps, unnamed
+    assert not isinstance(df.index, pd.RangeIndex) or list(df.index) != list(range(len(df)))
+    assert df.index.name is None and pd.api.types.is_integer_dtype(df.index)
+    html = exec_transport._styled_html(_styler(df))
+    _assert_index_hidden(html, df)
+
+
+def test_styled_html_hides_an_explicit_unnamed_integer_index():
+    df = _metric_frame(index=pd.Index([10, 20, 30]))
+    html = exec_transport._styled_html(_styler(df))
+    _assert_index_hidden(html, df)
+
+
+@pytest.mark.parametrize("case", ["named_int", "named_range", "city_names", "dates",
+                                  "multiindex"])
+def test_styled_html_keeps_a_meaningful_index_visible(case):
+    if case == "named_int":
+        df = _metric_frame(index=pd.Index([10, 20, 30], name="branch_id"))
+    elif case == "named_range":
+        df = _metric_frame().rename_axis("row")
+    elif case == "city_names":
+        df = _metric_frame(index=pd.Index(["Tbilisi", "Batumi", "Kutaisi"]))
+    elif case == "dates":
+        df = _metric_frame(index=pd.date_range("2024-01-01", periods=3, freq="MS"))
+    else:
+        df = _metric_frame(index=pd.MultiIndex.from_tuples(
+            [(1, "a"), (1, "b"), (2, "a")]))
+    sty = _styler(df)
+    expected = sty.to_html()
+    assert "row_heading" in expected
+    html = exec_transport._styled_html(sty)
+    # untouched: byte-identical to the same styler's own rendering
+    assert html == expected
+    assert "row_heading" in html
+    if case == "city_names":
+        assert "Tbilisi" in html and "Kutaisi" in html
+
+
+def test_styled_html_hidden_index_survives_the_transport_round_trip(job_dir):
+    df = _metric_frame()
+    decoded = _roundtrip(_python_return(_styler(df)), job_dir)
+    result = decoded["result"]
+    assert isinstance(result, exec_transport.StyledFrame), type(result)
+    html = result.to_html()
+    _assert_index_hidden(html, df)
+    # the rows themselves are untouched (the frame crosses as data)
+    assert result.data.equals(df)
+    table = _build_table_from_result(result)
+    assert table is not None and "styled_html" in table, table
+    assert "row_heading" not in table["styled_html"]
+
+
+def test_styled_html_named_index_survives_the_transport_round_trip(job_dir):
+    df = _metric_frame(index=pd.Index(["Tbilisi", "Batumi", "Kutaisi"], name="city"))
+    sty = _styler(df)
+    expected = sty.to_html()
+    decoded = _roundtrip(_python_return(sty), job_dir)
+    result = decoded["result"]
+    assert isinstance(result, exec_transport.StyledFrame), type(result)
+    assert result.to_html() == expected
+    assert "Tbilisi" in result.to_html()
+
+
+def test_styled_html_never_raises_on_a_styler_like_object_without_hide():
+    class _Fake:
+        data = pd.DataFrame({"a": [1, 2]})
+
+        def to_html(self):
+            return "<table><tr><td>1</td></tr></table>"
+
+    out = exec_transport._styled_html(_Fake())
+    assert out is None or isinstance(out, str), out
+
+    class _Broken:
+        data = pd.DataFrame({"a": [1, 2]})
+
+        def hide(self, *a, **k):
+            raise RuntimeError("boom")
+
+        def to_html(self):
+            raise RuntimeError("boom")
+
+    assert exec_transport._styled_html(_Broken()) is None
+
+
 def test_result_dict_of_frames_with_per_entry_styler_html(job_dir):
     df1 = _sales()
     df2 = pd.DataFrame({"q": [1.0, 2.0], "r": [2.0, 1.0]})
-    sty2 = df2.style.background_gradient(cmap="Blues").format("{:.1f}")
+    # C1 / F7 (deliberate update): index hidden up front — see
+    # test_result_styler_html_is_byte_identical_to_that_object.
+    sty2 = df2.style.background_gradient(cmap="Blues").format("{:.1f}").hide(axis="index")
     value = {"Sales first 10": df1, "Stock first 10": sty2}
     expected_tables = _build_tables_from_result(value)
     decoded = _roundtrip(_python_return(value), job_dir)

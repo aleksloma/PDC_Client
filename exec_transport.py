@@ -46,6 +46,7 @@ type NAME (`Opaque`), never as content.
 from __future__ import annotations
 
 import base64
+import copy
 import io
 import json
 import math
@@ -778,13 +779,47 @@ def _is_styler(value: Any) -> bool:
             and hasattr(value, "to_html"))
 
 
+def _index_is_default(index) -> bool:
+    """True when a row index carries no information — the rule
+    `run_chat_local._normalize_df_for_table` uses for plain tables: not a
+    MultiIndex, no named level, and a RangeIndex or an integer-dtype index
+    (a filtered frame's gappy 0..n). Dates, labels, a named or a MultiIndex
+    are meaningful."""
+    return not (isinstance(index, pd.MultiIndex)
+                or any(n is not None for n in (index.names or []))
+                or not (isinstance(index, pd.RangeIndex)
+                        or pd.api.types.is_integer_dtype(index)))
+
+
+def _without_default_index(styler):
+    """The Styler to render: a shallow COPY with the index hidden when the
+    frame's index carries no information (`_index_is_default`), else the
+    styler itself. The copy (`Styler.__copy__`: same data, uuid, formats and
+    queued styles) keeps the caller's object untouched. Never raises: any
+    failure logs and renders the styler as given."""
+    try:
+        if not _index_is_default(styler.data.index):
+            return styler
+        if not callable(getattr(styler, "hide", None)):
+            return styler
+        hidden = copy.copy(styler).hide(axis="index")
+        return hidden if hidden is not None and hasattr(hidden, "to_html") else styler
+    except Exception as e:
+        log_with_sid("exec", "warning",
+                     f"EXEC_STYLER_HIDE_INDEX_FAILED: {log_safe_text(str(e))}")
+        return styler
+
+
 def _styled_html(styler) -> Optional[str]:
-    """`styler.to_html()` within the Styler caps, else None."""
+    """`styler.to_html()` within the Styler caps, else None. An index that
+    carries no information (RangeIndex / unnamed integer index, not a
+    MultiIndex) is hidden first, on a copy (`_without_default_index`), so the
+    styled table shows no 0..n column — a meaningful index stays visible."""
     try:
         frame = styler.data
         if frame.shape[0] > STYLED_MAX_ROWS or frame.shape[1] > STYLED_MAX_COLS:
             return None
-        html = styler.to_html()
+        html = _without_default_index(styler).to_html()
         if not isinstance(html, str) or not html.strip() or len(html) > STYLED_MAX_CHARS:
             return None
         return html

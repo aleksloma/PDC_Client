@@ -405,3 +405,124 @@ def test_fmt_default_locale_unchanged_by_uz_ru():
         assert fmt("2026 Март", "text", locale=loc) == "2026 Март"
         assert fmt(None, "count", locale=loc) == "n/a"
         assert fmt(True, "count", locale=loc) == "true"
+
+
+# --- C1 / F4: the `pvalue` kind -----------------------------------------------
+# A finite p-value below 0.001 (0 included) renders "<0.001", any other one in
+# [0.001, 1] three decimals; a negative value or one above 1 is not a p-value
+# ("n/a"); non-finite -> "n/a" (rule 7); a bool stays rule 3; the decimal
+# separator follows the locale like every other numeric kind. `float` is
+# untouched (pinned above).
+
+def test_pvalue_kind_registered_last_and_numeric():
+    assert "pvalue" in pdc_diag.KINDS
+    assert pdc_diag.KINDS[-1] == "pvalue"
+    assert pdc_diag.KINDS[:-1] == ("count", "float", "pct", "ratio", "amount", "text", "period")
+    assert "pvalue" in pdc_diag._NUMERIC_KINDS
+
+
+@pytest.mark.parametrize("value,expected", [
+    (0.0004, "<0.001"),
+    (0.0, "<0.001"),
+    (0, "<0.001"),                     # an int zero is a finite number too
+    (1e-300, "<0.001"),
+    (5e-324, "<0.001"),                # the smallest subnormal: never scientific
+    (0.0005, "<0.001"),                # below the threshold: never rounded up to 0.001
+    (0.000999, "<0.001"),
+    (0.001, "0.001"),
+    (0.0014, "0.001"),
+    (0.04213, "0.042"),
+    (0.05, "0.050"),
+    (0.5, "0.500"),
+    (0.9996, "1.000"),
+    (1.0, "1.000"),
+    (1, "1.000"),
+])
+def test_pvalue_format(value, expected):
+    out = fmt(value, "pvalue")
+    assert out == expected, out
+
+
+@pytest.mark.parametrize("value", [
+    -0.0001, -0.5, -1, -1e-12,          # negative: not a p-value
+    1.0000001, 1.5, 2, 42.0, 1e9,       # above 1: not a p-value
+    float("nan"), float("inf"), float("-inf"),
+    np.float64("nan"), np.float64("inf"),
+    None,
+])
+def test_pvalue_out_of_range_and_non_finite_are_na(value):
+    assert fmt(value, "pvalue") == "n/a"
+
+
+@pytest.mark.parametrize("value,expected", [
+    (np.float64(0.04213), "0.042"),
+    (np.float64(0.0004), "<0.001"),
+    (np.float32(0.5), "0.500"),
+    (np.float64(1.0), "1.000"),
+    (np.int64(0), "<0.001"),
+    (np.int64(1), "1.000"),
+    (np.float64(-0.2), "n/a"),
+    (np.float64(3.0), "n/a"),
+])
+def test_pvalue_numpy_scalars(value, expected):
+    assert fmt(value, "pvalue") == expected
+
+
+def test_pvalue_bool_and_string_follow_the_general_rules():
+    # rule 3: a bool is never a number
+    assert fmt(True, "pvalue") == "true"
+    assert fmt(False, "pvalue") == "false"
+    assert fmt(np.bool_(True), "pvalue") == "true"
+    # rule 6: a numeric kind with a string value -> the text rule, unparsed
+    assert fmt("0.04", "pvalue") == "0.04"
+    assert fmt("abc", "pvalue") == "abc"
+
+
+@pytest.mark.parametrize("locale", ["uz", "ru"])
+@pytest.mark.parametrize("value,expected", [
+    (0.0004, "<0,001"),
+    (0.0, "<0,001"),
+    (0.001, "0,001"),
+    (0.04213, "0,042"),
+    (0.5, "0,500"),
+    (1.0, "1,000"),
+    (-0.1, "n/a"),
+    (1.5, "n/a"),
+    (float("nan"), "n/a"),
+])
+def test_pvalue_uz_ru_locale_comma_decimal(locale, value, expected):
+    assert fmt(value, "pvalue", locale=locale) == expected
+
+
+def test_pvalue_default_and_unknown_locale_keep_the_point():
+    for loc in (None, "default", "xx", ""):
+        assert fmt(0.04213, "pvalue", locale=loc) == "0.042"
+        assert fmt(0.0004, "pvalue", locale=loc) == "<0.001"
+
+
+@pytest.mark.parametrize("value", [0.0, 1e-300, 5e-324, 1e-7, 2.5e-5, 0.0009, 0.001,
+                                   0.123456789, 1.0, np.float64(1e-20)])
+def test_pvalue_never_scientific(value):
+    for loc in (None, "uz", "ru"):
+        out = fmt(value, "pvalue", locale=loc)
+        assert "e" not in out.lower(), out
+        assert "+" not in out, out
+        assert len(out) <= pdc_diag.FMT_MAX_LEN
+
+
+@pytest.mark.parametrize("value", [object(), [0.01], {"p": 0.01}, b"0.01", complex(0.01, 0)])
+def test_pvalue_never_raises_on_odd_input(value):
+    out = fmt(value, "pvalue")
+    assert isinstance(out, str)
+    assert len(out) <= 200
+
+
+def test_float_kind_unchanged_by_pvalue():
+    # the pvalue kind is a NEW kind: `float` keeps two decimals, never "<0.01"
+    assert fmt(0.0004, "float") == "0.00"
+    assert fmt(0.04213, "float") == "0.04"
+    assert fmt(0.5, "float") == "0.50"
+    assert fmt(1.0, "float") == "1.00"
+    assert fmt(1.5, "float") == "1.50"
+    assert fmt(-0.2, "float") == "-0.20"
+    assert fmt(0.04213, "float", locale="ru") == "0,04"
