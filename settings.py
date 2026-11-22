@@ -94,7 +94,8 @@ class Settings(BaseModel):
     # surface as a named error, not as a spinner nobody can wait out.
     BRAIN_DRAFT_TIMEOUT: float = Field(default_factory=lambda: float(os.getenv("BRAIN_DRAFT_TIMEOUT", "60.0")))
     # Seconds a chat stream waits for its first answer event (a partial, a
-    # narrative or the done event) before it sends ONE keyed progress event
+    # caption, a narrative, the done / single answer or an error — see
+    # routes/chat.py `_is_answer_event`) before it sends ONE keyed progress event
     # `lab.taking_longer` ("This is taking longer than usual…"). Read by
     # routes/chat.py at call time; 0 sends no notice.
     SLOW_ANSWER_NOTICE_SECONDS: float = Field(default_factory=lambda: _float_env("SLOW_ANSWER_NOTICE_SECONDS", 90.0, 0.0))
