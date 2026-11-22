@@ -395,6 +395,86 @@ Remove the check's throwaway account and dashboard afterwards.
 
 ## Deploy history
 
+**2026-11-22 — `main` at `0268f47` (PR #42, PROMPT 29).** The lab-test
+findings of 21 Nov: stage messages in the stream (translated, with the "taking
+longer than usual" notice at `SLOW_ANSWER_NOTICE_SECONDS`, default 90 s),
+charts and single tables shown right after execution with their captions
+following, describe only where a planned caption did not render, a translated
+"analysis could not be completed" error for `llm_unavailable` /
+`llm_budget_exhausted`; the `pvalue` slot kind, a one-sided outlier drop, no
+index column on styled tables, the `coverage_check` period guard (more than
+5,000 distinct periods is refused); a log scale decided per axis with a note on
+the axis title and a top legend placed under the chart title; one dismiss
+helper for menus and dialogs (Escape, outside click), a top bar that fits, and
+Text / Number / Date / Yes-No column types; the conversation title after the
+first answered question; static files versioned by `?v=<commit>`, cached
+immutable and gzip-compressed (the Plotly bundle excluded). `SLOW_ANSWER_NOTICE_SECONDS`
+is not set on the service, so the image default applies; no spec change beyond
+the images. Built ONCE by Cloud Build `2754f1ee-4f75-4d0d-a6d3-e2d09f52e4d2`
+from a clean clone of GitHub `main` at `0268f47` (both images stamped
+`0268f47`, `BUILD_TIME=2026-11-22T12:00:25Z`) and deployed here first, then to
+`pdcclient-brb`; the brain went live after both (see `PDC_Brain/docs/DEPLOY.md`):
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:0268f47` | `sha256:16d02de39271bd09d267808e4df2ad87cbccfce5ba3ae9ddb320586d7158bc01` |
+| `pdcexecutor-demo:0268f47` | `sha256:2eb7d76ad492ce467d2dc92749c0789c0e788142c55c46ae3c543d2eb0d55fd2` |
+
+Revision `pdcclient-demo-0268f47`, serving 100 % since 2026-11-22 ~12:14 UTC;
+it resolved exactly the two digests above. It replaced
+`pdcclient-demo-f841877`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-demo-f841877=100
+```
+
+Backup taken before the deploy:
+`gs://pdc-enterprise-client-demo-data-backups/20261122-120154/`, which matched
+the data bucket in size (451,256,851 bytes) and in its 622 object names
+(0-byte folder objects ignored). Data bucket before the traffic move: 622
+files, 451,257,203 bytes; after the move and the live checks: 622 files,
+451,258,650 bytes.
+
+The spec change was image-only (two `image:` lines and the template name; the
+tag-only `candidate` traffic entry dropped), checked by a diff against the
+export before the Admin API `PUT`. Candidate checks (`candidate---…` URL):
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `0268f47`; the landing
+  answered 200, an anonymous `/lab` redirected to sign-in, and an anonymous
+  `/auth/active_chats` and `/api/admin/connections` answered 401. Revision log:
+  `LADMIN_PRESENT`, `RESET_TOKEN_INDEX_FILLED count=1`,
+  `EXECUTOR_HANDSHAKE_OK version=0268f47`, `DB_SCHEDULER_STARTED`; no error
+  lines, no 5xx, no `BACKEND_REQUEST_REFUSED`.
+- A self-registered throwaway account (scripted over HTTPS) saw
+  `window.__DIRECT_UPLOAD__ = true` on `/lab`, created a `sample_sales.csv`
+  chat (welcome message and three suggested questions present) and asked for
+  total revenue by product as a bar chart: the stream carried the stage events
+  (`lab.stage_working`, `…planning`, `…running`, `…summary`), the chart, then
+  the narrative; 74.5 s end to end on the brain then serving. The same account
+  created a dashboard and pinned the chart (1 tile read back).
+- All ten `/static` references of `/lab` carried `?v=0268f47`; the versioned
+  `dashboard.js` answered gzip, a weak ETag and
+  `Cache-Control: …max-age=31536000, immutable` (`public` for an anonymous
+  request, `private` when a session cookie is present).
+- `ladmin` signed in with the password in `CLIENT_DEMO_LADMIN_PASSWORD`
+  (302 → `/admin/data_sources`), so the sign-in problem recorded on 2026-11-10
+  is gone. The throwaway account was removed through
+  `POST /api/admin/users/remove` (1 chat deleted).
+- Not run: the browser-only checks (the Escape and outside-click layers, the
+  top bar at laptop widths, the chart legend under the title) and the > 32 MiB
+  direct-upload trace; the served `dashboard.js` / `i18n.js` carry the new
+  code and the local stack passed the browser tests.
+- After the shift, `client.powerdatachat.com` reported `/version` `0268f47`
+  and the same `/health`, served the same static headers, and a second
+  throwaway account (chart question 88 s, dashboard, pin) worked; `pdcbrain`
+  gained no revision at that point (`pdcbrain-00034-riq` serving).
+- Housekeeping: the throwaway account
+  `deploycheck-f841877-06533631@example.com` left pending on 2026-11-10 was
+  removed, and the two accounts of this deploy as well.
+- Brain: the new brain revision (`pdcbrain-00036-civ`) went live afterwards;
+  one question through `client.powerdatachat.com` on it answered (chart,
+  narrative, dashboard pin).
+
 **2026-11-10 — `main` at `f841877` (PRs #37, #39, #40).** Personal
 (self-service) database connections: a non-administrator account may add its
 own read-only connections and register up to `PERSONAL_TABLES_MAX` (default

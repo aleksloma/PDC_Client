@@ -218,6 +218,71 @@ the demo export is kept in `BRB_Database_template/docs/BRB_SERVICE_DIFF.md`.
 
 ## Deploy history
 
+**2026-11-22 — `main` at `0268f47` (PR #42, PROMPT 29).** The lab-test
+findings of 21 Nov: stage messages and early visuals in the stream, the
+"taking longer than usual" notice (`SLOW_ANSWER_NOTICE_SECONDS`, default 90 s,
+not set on the service), the `pvalue` slot kind, a one-sided outlier drop,
+per-axis log scale, the legend under the chart title, one dismiss helper for
+menus and dialogs, the top bar fit and plain column types, the conversation
+title after the first answered question, and versioned, immutable, gzip
+static files (see the `pdcclient-demo` entry). Same images as
+`pdcclient-demo` (Cloud Build `2754f1ee-4f75-4d0d-a6d3-e2d09f52e4d2`,
+`BUILD_TIME=2026-11-22T12:00:25Z`), deployed right after the demo; the
+revision resolved exactly these digests:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:0268f47` | `sha256:16d02de39271bd09d267808e4df2ad87cbccfce5ba3ae9ddb320586d7158bc01` |
+| `pdcexecutor-demo:0268f47` | `sha256:2eb7d76ad492ce467d2dc92749c0789c0e788142c55c46ae3c543d2eb0d55fd2` |
+
+Revision `pdcclient-brb-0268f47`, serving 100 % since 2026-11-22 ~12:21 UTC.
+It replaced `pdcclient-brb-f841877`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-brb --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-brb-f841877=100
+```
+
+Backups taken before the deploy:
+- Data bucket: `gs://pdc-enterprise-client-brb-data-backups/20261122-121720/`,
+  which matched the data bucket in size (285,619,830 bytes) and in its 347
+  object names (0-byte folder objects ignored). Data bucket before the
+  traffic move: 347 files, 285,619,830 bytes; after the move and the live
+  checks: 347 files, 285,620,721 bytes.
+- Database (Cloud SQL export of `brb-demo-pg`, instance `RUNNABLE`):
+  `gs://pdc-enterprise-client-brb-data-backups/20261122-121720-sql/brb_demo.sql.gz`
+  (180,645,192 bytes).
+
+The spec change was image-only (two `image:` lines and the template name; the
+tag-only `candidate` traffic entry dropped; the `cloudsql-instances`
+annotation, secrets, buckets and resources carried over), checked by a diff
+against the export before the Admin API `PUT`. Candidate checks
+(`candidate---…` URL), none of them signed in:
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `0268f47`; the landing
+  answered 200, an anonymous `/lab` redirected to sign-in, and an anonymous
+  `/auth/active_chats` and `/api/admin/connections` answered 401. Revision log:
+  `LADMIN_PRESENT`, `RESET_TOKEN_INDEX_FILLED count=9`,
+  `EXECUTOR_HANDSHAKE_OK version=0268f47`, `DB_SCHEDULER_STARTED`; no error
+  lines, no 5xx, no `BACKEND_REQUEST_REFUSED`.
+- The served `i18n.js` carries the stage, `lab.taking_longer` and
+  `lab.analysis_failed` strings and the served `dashboard.js` the dismiss
+  helper (`registerDismissLayer`); both answered `immutable` for `?v=0268f47`.
+- `ladmin`: one scripted sign-in with `CLIENT_BRB_LADMIN_PASSWORD` answered
+  401 (the secret still predates the 2026-10-03 password change; one attempt
+  only, not retried).
+- **Pending, to be done by hand in the browser:** the signed-in checks (the
+  connection test and 39 tables, a question in a DB-table chat, the invitation
+  sent twice). This instance is invitation-only and no account was created;
+  the same two digests passed the signed-in checks on the `pdcclient-demo`
+  candidate and on `client.powerdatachat.com`. After the brain went live the
+  BRB signed-in question was NOT run either, for the same reason: store the
+  current `ladmin` password as a new version of `CLIENT_BRB_LADMIN_PASSWORD`
+  so the next deploy can sign in.
+- After the shift, `brb.powerdatachat.com` reported `/version` `0268f47` and
+  the same `/health`, and served the same static headers; `pdcbrain` gained
+  no revision at that point (`pdcbrain-00034-riq`) and `pdcclient-demo` stayed
+  on `pdcclient-demo-0268f47`.
+
 **2026-11-10 — `main` at `f841877` (PRs #37, #39, #40).** Personal
 (self-service) database connections for non-administrator accounts, owner-only
 and never grantable to a role, with the per-user "Own connections" switch (on
