@@ -1006,6 +1006,163 @@ function initDesktopSidebar() {
   }
 }
 
+// ── Dismissing layers: Escape and outside click ────────────────────────────
+// ONE place decides what Escape and a click outside close on /lab.
+//  - MENUS (the dropdowns / popovers listed in _DISMISS_MENUS): a click
+//    outside a menu closes it. The listener runs in the CAPTURE phase, so an
+//    opener or a modal that stops propagation cannot hide the click from it,
+//    and clicking any opener closes every other open menu first.
+//  - MODALS (`.modal`): a click on the backdrop (pressed and released there)
+//    closes the TOPMOST visible modal through the close function registered
+//    for it with registerDismissLayer — Rename and Delete resolve their
+//    promise there, Share drops its handlers, the file-collision dialog
+//    answers 'drop'. A modal with no registered function is hidden.
+//  - Escape closes the open menus when there are any, else the topmost modal.
+// One key press or click closes one layer: never the modal under a menu.
+// The full-screen chart / image viewers (.pdc-fullscreen-viewer) close
+// themselves, and a busy overlay (an upload, a rename in flight) blocks both.
+const _DISMISS_MENUS = [
+  { sel: '#profileDropdown', inside: '.profile-dropdown-container' },
+  { sel: '#downloadReportMenu', inside: '#downloadReportDropdown' },
+  { sel: '#dashboardsMenu', inside: '#dashboardsDropdown' },
+  { sel: '#dbSelectPanel', inside: '#dbSelectWrap', close: () => _closeDbPanel() },
+  // the sidebar "⋯" menu (showItemMenu) and the add-to-dashboard picker are
+  // built on open and removed on close
+  { sel: '.item-context-menu', inside: '.item-context-menu', close: (el) => el.remove() },
+  { sel: '.pdc-dash-pop', inside: '.pdc-dash-pop', close: () => _closeDashPicker() },
+];
+
+const _dismissModalClosers = new Map();   // modal element -> its own close function
+
+// A modal opened by code that owns a close function hands it over while it
+// is open (a later call for the same modal replaces it).
+function registerDismissLayer(modal, close) {
+  if (modal && typeof close === 'function') _dismissModalClosers.set(modal, close);
+}
+
+function _openDismissMenus() {
+  const open = [];
+  _DISMISS_MENUS.forEach((menu) => {
+    document.querySelectorAll(menu.sel).forEach((el) => {
+      if (!el.classList.contains('hidden')) open.push({ menu, el });
+    });
+  });
+  return open;
+}
+
+function _closeDismissMenu(entry) {
+  try {
+    if (entry.menu.close) entry.menu.close(entry.el);
+    else entry.el.classList.add('hidden');
+  } catch (e) {
+    console.warn('Closing a menu failed:', e);
+  }
+}
+
+function _topDismissModal() {
+  let top = null;
+  let topZ = -Infinity;
+  document.querySelectorAll('.modal').forEach((el) => {
+    if (el.classList.contains('hidden')) return;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none') return;
+    const z = parseInt(style.zIndex, 10) || 0;
+    if (z >= topZ) { top = el; topZ = z; }   // on a tie the later one is on top
+  });
+  return top;
+}
+
+function _closeDismissModal(modal) {
+  const close = _dismissModalClosers.get(modal);
+  try {
+    if (close) close();
+    else modal.classList.add('hidden');
+  } catch (e) {
+    console.warn('Closing a dialog failed:', e);
+    modal.classList.add('hidden');
+  }
+}
+
+function _dismissBlocked() {
+  if (document.querySelector('.pdc-fullscreen-viewer')) return true;
+  return ['loadingOverlay', 'frictionlessOverlay'].some((id) => {
+    const el = document.getElementById(id);
+    return !!el && !el.classList.contains('hidden');
+  });
+}
+
+function initLayerDismiss() {
+  const hide = (id) => () => document.getElementById(id)?.classList.add('hidden');
+  // The page's fixed modals. Rename, Share, Delete, New dashboard and the
+  // file-collision dialog register their own close function when they open.
+  [
+    ['createNewModal', closeCreateWizard],
+    ['schemaViewerModal', hide('schemaViewerModal')],
+    ['changePwModal', hide('changePwModal')],
+    ['profileModal', hide('profileModal')],
+    ['subscriptionModal', _closeSubModal],
+    ['aboutModal', hide('aboutModal')],
+    ['autoAnalyticsPopup', hide('autoAnalyticsPopup')],
+  ].forEach(([id, close]) => registerDismissLayer(document.getElementById(id), close));
+
+  let downTarget = null;
+  document.addEventListener('mousedown', (e) => { downTarget = e.target; }, true);
+  document.addEventListener('click', (e) => {
+    const target = e.target;
+    let closedMenu = false;
+    _openDismissMenus().forEach((entry) => {
+      if (target && target.closest && target.closest(entry.menu.inside)) return;
+      _closeDismissMenu(entry);
+      closedMenu = true;
+    });
+    if (closedMenu || _dismissBlocked()) return;
+    const modal = _topDismissModal();
+    if (modal && target === modal && downTarget === modal) _closeDismissModal(modal);
+  }, true);
+  document.addEventListener('keydown', (e) => {
+    // An Escape that ends an IME composition, or that a field already used
+    // (a description being edited cancels its edit), closes nothing.
+    if (e.key !== 'Escape' || e.isComposing || e.defaultPrevented || _dismissBlocked()) return;
+    const menus = _openDismissMenus();
+    if (menus.length) {
+      menus.forEach(_closeDismissMenu);
+      return;
+    }
+    const modal = _topDismissModal();
+    if (modal) _closeDismissModal(modal);
+  });
+}
+
+// Top bar: from 769 to 1200 px dashboard.css shows the buttons as icons. A
+// wide sidebar can leave too little room above 1200 px too, so the bar is
+// also marked `top-bar-compact` (same icon rules, desktop only) whenever its
+// full labels overflow. Measured on every size change of the bar or of its
+// buttons (a button shown or hidden, a label translated).
+function initTopBarFit() {
+  const bar = document.querySelector('.top-bar');
+  if (!bar || typeof ResizeObserver !== 'function') return;
+  const actions = bar.querySelector('.top-bar-actions');
+  // Strict: the buttons end past the bar's content box (sub-pixel included),
+  // or the bar scrolls at all.
+  const overflows = () => {
+    if (bar.scrollWidth > bar.clientWidth) return true;
+    if (!actions) return false;
+    const style = window.getComputedStyle(bar);
+    const contentRight = bar.getBoundingClientRect().right
+      - (parseFloat(style.paddingRight) || 0) - (parseFloat(style.borderRightWidth) || 0);
+    return actions.getBoundingClientRect().right > contentRight + 0.01;
+  };
+  const fit = () => {
+    bar.classList.remove('top-bar-compact');
+    if (overflows()) bar.classList.add('top-bar-compact');
+  };
+  const observer = new ResizeObserver(fit);
+  observer.observe(bar);
+  if (actions) observer.observe(actions);
+  // While compact the labels take no room, so a translation changes no size.
+  window.addEventListener('languageChanged', fit);
+}
+
 // Setup event listeners
 function setupEventListeners() {
   // Mobile sidebar toggle
@@ -1043,20 +1200,21 @@ function setupEventListeners() {
   // first open (on slow storage the round trip takes seconds).
   _fetchDbTables();
   
-  // Profile icon dropdown
+  // Profile icon dropdown. Outside click, Escape and "another menu opened"
+  // are handled by initLayerDismiss (one capture-phase listener for every
+  // menu), so the opener no longer stops the click from propagating.
   const profileIconBtn = document.getElementById('btnProfileIcon');
   const profileDropdown = document.getElementById('profileDropdown');
-  
-  profileIconBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
+
+  profileIconBtn.addEventListener('click', () => {
     profileDropdown.classList.toggle('hidden');
   });
-  
-  // Close dropdown when clicking outside
-  document.addEventListener('click', () => {
-    profileDropdown.classList.add('hidden');
-  });
-  
+
+  // Escape / outside click for every menu and modal of the page
+  initLayerDismiss();
+  // Top bar: icons only when the labels do not fit
+  initTopBarFit();
+
   // Profile button — opens profile modal at top.
   // Enterprise: the dropdown has no Profile / Subscriptions items (replaced
   // by Change Password + Logout), so these are optional bindings.
@@ -1262,11 +1420,11 @@ function setupEventListeners() {
   // Download Analytics dropdown: main button toggles menu; the two
   // [data-format] items dispatch by format. The Auto Analytics item keeps its
   // own handler (AutoAnalytics.init above) — here it only closes the menu.
+  // Outside click / Escape: initLayerDismiss.
   const dlBtn = document.getElementById('btnDownloadReport');
   const dlMenu = document.getElementById('downloadReportMenu');
   if (dlBtn && dlMenu) {
-    dlBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
+    dlBtn.addEventListener('click', () => {
       dlMenu.classList.toggle('hidden');
     });
     document.getElementById('btnAutoAnalytics')?.addEventListener('click', () => {
@@ -1279,11 +1437,6 @@ function setupEventListeners() {
         dlMenu.classList.add('hidden');
         downloadReport(format);
       });
-    });
-    document.addEventListener('click', (e) => {
-      if (!e.target.closest('#downloadReportDropdown')) {
-        dlMenu.classList.add('hidden');
-      }
     });
   }
   
@@ -1578,9 +1731,11 @@ async function downloadReport(format) {
   const endpoint = fmt === 'pptx' ? 'download_pptx' : 'download_report';
   const defaultFilename = fmt === 'pptx' ? 'analytics_report.pptx' : 'analytics_report.pdf';
 
-  const originalText = btn.textContent;
+  // Only the label span changes: the button also holds the icon span, which
+  // stays visible when the top bar shows icons only.
+  const label = btn.querySelector('.top-bar-label');
   btn.disabled = true;
-  btn.textContent = 'Generating Report...';
+  if (label) label.textContent = _t('lab.generating_report', 'Generating Report...');
 
   try {
     const res = await pdcFetch(`/api/chat/${currentChatId}/conversation/${currentConvId}/${endpoint}`, {
@@ -1615,7 +1770,7 @@ async function downloadReport(format) {
     showToast('Failed to download report', true);
   } finally {
     btn.disabled = false;
-    btn.textContent = originalText;
+    if (label) label.textContent = _t('lab.download_report', 'Download Analytics');
   }
 }
 
@@ -2691,6 +2846,7 @@ function createImageWithFullscreen(base64Data, messageContext = '') {
 
   viewBtn.addEventListener('click', () => {
     const modal = document.createElement('div');
+    modal.className = 'pdc-fullscreen-viewer';   // closes itself (Escape below); initLayerDismiss stands aside
     modal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 10000; display: flex; align-items: center; justify-content: center; cursor: zoom-out;';
 
     const modalImg = document.createElement('img');
@@ -2823,6 +2979,7 @@ function createPlotlyContainer(htmlString, chatIdRef, messageContext = '', chart
   viewBtn.style.cssText = 'padding: 6px 12px; font-size: 13px;';
   viewBtn.addEventListener('click', () => {
     const modal = document.createElement('div');
+    modal.className = 'pdc-fullscreen-viewer';   // closes itself (Escape below); initLayerDismiss stands aside
     modal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95); z-index: 10000; display: flex; align-items: center; justify-content: center; padding: 0;';
 
     const modalIframe = document.createElement('iframe');
@@ -4082,16 +4239,9 @@ function _wireDbPanel() {
   }
   if (_dbPanelWired) return;
   _dbPanelWired = true;
-  // Outside click / Escape close. The closest() guard keeps checkbox clicks
-  // inside the panel from closing it. CAPTURE phase: several modal handlers
-  // call stopPropagation(), which would swallow a bubbling document listener
-  // and leave the panel stuck open.
-  document.addEventListener('click', (e) => {
-    if (!e.target.closest('#dbSelectWrap')) _closeDbPanel();
-  }, true);
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') _closeDbPanel();
-  });
+  // Outside click / Escape close: initLayerDismiss (_DISMISS_MENUS — its
+  // capture-phase click listener is not swallowed by the modal handlers that
+  // call stopPropagation, and Escape closes the panel before the wizard).
   // The panel is position:fixed (the wizard modal clips absolute children),
   // so any scroll would leave it floating detached — just close it.
   document.addEventListener('scroll', (e) => {
@@ -4452,6 +4602,8 @@ function _showFileCollisionDialog(fileName, suggestedName, fileObj) {
     renameBtn.onclick = () => done('rename');
     overwriteBtn.onclick = () => done('overwrite');
     closeBtn.onclick = () => done('drop');
+    // Escape / backdrop click answer like ✕: the file is not added.
+    registerDismissLayer(modal, () => done('drop'));
     modal.classList.remove('hidden');
     // Background probe — replaces the note only if THIS dialog is still open.
     _probeCollisionStructure(fileObj, fileName).then((res) => {
@@ -5232,10 +5384,12 @@ function _renderEditableSchema() {
     } else {
       colNames.forEach(col => {
         const info = fields[col] || {};
-        const dtype = info.technical_description ? String(info.technical_description).split(',')[0] : '';
+        const technical = info.technical_description ? String(info.technical_description) : '';
+        const dtype = technical ? technical.split(',')[0].trim() : '';
         section.appendChild(_buildEditorRow({
           labelText: col,
-          dtype: dtype,
+          dtype: _columnTypeLabel(dtype, technical, col),
+          dtypeTitle: dtype,
           value: (typeof info.description === 'string') ? info.description : '',
           multiline: false,
           onSave: (newVal, done) => _saveColumnDescription(fileIdx, col, newVal, done),
@@ -5247,8 +5401,99 @@ function _renderEditableSchema() {
   });
 }
 
+// The data-type label of a column in the Descriptions view: Text / Number /
+// Date / Yes-No, localized. DISPLAY ONLY: it is read from the stored
+// technical description (whose first part is the pandas dtype, kept as the
+// label's tooltip); what the page saves, what the brain receives and the
+// dtypes the analysis sees do not change. A text column reads "Date" when
+// the values its description already lists (a column with at most 20
+// distinct values) all look like dates, or — when it lists none — when its
+// name says date: a CSV date column stays text in pandas, nothing parses it.
+const _COLUMN_TYPE_LABELS = {
+  text: ['schema.type_text', 'Text'],
+  number: ['schema.type_number', 'Number'],
+  date: ['schema.type_date', 'Date'],
+  yesno: ['schema.type_yesno', 'Yes/No'],
+};
+const _MONTH_NAME = '(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?';
+const _DATE_TEXT_PATTERNS = [
+  // 2024-01-15, 2024/1/5, 2024.01.15, optional time / zone
+  /^\d{4}([-/.])(0?[1-9]|1[0-2])\1(0?[1-9]|[12]\d|3[01])([ T]\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?\s*(Z|[+-]\d{2}:?\d{2})?)?$/,
+  // 2024-01, 2024/01
+  /^\d{4}[-/](0?[1-9]|1[0-2])$/,
+  // 15/01/2024, 1-5-24 (day or month first), optional time
+  /^\d{1,2}([-/])\d{1,2}\1(\d{2}|\d{4})([ T]\d{1,2}:\d{2}(:\d{2})?)?$/,
+  // 15.01.2024 — a four-digit year only, so a version number (1.2.10) is not a date
+  /^\d{1,2}\.\d{1,2}\.\d{4}([ T]\d{1,2}:\d{2}(:\d{2})?)?$/,
+  // 5 Jan 2024, 05-Jan-24, 5 January, 2024, Jan 2024, January 5 2024, Jan 5, 2024
+  new RegExp('^\\d{1,2}[ -]' + _MONTH_NAME + ',?[ -]\\d{2,4}$', 'i'),
+  new RegExp('^' + _MONTH_NAME + '[ -](\\d{1,2},?[ -])?\\d{4}$', 'i'),
+];
+// The name rule (used only when the description lists no values): a date
+// token, or an `_at` / `_on` ending (created_at, createdAt, posted_on) —
+// never when a text-like token says the column holds words about a date.
+const _DATE_NAME_TOKENS = new Set(['date', 'dates', 'datetime', 'timestamp', 'dt', 'datum',
+  'дата', 'თარიღი']);
+const _DATE_NAME_SUFFIXES = new Set(['at', 'on']);
+const _TEXT_NAME_TOKENS = new Set(['comment', 'comments', 'note', 'notes', 'text', 'description',
+  'descriptions', 'desc', 'remark', 'remarks']);
+
+function _isDateText(value) {
+  const v = String(value || '').trim();
+  return !!v && _DATE_TEXT_PATTERNS.some(re => re.test(v));
+}
+
+// The values a technical description lists, all dates? dataset_profile writes
+// `CATEGORICAL (<n> unique: <v1>, <v2>, …)` — the values joined by ", ", each
+// cut to 40 characters — so a value can itself hold ", " ("Jan 5, 2024").
+// The fragments are re-joined: at each position the longest run (up to three
+// fragments) that reads as a date is one value; a fragment that starts no
+// date makes the answer false, and the number of values found must be <n>.
+// null when the description lists no values.
+function _listedValuesAllDates(technical) {
+  const listed = /CATEGORICAL \((\d+) unique: (.*)\)\s*$/s.exec(technical || '');
+  if (!listed || !listed[2].trim()) return null;
+  const parts = listed[2].split(', ');
+  let i = 0;
+  let found = 0;
+  while (i < parts.length) {
+    let j = Math.min(parts.length, i + 3);
+    while (j > i && !_isDateText(parts.slice(i, j).join(', '))) j--;
+    if (j === i) return false;
+    found += 1;
+    i = j;
+  }
+  return found === parseInt(listed[1], 10);
+}
+
+function _textColumnLooksLikeDate(technical, name) {
+  const listed = _listedValuesAllDates(technical);
+  if (listed !== null) return listed;      // listed values decide
+  const tokens = String(name || '')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean);
+  if (tokens.some(t => _TEXT_NAME_TOKENS.has(t))) return false;
+  if (tokens.some(t => _DATE_NAME_TOKENS.has(t))) return true;
+  return tokens.length >= 2 && _DATE_NAME_SUFFIXES.has(tokens[tokens.length - 1]);
+}
+
+function _columnTypeLabel(dtype, technical, name) {
+  const d = String(dtype || '').trim().toLowerCase();
+  if (!d) return '';
+  let kind = 'text';
+  if (d === 'bool' || d === 'boolean') kind = 'yesno';
+  else if (/^(u?int|float|complex|decimal|timedelta)/.test(d)) kind = 'number';
+  else if (/^(datetime|date|period)/.test(d)) kind = 'date';
+  else if (_textColumnLooksLikeDate(technical, name)) kind = 'date';
+  const [key, fallback] = _COLUMN_TYPE_LABELS[kind];
+  return _t(key, fallback);
+}
+
 function _buildEditorRow(opts) {
-  // opts: { labelText, dtype, value, multiline, onSave(newVal, done) }
+  // opts: { labelText, dtype (the shown type label), dtypeTitle (its tooltip),
+  //         value, multiline, onSave(newVal, done) }
   const row = document.createElement('div');
   row.className = 'editor-row';
 
@@ -5259,6 +5504,7 @@ function _buildEditorRow(opts) {
     const dtypeEl = document.createElement('span');
     dtypeEl.className = 'editor-dtype';
     dtypeEl.textContent = opts.dtype;
+    if (opts.dtypeTitle) dtypeEl.title = opts.dtypeTitle;
     labelEl.appendChild(dtypeEl);
   }
   row.appendChild(labelEl);
@@ -5267,7 +5513,19 @@ function _buildEditorRow(opts) {
   valueWrap.className = 'editor-value';
   row.appendChild(valueWrap);
 
+  // While the row is in edit mode, Escape cancels the edit (the draft is
+  // dropped, as Cancel does) instead of closing the Descriptions modal,
+  // wherever the focus is in the modal: this listener runs in the capture
+  // phase and marks the key handled (preventDefault), which initLayerDismiss
+  // respects; the next Escape closes the modal.
+  let escListener = null;
+  const stopEscListener = () => {
+    if (escListener) document.removeEventListener('keydown', escListener, true);
+    escListener = null;
+  };
+
   const renderRead = (currentValue) => {
+    stopEscListener();
     valueWrap.innerHTML = '';
     const text = document.createElement('div');
     text.className = 'editor-value-text';
@@ -5345,6 +5603,17 @@ function _buildEditorRow(opts) {
     actions.appendChild(cancelBtn);
     form.appendChild(actions);
     valueWrap.appendChild(form);
+
+    stopEscListener();
+    escListener = (e) => {
+      if (e.key !== 'Escape' || e.isComposing || e.defaultPrevented) return;
+      if (!form.isConnected) { stopEscListener(); return; }   // the modal was re-rendered
+      if (form.offsetParent === null) return;                  // the modal is closed
+      e.preventDefault();
+      if (input.disabled) return;   // saving: its answer re-renders the row
+      renderRead(currentValue);
+    };
+    document.addEventListener('keydown', escListener, true);
 
     setTimeout(() => input.focus(), 30);
   };
@@ -5542,13 +5811,8 @@ function showItemMenu(btn) {
     });
   });
 
-  // Close menu on outside click
-  setTimeout(() => {
-    document.addEventListener('click', function closeMenu() {
-      menu.remove();
-      document.removeEventListener('click', closeMenu);
-    });
-  }, 10);
+  // Outside click / Escape / another menu opening close it: initLayerDismiss
+  // (`.item-context-menu` in _DISMISS_MENUS).
 }
 
 async function handleRename(type, chatId, convId, currentName) {
@@ -5574,7 +5838,9 @@ async function handleRename(type, chatId, convId, currentName) {
       modal.classList.add('hidden');
       resolve();
     };
-    
+    // Escape / backdrop click close through closeModal (the promise resolves).
+    registerDismissLayer(modal, closeModal);
+
     const confirmRename = async () => {
       const newName = input.value.trim();
       if (!newName || newName === currentName) {
@@ -5629,8 +5895,6 @@ async function handleRename(type, chatId, convId, currentName) {
       if (e.key === 'Enter') {
         e.preventDefault();
         confirmRename();
-      } else if (e.key === 'Escape') {
-        closeModal();
       }
     };
   });
@@ -5733,6 +5997,8 @@ async function handleShare(type, chatId, convId, title) {
     btnCancelShare.onclick = null;
     btnClose.onclick = null;
   };
+  // Escape / backdrop click close through closeModal (handlers dropped).
+  registerDismissLayer(modal, closeModal);
 
   const saveShare = async () => {
     const emails = shareEmails.value.trim();
@@ -5888,6 +6154,8 @@ async function handleDelete(type, chatId, convId, title) {
       btnClose.onclick = null;
       resolve();
     };
+    // Escape / backdrop click close through closeModal (the promise resolves).
+    registerDismissLayer(modal, closeModal);
 
     const confirmDelete = async () => {
       modal.classList.add('hidden');
@@ -6090,10 +6358,7 @@ function initDashboardsDropdown() {
         + ' (' + String(e && e.message || e) + ')');
     }
   });
-  // Close on outside click (same pattern as the report-download dropdown).
-  document.addEventListener('click', (e) => {
-    if (!e.target.closest('#dashboardsDropdown')) menu.classList.add('hidden');
-  });
+  // Outside click / Escape: initLayerDismiss (_DISMISS_MENUS).
 }
 
 // ── New-dashboard name modal ───────────────────────────────────────────────
@@ -6115,6 +6380,7 @@ function _openNewDashboardModal(onCreated) {
     if (btnClose) btnClose.onclick = null;
     input.onkeydown = null;
   };
+  registerDismissLayer(modal, close);
   const create = async () => {
     const name = input.value.trim();
     if (!name) { input.focus(); return; }
@@ -6188,17 +6454,14 @@ function _openDashPicker(anchorEl, payloadBuilder, onAdded) {
     pop.style.bottom = (window.innerHeight - rect.top + 6) + 'px';
   }
 
+  // Closed at the outside mousedown (before a click can land elsewhere);
+  // Escape goes through initLayerDismiss (`.pdc-dash-pop` in _DISMISS_MENUS).
   const onDocDown = (e) => {
     if (!e.target.closest('.pdc-dash-pop') && e.target !== anchorEl) _closeDashPicker();
   };
-  const onKey = (e) => {
-    if (e.key === 'Escape') _closeDashPicker();
-  };
   document.addEventListener('mousedown', onDocDown, true);
-  document.addEventListener('keydown', onKey, true);
   _dashPickerCleanup = () => {
     document.removeEventListener('mousedown', onDocDown, true);
-    document.removeEventListener('keydown', onKey, true);
     pop.remove();
   };
 

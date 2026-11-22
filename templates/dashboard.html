@@ -99,9 +99,15 @@
             <line x1="3" y1="18" x2="21" y2="18"/>
           </svg>
         </button>
+        <!-- Top-bar buttons: an icon plus a separate label span (data-i18n on
+             the span, never on the button — applyAll replaces textContent).
+             From 769 to 1200 px (or whenever the labels do not fit) the labels
+             are hidden and the button keeps its localized title / aria-label. -->
         <div id="dashboardsDropdown" class="dropdown-container">
-          <button id="btnDashboards" class="ghost small top-action-btn">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <button id="btnDashboards" class="ghost small top-action-btn" type="button"
+                  title="Dashboards" aria-label="Dashboards"
+                  data-i18n-title="dash.dashboards" data-i18n-aria-label="dash.dashboards">
+            <svg class="top-bar-icon" width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
               <rect x="2" y="3" width="5" height="5" rx="1"/>
               <rect x="9" y="3" width="13" height="5" rx="1"/>
               <rect x="2" y="10" width="5" height="5" rx="1"/>
@@ -109,7 +115,7 @@
               <rect x="2" y="17" width="5" height="5" rx="1"/>
               <rect x="9" y="17" width="13" height="5" rx="1"/>
             </svg>
-            <span data-i18n="dash.dashboards">Dashboards</span>
+            <span class="top-bar-label" data-i18n="dash.dashboards">Dashboards</span>
           </button>
           <div id="dashboardsMenu" class="dropdown-menu hidden"></div>
         </div>
@@ -122,7 +128,9 @@
                exports of the current conversation (2+ charts/tables). Each
                item is shown by its own rule; the container shows when any is. -->
           <div id="downloadReportDropdown" class="dropdown-container hidden">
-            <button id="btnDownloadReport" class="ghost small top-action-btn report-download-btn" data-i18n="lab.download_report">📊 Download Analytics</button>
+            <button id="btnDownloadReport" class="ghost small top-action-btn report-download-btn" type="button"
+                    title="Download Analytics" aria-label="Download Analytics"
+                    data-i18n-title="lab.download_report" data-i18n-aria-label="lab.download_report"><span class="top-bar-icon" aria-hidden="true">📊</span><span class="top-bar-label" data-i18n="lab.download_report">Download Analytics</span></button>
             <div id="downloadReportMenu" class="dropdown-menu hidden">
               <button id="btnAutoAnalytics" class="dropdown-item hidden" type="button">
                 <span class="aa-btn-icon" aria-hidden="true">✨</span>
@@ -132,8 +140,12 @@
               <button class="dropdown-item hidden" data-format="pptx" type="button" data-i18n="lab.current_analytics_pptx">📊 Current Analytics – PowerPoint</button>
             </div>
           </div>
-          <button id="btnAddData" class="ghost small top-action-btn hidden" data-i18n="lab.add_data">➕ Add Data</button>
-          <button id="btnSchema" class="ghost small top-action-btn hidden" data-i18n="lab.view_schema">View / Edit Descriptions</button>
+          <button id="btnAddData" class="ghost small top-action-btn hidden" type="button"
+                  title="Add Data" aria-label="Add Data"
+                  data-i18n-title="lab.add_data" data-i18n-aria-label="lab.add_data"><span class="top-bar-icon" aria-hidden="true">➕</span><span class="top-bar-label" data-i18n="lab.add_data">Add Data</span></button>
+          <button id="btnSchema" class="ghost small top-action-btn hidden" type="button"
+                  title="View / Edit Descriptions" aria-label="View / Edit Descriptions"
+                  data-i18n-title="lab.view_schema" data-i18n-aria-label="lab.view_schema"><span class="top-bar-icon" aria-hidden="true">📝</span><span class="top-bar-label" data-i18n="lab.view_schema">View / Edit Descriptions</span></button>
           {% include 'partials/profile_button.html' %}
         </div>
       </div>
