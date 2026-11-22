@@ -291,6 +291,8 @@ def _done(events):
 
 
 def _single(events):
+    # C2 §2: a single TABLE answer yields its table partial first
+    events = [e for e in events if not e.get("single_table")]
     assert len(events) == 1 and events[0].get("single_response"), events
     return events[0]["result"]
 

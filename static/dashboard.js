@@ -2443,6 +2443,28 @@ function appendMessage(role, content, imageBase64, table, fullTableKey, extras) 
 
   messageDiv.appendChild(contentDiv);
   chatMessages.appendChild(messageDiv);
+  return messageDiv;
+}
+
+// Fill the caption slot of a message streamed without its text (C2 §2): a
+// chart whose describe text arrives later as a `caption` event, or a single
+// table answer whose text arrives on the done event. The text goes where
+// appendMessage puts a message's text (first in .message-content), through
+// renderMarkdown, which escapes before it formats. Empty text adds nothing.
+// The text is also kept on the message (`_pdcCaption`) for the pin button,
+// whose description was captured when the message was appended.
+function _fillCaptionSlot(messageDiv, text) {
+  if (!messageDiv || !text) return;
+  const content = messageDiv.querySelector('.message-content');
+  if (!content) return;
+  messageDiv._pdcCaption = text;
+  let slot = content.querySelector(':scope > .pdc-stream-caption');
+  if (!slot) {
+    slot = document.createElement('div');
+    slot.className = 'pdc-stream-caption';
+    content.insertBefore(slot, content.firstChild);
+  }
+  slot.innerHTML = renderMarkdown(text);
 }
 
 // Markdown renderer
@@ -3322,6 +3344,10 @@ async function sendMessage() {
   const narrativeSlots = { 1: _createNarrativeSlot(1, loadingDiv) };
   let narrativeShown = false;
   let tablesStreamed = 0;
+  // Streamed chart messages by chart_n — a `caption` event fills one (C2 §2).
+  const chartMsgs = {};
+  // The message of a single table answer streamed before its text (C2 §2).
+  let singleTableMsg = null;
 
   // Abort controller at 330s — past the server's 300s brain-call timeout, so its message arrives first
   const controller = new AbortController();
@@ -3465,13 +3491,20 @@ async function sendMessage() {
           }
 
           // Handle real-time progress events from the server. A keyed event
-          // (the narrative-only retry's `lab.narrative_retry`) is translated;
-          // after the charts the loading bubble is gone, so it gets its own
-          // status bubble (the done handler removes streamLoadingDiv).
+          // (the stage events `lab.stage_*`, `lab.taking_longer`, the
+          // narrative-only retry's `lab.narrative_retry`) is translated and
+          // replaces the previous status; after the first chart the loading
+          // bubble is gone, so it gets its own status bubble, which the next
+          // keyed event replaces and the done handler removes.
           if (data.progress) {
-            const progressText = data.message_key
+            let progressText = data.message_key
               ? _t(data.message_key, data.message || '')
               : (data.message || 'Processing...');
+            // lab.stage_fixing: the attempt number into a translated `{n}`
+            // (the server's English `message` already carries it).
+            if (data.attempt !== undefined && data.attempt !== null) {
+              progressText = String(progressText).replace('{n}', String(data.attempt));
+            }
             if (statusTextEl && loadingBubbleVisible) {
               statusTextEl.textContent = progressText;
             } else if (data.message_key) {
@@ -3490,6 +3523,14 @@ async function sendMessage() {
             continue;
           }
 
+          // Caption (C2 §2): a streamed chart's describe text, filled into
+          // that chart's caption slot. (`=== true`: a single answer's done
+          // event carries `caption` as its TEXT.)
+          if (data.caption === true) {
+            _fillCaptionSlot(chartMsgs[data.index], data.text || '');
+            continue;
+          }
+
           // Tables partial: tables (with captions) without a chart — never
           // counted as a chart.
           if (data.partial && !data.image_base64 && data.tables) {
@@ -3502,9 +3543,20 @@ async function sendMessage() {
               streamLoadingDiv.remove();
               streamLoadingDiv = null;
             }
-            appendMessage('assistant', '', null, null, null,
-              { tables: data.tables, fullTableKeys: data.full_table_keys || null,
-                tableCaptions: data.table_captions || null });
+            if (data.single_table) {
+              // A single table answer, drawn as the done event would draw
+              // it; its text arrives on the done event (_fillCaptionSlot).
+              singleTableMsg = (data.table && data.table.columns)
+                ? appendMessage('assistant', '', null, data.table, data.full_table_key || null,
+                    { code: data.code })
+                : appendMessage('assistant', '', null, null, null,
+                    { code: data.code, tables: data.tables,
+                      fullTableKeys: data.full_table_keys || null });
+            } else {
+              appendMessage('assistant', '', null, null, null,
+                { tables: data.tables, fullTableKeys: data.full_table_keys || null,
+                  tableCaptions: data.table_captions || null });
+            }
             tablesStreamed++;
             chatMessages.scrollTop = chatMessages.scrollHeight;
             continue;
@@ -3523,11 +3575,13 @@ async function sendMessage() {
               streamLoadingDiv = null;
             }
 
-            // Append chart as a new assistant message
+            // Append chart as a new assistant message (a chart sent before
+            // its describe text gets it later through a `caption` event)
             chartCount++;
-            appendMessage('assistant', data.answer || '', data.image_base64, null, null,
+            const chartMsg = appendMessage('assistant', data.answer || '', data.image_base64, null, null,
               { code: data.code, chartDataKey: data.chart_data_key,
                 chartRef: data.chart_ref ? { chart_ref: data.chart_ref } : null });
+            if (data.chart_n !== undefined && data.chart_n !== null) chartMsgs[data.chart_n] = chartMsg;
             chatMessages.scrollTop = chatMessages.scrollHeight;
 
             // Show "Rendering chart N of M..." if more charts expected
@@ -3550,10 +3604,31 @@ async function sendMessage() {
               streamLoadingDiv.remove();
               streamLoadingDiv = null;
             }
+            // A single table answer already drawn by its partial (C2 §2): the
+            // done event brings only its text — the narrative into slot 1
+            // (above the table), the visual's own text into the table message.
+            if (singleTableMsg && chartCount === 0) {
+              if (typeof data.narrative === 'string') {
+                if (data.narrative) {
+                  const slot1 = narrativeSlots[1];
+                  if (slot1 && slot1.parentNode) {
+                    _fillNarrativeSlot(slot1, data.narrative);
+                  } else {
+                    const nm = appendNarrativeMessage(data.narrative, 1);
+                    chatMessages.insertBefore(nm, singleTableMsg);
+                  }
+                }
+                _fillCaptionSlot(singleTableMsg, data.caption || '');
+              } else {
+                _fillCaptionSlot(singleTableMsg, narrativeShown ? '' : (data.answer || ''));
+              }
+            }
             _removeHiddenNarrativeSlots(narrativeSlots);
 
             // For single-response (non-multi-plot) that came via SSE
-            if (chartCount === 0 && tablesStreamed === 0) {
+            if (singleTableMsg && chartCount === 0) {
+              chatMessages.scrollTop = chatMessages.scrollHeight;
+            } else if (chartCount === 0 && tablesStreamed === 0) {
               if (typeof data.narrative === 'string') {
                 // Single answer with a narrative: the narrative, then the
                 // visual with its own caption — a template rendered to ""
@@ -6236,6 +6311,13 @@ function _pinnableCode(rawCode) {
 
 function _wireAddToDash(contentDiv, chartContainer, extras, content) {
   extras = extras || {};
+  // The message text: `content` as appended, else (a message streamed before
+  // its text, C2 §2) the text `_fillCaptionSlot` stored later — read at click.
+  const _pinText = () => {
+    if (content) return content;
+    const msg = contentDiv.closest('.message');
+    return (msg && typeof msg._pdcCaption === 'string') ? msg._pdcCaption : '';
+  };
   // Chart pin — payload is read at CLICK time: the chart container's current
   // HTML / the img src reflect any in-chat refresh, extras.chartDataKey is
   // mutated by refresh.
@@ -6260,7 +6342,7 @@ function _wireAddToDash(contentDiv, chartContainer, extras, content) {
         return {
           chat_id: chatId,
           kind: 'chart',
-          description: content || '',
+          description: _pinText(),
           code: _pinnableCode(extras.code),
           image_base64: image,
           is_plotly: isPlotly,
@@ -6287,7 +6369,7 @@ function _wireAddToDash(contentDiv, chartContainer, extras, content) {
       return {
         chat_id: chatId,
         kind: 'table',
-        description: title ? (title + '\n\n' + (content || '')) : (content || ''),
+        description: title ? (title + '\n\n' + _pinText()) : _pinText(),
         code: tableCode,
         table: t,
         full_table_key: wrap._pdcFullKey || null,

@@ -159,12 +159,18 @@ def _run_multi(dfs, question="show sales"):
 
 
 def _single(events):
+    # C2 §2: a single TABLE answer yields its table partial first
+    events = [e for e in events if not e.get("single_table")]
     assert len(events) == 1 and events[0].get("single_response"), events
     return events[0]["result"]
 
 
 def _partials(events):
-    return [e for e in events if e.get("partial") and e.get("image_base64")]
+    # C2 §2: an uncaptioned chart's describe text follows its partial as a
+    # `caption` event (index = chart_n); folded back into `answer` here.
+    caps = {e.get("index"): e.get("text") for e in events if e.get("caption") is True}
+    return [dict(e, answer=caps.get(e.get("chart_n"), e.get("answer")))
+            for e in events if e.get("partial") and e.get("image_base64")]
 
 
 def _narrative_events(events):
@@ -339,7 +345,10 @@ def test_multi_caption_index_counts_table_blocks(monkeypatch, dfs):
     assert brain.calls["describe"] == []
 
 
-def test_multi_missing_caption_describes_that_chart_only(monkeypatch, dfs):
+def test_multi_uncaptioned_chart_of_narrated_turn_is_not_described(monkeypatch, dfs):
+    """C2 §4: chart B had no planned caption and the narrative rendered — the
+    narrative's last sentence explains it, so no describe call is made and
+    the chart has no text of its own (was: described)."""
     narr_t = "N {{a}} {{b}}"
     brain = Brain(_multi_plan(("plot_code", CODE_A), ("plot_code", CODE_B),
                               narrative_t=narr_t, captions={"1": "cap {{a}}"}),
@@ -348,10 +357,10 @@ def test_multi_missing_caption_describes_that_chart_only(monkeypatch, dfs):
 
     events = _run_multi(dfs)
 
-    assert len(brain.calls["describe"]) == 1
-    assert brain.calls["describe"][0]["code"] == CODE_B
+    assert brain.calls["describe"] == []
+    assert [e for e in events if e.get("caption") is True] == []
     parts = _partials(events)
-    assert [p["answer"] for p in parts] == ["cap 1", "described B"]
+    assert [p["answer"] for p in parts] == ["cap 1", ""]
     assert parts[0].get("caption_template") == "cap {{a}}"
     assert parts[1].get("caption_template") is None
     assert brain.calls["summarize"] == []
@@ -488,7 +497,8 @@ def test_narrative_keeps_clean_sentence_drops_na_one(monkeypatch, dfs, caplog):
     dropped = [m for m in msgs if "NARRATIVE_SENTENCE_DROPPED" in m]
     assert len(dropped) == 1 and "n=1" in dropped[0] and "what=narrative" in dropped[0]
     assert not any("all_sentences_dropped" in m for m in msgs)
-    assert [kw["code"] for kw in brain.calls["describe"]] == [code_ok]
+    # C2 §4: the uncaptioned chart of this narrated turn is not described
+    assert brain.calls["describe"] == []
 
 
 def test_caption_with_none_value_goes_to_describe(monkeypatch, dfs, caplog):

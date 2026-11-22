@@ -161,6 +161,8 @@ def _run_multi(dfs, question="how many new items by region?"):
 
 
 def _single(events):
+    # C2 §2: a single TABLE answer yields its table partial first
+    events = [e for e in events if not e.get("single_table")]
     assert len(events) == 1 and events[0].get("single_response"), events
     return events[0]["result"]
 
@@ -326,7 +328,10 @@ def test_multi_caption_and_narrative_rendering_code(monkeypatch, dfs, logs):
     assert calls["plot"] == [CHART_CODE]
     partials = [e for e in events if e.get("partial") and e.get("image_base64")]
     assert len(partials) == 1
-    assert partials[0]["answer"] == "described"
+    # C2 §2: the chart goes out first; its describe text follows as a caption event
+    assert partials[0]["answer"] == ""
+    caps = [e for e in events if e.get("caption") is True]
+    assert [(c["index"], c["text"]) for c in caps] == [(partials[0]["chart_n"], "described")]
     assert len(brain.calls["describe"]) == 1
     assert [e for e in events if e.get("narrative")] == []
     done = [e for e in events if e.get("done")]

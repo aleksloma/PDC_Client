@@ -102,7 +102,10 @@ def test_retry_python_with_image_is_accepted(monkeypatch, dfs):
     partials = [e for e in events if e.get("partial")]
     assert len(partials) == 1
     assert partials[0]["image_base64"] == "IMG"
-    assert partials[0]["answer"] == "described"
+    # C2 §2: the chart goes out first; its describe text follows as a caption event
+    assert partials[0]["answer"] == ""
+    caps = [e for e in events if e.get("caption") is True]
+    assert [(c["index"], c["text"]) for c in caps] == [(1, "described")]
     done = [e for e in events if e.get("done")][0]
     assert done["combined_answer"] == "described"
 

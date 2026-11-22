@@ -1165,6 +1165,8 @@ def test_run_chat_multi_plot_delivers_a_styler_answer_through_the_dispatcher(exe
         history_rows=[], user_email="alice@acme.com"))
 
     assert len(calls) >= 1, "the answer did not go through the transport"
+    # C2 §2: a single TABLE answer yields its table partial first
+    events = [e for e in events if not e.get("single_table")]
     assert len(events) == 1 and events[0].get("single_response"), events
     result = events[0]["result"]
     tables = result.get("tables")

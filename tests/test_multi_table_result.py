@@ -49,6 +49,8 @@ def _run(monkeypatch, dfs, code, describe_calls=None, summarize_calls=None):
     events = list(run_chat_local.run_chat_multi_plot(
         sid="t", dfs=dfs, schema_docs={}, question="show tables",
         history_rows=[], user_email="alice@acme.com"))
+    # C2 §2: a single TABLE answer yields its table partial first
+    events = [e for e in events if not e.get("single_table")]
     assert len(events) == 1 and events[0]["single_response"]
     return events[0]["result"]
 

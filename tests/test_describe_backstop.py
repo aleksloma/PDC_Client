@@ -62,6 +62,8 @@ def _run(monkeypatch, dfs, code, describe_impl, *, question="show quantities",
         sid="t", dfs=dfs, schema_docs={}, question=question,
         history_rows=[], user_email="alice@acme.com",
         dataset_profile=dataset_profile))
+    # C2 §2: a single TABLE answer yields its table partial first
+    events = [e for e in events if not e.get("single_table")]
     assert len(events) == 1 and events[0]["single_response"]
     return events[0]["result"], calls
 
@@ -207,7 +209,10 @@ def test_chart_answer_uses_chart_data(monkeypatch, dfs):
     assert calls and calls[0]["data_caveat"]["kind"] == "constant_metric"
     partial = [e for e in events if e.get("partial")]
     assert partial, "no chart was emitted"
+    # C2 §2: the chart goes out first; its describe text follows as a caption event
+    caption = [e for e in events if e.get("caption") is True]
+    assert len(caption) == 1 and caption[0]["index"] == partial[0]["chart_n"]
     # the model's reply carried no marker -> the client's own note leads the text
-    assert partial[0]["answer"].startswith(
+    assert caption[0]["text"].startswith(
         run_chat_local.result_backstop.fallback_sentence("en", catalog=True))
-    assert "flat chart" in partial[0]["answer"]
+    assert "flat chart" in caption[0]["text"]
