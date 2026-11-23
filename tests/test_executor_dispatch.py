@@ -79,6 +79,7 @@ SANDBOX_IMAGE_MODULES = (
     "code_exec.py", "plot_utils.py", "exec_sanitizer.py", "sandbox_guard.py",
     "outlier_utils.py", "logger_utils.py", "settings.py", "exec_transport.py",
     "pdc_diag.py",
+    "ident_rule.py",            # P31 Part D
     "executor/__init__.py", "executor/app.py", "executor/runner.py",
 )
 

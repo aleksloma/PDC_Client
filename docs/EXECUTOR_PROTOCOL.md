@@ -241,6 +241,66 @@ an input column name or a fixed code; at most 24 after merging) only in the
 main app, `narrative.validate_findings`; the sandbox never knows the input
 column names.
 
+### `chart_stats` — what a Plotly chart draws (PLOT only, log only)
+
+A successful Plotly PLOT payload carries one more key, `chart_stats`, next to
+`chart_data`; each `multi_charts` entry of a split grid carries its own
+(P31, 22 Nov 2026). `plot_utils._chart_stats` builds it from the FULL figure
+(not the "Show data" cut); a matplotlib chart has none. A trace whose stats
+fail is skipped with one `CHART_STATS_FAILED error=<Type>` line (the escaped
+type name, no job text); only a figure whose every trace fails gives `null`.
+Shape:
+
+```
+"chart_stats": {"traces": [
+  {"type": "bar" | "scatter" | "pie" | "box" | "violin" | "histogram" |
+           "heatmap" | "treemap" | "sunburst" | "icicle" | "waterfall" |
+           "funnel" | "other",
+   "values": [<number>, …],     # what the trace draws (see below), ≤ 2000
+   "total": <number> | null,    # the sum of ALL its drawn numbers (a hierarchy
+                                #   with branchvalues "total": its root nodes;
+                                #   null for a waterfall with an absolute / total bar)
+   "groups": [{"n", "mean", "median", "q1", "q3", "min", "max"}, …],
+                                # box / violin / one-sample histogram, ≤ 50
+   "draws_mean": bool}          # box boxmean / violin meanline.visible
+]}                              # ≤ 20 traces; visible False / "legendonly" skipped
+```
+
+`values` also carries what the user sees as one bar or slice: a bar trace
+that repeats a category adds the per-category sums, a stacked figure
+(`barmode` "stack" / "relative") adds the per-category stack totals to its
+first bar trace, and a pie / funnelarea with a repeated label adds the
+per-label sums (at most 200 sums per trace). A trace over the 2000 cap keeps
+its first and last values plus its min and max.
+
+Box and violin quartiles follow plotly.js's own `quartilemethod` ("linear" is
+plotly.js `Lib.interp`; "exclusive" / "inclusive" take the median of each
+half for an odd sample); a box with precomputed quartiles reports those. The
+caps are `exec_transport.CHART_STATS_MAX_TRACES` (20),
+`CHART_STATS_MAX_VALUES` (2000) and `CHART_STATS_MAX_GROUPS` (50). Numbers
+only. The web service decodes it as hostile input (§6), uses it ONLY for the
+log-only text/chart check (`text_chart_check`, `TEXT_CHART_CHECK` lines of
+counts and slot names) and drops it: it is never stored, never sent to the
+browser and **never crosses to the Brain**. An older sandbox image sends no
+key; the check then does not run.
+
+### Identifier columns (per job)
+
+`ident_rule.py` (a leaf: stdlib + numpy + pandas, no logging) is in BOTH
+images. Each exec site calls `ident_rule.begin_job(dfs)` with the job's own
+input frames (shallow copies) right after the dtype gate; the job's source
+identifier columns (`job_identifiers()`) are computed lazily, the first time
+a Styler is serialized or a figure is formatted, and reset by the next job
+(one job per runner process). Nothing new rides on the request: the sandbox
+decides from what it was given. `exec_transport._styled_html` formats the
+identifier columns of a Styler as plain digit strings (no grouping, no
+`.0`) on a copy, overriding a generated `.format(thousands=',')` for those
+columns only (`EXEC_STYLER_IDENT_FORMAT_FAILED error=<Type>` keeps the
+Styler as it was). The chart formatters leave an identifier axis ungrouped
+(a pure dimension axis becomes a category axis; a large whole-number axis
+gets `tickformat` `d`; a year axis is untouched). Display only: the frames
+the code computes on are unchanged.
+
 ### Serialization matrix (`result`)
 
 | RESULT | Wire | Rebuilt as |
@@ -250,7 +310,7 @@ column names.
 | list / nested dict of JSON-native values | `{"kind": "json", …}` | the same value |
 | `DataFrame` | `{"kind": "frame", "ref": "out/result.parquet"}` | `read` → `DataFrame` (index and label types restored from the parquet metadata, MultiIndex included) |
 | `Series` | `{"kind": "series", "ref": …, "unnamed": bool}` | `Series` (`unnamed` restores `.name = None`, which parquet turns into `0`) |
-| Styler | `{"kind": "styler", "ref": …, "styled_html": str \| null}` | a two-attribute value object with `.data` and `.to_html()` |
+| Styler | `{"kind": "styler", "ref": …, "styled_html": str \| null}` (identifier columns as plain digits, see above) | a two-attribute value object with `.data` and `.to_html()` |
 | dict of the above | `{"kind": "dict", "entries": [{"key", "key_type", "value"}]}` | a dict in the original order, keys restored to their type |
 | anything else | `{"kind": "opaque", "type_name": "Figure"}` | an `Opaque` marker — no repr, no content |
 
@@ -358,6 +418,16 @@ plus a drop count, and a `*_dropped` that is not a non-negative integer up to
 100 000 reads as 0; the decoder's own drops are added to it. A response
 without the keys — an older sandbox image — reads cleanly and adds none of
 them, so the turn simply has no VALUES (its template slots render `n/a`).
+
+`chart_stats` (on the PLOT payload and on each `multi_charts` entry) is
+decoded by `exec_transport.decode_chart_stats` under the same discipline and
+never causes a violation: only an exact `dict` with a `traces` list is read
+(else `null`); every number must be an exact finite `int` / `float` (never a
+bool or a string); unknown keys are dropped; an unknown `type` reads
+`other`; a group `n` must be a non-negative whole number; the caps keep the
+first 20 traces, 2000 values and 50 groups, and a list more than four times
+its cap is dropped unread. A failure inside the decoder gives `null` and one
+`CHART_STATS_DECODE_FAILED error=<Type>` line.
 
 **Residual risk, accepted:** a deliberately crafted single batch can still
 exceed the decoded cap in one step. The web service is nonetheless strictly
@@ -633,7 +703,7 @@ the default target ends unprivileged with no test runner in it.
 The image copies **only** the modules the runner imports — the two execution
 modules, the dtype gate, the sandbox guard, the outlier helpers, the
 diagnostics helper library (`pdc_diag.py`, a leaf module the generated code
-calls), the logger, the settings module and the transport — plus the Georgian
+calls), the identifier rule (`ident_rule.py`, a leaf, P31), the logger, the settings module and the transport — plus the Georgian
 font and the offline plotly bundle. An older sandbox image without `pdc_diag`
 makes code that calls it fail with a `NameError`, which goes through the
 ordinary retries. Never `COPY . .`. There is no `local_store`, no `db_*`, no

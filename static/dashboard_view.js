@@ -41,17 +41,84 @@
   const REFRESH_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/></svg>';
 
   // ── cell formatting (adapted copies of dashboard.js helpers) ─────────────
-  const IDENT_HEAD_WORDS = new Set(['year', 'yr', 'წელი', 'id', 'ids', 'code', 'codes', 'კოდი', 'იდ', 'zip', 'postal', 'phone', 'account', 'iban', 'invoice', 'order', 'ref']);
+  // IDENTIFIER columns show plain digits (never grouped, never decimals): the
+  // tile table's `identifier_columns` when present, else the NAME rule
+  // mirroring ident_rule.is_identifier_name (last word, camelCase split, or a
+  // trailing "#").
+  const IDENT_HEAD_WORDS = new Set(['year', 'yr', 'წელი', 'id', 'ids', 'code', 'codes', 'კოდი', 'იდ', 'zip', 'postal', 'phone', 'account', 'iban', 'invoice', 'order', 'ref',
+    'number', 'num', 'no', 'nr', 'nbr', 'key', 'uid', 'guid', 'uuid',
+    'pin', 'pinfl', 'ssn', 'tin', 'inn', 'iin', 'passport', 'card', 'msisdn', 'imei',
+    'ნომერი', 'номер', 'код', 'счет', 'счёт', 'ид']);
+  // MEASURE words: a label holding ANY of them is never an identifier by
+  // name (mirrors ident_rule.MEASURE_WORDS).
+  const IDENT_MEASURE_WORDS = new Set(['amount', 'amt', 'sum', 'total', 'price', 'cost', 'revenue', 'sales', 'salary', 'income', 'balance', 'fee', 'value', 'qty', 'quantity', 'count', 'avg', 'mean', 'median', 'per', 'spend', 'profit', 'margin', 'rate', 'score', 'сумма', 'цена', 'стоимость', 'выручка', 'доход', 'баланс', 'количество', 'итого', 'თანხა', 'ფასი', 'ჯამი', 'შემოსავალი', 'ბალანსი', 'რაოდენობა']);
+  // The ORIGINAL identifier words: a label ending in one of them is an
+  // identifier even when it holds a measure word (ident_rule.ORIGINAL_IDENT_WORDS).
+  const IDENT_ORIGINAL_WORDS = new Set(['year', 'yr', 'წელი', 'id', 'ids', 'code', 'codes', 'კოდი', 'იდ', 'zip', 'postal', 'phone', 'account', 'iban', 'invoice', 'order', 'ref']);
 
-  function isIdentifierLabel(name) {
-    if (name == null) return false;
-    const toks = String(name).match(/\p{L}+/gu);
-    if (!toks || !toks.length) return false;
-    return IDENT_HEAD_WORDS.has(toks[toks.length - 1].toLowerCase());
+  function identNameTokens(name) {
+    const chars = Array.from(String(name));
+    const isL = (c) => /\p{L}/u.test(c);
+    const isLo = (c) => /\p{Ll}/u.test(c);
+    const isUp = (c) => /\p{Lu}/u.test(c);
+    const toks = [];
+    let cur = '';
+    for (let i = 0; i < chars.length; i++) {
+      const ch = chars[i];
+      if (!isL(ch)) {
+        if (cur) { toks.push(cur.toLowerCase()); cur = ''; }
+        continue;
+      }
+      if (cur) {
+        const prev = chars[i - 1];
+        let split = isLo(prev) && isUp(ch);
+        if (!split && isUp(prev) && isUp(ch)) {
+          let j = i + 1;
+          while (j < chars.length && isL(chars[j]) && isLo(chars[j])) j++;
+          split = (j - (i + 1)) >= 2;
+        }
+        if (split) { toks.push(cur.toLowerCase()); cur = ''; }
+      }
+      cur += ch;
+    }
+    if (cur) toks.push(cur.toLowerCase());
+    return toks;
   }
 
-  function fmtCellValue(colName, v) {
-    if (typeof v === 'number' && isFinite(v) && !isIdentifierLabel(colName)) {
+  function isIdentifierLabel(name, identCols) {
+    if (name == null) return false;
+    const label = String(name);
+    if (identCols && identCols.has(label)) return true;
+    const t = label.trim();
+    if (!t) return false;
+    const toks = identNameTokens(t);
+    if (toks.some((w) => IDENT_MEASURE_WORDS.has(w))
+      && !(toks.length && IDENT_ORIGINAL_WORDS.has(toks[toks.length - 1]))) return false;
+    // "no" and a trailing "#" count only after another word that is not "yes"
+    const after = (prev) => prev.length >= 1 && prev[prev.length - 1] !== 'yes';
+    if (t.endsWith('#')) return after(toks);
+    if (!toks.length) return false;
+    const last = toks[toks.length - 1];
+    if (last === 'no') return after(toks.slice(0, -1));
+    return IDENT_HEAD_WORDS.has(last);
+  }
+
+  function identColumnSet(table) {
+    const list = table && Array.isArray(table.identifier_columns) ? table.identifier_columns : null;
+    return list ? new Set(list.map((c) => String(c))) : null;
+  }
+
+  function fmtIdentValue(v) {
+    if (v === null || v === undefined) return '';
+    if (typeof v === 'number' && isFinite(v) && Number.isInteger(v)) {
+      return v.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 0 });
+    }
+    return String(v);
+  }
+
+  function fmtCellValue(colName, v, identCols) {
+    if (isIdentifierLabel(colName, identCols)) return fmtIdentValue(v);
+    if (typeof v === 'number' && isFinite(v)) {
       return Number.isInteger(v)
         ? v.toLocaleString('en-US')
         : v.toLocaleString('en-US', { maximumFractionDigits: 2 });
@@ -159,6 +226,7 @@
     const table = snap.table || {};
     const cols = Array.isArray(table.columns) ? table.columns : [];
     const rows = Array.isArray(table.rows) ? table.rows : [];
+    const identCols = identColumnSet(table);
     const tot = typeof table.total_rows === 'number' ? table.total_rows : rows.length;
     if (tot > rows.length) {
       const meta = document.createElement('div');
@@ -207,7 +275,7 @@
       cols.forEach(c => {
         const td = document.createElement('td');
         let v = row && Object.prototype.hasOwnProperty.call(row, c) ? row[c] : '';
-        td.textContent = fmtCellValue(c, v);
+        td.textContent = fmtCellValue(c, v, identCols);
         tr.appendChild(td);
       });
       tbody.appendChild(tr);
@@ -419,7 +487,9 @@
         if (!res || !res.ok) {
           res = await pdcFetch(`/api/chat/${tile.chat_id}/export_excel`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ columns: snapTable.columns || [], rows: snapTable.rows || [], filename }),
+            body: JSON.stringify({ columns: snapTable.columns || [], rows: snapTable.rows || [],
+              identifier_columns: Array.isArray(snapTable.identifier_columns) ? snapTable.identifier_columns : [],
+              filename }),
           });
         }
         if (!res.ok) throw new Error('export failed');

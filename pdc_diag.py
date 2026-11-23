@@ -192,6 +192,11 @@ def _fmt(value, kind, locale) -> str:
     if kind in ("text", "period"):                              # rule 5
         if isinstance(value, str):
             return value[:_TEXT_MAX]
+        if kind == "text" and _is_integral(value):
+            # A `text` slot holding a whole number is a label (an id, a
+            # personal number): its plain digits, never grouped, no ".0".
+            # `period` keeps the count / float path below.
+            return str(int(value))[:_TEXT_MAX]
         if is_number:
             kind = "count" if isinstance(value, int) else "float"
         else:
@@ -211,6 +216,15 @@ def _fmt(value, kind, locale) -> str:
     if len(out) > FMT_MAX_LEN:                                  # rule 11
         return _NA
     return out
+
+
+def _is_integral(value) -> bool:
+    """A finite int / float with no fractional part (never a bool)."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and math.isfinite(value) and value.is_integer()
 
 
 def _format_count(value) -> str:

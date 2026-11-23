@@ -31,6 +31,7 @@ from brain_client import TenantRevokedError, BrainError
 from exec_transport import log_safe_text
 from logger_utils import log_with_sid
 from routes.chat import (_EXEC as _CHAT_EXEC, _FULL_KEY_RE, _code_not_stored,
+                         _frame_identifier_columns,
                          _json_safe, _load_full_table_record, _persist_full_table,
                          _persistable_chart_data, _reexecute_full_df,
                          _refresh_role_gate, _require_chat, _safe_filename,
@@ -122,6 +123,13 @@ def _capped_table(table) -> dict | None:
         out["dtype"] = table["dtype"]
     if table.get("title"):
         out["title"] = table["title"]
+    # Additive: the columns shown as plain digits (ident_rule). Labels only,
+    # used by the page as a set-membership test — never inserted as markup.
+    ident_cols = table.get("identifier_columns")
+    if isinstance(ident_cols, list):
+        kept = [c for c in ident_cols[:1000] if isinstance(c, str) and len(c) <= 500]
+        if kept:
+            out["identifier_columns"] = kept
     return out
 
 
@@ -616,6 +624,11 @@ async def refresh_tile(request: Request, dash_id: str, tile_id: str):
                 "rows": df.head(_MAX_TILE_TABLE_ROWS).to_dict(orient="records"),
                 "total_rows": int(len(df)),
             })
+            # Identifier columns (additive, only when non-empty): the source
+            # identifiers `_reexecute_full_df` put on the frame's attrs.
+            ident_cols = _frame_identifier_columns(df)
+            if ident_cols:
+                table["identifier_columns"] = ident_cols
             result = {"ok": True, "kind": "table", "table": table}
             # What the re-execution ran (see `_reexecute_full_df`), so the
             # fresh record keeps its SELECT like the refresh_item one does.

@@ -22,6 +22,9 @@ from outlier_utils import outlier_mask, drop_extreme_outliers
 # The sandbox diagnostics library (DIAGNOSTICS_SPEC B8) — a leaf module too
 # (stdlib + numpy + pandas at import time).
 import pdc_diag
+# The one identifier rule (leaf: stdlib + numpy + pandas) — axis titles and
+# the job's source identifiers decide which axes are never grouped.
+import ident_rule
 
 # Import visualization libraries
 try:
@@ -1109,6 +1112,426 @@ def _extract_plotly_chart_data(fig):
         return None
 
 
+# ---------------------------------------------------------------------------
+# chart_stats — the numbers a Plotly chart DRAWS (PROMPT 31 Part C, LOG ONLY)
+# ---------------------------------------------------------------------------
+# Read by the web app's `text_chart_check` to see whether a number the answer
+# text gives is one the chart shows. Built from the FULL figure (not the
+# 5,000-row "Show data" cut), bounded by the `exec_transport.CHART_STATS_*`
+# caps, numbers only. Box / violin quartiles follow plotly.js's own
+# `quartilemethod`: the default "linear" is plotly.js `Lib.interp` — position
+# p * n - 0.5 on the sorted sample (numpy's `method="hazen"`, Hyndman & Fan
+# type 5) — and "exclusive" / "inclusive" take the median of each half for an
+# odd sample, exactly as plotly.js does. A trace above the value cap keeps its
+# first and last numbers (half each) plus its min and max; a bar category a
+# trace repeats, a stacked bar (barmode "stack" / "relative") and a repeated
+# pie label also carry the per-category sums — the heights the user sees.
+_STATS_TRACE_TYPES = {
+    "bar": "bar", "scatter": "scatter", "scattergl": "scatter", "pie": "pie",
+    "box": "box", "violin": "violin", "histogram": "histogram",
+    "heatmap": "heatmap", "heatmapgl": "heatmap", "treemap": "treemap",
+    "sunburst": "sunburst", "icicle": "icicle", "waterfall": "waterfall",
+    "funnel": "funnel", "funnelarea": "funnel",
+}
+_STATS_HISTFUNCS = ("count", "sum", "avg", "min", "max")
+
+
+def _stats_floats(arr):
+    """A plotted array as a 1-D float ndarray (NaN where an entry is not a
+    number), or None for a non-numeric array (dates, bools, labels only)."""
+    if arr is None or isinstance(arr, (str, bytes, dict)):
+        return None
+    a = np.asarray(arr)
+    if a.ndim == 0:
+        a = a.reshape(1)
+    kind = a.dtype.kind
+    if kind in "iuf":
+        return a.astype(float, copy=False).ravel()
+    if kind not in "OUS":
+        return None                      # bool, datetime, timedelta, complex
+    s = pd.Series(a.ravel(), dtype=object)
+    inferred = s.infer_objects()
+    if inferred.dtype.kind in "iuf":
+        return inferred.to_numpy(dtype=float)
+    if inferred.dtype.kind in "bMm":
+        return None
+    if not s.map(lambda v: isinstance(v, (int, float, str, np.number))
+                 and not isinstance(v, bool)).all():
+        return None
+    out = pd.to_numeric(s, errors="coerce").to_numpy(dtype=float)
+    return out if np.isfinite(out).any() else None
+
+
+# The most per-category sums (a repeated bar category, a stack, a repeated
+# pie label) one trace carries on top of its own values.
+_STATS_SUMS_MAX = 200
+
+
+def _stats_pick(fin, cap, extras=()):
+    """The drawn numbers of a finite 1-D array within `cap`: all of them when
+    they fit, else the first and the last half of the room the `extras`
+    leave (so a long line's latest point stays a candidate) plus the
+    array's min and max; then the `extras` (per-category sums). Never more
+    than `cap` numbers."""
+    extras = [float(v) for v in extras if np.isfinite(v)][:_STATS_SUMS_MAX]
+    room = max(cap - len(extras), 0)
+    if fin.size <= room:
+        rows = [float(v) for v in fin]
+    else:
+        room = max(room - 2, 0)
+        head = room - room // 2
+        tail = room // 2
+        rows = [float(v) for v in fin[:head]]
+        if tail:
+            rows += [float(v) for v in fin[fin.size - tail:]]
+        rows += [float(np.min(fin)), float(np.max(fin))]
+    return (rows + extras)[:cap]
+
+
+def _stats_values(arr, cap, extras=()):
+    """`(values, total)`: the drawn numbers of `arr` (`_stats_pick`) and the
+    sum of ALL its finite numbers (None when there is none)."""
+    a = _stats_floats(arr)
+    if a is None:
+        return [], None
+    fin = a[np.isfinite(a)]
+    if not fin.size:
+        return [], None
+    total = float(np.sum(fin))
+    return _stats_pick(fin, cap, extras), (total if np.isfinite(total) else None)
+
+
+def _stats_category_sums(cats, arr, only_repeated=True):
+    """The per-category sums of `arr` over the labels `cats` (order of first
+    appearance, at most `_STATS_SUMS_MAX`), or [] — with `only_repeated`,
+    unless some label repeats."""
+    a = _stats_floats(arr)
+    if a is None or cats is None:
+        return []
+    labels = np.asarray(cats, dtype=object).ravel()
+    m = min(len(labels), len(a))
+    frame = pd.DataFrame({"k": pd.Series(labels[:m], dtype=object), "v": a[:m]})
+    frame = frame[np.isfinite(frame["v"].to_numpy()) & frame["k"].notna().to_numpy()]
+    if frame.empty:
+        return []
+    sums = frame.groupby("k", sort=False)["v"].sum()
+    if only_repeated and len(sums) == len(frame):
+        return []
+    return [float(v) for v in sums.to_numpy()[:_STATS_SUMS_MAX]]
+
+
+def _stats_interp(s, p):
+    """plotly.js `Lib.interp(sorted, p)` (numpy `quantile(method="hazen")`)."""
+    k = p * len(s) - 0.5
+    if k < 0:
+        return float(s[0])
+    if k > len(s) - 1:
+        return float(s[-1])
+    lo = int(np.floor(k))
+    hi = int(np.ceil(k))
+    frac = k - lo
+    return float(frac * s[hi] + (1 - frac) * s[lo])
+
+
+def _stats_group(s, method):
+    """The stats of one SORTED, finite sample (len >= 1) as plotly draws them."""
+    n = len(s)
+    if n % 2 and method in ("exclusive", "inclusive"):
+        half = n // 2
+        lower = s[:half] if method == "exclusive" else s[:half + 1]
+        upper = s[half + 1:] if method == "exclusive" else s[half:]
+        if not len(lower) or not len(upper):
+            lower = upper = s
+        q1, q3 = _stats_interp(lower, 0.5), _stats_interp(upper, 0.5)
+    else:
+        q1, q3 = _stats_interp(s, 0.25), _stats_interp(s, 0.75)
+    mean = float(np.mean(s))
+    return {"n": int(n), "mean": mean if np.isfinite(mean) else None,
+            "median": _stats_interp(s, 0.5), "q1": q1, "q3": q3,
+            "min": float(s[0]), "max": float(s[-1])}
+
+
+def _stats_sample_groups(sample, cats, method, cap):
+    """One group per category of `cats` (order of first appearance, the
+    first `cap`), or one group for the whole sample when `cats` is None."""
+    a = _stats_floats(sample)
+    if a is None:
+        return []
+    if cats is None:
+        fin = np.sort(a[np.isfinite(a)])
+        return [_stats_group(fin, method)] if fin.size else []
+    labels = np.asarray(cats, dtype=object).ravel()
+    m = min(len(labels), len(a))
+    codes, uniques = pd.factorize(pd.Series(labels[:m], dtype=object), sort=False)
+    a = a[:m]
+    keep = (codes >= 0) & (codes < cap) & np.isfinite(a)
+    codes, a = codes[keep], a[keep]
+    if not a.size:
+        return []
+    order = np.lexsort((a, codes))
+    codes, a = codes[order], a[order]
+    bounds = np.searchsorted(codes, np.arange(min(len(uniques), cap) + 1))
+    groups = []
+    for g in range(len(bounds) - 1):
+        seg = a[bounds[g]:bounds[g + 1]]
+        if seg.size:
+            groups.append(_stats_group(seg, method))
+    return groups
+
+
+def _stats_orientation(tr, default):
+    o = getattr(tr, "orientation", None)
+    if o in ("h", "v"):
+        return o
+    return default
+
+
+def _stats_box_like(tr, ttype, cap):
+    """Groups of a box / violin trace and whether it draws the mean."""
+    if ttype == "box":
+        draws_mean = getattr(tr, "boxmean", None) in (True, "sd")
+    else:
+        meanline = getattr(tr, "meanline", None)
+        draws_mean = getattr(meanline, "visible", None) is True
+    method = getattr(tr, "quartilemethod", None) if ttype == "box" else None
+    x, y = getattr(tr, "x", None), getattr(tr, "y", None)
+    q1 = getattr(tr, "q1", None) if ttype == "box" else None
+    med = getattr(tr, "median", None) if ttype == "box" else None
+    q3 = getattr(tr, "q3", None) if ttype == "box" else None
+    if q1 is not None and med is not None and q3 is not None:
+        # A go.Box with PRECOMPUTED quartiles: those are what it draws.
+        cols = {"q1": q1, "median": med, "q3": q3,
+                "min": getattr(tr, "lowerfence", None),
+                "max": getattr(tr, "upperfence", None),
+                "mean": getattr(tr, "mean", None)}
+        arrs = {k: _stats_floats(v) for k, v in cols.items()}
+        core = [arrs[k] for k in ("q1", "median", "q3")]
+        n = min(len(a) for a in core) if all(a is not None for a in core) else 0
+        groups = []
+        for i in range(min(n, cap)):
+            g = {}
+            for k, arr in arrs.items():
+                if arr is not None and i < len(arr) and np.isfinite(arr[i]):
+                    g[k] = float(arr[i])
+            if g:
+                groups.append(g)
+        return groups, draws_mean
+    horizontal = _stats_orientation(tr, "h" if (x is not None and y is None) else "v") == "h"
+    sample, cats = (x, y) if horizontal else (y, x)
+    if sample is None:
+        sample, cats = cats, None
+    return _stats_sample_groups(sample, cats, method or "linear", cap), draws_mean
+
+
+def _stats_histogram(tr, cap_values, cap_groups):
+    """`(values, total, groups)` of a histogram: the per-category aggregate a
+    histogram of a LABEL axis draws (histfunc count/sum/avg/min/max, histnorm
+    percent/probability), or — a numeric sample with no second array — one
+    group of that sample. Binned numeric aggregates are not recomputed."""
+    x, y = getattr(tr, "x", None), getattr(tr, "y", None)
+    horizontal = _stats_orientation(tr, "h" if (y is not None and x is None) else "v") == "h"
+    sample, other = (y, x) if horizontal else (x, y)
+    if sample is None:
+        return [], None, []
+    numeric = _stats_floats(sample)
+    if numeric is not None:
+        if other is None:
+            return [], None, _stats_sample_groups(sample, None, "linear", cap_groups)
+        return [], None, []
+    labels = pd.Series(np.asarray(sample, dtype=object).ravel(), dtype=object)
+    func = getattr(tr, "histfunc", None) or "count"
+    if func not in _STATS_HISTFUNCS:
+        return [], None, []
+    if other is None or func == "count":
+        agg = labels.value_counts(sort=False, dropna=True).astype(float)
+    else:
+        vals = _stats_floats(other)
+        if vals is None:
+            return [], None, []
+        m = min(len(labels), len(vals))
+        frame = pd.DataFrame({"k": labels[:m].to_numpy(), "v": vals[:m]})
+        frame = frame[np.isfinite(frame["v"].to_numpy())]
+        agg = frame.groupby("k", sort=False)["v"].agg(
+            {"sum": "sum", "avg": "mean", "min": "min", "max": "max"}[func]).astype(float)
+    norm = getattr(tr, "histnorm", None) or ""
+    if norm in ("percent", "probability"):
+        tot = float(agg.sum())
+        if tot:
+            agg = agg / tot * (100.0 if norm == "percent" else 1.0)
+    elif norm:
+        return [], None, []
+    values, total = _stats_values(agg.to_numpy(dtype=float), cap_values)
+    return values, total, []
+
+
+def _stats_hierarchy_total(tr, values_arr):
+    """The total a sunburst / treemap / icicle shows: the sum of its ROOT
+    nodes with branchvalues "total", else of every node."""
+    a = _stats_floats(values_arr)
+    if a is None:
+        return None
+    parents = getattr(tr, "parents", None)
+    if getattr(tr, "branchvalues", None) == "total" and parents is not None:
+        p = np.asarray(parents, dtype=object).ravel()
+        m = min(len(p), len(a))
+        roots = np.array([v is None or (isinstance(v, str) and v == "") for v in p[:m]],
+                         dtype=bool)
+        a = a[:m][roots]
+    fin = a[np.isfinite(a)]
+    if not fin.size:
+        return None
+    total = float(np.sum(fin))
+    return total if np.isfinite(total) else None
+
+
+def _stats_bar_axes(tr):
+    """`(horizontal, value array, category array)` of a bar trace."""
+    horizontal = _stats_orientation(tr, "v") == "h"
+    x, y = getattr(tr, "x", None), getattr(tr, "y", None)
+    return (horizontal, x, y) if horizontal else (horizontal, y, x)
+
+
+def _stats_stack_sums(fig, traces):
+    """{index of the FIRST bar trace of a stack: per-category sums across
+    the stack}. A layout `barmode` "stack" / "relative" (px.bar with `color`
+    stacks by default) draws one bar per category whose height is that sum;
+    the bars of one subplot and orientation stack together, and a stack of
+    one trace adds nothing. Never raises (a failure -> {} and one
+    CHART_STATS_FAILED line)."""
+    try:
+        barmode = getattr(getattr(fig, "layout", None), "barmode", None)
+        if barmode not in ("stack", "relative"):
+            return {}
+        stacks: dict = {}
+        for i, tr in enumerate(traces):
+            if getattr(tr, "type", None) != "bar":
+                continue
+            horizontal, vals, cats = _stats_bar_axes(tr)
+            key = (getattr(tr, "xaxis", None) or "x", getattr(tr, "yaxis", None) or "y",
+                   horizontal)
+            stacks.setdefault(key, []).append((i, vals, cats))
+        out = {}
+        for members in stacks.values():
+            if len(members) < 2:
+                continue
+            all_cats, all_vals = [], []
+            for _i, vals, cats in members:
+                a = _stats_floats(vals)
+                if a is None or cats is None:
+                    continue
+                labels = np.asarray(cats, dtype=object).ravel()
+                m = min(len(labels), len(a))
+                all_cats.append(labels[:m])
+                all_vals.append(a[:m])
+            if len(all_vals) < 2:
+                continue
+            sums = _stats_category_sums(np.concatenate(all_cats), np.concatenate(all_vals),
+                                        only_repeated=False)
+            if sums:
+                out[members[0][0]] = sums
+        return out
+    except Exception as e:
+        _log_chart_stats_failed(e)
+        return {}
+
+
+def _log_chart_stats_failed(e) -> None:
+    """ONE `CHART_STATS_FAILED error=<Type>` line: the exception type only,
+    escaped (sandbox log rules — no job text, no value)."""
+    import logging
+    try:
+        from logger_utils import log_safe_value
+        name = log_safe_value(type(e).__name__, 80)
+    except Exception:
+        name = "unknown"
+    logging.warning(f"[PLOT_RENDER] CHART_STATS_FAILED error={name}")
+
+
+def _stats_trace(tr, caps, stack_sums=()):
+    ttype = _STATS_TRACE_TYPES.get(getattr(tr, "type", None) or "", "other")
+    cap_values, cap_groups = caps
+    values, total, groups, draws_mean = [], None, [], False
+    if ttype in ("box", "violin"):
+        groups, draws_mean = _stats_box_like(tr, ttype, cap_groups)
+    elif ttype == "histogram":
+        values, total, groups = _stats_histogram(tr, cap_values, cap_groups)
+    elif ttype == "bar":
+        _horizontal, vals, cats = _stats_bar_axes(tr)
+        # a category the trace repeats is drawn as ONE bar of the summed
+        # height; a stack's per-category heights ride on its first trace
+        extras = _stats_category_sums(cats, vals) + list(stack_sums)
+        values, total = _stats_values(vals, cap_values, extras)
+    elif ttype == "scatter":
+        y = getattr(tr, "y", None)
+        values, total = _stats_values(y if y is not None else getattr(tr, "x", None),
+                                      cap_values)
+    elif ttype == "pie" or getattr(tr, "type", None) == "funnelarea":
+        vals = getattr(tr, "values", None)
+        labels = getattr(tr, "labels", None)
+        extras = []
+        if vals is None and labels is not None:
+            series = pd.Series(np.asarray(labels, dtype=object).ravel(), dtype=object)
+            vals = series.value_counts(sort=False, dropna=True).to_numpy(dtype=float)
+        elif labels is not None:
+            # a repeated label is ONE slice of the summed value
+            extras = _stats_category_sums(labels, vals)
+        values, total = _stats_values(vals, cap_values, extras)
+    elif ttype == "funnel":
+        horizontal = _stats_orientation(tr, "h") == "h"
+        arr = getattr(tr, "x" if horizontal else "y", None)
+        values, total = _stats_values(arr, cap_values)
+    elif ttype == "waterfall":
+        horizontal = _stats_orientation(tr, "v") == "h"
+        values, total = _stats_values(getattr(tr, "x" if horizontal else "y", None),
+                                      cap_values)
+        measure = getattr(tr, "measure", None)
+        if measure is not None and any(m not in (None, "relative") for m in measure):
+            total = None                 # an absolute / total bar is no delta
+    elif ttype in ("treemap", "sunburst", "icicle"):
+        vals = getattr(tr, "values", None)
+        values, _all = _stats_values(vals, cap_values)
+        total = _stats_hierarchy_total(tr, vals) if values else None
+    elif ttype == "heatmap":
+        values, total = _stats_values(getattr(tr, "z", None), cap_values)
+    return {"type": ttype, "values": values, "total": total, "groups": groups,
+            "draws_mean": bool(draws_mean)}
+
+
+def _chart_stats(fig):
+    """`{"traces": [...]}` of a Plotly figure (see the block comment above),
+    or None. Never raises: a trace whose statistics fail is skipped and the
+    others kept, one `CHART_STATS_FAILED error=<Type>` line per failure (the
+    type only — sandbox log rule); every trace failing, or a failure outside
+    the traces -> None. A hidden trace (`visible` False or "legendonly") draws nothing and is
+    skipped."""
+    try:
+        import exec_transport
+        caps = (exec_transport.CHART_STATS_MAX_VALUES, exec_transport.CHART_STATS_MAX_GROUPS)
+        shown = [tr for tr in list(getattr(fig, "data", None) or [])
+                 if getattr(tr, "visible", None) not in (False, "legendonly")]
+        stack_sums = _stats_stack_sums(fig, shown)
+        traces = []
+        failed = 0
+        for i, tr in enumerate(shown):
+            try:
+                trace = _stats_trace(tr, caps, stack_sums.get(i, ()))
+                for g in trace["groups"]:
+                    for k in [k for k, v in g.items() if v is None]:
+                        del g[k]
+            except Exception as e:
+                _log_chart_stats_failed(e)
+                failed += 1
+                continue
+            traces.append(trace)
+            if len(traces) >= exec_transport.CHART_STATS_MAX_TRACES:
+                break
+        # every trace failed: there is nothing reliable to compare against
+        return None if failed and not traces else {"traces": traces}
+    except Exception as e:
+        _log_chart_stats_failed(e)
+        return None
+
+
 def _is_plotly_grid(fig):
     """True if a Plotly figure is a multi-CELL subplot grid — make_subplots with
     rows>1 or cols>1, or a faceted small-multiple: two+ charts crammed into one
@@ -1194,6 +1617,7 @@ def _split_plotly_grid(fig):
             charts.append({
                 "image": html, "is_plotly": True, "title": title,
                 "chart_data": _extract_plotly_chart_data(sub),
+                "chart_stats": _chart_stats(sub),
             })
         return charts
     except Exception:
@@ -1201,28 +1625,34 @@ def _split_plotly_grid(fig):
 
 
 # Label HEAD words that mark an axis/column as a year/identifier DIMENSION whose
-# numeric values must NOT be comma-grouped (EN + Georgian). We match the HEAD
-# (last) word only — not any substring — so a MEASURE label that merely mentions
-# one of these words still groups: "Order Value" / "Number of Orders" /
-# "Reference Price" / "ID Count" group; "Order ID" / "Customer Code" / "Year"
-# stay raw. Mirrors the frontend `_isIdentifierLabel`.
-_IDENTIFIER_HEAD_WORDS = frozenset({
-    "year", "yr", "წელი", "id", "ids", "code", "codes", "კოდი", "იდ",
-    "zip", "postal", "phone", "account", "iban", "invoice", "order", "ref",
-})
+# numeric values must NOT be comma-grouped. The ONE list and rule live in
+# `ident_rule` (also mirrored by the frontend `_isIdentifierLabel`): the LAST
+# word (camelCase split too) decides, so "Order Value" / "Number of Orders" /
+# "ID Count" group while "Order ID" / "Customer Code" / "Year" stay raw.
+_IDENTIFIER_HEAD_WORDS = ident_rule.IDENT_WORDS
 
 
 def _is_identifier_label(label) -> bool:
     """True when the label's HEAD (last) word names a year/identifier dimension,
-    so its numeric values should stay un-grouped. Never raises."""
+    so its numeric values should stay un-grouped. Delegates to
+    `ident_rule.is_identifier_name` (the name is kept for callers). Never
+    raises."""
     try:
         if not label:
             return False
-        # Unicode letter tokens (drops digits/punctuation/units like "(USD)").
-        toks = re.findall(r"[^\W\d_]+", str(label))
-        if not toks:
+        return ident_rule.is_identifier_name(label)
+    except Exception:
+        return False
+
+
+def _is_identifier_axis_title(title) -> bool:
+    """True when an axis TITLE names an identifier: the name rule, or (in the
+    sandbox) a source input column the job's value rule marked
+    (`ident_rule.job_identifiers`). Never raises."""
+    try:
+        if not title:
             return False
-        return toks[-1].lower() in _IDENTIFIER_HEAD_WORDS
+        return bool(ident_rule.identifier_columns([title], ident_rule.job_identifiers()))
     except Exception:
         return False
 
@@ -1581,22 +2011,104 @@ def _format_plotly_numeric(fig):
                     break
             return bool(vals) and all(_is_num(v) for v in vals)
 
+        def _axis_sample(letter):
+            vals = []
+            for tr in traces:
+                arr = getattr(tr, letter, None)
+                if arr is None:
+                    continue
+                for v in list(arr)[:200]:
+                    if v is not None:
+                        vals.append(v)
+                if len(vals) >= 200:
+                    break
+            return vals
+
+        def _axis_title_text(axis):
+            t = getattr(axis, "title", None) if axis is not None else None
+            return (getattr(t, "text", None) or "") if t is not None else ""
+
+        def _trace_value_letter(tr):
+            """The axis letter that carries a trace's VALUES (the same rule
+            as `_value_var` below): "x" for a horizontal bar, None for a
+            pie / funnelarea / hierarchy trace, else "y"."""
+            ttype = getattr(tr, "type", None)
+            if ttype in ("pie", "funnelarea") or ttype in _HIERARCHY_TYPES:
+                return None
+            if ttype == "bar" and getattr(tr, "orientation", None) == "h":
+                return "x"
+            return "y"
+
+        def _is_value_axis(letter):
+            """True when some trace draws its VALUES on the primary `letter`
+            axis (a trace on a secondary axis — `y2` … — does not count)."""
+            for tr in traces:
+                try:
+                    if _trace_value_letter(tr) != letter:
+                        continue
+                    ref = getattr(tr, letter + "axis", None)
+                    if not ref or ref == letter:
+                        return True
+                except Exception:
+                    return True
+            return False
+
         layout = getattr(fig, "layout", None)
+        # Primary axes whose title names an identifier (the name rule, or a
+        # source column the job's value rule marked): never grouped, and
+        # their value labels are not grouped either (below).
+        ident_letters = set()
         for letter, axis_name in (("x", "xaxis"), ("y", "yaxis")):
             try:
                 axis = getattr(layout, axis_name, None)
                 atype = getattr(axis, "type", None) if axis is not None else None
-                if atype in ("date", "category", "multicategory", "log"):
+                if _is_identifier_axis_title(_axis_title_text(axis)):
+                    ident_letters.add(letter)
+                    numeric = _axis_numeric(letter)
+                    sample = [v for v in _axis_sample(letter) if _is_num(v)] if numeric else []
+                    integral = bool(sample) and all(float(v).is_integer() for v in sample)
+                    # A YEAR axis (every value a whole number in 1900–2100)
+                    # is left exactly as before: never grouped, no type or
+                    # format set here.
+                    if integral and all(1900 <= float(v) <= 2100 for v in sample):
+                        continue
+                    # A linear axis would print 52906123456 as "52.9B" and
+                    # place ticks between real ids. A pure DIMENSION axis
+                    # (no trace draws its values there, no explicit range,
+                    # no type set by the figure) shows its values as
+                    # categories. Any other identifier axis keeps its type;
+                    # it prints full digits (`tickformat="d"`: no grouping,
+                    # no SI suffix) only when its values are whole numbers
+                    # reaching 10 000 — where plotly would switch to "k" /
+                    # "B". Anything else is left as before (never grouped).
+                    no_range = getattr(axis, "range", None) is None if axis is not None else True
+                    if (atype in (None, "-") and numeric and no_range
+                            and not _is_value_axis(letter)):
+                        fig.update_layout(**{axis_name: dict(type="category")})
+                        continue
+                    if (integral and max(abs(float(v)) for v in sample) >= 10000
+                            and (atype in ("linear", "log") or (atype in (None, "-") and numeric))):
+                        fig.update_layout(**{axis_name: dict(tickformat="d")})
                     continue
-                # skip only genuine year/id-style axes (head-word match)
-                t = getattr(axis, "title", None) if axis is not None else None
-                ttxt = (getattr(t, "text", None) or "") if t is not None else ""
-                if _is_identifier_label(ttxt):
+                if atype in ("date", "category", "multicategory", "log"):
                     continue
                 if atype == "linear" or (atype in (None, "-") and _axis_numeric(letter)):
                     fig.update_layout(**{axis_name: dict(tickformat=",")})
             except Exception:
                 continue
+
+        def _value_axis_is_ident(tr, var):
+            """True when the trace's value axis (`var` x / y) is an
+            identifier axis: the primary one by `ident_letters`, a secondary
+            one (`y2` …) by its own title."""
+            if var not in ("x", "y"):
+                return False
+            ref = getattr(tr, var + "axis", None)
+            if not ref or ref == var:
+                return var in ident_letters
+            name = _layout_axis_name(ref)
+            axis = getattr(layout, name, None) if name else None
+            return _is_identifier_axis_title(_axis_title_text(axis))
 
         # ── Numeric value labels → thousands-grouped ──────────────────────
         # A trace can show numeric value labels three ways, all handled here:
@@ -1668,6 +2180,10 @@ def _format_plotly_numeric(fig):
         for tr in traces:
             try:
                 var = _value_var(tr)
+                # Value labels of a trace whose value axis is an identifier
+                # axis are left exactly as the code built them (no grouping).
+                if _value_axis_is_ident(tr, var):
+                    continue
                 # (C) sunburst/treemap/icicle without a texttemplate: a
                 # `textinfo` that shows the value gets an equivalent template
                 # whose value part is formatted (see _hierarchy_texttemplate);
@@ -1991,12 +2507,25 @@ def _format_matplotlib_numeric(fig):
         except Exception:
             pass
 
+        def _value_axis_letter(ax):
+            """The axis that carries the subplot's VALUES: "x" when it holds
+            a horizontal bar container (`barh`), else "y". Never raises."""
+            try:
+                for cont in list(getattr(ax, "containers", []) or []):
+                    if getattr(cont, "orientation", None) == "horizontal":
+                        return "x"
+            except Exception:
+                pass
+            return "y"
+
         for ax in fig.get_axes():
             for axis, label in ((ax.xaxis, ax.get_xlabel()), (ax.yaxis, ax.get_ylabel())):
                 try:
                     if _skip_axis(axis):
                         continue
-                    if _is_identifier_label(label):
+                    # An identifier axis (by label: the name rule or a source
+                    # column the job's value rule marked) is never grouped.
+                    if _is_identifier_axis_title(label):
                         continue
                     # Only group an axis whose CURRENT tick labels are all
                     # numeric. Skipping a string/category axis preserves names
@@ -2006,6 +2535,14 @@ def _format_matplotlib_numeric(fig):
                     axis.set_major_formatter(_mtick.FuncFormatter(_fmt))
                 except Exception:
                     continue
+            # Data labels show the VALUES: when the value axis is an
+            # identifier axis they are identifier values, left as drawn.
+            try:
+                value_label = ax.get_xlabel() if _value_axis_letter(ax) == "x" else ax.get_ylabel()
+                if _is_identifier_axis_title(value_label):
+                    continue
+            except Exception:
+                pass
             # Numeric data labels (bar labels / annotations). Plain numbers only;
             # a 4-digit year is left alone, 'k'/'M'-suffixed or text labels skip.
             for t in list(getattr(ax, "texts", []) or []):
@@ -2101,6 +2638,14 @@ def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: b
     # per-exec-site install pattern as SANDBOX_BUILTINS below).
     from exec_sanitizer import sanitize_for_execution
     dfs = sanitize_for_execution(dfs, sid_or_id)
+    # The job's source identifier columns, from its OWN input frames (the
+    # sandbox side decides; nothing new rides on the executor request). Kept
+    # as per-job state for the chart formatters; reset every job and
+    # computed lazily, the first time a figure is formatted.
+    try:
+        ident_rule.begin_job(dfs)
+    except Exception as _e:
+        logging.warning(f"[PLOT_RENDER] IDENT_COLUMNS_FAILED error={type(_e).__name__}")
     env["dfs"] = dfs
     # Same guarded builtins as `code_exec._execute_in_process` — chart code
     # must not import DB drivers / credential modules either (Article VII).
@@ -2206,7 +2751,11 @@ def _render_in_process(code: str, dfs: dict, sid_or_id: str, split_multi_axes: b
             # Capture the plotted data for the client-side "Show data" button.
             # Display-only; failures degrade to None and never block the chart.
             chart_data = _extract_plotly_chart_data(plotly_fig)
-            out = {"ok": True, "plotly_html": html, "is_plotly": True, "chart_data": chart_data}
+            # What the chart DRAWS, from the full figure, for the web app's
+            # text/chart check (log only). None on any failure.
+            chart_stats = _chart_stats(plotly_fig)
+            out = {"ok": True, "plotly_html": html, "is_plotly": True, "chart_data": chart_data,
+                   "chart_stats": chart_stats}
             return _with_outputs(out, env)
         else:
             # Empty-data guard: check if any axes have actual data before encoding

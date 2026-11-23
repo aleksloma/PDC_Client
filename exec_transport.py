@@ -63,6 +63,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from exec_sanitizer import sanitize_for_execution
+import ident_rule
 import logger_utils as _logger_utils
 from logger_utils import log_with_sid
 
@@ -810,16 +811,52 @@ def _without_default_index(styler):
         return styler
 
 
+def _ident_cell_text(value) -> str:
+    """One identifier cell of a styled table: '' for a missing value, the
+    plain digits of an integral number (no grouping, no ".0"), else str(v)."""
+    text = ident_rule.plain_text(value)
+    return "" if text is None else text
+
+
+def _with_plain_identifiers(styler):
+    """A COPY of `styler` whose identifier columns (decided by
+    `ident_rule.identifier_columns` over `styler.data`'s columns and the
+    job's source identifiers — `ident_rule.job_identifiers()`, the per-job
+    state `code_exec._execute_in_process` set from the job's own input
+    frames) are formatted as plain digit strings, overriding a generated
+    `.format(thousands=',')` for those columns only. No identifier column ->
+    the styler itself. Never raises: a failure logs the exception TYPE only
+    (a library message can quote a cell) and keeps the styler as it was."""
+    try:
+        frame = styler.data
+        cols = ident_rule.identifier_columns(frame.columns, ident_rule.job_identifiers())
+        if not cols:
+            return styler
+        wanted = set(cols)
+        subset = [c for c in frame.columns if str(c) in wanted]
+        if not subset or len(set(subset)) != len(subset) or not frame.columns.is_unique:
+            return styler
+        out = copy.deepcopy(styler)
+        formatted = out.format(_ident_cell_text, subset=subset, escape="html")
+        return formatted if formatted is not None and hasattr(formatted, "to_html") else styler
+    except Exception as e:
+        log_with_sid("exec", "warning",
+                     f"EXEC_STYLER_IDENT_FORMAT_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return styler
+
+
 def _styled_html(styler) -> Optional[str]:
     """`styler.to_html()` within the Styler caps, else None. An index that
     carries no information (RangeIndex / unnamed integer index, not a
     MultiIndex) is hidden first, on a copy (`_without_default_index`), so the
-    styled table shows no 0..n column — a meaningful index stays visible."""
+    styled table shows no 0..n column — a meaningful index stays visible.
+    Identifier columns are shown as plain digits first, on a copy
+    (`_with_plain_identifiers`)."""
     try:
         frame = styler.data
         if frame.shape[0] > STYLED_MAX_ROWS or frame.shape[1] > STYLED_MAX_COLS:
             return None
-        html = _without_default_index(styler).to_html()
+        html = _without_default_index(_with_plain_identifiers(styler)).to_html()
         if not isinstance(html, str) or not html.strip() or len(html) > STYLED_MAX_CHARS:
             return None
         return html
@@ -1106,6 +1143,122 @@ def capture_outputs(env: Any) -> dict:
         return {"values": {}, "values_dropped": 0, "findings": {}, "findings_dropped": 0}
 
 
+# ---------------------------------------------------------------------------
+# chart_stats — what a Plotly chart draws, for the text/chart check (LOG ONLY)
+# ---------------------------------------------------------------------------
+# Built in the sandbox by `plot_utils._chart_stats` next to `chart_data`, read
+# in the web app by `text_chart_check.check_block`. Numbers only: it is never
+# stored in history, never sent to the brain and never logged except as
+# counts. The caps bound both the sandbox's work and the decoder's.
+CHART_STATS_MAX_TRACES = 20
+CHART_STATS_MAX_VALUES = 2000
+CHART_STATS_MAX_GROUPS = 50
+CHART_STATS_TYPES = ("bar", "scatter", "pie", "box", "violin", "histogram", "heatmap",
+                     "treemap", "sunburst", "icicle", "waterfall", "funnel", "other")
+CHART_STATS_GROUP_KEYS = ("n", "mean", "median", "q1", "q3", "min", "max")
+# A list longer than this many times its cap is not read at all (dropped):
+# the decoder's work stays bounded whatever the response holds.
+_CHART_STATS_SCAN_FACTOR = 4
+
+
+def _stats_number(value: Any):
+    """An exact, finite int / float (never a bool) as a float, else None."""
+    kind = type(value)
+    if kind is not int and kind is not float:
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _stats_list(value: Any, cap: int) -> list:
+    """The finite numbers of a list, the first `cap` kept; a non-list or a
+    list above `cap * _CHART_STATS_SCAN_FACTOR` entries -> []."""
+    if type(value) is not list or len(value) > cap * _CHART_STATS_SCAN_FACTOR:
+        return []
+    out = []
+    for item in value:
+        number = _stats_number(item)
+        if number is None:
+            continue
+        out.append(number)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _stats_group(value: Any):
+    if type(value) is not dict:
+        return None
+    group = {}
+    for key in CHART_STATS_GROUP_KEYS:
+        number = _stats_number(dict.get(value, key))
+        if number is None:
+            continue
+        if key == "n":
+            if number < 0 or not number.is_integer():
+                continue
+            group[key] = int(number)
+        else:
+            group[key] = number
+    return group or None
+
+
+def _stats_trace(value: Any):
+    if type(value) is not dict:
+        return None
+    kind = dict.get(value, "type")
+    if type(kind) is not str or kind not in CHART_STATS_TYPES:
+        kind = "other"
+    groups_raw = dict.get(value, "groups")
+    groups = []
+    if (type(groups_raw) is list
+            and len(groups_raw) <= CHART_STATS_MAX_GROUPS * _CHART_STATS_SCAN_FACTOR):
+        for item in groups_raw:
+            group = _stats_group(item)
+            if group is not None:
+                groups.append(group)
+                if len(groups) >= CHART_STATS_MAX_GROUPS:
+                    break
+    return {"type": kind,
+            "values": _stats_list(dict.get(value, "values"), CHART_STATS_MAX_VALUES),
+            "total": _stats_number(dict.get(value, "total")),
+            "groups": groups,
+            "draws_mean": dict.get(value, "draws_mean") is True}
+
+
+def decode_chart_stats(raw: Any):
+    """The main-app side of `chart_stats` (HOSTILE input — the same
+    discipline as `decode_values`): `{"traces": [{type, values, total,
+    groups, draws_mean}, ...]}` or None. Only exact dicts / lists are read,
+    every number must be an exact finite int / float (never a bool or a
+    string), unknown keys are dropped, an unknown `type` reads "other", the
+    caps (20 traces, 2000 values, 50 groups) keep the first entries and a
+    list far above its cap is dropped unread. Not a dict, or no `traces`
+    list -> None. Never raises, never logs a value."""
+    try:
+        if type(raw) is not dict:
+            return None
+        traces_raw = dict.get(raw, "traces")
+        if (type(traces_raw) is not list
+                or len(traces_raw) > CHART_STATS_MAX_TRACES * _CHART_STATS_SCAN_FACTOR):
+            return None
+        traces = []
+        for item in traces_raw:
+            trace = _stats_trace(item)
+            if trace is not None:
+                traces.append(trace)
+                if len(traces) >= CHART_STATS_MAX_TRACES:
+                    break
+        return {"traces": traces}
+    except Exception as e:
+        log_with_sid("exec", "warning",
+                     f"CHART_STATS_DECODE_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return None
+
+
 def _known_dropped(value: Any) -> int:
     """A drop count from the response: a non-negative int up to the cap,
     else 0. A count cannot be negative, so a negative one reads as 0."""
@@ -1121,9 +1274,9 @@ def _known_dropped(value: Any) -> int:
 _PYTHON_KEYS = ("error", "result", "preview", "image_base64",
                 "values", "values_dropped", "findings", "findings_dropped")
 _PLOT_KEYS = ("ok", "error", "trace", "multi_axes", "is_plotly", "image",
-              "plotly_html", "multi_charts", "chart_data", "result",
+              "plotly_html", "multi_charts", "chart_data", "chart_stats", "result",
               "values", "values_dropped", "findings", "findings_dropped")
-_CHART_KEYS = ("image", "is_plotly", "title", "chart_data")
+_CHART_KEYS = ("image", "is_plotly", "title", "chart_data", "chart_stats")
 _MULTI_CHARTS_MAX = 32
 
 
@@ -1219,6 +1372,8 @@ def _reconstruct(payload: dict, job_dir: Path, kind: str) -> dict:
             out[key] = _decode_blob(value, job_dir)
         elif key == "chart_data":
             out[key] = _decode_chart_data(value)
+        elif key == "chart_stats":
+            out[key] = decode_chart_stats(value)
         elif key == "multi_charts":
             out[key] = _decode_multi_charts(value, job_dir)
     # VALUES / FINDINGS never cause a violation: a hostile entry degrades to
@@ -1271,6 +1426,8 @@ def _decode_multi_charts(value: Any, job_dir: Path):
                 entry[key] = _decode_blob(item, job_dir)
             elif key == "chart_data":
                 entry[key] = _decode_chart_data(item)
+            elif key == "chart_stats":
+                entry[key] = decode_chart_stats(item)
             elif key == "is_plotly":
                 if not isinstance(item, bool):
                     raise _Violation("multi_charts is_plotly is not a boolean")

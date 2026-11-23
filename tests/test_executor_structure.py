@@ -89,6 +89,9 @@ RUNTIME_COPY_SOURCES = {
     "code_exec.py", "plot_utils.py", "exec_sanitizer.py", "sandbox_guard.py",
     "outlier_utils.py", "logger_utils.py", "settings.py", "exec_transport.py",
     "pdc_diag.py",
+    # P31 Part D: the one identifier rule, read by the styled-table and
+    # chart formatters inside the sandbox
+    "ident_rule.py",
     "static/fonts/DejaVuSans.ttf",
     "executor/__init__.py", "executor/app.py", "executor/runner.py",
     "executor/requirements.txt",

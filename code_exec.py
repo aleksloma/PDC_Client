@@ -22,6 +22,7 @@ from settings import settings
 from sandbox_guard import SANDBOX_BUILTINS, PDC_DIAG_REDEFINED_TEXT, pdc_diag_redefinition
 from exec_sanitizer import sanitize_for_execution
 import exec_transport
+import ident_rule
 
 # --- Extended visualization libraries (safe imports) ---
 try:
@@ -235,6 +236,17 @@ def _execute_in_process(code: str, dfs: dict, sid: str | None = None, timeout: f
     # Article XIII gate: generated code must only ever see standard dtypes.
     # Rebinding the local `dfs` covers both env["dfs"] and the `df` alias.
     dfs = sanitize_for_execution(dfs, sid or "exec")
+
+    # The job's source identifier columns, decided from its OWN input frames
+    # (Article XIV: the sandbox decides; nothing new rides on the request).
+    # Per-job state, reset every job and computed lazily — only when
+    # `exec_transport._styled_html` serializes a Styler or a chart is
+    # formatted.
+    try:
+        ident_rule.begin_job(dfs)
+    except Exception as e:
+        log_with_sid(sid or "exec", "warning",
+                     f"IDENT_COLUMNS_FAILED error={type(e).__name__}")
 
     # `pdc_diag` cannot be redefined (sandbox_guard): refused BEFORE anything
     # executes, with a fixed text that carries no code. Logged with the code

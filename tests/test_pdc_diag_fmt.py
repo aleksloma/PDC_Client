@@ -277,12 +277,21 @@ def test_fmt_text_kind_caps_200(kind):
     assert fmt("", kind) == ""
 
 
-@pytest.mark.parametrize("kind", ["text", "period"])
-def test_fmt_text_kind_with_number_uses_type_default(kind):
-    # rule 5: an int / float under a text kind takes its type's default kind
-    assert fmt(1234567, kind) == "1,234,567"
-    assert fmt(1234.5678, kind) == "1,234.57"
-    assert fmt(np.int64(1234567), kind) == "1,234,567"
+def test_fmt_period_kind_with_number_uses_type_default():
+    # rule 5: an int / float under `period` takes its type's default kind
+    assert fmt(1234567, "period") == "1,234,567"
+    assert fmt(1234.5678, "period") == "1,234.57"
+    assert fmt(np.int64(1234567), "period") == "1,234,567"
+
+
+def test_fmt_text_kind_with_number_integral_is_plain_digits():
+    # rule 5 (P31 Part D, deliberate update): an INTEGRAL number under `text`
+    # renders str(int(v)) — an identifier such as a personal number must
+    # never be grouped. A non-integral number keeps the float default.
+    assert fmt(1234567, "text") == "1234567"
+    assert fmt(np.int64(1234567), "text") == "1234567"
+    assert fmt(1234567.0, "text") == "1234567"
+    assert fmt(1234.5678, "text") == "1,234.57"
 
 
 # --- rule 6: a numeric kind with a non-numeric value -> the text rule ---------

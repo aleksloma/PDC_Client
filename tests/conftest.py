@@ -199,6 +199,21 @@ def no_brain_activity_worker(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def reset_identifier_state():
+    """Start every test with no per-job identifier state (P31 Part D).
+
+    `ident_rule` keeps the sandbox job's input frames / source identifiers as
+    module state (one job per runner subprocess in production). In this
+    single test process a job run by one test would otherwise decide which
+    columns a later test's styled table or chart treats as identifiers, so
+    the state is cleared before each test."""
+    import ident_rule
+
+    ident_rule.reset_job()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def no_brain_title_call(request, monkeypatch):
     """Replace `brain_client.title` with a stub for every test.
 

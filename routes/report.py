@@ -27,6 +27,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
 import brain_client
+import ident_rule
 import local_store
 import narrative as _narr
 from brain_client import TenantRevokedError, BrainError
@@ -701,12 +702,13 @@ def _render_pptx_builtin(qa_pairs: list, report_structure: dict, sid: str) -> by
             cols = table.get("columns") or []
             rows = (table.get("rows") or [])[:15]
             if cols and rows:
+                idents = _table_ident_columns(table)
                 tbl = slide.shapes.add_table(len(rows) + 1, len(cols), Inches(0.4), Inches(3.0), Inches(12.5), Inches(4.2)).table
                 for j, c in enumerate(cols):
                     tbl.cell(0, j).text = str(c)
                 for r_idx, row in enumerate(rows):
                     for j, c in enumerate(cols):
-                        tbl.cell(r_idx + 1, j).text = str(row.get(c, ""))[:80]
+                        tbl.cell(r_idx + 1, j).text = _report_cell(row.get(c, ""), str(c) in idents)[:80]
 
     # Key takeaways
     takeaways = report_structure.get("key_takeaways") or []
@@ -720,6 +722,37 @@ def _render_pptx_builtin(qa_pairs: list, report_structure: dict, sid: str) -> by
     buf = io.BytesIO()
     prs.save(buf)
     return buf.getvalue()
+
+
+def _table_ident_columns(table) -> set:
+    """The identifier columns of a stored table payload: its additive
+    `identifier_columns` list plus the name rule over its columns
+    (`ident_rule.identifier_columns`) — a row stored before the key existed
+    is decided by name. Never raises (a failure logs the TYPE, answers an
+    empty set)."""
+    try:
+        cols = set(ident_rule.identifier_columns(table.get("columns") or []))
+        listed = table.get("identifier_columns")
+        if isinstance(listed, list):
+            cols.update(str(c) for c in listed if isinstance(c, (str, int, float)))
+        return cols
+    except Exception as e:
+        log_with_sid("report", "warning",
+                     f"REPORT_IDENT_COLUMNS_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return set()
+
+
+def _report_cell(value, is_ident: bool) -> str:
+    """One PDF / PPTX table cell as text: an identifier column's integral
+    number as its plain digits (no ".0"), everything else `str(value)` as
+    before. Never raises."""
+    if is_ident:
+        try:
+            text = ident_rule.plain_text(value)
+            return "" if text is None else text
+        except Exception:
+            pass
+    return str(value)
 
 
 def _hex_to_rgb(hex_str: str, fallback=(55, 65, 81)):
@@ -2400,7 +2433,9 @@ def _render_pdf(qa_pairs: list, report_structure: dict, sid: str) -> bytes:
             cols = table.get("columns") or []
             rows = (table.get("rows") or [])[:15]
             if cols and rows:
-                data = [cols] + [[str(r.get(c, ""))[:60] for c in cols] for r in rows]
+                idents = _table_ident_columns(table)
+                data = [cols] + [[_report_cell(r.get(c, ""), str(c) in idents)[:60] for c in cols]
+                                 for r in rows]
                 t = RLTable(data, repeatRows=1)
                 t.setStyle(TableStyle([
                     ("BACKGROUND", (0, 0), (-1, 0), HexColor("#001E44")),

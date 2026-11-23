@@ -172,6 +172,13 @@ detected language as a hint; the brain applies the tenant's
 English). Unset = today's behavior (client-detected → English). See
 [`PROTOCOL.md`](PROTOCOL.md) `/v1/chat_metadata`.
 
+**Answers are not masked.** A user who may read a table sees its values in
+answers, names and personal numbers included. Who sees a table is decided by
+the client's roles; which values are kept away from the brain is set by the
+client's `SCHEMA_VALUE_DENY_COLUMNS`. Tenant prompt tuning must not ask the
+planner to hide personal data: the masking lines were removed from the
+tenants' tuning texts and from the `banking_uz` domain skill on 22 Nov 2026.
+
 The skill ENGINE and skill LIBRARY (definitions, selection logic,
 code-generation templates) live on the brain and are shared across all
 tenants.
@@ -306,6 +313,22 @@ of the request (for a plan, including the classifier).
   deadline instead (next bullet). Inside one attempt the 429/5xx HTTP
   retries of `_call_gemini_rest` also stop at the request deadline: a retry
   that would leave less than 10 s is not made.
+- **Output limit.** The plan attempts (main, reserve, chain, narrative
+  correction), the code retry, the narrative-only retry and the
+  auto-analytics planner ask for the model's own output maximum
+  (`outputTokenLimit` from the Gemini model list); every other call keeps
+  its explicit limit. The list is fetched once per process and kept for
+  `MODEL_LIMITS_TTL_SECONDS` (3600 s); a failed or missing lookup is tried
+  again at most every 300 s and keeps a cached value. One fetch takes at
+  most `MODEL_LIMITS_FETCH_SECONDS` (10 s) and, inside a request, ends 10 s
+  before the deadline. When a tenant's own API key cannot read the list,
+  the brain key is tried once. A model the list does not name gets 32768
+  (`MODEL_OUTPUT_LIMIT_UNKNOWN`, once per model per process).
+  `LLM_MAX_OUTPUT_TOKENS` above 0 is an optional lower cap; the default 0
+  is off (it was a fixed 32768). Measured on 22 Nov 2026: gemini-3.8-flash,
+  gemini-3.5-flash-lite and gemini-3.1-pro-preview allow 65536,
+  gemini-4-argon (tenant TIME's complex tier) 32768. `LLM_DONE` logs the
+  limit sent (`max_output_tokens=`).
 - **Streamed thinking calls (liveness).** On a tier with thinking on, the
   plan's main and chain attempts, the code retry, the narrative-only retry
   and the narrative correction call are streamed
@@ -326,9 +349,15 @@ of the request (for a plan, including the classifier).
     arrive: it may run to the request deadline. Every other streamed call
     keeps `min(cap, time left)`. Reaching the bound is a timeout
     (`LLM_TIMEOUT`);
-  - *thinking tokens:* with `LLM_THINKING_TOKEN_CAP` above 0 (default 0,
-    off) a streamed thinking call ends as `thinking_cap` once its streamed
-    `thoughtsTokenCount` passes the cap.
+  - *thinking tokens (reply reserve):* a streamed thinking call ends as
+    `thinking_cap` once its streamed `thoughtsTokenCount` passes
+    `max_tokens - ceil(max_tokens × LLM_REPLY_RESERVE_SHARE)` (default
+    0.25, clamped to 0–0.9, 0 = off: 49152 of 65536, 24576 of 32768), so
+    the reply keeps that share of the output limit. `LLM_THINKING_TOKEN_CAP`
+    above 0 (default 0, off) is the cap instead when it is lower. The cap
+    never ends a call once its answer text has started, nor on the chunk
+    that finishes it (`LLM_THINKING_CAP_REACHED … reason=reply_reserve|setting`).
+    `thinkingBudget` is unchanged.
 
   What a model does is learned per process from its replies, never from a
   model name in code. A model that sends a thought part becomes known. A
@@ -352,14 +381,31 @@ of the request (for a plan, including the classifier).
   the request's. When the main attempt fails or stalls before that, the
   reserve runs at once in the request thread; when the reserve is already
   running, the request waits for it (at most the time left plus
-  `LLM_STREAM_STALL_SECONDS`). Result choice: the main answer wins whenever
-  it arrives — a reserve is then cancelled, waited for at most
-  `LLM_STREAM_STALL_SECONDS`, and its token counts (full or partial) are
-  added to `usage`; the reserve answer is used only when the main attempt
-  failed, stalled or reached its bound. There is no reserve when the
-  reserve tier's model and thinking setting equal the main attempt's, and
-  none is started with under 10 s left. Main attempt, reserve and chain all
-  run inside the one request budget (240 s, unchanged).
+  `LLM_STREAM_STALL_SECONDS`). Result choice: a usable main answer (next
+  bullet) wins whenever it arrives — a reserve is then cancelled, waited for
+  at most `LLM_STREAM_STALL_SECONDS`, and its token counts (full or
+  partial) are added to `usage`; the reserve answer is used only when the
+  main attempt failed, stalled, reached its bound or gave no usable reply.
+  There is no reserve when the reserve tier's model and thinking setting
+  equal the main attempt's, and none is started with under 10 s left. Main
+  attempt, reserve and chain all run inside the one request budget (240 s,
+  unchanged).
+- **Plan replies are judged.** A main, reserve or chain reply is checked
+  before it wins. A reply that ended at the output limit (finish reason
+  `MAX_TOKENS`, outcome `max_tokens`), or prose without an outcome keyword
+  or an empty reply (`no_code`), is not used: it counts like a failed
+  attempt, so the reserve (`PLAN_RESERVE_USED
+  reason=main_max_tokens|main_no_code`) and then the chain answer. An
+  exact `NO_CODE`, `CLARIFICATION` / `ANSWER` / `MISSING_DATA` and a
+  safety block stay usable. An unusable reply logs `PLAN_REPLY_UNUSABLE`
+  (counts only) and its token counts are added to `usage`. When no reply
+  is usable, a cut reply that still has a complete code block once its
+  unfinished block is dropped is the last resort (`PLAN_SALVAGED_CUT_REPLY`,
+  `finish_reason` stays `MAX_TOKENS`); otherwise the plan has no answer
+  (`PLAN_NO_USABLE_REPLY outcomes=…`; see "Exhausted budget" and "No
+  answer with time left" below). A retry reply cut
+  at the limit keeps its complete code blocks (`RETRY_REPLY_CUT
+  salvaged=true|false`).
 - **Fallback chain.** After the main attempt and the reserve, `/v1/plan`
   tries the rest of its chain one model after another: the simple and the
   light tier model (tenant overrides honoured), then `LLM_FALLBACK_MODELS`
@@ -372,10 +418,12 @@ of the request (for a plan, including the classifier).
   shape (plan: `context_decision.api_failed = true`, no code) and adds
   `error_code: "llm_budget_exhausted"` plus `models_tried`, so the client can
   tell a spent budget from other failures (see `PROTOCOL.md`). A plan with
-  no answer and under 10 s left at the end counts as a spent budget.
-- **No answer with time left.** When every plan attempt failed and at least
-  10 s of the budget is left, the plan adds `error_code: "llm_unavailable"`
-  plus `models_tried` (log `PLAN_API_FAILED`). The other endpoints keep
+  no usable answer and under 10 s left at the end counts as a spent budget.
+- **No answer with time left.** When every plan attempt failed or gave no
+  usable reply (none salvaged) and at least 10 s of the budget is left, the plan adds
+  `error_code: "llm_unavailable"` plus `models_tried` (log
+  `PLAN_API_FAILED`; `reason=no_usable_reply` when no attempt raised an
+  error but none was usable). The other endpoints keep
   their fallback body without `error_code` when their model fails inside
   the budget.
 - **One log line per request that reaches a model call** (a plan answered
@@ -387,7 +435,8 @@ of the request (for a plan, including the classifier).
   `<model>:<seconds>:<outcome>:correction`, a plan's reserve attempt as
   `<model>:<seconds>:<outcome>:reserve` after a failed main attempt, or
   `<model>:<seconds>:<outcome>:reserve:discarded` when the main answer won,
-  or `-` when no model was started),
+  a salvaged cut plan reply as `<model>:<seconds>:ok:salvaged` after its
+  own `max_tokens` record, or `-` when no model was started),
   written at the END of the request so it covers every call, e.g.
   `[sid=…] [caller=plan] [total_elapsed=240.31] [budget=240] [exhausted=True]
   [attempts=gemini-4-argon:150.00:ReadTimeout;gemini-3.8-flash:90.00:ReadTimeout] LLM_BUDGET`
@@ -398,7 +447,8 @@ of the request (for a plan, including the classifier).
   `[attempts=gemini-3.8-flash:4.10:ok:classifier;gemini-4-argon:131.40:ok;gemini-3.8-flash:41.38:cancelled:reserve:discarded]`.
   Model names, seconds and the outcome (`ok`, `skipped_budget`, `stalled`,
   `thinking_cap`, `cancelled`, `running` — a reserve still running when it
-  was given up — or an exception class name) only, never prompt or reply
+  was given up —, `max_tokens` / `no_code` — a plan reply that answered but
+  was not usable — or an exception class name) only, never prompt or reply
   text (Article II). A spent
   budget also logs `<CALLER>_BUDGET_EXHAUSTED` (e.g. `PLAN_BUDGET_EXHAUSTED`),
   or `NARRATIVE_CORRECTION_SKIPPED_BUDGET` when it runs out at the correction step.
@@ -1732,6 +1782,20 @@ capabilities, which restores the earlier prompts and responses.
   (input column and df names, and text the failed code itself contains,
   kept); `/v1/report` `table_columns` keeps
   input column names only.
+- **Identifiers shown as plain digits (P31, 22 Nov 2026).** One leaf
+  rule, `ident_rule.py` (both images), decides which columns are
+  identifiers (ids, personal / account / phone / card numbers, codes,
+  years): the column name, and for an input column also its values. Their
+  numbers are never thousands-grouped and never show `.0` — in tables (an
+  additive `identifier_columns` on table payloads, `CLIENT_ENDPOINTS.md`),
+  styled tables, chart axes, narrative slots, Excel, PDF and PPTX. Display
+  only; loading is unchanged and nothing new goes to the brain.
+- **Text-vs-chart check (P31, log only).** For a Plotly chart the sandbox
+  also returns `chart_stats`, the numbers the chart draws; the web app
+  compares the narrative's and caption's numeric slots with them
+  (`text_chart_check`) and logs one `TEXT_CHART_CHECK` line of counts and
+  slot names. Nothing is shown, stored, retried or sent to the brain
+  (`DIAGNOSTICS_SPEC.md` A5.7).
 
 Kill switch: `BRAIN_CAPABILITIES=""` (default `narrative_v1,diagnostics_v1`;
 `two_phase_v1` is ignored by this release). The scrubs and the null

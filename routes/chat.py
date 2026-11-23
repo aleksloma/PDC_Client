@@ -230,6 +230,9 @@ def _persist_full_table(store, table: dict, code: str | None,
             "rows": table.get("rows", []),
             "total_rows": table.get("total_rows"),
         })
+        ident_cols = table.get("identifier_columns")
+        if isinstance(ident_cols, list) and ident_cols:
+            record["identifier_columns"] = [str(c) for c in ident_cols]
         if code:
             record["code"] = code
         if result_key is not None:
@@ -301,7 +304,10 @@ async def _reexecute_full_df(chat_id: str, code: str | None, result_key: str | N
     not per-user, so the cache must always hold the full set.
 
     The returned frame carries `attrs["pdc_sql_used"]` (the live SELECTs
-    that ran: df key -> SQL text, None for a default read; {} when none)
+    that ran: df key -> SQL text, None for a default read; {} when none),
+    `attrs["pdc_source_idents"]` (the input frames' identifier column names,
+    `run_chat_local.source_identifiers`, sorted — what the full-table view,
+    the dashboard tile and the Excel download format identifiers by)
     and `attrs["pdc_first_key"]` (the first frame's key), always set here —
     a caller persisting a fresh full-table record passes them on as `sql=` /
     `first_key=` (the dashboard multi-table tile). Carried on the frame so
@@ -335,6 +341,8 @@ async def _reexecute_full_df(chat_id: str, code: str | None, result_key: str | N
             _EXEC, lambda: safe_execute(code, dfs, sid=chat_id))
         if not isinstance(exec_out, dict) or exec_out.get("error"):
             return None
+        idents = await loop.run_in_executor(
+            _EXEC, lambda: run_chat_local.source_identifiers(chat_id, dfs))
         obj = exec_out.get("result")
         if isinstance(obj, dict) and result_key is not None:
             obj = obj.get(result_key)
@@ -354,6 +362,7 @@ async def _reexecute_full_df(chat_id: str, code: str | None, result_key: str | N
         # and only this process decides what ran.
         out.attrs["pdc_sql_used"] = dict(sql_used or {})
         out.attrs["pdc_first_key"] = first_key
+        out.attrs["pdc_source_idents"] = sorted(idents or ())
         return out
     except Exception as e:
         # The re-executed RESULT is normalized here (`_normalize_df_for_table`),
@@ -3159,12 +3168,31 @@ async def full_table_get(request: Request, chat_id: str, key: str):
         return denied
     df = await _reexecute_full_df(chat_id, rec.get("code"), rec.get("result_key"))
     if df is not None and not df.empty:
-        return _json_safe({
+        payload = {
             "columns": list(df.columns),
             "rows": df.to_dict(orient="records"),
             "total_rows": int(len(df)),
-        })
+        }
+        ident_cols = _frame_identifier_columns(df)
+        if ident_cols:
+            payload["identifier_columns"] = ident_cols
+        return _json_safe(payload)
     return _json_safe(rec)
+
+
+def _frame_identifier_columns(df) -> list:
+    """The identifier columns of a re-executed frame (`ident_rule.
+    identifier_columns` over its columns and the source identifiers
+    `_reexecute_full_df` put on `attrs["pdc_source_idents"]`). Never raises
+    (a failure logs the exception TYPE and answers [])."""
+    try:
+        import ident_rule
+        attrs = getattr(df, "attrs", None) or {}
+        return ident_rule.identifier_columns(df.columns, attrs.get("pdc_source_idents") or ())
+    except Exception as e:
+        log_with_sid("table", "warning",
+                     f"IDENT_FRAME_FAILED error={log_safe_text(type(e).__name__, 80)}")
+        return []
 
 
 # --- Per-chart / per-table refresh -------------------------------------------
@@ -3472,7 +3500,9 @@ async def run_item_refresh(chat_id: str, code: str, kind: str, sid: str,
                              f"REFRESH_ITEM_TABLE_EXEC_ERROR: {log_safe_text(str(emsg), 200)}",
                              chat_id=chat_id)
                 return {"ok": False, "error": "Could not re-run this table with the current data."}
-            table = _build_table_from_result(exec_out.get("result"))
+            idents = await loop.run_in_executor(
+                _EXEC, lambda: run_chat_local.source_identifiers(sid, dfs))
+            table = _build_table_from_result(exec_out.get("result"), idents)
             if not table or not (table.get("rows") or []):
                 return {"ok": False, "error": "Re-execution did not produce a table."}
             payload = {"ok": True, "kind": "table", "table": table}
@@ -3576,27 +3606,115 @@ def _safe_filename(name: str, default: str = "download") -> str:
     return cleaned[:120] or default
 
 
-def _table_to_xlsx_bytes(columns: list, rows: list) -> bytes:
-    """Build a .xlsx from the cached/posted table shape ({columns, rows})."""
+# Excel keeps 15 significant digits: an identifier with more is written as
+# text so no digit is lost; up to 15 it stays a NUMBER shown as "0".
+_XLSX_MAX_NUMERIC_DIGITS = 15
+_XLSX_IDENT_NUMBER_FORMAT = "0"
+
+
+def _xlsx_ident_cell(value):
+    """One identifier cell for the workbook: None for a missing value, an
+    integral number of at most `_XLSX_MAX_NUMERIC_DIGITS` digits as an int
+    (kept numeric), a longer one as its plain digits (text); anything else
+    unchanged."""
+    import math
+    import numpy as np
+
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        return value
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float):
+        if value != value:
+            return None
+        if not (math.isfinite(value) and value.is_integer()):
+            return value
+        value = int(value)
+    if isinstance(value, int) and not isinstance(value, bool):
+        if len(str(abs(value))) <= _XLSX_MAX_NUMERIC_DIGITS:
+            return value
+        return str(value)
+    return value
+
+
+def _xlsx_prepare_identifiers(df, source_idents=None, identifier_columns=None):
+    """`(frame, positions)`: a COPY of `df` whose identifier columns
+    (`ident_rule.identifier_columns(df.columns, source_idents)` plus any
+    label in `identifier_columns`, a table payload's own list) went through
+    `_xlsx_ident_cell`, and those columns' positions — the writer shows their
+    numeric cells with number format "0" (full digits, no separators, never
+    5.29E+11). No identifier column -> `(df, [])`. Never raises: a failure
+    logs the exception TYPE only — never a value — and the workbook is
+    written as before."""
+    try:
+        import ident_rule
+
+        cols = set(ident_rule.identifier_columns(df.columns, source_idents or ()))
+        if isinstance(identifier_columns, (list, tuple)):
+            cols.update(str(c) for c in identifier_columns[:1000] if isinstance(c, (str, int, float)))
+        if not cols:
+            return df, []
+        positions = [i for i, c in enumerate(df.columns) if str(c) in cols]
+        if not positions:
+            return df, []
+        out = df.copy(deep=False)
+        for i in positions:
+            out.isetitem(i, df.iloc[:, i].map(_xlsx_ident_cell).astype(object))
+        return out, positions
+    except Exception as e:
+        log_with_sid("excel", "warning",
+                     f"XLSX_IDENT_PREPARE_FAILED type={log_safe_text(type(e).__name__, 80)}")
+        return df, []
+
+
+def _write_xlsx(df, ident_positions) -> bytes:
+    """The workbook bytes of `df` (sheet "Data", no index); the numeric cells
+    of the identifier columns at `ident_positions` get number format "0". A
+    failure of that formatting logs the exception TYPE and keeps the
+    workbook as written."""
+    import pandas as pd
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Data")
+        if ident_positions:
+            try:
+                ws = writer.sheets["Data"]
+                for pos in ident_positions:
+                    col = pos + 1
+                    for (cell,) in ws.iter_rows(min_row=2, max_row=ws.max_row,
+                                                min_col=col, max_col=col):
+                        if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+                            cell.number_format = _XLSX_IDENT_NUMBER_FORMAT
+            except Exception as e:
+                log_with_sid("excel", "warning",
+                             f"XLSX_IDENT_FORMAT_FAILED type={log_safe_text(type(e).__name__, 80)}")
+    return buf.getvalue()
+
+
+def _table_to_xlsx_bytes(columns: list, rows: list, source_idents=None,
+                         identifier_columns=None) -> bytes:
+    """Build a .xlsx from the cached/posted table shape ({columns, rows}).
+    Identifier columns keep full digits (`_xlsx_prepare_identifiers`)."""
     import pandas as pd
 
     cols = list(columns or [])
     data = rows or []
     df = pd.DataFrame(data, columns=cols) if cols else pd.DataFrame(data)
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Data")
-    return buf.getvalue()
+    df, positions = _xlsx_prepare_identifiers(df, source_idents, identifier_columns)
+    return _write_xlsx(df, positions)
 
 
-def _df_to_xlsx_bytes(df) -> bytes:
-    """Build a .xlsx from a full (uncapped) DataFrame — every row."""
-    import pandas as pd
-
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Data")
-    return buf.getvalue()
+def _df_to_xlsx_bytes(df, source_idents=None) -> bytes:
+    """Build a .xlsx from a full (uncapped) DataFrame — every row.
+    Identifier columns keep full digits (`_xlsx_prepare_identifiers`);
+    `source_idents` defaults to the frame's `attrs["pdc_source_idents"]`."""
+    if source_idents is None:
+        source_idents = (getattr(df, "attrs", None) or {}).get("pdc_source_idents") or ()
+    df, positions = _xlsx_prepare_identifiers(df, source_idents)
+    return _write_xlsx(df, positions)
 
 
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -3716,7 +3834,8 @@ async def download_excel(request: Request, chat_id: str, key: str):
         if df is not None and not df.empty:
             xlsx = _df_to_xlsx_bytes(df)
         else:
-            xlsx = _table_to_xlsx_bytes(rec.get("columns"), rec.get("rows"))
+            xlsx = _table_to_xlsx_bytes(rec.get("columns"), rec.get("rows"),
+                                        identifier_columns=rec.get("identifier_columns"))
     except Exception as e:
         # Type + a value-free reason only — see `_xlsx_failure_reason`. The
         # type name is escaped and capped for the same reason every other
@@ -3746,10 +3865,15 @@ async def export_excel(request: Request, chat_id: str):
     filename = _safe_filename((body or {}).get("filename") or "table", "table")
     columns = (body or {}).get("columns") or []
     rows = (body or {}).get("rows") or []
+    # Optional, additive: the table payload's own identifier columns (labels
+    # only — they choose which columns are written as text, nothing else).
+    ident_cols = (body or {}).get("identifier_columns")
+    if not isinstance(ident_cols, list):
+        ident_cols = None
     if not columns and not rows:
         return JSONResponse({"error": "No table data provided."}, status_code=400)
     try:
-        xlsx = _table_to_xlsx_bytes(columns, rows)
+        xlsx = _table_to_xlsx_bytes(columns, rows, identifier_columns=ident_cols)
     except Exception as e:
         # `rows` came straight off the request body, so the exception text is
         # a caller-chosen value — dropped, never escaped-and-logged.

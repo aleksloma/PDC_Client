@@ -25,18 +25,82 @@
     });
   }
 
-  // Comma number-grouping — mirrors dashboard.js _fmtCellValue (years/ids raw).
-  // HEAD (last) word match only, so a measure like "Order Value" still groups
-  // while "Order ID" / "Year" stay raw.
-  var IDENT_HEAD_WORDS = new Set(["year","yr","წელი","id","ids","code","codes","კოდი","იდ","zip","postal","phone","account","iban","invoice","order","ref"]);
-  function isIdentifierLabel(name) {
-    if (name == null) return false;
-    var toks = String(name).match(/\p{L}+/gu);
-    if (!toks || !toks.length) return false;
-    return IDENT_HEAD_WORDS.has(toks[toks.length - 1].toLowerCase());
+  // Comma number-grouping — mirrors dashboard.js _fmtCellValue. IDENTIFIER
+  // columns (personal numbers, ids, codes, years) show plain digits — never
+  // grouped, never decimals: the table's `identifier_columns` (server-decided,
+  // ident_rule.identifier_columns) when present, else the NAME rule mirroring
+  // ident_rule.is_identifier_name — the LAST word (letter runs split on
+  // non-letters AND camelCase) is in the list, or the label ends with "#".
+  // So a measure like "Order Value" still groups while "Order ID" stays raw.
+  var IDENT_HEAD_WORDS = new Set(["year","yr","წელი","id","ids","code","codes","კოდი","იდ","zip","postal","phone","account","iban","invoice","order","ref",
+    "number","num","no","nr","nbr","key","uid","guid","uuid",
+    "pin","pinfl","ssn","tin","inn","iin","passport","card","msisdn","imei",
+    "ნომერი","номер","код","счет","счёт","ид"]);
+  // MEASURE words: a label holding ANY of them is never an identifier by
+  // name (mirrors ident_rule.MEASURE_WORDS).
+  var IDENT_MEASURE_WORDS = new Set(["amount","amt","sum","total","price","cost","revenue","sales","salary","income","balance","fee","value","qty","quantity","count","avg","mean","median","per","spend","profit","margin","rate","score","сумма","цена","стоимость","выручка","доход","баланс","количество","итого","თანხა","ფასი","ჯამი","შემოსავალი","ბალანსი","რაოდენობა"]);
+  // The ORIGINAL identifier words: a label ending in one of them is an
+  // identifier even when it holds a measure word (ident_rule.ORIGINAL_IDENT_WORDS).
+  var IDENT_ORIGINAL_WORDS = new Set(["year","yr","წელი","id","ids","code","codes","კოდი","იდ","zip","postal","phone","account","iban","invoice","order","ref"]);
+  function identNameTokens(name) {
+    var chars = Array.from(String(name));
+    var isL = function (c) { return /\p{L}/u.test(c); };
+    var isLo = function (c) { return /\p{Ll}/u.test(c); };
+    var isUp = function (c) { return /\p{Lu}/u.test(c); };
+    var toks = [];
+    var cur = "";
+    for (var i = 0; i < chars.length; i++) {
+      var ch = chars[i];
+      if (!isL(ch)) {
+        if (cur) { toks.push(cur.toLowerCase()); cur = ""; }
+        continue;
+      }
+      if (cur) {
+        var prev = chars[i - 1];
+        var split = isLo(prev) && isUp(ch);
+        if (!split && isUp(prev) && isUp(ch)) {
+          var j = i + 1;
+          while (j < chars.length && isL(chars[j]) && isLo(chars[j])) j++;
+          split = (j - (i + 1)) >= 2;
+        }
+        if (split) { toks.push(cur.toLowerCase()); cur = ""; }
+      }
+      cur += ch;
+    }
+    if (cur) toks.push(cur.toLowerCase());
+    return toks;
   }
-  function fmtCell(colName, v) {
-    if (typeof v === "number" && isFinite(v) && !isIdentifierLabel(colName)) {
+  function isIdentifierLabel(name, identCols) {
+    if (name == null) return false;
+    var label = String(name);
+    if (identCols && identCols.has(label)) return true;
+    var t = label.trim();
+    if (!t) return false;
+    var toks = identNameTokens(t);
+    if (toks.some(function (w) { return IDENT_MEASURE_WORDS.has(w); })
+      && !(toks.length && IDENT_ORIGINAL_WORDS.has(toks[toks.length - 1]))) return false;
+    // "no" and a trailing "#" count only after another word that is not "yes"
+    var after = function (prev) { return prev.length >= 1 && prev[prev.length - 1] !== "yes"; };
+    if (t.charAt(t.length - 1) === "#") return after(toks);
+    if (!toks.length) return false;
+    var last = toks[toks.length - 1];
+    if (last === "no") return after(toks.slice(0, -1));
+    return IDENT_HEAD_WORDS.has(last);
+  }
+  function identColumnSet(table) {
+    var list = table && Array.isArray(table.identifier_columns) ? table.identifier_columns : null;
+    return list ? new Set(list.map(function (c) { return String(c); })) : null;
+  }
+  function fmtIdentValue(v) {
+    if (v === null || v === undefined) return "";
+    if (typeof v === "number" && isFinite(v) && Number.isInteger(v)) {
+      return v.toLocaleString("en-US", { useGrouping: false, maximumFractionDigits: 0 });
+    }
+    return String(v);
+  }
+  function fmtCell(colName, v, identCols) {
+    if (isIdentifierLabel(colName, identCols)) return fmtIdentValue(v);
+    if (typeof v === "number" && isFinite(v)) {
       // Value-driven rounding: integers → 0 dp; non-integers → ≤2 dp (avoids
       // raw floats like "15,018.369999999999"). No column-name literals.
       return Number.isInteger(v)
@@ -150,6 +214,7 @@
     var cols = (table && Array.isArray(table.columns)) ? table.columns : [];
     var rows = (table && Array.isArray(table.rows)) ? table.rows : [];
     if (!cols.length || !rows.length) return "";
+    var identCols = identColumnSet(table);
 
     // Right-align columns whose values are predominantly numeric.
     var numericCol = cols.map(function (c) {
@@ -170,7 +235,7 @@
     var body = rows.map(function (row) {
       return "<tr>" + cols.map(function (c, ci) {
         var v = row ? row[c] : "";
-        return "<td class='" + (numericCol[ci] ? "num" : "") + "'>" + esc(fmtCell(c, v)) + "</td>";
+        return "<td class='" + (numericCol[ci] ? "num" : "") + "'>" + esc(fmtCell(c, v, identCols)) + "</td>";
       }).join("") + "</tr>";
     }).join("");
 
