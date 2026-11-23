@@ -395,6 +395,68 @@ Remove the check's throwaway account and dashboard afterwards.
 
 ## Deploy history
 
+**2026-11-23 — `main` at `2a5e6e9` (PR #44, PROMPT 31).** Identifier columns
+(ids, personal / account / phone / card numbers, codes, years) shown as plain
+digits everywhere — tables, Show data, dashboards, styled tables, chart axes,
+the answer text, Excel (number format `0`, text above 15 digits) and PDF / PPTX
+(`ident_rule.py`, in both images); a cut plan (`finish_reason` MAX_TOKENS
+without code) answered with the translated "analysis could not be completed"
+error instead of "Try rephrasing"; the sandbox's `chart_stats` and the
+LOG-ONLY `TEXT_CHART_CHECK` line comparing the answer's numbers with the
+chart's (`text_chart_check.py`, web image only). No new setting; no spec change
+beyond the images. Built ONCE by Cloud Build
+`e972d48f-1e33-4311-8456-8e0ea5f3da4d` from a clean clone of GitHub `main` at
+`2a5e6e9` (both images stamped `2a5e6e9`, `BUILD_TIME=2026-11-23T20:25:57Z`)
+and deployed here first, then to `pdcclient-brb`; the brain went live after
+both (see `PDC_Brain/docs/DEPLOY.md`):
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:2a5e6e9` | `sha256:3d8f72f9dafae59bc545c52314afbb62285554072e0112ce19b6030c1d24d2a8` |
+| `pdcexecutor-demo:2a5e6e9` | `sha256:eae083195a7ce9242755eab0a337be860b947a9562613a06c84ef21f48e0209e` |
+
+Revision `pdcclient-demo-2a5e6e9`, serving 100 % since 2026-11-23 ~20:35 UTC;
+it resolved exactly the two digests above. It replaced
+`pdcclient-demo-0268f47`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-demo --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-demo-0268f47=100
+```
+
+Backup taken before the deploy:
+`gs://pdc-enterprise-client-demo-data-backups/20261123-202630/`, which matched
+the data bucket in size (455,690,511 bytes) and in its 617 object names
+(415 0-byte folder objects ignored). Data bucket before the traffic move: 617
+files, 455,690,511 bytes; after the move and the live checks: 617 files,
+455,690,863 bytes.
+
+The spec change was image-only (two `image:` lines and the template name; the
+tag-only `candidate` traffic entry dropped), checked by a diff against the
+export before the Admin API `PUT`. Candidate checks (`candidate---…` URL):
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `2a5e6e9`; the landing
+  answered 200, an anonymous `/lab` redirected to sign-in, and an anonymous
+  `/auth/active_chats` and `/api/admin/connections` answered 401; the versioned
+  `dashboard.js` answered `immutable`. Revision log: `LADMIN_PRESENT`,
+  `RESET_TOKEN_INDEX_FILLED count=1`, `EXECUTOR_HANDSHAKE_OK version=2a5e6e9`,
+  `DB_SCHEDULER_STARTED`; no error lines, no 5xx, no `BACKEND_REQUEST_REFUSED`.
+- After the shift, `client.powerdatachat.com` reported `/version` `2a5e6e9`
+  (three uncached fetches) and the same `/health`. A self-registered throwaway
+  account (scripted over HTTPS) created a `sample_sales.csv` chat (welcome
+  message and two suggested questions) and asked for total revenue by product
+  as a bar chart: stage events, the "taking longer than usual" notice at 91 s,
+  the chart and the narrative, 120 s end to end on the brain then serving
+  (`pdcbrain-00036-civ`); it created a dashboard and pinned the chart (1 tile
+  read back). `ladmin` signed in with `CLIENT_DEMO_LADMIN_PASSWORD` and removed
+  the account through `POST /api/admin/users/remove` (1 chat deleted).
+  `pdcbrain` gained no revision at that point.
+- Not run: the browser-only checks and the > 32 MiB direct-upload trace (the
+  release does not touch uploads).
+- Brain: the new brain revision (`pdcbrain-00038-fum`) went live afterwards;
+  one question through `client.powerdatachat.com` on it answered (chart,
+  narrative, dashboard pin, 121 s; a second throwaway account, removed the
+  same way). Data bucket after that check: 617 files.
+
 **2026-11-22 — `main` at `0268f47` (PR #42, PROMPT 29).** The lab-test
 findings of 21 Nov: stage messages in the stream (translated, with the "taking
 longer than usual" notice at `SLOW_ANSWER_NOTICE_SECONDS`, default 90 s),

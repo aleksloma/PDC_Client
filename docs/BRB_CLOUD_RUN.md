@@ -218,6 +218,59 @@ the demo export is kept in `BRB_Database_template/docs/BRB_SERVICE_DIFF.md`.
 
 ## Deploy history
 
+**2026-11-23 — `main` at `2a5e6e9` (PR #44, PROMPT 31).** Identifier columns
+shown as plain digits everywhere, the translated error for a cut plan, and the
+log-only text-versus-chart check (see the `pdcclient-demo` entry). Same images
+as `pdcclient-demo` (Cloud Build `e972d48f-1e33-4311-8456-8e0ea5f3da4d`,
+`BUILD_TIME=2026-11-23T20:25:57Z`), deployed right after the demo; the
+revision resolved exactly these digests:
+
+| Image | Digest |
+|---|---|
+| `pdcclient-demo:2a5e6e9` | `sha256:3d8f72f9dafae59bc545c52314afbb62285554072e0112ce19b6030c1d24d2a8` |
+| `pdcexecutor-demo:2a5e6e9` | `sha256:eae083195a7ce9242755eab0a337be860b947a9562613a06c84ef21f48e0209e` |
+
+Revision `pdcclient-brb-2a5e6e9`, serving 100 % since 2026-11-23 ~20:40 UTC.
+It replaced `pdcclient-brb-0268f47`, which stays available for rollback:
+
+```bash
+gcloud run services update-traffic pdcclient-brb --project=pdc-enterprise   --region=europe-west1 --to-revisions=pdcclient-brb-0268f47=100
+```
+
+Backup taken before the deploy: data bucket
+`gs://pdc-enterprise-client-brb-data-backups/20261123-203812/`, which matched
+the data bucket in size (285,623,805 bytes) and in its 347 object names (91
+0-byte folder objects ignored). Data bucket before the traffic move: 347
+files, 285,623,805 bytes; after the move: 347 files, 285,623,805 bytes. No
+database export this time: the release changes no database code, and Cloud
+SQL was only read (`brb-demo-pg` `RUNNABLE`, activation policy `ALWAYS`,
+nothing started, stopped or exported).
+
+The spec change was image-only (two `image:` lines and the template name; the
+tag-only `candidate` traffic entry dropped; the `cloudsql-instances`
+annotation, secrets, buckets and resources carried over), checked by a diff
+against the export before the Admin API `PUT`. Candidate checks
+(`candidate---…` URL), none of them signed in:
+- `/health` answered `brain_reachable`, `tenant_token_configured` and
+  `executor_reachable` all `true`; `/version` reported `2a5e6e9`; the landing
+  answered 200, an anonymous `/lab` redirected to sign-in, and an anonymous
+  `/auth/active_chats` and `/api/admin/connections` answered 401; the versioned
+  `dashboard.js` answered `immutable`. Revision log: `LADMIN_PRESENT`,
+  `RESET_TOKEN_INDEX_FILLED count=9`, `EXECUTOR_HANDSHAKE_OK version=2a5e6e9`,
+  `DB_SCHEDULER_STARTED`; no error lines, no 5xx, no `BACKEND_REQUEST_REFUSED`.
+- `ladmin`: one scripted sign-in with `CLIENT_BRB_LADMIN_PASSWORD` answered
+  401 (`USER_LOGIN_BAD_PASSWORD`; the secret still predates the 2026-10-03
+  password change; one attempt only, not retried, secret unchanged).
+- **Pending, to be done by hand in the browser:** the signed-in checks (the
+  connection test and 39 tables, a question in a DB-table chat, the invitation
+  sent twice). Store the current `ladmin` password as a new version of
+  `CLIENT_BRB_LADMIN_PASSWORD` so the next deploy can sign in. The same two
+  digests passed the signed-in checks on `client.powerdatachat.com`.
+- After the shift, `brb.powerdatachat.com` reported `/version` `2a5e6e9` and
+  the same `/health`; `pdcbrain` gained no revision at that point
+  (`pdcbrain-00036-civ`) and `pdcclient-demo` stayed on
+  `pdcclient-demo-2a5e6e9`.
+
 **2026-11-22 — `main` at `0268f47` (PR #42, PROMPT 29).** The lab-test
 findings of 21 Nov: stage messages and early visuals in the stream, the
 "taking longer than usual" notice (`SLOW_ANSWER_NOTICE_SECONDS`, default 90 s,
