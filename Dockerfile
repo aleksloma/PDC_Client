@@ -107,14 +107,14 @@ RUN python -m pip uninstall -y pip \
 COPY app.py auth_limiter.py auto_analytics.py brain_client.py code_exec.py \
      dataset_profile.py db_connector.py db_scheduler.py db_sources.py \
      excel_table_detector.py exec_sanitizer.py exec_transport.py \
-     executor_client.py gcs_upload.py html_sanitize.py ident_rule.py \
-     local_store.py \
+     executor_client.py gcs_upload.py html_sanitize.py http_redirect.py \
+     ident_rule.py local_store.py \
      logger_utils.py models.py narrative.py outlier_utils.py \
      password_utils.py pdc_diag.py plot_utils.py pptx_template_cache.py \
      relation_discovery.py \
      result_backstop.py roles_store.py run_chat_local.py sandbox_guard.py \
-     schedule_utils.py schema_builder.py settings.py signin_domains.py \
-     sso_store.py text_chart_check.py ./
+     schedule_utils.py schema_builder.py serve.py settings.py \
+     signin_domains.py sso_store.py text_chart_check.py ./
 COPY routes/ routes/
 COPY templates/ templates/
 COPY static/ static/
@@ -166,7 +166,11 @@ USER pdc
 
 EXPOSE 8000
 
+# Plain HTTP first: without built-in HTTPS this is the one request the probe
+# always made. With built-in HTTPS that attempt fails at once and the https
+# request decides. The probe reads no setting, so it cannot disagree with the
+# application about which of the two is being served.
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -fs http://localhost:8000/health || exit 1
+    CMD curl -fs http://localhost:8000/health || curl -fsk https://localhost:8000/health || exit 1
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD ["python", "serve.py"]

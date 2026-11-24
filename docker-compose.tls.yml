@@ -1,0 +1,50 @@
+# BUILT-IN HTTPS — an override for docker-compose.yml (customer install).
+#
+# Use it when the application itself should serve HTTPS, without a reverse
+# proxy in front of it. Without this file nothing changes: the application
+# serves plain HTTP on the loopback port, as before.
+#
+# Usage:
+#   1. Put the certificate (PEM, with its chain) and its private key (PEM,
+#      WITHOUT a passphrase) in a folder next to this file — `./certs` by
+#      default — as `server.crt` and `server.key`. Both must be readable by
+#      the application user (uid 10001).
+#   2. Start the stack with BOTH files, every time:
+#        docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+#
+# What it does (the `client` service only — the analysis sandbox is untouched):
+#   - mounts the certificate folder read-only at /certs;
+#   - sets TLS_CERT_FILE / TLS_KEY_FILE, which switch the application's port
+#     8000 to HTTPS and start a redirect-only listener on port 8080;
+#   - publishes HTTPS on port 443 and the HTTP→HTTPS redirect on port 80.
+#
+# Variables (set them in a `.env` file next to this one, or in the shell):
+#   PDC_TLS_DIR        certificate folder on the host        (default ./certs)
+#   PDC_TLS_CERT       certificate file name in that folder  (default server.crt)
+#   PDC_TLS_KEY        private-key file name in that folder  (default server.key)
+#   PDC_HTTPS_PORT     host port for HTTPS                   (default 443)
+#   PDC_HTTP_PORT      host port for the redirect            (default 80)
+#   PDC_TLS_BIND_HOST  host address both ports bind to       (default 0.0.0.0)
+#
+# The two ports bind to every interface by default, because this mode exists
+# to be the address users on the network type. Compose ADDS these ports to the
+# base file's: its loopback port 8000 stays published and now speaks HTTPS too.
+#
+# The application refuses to start when only one of the two files is
+# configured, a file is missing or unreadable, the key does not belong to the
+# certificate, or the key needs a passphrase. Renewal: replace the files and
+# restart the `client` service.
+#
+# Set PUBLIC_BASE_URL in client.env to the https address users type, and keep
+# SESSION_HTTPS_ONLY at its default (true).
+
+services:
+  client:
+    environment:
+      - TLS_CERT_FILE=/certs/${PDC_TLS_CERT:-server.crt}
+      - TLS_KEY_FILE=/certs/${PDC_TLS_KEY:-server.key}
+    volumes:
+      - ${PDC_TLS_DIR:-./certs}:/certs:ro
+    ports:
+      - "${PDC_TLS_BIND_HOST:-0.0.0.0}:${PDC_HTTPS_PORT:-443}:8000"
+      - "${PDC_TLS_BIND_HOST:-0.0.0.0}:${PDC_HTTP_PORT:-80}:8080"

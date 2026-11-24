@@ -17,6 +17,8 @@
 credentials.json
 service-account*.json
 google-credentials.json
+# Built-in HTTPS: the certificate folder the TLS compose overrides mount.
+certs/
 
 # Bearer tokens, API keys, anything that looks secret-ish
 secrets/

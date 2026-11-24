@@ -1,0 +1,36 @@
+# LOCAL TESTING stack with BUILT-IN HTTPS — an override for
+# docker-compose.local.yml. PowerDataChat's local testing only; customers use
+# docker-compose.yml + docker-compose.tls.yml.
+#
+# Usage:
+#   1. Put a certificate for `localhost` and its private key (PEM, no
+#      passphrase, readable by uid 10001) in `./certs` as `server.crt` and
+#      `server.key` (the folder is git-ignored and docker-ignored).
+#   2. docker compose -f docker-compose.local.yml -f docker-compose.local.tls.yml up -d --build
+#
+# What changes against the plain local stack (the `client` service only):
+#   - https://localhost:8091 — the same host port, now HTTPS (port 8000 in
+#     the container);
+#   - http://localhost:8092  — the redirect-only listener (port 8080 in the
+#     container), which sends every request to https://localhost:8091;
+#   - the session cookie is Secure again and PUBLIC_BASE_URL is the https
+#     address (both override the base file's plain-HTTP values).
+#
+# Variables: PDC_TLS_DIR (default ./certs), PDC_TLS_CERT (default
+# server.crt), PDC_TLS_KEY (default server.key), PDC_WEB_BIND_HOST (default
+# 127.0.0.1, shared with the base file).
+#
+# Back to plain HTTP: start the stack with docker-compose.local.yml alone.
+# The same rules as the base file apply: never `docker compose down -v`.
+
+services:
+  client:
+    environment:
+      - TLS_CERT_FILE=/certs/${PDC_TLS_CERT:-server.crt}
+      - TLS_KEY_FILE=/certs/${PDC_TLS_KEY:-server.key}
+      - SESSION_HTTPS_ONLY=true
+      - PUBLIC_BASE_URL=https://localhost:8091
+    volumes:
+      - ${PDC_TLS_DIR:-./certs}:/certs:ro
+    ports:
+      - "${PDC_WEB_BIND_HOST:-127.0.0.1}:8092:8080"

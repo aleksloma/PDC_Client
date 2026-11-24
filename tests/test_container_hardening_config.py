@@ -7,9 +7,16 @@ parse the build/compose files themselves (PyYAML for compose; a small
 continuation-aware reader for the Dockerfile) so a regression in either file
 fails the suite without Docker.
 
-Pinned as UNCHANGED on purpose: ports, HEALTHCHECK, CMD,
-`env_file: client.env` in the customer file, and the external-volume rule in
-the local file.
+Pinned as UNCHANGED on purpose: ports, `env_file: client.env` in the customer
+file, and the external-volume rule in the local file. CMD (the launcher
+`python serve.py`) and HEALTHCHECK (plain http first, then https; the same
+interval, timeout and retries as ever) are pinned to their exact text.
+
+Built-in HTTPS is two OVERRIDE files (`docker-compose.tls.yml`,
+`docker-compose.local.tls.yml`). The base files know nothing about it, and an
+override may only add a certificate mount, its environment and its ports to
+the `client` service -- nothing that could reach the sandbox or relax the
+hardening of the base file.
 
 Two things this file deliberately does more than once. (1) The hardening
 cases parametrize over EVERY service in EVERY compose file, not just
@@ -23,7 +30,10 @@ clean checkout answers every question `ExecutorUnavailable`, which is why the
 wiring is a structural pin and not only an integration test.
 """
 import fnmatch
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -37,9 +47,10 @@ COMPOSE_LOCAL = ROOT / "docker-compose.local.yml"
 # Today's exact text — byte-for-byte pins (universal newlines via read_text).
 EXPECTED_HEALTHCHECK = (
     "HEALTHCHECK --interval=30s --timeout=5s --retries=3 \\\n"
-    "    CMD curl -fs http://localhost:8000/health || exit 1"
+    "    CMD curl -fs http://localhost:8000/health "
+    "|| curl -fsk https://localhost:8000/health || exit 1"
 )
-EXPECTED_CMD = 'CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]'
+EXPECTED_CMD = 'CMD ["python", "serve.py"]'
 EXPECTED_EXPOSE = "EXPOSE 8000"
 
 # The OS patch layer is pinned in BOTH images: the sandbox ships its own base
@@ -202,12 +213,54 @@ def test_dockerfile_never_chowns_all_of_app():
 
 
 def test_dockerfile_expose_healthcheck_and_cmd_unchanged():
+    """Byte-exact: any edit of the three lines has to change this file too."""
     expose = _raw_instruction_block("EXPOSE")
     assert expose == EXPECTED_EXPOSE, expose
     healthcheck = _raw_instruction_block("HEALTHCHECK")
     assert healthcheck == EXPECTED_HEALTHCHECK, healthcheck
     cmd = _raw_instruction_block("CMD")
     assert cmd == EXPECTED_CMD, cmd
+
+
+HTTP_PROBE = "-fs http://localhost:8000/health"
+HTTPS_PROBE = "-fsk https://localhost:8000/health"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="runs the HEALTHCHECK in a POSIX shell")
+@pytest.mark.parametrize("tls_env", [{}, {"TLS_CERT_FILE": "", "TLS_KEY_FILE": ""},
+                                     {"TLS_CERT_FILE": "  "},
+                                     {"TLS_CERT_FILE": "/certs/a.crt",
+                                      "TLS_KEY_FILE": "/certs/a.key"}],
+                         ids=["unset", "empty", "blank", "set"])
+@pytest.mark.parametrize("http_exit,https_exit,probes,code", [
+    (0, 0, [HTTP_PROBE], 0),                         # plain HTTP: exactly one request
+    (0, 60, [HTTP_PROBE], 0),
+    (52, 0, [HTTP_PROBE, HTTPS_PROBE], 0),           # built-in HTTPS
+    (7, 7, [HTTP_PROBE, HTTPS_PROBE], 1),            # nothing answers
+    (22, 35, [HTTP_PROBE, HTTPS_PROBE], 1),          # an unhealthy plain-HTTP app
+], ids=["http", "http-only", "https", "down", "unhealthy"])
+def test_the_healthcheck_probes_http_then_https(tmp_path, tls_env, http_exit, https_exit,
+                                                probes, code):
+    """The command itself, in a real shell with a recording `curl`: it looks
+    at what the port speaks and never at the TLS_* settings."""
+    if not shutil.which("sh"):
+        pytest.skip("no sh")
+    command = [args for kw, args in _instructions() if kw == "HEALTHCHECK"][-1]
+    command = command.split(" CMD ", 1)[1]
+    assert "TLS" not in command and "$" not in command, command
+    record = tmp_path / "calls.txt"
+    stub = tmp_path / "curl"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{record}"\n'
+        f'case "$*" in *https://*) exit {https_exit};; *) exit {http_exit};; esac\n',
+        encoding="utf-8")
+    stub.chmod(0o755)
+    env = {"PATH": f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}", **tls_env}
+    proc = subprocess.run(["sh", "-c", command], env=env, capture_output=True, text=True,
+                          timeout=30)
+    assert record.read_text(encoding="utf-8").splitlines() == probes, proc.stderr
+    assert proc.returncode == code, proc.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +792,121 @@ def test_customer_compose_executor_is_image_only():
 
 
 # ---------------------------------------------------------------------------
+# Compose — built-in HTTPS: the two override files
+#
+# The base files stay a plain-HTTP stack behind a proxy (their ports and their
+# hardening are pinned above); HTTPS exists only when an override is added.
+# ---------------------------------------------------------------------------
+COMPOSE_TLS = ROOT / "docker-compose.tls.yml"
+COMPOSE_LOCAL_TLS = ROOT / "docker-compose.local.tls.yml"
+TLS_OVERRIDES = [
+    pytest.param(COMPOSE_TLS, id="customer-tls"),
+    pytest.param(COMPOSE_LOCAL_TLS, id="local-tls"),
+]
+TLS_MOUNT = "${PDC_TLS_DIR:-./certs}:/certs:ro"
+TLS_ENVIRONMENT = {
+    "TLS_CERT_FILE": "/certs/${PDC_TLS_CERT:-server.crt}",
+    "TLS_KEY_FILE": "/certs/${PDC_TLS_KEY:-server.key}",
+}
+# Keys an override could use to relax (or bypass) what the base file sets on
+# the client. `image`/`build`/`command`/`user` are here for the same reason:
+# they would replace the hardened process itself.
+FORBIDDEN_OVERRIDE_KEYS = (
+    "read_only", "cap_drop", "cap_add", "security_opt", "tmpfs", "mem_limit", "pids_limit",
+    "cpus", "networks", "network_mode", "env_file", "privileged", "user", "command",
+    "entrypoint", "image", "build", "healthcheck", "devices", "pid", "ipc", "extends",
+    "depends_on", "logging", "deploy",
+)
+
+
+@pytest.mark.parametrize("path", COMPOSE_FILES)
+@pytest.mark.parametrize("token", ["TLS_CERT_FILE", "TLS_KEY_FILE", "/certs", "PDC_TLS"])
+def test_the_base_compose_files_know_nothing_about_built_in_https(path, token):
+    assert token not in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("path", COMPOSE_FILES)
+def test_the_base_compose_files_publish_one_loopback_port_and_no_redirect(path):
+    ports = _ports(_client_service(path))
+    assert len(ports) == 1, ports
+    assert ports[0].startswith(BIND_DEFAULT + ":") and ports[0].endswith(":8000"), ports
+
+
+@pytest.mark.parametrize("path", TLS_OVERRIDES)
+def test_tls_override_touches_the_client_service_only(path):
+    doc = _load(path)
+    assert set(doc) == {"services"}, sorted(doc)
+    assert set(doc["services"]) == {"client"}, sorted(doc["services"])
+
+
+@pytest.mark.parametrize("path", TLS_OVERRIDES)
+@pytest.mark.parametrize("key", FORBIDDEN_OVERRIDE_KEYS)
+def test_tls_override_declares_nothing_that_could_override_hardening(path, key):
+    assert key not in _client_service(path), sorted(_client_service(path))
+
+
+@pytest.mark.parametrize("path", TLS_OVERRIDES)
+def test_tls_override_declares_exactly_a_mount_an_environment_and_ports(path):
+    assert set(_client_service(path)) == {"environment", "volumes", "ports"}
+
+
+@pytest.mark.parametrize("path", TLS_OVERRIDES)
+def test_tls_override_mounts_the_certificate_folder_read_only(path):
+    assert _client_service(path)["volumes"] == [TLS_MOUNT]
+
+
+def test_customer_tls_override_environment_and_ports():
+    svc = _client_service(COMPOSE_TLS)
+    assert _environment(svc) == TLS_ENVIRONMENT
+    assert svc["ports"] == [
+        "${PDC_TLS_BIND_HOST:-0.0.0.0}:${PDC_HTTPS_PORT:-443}:8000",
+        "${PDC_TLS_BIND_HOST:-0.0.0.0}:${PDC_HTTP_PORT:-80}:8080",
+    ]
+
+
+def test_local_tls_override_environment_and_ports():
+    svc = _client_service(COMPOSE_LOCAL_TLS)
+    assert {k: _env_text(v) for k, v in _environment(svc).items()} == {
+        **TLS_ENVIRONMENT,
+        "SESSION_HTTPS_ONLY": "true",
+        "PUBLIC_BASE_URL": "https://localhost:8091",
+    }
+    assert svc["ports"] == ["${PDC_WEB_BIND_HOST:-127.0.0.1}:8092:8080"]
+
+
+def test_the_redirect_port_the_overrides_publish_is_the_listeners():
+    source = (ROOT / "http_redirect.py").read_text(encoding="utf-8")
+    assert re.search(r"^DEFAULT_PORT = 8080\b", source, re.M)
+
+
+@pytest.mark.parametrize("module", ["serve.py", "http_redirect.py"])
+def test_the_https_modules_ship_in_the_web_image_and_not_in_the_sandbox(module):
+    assert module in _web_copy_sources()
+    assert module not in _dockerfile_text(EXEC_DOCKERFILE)
+
+
+def test_the_certificate_folder_is_git_ignored():
+    lines = [ln.strip() for ln in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()]
+    assert "certs/" in lines
+    assert not any(ln.startswith("!") and "cert" in ln for ln in lines), lines
+
+
+def test_no_certificate_or_key_is_tracked():
+    """Certificates are mounted at run time and generated by the tests."""
+    git = shutil.which("git")
+    if not git or not (ROOT / ".git").exists():
+        pytest.skip("not a git checkout")
+    proc = subprocess.run([git, "ls-files"], cwd=str(ROOT), capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=60)
+    if proc.returncode != 0:
+        pytest.skip("git cannot read this checkout")
+    tracked = [f for f in proc.stdout.splitlines()
+               if f.lower().endswith((".pem", ".key", ".crt", ".p12", ".pfx"))
+               or f.startswith("certs/")]
+    assert tracked == [], tracked
+
+
+# ---------------------------------------------------------------------------
 # What the build context hands to a customer
 #
 # Both images copy NAMED files only (the web image since the C2 hardening:
@@ -756,13 +924,13 @@ DOCKERIGNORE = ROOT / ".dockerignore"
 # material; the rest were already there and are restated so a rewrite of the
 # file cannot quietly drop them.
 REQUIRED_IGNORES = ["docs/security/", "*.docx", ".git", "*.env", ".claude/",
-                    ".venv", "client_data/", "__pycache__"]
+                    ".venv", "client_data/", "__pycache__", "certs/"]
 
 # Paths in the tree that must never reach the image, as glob patterns
 # evaluated against the tree itself (so a NEW one of these is caught, not
 # just a deleted line).
 MUST_NOT_SHIP_GLOBS = ["**/*.docx", "**/*.env"]
-MUST_NOT_SHIP_DIRS = ["docs/security", ".git", ".claude"]
+MUST_NOT_SHIP_DIRS = ["docs/security", ".git", ".claude", "certs", "certs/server.key"]
 
 
 def _dockerignore_patterns() -> tuple:

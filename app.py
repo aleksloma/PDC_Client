@@ -162,12 +162,38 @@ def _refuse_on_missing_executor_cidr() -> None:
         raise SystemExit(1)
 
 
+def _refuse_on_bad_tls_config():
+    """Refuse to start on a TLS configuration that cannot be served.
+
+    Built-in HTTPS is on when TLS_CERT_FILE and TLS_KEY_FILE are both set.
+    The launcher (`serve.py`) runs this check before uvicorn; it runs here
+    again so a start that bypasses the launcher refuses the same way. Returns
+    the (certificate, key) paths, or None when TLS is off.
+
+    With a valid pair configured the server must really be serving TLS: a
+    uvicorn started without its certificate and key options would answer in
+    plain HTTP on the main port, so that start is refused too. Nothing about
+    the configured values is logged.
+    """
+    import serve
+    tls = serve.tls_files_or_refuse()
+    if tls and not serve.tls_is_served(sys.argv):
+        log_with_sid("startup", "error",
+                     "TLS_NOT_SERVED refusing to start: TLS_CERT_FILE and "
+                     "TLS_KEY_FILE are set but the server was started without "
+                     "its TLS options and would answer in plain HTTP; start "
+                     "the application with python serve.py")
+        raise SystemExit(1)
+    return tls
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Configuration checks come FIRST: a misconfigured install must not serve a
     # single request (the executor's secret self-check is the same pattern).
     _refuse_on_weak_secret_key()
     _refuse_on_missing_executor_cidr()
+    tls = _refuse_on_bad_tls_config()
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
@@ -251,7 +277,30 @@ async def lifespan(app: FastAPI):
                      f"ORACLE_THICK_MODE_STARTUP_FAILED {log_safe_text(type(e).__name__, 80)}")
     import db_scheduler
     db_scheduler.start()
+    # Built-in HTTPS: uvicorn serves TLS on the main port (serve.py), and a
+    # redirect-only plain-HTTP listener sends every request to the https
+    # address. Nothing starts when TLS is off. A listener that cannot bind
+    # costs the redirect, never the boot.
+    redirect_server = None
+    if tls:
+        log_with_sid("startup", "info", "TLS_ENABLED")
+        try:
+            import http_redirect
+            redirect_server = await http_redirect.start()
+            if redirect_server is not None:
+                log_with_sid("startup", "info",
+                             f"HTTP_REDIRECT_STARTED port={int(http_redirect.DEFAULT_PORT)}")
+        except Exception as e:
+            log_with_sid("startup", "error",
+                         f"HTTP_REDIRECT_START_FAILED error={log_safe_text(type(e).__name__, 80)}")
     yield
+    if redirect_server is not None:
+        try:
+            import http_redirect
+            await http_redirect.stop(redirect_server)
+        except Exception as e:
+            log_with_sid("shutdown", "warning",
+                         f"HTTP_REDIRECT_STOP_FAILED error={log_safe_text(type(e).__name__, 80)}")
     db_scheduler.stop()
     log_with_sid("shutdown", "info", "CLIENT_STOPPED")
 
