@@ -114,8 +114,10 @@ Never copy this layout into a customer install.
 
 ## Why these Cloud Run settings
 
-- `--port=8000` — the Dockerfile CMD hardcodes uvicorn on 8000; Cloud Run
-  routes traffic there. No code change needed.
+- `--port=8000` — the image's launcher (`serve.py`) runs uvicorn on 8000;
+  with no TLS settings present, as here, it is exactly the command the
+  Dockerfile CMD used to hold. Cloud Run routes traffic there and terminates
+  HTTPS itself. No code change needed.
 - Public access: an org policy (domain-restricted sharing) blocks the
   `allUsers` IAM binding that `--allow-unauthenticated` tries to create, so
   public access is granted with `--no-invoker-iam-check` instead — the same

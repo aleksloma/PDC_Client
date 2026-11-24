@@ -251,6 +251,16 @@ class Settings(BaseModel):
     # so when it is unset.
     PUBLIC_BASE_URL: str = Field(default_factory=lambda: os.getenv("PUBLIC_BASE_URL", ""))
 
+    # Built-in HTTPS (serve.py). Both empty (the default): plain HTTP on port
+    # 8000, exactly as before — a TLS reverse proxy or Cloud Run terminates
+    # HTTPS. Both set to PEM file paths inside the container: port 8000
+    # serves HTTPS with that certificate and key, and port 8080 answers every
+    # request with a redirect to https (http_redirect.py). Exactly one set, an
+    # unreadable file, a pair that does not match or a passphrase-protected
+    # key ⇒ the app refuses to start.
+    TLS_CERT_FILE: str = Field(default_factory=lambda: os.getenv("TLS_CERT_FILE", ""))
+    TLS_KEY_FILE: str = Field(default_factory=lambda: os.getenv("TLS_KEY_FILE", ""))
+
     # Open self-registration: an unknown address signing in becomes an
     # account with the password it typed. OFF by default — accounts are
     # created by an admin invite, a share or Microsoft SSO. The only reason it

@@ -39,9 +39,19 @@ password login already emits.
   losing it means re-entering every stored credential.)
 - **HTTPS.** Microsoft requires `https://` redirect URIs (plain `http://`
   is allowed only for `localhost` testing). Production SSO therefore needs
-  the PowerDataChat client to be reachable over TLS — typically a reverse
-  proxy in front of the container — and the **Public base URL** field set
-  to that external `https://` address.
+  the PowerDataChat client to be reachable over TLS, in one of two ways:
+  - a reverse proxy in front of the container, with the **Public base URL**
+    field set to that external `https://` address; or
+  - built-in HTTPS
+    ([`CUSTOMER_INSTALL.md`](../CUSTOMER_INSTALL.md) §3). With **Public base
+    URL** empty the redirect URI then follows the address the request came in
+    on (`https`, host and port); set the field when administrators and users
+    use different addresses.
+
+  When **Public base URL** is set, the redirect URI is built from it in both
+  cases. It is a field of the single sign-on page, separate from the
+  `PUBLIC_BASE_URL` setting in `client.env`. After a move from plain HTTP,
+  update an `http://` value in this field and the redirect URI in Entra.
 
 ## Step 1 — Register PowerDataChat in your Entra tenant
 

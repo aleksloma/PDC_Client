@@ -90,9 +90,26 @@ file documents the enterprise client's implementation of each one.
   only to responses to requests that arrived over HTTPS (`scope["scheme"]`);
   behind a TLS reverse proxy that is the case only when uvicorn trusts the
   proxy's `X-Forwarded-Proto` (`FORWARDED_ALLOW_IPS` naming the proxy, never
-  `*`). A plain-HTTP request never gets HSTS. Source: `SecurityHeaders` in
+  `*`), while with built-in HTTPS every request to port 8000 arrives over
+  HTTPS. A plain-HTTP request never gets HSTS. Source: `SecurityHeaders` in
   `app.py`, which sits right outside `ContentSecurityPolicy`, inside
   `BackendNetworkGuard`.
+- **Built-in HTTPS and the redirect listener (port 8080).** With
+  `TLS_CERT_FILE` and `TLS_KEY_FILE` set, port 8000 serves HTTPS (`serve.py`)
+  and the same process listens on port 8080 in plain HTTP. That listener
+  answers every request, whatever the method or path, with `301` and
+  `Connection: close`. It sees no session and none of the routes or
+  middleware described here, the backend-network refusal included. Its
+  `Location` is `PUBLIC_BASE_URL` when that starts with `https://`, otherwise
+  `https://<Host header without its port>`, followed by the path and query
+  (`/` when the target does not start with `/` or holds anything but
+  printable ASCII). A malformed request line, a head above 8 KiB, or no usable
+  `Host` while no https base is configured gets a bare `400`; a head that is
+  incomplete after 5 s, or a connection beyond 256 open ones, is closed
+  without an answer. If port 8080 cannot be bound the log shows
+  `HTTP_REDIRECT_START_FAILED` and HTTPS is served without the redirect. With
+  the two settings empty (the default) nothing listens on 8080. Source:
+  `http_redirect.py`, started by the lifespan in `app.py`.
 - **Static files (`/static/…`, P29 C5).** The page routes write every local
   static URL as `/static/<file>?v=<value>`, where the value is
   `BUILD_COMMIT` on a stamped image (URL-safe characters only, at most 64)

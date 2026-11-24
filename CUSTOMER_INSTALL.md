@@ -114,7 +114,15 @@ Read these before you upgrade an existing install to this release.
   no longer served; those addresses answer 404.
 - The web port is now published on 127.0.0.1 only: your reverse proxy must
   run on the same host and forward to http://127.0.0.1:8000 (see
-  PDC_WEB_BIND_HOST under "Serve it over HTTPS" in §3 if it cannot).
+  PDC_WEB_BIND_HOST under "Serve it over HTTPS" in §3 if it cannot), or you
+  use built-in HTTPS instead of a proxy.
+- The application can now serve HTTPS itself, without a reverse proxy (see
+  "Built-in HTTPS (without a reverse proxy)" in §3). Nothing to do unless you
+  turn it on. The web container's start command is now `python serve.py`,
+  which runs exactly the previous `uvicorn` command while built-in HTTPS is
+  off. An install that overrides the command with `uvicorn app:app …` keeps
+  working as long as TLS_CERT_FILE and TLS_KEY_FILE are unset; with both set,
+  that start is refused (`TLS_NOT_SERVED`).
 - Each container is now capped at 2 CPUs (`cpus: "2.0"`). Docker refuses to
   start a container whose `cpus` value is above the host's CPU count, so the
   host needs at least 2 vCPUs; on a smaller host lower the value in both
@@ -265,7 +273,8 @@ A few more settings are worth knowing about, all optional:
 - **`PDC_WEB_BIND_HOST`** — the host address the web port is published on,
   `127.0.0.1` (loopback) by default. Also a **compose-level** variable. Leave
   it unset unless your reverse proxy runs on another machine; see "Serve it
-  over HTTPS" in §3.
+  over HTTPS" in §3. (Built-in HTTPS does not use it; it has its own
+  variables, see "Built-in HTTPS (without a reverse proxy)" in §3.)
 - **`ENABLE_THIRD_PARTY_SCRIPTS`** — leave it unset. By default the `/lab` page
   loads no third-party script at all: no browser analytics, no billing widget.
   Setting it to `true` restores them, which no on-premise install needs.
@@ -637,8 +646,8 @@ clears every counter and lifts any lock.
 The numbers are `AUTH_FAIL_THRESHOLD`, `AUTH_FAIL_THRESHOLD_IP`,
 `AUTH_FAIL_WINDOW_S` and `AUTH_LOCKOUT_S` in `client.env`. The counters live in
 the web process: they reset on restart and assume the single web worker this
-product runs (see "Concurrency and waiting"). Keep a rate limit on your
-reverse proxy as well.
+product runs (see "Concurrency and waiting"). If you run a reverse proxy, keep
+a rate limit on it as well.
 
 **Addresses.** An address must use letters, digits and `. _ % + -` before the
 `@`. An existing account whose address uses another character, such as an
@@ -785,7 +794,10 @@ curl http://127.0.0.1:8000/health
 Run these on the host itself. The web container's port **8000** is published
 on the host's loopback address **127.0.0.1** only, so it is not reachable from
 other machines: your users reach the application through the reverse proxy
-that terminates TLS on the same host (see "Serve it over HTTPS" below). The
+that terminates TLS on the same host (see "Serve it over HTTPS" below) or, with
+built-in HTTPS, on the two ports its compose override publishes (see "Built-in
+HTTPS (without a reverse proxy)" below; the last command is then
+`curl -k https://127.0.0.1:8000/health`). The
 web container keeps all state in **`/data/client`**, mounted from the
 persistent `pdc_client_data` volume so nothing is lost on restart or upgrade.
 The sandbox publishes no port.
@@ -842,9 +854,9 @@ The web container joins two networks. The sandbox joins only one:
 
 Nothing but these two services may join the internal sandbox network
 (`backend` in `docker-compose.yml`). Point monitoring at `/health` on the
-host (`http://127.0.0.1:8000/health`) or through your reverse proxy: a
-monitoring sidecar attached to `backend` gets HTTP 403, like anything else in
-that range.
+host (`http://127.0.0.1:8000/health`; `https://` with built-in HTTPS) or
+through your reverse proxy: a monitoring sidecar attached to `backend` gets
+HTTP 403, like anything else in that range.
 
 `PDC_BACKEND_SUBNET` pins the sandbox network's address range
 (`192.168.255.240/28` by default) and the same value reaches the web
@@ -989,16 +1001,21 @@ That allow-list applies to the **web container only**. The sandbox needs no
 egress rule at all, because it has no route to anywhere: its only network is
 internal and has no gateway. There is nothing to permit and nothing to block.
 
-Inbound, only the HTTPS port of the reverse proxy needs to be reachable by
-your users. Port 8000 is published on 127.0.0.1 only and should stay
-unreachable from other machines. The sandbox publishes no port.
+Inbound, only the HTTPS port of the reverse proxy — or, with built-in HTTPS,
+the HTTPS port and the redirect port of the web container — needs to be
+reachable by your users. Port 8000 is published on 127.0.0.1 only and should
+stay unreachable from other machines. The sandbox publishes no port.
 
 ### Serve it over HTTPS
 
 The session cookie is marked `Secure`, so browsers return it only over HTTPS
-(`http://localhost` is exempt). Put the container behind your own TLS
-terminator — a reverse proxy with your certificate — and publish that HTTPS
-address to your users.
+(`http://localhost` is exempt). There are two ways to serve it; choose one:
+
+- **behind your own TLS terminator** — a reverse proxy with your certificate,
+  whose HTTPS address you publish to your users. This section describes it.
+- **built-in HTTPS** — the application serves your certificate itself, with no
+  proxy. See "Built-in HTTPS (without a reverse proxy)" below; the rest of
+  this section does not apply then.
 
 **Run the proxy on the same host.** The compose files publish the web port on
 the loopback address only (`127.0.0.1:8000`), so the proxy must run on the
@@ -1013,11 +1030,11 @@ The address comes from the compose-level variable `PDC_WEB_BIND_HOST`
 shell or in a `.env` file next to `docker-compose.yml` like
 `PDC_BACKEND_SUBNET`, only when the proxy or load balancer runs on another
 machine — for example to the host's LAN address. Do not change it otherwise:
-the application itself speaks plain HTTP, so once the port is published on a
-reachable address anyone who can reach that address can use the application
-without TLS, and sessions and passwords cross the network unencrypted. If you
-do set it, restrict port 8000 with a host firewall so that only the proxy's
-address can connect.
+without built-in HTTPS the application itself speaks plain HTTP, so once the
+port is published on a reachable address anyone who can reach that address can
+use the application without TLS, and sessions and passwords cross the network
+unencrypted. If you do set it, restrict port 8000 with a host firewall so that
+only the proxy's address can connect.
 
 The application sends `Strict-Transport-Security` (browsers then refuse
 plain HTTP for the site for a year) only on requests that reached it as HTTPS.
@@ -1115,9 +1132,158 @@ application; do not compress the answer stream in the proxy either (it is
 sent with `X-Accel-Buffering: no`, so nginx passes each progress line on at
 once).
 
+### Built-in HTTPS (without a reverse proxy)
+
+Use this instead of the reverse proxy above, never together with it. The web
+container serves your certificate on its port 8000 (TLS 1.2 and 1.3; older
+versions are refused) and answers plain HTTP on a second port, 8080, with a
+redirect to the HTTPS address and nothing else. It is off by default: without
+the second compose file below (or the two settings it sets) nothing changes.
+
+**1. Place the certificate.** Put two PEM files in a folder named `certs` next
+to `docker-compose.yml`:
+
+| File | Content |
+|---|---|
+| `certs/server.crt` | The full chain: your server certificate first, then the intermediate certificates |
+| `certs/server.key` | The private key of that certificate, **without a passphrase** |
+
+The certificate must name the host your users type. If the key has a
+passphrase, write an unencrypted copy (openssl asks for the passphrase):
+
+```
+openssl pkey -in encrypted.key -out certs/server.key
+```
+
+The application runs as uid **10001** and must be able to read both files:
+
+```
+sudo chown 10001:10001 certs/server.crt certs/server.key
+sudo chmod 0400 certs/server.key
+sudo chmod 0444 certs/server.crt
+sudo chmod 0755 certs
+```
+
+Use real files, not symbolic links that lead out of the folder: only the folder
+itself is mounted into the container (read-only, at `/certs`). Keep the folder
+out of version control and out of any archive you share; the key is the secret
+of your HTTPS address.
+
+**2. Set `client.env`:**
+
+```
+PUBLIC_BASE_URL=https://pdc.example.com
+```
+
+It must be the `https://` address your users open. When the HTTPS port is not
+443 it is **required** and must carry the port
+(`PUBLIC_BASE_URL=https://pdc.example.com:8443`): the redirect goes to
+`PUBLIC_BASE_URL` when that starts with `https://`, and otherwise to the
+requested host name without a port, i.e. to port 443.
+
+Coming from plain HTTP, also remove `SESSION_HTTPS_ONLY=false` from
+`client.env` and `PDC_WEB_BIND_HOST` from your shell or `.env`. There is no
+proxy any more, so leave `FORWARDED_ALLOW_IPS` unset and remove a value set
+for an earlier proxy.
+
+**3. Start the stack with both compose files**
+([`docker-compose.tls.yml`](docker-compose.tls.yml) comes from PowerDataChat
+together with the base file):
+
+```
+docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+```
+
+Use both files in **every** later compose command, upgrades included. A plain
+`docker compose up -d` recreates the web container without HTTPS: it is then
+reachable only over plain HTTP on 127.0.0.1:8000, and your users get no
+answer.
+
+The override has these compose-level variables (your shell, or a `.env` file
+next to the compose files):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PDC_TLS_DIR` | `./certs` | Folder on the host that holds the two files |
+| `PDC_TLS_CERT` | `server.crt` | Certificate file name in that folder |
+| `PDC_TLS_KEY` | `server.key` | Private-key file name in that folder |
+| `PDC_HTTPS_PORT` | `443` | Host port for HTTPS |
+| `PDC_HTTP_PORT` | `80` | Host port for the redirect |
+| `PDC_TLS_BIND_HOST` | `0.0.0.0` | Host address both ports are published on |
+
+The base file's port 8000 stays published on 127.0.0.1 and speaks HTTPS too,
+so on the host use `curl -k https://127.0.0.1:8000/health`. The sandbox is not
+touched.
+
+**If your containers are started with `docker run`,** steps 1 and 2
+apply as well. Then add these flags to the **existing** command of the web
+container:
+
+```
+  -v /path/certs:/certs:ro \
+  -e TLS_CERT_FILE=/certs/server.crt \
+  -e TLS_KEY_FILE=/certs/server.key \
+  -p 443:8000 -p 80:8080 \
+```
+
+They are additions, not a new command: the existing one must keep its
+hardening flags, its networks, its volumes and the rest of its settings as
+they are. A `-p …:8000` mapping it already has keeps working and speaks HTTPS.
+`TLS_CERT_FILE` and `TLS_KEY_FILE` can stand in `client.env` instead of on the
+command line; with compose, leave them out of it, the override sets them.
+
+**4. Verify.** `docker logs pdc-client` shows `TLS_ENABLED` and
+`HTTP_REDIRECT_STARTED port=8080`. Then, from another machine:
+
+```
+curl -sI http://pdc.example.com/
+#   HTTP/1.1 301 Moved Permanently
+#   Location: https://pdc.example.com/
+curl https://pdc.example.com/health
+#   add  --cacert your-ca.pem  when the certificate comes from your own CA
+```
+
+The second command must succeed **without** `-k`; that also proves the chain
+in `server.crt` is complete. Read the body as described in §4.
+
+**The container refuses to start** rather than fall back to plain HTTP. `docker
+logs pdc-client` shows one of these lines and the container exits (the restart
+policy tries again):
+
+| Log line | Cause |
+|---|---|
+| `TLS_CONFIG_INCOMPLETE` | Only one of `TLS_CERT_FILE` / `TLS_KEY_FILE` is set; `missing=` names the one that is not |
+| `TLS_FILE_UNREADABLE which=cert` or `which=key` | The file is missing, is not a regular file, or uid 10001 may not read it. `error=` gives the reason (`FileNotFoundError`, `PermissionError`, …) |
+| `TLS_PAIR_INVALID` | A file is not PEM, the key does not belong to the certificate, or the key has a passphrase |
+| `TLS_NOT_SERVED` | The files are valid but the container was started with a command other than the image's own (`python serve.py`) and would answer in plain HTTP. Remove the command override |
+
+`HTTP_REDIRECT_START_FAILED` is not a refusal: the redirect port could not be
+opened, and HTTPS is served without it.
+
+**Renewal.** Replace the two files, give them the same owner and mode, and
+restart the web container; it reads them only at startup:
+
+```
+docker compose -f docker-compose.yml -f docker-compose.tls.yml restart client
+```
+
+**Browsers remember HTTPS (HSTS).** HTTPS responses carry
+`Strict-Transport-Security: max-age=31536000; includeSubDomains`. A browser
+that has opened the site then uses HTTPS for one year for that host name, its
+subdomains, and **every port** of them, so another service that speaks plain
+HTTP under the same name stops working in that browser, and so does this
+application if you go back to plain HTTP. Give PowerDataChat a host name of
+its own, and renew the certificate before it expires: browsers do not let
+users click past a certificate error on such a site.
+
+**Microsoft sign-in.** The redirect URI registered in Entra must be the
+`https://` address; see the prerequisites in
+[`docs/SSO_MICROSOFT.md`](docs/SSO_MICROSOFT.md).
+
 ## 4. Verify
 
-- Open your HTTPS address (`PUBLIC_BASE_URL`, served by the reverse proxy)
+- Open your HTTPS address (`PUBLIC_BASE_URL`, served by the reverse proxy or
+  by built-in HTTPS)
   → sign in as `ladmin` with `LOCAL_ADMIN_PASSWORD`
   → you land on the admin panel; invite a first user from **Users** and check
   that the invitation mail arrives with a link to your `PUBLIC_BASE_URL`.
@@ -1125,6 +1291,8 @@ once).
 
   ```
   curl http://127.0.0.1:8000/health
+  # with built-in HTTPS:
+  curl -k https://127.0.0.1:8000/health
   ```
 
   A healthy install shows:
@@ -1279,7 +1447,8 @@ decks, and your branded templates.
   pages redirect to the change form, and every data request is refused with
   "Password change required" until the change is made.
 - **Upgrades:** pull or load the new tag of **both** images, update the tag in
-  your `docker-compose.yml`, then `docker compose up -d`. The two images belong
+  your `docker-compose.yml`, then `docker compose up -d` (with built-in HTTPS,
+  name both compose files, as in §3). The two images belong
   to one release, so upgrading only one leaves the pair mismatched. The
   `pdc_client_data` volume (your data) is preserved across upgrades.
 - **Upgrading an install that predates the analysis sandbox.** Nothing to
@@ -1339,8 +1508,8 @@ decks, and your branded templates.
   again." every time they sign in (the log shows `CSRF_FORM_TOKEN_REFUSED`).
   It does NOT reproduce on the
   installer's own laptop, because browsers exempt `http://localhost`. Before
-  upgrading, either front the container with TLS (see "Serve it over HTTPS") or
-  add `SESSION_HTTPS_ONLY=false` to `client.env`.
+  upgrading, either serve it over HTTPS (a proxy or built-in HTTPS, both in §3)
+  or add `SESSION_HTTPS_ONLY=false` to `client.env`.
 - **Test single sign-on right after this upgrade if you use it.** The library
   that validates the Microsoft identity token changed in this release. Sign-in
   through Microsoft is exercised end to end for the first time on your own

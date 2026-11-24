@@ -7,6 +7,8 @@ logs/
 *.env
 !*.env.example
 .claude/
+# Built-in HTTPS: certificates and keys are mounted at run time, never built in.
+certs/
 # Both images copy named files only, so the working tree does not reach /app
 # through their COPY lines; this list still bounds the BUILD CONTEXT (and any
 # directory a COPY names, e.g. static/). Git-ignoring a file keeps it out of
