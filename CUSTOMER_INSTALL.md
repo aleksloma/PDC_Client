@@ -1280,6 +1280,40 @@ users click past a certificate error on such a site.
 `https://` address; see the prerequisites in
 [`docs/SSO_MICROSOFT.md`](docs/SSO_MICROSOFT.md).
 
+#### Checklist: switching an existing plain-HTTP install to built-in HTTPS
+
+1. Get from your IT team: a certificate (full chain) and its private key
+   without a passphrase, for the DNS name your users open; and ports 443 and
+   80 open from your users to the server (see
+   [Restrict what the containers can reach](#restrict-what-the-containers-can-reach-recommended)).
+2. Back up the data volume and `client.env` before anything else. Find the
+   volume's real name first, usually `<project>_pdc_client_data` (see
+   [Notes](#notes): a wrong name does not fail, Docker creates an empty
+   volume):
+
+   ```
+   docker volume ls
+   mkdir -p "$PWD/pdc_backup_$(date +%F)/data"
+   docker run --rm -v <that name>:/src:ro -v "$PWD/pdc_backup_$(date +%F)/data":/dest        alpine cp -a /src/. /dest/
+   cp -p client.env "pdc_backup_$(date +%F)/"
+   ```
+
+3. Pull or load **both** images of the new release
+   ([§1](#1-get-the-images)) and read the [Upgrade notes](#upgrade-notes) and
+   the upgrade items under [Notes](#notes).
+4. Place the certificate and key:
+   [Built-in HTTPS](#built-in-https-without-a-reverse-proxy), step 1.
+5. Edit `client.env`:
+   [Built-in HTTPS](#built-in-https-without-a-reverse-proxy), step 2.
+6. Start with both compose files, or add the `docker run` flags:
+   [Built-in HTTPS](#built-in-https-without-a-reverse-proxy), step 3.
+7. Verify: [Built-in HTTPS](#built-in-https-without-a-reverse-proxy), step 4.
+8. Microsoft sign-in, if you use it: check the **Public base URL** field
+   (update an `http://` value; set it when administrators and users use
+   different addresses; otherwise it may stay empty) and register the
+   `https://` redirect address in Entra: see
+   [`docs/SSO_MICROSOFT.md`](docs/SSO_MICROSOFT.md).
+
 ## 4. Verify
 
 - Open your HTTPS address (`PUBLIC_BASE_URL`, served by the reverse proxy or
