@@ -10,6 +10,41 @@ against the existing data volume.
 
 ## Unreleased (on `main`, not yet tagged)
 
+### Built-in HTTPS — 2026-11-24
+
+**Why.** Until now the web container spoke plain HTTP only, so HTTPS needed a
+reverse proxy in front of it. An install without one can now have the
+application serve its own certificate.
+
+**Change.**
+- Off by default: with `TLS_CERT_FILE` and `TLS_KEY_FILE` empty the container
+  runs exactly the uvicorn command it ran before. Both set: port 8000 serves
+  HTTPS (TLS 1.2 with ECDHE AES-GCM / ChaCha20 suites, TLS 1.3) and port 8080
+  answers every request with a redirect to the HTTPS address
+  (`http_redirect.py`).
+- The image's start command is `python serve.py` (the launcher) instead of
+  `uvicorn …`. A TLS configuration that cannot be served refuses the start:
+  `TLS_CONFIG_INCOMPLETE`, `TLS_FILE_UNREADABLE`, `TLS_PAIR_INVALID`,
+  `TLS_NOT_SERVED`.
+- The image `HEALTHCHECK` tries http first, then https without certificate
+  verification.
+- Two compose overrides, `docker-compose.tls.yml` (customer) and
+  `docker-compose.local.tls.yml` (local testing); the base files are
+  unchanged.
+- No change to the sandbox image, to a stored format or to the brain protocol.
+- Operator instructions: `CUSTOMER_INSTALL.md` §3, "Built-in HTTPS (without a
+  reverse proxy)".
+
+**Gates (local, before the pull request).**
+
+| Gate | Result |
+|---|---|
+| Web suite, Python 3.11, Windows | 7308 passed, 132 skipped, 0 failed (`tests/test_export_plotly_png.py` left to CI: kaleido hangs on Windows) |
+| Local web image build | pass (both images) |
+| Localhost smoke, plain stack (`docker-compose.local.yml`) | pass: http on 8091 as before, 8092 closed, users and chats equal to the baseline |
+| Localhost smoke, TLS stack (with `docker-compose.local.tls.yml`): HTTPS, redirect, boot refusals, HEALTHCHECK | pass: TLS 1.0/1.1 refused, TLS 1.3 negotiated, TLS 1.2 with three ECDHE AEAD suites, 301 with path and query, Secure cookie, HSTS, one answered question, SSO redirect address and state cookie |
+| CI tests / executor-tests / images | required green on the pull request before the merge |
+
 ### joserfc 1.7.5 → 1.7.6, pyasn1 0.6.4 → 0.6.5 — 2026-11-04
 
 **Why.** pip-audit (PyPI and OSV) on the built web image reported

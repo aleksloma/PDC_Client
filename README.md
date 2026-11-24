@@ -194,8 +194,10 @@ that terminates TLS on the same host and forwards to `http://127.0.0.1:8000`.
 The compose-level variable `PDC_WEB_BIND_HOST` (default `127.0.0.1`) changes
 that address; set it only when the proxy runs on another machine, and then
 firewall the port to the proxy's address, because the application itself
-speaks plain HTTP. See [`CUSTOMER_INSTALL.md`](CUSTOMER_INSTALL.md) §3,
-"Serve it over HTTPS".
+speaks plain HTTP. Instead of a proxy the application can serve HTTPS itself,
+with the [`docker-compose.tls.yml`](docker-compose.tls.yml) override. See
+[`CUSTOMER_INSTALL.md`](CUSTOMER_INSTALL.md) §3, "Serve it over HTTPS" and
+"Built-in HTTPS".
 
 On the Docker host itself, open `http://localhost:8000` and sign in as
 `ladmin` with `LOCAL_ADMIN_PASSWORD`, then invite users from the admin panel's

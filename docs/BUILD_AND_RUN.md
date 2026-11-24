@@ -122,7 +122,23 @@ To run the client you need a **tenant token from the brain**. Create one
 through the brain's admin panel — when the token is created it is shown
 ONCE and never again. Save it.
 
-Two settings stop the web container at startup, before it serves a request:
+The web image's start command is `python serve.py`. With `TLS_CERT_FILE` and
+`TLS_KEY_FILE` both empty (the default) it replaces itself with exactly the
+command the image ran before, `uvicorn app:app --host 0.0.0.0 --port 8000
+--workers 1`, in the environment the container was started with. With both set
+it adds `--ssl-certfile`, `--ssl-keyfile` and `--ssl-ciphers
+ECDHE+AESGCM:ECDHE+CHACHA20` (TLS 1.2 suites; TLS 1.3 is enabled as well, TLS
+1.0 and 1.1 are not), so port 8000 serves HTTPS, and the app lifespan starts
+the redirect-only listener on port 8080 (`docs/CLIENT_ENDPOINTS.md`, "Built-in
+HTTPS"). Operator instructions: `CUSTOMER_INSTALL.md` §3, "Built-in HTTPS
+(without a reverse proxy)".
+
+The image's `HEALTHCHECK` requests `http://localhost:8000/health` first and,
+only if that fails, `https://localhost:8000/health` without certificate
+verification. Plain mode is decided by the first request, built-in HTTPS by
+the second; the probe reads no setting.
+
+These settings stop the web container at startup, before it serves a request:
 
 - **`SECRET_KEY`** signs the session cookie and is **required**. Empty, the
   old placeholder `replace-me-in-prod`, or shorter than 32 characters ⇒ the
@@ -134,6 +150,15 @@ Two settings stop the web container at startup, before it serves a request:
   `EXECUTOR_CIDR_UNSET` and exit. Both compose files set it from
   `PDC_BACKEND_SUBNET`. Only a run with `EXECUTOR_URL=""` (no sandbox at
   all) may leave it empty.
+- **`TLS_CERT_FILE` / `TLS_KEY_FILE`**, when at least one is set. The launcher
+  checks them before uvicorn runs and the lifespan checks them again:
+  `TLS_CONFIG_INCOMPLETE` (exactly one is set), `TLS_FILE_UNREADABLE
+  which=cert|key` (missing, not a regular file, not readable by uid 10001),
+  `TLS_PAIR_INVALID` (not PEM, key and certificate do not match, key behind a
+  passphrase). `TLS_NOT_SERVED` comes from the lifespan alone: the pair is
+  valid but the server was started without `--ssl-certfile` and
+  `--ssl-keyfile`, i.e. without the launcher. No line carries a path or file
+  content.
 
 Run the two images with compose, never by hand: the sandbox is only isolated
 because compose gives it an internal network with no gateway, and the two
@@ -154,9 +179,13 @@ Both compose files also set, for both services:
   (the shell, or a `.env` next to the compose file, like
   `PDC_BACKEND_SUBNET`), not a `client.env` setting; compose's `:-` also
   treats an empty value as unset, so an empty value stays on loopback. Set it
-  only when the proxy runs on another machine — the application speaks plain
-  HTTP, so a reachable address serves it without TLS to anyone who can reach
-  it, and the port must then be firewalled to the proxy's address.
+  only when the proxy runs on another machine — without built-in HTTPS the
+  application speaks plain HTTP, so a reachable address serves it without TLS
+  to anyone who can reach it, and the port must then be firewalled to the
+  proxy's address. Built-in HTTPS is an override file on top
+  (`docker-compose.tls.yml`, local: `docker-compose.local.tls.yml`). It adds
+  the certificate mount, the two settings and its own ports to the `client`
+  service and changes nothing else; the base files know nothing about it.
 - **CPU cap.** `cpus: "2.0"` on each service. Docker refuses to start a
   container whose `cpus` is above the host's CPU count, so the host needs at
   least 2 vCPUs, or lower the value in both services.
@@ -320,6 +349,43 @@ After `up`, verify `GET http://localhost:8090/health` and
 users / chats are still visible before testing the change at hand. The client
 health body must also show `executor_reachable: true`. It stays 200 when the
 sandbox is down, so the status code alone proves nothing.
+
+### The local stack with built-in HTTPS
+
+`docker-compose.local.tls.yml` is an override for the local stack: the same
+services, the same external data volume, the same hard rules as above. Make a
+self-signed certificate for `localhost` once (Git Bash; `certs/` is
+git-ignored and docker-ignored):
+
+```bash
+mkdir -p certs
+MSYS_NO_PATHCONV=1 openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+  -keyout certs/server.key -out certs/server.crt
+```
+
+Both files must be readable by uid 10001 (on a Linux host: the `chown` /
+`chmod` of `CUSTOMER_INSTALL.md` §3). Then:
+
+```powershell
+docker compose -f docker-compose.local.yml -f docker-compose.local.tls.yml up -d --build
+curl.exe -k https://localhost:8091/health
+curl.exe -sI http://localhost:8092/       # 301 to https://localhost:8091/
+```
+
+`https://localhost:8091` is the application and `http://localhost:8092` the
+redirect listener. The override sets `SESSION_HTTPS_ONLY=true` and
+`PUBLIC_BASE_URL=https://localhost:8091`.
+
+**Never open `https://localhost:8091` in a normal browser profile.** The
+response carries HSTS for the host name `localhost`, and HSTS has no port: a
+browser that records it turns every `http://localhost:<port>` — the plain
+stack on 8091, the brain on 8090, any other local service — into `https://`
+for a year. Use `curl -k`, or a throwaway browser profile that is deleted
+afterwards.
+
+Back to the plain stack: start it with the base file alone,
+`docker compose -f docker-compose.local.yml up -d`.
 
 ---
 
