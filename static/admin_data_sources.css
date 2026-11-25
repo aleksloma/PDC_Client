@@ -657,3 +657,9 @@ body.admin-ds-page {
 #mcpTokenBox p { margin: 4px 0; }
 #mcpTokensList th, #mcpTokensList td:not(.adm-actions-cell) { white-space: normal; }
 #mcpTokensList td:nth-child(1), #mcpTokensList td:nth-child(3) { overflow-wrap: anywhere; }
+#mcpTokensList .adm-cell-mono span { white-space: nowrap; }
+/* Georgian and Russian headers are long. */
+@media (max-width: 1200px) {
+  #mcpTokensList th, #mcpTokensList td { padding-left: 8px; padding-right: 8px; }
+  #mcpTokensList th { font-size: 11px; letter-spacing: 0; text-transform: none; }
+}

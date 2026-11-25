@@ -1469,6 +1469,24 @@ def test_the_module_logs_safely():
 # ===========================================================================
 # end to end: POST /mcp with the real content builder
 # ===========================================================================
+
+def read_answer(res, job_id):
+    """(state, the items of the answer) of a get_answer result. Its first item
+    is the state as JSON; only a running job has it as structuredContent too."""
+    first = res["content"][0]
+    assert set(first) == {"type", "text"} and first["type"] == "text", first
+    head = json.loads(first["text"])
+    assert set(head) == {"job_id", "state"} and head["job_id"] == job_id, head
+    state, items = head["state"], res["content"][1:]
+    if state == "running":
+        assert res["structuredContent"] == head and items == [], res
+    else:
+        assert state in ("done", "failed") and items, res
+        assert "structuredContent" not in res, "the answer would be shown to no model"
+    assert bool(res.get("isError")) is (state == "failed"), res
+    return state, items
+
+
 @pytest.fixture
 def served(world, renderer, monkeypatch):
     """`served.events` is what the pipeline yields."""
@@ -1505,8 +1523,9 @@ def served(world, renderer, monkeypatch):
             job_id = job["structuredContent"]["job_id"]
             for _ in range(5):
                 res = self.call("get_answer", {"job_id": job_id}, **headers)
-                if res["structuredContent"]["state"] != "running":
-                    return res
+                state, items = read_answer(res, job_id)
+                if state != "running":
+                    return {**res, "content": items}        # the answer's own items
             raise AssertionError("the job never finished")
 
     s = Served()

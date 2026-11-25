@@ -1067,6 +1067,31 @@ def test_a_modern_tool_result_carries_the_result_type_too(bot):
     assert legacy["structuredContent"] == {"chats": []}
 
 
+@pytest.mark.parametrize("state", ["running", "done", "failed"])
+def test_a_modern_answer_has_the_same_shape(bot, monkeypatch, state):
+    """The state comes first in the content; a finished answer carries no
+    structuredContent, so a client cannot show that instead of the answer."""
+    jobs = importlib.import_module("mcp_jobs")
+    job = jobs.Job(id="a" * 32, token_id="t", email=USER, chat_id="c_x", state=state)
+    if state != "running":
+        job.content = [{"type": "text", "text": "the text"}]
+        job.error_text = "the text" if state == "failed" else None
+    monkeypatch.setattr(jobs, "get", lambda *a: job)
+    monkeypatch.setattr(importlib.import_module("routes.chat"), "_require_chat",
+                        lambda request, chat_id: (USER, None))
+    monkeypatch.setattr(settings, "MCP_ANSWER_WAIT_SECONDS", 0.0)
+    call = {"name": "get_answer", "arguments": {"job_id": job.id}}
+    res = _modern_result(bot.modern("tools/call", call, headers={"X-PDC-User-Email": USER}))
+    out = {"job_id": job.id, "state": state}
+    assert json.loads(res["content"][0]["text"]) == out
+    assert res["content"][1:] == (job.content or [])
+    assert res.get("structuredContent") == (out if state == "running" else None)
+    assert "structuredContent" in res or state != "running"
+    assert res.get("isError", False) is (state == "failed")
+    legacy = result_of(bot.legacy("tools/call", call, headers=[("X-PDC-User-Email", USER)]))
+    assert legacy == {k: v for k, v in res.items() if k not in ("resultType", "_meta")}
+
+
 def test_a_modern_refused_tool_call_carries_it_as_well(bot):
     res = _modern_result(bot.modern("tools/call", {"name": "list_chats", "arguments": {}}))
     assert res["isError"] is True               # no X-PDC-User-Email

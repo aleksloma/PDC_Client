@@ -186,6 +186,8 @@ class Client:
     def tool(self, name, arguments):
         """The result of one tool call."""
         result = self.call("tools/call", {"name": name, "arguments": arguments})
+        if name == "get_answer":
+            result = _split_state(result)
         if result.get("isError"):
             raise Stop(1, "\n".join(_texts(result))
                        or "The server refused the call without a reason.")
@@ -211,6 +213,23 @@ def _structured(result, key):
     return value.get(key) if isinstance(value, dict) else None
 
 
+def _split_state(result):
+    """A get_answer result as its "state" and the "content" of the answer. The
+    state is the JSON {"job_id", "state"} in the first item, which is not a
+    part of the answer; without such an item it is in structuredContent."""
+    content = result.get("content")
+    content = content if isinstance(content, list) else []
+    try:
+        item = json.loads(_texts({"content": content[:1]})[0])
+    except (IndexError, ValueError, RecursionError):
+        item = None
+    if isinstance(item, dict) and "job_id" in item and "state" in item:
+        state, content = item["state"], content[1:]
+    else:
+        state = _structured(result, "state")
+    return {"state": state, "content": content, "isError": result.get("isError")}
+
+
 def _list_chats(client):
     chats = _structured(client.tool("list_chats", {}), "chats")
     if not isinstance(chats, list):
@@ -229,7 +248,7 @@ def _ask(client, chat_id, question, max_wait):
     deadline = time.monotonic() + max_wait
     while True:
         result = client.tool("get_answer", {"job_id": job_id})
-        state = _structured(result, "state")
+        state = result["state"]
         if state == "done":
             return result
         if state != "running":

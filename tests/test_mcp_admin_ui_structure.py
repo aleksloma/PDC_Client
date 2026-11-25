@@ -68,7 +68,7 @@ LATIN_ALLOWED = {"MCP", "PowerDataChat", "URL", "HTTP", "Authorization", "Bearer
                  "X-PDC-User-Email", "API"}
 # English words in Georgian letters; the interface has Georgian words for them.
 GEO_TRANSLITERATED = ("ტოკენ", "ენდპოინტ", "ენდფოინთ", "აქაუნთ", "ექაუნთ", "იუზერ",
-                      "იმეილ", "ლინკ", "ქოფი", "რევოქ", "ფილდ")
+                      "იმეილ", "ლინკ", "ქოფი", "რევოქ", "ფილდ", "ლოკალურ")
 
 RAW = "pdcmcp_" + "R" * 43
 
@@ -690,6 +690,28 @@ def test_the_token_is_gone_after_the_section_is_left(tmp_path):
     left, copied, box, value, back = out["result"]
     assert (left, box, value, back) == (False, False, "", False)
     assert RAW not in copied
+
+
+def test_leaving_the_section_resets_the_form(tmp_path):
+    reason = "There is no account with this email address."
+    out = _run(tmp_path, f"""
+      await h.open('mcp');
+      h.server.create = [400, {{ error: {reason!r} }}];
+      await h.create('Kiosk', 'shared_account', 'nobody@corp.example');
+      const look = () => ({{ name: h.$('mcpName').value, account: h.$('mcpAccount').value,
+        mode: h.$('mcpMode').value, accountShown: h.visible('mcpAccount'),
+        shared: h.visible('mcpSharedNote'), perUser: h.visible('mcpPerUserNote'),
+        error: h.texts(h.$('secMcp')).includes({reason!r}) }});
+      const before = look();
+      await h.open('users');
+      await h.open('mcp');
+      return [before, look()];""")
+    before, after = out["result"]
+    assert before == {"name": "Kiosk", "account": "nobody@corp.example",
+                      "mode": "shared_account", "accountShown": True, "shared": True,
+                      "perUser": False, "error": True}
+    assert after == {"name": "", "account": "", "mode": "per_user", "accountShown": False,
+                     "shared": False, "perUser": True, "error": False}
 
 
 def test_a_create_answer_after_the_section_was_left_shows_no_token(tmp_path):

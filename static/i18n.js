@@ -943,7 +943,7 @@ window.I18N_TRANSLATIONS = {
     'admin.mcp.error_name_taken': 'ამ დასახელებით მოქმედი გასაღები უკვე არსებობს.',
     'admin.mcp.error_account_address': 'შეიყვანეთ არსებული ანგარიშის ელფოსტის მისამართი.',
     'admin.mcp.error_account_unknown': 'ამ ელფოსტის მისამართით ანგარიში არ არსებობს.',
-    'admin.mcp.error_account_local_admin': 'ლოკალური ადმინისტრატორის ანგარიშის გამოყენება გასაღებისთვის შეუძლებელია.',
+    'admin.mcp.error_account_local_admin': 'ადგილობრივი ადმინისტრატორის ანგარიშის გამოყენება გასაღებისთვის შეუძლებელია.',
     'admin.mcp.error_account_undated': 'ამ ანგარიშს შექმნის თარიღი არ აქვს, ამიტომ მასზე გასაღების მიბმა შეუძლებელია.',
     'admin.mcp.error_store': 'გასაღებების წაკითხვა ან შენახვა ვერ მოხერხდა. მიზეზი სერვერის ჟურნალშია.',
     'admin.mcp.error_unknown_token': 'ასეთი გასაღები არ არსებობს.',

@@ -14,6 +14,9 @@ Pinned readings of the brief:
 * it checks the token again too, before delivering and while waiting: a token
   revoked meanwhile gets the 401 of any refused token;
 * the job thread checks the chat access once more before the turn;
+* every state of `get_answer` is in its FIRST text item, exactly
+  {"job_id", "state"}. A finished answer has no structuredContent: a client
+  that shows its model only that would lose the answer;
 * every refused job read — unknown, expired, another user's, another token's,
   access removed — is the same bytes;
 * the question is stripped and an empty one gets the web's text.
@@ -227,6 +230,8 @@ class Bot:
         assert "set-cookie" not in r.headers
         body = r.json()
         assert "result" in body, body
+        if tool == "get_answer":
+            state_of(body["result"])            # every answer keeps the shape
         return body["result"]
 
     def ask(self, question=QUESTION, chat=CHAT, **kw):
@@ -238,7 +243,7 @@ class Bot:
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             res = self.call("get_answer", {"job_id": job_id}, **kw)
-            if (res.get("structuredContent") or {}).get("state") != "running":
+            if state_of(res) != "running":
                 return res
         raise AssertionError("the job never finished")
 
@@ -248,9 +253,44 @@ def bot(jobs):
     return Bot()
 
 
+def state_of(res, job_id=None):
+    """The state of a get_answer result, None for a refused call ("Job not
+    found.", an identity refusal). Checks the shape of each."""
+    first = res["content"][0]
+    assert first["type"] == "text" and set(first) == {"type", "text"}, res
+    try:
+        out = json.loads(first["text"])
+    except ValueError:
+        error_text(res)
+        return None
+    assert isinstance(out, dict) and set(out) == {"job_id", "state"}, res
+    assert isinstance(out["job_id"], str) and re.fullmatch(r"[0-9a-f]{32}", out["job_id"])
+    assert out["state"] in ("running", "done", "failed"), res
+    assert job_id is None or out["job_id"] == job_id
+    if out["state"] == "running":
+        assert len(res["content"]) == 1, res
+        assert res["structuredContent"] == out
+        assert not res.get("isError")
+    else:
+        assert "structuredContent" not in res, "the client would show only this"
+        assert len(res["content"]) >= 2, "a finished job delivers something"
+        assert res.get("isError", False) is (out["state"] == "failed"), res
+    return out["state"]
+
+
+def failed_text(res, job_id=None):
+    """The one sentence of a failed answer."""
+    assert state_of(res, job_id) == "failed", res
+    assert [c["type"] for c in res["content"]] == ["text", "text"], res
+    text = res["content"][1]["text"]
+    assert isinstance(text, str) and text.strip() and "Traceback" not in text
+    return text
+
+
 def error_text(res):
     """The one sentence of a refused call."""
     assert res["isError"] is True, res
+    assert "structuredContent" not in res, res
     assert [c["type"] for c in res["content"]] == ["text"], res
     text = res["content"][0]["text"]
     assert isinstance(text, str) and text.strip()
@@ -621,7 +661,6 @@ def test_a_second_question_while_one_runs_is_refused(bot, pipeline):
     res = bot.call("ask", {"chat_id": CHAT, "question": "and now?"})
     text = error_text(res)
     assert text[0].isupper() and text.endswith(".")
-    assert "structuredContent" not in res or "job_id" not in (res["structuredContent"] or {})
     # another user of the same chat is not held up
     friends = bot.ask(email=FRIEND)
     pipeline.gate.set()
@@ -636,9 +675,8 @@ def test_an_empty_dataset_fails_with_the_webs_text(bot, world, pipeline):
     meta["files"] = []
     world.write_meta(meta)
     local_store._DATAFRAME_CACHE.invalidate()
-    res = bot.wait(bot.ask())
-    assert error_text(res) == "Chat dataset is empty."
-    assert res["structuredContent"]["state"] == "failed"
+    job_id = bot.ask()
+    assert failed_text(bot.wait(job_id), job_id) == "Chat dataset is empty."
     assert pipeline.calls == []
     assert local_store.AuthStore().list_conversations(OWNER) == []
 
@@ -683,7 +721,7 @@ def test_an_answer_that_was_not_saved_is_delivered_and_says_so(bot, pipeline, co
 
     monkeypatch.setattr(local_store.ChatDataStore, "append_history", broken)
     res = bot.wait(bot.ask())
-    assert not res.get("isError") and res["structuredContent"]["state"] == "done"
+    assert state_of(res) == "done"
     assert [c["saved"] for c in content.calls] == [False]
     monkeypatch.setattr(local_store.ChatDataStore, "append_history", real)
     bot.wait(bot.ask())
@@ -725,10 +763,11 @@ def test_an_unexpected_failure_in_ask_is_an_internal_error(bot, jobs, pipeline, 
 def test_a_question_that_cannot_be_stored_never_crashes(bot, pipeline):
     """A lone surrogate is valid JSON and cannot be written as UTF-8."""
     res = bot.call("ask", {"chat_id": CHAT, "question": "x \ud800 y"})
-    if not res.get("isError"):
-        res = bot.wait(res["structuredContent"]["job_id"])
     if res.get("isError"):
         error_text(res)
+    else:
+        job_id = res["structuredContent"]["job_id"]
+        assert state_of(bot.wait(job_id), job_id) in ("done", "failed")
     assert not bot.wait(bot.ask("a normal one")).get("isError")
 
 
@@ -806,16 +845,30 @@ def test_a_covered_table_reaches_the_planner(bot, world, pipeline, live):
 # ===========================================================================
 # get_answer
 # ===========================================================================
-def test_a_done_answer_is_the_jobs_content_as_it_is(bot, jobs):
+def test_a_done_answer_is_the_state_and_the_jobs_content_as_it_is(bot, jobs):
+    items = [{"type": "text", "text": "ANSWER the answer"},
+             {"type": "image", "data": "aGk=", "mimeType": "image/png"}]
     job_id = bot.ask()
     res = bot.wait(job_id)
     assert not res.get("isError")
-    assert res["content"] == [
-        {"type": "text", "text": "ANSWER the answer"},
-        {"type": "image", "data": "aGk=", "mimeType": "image/png"}]
-    assert res["structuredContent"] == {"job_id": job_id, "state": "done"}
-    # it can be read again
+    assert json.loads(res["content"][0]["text"]) == {"job_id": job_id, "state": "done"}
+    assert res["content"][1:] == items
+    assert set(res) <= {"content", "isError"}, set(res)
+    # it can be read again: the state item is never added to the job itself
     assert bot.wait(job_id) == res
+    assert jobs.get(job_id, bot.row["id"], OWNER).content == items
+
+
+@pytest.mark.parametrize("text", ["ANSWER", '{"job_id": "x", "state": "running"}', "", " "],
+                         ids=["plain", "json-lookalike", "empty", "blank"])
+def test_the_answers_own_items_are_never_merged_or_changed(bot, monkeypatch, text):
+    """An answer that looks like a state stays the second item."""
+    items = [{"type": "text", "text": text}, {"type": "text", "text": "two"}]
+    monkeypatch.setattr(sys.modules["mcp_answer"], "build_content",
+                        lambda *a, **k: [dict(i) for i in items])
+    job_id = bot.ask()
+    res = bot.wait(job_id)
+    assert state_of(res, job_id) == "done" and res["content"][1:] == items
 
 
 def test_a_running_answer(bot, pipeline, monkeypatch):
@@ -826,6 +879,7 @@ def test_a_running_answer(bot, pipeline, monkeypatch):
     assert not res.get("isError")
     assert res["structuredContent"] == {"job_id": job_id, "state": "running"}
     assert _one_text(res) == res["structuredContent"]
+    assert set(res) <= {"content", "structuredContent", "isError"}, set(res)
 
 
 def _errors():
@@ -847,8 +901,9 @@ def test_a_failed_answer_is_the_webs_text(bot, pipeline, name):
     pipeline.raises, text = _errors()[name]
     job_id = bot.ask()
     res = bot.wait(job_id)
-    assert error_text(res) == text
-    assert res["structuredContent"] == {"job_id": job_id, "state": "failed"}
+    assert failed_text(res, job_id) == text
+    assert json.loads(res["content"][0]["text"]) == {"job_id": job_id, "state": "failed"}
+    assert set(res) == {"content", "isError"}, set(res)
     assert "SECRET" not in json.dumps(res)
     # the next question is accepted
     pipeline.events, pipeline.raises = [_single()], None
@@ -857,14 +912,14 @@ def test_a_failed_answer_is_the_webs_text(bot, pipeline, name):
 
 def test_a_turn_without_any_event_is_failed_with_the_generic_text(bot, pipeline):
     pipeline.events = []
-    assert error_text(bot.wait(bot.ask())) == GENERIC
+    assert failed_text(bot.wait(bot.ask())) == GENERIC
 
 
 def test_a_stopped_turn_is_done(bot, pipeline, content, monkeypatch):
     chat_mod = importlib.import_module("routes.chat")
     monkeypatch.setattr(chat_mod, "_is_cancelled", lambda conv_id: True)
     res = bot.wait(bot.ask())
-    assert not res.get("isError") and res["structuredContent"]["state"] == "done"
+    assert state_of(res) == "done"
     assert content.calls[0]["record"]["stopped"] is True
 
 
@@ -877,7 +932,7 @@ def test_it_waits_up_to_the_setting_and_then_says_running(bot, pipeline, monkeyp
         started = time.monotonic()
         res = bot.call("get_answer", {"job_id": job_id})
         took = time.monotonic() - started
-        assert res["structuredContent"]["state"] == "running"
+        assert state_of(res, job_id) == "running"
         assert wait - 0.05 <= took < wait + 5, (wait, took)
 
 
@@ -888,7 +943,7 @@ def test_it_answers_as_soon_as_the_job_is_done(bot, pipeline, monkeypatch):
     threading.Timer(0.4, pipeline.gate.set).start()
     started = time.monotonic()
     res = bot.call("get_answer", {"job_id": job_id})
-    assert res["structuredContent"]["state"] == "done"
+    assert state_of(res, job_id) == "done"
     assert time.monotonic() - started < 15
 
 
@@ -937,7 +992,7 @@ def test_the_wait_does_not_block_the_event_loop(bot, pipeline, monkeypatch):
 
     took, results = _async_calls(bot, go)
     assert took < 4, f"another request took {took:.1f}s while answers were awaited"
-    assert {r["structuredContent"]["state"] for r in results} == {"done"}
+    assert {state_of(r, job_id) for r in results} == {"done"}
 
 
 def test_many_waiting_calls_use_no_worker_threads(bot, pipeline, monkeypatch):
@@ -1010,7 +1065,12 @@ def test_a_shared_token_does_not_read_the_same_users_per_user_job(bot, jobs):
                          ids=lambda v: ascii(v)[:20])
 def test_a_malformed_job_id_is_not_found(bot, job_id):
     args = {} if job_id == "missing" else {"job_id": job_id}
-    assert error_text(bot.call("get_answer", args))
+    assert error_text(bot.call("get_answer", args)) == NOT_FOUND
+
+
+def test_a_refused_read_is_one_sentence_and_nothing_else(bot):
+    res = bot.call("get_answer", {"job_id": "0" * 32})
+    assert res == {"content": [{"type": "text", "text": NOT_FOUND}], "isError": True}
 
 
 def test_an_expired_job_is_not_found(bot, jobs, monkeypatch):
@@ -1244,7 +1304,7 @@ def test_a_failing_activity_call_costs_nothing(bot, pipeline, monkeypatch):
     monkeypatch.setattr(brain_client, "post_activity", boom)
     pipeline.events = [_chart(1), _chart(2), DONE]
     res = bot.wait(bot.ask())
-    assert not res.get("isError") and res["structuredContent"]["state"] == "done"
+    assert state_of(res) == "done"
 
 
 def test_no_activity_carries_the_question_or_the_answer(bot, pipeline, activity):

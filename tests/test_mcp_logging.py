@@ -194,6 +194,23 @@ def pipeline(jobs, monkeypatch):
     return p
 
 
+def read_answer(res, job_id):
+    """(state, the items of the answer) of a get_answer result. Its first item
+    is the state as JSON; only a running job has it as structuredContent too."""
+    first = res["content"][0]
+    assert set(first) == {"type", "text"} and first["type"] == "text", first
+    head = json.loads(first["text"])
+    assert set(head) == {"job_id", "state"} and head["job_id"] == job_id, head
+    state, items = head["state"], res["content"][1:]
+    if state == "running":
+        assert res["structuredContent"] == head and items == [], res
+    else:
+        assert state in ("done", "failed") and items, res
+        assert "structuredContent" not in res, "the answer would be shown to no model"
+    assert bool(res.get("isError")) is (state == "failed"), res
+    return state, items
+
+
 class Bot:
     def __init__(self, name="Helpdesk bot"):
         self.row, self.raw = mcp_tokens.create_token(name, "per_user", ADMIN)
@@ -222,8 +239,9 @@ class Bot:
         job_id = self.ask(question, **kw)
         for _ in range(5):
             res = self.call("get_answer", {"job_id": job_id}, **kw)
-            if res["structuredContent"]["state"] != "running":
-                return job_id, res
+            state, items = read_answer(res, job_id)
+            if state != "running":
+                return job_id, {**res, "content": items}    # the answer's own items
         raise AssertionError("the job never finished")
 
 

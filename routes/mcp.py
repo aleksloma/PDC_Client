@@ -560,10 +560,13 @@ async def _get_answer(call: _Call, token: str, arguments: dict) -> dict:
 
 
 def _answer(job: mcp_jobs.Job) -> dict:
-    state = {"job_id": job.id, "state": job.state}
+    """The state as the first text item, then the job's content. Only a running
+    answer has structuredContent: a client may show that instead of the content,
+    and the answer would be lost."""
+    result = _structured({"job_id": job.id, "state": job.state})
     if job.state == "running":
-        return _structured(state)
-    result = {"content": job.content, "structuredContent": state}
+        return result
+    result = {"content": result["content"] + job.content}
     if job.state == "failed":
         result["isError"] = True
     return result

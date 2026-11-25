@@ -23,6 +23,8 @@ Deliberate differences from `_worker`:
 * a failing `on_event` is logged and ignored — the browser's consumer sits
   behind a queue and cannot fail the turn either;
 * `title="never"` skips the title generation;
+* CHAT_THREAD_ERROR and CHAT_PERSIST_ERROR log the exception type only, never
+  its text, which can quote table values;
 * the per-chart `plot_generated` activity event is the consumer's, as on the
   web, and is not posted here.
 """
@@ -359,10 +361,9 @@ def run_prepared_turn(turn: PreparedTurn, *,
         err_msg = "Analysis service is temporarily unavailable."
         _emit("error", err_msg)
     except Exception as e:
-        # `e` can quote a customer column label or the sandbox's own text.
+        # Type only, unlike the web: the text can quote table values (MCP logs none).
         log_with_sid(log_safe_text(sid, 80), "error",
-                     f"CHAT_THREAD_ERROR: {log_safe_text(type(e).__name__, 80)}: "
-                     f"{log_safe_text(str(e), 200)}")
+                     f"CHAT_THREAD_ERROR: {log_safe_text(type(e).__name__, 80)}")
         err_msg = "Something went wrong while processing your request."
         _emit("error", err_msg)
 
@@ -401,10 +402,9 @@ def run_prepared_turn(turn: PreparedTurn, *,
                                  f"TITLE_TRIGGER_FAILED "
                                  f"error={log_safe_text(type(e).__name__, 80)}")
     except Exception as e:
-        # The record's tables and labels are what the message can quote.
+        # Type only, unlike the web: the text can quote table values (MCP logs none).
         log_with_sid(log_safe_text(sid, 80), "error",
-                     f"CHAT_PERSIST_ERROR: {log_safe_text(type(e).__name__, 80)}: "
-                     f"{log_safe_text(str(e), 200)}")
+                     f"CHAT_PERSIST_ERROR: {log_safe_text(type(e).__name__, 80)}")
     finally:
         # Only after the row is saved: a status poll that sees
         # generating=false finds the AI row.

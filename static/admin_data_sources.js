@@ -3840,6 +3840,8 @@
     $('mcpResult').classList.add('hidden');
     $('mcpName').value = '';
     $('mcpAccount').value = '';
+    $('mcpMode').value = 'per_user';
+    onMcpModeChange();
   }
 
   async function loadMcpTokens() {
@@ -3871,7 +3873,15 @@
     const thead = _mcpEl('thead');
     thead.appendChild(head);
     const tbody = _mcpEl('tbody');
-    const when = (ts) => (ts ? String(ts).replace('T', ' ').slice(0, 16) : '—');
+    // The date and the time are one span each: a line may break between them only.
+    const when = (ts) => {
+      const td = _mcpEl('td', 'adm-cell-mono', ts ? '' : '—');
+      if (ts) {
+        td.append(_mcpEl('span', '', String(ts).slice(0, 10)), ' ',
+          _mcpEl('span', '', String(ts).slice(11, 16)));
+      }
+      return td;
+    };
     tokens.forEach((tok) => {
       const state = _mcpEl('td');
       state.appendChild(tok.active
@@ -3889,9 +3899,7 @@
         _mcpEl('td', '', tok.name),
         _mcpEl('td', '', MCP_MODES[tok.mode] ? mcpT(MCP_MODES[tok.mode]) : '—'),
         _mcpEl('td', '', tok.account || '—'),
-        _mcpEl('td', 'adm-cell-mono', when(tok.created_at)),
-        _mcpEl('td', 'adm-cell-mono', when(tok.last_used_at)),
-        state, actions);
+        when(tok.created_at), when(tok.last_used_at), state, actions);
       tbody.appendChild(tr);
     });
     const table = _mcpEl('table', 'adm-table');

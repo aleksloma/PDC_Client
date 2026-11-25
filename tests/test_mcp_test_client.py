@@ -23,7 +23,11 @@ Pinned readings of the brief:
 * waiting uses the module's `time` (`import time`), and there is a pause
   between two polls the server answered at once;
 * the default `--timeout` is above 60 s, the longest MCP_ANSWER_WAIT_SECONDS;
-* a chart whose name is taken is saved under another name.
+* a chart whose name is taken is saved under another name;
+* the state of get_answer is the JSON {"job_id", "state"} in its FIRST content
+  item. That item, and only that one, is never printed. `structuredContent`
+  may stand beside it (a running result has one) and never decides against it;
+  it decides only where there is no such item.
 
 Offline: DATA_ROOT is tmp_path; no brain call, no Plotly render.
 """
@@ -73,6 +77,7 @@ CHAT = "c_mcpclient000001"
 BOTCHAT = "c_mcpclient000002"
 BASE = "https://pdc.bank.example"
 QUESTION = "How did sales go?"
+JOB = "0f" * 16
 GEORGIAN = "გაყიდვები გაიზარდა"
 GENERIC = "Something went wrong while processing your request."
 TOKEN = "pdcmcp_" + "Zq7" * 14 + "x"
@@ -123,13 +128,14 @@ def _call(module, argv):
 
 @pytest.fixture
 def run(mod, capsys):
-    def go(*argv, token=TOKEN):
+    def go(*argv, token=TOKEN, json_ok=False):
         capsys.readouterr()
         rc = _call(mod, (["--token", token] if token else []) + list(argv))
         got = Run(rc, *capsys.readouterr())
         assert isinstance(rc, int) and not isinstance(rc, bool), got
         assert "Traceback" not in got.text, got
         assert "pdcmcp_" not in got.text, "a token was printed"
+        assert json_ok or '"job_id"' not in got.text, "the state item was printed"
         return got
     return go
 
@@ -321,7 +327,8 @@ def test_ask_prints_the_answer_and_saves_the_chart(run, app_seam, pipeline, call
     assert got.rc == 0, got
     assert "Sales are up." in got.out
     assert "| region | amount |" in got.out and "| South | 2 |" in got.out, got
-    assert re.search(re.escape(BASE) + r"/c/cv_[0-9a-f]{16}", got.out), got
+    assert len(re.findall(re.escape(BASE) + r"/c/cv_[0-9a-f]{16}", got.out)) == 1, got
+    assert got.out.count("Sales are up.") == 1
     assert saved(out) == {"chart_1.png": PNG}, got
     assert "chart_1.png" in got.out
     assert b64(PNG) not in got.text, "the image data is not text"
@@ -383,7 +390,8 @@ def test_a_running_answer_is_polled_until_it_is_done(run, app_seam, pipeline, pe
     def serve(url, headers, body, timeout):
         status, hdrs, raw = real(url, headers, body, timeout)
         if b'"get_answer"' in body:
-            states.append(json.loads(raw)["result"]["structuredContent"]["state"])
+            first = json.loads(raw)["result"]["content"][0]["text"]
+            states.append(json.loads(first)["state"])
             if len(states) == 2:
                 pipeline.gate.set()
         return status, hdrs, raw
@@ -546,7 +554,15 @@ class Script:
 
     @staticmethod
     def answer(state, *content):
-        return {"content": list(content), "structuredContent": {"job_id": "j", "state": state}}
+        """As the endpoint sends it: the state item first; only a running
+        result has structuredContent; a failed one has isError."""
+        value = {"job_id": JOB, "state": state}
+        result = {"content": [{"type": "text", "text": json.dumps(value)}, *content]}
+        if state == "running":
+            result["structuredContent"] = value
+        if state == "failed":
+            result["isError"] = True
+        return result
 
     def result(self, body):
         method, params = body["method"], body.get("params") or {}
@@ -565,7 +581,7 @@ class Script:
             return {"content": [], "structuredContent": {"chats": self.chats}}
         if key == "ask":
             return {"content": [],
-                    "structuredContent": {"job_id": "0" * 32, "state": "running"}}
+                    "structuredContent": {"job_id": JOB, "state": "running"}}
         if key == "get_answer":
             self.polls += 1
             assert self.polls < 5000, "the client polls without a pause or an end"
@@ -705,14 +721,14 @@ def test_help_does_not_print_the_token(run, script, monkeypatch):
 
 # --- waiting ---------------------------------------------------------------
 def test_there_is_a_pause_between_two_polls(run, script):
-    script.answers = [script.answer("running", text_item("{}"))] * 5 + script.answers
+    script.answers = [script.answer("running")] * 5 + script.answers
     assert run("ask", CHAT, QUESTION).rc == 0
     assert script.polls == 6
     assert len(script.clock.slept) >= 5 and min(script.clock.slept[:5]) > 0
 
 
 def test_max_wait_ends_the_waiting(run, script):
-    script.answers = [script.answer("running", text_item("{}"))]
+    script.answers = [script.answer("running")]
     started = script.clock.now
     got = run("ask", CHAT, QUESTION, "--max-wait", "30")
     assert got.rc == 1, got
@@ -724,10 +740,119 @@ def test_max_wait_ends_the_waiting(run, script):
 
 def test_the_waiting_ends_by_itself_too(run, script):
     """Without --max-wait a job that never ends does not hang the client."""
-    script.answers = [script.answer("running", text_item("{}"))]
+    script.answers = [script.answer("running")]
     started = script.clock.now
     assert run("ask", CHAT, QUESTION).rc == 1
     assert 120 <= script.clock.now - started <= 3600
+
+
+# --- the state item of get_answer ------------------------------------------
+def test_the_state_item_decides_without_structured_content(run, script):
+    running = script.answer("running")
+    del running["structuredContent"]
+    script.answers = [running, running] + script.answers
+    got = run("ask", CHAT, QUESTION)
+    assert got.rc == 0 and script.polls == 3, got
+    assert got.out.count("Sales are up.") == 1
+
+
+@pytest.mark.parametrize("structured", [{"job_id": JOB, "state": "done"},
+                                        {"job_id": JOB, "state": "running"},
+                                        {"state": "failed"}, {}, None, [], "done"],
+                         ids=json.dumps)
+def test_structured_content_beside_the_state_item_changes_nothing(run, script, structured,
+                                                                  tmp_path):
+    script.answers = [dict(script.answer("done", text_item("The text."), image(PNG)),
+                           structuredContent=structured)]
+    got = run("ask", CHAT, QUESTION, "--out", tmp_path / "out")
+    assert got.rc == 0 and script.polls == 1, got
+    assert got.out.count("The text.") == 1
+    assert saved(tmp_path / "out") == {"chart_1.png": PNG}
+
+
+def test_structured_content_does_not_end_a_running_question(run, script):
+    script.answers = [dict(script.answer("running", text_item("early")),
+                           structuredContent={"job_id": JOB, "state": "done"})]
+    got = run("ask", CHAT, QUESTION, "--max-wait", "5")
+    assert got.rc == 1 and script.polls > 1 and "early" not in got.text, got
+
+
+def test_an_answer_with_structured_content_only(run, script, tmp_path):
+    """No state item: every text is the answer's."""
+    script.answers = [{"content": [text_item("The text."), image(PNG)],
+                       "structuredContent": {"job_id": JOB, "state": "done"}}]
+    got = run("ask", CHAT, QUESTION, "--out", tmp_path / "out")
+    assert got.rc == 0 and got.out.count("The text.") == 1, got
+    assert saved(tmp_path / "out") == {"chart_1.png": PNG}
+
+
+@pytest.mark.parametrize("raw", [
+    '{"state":"done","job_id":"%s"}' % JOB,
+    json.dumps({"job_id": JOB, "state": "done", "more": [1]}, indent=2)],
+    ids=["compact", "indented"])
+def test_the_state_item_is_read_as_json(run, script, raw):
+    script.answers = [{"content": [text_item(raw), text_item("The text.")]}]
+    got = run("ask", CHAT, QUESTION)
+    assert got.rc == 0 and "The text." in got.out, got
+    assert "state" not in got.out and JOB not in got.out
+
+
+def test_only_the_first_item_is_the_state(run, script):
+    """An answer may quote such JSON: that is its text and decides nothing."""
+    quoted = json.dumps({"job_id": "x", "state": "running"})
+    script.answers = [script.answer("done", text_item(quoted), text_item("After."))]
+    got = run("ask", CHAT, QUESTION, json_ok=True)
+    assert got.rc == 0 and script.polls == 1, got
+    assert got.out.count(quoted) == 1 and "After." in got.out
+    assert JOB not in got.out
+    script.answers = [{"content": [text_item("Hello."), text_item(json.dumps(
+        {"job_id": JOB, "state": "done"}))]}]
+    assert run("ask", CHAT, QUESTION, "--max-wait", "5").rc == 2
+
+
+@pytest.mark.parametrize("command", [["ask", CHAT, QUESTION], ["selftest"]], ids=" ".join)
+def test_a_failure_prints_its_message_and_not_the_state(run, script, command):
+    script.answers = [script.answer("failed", text_item("The table is gone."))]
+    got = run(*command)
+    assert got.rc == 1 and got.text.count("The table is gone.") == 1, got
+    assert JOB not in got.text and "{" not in got.text
+
+
+def test_a_failure_without_a_message(run, script):
+    script.answers = [script.answer("failed")]
+    got = run("ask", CHAT, QUESTION)
+    assert got.rc == 1 and got.lines and JOB not in got.text, got
+
+
+def test_a_refused_get_answer_has_no_state_item(run, script):
+    script.answers = [{"content": [text_item("Job not found.")], "isError": True}]
+    got = run("ask", CHAT, QUESTION)
+    assert got.rc == 1 and got.text.count("Job not found.") == 1 and script.polls == 1, got
+
+
+@pytest.mark.parametrize("first", [
+    text_item("Hello."), text_item(""), text_item("null"), text_item("[]"), text_item("5"),
+    text_item('"done"'), text_item("{}"), text_item('{"state": null, "job_id": "j"}'),
+    text_item('{"state": ["done"], "job_id": "j"}'),
+    text_item('{"state": "paused", "job_id": "j"}'), text_item("[" * 100_000),
+    {"type": "text"}, {"type": "text", "text": 5}, image(PNG), None, 5],
+    ids=lambda v: json.dumps(v)[:60])
+def test_an_answer_without_a_known_state(run, script, first, tmp_path):
+    script.answers = [{"content": [first, text_item("The text."), image(PNG)]}]
+    out = tmp_path / "out"
+    got = run("ask", CHAT, QUESTION, "--out", out, "--max-wait", "5")
+    assert got.rc == 2 and script.polls == 1 and got.lines, got
+    assert saved(out) == {}
+
+
+def test_the_images_behind_the_state_item_are_numbered_from_one(run, script, tmp_path):
+    pngs = [PNG + bytes([i]) for i in range(2)]
+    script.answers = [script.answer("done", image(pngs[0]), text_item("Between."),
+                                    image(pngs[1]), text_item(f"Link: {BASE}/c/x"))]
+    got = run("ask", CHAT, QUESTION, "--out", tmp_path / "out")
+    assert got.rc == 0, got
+    assert saved(tmp_path / "out") == {"chart_1.png": pngs[0], "chart_2.png": pngs[1]}
+    assert got.out.count("Between.") == got.out.count(f"{BASE}/c/x") == 1
 
 
 # --- printing --------------------------------------------------------------
@@ -745,7 +870,8 @@ def test_every_text_is_printed(run, script):
     assert got.rc == 0, got
     for piece in ("First part.", "| a | b |", "| --- | --- |",
                   f"{BASE}/c/cv_0123456789abcdef"):
-        assert piece in got.out, piece
+        assert got.out.count(piece) == 1, piece
+    assert list(saved(script.work).values()) == [PNG]
 
 
 class _Stream(io.TextIOWrapper):
@@ -761,10 +887,7 @@ class _Stream(io.TextIOWrapper):
 @pytest.mark.parametrize("encoding", ["cp1252", "cp437", "ascii", "utf-8"])
 @pytest.mark.parametrize("state", ["done", "failed"])
 def test_a_console_that_cannot_show_the_answer(mod, script, monkeypatch, encoding, state):
-    answer = script.answer(state, text_item(f"Before {GEORGIAN} \ud83d after"))
-    if state == "failed":
-        answer["isError"] = True
-    script.answers = [answer]
+    script.answers = [script.answer(state, text_item(f"Before {GEORGIAN} \ud83d after"))]
     script.chats = [{"chat_id": CHAT, "title": GEORGIAN, "tables": [GEORGIAN + ".csv"]}]
     out, err = _Stream(encoding), _Stream(encoding)
     with monkeypatch.context() as m:
@@ -1207,7 +1330,7 @@ def test_it_runs_as_a_program_on_a_narrow_console(mod, serve):
     assert got.returncode == 0, got.stderr
     assert b"Before " in got.stdout and b" after" in got.stdout
     assert seen and TOKEN.encode() not in got.stdout + got.stderr
-    script.answers = [dict(script.answer("failed", text_item(GEORGIAN)), isError=True)]
+    script.answers = [script.answer("failed", text_item(GEORGIAN))]
     got = _process(["--url", url, "ask", CHAT, QUESTION], env)
     assert got.returncode == 1 and b"Traceback" not in got.stderr, got.stderr
 

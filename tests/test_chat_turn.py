@@ -791,3 +791,53 @@ def test_a_title_failure_keeps_the_answer(ct, store, gen, monkeypatch, caplog):
     assert res.persisted is True and store.get_history(conv_id)[-1]["content"] == "a"
     assert [r for r in caplog.records if "TITLE_TRIGGER_FAILED" in r.getMessage()]
     assert not [r for r in caplog.records if "CHAT_PERSIST_ERROR" in r.getMessage()]
+
+
+# ===========================================================================
+# the two error lines carry the exception TYPE only
+# ===========================================================================
+# A deliberate difference from the browser path, which logs the escaped text
+# too: a pandas / sandbox / serializer message can quote a customer value.
+# The drift test compares the MARKERS of these lines, never their text.
+SENTINEL = "SENTINEL_VALUE_48213"
+
+
+class SentinelError(RuntimeError):
+    def __init__(self):
+        super().__init__(f"could not handle {SENTINEL!r}")
+
+
+def _type_only(caplog, marker):
+    for r in caplog.records:
+        assert SENTINEL not in r.getMessage(), r.getMessage()
+        assert r.exc_info is None or r.exc_info[0] is None, \
+            "a traceback quotes the exception text"
+    assert SENTINEL not in caplog.text
+    lines = [r.getMessage() for r in caplog.records if marker in r.getMessage()]
+    assert len(lines) == 1 and "SentinelError" in lines[0], lines
+
+
+@pytest.mark.parametrize("after_chart", [False, True])
+def test_a_pipeline_failure_is_logged_by_type_only(ct, store, gen, caplog, after_chart):
+    gen.raises = SentinelError()
+    with caplog.at_level(logging.DEBUG):
+        res, conv_id = _run(ct, store, gen, [_chart(1)] if after_chart else [])
+    assert res.error_text == "Something went wrong while processing your request."
+    assert SENTINEL not in json.dumps(store.get_history(conv_id))
+    _type_only(caplog, "CHAT_THREAD_ERROR")
+
+
+def test_a_persistence_failure_is_logged_by_type_only(ct, store, gen, caplog, monkeypatch):
+    conv_id = _conv(store)
+    real = local_store.ChatDataStore.append_history
+
+    def broken(self, conv_id, message):
+        if message.get("role") == "ai":
+            raise SentinelError()
+        return real(self, conv_id, message)
+
+    monkeypatch.setattr(local_store.ChatDataStore, "append_history", broken)
+    with caplog.at_level(logging.DEBUG):
+        res, _ = _run(ct, store, gen, [_single("x", code=TCODE)], conv_id=conv_id)
+    assert res.persisted is False
+    _type_only(caplog, "CHAT_PERSIST_ERROR")
