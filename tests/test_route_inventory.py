@@ -177,6 +177,7 @@ EXPECTED_ROUTES = [
     ('POST', '/auth/reset_password'),
     ('POST', '/auth/subscription'),
     ('POST', '/generate_chatdata'),
+    ('POST', '/mcp'),
     ('POST', '/new_session'),
     ('POST', '/schema'),
     ('POST', '/schema_autofill_full'),

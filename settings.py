@@ -342,6 +342,12 @@ class Settings(BaseModel):
     # never count. Read through _int_env (default 15, floor 1).
     PERSONAL_TABLES_MAX: int = Field(default_factory=lambda: _int_env("PERSONAL_TABLES_MAX", 15, 1))
 
+    # MCP endpoint (routes/mcp.py): how many seconds get_answer waits for a
+    # running question before it answers "running" (0-60), and how many rows
+    # of a table an answer shows (1-50: a saved answer holds at most 50).
+    MCP_ANSWER_WAIT_SECONDS: float = Field(default_factory=lambda: min(60.0, _float_env("MCP_ANSWER_WAIT_SECONDS", 20.0, 0.0)))
+    MCP_TABLE_MAX_ROWS: int = Field(default_factory=lambda: min(50, _int_env("MCP_TABLE_MAX_ROWS", 50, 1)))
+
     # Nightly snapshot refresh (container-local time; the admin UI value in
     # data_sources.json wins once set — these are first-boot defaults only).
     DB_REFRESH_TIME: str = Field(default_factory=lambda: os.getenv("DB_REFRESH_TIME", "00:00"))
