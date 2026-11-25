@@ -23,6 +23,10 @@ cannot lock a working chatbot out.
 File work runs on this module's own small pool; waiting for an answer is a
 coroutine and takes no thread. The log gets one line per tool call — never the
 token, the question or the answer.
+
+`admin_router` is the local admin's token API (/api/admin/mcp/tokens*): list,
+create, revoke. Guarded like every other admin route and audited, without the
+token.
 """
 from __future__ import annotations
 
@@ -41,15 +45,18 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 from starlette.requests import ClientDisconnect
 
+import db_sources
 import local_store
 import mcp_jobs
 import mcp_tokens
 import routes.auth as _auth
 import routes.chat as _chat
 from logger_utils import log_safe_value, log_with_sid
+from routes.admin_data import _json_body, _require_admin
 from settings import settings
 
 router = APIRouter()
+admin_router = APIRouter(prefix="/api/admin/mcp", tags=["client-admin-mcp"])
 
 MAX_BODY_BYTES = 1024 * 1024
 BODY_READ_TIMEOUT_S = 30         # for the whole body
@@ -644,3 +651,85 @@ async def mcp_endpoint(request: Request) -> Response:
     if record is None:              # revoked while the body was sent
         return _unauthorized()
     return await _handle(request, token, record, peer, body)
+
+
+# ---------------------------------------------------------------------------
+# the local admin's token API
+# ---------------------------------------------------------------------------
+# One text for every failure of the token file; the cause is in the log. The
+# admin page translates both (admin.mcp.error_*, matched on the English text).
+TOKEN_STORE_TEXT = "The tokens could not be read or saved. The server log has the reason."
+UNKNOWN_TOKEN_TEXT = "Unknown token."
+
+
+def _endpoint() -> str:
+    """The address a chatbot calls; "" without a usable PUBLIC_BASE_URL (the
+    request's own address is the caller's claim)."""
+    base = _auth._public_base()
+    return f"{base}/mcp" if base else ""
+
+
+def _admin_failure(admin: str, what: str, e: Exception) -> JSONResponse:
+    log_with_sid(log_safe_value(admin, 254), "error",
+                 f"MCP_ADMIN_FAILED what={log_safe_value(what, 20)} "
+                 f"error={log_safe_value(type(e).__name__, 80)}")
+    return JSONResponse({"error": TOKEN_STORE_TEXT}, status_code=500)
+
+
+def _admin_create(admin: str, body: dict) -> tuple[dict, str]:
+    row, raw = mcp_tokens.create_token(body.get("name"), body.get("mode"), admin,
+                                       body.get("account"))
+    db_sources.audit(admin, "mcp_token.create", target=row["id"],
+                     detail={"name": row["name"], "mode": row["mode"],
+                             "account": row["account"]})
+    return row, raw
+
+
+def _admin_revoke(admin: str, token_id: str) -> Optional[dict]:
+    row = mcp_tokens.revoke_token(token_id, admin)
+    if row is not None:
+        mcp_jobs.drop_token(row["id"])      # only once the token is off
+        db_sources.audit(admin, "mcp_token.revoke", target=row["id"],
+                         detail={"name": row["name"]})
+    return row
+
+
+@admin_router.get("/tokens")
+async def list_tokens(request: Request):
+    email, err = _require_admin(request)
+    if err:
+        return err
+    return {"tokens": await _off_loop(mcp_tokens.list_tokens), "endpoint": _endpoint()}
+
+
+@admin_router.post("/tokens")
+async def create_token(request: Request):
+    """The only answer that ever carries the raw token."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    body = await _json_body(request)
+    try:
+        row, raw = await _off_loop(_admin_create, email, body)
+    except ValueError as e:
+        # A sentence of mcp_tokens about the admin's own input.
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        return _admin_failure(email, "create", e)
+    return JSONResponse({"token": row, "raw_token": raw, "endpoint": _endpoint()},
+                        headers={"Cache-Control": "no-store"})
+
+
+@admin_router.post("/tokens/{token_id}/revoke")
+async def revoke_token(request: Request, token_id: str):
+    """The token's jobs are forgotten with it. The body is ignored."""
+    email, err = _require_admin(request)
+    if err:
+        return err
+    try:
+        row = await _off_loop(_admin_revoke, email, token_id)
+    except Exception as e:
+        return _admin_failure(email, "revoke", e)
+    if row is None:
+        return JSONResponse({"error": UNKNOWN_TOKEN_TEXT}, status_code=404)
+    return {"token": row}

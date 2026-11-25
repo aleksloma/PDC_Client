@@ -649,3 +649,11 @@ body.admin-ds-page {
 .adm-chip.personal { background: #e0f2fe; color: #075985; }
 .adm-owner-cell { color: #475569; }
 .adm-conn-readonly-note { margin: -4px 0 0; font-size: 12px; }
+
+/* MCP access: the flex gap of the card spaces its notes. The list wraps
+   between words to keep Revoke in view; only a token name (1st column) and an
+   account (3rd) may break anywhere. */
+#secMcp .adm-schedule-card .adm-alert { margin: 0; }
+#mcpTokenBox p { margin: 4px 0; }
+#mcpTokensList th, #mcpTokensList td:not(.adm-actions-cell) { white-space: normal; }
+#mcpTokensList td:nth-child(1), #mcpTokensList td:nth-child(3) { overflow-wrap: anywhere; }

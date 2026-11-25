@@ -52,6 +52,7 @@ from routes.sso import router as sso_router
 from routes.sso import admin_router as sso_admin_router
 from routes.charts import router as charts_router
 from routes.mcp import router as mcp_router
+from routes.mcp import admin_router as mcp_admin_router
 
 
 _HERE = Path(__file__).resolve().parent
@@ -1054,6 +1055,7 @@ app.include_router(admin_users_router)
 app.include_router(sso_router)
 app.include_router(sso_admin_router)
 app.include_router(mcp_router)
+app.include_router(mcp_admin_router)
 
 
 @app.get("/", response_class=HTMLResponse)
