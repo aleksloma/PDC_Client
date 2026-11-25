@@ -54,12 +54,14 @@ one thing that must not run next to the data and the credentials.
 ```
 
 ### Client container — `pdc-client` (company LAN, uid 10001)
-- Data upload and storage. Raw data values never leave the LAN.
+- Data upload and storage. Raw data values never leave the LAN (except in
+  answers to a connected MCP chatbot, §10e).
 - The `/lab` frontend, reports (PDF, PPTX) and chart rasterization
   (kaleido). These are not LLM steps and they stay here because they touch
   raw data and the company's template.
 - Database connections. The credentials live here, encrypted at rest, and
   the SELECT-only login the customer provisions is the real guarantee.
+- The MCP endpoint `POST /mcp` (§10e), a second way in beside the browser.
 - It orchestrates execution but does not perform it: it writes each job's
   input frames into the shared jobs directory, asks the sandbox to run the
   code, and reads the result back.
@@ -108,6 +110,7 @@ the two containers.
 | client → brain | question text, schema and column metadata, aggregate profiles (no min/max, top or constant values), generated code, error text with quoted literals scrubbed, FINDINGS (booleans, input column names, fixed codes), the capability list, unfilled answer templates in history. **Never rows, tables, charts or a result value** (summarize gets `preview: null`). | generated Python, narrative text, answer templates |
 | client → sandbox | the code to run, and the input frames as parquet written per job | the result (parquet, chart HTML or PNG, a scalar preview), the job's `VALUES` / `FINDINGS` (filtered plain scalars; §10d), plus a capped tail of the sandbox's stderr and traceback for the local log. A job's stdout crosses in the same response but is NOT written to the web log. The sandbox keeps no log file and logs only the lengths of a job's stdout and stderr, so what a job printed is logged nowhere |
 | sandbox → anywhere else | nothing. It has no network route and no credentials. | — |
+| client → connecting chatbot (MCP, §10e; off until the administrator creates a token) | the answer of a question the chatbot asked: text with data values, table rows (at most 50 per table), chart images, a link, and the titles of the user's chats with the names of their tables and files (tables outside the user's role included). If the chatbot uses an external language model, these values leave the customer's network; that is the customer's decision. The brain boundary is unchanged | the question, the chat id, the user's address (`X-PDC-User-Email`) |
 
 ### Brain (PowerDataChat GCP — enterprise only)
 - Skill engine + skill library (the IP).
@@ -1463,7 +1466,9 @@ audited `signin_domains.set`): a genuinely NEW address (no user folder)
 whose domain — the text after the last `@`, matched exactly, subdomains not
 included — is on it creates its own account at its first sign-in, through
 the password form (the typed password becomes its password, welcome mail)
-or a Microsoft sign-in (§10c). Such an account starts with the Standard
+or a Microsoft sign-in (§10c), or at the first `per_user` MCP call for it (§10e:
+no password; first web sign-in through Reset password, an invitation or
+Microsoft). Such an account starts with the Standard
 permission and no data roles (Base), like an invited one; the administrator
 changes them as usual. An existing account at an approved address — an
 invited or share placeholder, an SSO-only account — is never affected, and
@@ -1650,8 +1655,8 @@ Microsoft sign-in. A Microsoft sign-in creates an account only when
 approved sign-in domain (§10b; logged `SSO_DOMAIN_ACCOUNT_PROVISIONED`);
 otherwise an identity matching no account is refused (401). A guest is
 refused (403) unless `SSO_ALLOW_GUESTS` is set (both env settings, default
-false). Without either, accounts come from an administrator's invitation or
-a share. Who may complete a Microsoft sign-in at all is decided in Entra —
+false). Without either, accounts come from an administrator's invitation, a
+share, or (an approved domain and an active token) a `per_user` MCP call (§10e). Who may complete a Microsoft sign-in at all is decided in Entra —
 "Assignment required? = Yes" on the enterprise application is a mandatory
 install step; the client's approved domains decide only whether a missing
 account is created, never who may sign in. Nothing about SSO
@@ -1819,6 +1824,36 @@ may carry a value in their answer text.
 
 Wire shapes: `PROTOCOL.md`. Design: `docs/DIAGNOSTICS_SPEC.md` in the
 client repository.
+
+---
+
+## 10e. MCP — a second way into the client (client-side only)
+
+Besides the browser, another chatbot in the customer's network can ask a
+question over MCP (`POST /mcp`, `routes/mcp.py`). The brain is not changed: an
+MCP question sends it exactly what a web question sends, except that no title
+is generated (`/v1/title` is not called).
+
+- **Identity is the token, not a session.** The local admin creates it on the
+  "MCP access" page; only a hash is stored (`mcp_tokens.py`). A `per_user`
+  token takes the acting user from the `X-PDC-User-Email` header, set by the
+  chatbot's backend (a tool argument would be filled by its language model);
+  its holder can act as any existing account except the bootstrap admin (a
+  Local admin acts as a chat user) and as any address in the approved sign-in
+  domains, whose account is created when missing. A `shared_account` token is bound to one account. Off while no
+  token exists.
+- **Same checks as the web.** Chat access, the role gate on database tables
+  and the empty-dataset and Auto Analytics checks are the web's functions. A
+  job is read only by the token and user that started it.
+- **Saving.** `chat_turn.py` saves the turn in the web's history format, one
+  conversation per user, chat and UTC day ("MCP YYYY-MM-DD"), visible on the
+  web. The browser handler keeps its own saving code, so the two must be kept
+  in step (`tests/test_chat_turn_drift.py`).
+- **Answers leave the client to the chatbot** (text, up to 50 rows per table,
+  chart PNGs, a link). See the boundary table in §2.
+- Jobs are in memory (one worker process), at most 8 running.
+
+Full description: `docs/MCP_INTEGRATION.md` in the client repository.
 
 ---
 

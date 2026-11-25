@@ -60,7 +60,7 @@ and counts only, never a value. User email is sent for tenant routing.
   technical descriptions, the dataset profile and the schema-autofill hints.
   Use it for columns such as account numbers or national ids. It does not
   filter what an analysis computes: the answer the user reads (which stays on
-  this server) and past answers stored before the narrative release, which
+  this server; a chatbot connected over MCP receives it) and past answers stored before the narrative release, which
   travel back as history, can still carry values.
 - The `/lab` page loads **no third-party script** by default (no analytics, no
   billing widget): `settings.ENABLE_THIRD_PARTY_SCRIPTS` is False, so the
@@ -89,6 +89,7 @@ and counts only, never a value. User email is sent for tenant routing.
 | Answer text | Conversation title | Question and the first 300 characters of the answer's brain-safe text — for a templated answer the template with slots shown as `[name]` (`narrative.brain_view`), never the filled-in text |
 | Answer text | Report generation | Question and answer truncated to 500 characters (a templated answer: `brain_view` of its templates), code snippet to 300 |
 | Table column names | Report generation | INPUT column NAMES only, first 10 — other result-table labels (pivot/crosstab headers) are removed; never rows |
+| Answers over MCP | Only when an administrator has created an MCP token, to the chatbot that asked; never to the brain | Answer text with data values, table rows (at most 50 per table), chart images, a link; chat titles and table or file names (`docs/MCP_INTEGRATION.md`) |
 | User email | Every call | Tenant routing and per-user activity |
 | Activity events | Login, upload, chat, report | Event name, user email, lightweight counters |
 | Password-reset payload | Password reset and invitation | The e-mail address, whether it is a reset or an invitation, and a single-use link (valid 30 minutes for a reset, 30 days for an invitation), relayed through the brain's mail service; until it is used or expires the link sets the account's password |

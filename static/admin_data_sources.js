@@ -143,7 +143,7 @@
   // ── Sidebar navigation ─────────────────────────────────────────────────
   const SECTIONS = POWER
     ? ['connections', 'tables', 'relations']
-    : ['connections', 'tables', 'relations', 'users', 'roles', 'sso', 'schedule', 'audit'];
+    : ['connections', 'tables', 'relations', 'users', 'roles', 'sso', 'mcp', 'schedule', 'audit'];
 
   function showSection(name) {
     if (!SECTIONS.includes(name)) name = 'connections';
@@ -162,6 +162,8 @@
     if (name === 'users') { loadUsers(); loadSigninDomains(); }   // lazy refetch, like the audit tail
     if (name === 'audit') loadAudit();
     if (name === 'sso') loadSso();
+    if (name === 'mcp') loadMcpTokens();
+    else leaveMcp();                // a new token is shown until its section is left
     if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
   }
 
@@ -3256,11 +3258,12 @@
   // true for the action button, false for Cancel / ✕. Text only.
   let _userActionResolve = null;
 
-  function confirmUserAction(title, text, goLabel) {
+  function confirmUserAction(title, text, goLabel, cancelLabel) {
     if (_userActionResolve) _userActionResolve(false);   // a stale prompt
     $('userActionTitle').textContent = title;
     $('userActionText').textContent = text;
     $('btnUserActionGo').textContent = goLabel;
+    $('btnUserActionCancel').textContent = cancelLabel || 'Cancel';
     $('userActionModal').classList.remove('hidden');
     return new Promise((resolve) => { _userActionResolve = resolve; });
   }
@@ -3752,23 +3755,203 @@
   }
 
   function copySsoRedirectUri() {
-    const text = $('ssoRedirectUri').textContent || '';
+    _copyText($('ssoRedirectUri').textContent || '', () => toast('Copied'));
+  }
+
+  function _copyText(text, done) {
     if (!text) return;
-    const done = () => toast('Copied');
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(done).catch(() => _ssoCopyFallback(text, done));
+      navigator.clipboard.writeText(text).then(done).catch(() => _copyFallback(text, done));
     } else {
-      _ssoCopyFallback(text, done);   // plain-HTTP appliances lack the async API
+      _copyFallback(text, done);      // plain-HTTP appliances lack the async API
     }
   }
 
-  function _ssoCopyFallback(text, done) {
+  function _copyFallback(text, done) {
     const ta = document.createElement('textarea');
     ta.value = text;
     document.body.appendChild(ta);
     ta.select();
     try { document.execCommand('copy'); done(); } catch (e) { /* ignore */ }
     ta.remove();
+  }
+
+  // ── MCP access tokens ──────────────────────────────────────────────────
+  // The one translated section, in the language /lab stored. Only its own
+  // elements and texts are translated, never the document. Server values are
+  // written as text.
+  const MCP_MODES = { per_user: 'admin.mcp.mode_per_user',
+    shared_account: 'admin.mcp.mode_shared_account' };
+  let mcpListSeq = 0;         // an older list answer never replaces a newer one
+  let mcpShownTokenId = '';   // the token whose raw value is in the box
+
+  // Without i18n.js: the English of the template, else the key's own words.
+  function mcpPlainText(key) {
+    const el = document.querySelector(`#secMcp [data-i18n="${key}"]`);
+    return el ? el.textContent : key.split('.').pop().replace(/_/g, ' ');
+  }
+
+  function mcpT(key, name) {
+    const text = window.i18n ? window.i18n.t(key) : mcpPlainText(key);
+    return name === undefined ? text : text.replace('{name}', () => name);
+  }
+
+  function translateMcp() {
+    if (!$('secMcp') || !window.i18n) return;   // power mode; or the English text stays
+    document.querySelectorAll('#secMcp [data-i18n], .adm-nav-item[data-section="mcp"] [data-i18n]')
+      .forEach((el) => { el.textContent = mcpT(el.dataset.i18n); });
+  }
+
+  // What to say about a failed request. The server's sentences are English;
+  // one that is the English text of an admin.mcp.error_* key is translated.
+  function mcpErrorText(r, fallbackKey) {
+    if (r.status === 401) return mcpT('admin.mcp.session_ended');
+    const said = r.status && r.data.error;
+    if (!said) return mcpT(fallbackKey);
+    const en = (window.I18N_TRANSLATIONS || {}).en || {};
+    const key = Object.keys(en).find((k) => k.startsWith('admin.mcp.error_') && en[k] === said);
+    return key ? mcpT(key) : said;
+  }
+
+  function _mcpEl(tag, cls, text) {
+    const el = document.createElement(tag);
+    if (cls) el.className = cls;
+    if (text) el.textContent = text;
+    return el;
+  }
+
+  function onMcpModeChange() {
+    const shared = $('mcpMode').value === 'shared_account';
+    $('mcpAccountWrap').classList.toggle('hidden', !shared);
+    $('mcpSharedNote').classList.toggle('hidden', !shared);
+    $('mcpPerUserNote').classList.toggle('hidden', shared);
+  }
+
+  function clearMcpToken() {
+    if (!$('mcpTokenBox')) return;           // power mode has no MCP section
+    $('mcpTokenBox').classList.add('hidden');
+    $('mcpTokenValue').textContent = '';
+    mcpShownTokenId = '';
+  }
+
+  function leaveMcp() {
+    if (!$('mcpTokenBox')) return;           // power mode has no MCP section
+    clearMcpToken();
+    $('mcpResult').classList.add('hidden');
+    $('mcpName').value = '';
+    $('mcpAccount').value = '';
+    $('mcpMode').value = 'per_user';
+    onMcpModeChange();
+  }
+
+  async function loadMcpTokens() {
+    mcpListSeq += 1;
+    const seq = mcpListSeq;
+    const r = await api('/api/admin/mcp/tokens');
+    if (seq !== mcpListSeq) return;
+    if (!r.ok) {
+      $('mcpTokensList').replaceChildren(
+        _mcpEl('div', 'adm-alert warn', mcpErrorText(r, 'admin.mcp.list_failed')));
+      return;
+    }
+    $('mcpAddress').textContent = r.data.endpoint || mcpT('admin.mcp.endpoint_unset');
+    renderMcpTokens(r.data.tokens || []);
+  }
+
+  function renderMcpTokens(tokens) {
+    const card = _mcpEl('div', 'adm-card adm-table-scroll');
+    $('mcpTokensList').replaceChildren(card);
+    if (!tokens.length) {
+      card.appendChild(_mcpEl('div', 'adm-empty', mcpT('admin.mcp.empty')));
+      return;
+    }
+    const head = _mcpEl('tr');
+    ['admin.mcp.col_name', 'admin.mcp.col_mode', 'admin.mcp.col_account',
+      'admin.mcp.col_created', 'admin.mcp.col_last_used', 'admin.mcp.col_state']
+      .forEach((key) => head.appendChild(_mcpEl('th', '', mcpT(key))));
+    head.appendChild(_mcpEl('th'));
+    const thead = _mcpEl('thead');
+    thead.appendChild(head);
+    const tbody = _mcpEl('tbody');
+    // The date and the time are one span each: a line may break between them only.
+    const when = (ts) => {
+      const td = _mcpEl('td', 'adm-cell-mono', ts ? '' : '—');
+      if (ts) {
+        td.append(_mcpEl('span', '', String(ts).slice(0, 10)), ' ',
+          _mcpEl('span', '', String(ts).slice(11, 16)));
+      }
+      return td;
+    };
+    tokens.forEach((tok) => {
+      const state = _mcpEl('td');
+      state.appendChild(tok.active
+        ? _mcpEl('span', 'adm-chip ok', mcpT('admin.mcp.state_active'))
+        : _mcpEl('span', 'adm-chip', mcpT('admin.mcp.state_revoked')));
+      const actions = _mcpEl('td', 'adm-actions-cell');
+      if (tok.active) {
+        const btn = _mcpEl('button', 'adm-btn danger small mcp-revoke', mcpT('admin.mcp.revoke'));
+        btn.type = 'button';
+        btn.addEventListener('click', () => revokeMcpToken(tok));
+        actions.appendChild(btn);
+      }
+      const tr = _mcpEl('tr');
+      tr.append(
+        _mcpEl('td', '', tok.name),
+        _mcpEl('td', '', MCP_MODES[tok.mode] ? mcpT(MCP_MODES[tok.mode]) : '—'),
+        _mcpEl('td', '', tok.account || '—'),
+        when(tok.created_at), when(tok.last_used_at), state, actions);
+      tbody.appendChild(tr);
+    });
+    const table = _mcpEl('table', 'adm-table');
+    table.append(thead, tbody);
+    card.appendChild(table);
+  }
+
+  async function createMcpToken() {
+    const btn = $('btnMcpCreate');
+    const out = $('mcpResult');
+    const mode = $('mcpMode').value;
+    const body = { name: $('mcpName').value.trim(), mode };
+    if (mode === 'shared_account') body.account = $('mcpAccount').value.trim();
+    btn.disabled = true;
+    out.classList.add('hidden');
+    const r = await api('/api/admin/mcp/tokens', { method: 'POST', body: JSON.stringify(body) });
+    btn.disabled = false;
+    if (!r.ok || !r.data.raw_token) {
+      out.textContent = mcpErrorText(r, 'admin.mcp.create_failed');
+      out.classList.remove('hidden');
+      return;
+    }
+    // Left meanwhile: the token is not shown. It is in the list, to be revoked.
+    if (!$('secMcp').hidden) {
+      $('mcpTokenValue').textContent = r.data.raw_token;
+      $('mcpEndpoint').textContent = r.data.endpoint || mcpT('admin.mcp.endpoint_unset');
+      $('mcpTokenBox').classList.remove('hidden');
+      mcpShownTokenId = r.data.token.id;
+    }
+    $('mcpName').value = '';
+    $('mcpAccount').value = '';
+    await loadMcpTokens();
+  }
+
+  function copyMcpToken() {
+    _copyText($('mcpTokenValue').textContent || '', () => toast(mcpT('admin.mcp.copied')));
+  }
+
+  async function revokeMcpToken(tok) {
+    const confirmed = await confirmUserAction(mcpT('admin.mcp.revoke_title'),
+      mcpT('admin.mcp.revoke_text', tok.name), mcpT('admin.mcp.revoke_title'),
+      mcpT('admin.mcp.cancel'));
+    if (!confirmed) return;
+    const r = await api(`/api/admin/mcp/tokens/${encodeURIComponent(tok.id)}/revoke`,
+      { method: 'POST', body: '{}' });
+    if (r.ok) {
+      toast(mcpT('admin.mcp.revoked', tok.name));
+      if (tok.id === mcpShownTokenId) clearMcpToken();
+    } else {
+      toast(mcpErrorText(r, 'admin.mcp.revoke_failed'), true);
+    }
+    await loadMcpTokens();
   }
 
   // ── Account (admin sidebar footer + the power-mode profile menu) ───────────────────────────────────────────
@@ -3813,6 +3996,7 @@
     document.querySelectorAll('.adm-nav-item').forEach((b) => {
       b.addEventListener('click', () => showSection(b.dataset.section));
     });
+    translateMcp();
     showSection((location.hash || '').replace('#', ''));
 
     // ?. binds: these elements are removed by the template in power mode.
@@ -3901,6 +4085,13 @@
     $('btnSsoEnable')?.addEventListener('click', enableSso);
     $('btnSsoDisable')?.addEventListener('click', disableSso);
     $('btnSsoCopyUri')?.addEventListener('click', copySsoRedirectUri);
+
+    // ?. binds: the MCP section is removed in power mode.
+    $('mcpMode')?.addEventListener('change', onMcpModeChange);
+    $('btnMcpCreate')?.addEventListener('click', createMcpToken);
+    $('btnMcpCopy')?.addEventListener('click', copyMcpToken);
+    // The browser may keep the page for its Back button.
+    window.addEventListener('pagehide', clearMcpToken);
 
     // ?. binds: the sidebar footer controls are removed in power mode.
     $('btnAdmLogout')?.addEventListener('click', logout);

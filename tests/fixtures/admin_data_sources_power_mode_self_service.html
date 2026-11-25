@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Admin · Data sources - PowerDataChat</title>
+  <meta name="robots" content="noindex, nofollow" />
+  <link rel="icon" type="image/png" href="/static/logo.png?v=0" />
+  <link rel="shortcut icon" href="/static/logo.png?v=0" />
+  <link rel="stylesheet" href="/static/admin_data_sources.css?v=0" />
+</head>
+<body class="admin-ds-page">
+  <div class="adm-shell">
+
+    <!-- ── Sidebar ─────────────────────────────────────────────────────── -->
+    <aside class="adm-sidebar">
+      <div class="adm-brand">
+        
+        <img src="/static/logo_white.png?v=0" alt="PowerDataChat" class="adm-brand-logo" />
+        <span class="adm-brand-sub">Data sources</span>
+      </div>
+
+      <nav class="adm-nav">
+        <button class="adm-nav-item active" data-section="connections">
+          <span class="adm-nav-ico">🔌</span> Connections
+          <span class="adm-nav-count" id="navConnCount"></span>
+        </button>
+        <button class="adm-nav-item" data-section="tables">
+          <span class="adm-nav-ico">📋</span> Registered tables
+          <span class="adm-nav-count" id="navTableCount"></span>
+        </button>
+        <button class="adm-nav-item" data-section="relations">
+          <span class="adm-nav-ico">🔗</span> Relations
+          <span class="adm-nav-count" id="navRelCount"></span>
+        </button>
+        
+      </nav>
+
+      <div class="adm-sidebar-footer">
+        <div class="adm-build-stamp" title="The running build — also served by /version">
+          build test</div>
+      </div>
+    </aside>
+
+    <!-- ── Main content ─────────────────────────────────────────────────── -->
+    <main class="adm-main">
+      
+      <div class="adm-topbar">
+<div class="profile-dropdown-container">
+  
+  <button id="btnProfileIcon" class="profile-btn" title="Profile"
+          data-username="power@x.com">
+    <span id="profileAvatar" class="profile-avatar" style="background:#2563eb">AD</span>
+    <span class="profile-btn-info">
+      <span id="profileBtnName" class="profile-btn-name">power@x.com</span>
+      <span id="profileBtnPlan" class="profile-btn-plan">Enterprise</span>
+    </span>
+  </button>
+  
+  <div id="profileDropdown" class="profile-dropdown hidden">
+    
+    <button class="dropdown-item" id="btnBackToChat" data-target="/lab">Back to chat</button>
+    <div class="dropdown-divider"></div>
+    <button class="dropdown-item" id="btnChangePassword" data-i18n="profile.change_pw_btn">Change Password</button>
+    <div class="dropdown-divider"></div>
+    <button class="dropdown-item" id="btnLogout" data-i18n="profile.logout">Logout</button>
+    
+  </div>
+</div></div>
+
+      <!-- Connections -->
+      <section id="secConnections" class="adm-section">
+        <header class="adm-page-head">
+          <div>
+            <h1>Database connections</h1>
+            <p class="adm-page-sub">You can
+               add your own read-only database connections and register tables from them;
+               connections your administrator granted are read-only here.</p>
+            
+          </div>
+          
+          <button id="btnAddConnection" class="adm-btn primary">＋ Add connection</button>
+          
+        </header>
+
+        <!-- Encryption-key warning (shown when CLIENT_ENCRYPTION_KEY is unset/invalid) -->
+        <div id="adsKeyWarning" class="adm-alert warn hidden">
+          <strong>CLIENT_ENCRYPTION_KEY is not configured on this server.</strong>
+          Database connections cannot be saved until it is set in the environment and
+          the container is restarted.
+        </div>
+
+        
+
+        <div id="connectionsList"></div>
+      </section>
+
+      <!-- Registered tables -->
+      <section id="secTables" class="adm-section" hidden>
+        <header class="adm-page-head">
+          <div>
+            <h1>Registered tables</h1>
+            <p class="adm-page-sub">Tables users can add to chats. <em>Connector</em> tables are
+               hidden from users and auto-included through their relations. A <em>live</em> table
+               is not copied when you save it, and scheduled refreshes skip it. Live tables are
+               queried at question time; each question reads at most the configured row cap.</p>
+          </div>
+          <button id="btnRegisterTable" class="adm-btn primary">＋ Register table</button>
+        </header>
+        <div id="driftBanner"></div>
+        <div id="tablesList"></div>
+      </section>
+
+      <!-- Relations: confirmed overview (Zone A) + discovery (Zone B) -->
+      <section id="secRelations" class="adm-section" hidden>
+        <header class="adm-page-head">
+          <div>
+            <h1>Relations</h1>
+            <p class="adm-page-sub">Join hints the AI uses to combine tables correctly. Confirmed
+               relations are listed first; discovery below only ever proposes — nothing is applied
+               until you accept it.</p>
+          </div>
+          <div class="adm-rel-headactions">
+            <div class="adm-rel-viewtoggle" role="group" aria-label="Relations view">
+              <button id="btnRelViewList" class="adm-btn ghost small active">☰ List</button>
+              <button id="btnRelViewGraph" class="adm-btn ghost small">🕸 Graph</button>
+            </div>
+            <button id="btnRelScan" class="adm-btn primary">🔍 Scan for relations</button>
+          </div>
+        </header>
+
+        <!-- Zone A: every confirmed relation across all registered tables -->
+        <div id="relConfirmedCard" class="adm-card adm-rel-confirmed-card">
+          <div class="adm-subhead">
+            <h4>Confirmed relations</h4>
+            <button id="btnRelAddManual" class="adm-btn ghost small">＋ Add relation</button>
+            <button id="btnRelDeleteFlagged" class="adm-btn ghost small hidden"
+              title="Delete every relation flagged as joining a table to its own duplicate registration">
+              🗑 Delete all flagged</button>
+          </div>
+          <div id="relAddForm" class="hidden"></div>
+          <div id="relConfirmedEmpty" class="adm-muted adm-rel-band-empty hidden">
+            No relations confirmed yet — scan for proposals in the candidates panel, or add them
+            manually in each table's settings (Registered tables → ✎).
+          </div>
+          <div id="relConfirmedList"></div>
+        </div>
+
+        <!-- Graph view of the confirmed relations (toggled with the List) -->
+        <div id="relGraphCard" class="adm-card adm-rel-graph-card hidden">
+          <div class="adm-subhead">
+            <h4>Relations graph</h4>
+            <div class="adm-rel-graph-tools">
+              <button id="btnRelGraphZoomIn" class="adm-btn ghost small"
+                      title="Zoom in">＋</button>
+              <button id="btnRelGraphZoomOut" class="adm-btn ghost small"
+                      title="Zoom out">－</button>
+              <button id="btnRelGraphFit" class="adm-btn ghost small"
+                      title="Fit the whole diagram in view">⤢ Fit</button>
+            </div>
+          </div>
+          <div id="relGraphLegend" class="adm-rel-legend"></div>
+          <div id="relGraph" class="adm-rel-graph"></div>
+          <div id="relGraphPopover" class="adm-rel-popover hidden"></div>
+        </div>
+
+        <!-- Zone B: discovery output, directly under the confirmed list so a
+             scan's result lands where the eye already is -->
+        <div class="adm-card adm-rel-candidates-card">
+          <div class="adm-subhead"><h4>Proposed candidates <span class="adm-label-note">(from
+            “Scan for relations” above and “Analyze SQL” below — nothing is applied until you
+            accept)</span></h4></div>
+          <div id="relDegraded" class="adm-alert warn hidden"></div>
+          <div id="relWarnings" class="adm-alert warn hidden"></div>
+          <div id="relRecommended" class="hidden"></div>
+          <div id="relUnknownList" class="hidden"></div>
+          <div id="relNoNew" class="adm-muted adm-rel-nonew hidden"></div>
+          <div id="relEmpty" class="adm-empty">
+            <div class="adm-empty-ico">🔗</div>
+            <p>No candidates yet.</p>
+            <p class="adm-muted">Run “Scan for relations” to propose joins from foreign keys and
+              column-name similarity, or paste SQL below.</p>
+          </div>
+          <div id="relBands" class="hidden">
+            <div class="adm-rel-bulkbar">
+              <button id="btnRelAcceptChecked" class="adm-btn primary">✔ Accept all checked</button>
+              <span id="relCheckedCount" class="adm-muted"></span>
+            </div>
+            <div class="adm-subhead"><h4>Confirmed <span class="adm-label-note">(strong evidence —
+              pre-checked)</span></h4></div>
+            <div id="relBandConfirmed"></div>
+            <div class="adm-subhead"><h4>Suggested <span class="adm-label-note">(good evidence —
+              review and tick to accept)</span></h4></div>
+            <div id="relBandSuggested"></div>
+            <div class="adm-subhead"><h4>Needs attention <span class="adm-label-note">(weak overlap,
+              many-to-many, or unverified)</span></h4></div>
+            <div id="relBandAttention"></div>
+          </div>
+        </div>
+
+        <div class="adm-card adm-rel-sql-card">
+          <div class="adm-subhead">
+            <h4>Analyze SQL <span class="adm-label-note">(optional — paste SELECT queries your team
+              already runs; their joins become candidates above)</span></h4>
+          </div>
+          <textarea id="relSqlInput" rows="5"
+            placeholder="Paste one or more SELECT statements…"></textarea>
+          <div class="adm-rel-sql-actions">
+            <label>Dialect
+              <select id="relSqlDialect"><option value="">auto</option></select>
+            </label>
+            <button id="btnRelAnalyzeSql" class="adm-btn ghost">Analyze SQL</button>
+            <span class="adm-muted">SQL is parsed in memory on this server only — the SQL text is
+              never stored, logged, or sent anywhere. Only the table and column names found in it
+              are kept on this server to recommend missing tables.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Users (role assignment + permission level; the bootstrap local
+           admin account is config-only and never listed here) -->
+      
+
+      
+
+      <!-- Per-table schedule override modal (narrow #pwModal chrome) -->
+      <div id="tableScheduleModal" class="adm-modal-backdrop hidden">
+        <div class="adm-modal adm-modal-narrow">
+          <div class="adm-modal-head">
+            <h3 id="tsmTitle">Table schedule</h3>
+            <button id="closeTsmModal" class="adm-x">✕</button>
+          </div>
+          <div class="adm-modal-body">
+            <label class="adm-switch-row">
+              <input type="radio" name="tsmMode" id="tsmInherit" checked />
+              <span>Inherit the global schedule</span>
+            </label>
+            <label class="adm-switch-row">
+              <input type="radio" name="tsmMode" id="tsmOwn" />
+              <span>Own schedule for this table</span>
+            </label>
+            <div id="tsmFields" class="hidden"><!-- renderScheduleFields() --></div>
+            <div id="tsmPreview" class="adm-muted"></div>
+          </div>
+          <div class="adm-modal-foot">
+            <span class="adm-spacer"></span>
+            <button id="btnTsmCancel" class="adm-btn ghost">Cancel</button>
+            <button id="btnTsmSave" class="adm-btn primary">Save</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Per-table storage mode modal (snapshot / live; narrow #recAcceptModal
+           chrome). Rendered in both manager modes. -->
+      <div id="tableModeModal" class="adm-modal-backdrop hidden">
+        <div class="adm-modal adm-modal-narrow">
+          <div class="adm-modal-head">
+            <h3 id="tmmTitle">Storage mode</h3>
+            <button id="closeTmmModal" class="adm-x">✕</button>
+          </div>
+          <div class="adm-modal-body">
+            <label class="adm-check">
+              <input type="radio" name="tmmMode" id="tmmSnapshot" value="snapshot" />
+              <span><strong>Snapshot</strong> — a local copy of the table, refreshed on
+              the schedule.</span>
+            </label>
+            <label class="adm-check">
+              <input type="radio" name="tmmMode" id="tmmLive" value="live" />
+              <span><strong>Live</strong> — no local copy; the table stays in your
+              database.</span>
+            </label>
+            <div id="tmmHint" class="adm-alert warn hidden"></div>
+            <div class="adm-label-note">A live table is not copied when you switch it, and
+              scheduled refreshes skip it. Live tables are queried at question time; each
+              question reads at most the configured row cap.</div>
+          </div>
+          <div class="adm-modal-foot">
+            <span class="adm-spacer"></span>
+            <button id="btnTmmCancel" class="adm-btn ghost">Cancel</button>
+            <button id="btnTmmSave" class="adm-btn primary">Save</button>
+          </div>
+        </div>
+      </div>
+
+      
+
+    </main>
+  </div>
+
+  <!-- ── Connection form modal (create + edit; Test works on the unsaved draft) ── -->
+  <div id="connModal" class="adm-modal-backdrop hidden">
+    <div class="adm-modal">
+      <div class="adm-modal-head">
+        <h3 id="connModalTitle">Add connection</h3>
+        <button id="closeConnModal" class="adm-x">✕</button>
+      </div>
+      <div class="adm-modal-body">
+        <div class="adm-form-grid">
+          <label class="span2">Connection name
+            <input type="text" id="connName" placeholder="e.g. Core DWH" />
+          </label>
+          <label class="span2">Database type
+            <select id="connType"></select>
+          </label>
+          <label>Host
+            <input type="text" id="connHost" placeholder="db.corp.local" />
+          </label>
+          <label>Port
+            <input type="number" id="connPort" />
+          </label>
+          <label class="span2" id="connDatabaseWrap">Database
+            <input type="text" id="connDatabase" />
+          </label>
+          <label class="span2 hidden" id="connServiceWrap">Service name
+            <input type="text" id="connService" />
+          </label>
+          <label>User
+            <input type="text" id="connUser" autocomplete="off" />
+          </label>
+          <label>Password
+            <input type="password" id="connPassword" autocomplete="new-password" />
+          </label>
+          <label class="adm-check"><input type="checkbox" id="connSsl" /> SSL / Encrypt</label>
+          <label class="adm-check"><input type="checkbox" id="connTrustCert" /> Trust server certificate</label>
+          <label class="adm-check span2"><input type="checkbox" id="connReadOnly" checked disabled /> Read-only access</label>
+          <p class="adm-muted span2 adm-conn-readonly-note">PowerDataChat only ever reads from a database.
+            Writes are refused by the platform even when the login has write privileges.</p>
+        </div>
+        <div id="connTlsWarn" class="adm-alert warn hidden conn-tls-warn" role="status"></div>
+        <div id="connTestResult" class="adm-test-result hidden"></div>
+      </div>
+      <div class="adm-modal-foot">
+        <button id="btnTestConn" class="adm-btn ghost">🔌 Test connection</button>
+        <span class="adm-spacer"></span>
+        <button id="btnCancelConn" class="adm-btn ghost">Cancel</button>
+        <button id="btnSaveConn" class="adm-btn primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Register / edit table: 3-step wizard ──────────────────────────── -->
+  <div id="tableModal" class="adm-modal-backdrop hidden">
+    <div class="adm-modal adm-modal-wide">
+      <div class="adm-modal-head">
+        <h3 id="tableModalTitle">Register table</h3>
+        <button id="closeTableModal" class="adm-x">✕</button>
+      </div>
+
+      <div class="adm-stepper">
+        <div class="adm-step-dot active" data-step="1"><span>1</span> Source</div>
+        <div class="adm-step-line"></div>
+        <div class="adm-step-dot" data-step="2"><span>2</span> Describe</div>
+        <div class="adm-step-line"></div>
+        <div class="adm-step-dot" data-step="3"><span>3</span> Confirm &amp; save</div>
+      </div>
+
+      <div class="adm-modal-body">
+        <!-- Step 1: pick source table -->
+        <div id="twStep1" class="adm-wstep">
+          <p class="adm-step-hint">Choose the table (or view) to make available. Its structure and a
+             few preview rows load next — nothing is saved yet.</p>
+          <div class="adm-form-grid">
+            <label class="span2">Connection
+              <input type="text" id="twConnName" disabled />
+            </label>
+            <label>Schema
+              <select id="twSchema"></select>
+            </label>
+            <label>Table
+              <select id="twTable"></select>
+            </label>
+          </div>
+          <label class="adm-check adm-sys-schema-toggle">
+            <input type="checkbox" id="twShowSystemSchemas" />
+            <span class="adm-label-note">Show system schemas</span>
+          </label>
+          <div id="twPickStatus" class="adm-muted"></div>
+        </div>
+
+        <!-- Step 2: describe -->
+        <div id="twStep2" class="adm-wstep" hidden>
+          <p class="adm-step-hint">These names and descriptions are what the AI uses to understand
+             the table — write them for a colleague who has never seen this database.
+             <span class="adm-muted">Relation suggestions (foreign keys, matching column names)
+             appear at the Confirm step.</span></p>
+          <div class="adm-form-grid">
+            <label class="span2">Display name <span class="adm-label-note">(what users see, e.g. “clients information”)</span>
+              <input type="text" id="twDisplayName" />
+            </label>
+            <label class="span2">Table description <span class="adm-label-note">(contents + how it joins other tables)</span>
+              <textarea id="twDescription" rows="2"></textarea>
+            </label>
+          </div>
+          <div id="twStats" class="adm-muted"></div>
+
+          <div class="adm-subhead">
+            <h4>Column descriptions</h4>
+            <button id="btnDraftAI" class="adm-btn ghost small">✨ Draft descriptions with AI</button>
+          </div>
+          <div id="twDraftBanner" class="adm-alert warn hidden">
+            AI-drafted — review every description before confirming. Only column
+            <em>names and types</em> were shared with the AI, never row values.
+          </div>
+          <div class="adm-table-scroll adm-cols-scroll">
+            <table class="adm-table">
+              <thead><tr><th>Column</th><th>Type</th><th>PK</th><th>Indexed</th><th style="width:50%">Description</th></tr></thead>
+              <tbody id="twColsBody"></tbody>
+            </table>
+          </div>
+
+          <details class="adm-preview-details">
+            <summary>Preview first rows</summary>
+            <div id="twPreview" class="adm-table-scroll"></div>
+          </details>
+        </div>
+
+        <!-- Step 3: confirm -->
+        <div id="twStep3" class="adm-wstep" hidden>
+          <div class="adm-summary" id="twSummary"></div>
+
+          <label class="adm-check adm-connector-check">
+            <input type="checkbox" id="twIsConnector" />
+            <span><strong>Connector table</strong> — a helper/dictionary table users should not pick
+            directly; it is auto-included whenever a related table is used.</span>
+          </label>
+
+          <div class="adm-mode-block">
+            <div class="adm-subhead"><h4>Storage</h4></div>
+            <label class="adm-check">
+              <input type="radio" name="twMode" id="twModeSnapshot" value="snapshot" checked />
+              <span><strong>Snapshot</strong> — a local copy of the table, refreshed on
+              the schedule.</span>
+            </label>
+            <label class="adm-check">
+              <input type="radio" name="twMode" id="twModeLive" value="live" />
+              <span><strong>Live</strong> — no local copy; the table stays in your
+              database.</span>
+            </label>
+            <div id="twModeHint" class="adm-alert warn hidden"></div>
+            <div id="twModeNote" class="adm-label-note hidden">A live table is not copied when
+              you save it, and scheduled refreshes skip it. Live tables are queried at question
+              time; each question reads at most the configured row cap.</div>
+          </div>
+
+          <div class="adm-suggest-panel">
+            <div class="adm-subhead">
+              <h4>💡 Suggested relations <span class="adm-label-note">(from this table's foreign keys
+                and column-name similarity — checked rows are saved with the table)</span></h4>
+            </div>
+            <div id="twSuggestions" class="adm-muted adm-rel-band-empty">Loading suggestions…</div>
+          </div>
+
+          <div class="adm-subhead">
+            <h4>Relations <span class="adm-label-note">(join keys to other registered tables — lets the AI join correctly)</span></h4>
+            <button id="btnAddRelation" class="adm-btn ghost small">＋ Add relation</button>
+          </div>
+          <div id="twRelations"></div>
+
+          
+          <div id="twAccessWrap">
+            <div class="adm-subhead">
+              
+              <h4>Share with your roles <span class="adm-label-note">(unchecked = only you;
+                roles already covering it via a schema/connection grant are shown locked)</span></h4>
+              
+            </div>
+            <div id="twAccessRoles" class="adm-access-panel adm-muted">Loading roles…</div>
+          </div>
+
+          <label class="adm-check adm-confirm">
+            <input type="checkbox" id="twConfirm" />
+            <span>I have reviewed the table and column descriptions</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="adm-modal-foot">
+        <button id="btnTwBack" class="adm-btn ghost" hidden>← Back</button>
+        <span class="adm-spacer"></span>
+        <button id="btnCancelTable" class="adm-btn ghost">Cancel</button>
+        <button id="btnTwNext" class="adm-btn primary">Next →</button>
+        <button id="btnSaveTable" class="adm-btn primary" disabled hidden>💾 Save &amp; snapshot</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Change-password modal ─────────────────────────────────────────── -->
+  <div id="pwModal" class="adm-modal-backdrop hidden">
+    <div class="adm-modal adm-modal-narrow">
+      <div class="adm-modal-head">
+        <h3>Change password</h3>
+        <button id="closePwModal" class="adm-x">✕</button>
+      </div>
+      <div class="adm-modal-body">
+        <div class="adm-form-grid">
+          <label class="span2">Current password
+            <input type="password" id="pwCurrent" autocomplete="current-password" />
+          </label>
+          <label class="span2">New password
+            <input type="password" id="pwNew" autocomplete="new-password" />
+          </label>
+          <label class="span2">Repeat new password
+            <input type="password" id="pwNew2" autocomplete="new-password" />
+          </label>
+        </div>
+        <div id="pwError" class="adm-test-result bad hidden"></div>
+      </div>
+      <div class="adm-modal-foot">
+        <span class="adm-spacer"></span>
+        <button id="btnCancelPw" class="adm-btn ghost">Cancel</button>
+        <button id="btnSavePw" class="adm-btn primary">Change password</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Accept-a-recommendation modal ─────────────────────────────────────
+       Replaces a native confirm(): it has to carry the table-type choice,
+       and confirm() blocks the page thread while the suggestion loads. -->
+  <div id="recAcceptModal" class="adm-modal-backdrop hidden">
+    <div class="adm-modal adm-modal-narrow">
+      <div class="adm-modal-head">
+        <h3>Register table</h3>
+        <button id="closeRecAccept" class="adm-x">✕</button>
+      </div>
+      <div class="adm-modal-body">
+        <p id="recAcceptText" class="adm-muted"></p>
+        <div class="adm-subhead"><h4>How should users see this table?</h4></div>
+        <label class="adm-check">
+          <input type="radio" name="recAcceptType" id="recTypeConnector" value="connector" />
+          <span><strong>Connector table</strong> — a helper/dictionary table users should
+          not pick directly; it is auto-included whenever a related table is used.</span>
+        </label>
+        <label class="adm-check">
+          <input type="radio" name="recAcceptType" id="recTypeNormal" value="normal" />
+          <span><strong>Normal table</strong> — users can pick it directly when they
+          start a chat.</span>
+        </label>
+        <div id="recAcceptReason" class="adm-label-note"></div>
+      </div>
+      <div class="adm-modal-foot">
+        <span class="adm-spacer"></span>
+        <button id="btnRecAcceptCancel" class="adm-btn ghost">Cancel</button>
+        <button id="btnRecAcceptGo" class="adm-btn primary">Register &amp; snapshot</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Role editor modal (create + edit; the access tree covers every
+       connection → schema → registered non-connector table) ─────────────── -->
+  <div id="roleModal" class="adm-modal-backdrop hidden">
+    <div class="adm-modal">
+      <div class="adm-modal-head">
+        <h3 id="roleModalTitle">Add role</h3>
+        <button id="closeRoleModal" class="adm-x">✕</button>
+      </div>
+      <div class="adm-modal-body">
+        <div class="adm-form-grid">
+          <label class="span2">Role name
+            <input type="text" id="roleName" placeholder="e.g. Finance" />
+          </label>
+          <label class="span2">Description
+            <textarea id="roleDesc" rows="2"
+              placeholder="Who is this role for? (optional)"></textarea>
+          </label>
+        </div>
+        <div class="adm-subhead">
+          <h4>Table access</h4>
+        </div>
+        
+        <div class="adm-tree-colhead">
+          <span class="adm-tree-col" title="Members can pick these tables in chat. Schema and connection checks include tables registered later.">Chat access</span>
+          <span class="adm-tree-col adm-tree-col-manage" title="Members with the Power user permission can register tables, relations and schedules here.">Manage</span>
+        </div>
+        <p class="adm-label-note adm-tree-legend">Chat access: schema and connection checks include
+          tables registered later. Manage: members with the Power user permission can register
+          tables, relations and schedules there.</p>
+        <div id="roleAccessTree" class="adm-tree"></div>
+        <div id="roleError" class="adm-test-result bad hidden"></div>
+      </div>
+      <div class="adm-modal-foot">
+        <span class="adm-spacer"></span>
+        <button id="btnCancelRole" class="adm-btn ghost">Cancel</button>
+        <button id="btnSaveRole" class="adm-btn primary">💾 Save role</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Delete-role confirm (replaces confirm(): it must show the member
+       count; members revert to Base dynamically — nothing is rewritten) ── -->
+  <div id="roleDeleteModal" class="adm-modal-backdrop hidden">
+    <div class="adm-modal adm-modal-narrow">
+      <div class="adm-modal-head">
+        <h3>Delete role</h3>
+        <button id="closeRoleDelete" class="adm-x">✕</button>
+      </div>
+      <div class="adm-modal-body">
+        <p id="roleDeleteText" class="adm-muted"></p>
+      </div>
+      <div class="adm-modal-foot">
+        <span class="adm-spacer"></span>
+        <button id="btnRoleDeleteCancel" class="adm-btn ghost">Cancel</button>
+        <button id="btnRoleDeleteGo" class="adm-btn danger">Delete role</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── User action confirm (End sessions / Remove user): the same narrow
+       chrome; title, text and button label are set per action (textContent) ── -->
+  <div id="userActionModal" class="adm-modal-backdrop hidden">
+    <div class="adm-modal adm-modal-narrow">
+      <div class="adm-modal-head">
+        <h3 id="userActionTitle">Confirm</h3>
+        <button id="closeUserAction" class="adm-x">✕</button>
+      </div>
+      <div class="adm-modal-body">
+        <p id="userActionText" class="adm-muted"></p>
+      </div>
+      <div class="adm-modal-foot">
+        <span class="adm-spacer"></span>
+        <button id="btnUserActionCancel" class="adm-btn ghost">Cancel</button>
+        <button id="btnUserActionGo" class="adm-btn danger">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Busy overlay for operations that hit the customer DB (snapshot /
+       refresh / test) — large tables can take a while; the page must never
+       look dead during them. -->
+  <div id="admBusy" class="adm-busy-backdrop hidden">
+    <div class="adm-busy-card">
+      <div class="adm-spinner"></div>
+      <div id="admBusyMsg">Working…</div>
+    </div>
+  </div>
+
+  <script nonce="nonce">
+    window.__MANAGER_MODE__ = "power";
+    
+    window.__MANAGER_EMAIL__ = "power@x.com";
+    window.__SELF_SERVICE__ = true;
+  </script>
+  <script src="/static/admin_data_sources.js?v=0"></script>
+</body>
+</html>

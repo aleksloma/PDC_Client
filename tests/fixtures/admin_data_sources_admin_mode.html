@@ -45,6 +45,9 @@
         <button class="adm-nav-item" data-section="sso">
           <span class="adm-nav-ico">🔐</span> Single sign-on
         </button>
+        <button class="adm-nav-item" data-section="mcp">
+          <span class="adm-nav-ico">🤖</span> <span data-i18n="admin.mcp.title">MCP access</span>
+        </button>
         <button class="adm-nav-item" data-section="schedule">
           <span class="adm-nav-ico">⏱️</span> Refresh schedule
         </button>
@@ -371,6 +374,66 @@
             <button id="btnSsoDisable" class="adm-btn danger">Disable SSO</button>
           </div>
         </div>
+      </section>
+
+      <!-- MCP access tokens — ladmin-only. The one translated section of this
+           page: admin_data_sources.js fills every [data-i18n] in it from
+           i18n.js; the text here is the English value of its key. -->
+      <section id="secMcp" class="adm-section" hidden>
+        <header class="adm-page-head">
+          <div>
+            <h1 data-i18n="admin.mcp.title">MCP access</h1>
+            <p class="adm-page-sub" data-i18n="admin.mcp.sub">Other chatbots can use PowerDataChat through
+               MCP: they ask questions in existing chats and receive the answers. Each chatbot needs a
+               token. MCP access is off while there is no active token.</p>
+            <p class="adm-page-sub"><span data-i18n="admin.mcp.endpoint_label">Endpoint address</span>:
+               <span class="sso-uri"><code id="mcpAddress"></code></span></p>
+          </div>
+        </header>
+
+        <div class="adm-subhead"><h4 data-i18n="admin.mcp.create_title">New token</h4></div>
+        <div class="adm-card adm-schedule-card">
+          <div class="adm-form-grid">
+            <label class="span2"><span data-i18n="admin.mcp.name_label">Name</span>
+              <input type="text" id="mcpName" maxlength="60" autocomplete="off" name="pdc-mcp-name" />
+            </label>
+            <label class="span2"><span data-i18n="admin.mcp.mode_label">Mode</span>
+              <select id="mcpMode" autocomplete="off">
+                <option value="per_user" data-i18n="admin.mcp.mode_per_user">Per user</option>
+                <option value="shared_account" data-i18n="admin.mcp.mode_shared_account">Shared account</option>
+              </select>
+            </label>
+            <label id="mcpAccountWrap" class="span2 hidden">
+              <span data-i18n="admin.mcp.account_label">PowerDataChat account (email)</span>
+              <input type="text" id="mcpAccount" inputmode="email" autocomplete="off"
+                     name="pdc-mcp-account" placeholder="name@company.com" />
+            </label>
+          </div>
+          <div id="mcpPerUserNote" class="adm-alert warn" data-i18n="admin.mcp.per_user_note">The chatbot sends
+            the user's email address in the X-PDC-User-Email header with every call. Whoever holds this
+            token can act as any user who has an account, and as any user in the approved sign-in
+            domains, so store it as a secret.</div>
+          <div id="mcpSharedNote" class="adm-alert warn hidden" data-i18n="admin.mcp.shared_note">All users of
+            this token share one conversation per chat per day and see each other's questions as history.
+            Links to the conversation open only for someone signed in as this account.</div>
+          <div class="adm-muted" data-i18n="admin.mcp.once_hint">The token is shown only once, right after it is created.</div>
+          <div class="adm-card-actions">
+            <button id="btnMcpCreate" type="button" class="adm-btn primary" data-i18n="admin.mcp.create_btn">Create token</button>
+          </div>
+          <div id="mcpResult" class="adm-alert warn hidden" role="alert"></div>
+          
+          <div id="mcpTokenBox" class="adm-alert ok hidden">
+            <p data-i18n="admin.mcp.token_once">Copy the token now. It is not shown again.</p>
+            <p><span data-i18n="admin.mcp.token_label">Token</span>:
+              <span class="sso-uri"><code id="mcpTokenValue"></code>
+              <button type="button" id="btnMcpCopy" class="adm-btn ghost small" data-i18n="admin.mcp.copy">Copy</button></span></p>
+            <p><span data-i18n="admin.mcp.endpoint_label">Endpoint address</span>:
+              <span class="sso-uri"><code id="mcpEndpoint"></code></span></p>
+          </div>
+        </div>
+
+        <div class="adm-subhead"><h4 data-i18n="admin.mcp.list_title">Tokens</h4></div>
+        <div id="mcpTokensList"></div>
       </section>
 
       <!-- Refresh schedule (GLOBAL — ladmin-only; per-table overrides live in
@@ -828,6 +891,7 @@
     window.__MANAGER_EMAIL__ = "admin2@x.com";
     window.__SELF_SERVICE__ = false;
   </script>
+  <script src="/static/i18n.js?v=0"></script>
   <script src="/static/admin_data_sources.js?v=0"></script>
 </body>
 </html>

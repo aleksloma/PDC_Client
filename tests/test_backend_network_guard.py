@@ -412,3 +412,43 @@ def test_a_websocket_from_inside_is_closed_with_policy_violation(monkeypatch):
     with TestClient(wrapped, client=OUTSIDE).websocket_connect("/ws") as ws:
         greeting = ws.receive_text()
     assert greeting == "hello", greeting
+
+
+# ---------------------------------------------------------------------------
+# the MCP endpoint: no session, so the guard is what keeps the sandbox out
+# ---------------------------------------------------------------------------
+def _mcp_call(peer, raw):
+    return _client(peer).post(
+        "/mcp", headers={"Authorization": f"Bearer {raw}",
+                         "X-PDC-User-Email": "user@corp.example"},
+        json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+
+
+@pytest.mark.parametrize("peer", [INSIDE, ("::ffff:" + INSIDE[0], 51000)],
+                         ids=["ipv4", "mapped"])
+def test_the_mcp_endpoint_is_refused_from_inside_even_with_a_valid_token(monkeypatch, peer):
+    """Generated code in the sandbox that got hold of a token still gets the
+    bare 403; the same request from the LAN is served."""
+    import mcp_tokens
+    _set_cidr(monkeypatch, CIDR)
+    _row, raw = mcp_tokens.create_token("Helpdesk bot", "per_user", "ladmin")
+
+    response = _mcp_call(peer, raw)
+    status = response.status_code
+    assert status == 403, (status, response.text[:300])
+    assert response.json() == FORBIDDEN_BODY
+    assert "www-authenticate" not in response.headers
+
+    response = _mcp_call(OUTSIDE, raw)
+    assert response.status_code == 200, (response.status_code, response.text[:300])
+    assert response.json()["result"] == {}
+
+
+def test_a_refused_mcp_call_never_reaches_the_token_check(monkeypatch):
+    import mcp_tokens
+    _set_cidr(monkeypatch, CIDR)
+    seen = []
+    monkeypatch.setattr(mcp_tokens, "verify", lambda raw: seen.append(1))
+    assert _mcp_call(INSIDE, "x").status_code == 403
+    assert seen == []
+    assert _mcp_call(OUTSIDE, "x").status_code == 401

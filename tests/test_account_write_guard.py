@@ -361,3 +361,48 @@ def test_the_already_safe_writers_stay_no_ops_on_a_missing_account(root, shape):
     _no_raise(store.clear_temp_password, email)
     assert not (root / "users" / email).exists()
     assert not store.user_exists(email)
+
+
+# ===========================================================================
+# the MCP day's-conversation mapping (users/<email>/mcp_conversations.json)
+# ===========================================================================
+def _mcp_factory(email):
+    import importlib
+    return importlib.import_module("mcp_conversations").make_factory(email, CHAT)
+
+
+@pytest.mark.parametrize("shape", ["never_seen", "removed"])
+def test_the_mcp_conversation_mapping_refuses_a_missing_account(root, logs, shape):
+    """The MCP conversation factory writes into the user's folder too: for a
+    missing account it answers None and the folder is not re-created."""
+    email = _missing_address(root, shape)
+    factory = _mcp_factory(email)
+    logs.clear()
+    assert _no_raise(factory, local_store.ChatDataStore(CHAT)) is None
+    _assert_nothing_written(root, email)
+    assert _refusals(logs, "record_conversation") or _refusals(logs, "mcp_conversation"), logs
+
+
+def test_the_mcp_conversation_mapping_refuses_an_account_removed_meanwhile(root, logs,
+                                                                           monkeypatch):
+    """The account is removed AFTER its index row was written and before the
+    mapping: the mapping write must not bring the folder back."""
+    local_store.AuthStore().ensure_user(GHOST)
+    real = local_store.AuthStore.record_conversation
+
+    def then_removed(self, email, *a, **k):
+        out = real(self, email, *a, **k)
+        assert self.remove_user(email) is True
+        return out
+
+    monkeypatch.setattr(local_store.AuthStore, "record_conversation", then_removed)
+    _no_raise(_mcp_factory(GHOST), local_store.ChatDataStore(CHAT))
+    _assert_nothing_written(root, GHOST)
+    assert _refusals(logs, "mcp_conversation"), logs
+
+
+def test_the_mcp_conversation_mapping_still_writes_on_an_existing_account(live, logs):
+    conv_id = _no_raise(_mcp_factory(LIVE), local_store.ChatDataStore(CHAT))
+    assert local_store.valid_conv_id(conv_id), conv_id
+    assert (live / "users" / LIVE / "mcp_conversations.json").is_file()
+    _no_refusal(logs)

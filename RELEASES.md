@@ -10,6 +10,45 @@ against the existing data volume.
 
 ## Unreleased (on `main`, not yet tagged)
 
+### MCP access for other chatbots — 2026-11-25
+
+**Why.** Other chatbots inside a customer's network should be able to ask a
+question in an existing PowerDataChat chat and receive the answer the web
+gives.
+
+**Change.**
+- New address `POST /mcp` (Model Context Protocol, revisions 2025-11-25 and
+  2026-07-28, plain JSON answers) with three tools: `list_chats`, `ask` and
+  `get_answer`. Off until an administrator creates a token: it answers 401.
+- Tokens, in mode "per user" (the chatbot sends the user's email in
+  `X-PDC-User-Email`) or "shared account", created and revoked on the new
+  "MCP access" section of the admin page (English, Georgian, Russian). Only a
+  hash is stored.
+- An MCP question runs with the web's access and table-permission checks and
+  is saved as a normal conversation "MCP YYYY-MM-DD" (one per user, chat and
+  UTC day). Answers carry text, Markdown tables, chart PNGs and a link.
+- Saving is a separate module (`chat_turn.py`) that mirrors the web chat; a
+  test (`tests/test_chat_turn_drift.py`) fails when the two differ.
+- A command-line test client (`tools/mcp_test_client.py`).
+- Two optional settings, `MCP_ANSWER_WAIT_SECONDS` and `MCP_TABLE_MAX_ROWS`.
+- New stored documents, `mcp_tokens.json` and per user
+  `mcp_conversations.json`, appear only when the feature is used. No existing
+  stored format, the sandbox, the brain protocol, sign-in or dependency
+  changes; the executor image is only rebuilt with two unused settings fields
+  (`settings.py` is shared). `routes/chat.py` is unchanged.
+- Trust model and known limits: `docs/MCP_INTEGRATION.md`.
+
+**Gates (local, before the pull request).**
+
+| Gate | Result |
+|---|---|
+| Web suite, Python 3.11, Windows | 9194 passed, 0 failed, 132 skipped (`tests/test_export_plotly_png.py` left to CI: kaleido hangs on Windows) |
+| Local image builds (web and sandbox) | built, both containers healthy |
+| `tools/mcp_test_client.py` self-test on the local stack (2026-11-25), per_user and shared_account tokens, protocols 2025-11-25 and 2026-07-28 | PASS; one repeated table question got a planner reply with unfilled template slots, which the web shows the same way (not from this change) |
+| Claude Code 2.1.332 as a client | connects (2026-07-28) |
+| Localhost smoke, full web cycle in the browser; an MCP conversation opened on the web | PASS (Chrome driven by Playwright) |
+| CI tests / executor-tests / images | required on the pull request |
+
 ### Built-in HTTPS — 2026-11-24
 
 **Why.** Until now the web container spoke plain HTTP only, so HTTPS needed a
