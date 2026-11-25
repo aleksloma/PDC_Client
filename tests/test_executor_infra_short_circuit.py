@@ -989,7 +989,7 @@ LOG_SAFE_MODULES = ["run_chat_local.py", "routes/chat.py", "exec_sanitizer.py",
                     "executor/app.py", "excel_table_detector.py",
                     "routes/dashboards.py", "routes/charts.py",
                     "routes/auth.py", "routes/upload.py", "local_store.py",
-                    "routes/sso.py", "narrative.py"]
+                    "routes/sso.py", "narrative.py", "mcp_tokens.py"]
 
 LOG_CALL_NAME = "log_with_sid"
 

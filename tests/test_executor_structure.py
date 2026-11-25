@@ -101,7 +101,7 @@ FORBIDDEN_COPY_FRAGMENTS = [
     "local_store", "db_connector", "db_sources", "db_scheduler", "brain_client",
     "roles_store", "sso_store", "gcs_upload", "password_utils", "routes",
     "templates", ".env", "client.env", "run_chat_local", "auto_analytics",
-    "signin_domains",
+    "signin_domains", "mcp_tokens",
 ]
 
 EXPECTED_RUNTIME_ENV = {
