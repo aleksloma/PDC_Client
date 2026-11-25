@@ -152,6 +152,9 @@ Read these before you upgrade an existing install to this release.
   0, 1, 2, … index column. These run inside the analysis sandbox, so the
   executor image must be upgraded together with the client image (as for
   every release: both images, the same tag).
+- Another chatbot can now be connected over MCP (see "Connecting another
+  chatbot (MCP)" in §2). Off until an administrator creates a token; until
+  then the new address `/mcp` answers 401. No stored file changes shape.
 - The `/lab` page: the "View / Edit Descriptions" dialog shows column types
   as Text, Number, Date or Yes/No (display only — the analysis is
   unchanged); from 769 to 1200 px wide (or whenever the labels do not fit)
@@ -289,6 +292,11 @@ A few more settings are worth knowing about, all optional:
   still running." (translated); `90` by default, `0` turns the note off. It
   appears at most once per question and only while nothing of the answer has
   arrived yet; the analysis keeps running either way.
+- **`MCP_ANSWER_WAIT_SECONDS`** and **`MCP_TABLE_MAX_ROWS`** — used only when
+  another chatbot is connected (see "Connecting another chatbot (MCP)"
+  below): how many seconds the answer call waits for a running question
+  before it answers "running" (default `20`, 0 to 60), and how many rows of
+  a table an answer shows (default `50`, 1 to 50).
 
 Leave the `EXECUTOR_*` variables out of `client.env`. The ones that wire the
 two containers together (`EXECUTOR_URL`, `EXECUTOR_SHARED_DIR`,
@@ -472,7 +480,7 @@ snapshot and live query) is made read-only where the database allows it:
 
 Unless you approve sign-in domains (below), nobody can create an account by
 typing an address at the sign-in page. Accounts come to exist in two ways,
-plus two you can switch on:
+plus three you can switch on:
 
 - **Invitation.** On the admin panel's **Users** page, `ladmin` enters an
   address and clicks **Invite user**. The account is created without a
@@ -522,11 +530,17 @@ plus two you can switch on:
   mailbox, and setting the password signs the other person out. Approve
   only domains whose addresses you trust on your network; an invitation
   remains the verified way to create an account.
+- **MCP call.** When you have created a per-user MCP token (see "Connecting
+  another chatbot (MCP)" below), a call for an address in an approved sign-in
+  domain creates its account without a password. The person first signs in on
+  the web through **Reset password**, an invitation or Microsoft.
 
 **Ending sessions and removing users.** Each row of the **Users** page has
 two more actions, both confirmed in a dialog first. **End sessions** signs
 the user out everywhere, on their next click; their password and their data
-stay as they are, and they can sign in again. **Remove** deletes the account
+stay as they are, and they can sign in again. **End sessions** and a password
+change do not end access through a per-user MCP token (see "Connecting another
+chatbot (MCP)" below). **Remove** deletes the account
 together with every chat and dashboard it owns; the shares built on them
 end (colleagues lose the chats and dashboards it shared with them, and a
 tile pinned from one of its chats keeps its last picture but no longer
@@ -550,7 +564,8 @@ the address if it matters.) With `SSO_AUTO_PROVISION=true`, a
 Microsoft user who is still assigned in Entra gets such an account simply by
 signing in again, so unassign them in Entra as well. The same holds when the
 address is in an approved sign-in domain, where the person can also create
-a new account with a password at the sign-in page. Neither action can
+a new account with a password at the sign-in page, and a per-user MCP token
+creates one again at its next call for the address. Neither action can
 target the `ladmin` account, and you cannot remove your own.
 
 **Passwords** must be at least 8 characters (`PASSWORD_MIN_LENGTH` in
@@ -741,7 +756,8 @@ whose address matches an account here that has not yet signed in with
 Microsoft (an invited colleague, a share recipient, a password account) can
 sign in to it — and with `SSO_AUTO_PROVISION=true`, any member at all gets an
 account (with approved sign-in domains, any member whose address is in one
-of them).
+of them). Disabling a person in Entra does not end access through a per-user
+MCP token; see "Connecting another chatbot (MCP)" below.
 
 **Who gets in.** Each account is bound to its Entra identity (tenant id +
 object id) at its first Microsoft sign-in; afterwards the same person reaches
@@ -775,6 +791,60 @@ the account: remove the `sso_tid` and `sso_oid` keys from
 (or remove the account on the **Users** page and invite it again, which
 deletes its chats). See [`docs/SSO_MICROSOFT.md`](docs/SSO_MICROSOFT.md) for
 the log lines of each refusal.
+
+### Connecting another chatbot (MCP) (optional)
+
+Another chatbot in your network can ask questions in existing PowerDataChat
+chats over MCP (Model Context Protocol) and receive the answer: text, tables,
+charts as images and a link to the conversation. It is off until you create a
+token.
+
+The chatbot must speak MCP revision 2025-11-25 or 2026-07-28; one that speaks
+only an older revision cannot connect. Its request timeout, and that of a
+reverse proxy in front, must be longer than `MCP_ANSWER_WAIT_SECONDS`.
+
+1. Set `PUBLIC_BASE_URL` (the link and the endpoint address are built from it).
+2. Serve the application over HTTPS (see §3). Over plain HTTP anyone on the
+   network path can read the token and the answers.
+3. On the admin page open **MCP access**, enter a name, choose the mode, click
+   **Create token** and copy the token; it is shown once. The endpoint is
+   `<PUBLIC_BASE_URL>/mcp`.
+4. Give both to the chatbot's operator. The chatbot sends
+   `Authorization: Bearer <token>`.
+
+The two modes:
+
+- **Per user.** The chatbot's backend also sends the user's address in the
+  `X-PDC-User-Email` header, and PowerDataChat acts as that user, with that
+  user's chats and table permissions. **Whoever holds the token can act as any
+  user who has an account here (except the bootstrap admin), and as any address
+  in the approved sign-in domains**; such an address gets an account at its
+  first call if it has none. "Any user" includes users with the **Local admin**
+  permission; they act as chat users, the admin pages are not reachable through
+  MCP. Only `ladmin` itself is refused. The chatbot can also list the user's
+  chat titles and the names of the tables and files in them, tables outside the
+  user's role included (names only). Nothing but the header says who the user is: use
+  this mode only with a chatbot that authenticates its users itself, and keep
+  the token like a password. A user you removed comes back, with an empty
+  account, at the next call for their address while the address is in an
+  approved domain. **Offboarding:** ending sessions, a password change and
+  disabling the person in Entra do not end this access. Remove the account, or
+  revoke the token.
+- **Shared account.** The token is tied to one existing account. All users of
+  the chatbot share that account's chats and one conversation per chat per day,
+  and links open only for someone signed in as it. When two of them ask in the
+  same chat at once, the second is told to wait for the first.
+
+An account created this way has no password. The person signs in on the web
+through **Reset password**, an invitation, or Microsoft sign-in.
+
+**Data note.** An answer holds real data values, table rows and chart images
+and goes to the connecting chatbot. If that chatbot uses an external language model, the values leave your
+network; decide that before you create a token. What reaches the PowerDataChat
+brain does not change. Click **Revoke** to end access at once. A backup
+of the data volume restored later brings back tokens revoked since it was made:
+revoke them again. Protocol, limits
+and a test client: [`docs/MCP_INTEGRATION.md`](docs/MCP_INTEGRATION.md).
 
 ## 3. Run
 
@@ -1382,7 +1452,9 @@ users click past a certificate error on such a site.
 ## What leaves your network
 
 No uploaded file, DataFrame, query result set, or rendered chart is ever
-transmitted. What does cross to the brain over HTTPS is listed in the table
+transmitted to the brain. (A chatbot you connect over MCP receives the answers,
+including data values, table rows and chart images, see "Connecting another chatbot (MCP)" in §2; it is off until you
+create a token.) What does cross to the brain over HTTPS is listed in the table
 below: the question text, the schema text (names, data types, descriptions
 and the values of text columns with at most 20 distinct values), profile
 counts and flags, and truncated answer text for titles and reports. Computed
@@ -1428,6 +1500,7 @@ worth stating plainly:
 | Answer text | Conversation title | The question and the first 300 characters of the answer as stored; for an answer written as a template, the template with each blank shown as `[name]` — never the filled-in numbers |
 | Answer text | Report generation | Question and answer truncated to 500 characters (a templated answer: its template with `[name]` blanks), code snippet to 300 |
 | Table column names | Report generation | Input column NAMES only, first 10 — a result table's other labels (a pivot header can be a category value or a date) are left out; never rows |
+| Answers over MCP | Never to the brain | Only to a chatbot you connected with a token you created (see "Connecting another chatbot (MCP)" in §2) |
 | User email | Every call | Tenant routing and per-user activity |
 | Activity events | Login, upload, chat, report | Event name, user email, lightweight counters |
 | Password-reset payload | Password reset and invitation | The e-mail address, whether it is a reset or an invitation, and a single-use link (valid 30 minutes for a reset, 30 days for an invitation), relayed through the brain's mail service; the brain never logs or stores the link. Until it is used or expires the link sets the account's password, so the operator of the brain and of its mail relay is trusted with it, as with any mailed reset link |
@@ -1441,7 +1514,7 @@ decks, and your branded templates.
 - **One tenant token per customer.** If service stops with `403`, your token may
   have been revoked — contact PowerDataChat.
 - **Your data stays yours.** Raw uploads, chats, and rendered decks live only in
-  the `/data/client` volume on your server and are never transmitted. See
+  the `/data/client` volume on your server and are never transmitted to the brain. See
   "What leaves your network" for exactly what does reach the brain. Files a
   user uploads but never turns into a chat are deleted when that user signs
   out or starts a new upload.

@@ -20,7 +20,8 @@ file documents the enterprise client's implementation of each one.
   redirects to the change form itself), `/static/…`, `/health`, `/version`,
   `/auth/login`, `/auth/logout`, `/auth/change_password`,
   `/auth/reset_password`, `/auth/me`, the reset-link routes (`/auth/reset/…`)
-  and the Microsoft sign-in routes (`/auth/microsoft…`). Source:
+  and the Microsoft sign-in routes (`/auth/microsoft…`). `/mcp` is not among
+  them, but a request without a session passes. Source:
   `PasswordChangeGate` in `app.py`.
 - **Requests from the analysis sandbox's network.** A request whose network
   peer lies inside the sandbox's subnet (`EXECUTOR_NETWORK_CIDR`) is refused
@@ -68,7 +69,10 @@ file documents the enterprise client's implementation of each one.
   - The two upload routes — `/upload` and
     `/api/chat/{chat_id}/probe_columns` — accept only `multipart/form-data`.
 
-  The session cookie is also `SameSite=lax`.
+  The session cookie is also `SameSite=lax`. `POST /mcp` (see "MCP
+  endpoint") follows the JSON rule and needs its own bearer token; the route
+  never reads the session, identity is the token (the gates still see a
+  cookie).
 - **Content-Security-Policy.** Every `text/html` response carries a
   `Content-Security-Policy` header with a fresh nonce per response:
   `default-src 'self'; script-src 'self' 'nonce-…'; style-src 'self'
@@ -262,7 +266,9 @@ Passwords never leave this container — only a HASH is stored, at
 format). Sign-in is by INVITATION unless approved sign-in domains are set
 (below): an account exists only after an
 administrator's invite (`POST /api/admin/users/invite`), a share (password-less
-placeholder) or — only with `SSO_AUTO_PROVISION=true`, or for an address in
+placeholder), a per_user MCP call for an address in an approved sign-in domain
+(password-less; first web sign-in through Reset password, an invitation or
+Microsoft; "MCP endpoint" below) or — only with `SSO_AUTO_PROVISION=true`, or for an address in
 an approved sign-in domain — a Microsoft SSO sign-in (otherwise a Microsoft
 identity without an account is refused). An
 account without a password —
@@ -424,6 +430,50 @@ guide: [`docs/SSO_MICROSOFT.md`](SSO_MICROSOFT.md).
 |---|---|---|
 | `GET` | `/auth/microsoft` | starts the flow: 302 to `login.microsoftonline.com` with state+nonce in the session. **404 while SSO is not enabled** (unconfigured installs look pre-SSO). Enabled but secret unreadable (encryption key rotated away) → landing with the generic failure message (503). |
 | `GET` | `/auth/microsoft/callback` | exchanges the code, validates the ID token (authlib — signature/issuer/audience/nonce), takes the address from `preferred_username` (falling back to `email` for a member; a GUEST — `#EXT#` in `upn` or `preferred_username`, `_is_guest` — from `preferred_username` only), lower-cased. Refusals, each the landing with "Microsoft sign-in failed…" and no session: no usable address → 400 (`SSO_CALLBACK_NO_EMAIL`); the bootstrap `ladmin` → 403 (`SSO_BOOTSTRAP_ADMIN_REFUSED`, checked on the claimed address and again on the resolved account); `tid`/`oid` not both GUIDs → 401 (`SSO_CLAIMS_MISSING`); a guest while `SSO_ALLOW_GUESTS` is false → 403 (`SSO_GUEST_REFUSED`). IDENTITY BINDING (`auth.json` `sso_tid`/`sso_oid`, additive): `AuthStore.find_sso_account(tid, oid)` first — a bound account is signed in whatever address the token now carries (`SSO_USERNAME_CHANGED` when it differs); else an EXISTING account at the address (invited, share placeholder incl. the SSO-only one, pre-binding account) is bound once through `bind_sso_identity` — an account already bound to ANOTHER identity → 403 (`SSO_BIND_CONFLICT`), an unreadable `auth.json` → 403 (`SSO_BIND_REFUSED_UNREADABLE`); else, with `SSO_AUTO_PROVISION` true OR the address in an approved sign-in domain (`signin_domains.allows_email`), the account is created (`ensure_user` → `create_account`; Standard permission, Base) and bound (`SSO_ACCOUNT_PROVISIONED` when the setting admitted it, else `SSO_DOMAIN_ACCOUNT_PROVISIONED`; no welcome mail); else 401 (`SSO_UNKNOWN_ACCOUNT`) and NOTHING is created. Who may sign in at all is Entra's "Assignment required? = Yes" (mandatory, `docs/SSO_MICROSOFT.md`). Then stamps `sso_provider`/`sso_last_login` on auth.json (`mark_sso_login` — merge-only, password hashes untouched), starts the session via the SAME `_start_session` as password login but with `remember=False` (browser-session cookie — Entra re-auth is silent) and never `must_change`, logs `USER_LOGIN_SSO`, posts the normal `login` activity event, 302 → `/lab`. Other failures (state mismatch, token error → 401 `SSO_CALLBACK_FAILED`; the account removed by an administrator while the sign-in was under way → 401) start no session; token contents never logged. 404 while disabled. |
+
+---
+
+## MCP endpoint (`routes/mcp.py`)
+
+A second way into the client beside the browser: another chatbot asks a
+question in an existing chat. The full description (protocol revisions, tools,
+tokens, trust model, jobs, answer content, test client) is
+[`docs/MCP_INTEGRATION.md`](MCP_INTEGRATION.md). Off while no token exists.
+
+| Method | Path | Behavior |
+|---|---|---|
+| `POST` | `/mcp` | JSON-RPC 2.0, MCP Streamable HTTP, plain JSON answers, protocol revisions 2025-11-25 and 2026-07-28. `Authorization: Bearer pdcmcp_…`; a `per_user` token also needs `X-PDC-User-Email` on every `tools/call`. Tools `list_chats`, `ask` (returns a `job_id`), `get_answer` (waits at most `MCP_ANSWER_WAIT_SECONDS`; the first content item is the text JSON `{job_id, state}`, also `structuredContent` while running, absent on done or failed). One JSON object per request, at most 1 MiB, read within 30 s. Any other method: `405` |
+
+Statuses: `200` an answer (tool errors and the JSON-RPC errors without a
+status of their own included), `202` a notification (empty body), `400`
+malformed JSON or JSON-RPC, a failed version or header check, or a client that
+goes away while sending the body, `401` (`WWW-Authenticate: Bearer`) a missing,
+unknown, malformed or revoked token or more than one `Authorization` header,
+also when the token is revoked while the body is sent or while `get_answer`
+waits, `403` an `Origin` that is not `PUBLIC_BASE_URL`'s, a sandbox-subnet peer
+or a browser session that still has to change its password, `404` a modern
+(2026-07-28) request with an unknown method, `405` any other HTTP method, `408`
+the body did not arrive within 30 s, `413` the body is over 1 MiB, `415` the
+content type is not JSON, `429` + `Retry-After` a FAILED token from an address
+over its limit (20 failures in 600 s, in memory; a valid token always passes).
+The refusals before JSON-RPC have the bare JSON body `{"error": …}`.
+
+The route never reads the session and sets no cookie; identity is the token
+(and the header). The gates below still see a cookie a browser sends. A tool
+problem is a `200` result with `isError: true`.
+
+How the middleware in `app.py` meets `/mcp` (no exemption anywhere):
+
+| Middleware | Effect |
+|---|---|
+| `BackendNetworkGuard` | unchanged: a peer in `EXECUTOR_NETWORK_CIDR` gets the bare `403` |
+| `SecurityHeaders` | adds `nosniff` (and HSTS over HTTPS) |
+| `ContentSecurityPolicy` | nothing, the answer is not HTML |
+| `JsonContentTypeGate` | `application/json` passes (parameters allowed), any other type gets `415`; a `POST`, `PUT`, `PATCH` or `DELETE` without it gets `415` before the `405` |
+| `UploadByteCap` | not matched, `/mcp` has its own 1 MiB cap |
+| `RememberMeSessionMiddleware` | a chatbot sends no cookie: an empty session, no cookie is set |
+| `SessionGenerationGate` | nothing without a session |
+| `PasswordChangeGate` | `/mcp` is NOT an open path: a browser session that still has to change its password gets its usual `403`, a request without a session passes |
 
 ---
 
@@ -1134,6 +1184,20 @@ invalidates it). All changes take effect on the next request — no restart.
 | `POST` | `/api/admin/sso/test` | proves the triple against Microsoft without a browser: GET the tenant's OpenID discovery doc + a client-credentials token request (scope `graph.microsoft.com/.default`), 10s timeout. 200 `{ok, message}` outcomes (admin_data connectivity convention); failure message = Microsoft's `error_description` only. Success records the enable-gate hash. **POLICY_BLOCKED** (`AADSTS500011`/`AADSTS65001` — tenant blocks app-only tokens but the credentials are right): `{ok:false, code:"POLICY_BLOCKED", message:…}` yet the gate hash IS recorded (Enable not held hostage to tenant policy) and the audit row carries ok=true + the code. `AADSTS7000215`/`AADSTS700016`/`AADSTS90002` stay plain failures. 400 nothing saved; 503 no encryption key |
 | `POST` | `/api/admin/sso/enable` | 400 incomplete config; 409 `{code:"TEST_REQUIRED"}` unless the last successful test matches the saved values; else flips `enabled` on. Audited both ways |
 | `POST` | `/api/admin/sso/disable` | flips `enabled` off (absent-file safe) — the landing page returns to the plain password form on the next request. Audited |
+
+### Admin routes — MCP access tokens (`routes/mcp.py` `admin_router`, prefix `/api/admin/mcp`, `_require_admin` guard — ladmin + promoted admins)
+
+Store: `DATA_ROOT/mcp_tokens.json` (`mcp_tokens.py`; atomic writes, sha256 of
+the token only, never the token). A token row is `{id, name, mode, account,
+created_at, created_by, last_used_at, revoked_at, revoked_by, active}`. An
+unreadable file answers an empty list, and create / revoke answer `500` with a
+fixed text. The page shows the section only in admin mode.
+
+| Method | Path | Behavior |
+|---|---|---|
+| `GET` | `/api/admin/mcp/tokens` | `{tokens, endpoint}`, newest first; `endpoint` = `<PUBLIC_BASE_URL>/mcp`, `""` without an http(s) `PUBLIC_BASE_URL` |
+| `POST` | `/api/admin/mcp/tokens` | `{name, mode, account?}` → `{token, raw_token, endpoint}`, the only answer that carries the raw token (`Cache-Control: no-store`). `400` with a plain sentence: the name (1–60 characters, unique among active tokens, no control characters), the mode (`per_user` / `shared_account`), the account (an existing account with a creation date, not the bootstrap admin). Audited `mcp_token.create` (name, mode, account) |
+| `POST` | `/api/admin/mcp/tokens/{token_id}/revoke` | `{token}`; `404` unknown id. Its jobs are forgotten. Repeatable: the first revoke's stamps stay (each call audits). The body is ignored. Audited `mcp_token.revoke` |
 
 ---
 

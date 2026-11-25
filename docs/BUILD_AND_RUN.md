@@ -261,6 +261,14 @@ Slow-answer note (see `client.env.example`):
 |---|---|
 | `SLOW_ANSWER_NOTICE_SECONDS` | Seconds a chat stream waits for its first answer event (a chart or table, a caption, the narrative, the final answer or an error) before it sends ONE keyed progress event `lab.taking_longer` ("This is taking longer than usual. The analysis is still running.", translated on the page; log `SLOW_ANSWER_NOTICE after_s=`). Default `90`, minimum `0`; `0` sends no note. Read at call time by `routes/chat.py` (P29 C2). |
 
+MCP settings (see `client.env.example` and `docs/MCP_INTEGRATION.md` in the
+client repository):
+
+| Var | Purpose |
+|---|---|
+| `MCP_ANSWER_WAIT_SECONDS` | Seconds the MCP tool `get_answer` waits for a running question before it answers "running" (default `20`, clamped to 0–60; a value that cannot be parsed reads as the default). |
+| `MCP_TABLE_MAX_ROWS` | Rows of a table an MCP answer shows (default `50`, clamped to 1–50; a value that cannot be parsed reads as the default). |
+
 Answer-template setting (see `client.env.example`):
 
 | Var | Purpose |
